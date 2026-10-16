@@ -1,4 +1,4 @@
-"""Tests for orchestrator.landing_evidence (task 2678).
+"""Tests for orchestrator.merge_lane.landing_evidence (task 2678).
 
 Unit tests for the shared, module-level ``validate_landing_evidence`` helper
 that both harness.py (x4 sites) and merge_queue.py (x1 site) delegate to for
@@ -30,7 +30,7 @@ import pytest
 
 from orchestrator.delivered_checks import DeliveredCheckResult
 from orchestrator.git_ops import CommitEffectProbe
-from orchestrator.landing_evidence import (
+from orchestrator.merge_lane.landing_evidence import (
     LANDING_TALLY,
     LandingEvidenceVerdict,
     LandingMethod,

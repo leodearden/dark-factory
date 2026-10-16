@@ -55,7 +55,8 @@ from _merge_lane_fakes import FakeClock, FakeVerifier, make_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     ItemLifecycleState,
@@ -65,7 +66,6 @@ from orchestrator.merge_queue import (
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ── Module-level sentinel for verify_task in pure unit tests ─────────────────
 #
@@ -1488,7 +1488,7 @@ class TestRemergeReturnPathParity:
         import inspect
         import textwrap
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         src = textwrap.dedent(inspect.getsource(SpeculativeMergeWorker._remerge))
         returns = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Return)]
@@ -1508,8 +1508,8 @@ class TestRemergeReturnPathParity:
         — is unaffected by the carve-out. A default of True would exempt the
         entire pipeline from §5.3 in one character.
         """
-        from orchestrator.merge_types import DecidedItem as _DI
-        from orchestrator.merge_types import RealMergeItem as _RMI
+        from orchestrator.merge_lane.types import DecidedItem as _DI
+        from orchestrator.merge_lane.types import RealMergeItem as _RMI
 
         for cls in (_RMI, _DI):
             field = {f.name: f for f in dataclasses.fields(cls)}['remerge_recovery']

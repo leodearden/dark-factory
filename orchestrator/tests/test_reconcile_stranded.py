@@ -31,7 +31,7 @@ from orchestrator.delivered_checks import (
     DeliveredChecksVerdict,
 )
 from orchestrator.harness import Harness, _pid_alive
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.warm_lane_pool import WarmLanePool
 

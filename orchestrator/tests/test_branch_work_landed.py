@@ -49,10 +49,10 @@ from _orch_helpers import (
     git_env_with_ceiling,
 )
 
-from orchestrator import landing_evidence
 from orchestrator.config import GitConfig, RecoveryEmissionConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.landing_evidence import (
+from orchestrator.merge_lane import landing_evidence, patch_content_contained
+from orchestrator.merge_lane.landing_evidence import (
     LANDING_GIT_ERROR_STORM_CATEGORY,
     LANDING_GIT_ERROR_STORM_SENTINEL,
     LandingMethod,
@@ -63,7 +63,6 @@ from orchestrator.landing_evidence import (
     file_landing_git_error_storm_escalation,
     format_unattributed_landing_detail,
 )
-from orchestrator.merge_lane import patch_content_contained
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -1032,7 +1031,7 @@ class TestDegenerateArmBackwardCompatibility:
 
         **The residual, named rather than implied.**  That "not SAFETY" is
         conditional on attribution ALSO failing, and it is not guaranteed to.
-        :func:`~orchestrator.landing_evidence._resolve_main_reachable_evidence`
+        :func:`~orchestrator.merge_lane.landing_evidence._resolve_main_reachable_evidence`
         tier 1 accepts ANY main-reachable commit whose subject cites the task,
         including one from an EARLIER partial landing that this branch played
         no part in.  For a parked branch with no recorded base, a task with

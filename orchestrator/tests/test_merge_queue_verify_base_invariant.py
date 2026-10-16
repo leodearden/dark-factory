@@ -51,7 +51,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,

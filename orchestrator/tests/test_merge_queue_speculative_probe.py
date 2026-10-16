@@ -58,7 +58,8 @@ from orchestrator.config import (
     OrchestratorConfig,
     SpeculationProbeConfig,
 )
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
@@ -66,7 +67,6 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import HostLease
 
 # ---------------------------------------------------------------------------
@@ -180,7 +180,7 @@ class TestSelectProbeDepthByteIdenticalAtZero:
 
     @pytest.mark.parametrize('round_index', list(range(21)))
     def test_zero_fraction_always_none(self, round_index):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=0.0,
@@ -205,7 +205,7 @@ class TestSelectProbeDepthFrequencyAndCycling:
     """
 
     def test_frequency_bounded_and_depths_cycle_in_order(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         probe_depths = [2, 3, 5, 8]
         n_rounds = 100
@@ -255,7 +255,7 @@ class TestSelectProbeDepthFrequencyBoundMidRange:
 
     @pytest.mark.parametrize('probe_fraction', [0.3, 0.4, 0.5, 0.7])
     def test_observed_firing_rate_never_exceeds_fraction(self, probe_fraction):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         n_rounds = 1000
         fired = [
@@ -299,7 +299,7 @@ class TestSelectProbeDepthAvailabilityFallback:
     """
 
     def test_insufficient_built_depth_falls_back_to_none(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -312,7 +312,7 @@ class TestSelectProbeDepthAvailabilityFallback:
         assert result is None
 
     def test_exactly_sufficient_built_depth_returns_sampled_depth(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -325,7 +325,7 @@ class TestSelectProbeDepthAvailabilityFallback:
         assert result == 8
 
     def test_more_than_sufficient_built_depth_returns_sampled_depth(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -339,7 +339,7 @@ class TestSelectProbeDepthAvailabilityFallback:
 
     @pytest.mark.parametrize('available_built_depth', [0, 1, 2, 7])
     def test_various_insufficient_depths_fall_back_to_none(self, available_built_depth):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -374,7 +374,7 @@ class TestSelectProbeDepthFlakeSuppression:
     """
 
     def test_high_fail_rate_suppresses_probe(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -388,7 +388,7 @@ class TestSelectProbeDepthFlakeSuppression:
 
     def test_fail_rate_exactly_at_threshold_suppresses_probe(self):
         """>= is inclusive of the threshold itself."""
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -401,7 +401,7 @@ class TestSelectProbeDepthFlakeSuppression:
         assert result is None
 
     def test_low_fail_rate_allows_probe(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -417,7 +417,7 @@ class TestSelectProbeDepthFlakeSuppression:
         """No rolling-window data yet (e.g. a freshly started worker) must
         not suppress -- only an observed high fail rate suppresses.
         """
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -1105,7 +1105,7 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
+            'orchestrator.merge_lane.worker._run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
             await worker._run_inflight_verify(
@@ -1156,7 +1156,7 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
+            'orchestrator.merge_lane.worker._run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
             await worker._run_inflight_verify(item, lease, depth=1)

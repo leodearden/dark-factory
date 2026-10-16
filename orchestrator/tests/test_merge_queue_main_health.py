@@ -21,7 +21,8 @@ from orchestrator import verify
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
@@ -31,7 +32,6 @@ from orchestrator.merge_queue import (
     _MainHealthProbeHandles,
     _run_post_merge_verify,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
 from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
@@ -733,7 +733,7 @@ class TestMainHealthFingerprintWarning:
     def test_fingerprint_failure_emits_warning(self, caplog) -> None:
         import logging
 
-        from orchestrator.merge_queue import _main_health_fingerprint
+        from orchestrator.merge_lane.worker import _main_health_fingerprint
 
         with (
             patch(
@@ -752,7 +752,7 @@ class TestMainHealthFingerprintWarning:
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert warning_texts, (
-            'Expected a WARNING at orchestrator.merge_queue; got no warnings'
+            'Expected a WARNING at orchestrator.merge_lane.worker; got no warnings'
         )
         assert any(
             'fingerprint' in t.lower() for t in warning_texts
@@ -1601,7 +1601,7 @@ class TestTrivialPassMainRedGate:
 
     def test_a_known_red_blocks_trivial_pass(self, tmp_path: Path) -> None:
         """seed red baseline + trivial pass -> blocked/MAIN_RED, worktree cleaned."""
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
             MergeFailureDisposition,
         )
@@ -1689,7 +1689,7 @@ class TestTrivialPassMainRedGate:
         self, tmp_path: Path,
     ) -> None:
         """A red known only from one module's probe still blocks a trivial pass."""
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
             MergeFailureDisposition,
         )

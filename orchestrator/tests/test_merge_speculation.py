@@ -90,14 +90,14 @@ from orchestrator.git_ops import (  # noqa: F401
     WorktreeInfo,
     _run,
 )
-from orchestrator.landed_outbox import LandedOutbox  # noqa: F401
-from orchestrator.merge_disposition import (  # noqa: F401
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.disposition import (  # noqa: F401
     ClassificationResult,
     classify_merge_failure_disposition,
 )
-from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.landed_outbox import LandedOutbox  # noqa: F401
 from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MergeRequest,
     _acquire_warm_verify_worktree,
 )
@@ -1298,7 +1298,7 @@ class TestSpecLaneShadowSafetyValve:
 # VERIFY PORT, NOT THE AMBIENT PATCH
 # ----------------------------------
 # The conftest autouse _mock_merge_queue_verification fixture leaves the
-# module-level orchestrator.merge_queue.run_scoped_verification returning
+# module-level orchestrator.merge_lane.worker.run_scoped_verification returning
 # passed=True for anything that still resolves it.  These tests do not rely on
 # it and do not displace it: each builds a _SequencedVerifier and passes it as
 # MergeLane(..., verifier=...), so the lane asks its OWN collaborator, for its
@@ -2796,7 +2796,7 @@ class TestJournalLandedThenAdvanceHelper:
 
     async def test_records_before_advance(self, tmp_path: Path) -> None:
         """The row must already be visible from inside advance_main's own call."""
-        from orchestrator.merge_queue import _journal_landed_then_advance
+        from orchestrator.merge_lane.worker import _journal_landed_then_advance
 
         outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
         merge_wt = tmp_path / '_merge-wt'
@@ -2838,7 +2838,7 @@ class TestJournalLandedThenAdvanceHelper:
 
     async def test_none_outbox_does_not_crash(self, tmp_path: Path) -> None:
         """outbox=None (no project_root) must no-op the record, not raise."""
-        from orchestrator.merge_queue import _journal_landed_then_advance
+        from orchestrator.merge_lane.worker import _journal_landed_then_advance
 
         merge_wt = tmp_path / '_merge-wt2'
         git_ops = MagicMock()

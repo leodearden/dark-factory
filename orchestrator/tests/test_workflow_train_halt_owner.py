@@ -26,7 +26,7 @@ from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 

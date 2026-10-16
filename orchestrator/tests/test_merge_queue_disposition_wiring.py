@@ -34,11 +34,12 @@ from _orch_helpers import make_placeholder_future
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_disposition import (
+from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
 )
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import OutcomeKind, QueuedBranch
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
@@ -46,7 +47,6 @@ from orchestrator.merge_queue import (
     _run_post_merge_verify,
     resolve_dispatch_time_merge_base,
 )
-from orchestrator.merge_types import OutcomeKind, QueuedBranch
 from orchestrator.verify import VerifyResult
 
 MAIN_SHA = 'cafecafe1234567890deadbeef'
@@ -230,7 +230,7 @@ class TestRenderSkewSurfaces:
     returns ('', None)."""
 
     def test_integration_skew_with_evidence_renders_surfaces(self) -> None:
-        from orchestrator.merge_queue import _render_skew_surfaces
+        from orchestrator.merge_lane.worker import _render_skew_surfaces
 
         evidence = SkewEvidence(
             implicated_commits=('abc123deadbeef',),
@@ -265,7 +265,7 @@ class TestRenderSkewSurfaces:
     def test_non_skew_dispositions_render_nothing(
         self, disposition: MergeFailureDisposition,
     ) -> None:
-        from orchestrator.merge_queue import _render_skew_surfaces
+        from orchestrator.merge_lane.worker import _render_skew_surfaces
 
         evidence = SkewEvidence(
             implicated_commits=('abc123',),
@@ -275,7 +275,7 @@ class TestRenderSkewSurfaces:
         assert _render_skew_surfaces(disposition, evidence) == ('', None)
 
     def test_integration_skew_with_none_evidence_renders_nothing(self) -> None:
-        from orchestrator.merge_queue import _render_skew_surfaces
+        from orchestrator.merge_lane.worker import _render_skew_surfaces
 
         assert _render_skew_surfaces(
             MergeFailureDisposition.INTEGRATION_SKEW, None,
@@ -352,7 +352,7 @@ class TestClassifyDispositionForOutcome:
     classifier's own fail-open."""
 
     def test_row2_integration_skew(self, tmp_path: Path) -> None:
-        from orchestrator.merge_queue import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -389,7 +389,7 @@ class TestClassifyDispositionForOutcome:
         assert landing_sha in observed.implicated_commits
 
     def test_row3_branch_bug(self, tmp_path: Path) -> None:
-        from orchestrator.merge_queue import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -438,7 +438,7 @@ class TestClassifyDispositionForOutcome:
         exploding branch is that fault delivered through a public constructor
         argument.
         """
-        from orchestrator.merge_queue import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -746,7 +746,7 @@ class TestRunInflightVerifyFreezesDispatchTimeMainSha:
         self, tmp_path: Path,
     ) -> None:
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -918,7 +918,7 @@ class TestEmitMergeAttemptSkewEvidence:
         """Emit one merge_attempt against a REAL EventStore and read its data
         back (the direct-emit unit-test convention named in
         ``_emit_merge_attempt``'s docstring)."""
-        from orchestrator.merge_queue import _emit_merge_attempt
+        from orchestrator.merge_lane.worker import _emit_merge_attempt
 
         store = EventStore(tmp_path / 'runs.db', run_id='run-test')
         _emit_merge_attempt(store, '3178', OutcomeKind.verify_failed, **kwargs)
@@ -1052,7 +1052,7 @@ class TestClassifyDispositionForOutcomeObservedEvidence:
         ``observed_evidence`` rather than the adjudicated ``evidence``: an I7
         degrade cited real landings, and that is exactly what the census needs
         to be able to read."""
-        from orchestrator.merge_queue import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()

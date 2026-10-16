@@ -27,7 +27,8 @@ import pytest
 import orchestrator.suffix_graph as suffix_graph
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import MergeBounceRegistry, QueuedBranch
+from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     GroupMergeRequest,
@@ -35,7 +36,6 @@ from orchestrator.merge_queue import (
     MergeRequest,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import MergeBounceRegistry, QueuedBranch
 from orchestrator.suffix_graph import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
     SuffixConflictGraph,

@@ -30,15 +30,21 @@ from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_work
 from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until
 from _orch_helpers import make_placeholder_future, wait_responsive
 
-from orchestrator.landing_evidence import LandingEvidenceVerdict
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
+from orchestrator.merge_lane.types import QueuedBranch
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.git_ops import GitOps
-    from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker, TrainCallbackFactory
+    from orchestrator.merge_lane.worker import (
+        MergeRequest,
+        SpeculativeMergeWorker,
+        TrainCallbackFactory,
+    )
 
-_MERGE_QUEUE_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'merge_queue.py'
+_WORKER_SRC_PATH = (
+    Path(__file__).parent.parent / 'src' / 'orchestrator' / 'merge_lane' / 'worker.py'
+)
 
 # ─── Step 1 ─────────────────────────────────────────────────────────────────
 
@@ -95,7 +101,7 @@ def _make_single_req(
     worktree: Path | None = None,
     lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
-    from orchestrator.merge_queue import MergeRequest
+    from orchestrator.merge_lane.worker import MergeRequest
     try:
         future = asyncio.get_running_loop().create_future()
     except RuntimeError:
@@ -309,7 +315,7 @@ def _make_req(
     worktree: Path,
     config: OrchestratorConfig,
 ) -> MergeRequest:
-    from orchestrator.merge_queue import MergeRequest
+    from orchestrator.merge_lane.worker import MergeRequest
     future = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
@@ -365,7 +371,11 @@ class TestCoreFormation:
               member_task_ids
         """
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
 
         # Set up 3 branches each touching a unique file (disjoint → line-stackable).
         # Branch names are BARE (no prefix): create_worktree('t1') creates branch
@@ -474,7 +484,7 @@ class TestExclusionIdempotency:
         unresolved and its task_id does not appear in the train's
         member_task_ids.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             ItemLifecycleState,
             SpeculativeMergeWorker,
@@ -533,7 +543,7 @@ class TestExclusionIdempotency:
         set_result must never be called on it — it stays cancelled (CancelledError),
         not overwritten with 'superseded'.  It also remains in the buffer.
         """
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'c1', 'alpha.py', 'a = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'c2', 'beta.py', 'b = 2\n')
@@ -591,7 +601,7 @@ class TestExclusionIdempotency:
         selected as a candidate — it is not re-absorbed.  Its future must remain
         unresolved after the pass.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             SpeculativeMergeWorker,
         )
@@ -677,7 +687,7 @@ class TestPartialStackability:
         """
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import TrainStackResult
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         db_path = tmp_path / 'es_overlap.db'
         es = EventStore(db_path=db_path, run_id='run-overlap')
@@ -743,7 +753,7 @@ class TestPartialStackability:
         """
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import TrainStackResult
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         db_path = tmp_path / 'es_eject.db'
         es = EventStore(db_path=db_path, run_id='run-eject')
@@ -815,7 +825,7 @@ class TestPartialStackability:
         """
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import TrainStackResult
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         db_path = tmp_path / 'es_nosurv.db'
         es = EventStore(db_path=db_path, run_id='run-nosurv')
@@ -879,7 +889,7 @@ class TestDebounce:
         first call).  The signature is recorded.  The second call with the same
         buffer composition must short-circuit BEFORE calling get_changed_line_ranges.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         queue: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(
@@ -930,7 +940,7 @@ class TestDebounce:
         tmp_path: Path,
     ):
         """Adding a new request re-arms the debounce (different signature → re-runs)."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         queue: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(
@@ -987,7 +997,7 @@ class TestDebounce:
         _last_coalesce_signature was set to the pre-coalesce candidate set, so a
         caller that somehow re-invokes without any new singles sees no extra stacking.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'sc1', 'aa.py', 'x = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'sc2', 'bb.py', 'y = 2\n')
@@ -1083,7 +1093,7 @@ class TestEndToEndWiring:
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
         from orchestrator.merge_lane.types import TrainCallbacks
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Build 3 disjoint-file branches off main.
         # Each touches a unique file → mutually line-stackable.
@@ -1143,7 +1153,7 @@ class TestEndToEndWiring:
         # object the port-injected scenes use, not a second implementation.
         async with running_merge_worker(worker):
             with patch(
-                'orchestrator.merge_queue.run_scoped_verification',
+                'orchestrator.merge_lane.worker.run_scoped_verification',
                 _gated_verify(gate_release, gate_entered),
             ):
                 try:
@@ -1236,7 +1246,7 @@ class TestMergeReadyPredicateSeam:
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'p1', 'file_p1.py', 'p1 = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'p2', 'file_p2.py', 'p2 = 2\n')
@@ -1318,7 +1328,7 @@ class TestBlockedHistoryGate:
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore, EventType
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'bh1', 'file_bh1.py', 'bh1 = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'bh2', 'file_bh2.py', 'bh2 = 2\n')
@@ -1400,7 +1410,7 @@ class TestBlockedHistoryGate:
         all 3 coalesce normally; exclusions == [].
         """
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'nh1', 'file_nh1.py', 'nh1 = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'nh2', 'file_nh2.py', 'nh2 = 2\n')
@@ -1464,7 +1474,7 @@ class TestOneStrikeExclusion:
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'os1', 'file_os1.py', 'os1 = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'os2', 'file_os2.py', 'os2 = 2\n')
@@ -1550,7 +1560,7 @@ class TestOneStrikeRecording:
         import contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -1588,7 +1598,7 @@ class TestOneStrikeRecording:
 
         # Patch _do_train_merge to return blocked (simulating verify failure).
         with patch(
-            'orchestrator.merge_queue._do_train_merge',
+            'orchestrator.merge_lane.worker._do_train_merge',
             AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
         ):
             await queue.put(group)
@@ -1616,7 +1626,7 @@ class TestOneStrikeRecording:
         import contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -1652,7 +1662,7 @@ class TestOneStrikeRecording:
         )
 
         with patch(
-            'orchestrator.merge_queue._do_train_merge',
+            'orchestrator.merge_lane.worker._do_train_merge',
             AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
         ):
             await queue.put(group)
@@ -1691,7 +1701,7 @@ class TestSuppressionObservability:
     ):
         """2 stackable singles, 1 excluded by predicate → no train, both futures unresolved."""
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import GroupMergeRequest, SpeculativeMergeWorker
 
         wt1 = await _make_branch_with_file(git_ops, 'sup1', 'file_sup1.py', 'sup1 = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'sup2', 'file_sup2.py', 'sup2 = 2\n')
@@ -1756,7 +1766,7 @@ class TestOneStrikeOnErrorOutcome:
         import contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -1793,7 +1803,7 @@ class TestOneStrikeOnErrorOutcome:
 
         # Patch _do_train_merge to return 'error' (infra/git failure).
         with patch(
-            'orchestrator.merge_queue._do_train_merge',
+            'orchestrator.merge_lane.worker._do_train_merge',
             AsyncMock(return_value=MergeOutcome('error', reason='git push failed')),
         ):
             await queue.put(group)
@@ -1833,7 +1843,7 @@ class TestRedriveCoalesceMembers:
         redrive_member,
     ):
         """Build a minimal GroupMergeRequest with a coalesce train_id."""
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
+        from orchestrator.merge_lane.worker import GroupMergeRequest, MergeOutcome
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         return GroupMergeRequest(
@@ -1861,7 +1871,7 @@ class TestRedriveCoalesceMembers:
         tmp_path: Path,
     ):
         """is_ancestor=False: redrive_member called for merge-deferred (m1, m2), skips in-progress (m3)."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         status_check = AsyncMock(return_value={
             'm1': 'merge-deferred',
@@ -1907,7 +1917,7 @@ class TestRedriveCoalesceMembers:
         helper's evidence sha, NOT the raw resolve_branch_sha return value —
         and no escalation is filed.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         status_check = AsyncMock(return_value={
             'm1': 'merge-deferred',
@@ -1977,7 +1987,7 @@ class TestRedriveCoalesceMembers:
         escalation is filed and the member is flipped to pending via
         redrive_member(mid, False, None) so a fresh solo-merge re-attributes it.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         status_check = AsyncMock(return_value={'m1': 'merge-deferred'})
         redrive_member = AsyncMock()
@@ -2039,7 +2049,7 @@ class TestRedriveCoalesceMembers:
         """validate_landing_evidence rejects with reason 'effect_absent' (the
         task-1175 reverted-merge shape) -> escalate, redrive(mid, False, None).
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         status_check = AsyncMock(return_value={'m1': 'merge-deferred'})
         redrive_member = AsyncMock()
@@ -2090,7 +2100,7 @@ class TestRedriveCoalesceMembers:
         tmp_path: Path,
     ):
         """redrive_member=None → _redrive_coalesce_members returns without raising."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         queue: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, train_callback_factory=_stub_factory())
@@ -2111,7 +2121,11 @@ class TestRedriveCoalesceMembers:
         tmp_path: Path,
     ):
         """Exception in first member's re-drive does not prevent second member from being called."""
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import (
+            GroupMergeRequest,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
 
         status_check = AsyncMock(return_value={
             'm1': 'merge-deferred',
@@ -2160,9 +2174,9 @@ class TestRedriveCoalesceMembersMainShaFallbackGrepGuard:
     """
 
     def test_main_sha_fallback_expression_absent(self) -> None:
-        content = _MERGE_QUEUE_SRC_PATH.read_text()
+        content = _WORKER_SRC_PATH.read_text()
         assert 'resolve_branch_sha(branch) or main_sha' not in content, (
-            'merge_queue.py still contains the silent '
+            'merge_lane/worker.py still contains the silent '
             '`resolve_branch_sha(branch) or main_sha` fallback expression; '
             'task 2678 replaces it with validate_landing_evidence + '
             'escalate-instead-of-stamp.'
@@ -2204,7 +2218,7 @@ class TestRedriveCoalesceMembersStaleEvidence:
         from escalation.queue import EscalationQueue
 
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -2338,7 +2352,7 @@ class TestMergerLoopRedrive:
         import contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -2380,7 +2394,7 @@ class TestMergerLoopRedrive:
 
         with (
             patch(
-                'orchestrator.merge_queue._do_train_merge',
+                'orchestrator.merge_lane.worker._do_train_merge',
                 AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
             ),
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=False)),
@@ -2409,7 +2423,7 @@ class TestMergerLoopRedrive:
         import contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -2447,7 +2461,7 @@ class TestMergerLoopRedrive:
         )
 
         with patch(
-            'orchestrator.merge_queue._do_train_merge',
+            'orchestrator.merge_lane.worker._do_train_merge',
             AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
         ):
             await queue.put(group)
@@ -2473,7 +2487,7 @@ class TestMergerLoopRedrive:
         import contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -2511,7 +2525,7 @@ class TestMergerLoopRedrive:
         )
 
         with patch(
-            'orchestrator.merge_queue._do_train_merge',
+            'orchestrator.merge_lane.worker._do_train_merge',
             AsyncMock(return_value=MergeOutcome('done', merge_sha='abc123')),
         ):
             await queue.put(group)
@@ -2562,7 +2576,7 @@ class TestCoalesceRedriveEndToEnd:
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeOutcome,
             SpeculativeMergeWorker,
@@ -2634,7 +2648,7 @@ class TestCoalesceRedriveEndToEnd:
 
         # ── run through merger loop with injected derail ─────────────────────
         with patch(
-            'orchestrator.merge_queue._do_train_merge',
+            'orchestrator.merge_lane.worker._do_train_merge',
             AsyncMock(return_value=MergeOutcome('blocked', reason='verify red')),
         ):
             await queue.put(group)
@@ -2708,7 +2722,7 @@ class TestCoalesceAfterHealthyMerge:
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
         from orchestrator.merge_lane.types import TrainCallbacks
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Five disjoint-file branches: one warm-up single whose verify is gated
         # open, then four followers.  The followers arrive as ONE synchronous
@@ -2911,7 +2925,7 @@ class TestAwaitUnadvancedPredecessor:
     async def test_no_wait_when_predecessor_already_finalized(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         config = _make_config(tmp_path)
         queue: asyncio.Queue = asyncio.Queue()
@@ -2929,7 +2943,7 @@ class TestAwaitUnadvancedPredecessor:
         unadvanced, and releases as soon as its Future resolves — no polling
         of git, no timeout in the happy path.
         """
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         config = _make_config(tmp_path)
         queue: asyncio.Queue = asyncio.Queue()

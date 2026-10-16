@@ -1,4 +1,4 @@
-"""Tests for orchestrator.merge_disposition — merge-skew attribution mechanism M1
+"""Tests for orchestrator.merge_lane.disposition — merge-skew attribution mechanism M1
 (PRD: plans/merge-skew-attribution-prd.md, task 2381 α).
 
 Git-only, read-only, fail-open classifier that refines a merge-verify failure
@@ -84,23 +84,23 @@ class TestMergeFailureDispositionMemberSet:
     """MergeFailureDisposition is a StrEnum with exactly the 4 named members."""
 
     def test_member_values_match_expected_set_exactly(self):
-        from orchestrator.merge_disposition import MergeFailureDisposition
+        from orchestrator.merge_lane.disposition import MergeFailureDisposition
         assert {d.value for d in MergeFailureDisposition} == {
             'main_red', 'integration_skew', 'branch_bug', 'indeterminate',
         }
 
     def test_member_count_is_four(self):
-        from orchestrator.merge_disposition import MergeFailureDisposition
+        from orchestrator.merge_lane.disposition import MergeFailureDisposition
         assert len(list(MergeFailureDisposition)) == 4
 
     def test_is_strenum_subclass(self):
         from enum import StrEnum
 
-        from orchestrator.merge_disposition import MergeFailureDisposition
+        from orchestrator.merge_lane.disposition import MergeFailureDisposition
         assert issubclass(MergeFailureDisposition, StrEnum)
 
     def test_named_members_have_expected_values(self):
-        from orchestrator.merge_disposition import MergeFailureDisposition
+        from orchestrator.merge_lane.disposition import MergeFailureDisposition
         assert MergeFailureDisposition.MAIN_RED == 'main_red'
         assert MergeFailureDisposition.INTEGRATION_SKEW == 'integration_skew'
         assert MergeFailureDisposition.BRANCH_BUG == 'branch_bug'
@@ -111,7 +111,7 @@ class TestSkewEvidenceFrozenDataclass:
     """SkewEvidence is a frozen dataclass carrying three tuple[str, ...] fields."""
 
     def test_construct_and_read_fields(self):
-        from orchestrator.merge_disposition import SkewEvidence
+        from orchestrator.merge_lane.disposition import SkewEvidence
         evidence = SkewEvidence(
             implicated_commits=('abc123',),
             failing_tests=('test_foo',),
@@ -122,7 +122,7 @@ class TestSkewEvidenceFrozenDataclass:
         assert evidence.overlap_files == ('src/foo.py',)
 
     def test_is_frozen(self):
-        from orchestrator.merge_disposition import SkewEvidence
+        from orchestrator.merge_lane.disposition import SkewEvidence
         evidence = SkewEvidence(
             implicated_commits=('abc123',),
             failing_tests=('test_foo',),
@@ -142,25 +142,25 @@ class TestMergeOutcomeDispositionField:
     """
 
     def test_default_is_indeterminate(self):
-        from orchestrator.merge_types import MergeFailureDisposition, MergeOutcome
+        from orchestrator.merge_lane.types import MergeFailureDisposition, MergeOutcome
         outcome = MergeOutcome(status='done')
         assert outcome.disposition == MergeFailureDisposition.INDETERMINATE
 
     def test_importable_from_merge_types(self):
-        from orchestrator.merge_types import MergeFailureDisposition  # noqa: F401
+        from orchestrator.merge_lane.types import MergeFailureDisposition  # noqa: F401
 
     def test_merge_outcome_importable_from_merge_queue_shim_carries_disposition(self):
         """merge_queue re-exports MergeOutcome (pre-existing shim); the new
         disposition field must flow through with zero merge_queue.py edits."""
-        from orchestrator.merge_disposition import MergeFailureDisposition
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.disposition import MergeFailureDisposition
+        from orchestrator.merge_lane.worker import MergeOutcome
         outcome = MergeOutcome(status='done')
         assert outcome.disposition == MergeFailureDisposition.INDETERMINATE
 
     def test_merge_types_and_merge_queue_export_the_same_mergeoutcome_class(self):
         """The shim must re-export the identical MergeOutcome class, not a copy."""
-        from orchestrator.merge_queue import MergeOutcome as ShimMergeOutcome
-        from orchestrator.merge_types import MergeOutcome as TypesMergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome as TypesMergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome as ShimMergeOutcome
         assert ShimMergeOutcome is TypesMergeOutcome
 
 
@@ -168,12 +168,12 @@ class TestClassifyMergeFailureDispositionImportable:
     """classify_merge_failure_disposition is importable and a coroutine function."""
 
     def test_importable_from_merge_disposition_module(self):
-        from orchestrator.merge_disposition import (  # noqa: F401
+        from orchestrator.merge_lane.disposition import (  # noqa: F401
             classify_merge_failure_disposition,
         )
 
     def test_is_coroutine_function(self):
-        from orchestrator.merge_disposition import classify_merge_failure_disposition
+        from orchestrator.merge_lane.disposition import classify_merge_failure_disposition
         assert inspect.iscoroutinefunction(classify_merge_failure_disposition), (
             'classify_merge_failure_disposition must be an async def (coroutine function)'
         )
@@ -189,7 +189,7 @@ class TestMainRedShortCircuit:
     ever re-probing verify_failure_is_preexisting_on_main (I1)."""
 
     def test_preexisting_true_returns_main_red(self):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -211,7 +211,7 @@ class TestMainRedShortCircuit:
         """I1: classify must never call verify_failure_is_preexisting_on_main
         itself — it only refines the caller-computed ``preexisting`` bucket."""
         from orchestrator import verify as verify_module
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -250,7 +250,7 @@ class TestExtractFailingTestsAndCandidateFiles:
     a guess (a false skew is the costly error to avoid)."""
 
     def test_pytest_style_failed_line_and_cause_hint_path(self):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -274,7 +274,7 @@ class TestExtractFailingTestsAndCandidateFiles:
         assert 'tests/test_foo.py' in candidate_files
 
     def test_rust_nextest_style_failed_line_and_file_path_in_cause_hint(self):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -295,7 +295,7 @@ class TestExtractFailingTestsAndCandidateFiles:
         assert 'crates/foo/src/bar.rs' in candidate_files
 
     def test_empty_output_yields_empty_candidate_set(self):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -318,7 +318,7 @@ class TestExtractFailingTestsAndCandidateFiles:
     def test_uninformative_output_yields_empty_candidate_set(self):
         """No FAILED lines and no file-shaped tokens anywhere -> bias to
         empty rather than guessing (ambiguity -> no implicated landings)."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -395,7 +395,7 @@ class TestShellGuardFilenameIsNotATestId:
     def test_live_shell_guard_filename_is_not_a_failing_test_id(
         self, cause_hint: str, guard_filename: str, reify_task: str,
     ):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -414,7 +414,7 @@ class TestShellGuardFilenameIsNotATestId:
         """The real shape at test_verify_classify.py:1117 — the unconstrained
         regex parses the English word "to" as a test id. RED before the fix;
         the shape floor closes this hole too."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -428,7 +428,7 @@ class TestShellGuardFilenameIsNotATestId:
         not anchor and zero ids parse. GREEN today — pinned so a future
         regex-relaxation (dropping the ``^`` anchor or adding ``re.search``)
         cannot silently reopen this shape."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -445,7 +445,7 @@ class TestShellGuardFilenameIsNotATestId:
         """A genuine pytest node id carries ``::`` and must be unaffected —
         including the test-id -> path heuristic (merge_disposition.py:162-165)
         that feeds its path segment into candidate_files."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -470,7 +470,7 @@ class TestShellGuardFilenameIsNotATestId:
         population. ``_RUST_FAILED_ID_RE`` already requires ``::`` by
         construction, so the Rust branch needs no guard and this true skew is
         provably unaffected by the fix."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             _extract_failing_tests_and_candidate_files,
         )
 
@@ -501,7 +501,7 @@ class TestImplicatedLandings:
     2357: both SHAs are authoritative caller-supplied inputs)."""
 
     def test_landing_touches_candidate_file(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _implicated_landings
+        from orchestrator.merge_lane.disposition import _implicated_landings
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -516,7 +516,7 @@ class TestImplicatedLandings:
         assert 'src/x.py' in overlap_files
 
     def test_landing_touches_unrelated_file_no_overlap(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _implicated_landings
+        from orchestrator.merge_lane.disposition import _implicated_landings
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -534,7 +534,7 @@ class TestImplicatedLandings:
         """repo_root exists on disk but is not a git repo -> git log fails
         (rc != 0); the helper must degrade to empty, never raise (I3-style
         fail-safe for the git-plumbing helper)."""
-        from orchestrator.merge_disposition import _implicated_landings
+        from orchestrator.merge_lane.disposition import _implicated_landings
 
         non_git_dir = tmp_path / 'not_a_repo'
         non_git_dir.mkdir()
@@ -590,7 +590,7 @@ class TestImplicatedLandingsAncestorFilter:
     citations, never suppresses a genuine skew)."""
 
     def test_orphan_speculative_commit_is_pruned(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _implicated_landings
+        from orchestrator.merge_lane.disposition import _implicated_landings
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -616,7 +616,7 @@ class TestImplicatedLandingsAncestorFilter:
     def test_genuine_landing_kept_even_when_main_advanced_past_dispatch_base(
         self, tmp_path: Path,
     ):
-        from orchestrator.merge_disposition import _implicated_landings
+        from orchestrator.merge_lane.disposition import _implicated_landings
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -639,7 +639,7 @@ class TestImplicatedLandingsAncestorFilter:
         assert 'src/x.py' in overlap_files
 
     def test_fail_open_none_keeps_orphan_citation(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _implicated_landings
+        from orchestrator.merge_lane.disposition import _implicated_landings
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -656,7 +656,7 @@ class TestImplicatedLandingsAncestorFilter:
         assert 'src/x.py' in overlap_files
 
     def test_fail_open_unresolvable_ref_keeps_orphan_citation(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _implicated_landings
+        from orchestrator.merge_lane.disposition import _implicated_landings
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -715,7 +715,7 @@ class TestBranchPreMergeVerifyGreen:
     merge_verify."""
 
     def test_any_prior_green_wins_over_later_failure(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         store = _make_event_store(tmp_path)
         _emit_workflow_verify(store, '2381', passed=True)
@@ -724,7 +724,7 @@ class TestBranchPreMergeVerifyGreen:
         assert _branch_pre_merge_verify_green(store, '2381') is True
 
     def test_only_failing_rows_returns_false(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         store = _make_event_store(tmp_path)
         _emit_workflow_verify(store, '2381', passed=False)
@@ -732,7 +732,7 @@ class TestBranchPreMergeVerifyGreen:
         assert _branch_pre_merge_verify_green(store, '2381') is False
 
     def test_no_rows_for_task_returns_none(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         store = _make_event_store(tmp_path)
         # rows exist, but for a DIFFERENT task -> task_id filtering yields None
@@ -740,18 +740,18 @@ class TestBranchPreMergeVerifyGreen:
         assert _branch_pre_merge_verify_green(store, '2381') is None
 
     def test_empty_store_returns_none(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         store = _make_event_store(tmp_path)
         assert _branch_pre_merge_verify_green(store, '2381') is None
 
     def test_none_event_store_returns_none(self):
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         assert _branch_pre_merge_verify_green(None, '2381') is None
 
     def test_none_task_id_returns_none(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         store = _make_event_store(tmp_path)
         _emit_workflow_verify(store, '2381', passed=True)
@@ -761,7 +761,7 @@ class TestBranchPreMergeVerifyGreen:
         """The amendment's load-bearing distinction: a passing merge_verify
         row (the merge worker's POST-rebase verdict) is NOT the branch-green
         fact and must be ignored — only workflow_verify counts."""
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         store = _make_event_store(tmp_path)
         # A passing merge_verify for the task, but NO workflow_verify.
@@ -785,7 +785,7 @@ class TestBranchPreMergeVerifyGreenCrossRun:
     history (fetch_events_by_type_all_runs), not the run-scoped current run."""
 
     def test_prior_run_green_is_visible_cross_run(self, tmp_path: Path):
-        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+        from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
 
         db_path = tmp_path / 'runs.db'
         # A green recorded under a PRIOR orchestrator run (before a restart).
@@ -841,7 +841,7 @@ class TestClassifyIntegrationSkew:
     task -> INTEGRATION_SKEW + SkewEvidence. Also asserts I2 (read-only)."""
 
     def test_implicated_landing_plus_green_yields_integration_skew(self, tmp_path: Path):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             SkewEvidence,
             classify_merge_failure_disposition,
@@ -892,7 +892,7 @@ class TestClassifyIntegrationSkewCrossRun:
     def test_prior_run_green_plus_implicated_landing_yields_integration_skew(
         self, tmp_path: Path,
     ):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             SkewEvidence,
             classify_merge_failure_disposition,
@@ -941,7 +941,7 @@ class TestClassifyBranchBug:
     irrelevant when nothing on main is implicated."""
 
     def test_no_implicated_landing_yields_branch_bug_even_with_green(self, tmp_path: Path):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -988,7 +988,7 @@ class TestClassifyIndeterminate:
         """The keystone amendment case: a real first-attempt skew (implicated
         landing present) with NO workflow_verify row degrades honestly to
         INDETERMINATE, never a fabricated INTEGRATION_SKEW."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1012,7 +1012,7 @@ class TestClassifyIndeterminate:
     def test_implicated_landing_but_workflow_verify_failed_is_indeterminate(
         self, tmp_path: Path,
     ):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1037,7 +1037,7 @@ class TestClassifyIndeterminate:
     def test_repo_root_none_is_indeterminate(self, tmp_path: Path):
         """No repo to search -> evidence unavailable -> INDETERMINATE (never
         BRANCH_BUG guessed from an unsearchable state)."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1061,7 +1061,7 @@ class TestClassifyIndeterminate:
     def test_unextractable_failure_is_indeterminate(self, tmp_path: Path):
         """No candidate file could be identified from the failure (ambiguity)
         -> INDETERMINATE, not BRANCH_BUG."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1099,8 +1099,8 @@ class TestClassifyFailOpen:
     def test_helper_exception_degrades_to_indeterminate(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        import orchestrator.merge_disposition as md
-        from orchestrator.merge_disposition import (
+        import orchestrator.merge_lane.disposition as md
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1141,7 +1141,7 @@ class TestClassifyOrphanSpeculativeNotSkew:
     def test_orphan_speculative_main_sha_plus_green_is_branch_bug_not_skew(
         self, tmp_path: Path,
     ):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1171,7 +1171,7 @@ class TestClassifyOrphanSpeculativeNotSkew:
         assert evidence is None
 
     def test_genuine_landing_plus_green_still_integration_skew(self, tmp_path: Path):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             SkewEvidence,
             classify_merge_failure_disposition,
@@ -1207,7 +1207,7 @@ class TestClassifyOrphanSpeculativeNotSkew:
         """An unresolved real-main (real_main_head_sha=None) degrades to today's
         pre-fix reference frame: the orphan is still cited -> INTEGRATION_SKEW.
         Documents fail-open (never crashes, never suppresses a genuine skew)."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1264,7 +1264,7 @@ class TestClassifyHarnessRatchetNotSkew:
     def test_kloc_cap_guard_with_genuine_landing_is_indeterminate_not_skew(
         self, tmp_path: Path,
     ):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1317,7 +1317,7 @@ class TestClassifyHarnessRatchetNotSkew:
     def test_baseline_manifest_grandfathering_with_genuine_landing_is_indeterminate_not_skew(
         self, tmp_path: Path,
     ):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1372,7 +1372,7 @@ class TestClassifyHarnessRatchetNotSkew:
         failing-test id over the overlapping file. Pins that ``failing_tests``
         is the sole discriminant introduced by task 2871 — the fix must not
         over-correct and suppress a true INTEGRATION_SKEW."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             SkewEvidence,
             classify_merge_failure_disposition,
@@ -1457,7 +1457,7 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
         self, tmp_path: Path, cause_hint: str, guard_filename: str, reify_task: str,
         caplog: pytest.LogCaptureFixture,
     ):
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             _extract_failing_tests_and_candidate_files,
             _implicated_landings,
@@ -1551,7 +1551,7 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
         one code path: a refactor that collapsed them — or emitted the I7 string
         unconditionally — would leave the I7 test above green while making the
         operator surface lie about why the gate bit."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )
@@ -1611,7 +1611,7 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
         file with a Rust-shaped failing-test id. This is the must-not-
         over-correct boundary: on the PROMOTED path the gathered bundle and the
         adjudicated bundle coincide."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             SkewEvidence,
             classify_merge_failure_disposition,
@@ -1670,7 +1670,7 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
         no landings implicated means there is no bundle to persist, so BOTH
         elements are None. That is what keeps the BRANCH_BUG merge_attempt
         row's payload byte-identical when step-10 widens the emit guard."""
-        from orchestrator.merge_disposition import (
+        from orchestrator.merge_lane.disposition import (
             MergeFailureDisposition,
             classify_merge_failure_disposition,
         )

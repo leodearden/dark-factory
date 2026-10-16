@@ -37,8 +37,8 @@ from orchestrator.merge_lane.shadow import (
     _submit_shadow_divergence_escalation,
     diff_per_test_results,
 )
-from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
+    PRODUCTION_VERIFIER,
     _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,
     parse_per_test_results,
@@ -1667,7 +1667,7 @@ class TestMaybeScheduleShadowCompare:
 # Step-15: Integration — warm capture + worker/harness wiring
 # ---------------------------------------------------------------------------
 
-from orchestrator.merge_queue import (  # noqa: E402
+from orchestrator.merge_lane.worker import (  # noqa: E402
     MergeOutcome,
     MergeRequest,
     QueuedBranch,
@@ -1744,7 +1744,7 @@ class TestRunPostMergeVerifyOnResultCallback:
         self, tmp_path: Path
     ) -> None:
         """Passing on_result= must not raise TypeError (kwarg must exist)."""
-        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _run_post_merge_verify  # noqa: PLC0415
 
         received: list[VerifyResult] = []
         merge_wt = tmp_path / 'wt'
@@ -1999,7 +1999,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         fake_eq = MagicMock()
         h._escalation_queue = fake_eq
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):
@@ -2057,7 +2057,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         # _escalation_queue is None by default (set in Harness.__init__)
         assert h._escalation_queue is None
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):

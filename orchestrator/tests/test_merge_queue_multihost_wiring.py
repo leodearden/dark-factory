@@ -25,8 +25,8 @@ from _merge_lane_fakes import FakeVerifier, raises
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore
+from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RemoteRunner
 
@@ -69,7 +69,7 @@ class TestBuildRemoteRunners:
     """Tests for _build_remote_runners(config, cwd, *, quarantine=None) -> list[RemoteRunner]."""
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_queue import _build_remote_runners
+        from orchestrator.merge_lane.worker import _build_remote_runners
         return _build_remote_runners(config, cwd, quarantine=quarantine)
 
     def test_empty_verify_runners_returns_empty_list(self):
@@ -192,7 +192,7 @@ class TestBuildRemoteRunnersDfCheckout:
     """
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_queue import _build_remote_runners
+        from orchestrator.merge_lane.worker import _build_remote_runners
         return _build_remote_runners(config, cwd, quarantine=quarantine)
 
     def test_df_remote_checkout_threaded_from_config(self):
@@ -268,7 +268,7 @@ def _make_merge_request(config, *, task_files=None, worktree=None):
     import asyncio
     from pathlib import Path
 
-    from orchestrator.merge_queue import MergeOutcome, MergeRequest
+    from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 
     future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
 
@@ -469,7 +469,7 @@ class TestRunPostMergeVerifyPoolWiring:
         The remote is NOT in the pool (slot accounting is γ's job).
         Runner in the merge_verify event must be 'local'.
         """
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -493,7 +493,7 @@ class TestRunPostMergeVerifyPoolWiring:
 
     async def test_dispatching_host_derives_task_files_when_enabled_runners(self, tmp_path):
         """With enabled runner + task_files=None, derivation runs on dispatching host."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=None, worktree=tmp_path)
@@ -523,7 +523,7 @@ class TestRunPostMergeVerifyPoolWiring:
     async def test_gate_no_derivation_when_no_enabled_runners(self, tmp_path):
         """With no enabled runners + task_files=None, _run_post_merge_verify does NOT
         proactively call _derive_task_files_from_git (Lever C gate — byte-identical path)."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_config(verify_runners=[])  # Lever C off
         req = _make_merge_request(config, task_files=None, worktree=tmp_path)
@@ -572,7 +572,7 @@ class TestRunPostMergeVerifyFlockContention:
         return stub
 
     async def test_contention_result_blocks_and_files_born_at_l2(self, tmp_path):
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
         from orchestrator.verify_runner import make_flock_contention_result
 
         config = _make_config()
@@ -609,7 +609,7 @@ class TestRunPostMergeVerifyFlockContention:
 
     async def test_non_contention_failure_invariant_no_escalation(self, tmp_path):
         """INVARIANT: a plain non-contention passed=False result files no escalation."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_config()
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -636,7 +636,7 @@ class TestRunPostMergeVerifyFlockContention:
 
     async def test_contention_result_none_safe_without_escalation_queue(self, tmp_path):
         """NONE-SAFE: a contention result with escalation_queue omitted still blocks, no raise."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
         from orchestrator.verify_runner import make_flock_contention_result
 
         config = _make_config()
@@ -672,7 +672,7 @@ class TestRunPostMergeVerifyLocalOnly:
 
         Fails on current main (today routes to 'laptop') — RED for step-17.
         """
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -742,7 +742,7 @@ class TestCrossCheckHoldsLaneLockLease:
         import contextlib as _contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _cross_check_config()
         # task_files non-None → dispatching-host derivation is skipped.
@@ -810,7 +810,7 @@ class TestCrossCheckHoldsLaneLockLease:
         import contextlib as _contextlib
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         # Warm-lane regime OFF → the lease must be SKIPPED (no contenders to
         # exclude). Cross-check itself stays ON so the verify still fires.
@@ -890,7 +890,7 @@ class TestCrossCheckLeaseContentionFailsSafe:
 
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import MergeVerifyLeaseContended
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
         from orchestrator.verify_cancel import lane_lock_path
 
         config = _cross_check_config()
@@ -973,7 +973,7 @@ class TestEnsureHostAllocator:
 
     def _make_worker(self, *, project_root=None):
         """Build a minimal SpeculativeMergeWorker with optional project_root."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
         git_ops = _make_git_ops_mock()
         if project_root is not None:
             git_ops.project_root = project_root
@@ -1070,14 +1070,14 @@ class TestColdShadowVerifyLocalOnly:
         LocalRunner subclass, and a _build_remote_runners call count for a
         builder the cold-shadow path never references — were watching for.
         """
-        from orchestrator.merge_queue import _run_cold_shadow_verify
+        from orchestrator.merge_lane.worker import _run_cold_shadow_verify
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_git_ops_mock()
         es = _RecordingEventStore()
 
-        with patch('orchestrator.merge_queue.run_scoped_verification',
+        with patch('orchestrator.merge_lane.worker.run_scoped_verification',
                    new=AsyncMock(return_value=_make_pass_result())):
             await _run_cold_shadow_verify(git_ops, req, 'abc123', es, verifier=PRODUCTION_VERIFIER)
 
@@ -1113,7 +1113,7 @@ class TestRunDriftCheck:
         throwaway checkout, with the full-gate spec — rather than a runner
         handed in by the test, and the genuine acquire/release/quarantine
         predicate runs.  That leg verifies through
-        ``orchestrator.merge_queue.run_scoped_verification``, which conftest's
+        ``orchestrator.merge_lane.worker.run_scoped_verification``, which conftest's
         autouse fixture already answers with a pass, so the agree/diverge
         matrix is driven entirely by *remote_result*.
 
@@ -1169,7 +1169,7 @@ class TestRunDriftCheck:
         allocator = self._drift_allocator()
 
         run_scoped = AsyncMock(return_value=_make_pass_result())
-        with patch('orchestrator.merge_queue.run_scoped_verification', new=run_scoped):
+        with patch('orchestrator.merge_lane.worker.run_scoped_verification', new=run_scoped):
             await _run_drift_check(
                 git_ops, req, 'abc123', None, None, set(),
                 allocator=allocator,
@@ -1242,7 +1242,7 @@ class TestMaybeRunDriftCheck:
 
     async def test_no_trigger_when_no_enabled_runners(self, tmp_path):
         """_maybe_run_drift_check is a no-op when verify_runners is empty."""
-        from orchestrator.merge_queue import _maybe_run_drift_check
+        from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
         config = _make_config(verify_runners=[])
         req = _make_merge_request(config, worktree=tmp_path)
@@ -1256,7 +1256,7 @@ class TestMaybeRunDriftCheck:
 
     async def test_trigger_on_nth_land(self, tmp_path):
         """With every_n=2, drift check is triggered on 2nd and 4th land."""
-        from orchestrator.merge_queue import _maybe_run_drift_check
+        from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
         config = _make_config(
             verify_runners=[_make_runner_cfg('laptop')],
@@ -1287,7 +1287,7 @@ class TestMaybeRunDriftCheck:
 
     async def test_increments_drift_land_count(self, tmp_path):
         """_maybe_run_drift_check increments worker._drift_land_count each call."""
-        from orchestrator.merge_queue import _maybe_run_drift_check
+        from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('r1')], drift_every_n=100)
         req = _make_merge_request(config, worktree=tmp_path)
@@ -1329,7 +1329,7 @@ class TestDriftCheckTaskGCSafety:
 
     async def test_worker_init_has_drift_check_tasks_attr(self):
         """(a) SpeculativeMergeWorker.__init__ sets _drift_check_tasks = set()."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         git_ops = _make_git_ops_mock()
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
@@ -1343,7 +1343,7 @@ class TestDriftCheckTaskGCSafety:
         self, tmp_path
     ):
         """(b+c) Task is in _drift_check_tasks while in-flight; done-callback clears it."""
-        from orchestrator.merge_queue import _maybe_run_drift_check
+        from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
         config = _make_config(
             verify_runners=[_make_runner_cfg('laptop')],
@@ -1417,7 +1417,7 @@ class TestDriftCheckTaskStopCleanup:
 
     async def test_stop_cancels_drift_tasks_and_runs_finally_cleanup(self):
         """stop() cancels in-flight drift tasks; their finally blocks run at shutdown."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         git_ops = _make_git_ops_mock()
         worker = SpeculativeMergeWorker(
@@ -1484,20 +1484,20 @@ class TestInflightVerifyResultReasonField:
 
     def test_reason_field_defaults_to_none(self):
         """InflightVerifyResult() has reason attribute defaulting to None."""
-        from orchestrator.merge_queue import InflightVerifyResult
+        from orchestrator.merge_lane.worker import InflightVerifyResult
         ivr = InflightVerifyResult(outcome=None, merge_wt=None)
         # RED: AttributeError until the field is added
         assert ivr.reason is None
 
     def test_reason_field_accepts_string(self):
         """InflightVerifyResult(reason='...') stores the value."""
-        from orchestrator.merge_queue import InflightVerifyResult
+        from orchestrator.merge_lane.worker import InflightVerifyResult
         ivr = InflightVerifyResult(outcome=None, merge_wt=None, reason='ssh timeout')
         assert ivr.reason == 'ssh timeout'
 
     def test_reason_field_in_runner_unavailable_sentinel(self):
         """InflightVerifyResult with status='RUNNER_UNAVAILABLE' can carry reason."""
-        from orchestrator.merge_queue import InflightStatus, InflightVerifyResult
+        from orchestrator.merge_lane.worker import InflightStatus, InflightVerifyResult
         ivr = InflightVerifyResult(
             outcome=None,
             merge_wt=None,
@@ -1521,7 +1521,7 @@ async def _drive_runner_unavailable(tmp_path, caplog, reason):
     WARNING's host/rc/trigger (task 4194) — drives it through here, so the
     one unavoidable reach into ``_run_inflight_verify`` is spelled once.
     """
-    from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
     from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
     git_ops = _make_git_ops_mock()
@@ -1733,7 +1733,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
     """
 
     def _make_item(self, tmp_path, merge_wt, *, config=None, speculative=False):
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
@@ -1753,12 +1753,12 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         The warm swap is driven through the REAL ``_acquire_warm_verify_worktree``
         (spec-lane-pool knob on + speculative item + valve disabled, the three
         preconditions of its ``_spec-`` branch) with only ``git_ops`` stubbed —
-        never by monkeypatching the helper onto ``orchestrator.merge_queue``.
+        never by monkeypatching the helper onto ``orchestrator.merge_lane.worker``.
         So the True
         asserted below is the value production would compute, not one injected.
         """
         from orchestrator.config import GitConfig, OrchestratorConfig
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
         lane = tmp_path / '_spec-0'
@@ -1810,7 +1810,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         mis-mark a genuinely cold ``_merge-<uuid>`` as pool-owned, which would
         send the chokepoint down ``release_spec_lane`` and leak the directory.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
         git_ops = _make_git_ops_mock()
@@ -1853,7 +1853,7 @@ class TestRunInflightVerifyThreadsEscalationQueue:
     """
 
     async def test_laptop_contention_alarm_reaches_the_workers_queue(self, tmp_path):
-        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, make_flock_contention_result
 
         git_ops = _make_git_ops_mock()
@@ -1915,7 +1915,7 @@ class TestRunnerUnavailableTracker:
         import asyncio
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         git_ops = MagicMock()
         git_ops.project_root = None
@@ -2094,7 +2094,7 @@ class TestAlarmVerifyHostUnreachable:
     """
 
     def _call(self, eq, host, reason, *, streak=3, duration_s=120.0, event_store=None):
-        from orchestrator.merge_queue import _alarm_verify_host_unreachable
+        from orchestrator.merge_lane.worker import _alarm_verify_host_unreachable
         _alarm_verify_host_unreachable(
             eq, host, reason,
             streak=streak,
@@ -2217,7 +2217,7 @@ class TestAlarmVerifyWorktreeContention:
     """
 
     def _call(self, eq, *, host='leo-laptop', holder_pgid: int | None = 4242, waiter_pgid: int | None = 4343):
-        from orchestrator.merge_queue import _alarm_verify_worktree_contention
+        from orchestrator.merge_lane.worker import _alarm_verify_worktree_contention
         _alarm_verify_worktree_contention(
             eq, host=host, holder_pgid=holder_pgid, waiter_pgid=waiter_pgid,
         )
@@ -2253,7 +2253,7 @@ class TestAlarmVerifyWorktreeContention:
         assert eq.submitted[0].category == 'verify_worktree_contention'
 
     def test_escalation_task_id_is_per_host_sentinel(self):
-        from orchestrator.merge_queue import _verify_worktree_contention_sentinel
+        from orchestrator.merge_lane.worker import _verify_worktree_contention_sentinel
         eq = _FakeEscalationQueue(open_l1=False)
         self._call(eq, host='leo-laptop')
         assert eq.submitted[0].task_id == _verify_worktree_contention_sentinel('leo-laptop')
@@ -2337,7 +2337,7 @@ def _make_ru_worker(*, escalate_after_n=2, escalation_queue=_DEFAULT_EQ):
     """
     import asyncio
 
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
     git_ops = _make_git_ops_mock()
     git_ops.project_root = None  # no real git needed for this test
@@ -2385,7 +2385,7 @@ def _make_ru_entry(worker, host_name, *, reason='ssh timeout', merge_wt=None, sp
     """
     import asyncio
 
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         InflightEntry,
         InflightStatus,
         InflightVerifyResult,
@@ -2462,7 +2462,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         """RUNNER_UNAVAILABLE → quarantine_and_release called (existing behavior preserved)."""
         from unittest.mock import patch
 
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_lane.worker import SpeculativeItem
 
         worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
         entry = self._make_ru_entry(worker, 'laptop')
@@ -2479,7 +2479,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         """After RUNNER_UNAVAILABLE the lease host is in worker._runner_quarantine."""
         from unittest.mock import patch
 
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_lane.worker import SpeculativeItem
 
         worker, eq, fake_alloc = self._make_worker(escalate_after_n=3)
         entry = self._make_ru_entry(worker, 'laptop')
@@ -2500,7 +2500,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         """After N RU events for same host exactly ONE escalation is submitted."""
         from unittest.mock import patch
 
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_lane.worker import SpeculativeItem
 
         n = 2
         worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
@@ -2520,7 +2520,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         """The submitted escalation names the host and captured reason."""
         from unittest.mock import patch
 
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_lane.worker import SpeculativeItem
 
         n = 2
         reason = 'ssh: Could not resolve hostname laptop'
@@ -2541,7 +2541,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         """Additional RU events after threshold are dedup'd (has_open_l1 guard)."""
         from unittest.mock import patch
 
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_lane.worker import SpeculativeItem
 
         n = 2
         worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
@@ -2561,7 +2561,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         """RUNNER_UNAVAILABLE does not set _n_failed (item should be re-dispatched)."""
         from unittest.mock import patch
 
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_lane.worker import SpeculativeItem
 
         n = 2
         worker, eq, fake_alloc = self._make_worker(escalate_after_n=n)
@@ -2615,7 +2615,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         """The RU'd worktree leaves the ledger — and stops being heartbeat-pinned."""
         import os
 
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         # escalate_after_n high so the unavailability alarm never fires and
         # cannot confound the ledger assertions.
@@ -2673,7 +2673,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
     async def test_ru_redispatch_ledger_does_not_accumulate(self, tmp_path):
         """N successive RU re-dispatches must not grow the ledger by N entries."""
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
         worker._running = True
@@ -2715,7 +2715,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         the moment the item is known dead — ``_record_dead_base`` four lines
         later in the same branch has just declared its merge commit dead.
         """
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
         worker._running = True
@@ -2769,7 +2769,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         ``TestRunInflightVerifyRunnerUnavailableSpecWarm``; without that pin
         this test would keep passing over a vr shape nothing could produce.
         """
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
         worker._running = True
@@ -2812,7 +2812,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
         head-failure cascade) dispose first; this pins that ordering so the
         alternative can never be reintroduced silently.
         """
-        from orchestrator.merge_queue import DecidedItem
+        from orchestrator.merge_lane.worker import DecidedItem
 
         worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
         worker._running = True
@@ -2891,7 +2891,7 @@ class TestClearVerifyHostUnreachable:
     """
 
     def _call(self, eq, es, host, *, downtime_s: float = 300.0):
-        from orchestrator.merge_queue import _clear_verify_host_unreachable
+        from orchestrator.merge_lane.worker import _clear_verify_host_unreachable
         _clear_verify_host_unreachable(eq, es, host, downtime_s=downtime_s)
 
     def test_none_queue_is_noop(self):
@@ -3070,7 +3070,7 @@ def make_reprobe_worker(*, escalate_after_secs: float = 5.0, escalate_after_n: i
     """
     import asyncio
 
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
     git_ops = _make_git_ops_mock()
     git_ops.project_root = None
@@ -3084,7 +3084,7 @@ def make_reprobe_worker(*, escalate_after_secs: float = 5.0, escalate_after_n: i
 
 def seed_ru_tracker(worker, host: str, first_unavailable_at: float, streak: int = 5):
     """Seed the RU tracker so *host* reads back as RU-quarantined."""
-    from orchestrator.merge_queue import _HostUnavailability
+    from orchestrator.merge_lane.worker import _HostUnavailability
     worker._runner_unavailable[host] = _HostUnavailability(
         streak=streak,
         first_unavailable_at=first_unavailable_at,
@@ -4324,7 +4324,7 @@ class TestRunPostMergeVerifyRemoteStderrWiring:
         Fails now: merge_queue.py:897-901 builds VerifyRunnerPool without archive_root
         so dispatch threads archive_root=None and no file is written.
         """
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
         from orchestrator.verify import VerifyResult
         from orchestrator.verify_runner import RemoteRunner, result_to_json
 
@@ -4613,7 +4613,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
     """
 
     def _make_worker_and_item(self, tmp_path, *, verifier=None):
-        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
 
         git_ops = _make_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
@@ -4971,7 +4971,7 @@ class TestOrphanGuardPreservesCancellation:
         ``InflightEntry`` holding the outer task, so the property is pinned as
         the cascade CONSUMES it rather than as a local variable in a harness.
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
         from orchestrator.verify_runner import RunnerUnavailable
 
         async def _fail_on_cancel(*args, **kwargs):
@@ -5621,7 +5621,7 @@ class TestCancelAndReleaseChokepoint:
         import ast
         from pathlib import Path
 
-        import orchestrator.merge_queue as mq
+        import orchestrator.merge_lane.worker as mq
 
         source = Path(mq.__file__).read_text()
 
@@ -5664,7 +5664,7 @@ class TestParkedStrandRecordedFromRealCallSites:
 
     def _entry_with_parked_lease(self, worker, alloc):
         """An InflightEntry holding a live remote lease on the down host."""
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         entry = _make_ru_entry(worker, 'leo-laptop')
         lease = alloc.acquire_remote()
@@ -5679,7 +5679,7 @@ class TestParkedStrandRecordedFromRealCallSites:
 
     async def test_resolve_and_release_cancel_lease_records_the_strand(self):
         """Site: _resolve_and_release(cancel_lease=True) — the shared chokepoint."""
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         worker, _eq, alloc, _runner = _make_parking_worker()
         entry = self._entry_with_parked_lease(worker, alloc)
@@ -5699,7 +5699,7 @@ class TestParkedStrandRecordedFromRealCallSites:
 
     async def test_resolve_and_release_plain_release_records_nothing(self):
         """cancel_lease=False takes the plain (idempotent) release — no strand."""
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         worker, _eq, alloc, _runner = _make_parking_worker()
         entry = self._entry_with_parked_lease(worker, alloc)
@@ -5732,7 +5732,7 @@ class TestParkedStrandRecordedFromRealCallSites:
         """Site: _finalize_inflight's `finally` with _cancel_release=True (DROPPED)."""
         import asyncio as _asyncio
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             InflightStatus,
             InflightVerifyResult,

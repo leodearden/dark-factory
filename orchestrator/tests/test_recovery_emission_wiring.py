@@ -35,7 +35,7 @@ from shared.task_statuses import TaskStatus
 from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import (
     RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
     RecoveryVetoStreakTracker,

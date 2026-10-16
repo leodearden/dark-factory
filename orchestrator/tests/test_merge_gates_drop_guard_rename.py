@@ -1,5 +1,5 @@
 """Gate-level tests for a rename false-positive class of
-:func:`orchestrator.merge_gates._check_plan_targets_in_tree` — SITE 2.
+:func:`orchestrator.merge_lane.gates._check_plan_targets_in_tree` — SITE 2.
 
 The defect: the drop-guard intersects ``branch_changed`` (the branch's
 add/modify set, ``--no-renames --diff-filter=AM``) with
@@ -32,8 +32,8 @@ in this dedicated file rather than in the 24k-line ``test_merge_queue.py``
 — the precedent set by the sibling ``test_merge_gates_plan_files_rename.py``
 (its docstring, L29-30/36-39: real-git tests plus keeping hot
 ``merge_queue.py`` out of this task's lock scope).  They import the guard
-from ``orchestrator.merge_gates`` DIRECTLY, never through the
-``orchestrator.merge_queue`` shim.  The only deviation from pure real-git
+from ``orchestrator.merge_lane.gates`` DIRECTLY, never through the
+``orchestrator.merge_lane.worker`` shim.  The only deviation from pure real-git
 is :class:`_RunSpy`, used narrowly for the one property real git will not
 produce on demand: a non-zero rc from a specific git subcommand.
 """
@@ -50,7 +50,7 @@ from _resolution_merges import resolution_merge
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_gates import _check_plan_targets_in_tree
+from orchestrator.merge_lane.gates import _check_plan_targets_in_tree
 
 # ---------------------------------------------------------------------------
 # Fixtures — the standard real-git fixture triple, copied verbatim from
@@ -328,7 +328,7 @@ class TestDropGuardRenameAwareness:
             spy = _RunSpy(
                 fail_when=lambda cmd: '--name-status' in cmd and '-M' in cmd,
             )
-            monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+            monkeypatch.setattr('orchestrator.merge_lane.gates._run', spy)
 
             with caplog.at_level(
                 logging.WARNING, logger='orchestrator.merge_lane',
@@ -481,7 +481,7 @@ class TestDropGuardSuppressionIsContentVerified:
         )
 
         spy = _RunSpy(fail_when=lambda cmd: 'apply' in cmd)
-        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', spy)
 
         with caplog.at_level(
             logging.WARNING, logger='orchestrator.merge_lane',

@@ -691,7 +691,7 @@ class TestLanePatchTargets:
         for entry in live_report['tests'].values():
             union.update(entry['patch_targets'])
         assert len(union) >= 40, len(union)
-        assert 'run_scoped_verification' in union
+        assert 'worker.run_scoped_verification' in union
 
 
 # ---------------------------------------------------------------------------

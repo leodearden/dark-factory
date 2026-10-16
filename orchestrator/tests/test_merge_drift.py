@@ -1,10 +1,10 @@
-"""Tests for orchestrator.merge_drift: extracted drift-check detective
+"""Tests for orchestrator.merge_lane.drift: extracted drift-check detective
 subsystem (MQ-refactor task γ).
 
 These tests encode the behavior-preserving contracts of the module split,
 mirroring task β's test_merge_gates.py:
 
-1. Module-existence — ``orchestrator.merge_drift`` exists and exports the
+1. Module-existence — ``orchestrator.merge_lane.drift`` exists and exports the
    full closure of moved symbols (the drift-check runner and its cadence
    gate).
 2. Logger-name — the module logs under the lane's one logger name,
@@ -35,7 +35,7 @@ from orchestrator.verify import VerifyResult
 
 
 def test_merge_drift_exports_moved_public_symbols() -> None:
-    from orchestrator.merge_drift import _maybe_run_drift_check, _run_drift_check
+    from orchestrator.merge_lane.drift import _maybe_run_drift_check, _run_drift_check
 
     for name, obj in {
         '_run_drift_check': _run_drift_check,
@@ -51,7 +51,7 @@ def test_merge_drift_logger_name_is_merge_lane() -> None:
     ``caplog.at_level(..., logger='orchestrator.merge_lane')`` filter
     captures this module's records too.
     """
-    import orchestrator.merge_drift as merge_drift
+    import orchestrator.merge_lane.drift as merge_drift
 
     assert merge_drift.logger.name == 'orchestrator.merge_lane'
 
@@ -68,22 +68,22 @@ class TestDriftCheckStatePersistence:
     test_merge_queue_warm_cold_shadow.py::TestShadowCompareStatePersistence.
 
     RED (pre-impl): DriftCheckState / _load_drift_check_state /
-    _save_drift_check_state do not exist yet in orchestrator.merge_drift.
+    _save_drift_check_state do not exist yet in orchestrator.merge_lane.drift.
     """
 
     def test_drift_check_state_defaults_land_count_zero(self) -> None:
-        from orchestrator.merge_drift import DriftCheckState
+        from orchestrator.merge_lane.drift import DriftCheckState
 
         assert DriftCheckState().land_count == 0
 
     def test_load_returns_default_when_file_missing(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
 
         state = _load_drift_check_state(tmp_path / 'nonexistent.json')
         assert state == DriftCheckState(land_count=0)
 
     def test_load_returns_default_on_corrupt_json(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
 
         path = tmp_path / 'drift.json'
         path.write_text('{ not valid json !!!')
@@ -91,7 +91,7 @@ class TestDriftCheckStatePersistence:
 
     def test_load_returns_default_on_empty_json_object(self, tmp_path: Path) -> None:
         # Missing keys → fail-safe default (mirror shadow's empty-object test).
-        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
 
         path = tmp_path / 'drift.json'
         path.write_text('{}')
@@ -99,7 +99,7 @@ class TestDriftCheckStatePersistence:
 
     def test_load_returns_default_on_wrong_typed_key(self, tmp_path: Path) -> None:
         # int("not-an-int") raises ValueError → fail-safe default.
-        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
 
         path = tmp_path / 'drift.json'
         path.write_text('{"land_count": "not-an-int"}')
@@ -107,14 +107,14 @@ class TestDriftCheckStatePersistence:
 
     def test_load_returns_default_on_null_key(self, tmp_path: Path) -> None:
         # int(None) raises TypeError → fail-safe default.
-        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+        from orchestrator.merge_lane.drift import DriftCheckState, _load_drift_check_state
 
         path = tmp_path / 'drift.json'
         path.write_text('{"land_count": null}')
         assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
 
     def test_round_trip_preserves_count(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import (
+        from orchestrator.merge_lane.drift import (
             DriftCheckState,
             _load_drift_check_state,
             _save_drift_check_state,
@@ -125,7 +125,7 @@ class TestDriftCheckStatePersistence:
         assert _load_drift_check_state(path).land_count == 19
 
     def test_round_trip_count_zero(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import (
+        from orchestrator.merge_lane.drift import (
             DriftCheckState,
             _load_drift_check_state,
             _save_drift_check_state,
@@ -137,14 +137,14 @@ class TestDriftCheckStatePersistence:
         assert _load_drift_check_state(path) == original
 
     def test_save_creates_parent_dirs(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import DriftCheckState, _save_drift_check_state
+        from orchestrator.merge_lane.drift import DriftCheckState, _save_drift_check_state
 
         path = tmp_path / 'a' / 'b' / 'c' / 'drift.json'
         _save_drift_check_state(path, DriftCheckState(land_count=5))
         assert path.exists()
 
     def test_save_writes_valid_json(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import DriftCheckState, _save_drift_check_state
+        from orchestrator.merge_lane.drift import DriftCheckState, _save_drift_check_state
 
         path = tmp_path / 'drift.json'
         _save_drift_check_state(path, DriftCheckState(land_count=3))
@@ -166,7 +166,7 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n(
     solely on that upstream validation — a 0-or-negative value must not raise
     ``ZeroDivisionError`` via ``worker._drift_land_count % every_n``.
     """
-    from orchestrator.merge_drift import (
+    from orchestrator.merge_lane.drift import (
         _load_drift_check_state,
         _maybe_run_drift_check,
     )
@@ -223,7 +223,7 @@ class TestDriftCheckCadencePersistence:
     async def test_persisted_counter_drives_cadence_and_is_saved(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_drift import (
+        from orchestrator.merge_lane.drift import (
             _load_drift_check_state,
             _maybe_run_drift_check,
         )
@@ -253,7 +253,7 @@ class TestDriftCheckCadencePersistence:
         assert reachback.await_count == 1
 
     async def test_cadence_survives_simulated_restart(self, tmp_path: Path) -> None:
-        from orchestrator.merge_drift import (
+        from orchestrator.merge_lane.drift import (
             _load_drift_check_state,
             _maybe_run_drift_check,
         )
@@ -321,7 +321,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
         """
         import orchestrator.verify_runner as _vr
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_drift import _run_drift_check
+        from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
         git_ops = MagicMock()
@@ -377,11 +377,11 @@ class TestDriftCheckFullGateSpecNoDerivation:
             ),
             # A full-gate drift spec must NOT derive/scope task_files at all.
             patch(
-                'orchestrator.merge_queue._derive_task_files_from_git',
+                'orchestrator.merge_lane.worker._derive_task_files_from_git',
                 derive_spy,
             ),
             patch(
-                'orchestrator.merge_queue.run_scoped_verification',
+                'orchestrator.merge_lane.worker.run_scoped_verification',
                 AsyncMock(return_value=pass_result),
             ),
         ):
@@ -420,7 +420,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
 # fake remote, which is what gets DriftDetector.check past its `local is None
 # or remote is None` INCONCLUSIVE early-return and into the LocalRunner, which
 # verifies through the injected VerifyPort and so through the patched
-# `orchestrator.merge_queue.run_scoped_verification`.
+# `orchestrator.merge_lane.worker.run_scoped_verification`.
 # ---------------------------------------------------------------------------
 
 
@@ -500,7 +500,7 @@ class TestDriftCheckHoldsLaneLease:
         assertions read the outcome RECORDED by the fake rather than relying on
         the function raising.
         """
-        from orchestrator.merge_drift import _run_drift_check
+        from orchestrator.merge_lane.drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
         head = await _drift_head_sha(drift_git_ops.project_root)
@@ -533,7 +533,7 @@ class TestDriftCheckHoldsLaneLease:
         req.config = OrchestratorConfig(project_root=drift_git_repo)
 
         with patch(
-            'orchestrator.merge_queue.run_scoped_verification', _reaping_scoped,
+            'orchestrator.merge_lane.worker.run_scoped_verification', _reaping_scoped,
         ):
             await _run_drift_check(
                 drift_git_ops, req, head, None, None, set(), allocator=allocator,

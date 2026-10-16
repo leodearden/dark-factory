@@ -42,12 +42,12 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -336,7 +336,7 @@ class TestTrainIntegrationB1B7:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = MergeLane(git_ops, queue, event_store=spy)
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", side_effect=_spy_verify):
             outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is done.

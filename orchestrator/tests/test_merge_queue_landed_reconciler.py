@@ -32,8 +32,8 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.git_ops import AdvanceOutcome
-from orchestrator.landed_outbox import LandedOutbox, LandedRow
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow
+from orchestrator.merge_lane.worker import (
     _journal_landed_then_advance,
     reconcile_landed_outbox,
     reconcile_landed_row,
@@ -538,7 +538,7 @@ class TestReconcileLandedRowStaleEvidenceBareBackCompat:
 # pre-existing caller in this 24k-line module stays byte-identical.
 # ---------------------------------------------------------------------------
 
-_MQ_GATE_TARGET = 'orchestrator.merge_queue.gate_mark_done_on_delivered_checks'
+_MQ_GATE_TARGET = 'orchestrator.merge_lane.worker.gate_mark_done_on_delivered_checks'
 _MQ_DC_CHECK = {
     'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
 }

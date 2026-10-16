@@ -39,7 +39,8 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     ItemLifecycleState,
@@ -48,7 +49,6 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     _HostUnavailability,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import HostAllocator, HostLease
 
 # ── fixtures (ported verbatim from test_merge_queue_finalize_head_visibility) ──

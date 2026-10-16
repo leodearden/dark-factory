@@ -1,10 +1,10 @@
-"""Tests for orchestrator.merge_shadow: extracted warm-vs-cold shadow-compare
+"""Tests for orchestrator.merge_lane.shadow: extracted warm-vs-cold shadow-compare
 subsystem (MQ-refactor task γ).
 
 These tests encode the behavior-preserving contracts of the module split,
 mirroring task β's test_merge_gates.py:
 
-1. Module-existence — ``orchestrator.merge_shadow`` exists and exports the
+1. Module-existence — ``orchestrator.merge_lane.shadow`` exists and exports the
    full closure of moved symbols (state/diff types, per-test parsers,
    sentinels, and the shadow-compare functions).
 2. Logger-name — the module logs under the lane's one logger name,
@@ -28,7 +28,7 @@ from orchestrator.verify import VerifyResult
 
 
 def test_merge_shadow_exports_moved_public_symbols() -> None:
-    from orchestrator.merge_shadow import (
+    from orchestrator.merge_lane.shadow import (
         _LIBTEST_TEST_LINE_RE,
         _NEXTEST_SUMMARY_LINE_RE,
         _NEXTEST_TEST_LINE_RE,
@@ -83,7 +83,7 @@ def test_merge_shadow_logger_name_is_merge_lane() -> None:
     ``caplog.at_level(..., logger='orchestrator.merge_lane')`` filter
     captures this module's records too.
     """
-    import orchestrator.merge_shadow as merge_shadow
+    import orchestrator.merge_lane.shadow as merge_shadow
 
     assert merge_shadow.logger.name == 'orchestrator.merge_lane'
 
@@ -115,10 +115,10 @@ class TestScheduleShadowCompareMapLess:
         ``warm_results`` (merge_shadow.py ~1162-1163), so no task is ever
         scheduled for a map-less land and ``worker._shadow_compare_tasks`` stays
         empty.  The coarse coroutine must be dispatched via the merge_queue
-        reach-back seam (``orchestrator.merge_queue._run_coarse_shadow_compare``),
+        reach-back seam (``orchestrator.merge_lane.worker._run_coarse_shadow_compare``),
         NOT the per-test ``_run_shadow_compare``.
         """
-        from orchestrator.merge_shadow import _maybe_schedule_shadow_compare
+        from orchestrator.merge_lane.shadow import _maybe_schedule_shadow_compare
 
         git_ops = MagicMock()
         config = OrchestratorConfig(
@@ -173,7 +173,7 @@ class TestScheduleShadowCompareMapLess:
         map-less population contributes to the cadence exactly like a
         map-bearing land (no silent cadence loss).
         """
-        from orchestrator.merge_shadow import (
+        from orchestrator.merge_lane.shadow import (
             _load_shadow_compare_state,
             _maybe_schedule_shadow_compare,
         )
@@ -230,7 +230,7 @@ class TestCoarseShadowCompare:
       mirrors ``_run_shadow_compare``'s inconclusive guard).
 
     The cold FULL-gate verify is exercised through the merge_queue reach-back
-    seam (``orchestrator.merge_queue._run_cold_shadow_verify_suite``) so a test
+    seam (``orchestrator.merge_lane.worker._run_cold_shadow_verify_suite``) so a test
     patch controls the suite-level :class:`VerifyResult` without shelling out.
     """
 
@@ -252,7 +252,7 @@ class TestCoarseShadowCompare:
     async def test_cold_fail_vs_warm_passed_alarms_born_at_l2(self) -> None:
         """cold FULL-gate FAIL on a map-less warm-passed land ⇒ born-at-L2 alarm."""
         from orchestrator.event_store import EventType
-        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
 
         git_ops = MagicMock()
         req = self._req()
@@ -294,7 +294,7 @@ class TestCoarseShadowCompare:
     async def test_cold_pass_emits_coarse_parity_ok_no_alarm(self) -> None:
         """cold FULL-gate PASS ⇒ verdict_parity_ok(coarse=True), no escalation."""
         from orchestrator.event_store import EventType
-        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
 
         git_ops = MagicMock()
         req = self._req()
@@ -326,7 +326,7 @@ class TestCoarseShadowCompare:
     async def test_empty_cold_is_inconclusive_no_alarm_no_event(self) -> None:
         """Empty/unparseable cold with NO build category (OOM/transport/disk
         hiccup in the throwaway worktree) ⇒ inconclusive no-op."""
-        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
 
         git_ops = MagicMock()
         req = self._req()
@@ -363,7 +363,7 @@ class TestCoarseShadowCompare:
         red main whose commit never compiled must not be silently dropped.
         """
         from orchestrator.event_store import EventType
-        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
 
         git_ops = MagicMock()
         req = self._req()
@@ -402,7 +402,7 @@ class TestCoarseShadowCompare:
         """A cold FAIL with an INFRA-transient category (e.g. disk_full) and no
         parseable map stays inconclusive — infra hiccups must NOT alarm even
         though they carry a category (guards against over-alarming)."""
-        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
 
         git_ops = MagicMock()
         req = self._req()
@@ -429,7 +429,7 @@ class TestCoarseShadowCompare:
 
     async def test_cold_leg_exception_is_swallowed(self) -> None:
         """A cold-leg exception is swallowed (WARNING) — never crashes the worker."""
-        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
 
         git_ops = MagicMock()
         req = self._req()
@@ -468,7 +468,7 @@ def test_did_not_pass_subset_includes_non_pass_verdicts() -> None:
     tests, not only the 'fail' entry — a failed-only filter would be unsound
     under nextest fail-fast.
     """
-    from orchestrator.merge_shadow import did_not_pass_subset
+    from orchestrator.merge_lane.shadow import did_not_pass_subset
 
     fail_fast_map = {
         'crate a::x': 'pass',
@@ -486,7 +486,7 @@ def test_did_not_pass_subset_includes_non_pass_verdicts() -> None:
 
 def test_did_not_pass_subset_all_pass_is_empty() -> None:
     """An all-'pass' fail-fast map yields the empty subset (nothing to retry)."""
-    from orchestrator.merge_shadow import did_not_pass_subset
+    from orchestrator.merge_lane.shadow import did_not_pass_subset
 
     assert did_not_pass_subset({'a::x': 'pass', 'a::y': 'pass'}) == []
 
@@ -516,7 +516,7 @@ def test_nextest_filter_ids_strips_binary_id_prefix() -> None:
     Empirical basis (cargo-nextest 0.9.136): `test(=some::mod::test_a)` matches,
     `test(=reify-core::lib some::mod::test_a)` matches nothing.
     """
-    from orchestrator.merge_shadow import nextest_filter_ids
+    from orchestrator.merge_lane.shadow import nextest_filter_ids
 
     assert nextest_filter_ids(['reify-core::lib some::mod::test_a']) == [
         'some::mod::test_a'
@@ -529,7 +529,7 @@ def test_nextest_filter_ids_passes_through_unqualified_keys() -> None:
     The libtest branch of parse_per_test_results keys on the bare test path
     already, so there is no binary-id prefix to strip.
     """
-    from orchestrator.merge_shadow import nextest_filter_ids
+    from orchestrator.merge_lane.shadow import nextest_filter_ids
 
     assert nextest_filter_ids(['some::mod::test_b']) == ['some::mod::test_b']
 
@@ -540,7 +540,7 @@ def test_nextest_filter_ids_splits_on_first_space_only() -> None:
     nextest permits spaces in test names for some harnesses; splitting on every
     space would truncate such a name and silently drop it from the retry subset.
     """
-    from orchestrator.merge_shadow import nextest_filter_ids
+    from orchestrator.merge_lane.shadow import nextest_filter_ids
 
     assert nextest_filter_ids(['pkg::bin my test with spaces']) == [
         'my test with spaces'
@@ -553,7 +553,7 @@ def test_nextest_filter_ids_preserves_order_and_collapses_duplicates() -> None:
     Two binaries running the same test name yield ONE `test(=name)` term — the
     unqualified term already matches the name in every binary.
     """
-    from orchestrator.merge_shadow import nextest_filter_ids
+    from orchestrator.merge_lane.shadow import nextest_filter_ids
 
     assert nextest_filter_ids(
         [
@@ -567,7 +567,7 @@ def test_nextest_filter_ids_preserves_order_and_collapses_duplicates() -> None:
 
 def test_nextest_filter_ids_empty_input_is_empty_list() -> None:
     """Empty input yields [] — the caller decides what an empty subset means."""
-    from orchestrator.merge_shadow import nextest_filter_ids
+    from orchestrator.merge_lane.shadow import nextest_filter_ids
 
     assert nextest_filter_ids([]) == []
 
@@ -594,7 +594,7 @@ def test_parse_nextest_list_planned_real_bytes() -> None:
     """
     import json
 
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     raw = (_FIXTURE_DIR / 'nextest-list.json').read_text()
     doc = json.loads(raw)
@@ -616,7 +616,7 @@ def test_parse_nextest_list_planned_real_bytes() -> None:
 
 def test_parse_nextest_list_planned_unparseable_stdout_is_none() -> None:
     """Non-JSON stdout -> None (a probe FAILURE, routing to a full verify)."""
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     assert parse_nextest_list_planned('error: no such command: `nextest`') is None
     assert parse_nextest_list_planned('') is None
@@ -624,7 +624,7 @@ def test_parse_nextest_list_planned_unparseable_stdout_is_none() -> None:
 
 def test_parse_nextest_list_planned_wrong_shape_is_none() -> None:
     """Well-formed JSON of the wrong shape -> None, never a silent empty plan."""
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     assert parse_nextest_list_planned('[]') is None  # not an object
     assert parse_nextest_list_planned('"a string"') is None
@@ -639,7 +639,7 @@ def test_parse_nextest_list_planned_zero_testcases_is_empty_list() -> None:
     workspace (a real, if unusual, answer), whereas None means "the probe
     failed, do not narrow anything".
     """
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     doc = '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {}}}}'
     assert parse_nextest_list_planned(doc) == []
@@ -651,7 +651,7 @@ def test_parse_nextest_list_planned_missing_binary_id_falls_back_to_key() -> Non
     nextest keys the rust-suites map by the binary id, so the key is the same
     value and a schema change that drops the field stays parseable.
     """
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     doc = '{"rust-suites": {"crate-z::lib": {"testcases": {"m::t": {}}}}}'
     assert parse_nextest_list_planned(doc) == ['crate-z::lib m::t']
@@ -676,7 +676,7 @@ def test_parse_nextest_list_planned_excludes_ignored_and_filtered_out() -> None:
     """
     import json
 
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     raw = (_FIXTURE_DIR / 'nextest-list-ignored.json').read_text()
     doc = json.loads(raw)
@@ -714,7 +714,7 @@ def test_parse_nextest_list_planned_unknown_case_shape_is_included() -> None:
     cannot be understood stays in the plan.  A future nextest schema change must
     not silently start SKIPPING tests on the retry.
     """
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     doc = (
         '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {'
@@ -741,7 +741,7 @@ def test_parse_nextest_list_planned_all_cases_excluded_is_empty_not_none() -> No
     a full verify via the material-narrowing gate); None means "the probe
     failed".  Conflating them would be the false-green this module guards.
     """
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     doc = (
         '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {'
@@ -774,7 +774,7 @@ def test_parse_failed_run_all_members_real_contract_bytes() -> None:
     Reads the checked-in fixture whole — including the verbatim contract
     excerpt, whose lines are '#'-commented and so must NOT match.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     text = (_FIXTURE_DIR / 'run_all-failed-marker.txt').read_text()
     assert parse_failed_run_all_members(text) == [
@@ -789,7 +789,7 @@ def test_parse_failed_run_all_members_human_summary_not_double_counted() -> None
     Both lines are emitted together by run_all.sh:1839-1841; counting both would
     double every member and (with the '===' token) inject a bogus name.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     log = (
         '=== Summary: 2 discovered, 1 failed ===\n'
@@ -806,7 +806,7 @@ def test_parse_failed_run_all_members_no_marker_is_empty() -> None:
     (verify.sh:2545 gates on `[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`), which
     is the safe direction.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     assert parse_failed_run_all_members('=== Summary: 3 discovered, 0 failed ===') == []
     assert parse_failed_run_all_members('') == []
@@ -814,7 +814,7 @@ def test_parse_failed_run_all_members_no_marker_is_empty() -> None:
 
 def test_parse_failed_run_all_members_marker_without_names_is_empty() -> None:
     """A marker with no names after it -> [] (full run_all, the safe direction)."""
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     assert parse_failed_run_all_members('FAILED \nnext line\n') == []
 
@@ -825,7 +825,7 @@ def test_parse_failed_run_all_members_last_marker_wins() -> None:
     A merge-gate log can concatenate output from more than one run_all
     invocation; the most recent marker is the one describing the final state.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     log = 'FAILED test_old.sh\nmore output\nFAILED test_new_a.sh test_new_b.sh\n'
     assert parse_failed_run_all_members(log) == ['test_new_a.sh', 'test_new_b.sh']
@@ -833,7 +833,7 @@ def test_parse_failed_run_all_members_last_marker_wins() -> None:
 
 def test_parse_failed_run_all_members_deduplicates_preserving_order() -> None:
     """Repeated names within one marker collapse, first-seen order preserved."""
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     assert parse_failed_run_all_members('FAILED b.sh a.sh b.sh\n') == ['b.sh', 'a.sh']
 
@@ -888,7 +888,7 @@ def test_parse_failed_run_all_members_partial_marker_without_names_refuses() -> 
     So `[]` here is not a nicety: it is the difference between a full retry and
     a green that tested nothing.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     log = _run_all_fixture_line('FAILED (partial)')
     got = parse_failed_run_all_members(log)
@@ -908,7 +908,7 @@ def test_parse_failed_run_all_members_partial_marker_with_names_refuses() -> Non
     the same coverage hole as the empty-names case, merely smaller.  Never
     narrow on an incomplete plan.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     log = _run_all_fixture_line('FAILED a.sh b.sh (partial)')
     assert parse_failed_run_all_members(log) == []
@@ -916,7 +916,7 @@ def test_parse_failed_run_all_members_partial_marker_with_names_refuses() -> Non
 
 def test_parse_failed_run_all_members_clean_marker_unaffected_by_partial_rule() -> None:
     """No regression: a clean marker still narrows to exactly its names."""
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     log = _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh')
     assert parse_failed_run_all_members(log) == [
@@ -933,7 +933,7 @@ def test_parse_failed_run_all_members_last_marker_wins_across_producers() -> Non
     property of the LAST marker only — it neither poisons an earlier clean
     marker's result nor rescues a later partial one.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     clean = _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh')
     partial = _run_all_fixture_line('FAILED a.sh b.sh (partial)')
@@ -955,7 +955,7 @@ def test_parse_failed_run_all_members_human_partial_summary_alone_is_empty() -> 
     beside the bare marker.  Both rendered forms are covered — note the empty-
     `_names` one carries the producer's DOUBLE space after the colon.
     """
-    from orchestrator.merge_shadow import parse_failed_run_all_members
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
 
     assert parse_failed_run_all_members(_run_all_fixture_line('=== FAILED:  (partial) ===')) == []
     assert (
@@ -974,7 +974,7 @@ def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
     soundness core.  ``planned`` is authoritative: a verdict key not in
     ``planned`` is ignored.
     """
-    from orchestrator.merge_shadow import build_fail_fast_map
+    from orchestrator.merge_lane.shadow import build_fail_fast_map
 
     planned = ['crate a::x', 'crate a::y', 'crate a::z']
     # As produced by parse_per_test_results on attempt-0 output: 'crate a::z'
@@ -998,7 +998,7 @@ def test_build_fail_fast_map_then_subset_retains_not_started() -> None:
     A raw failed-only view would drop 'crate a::z'; feeding the fail-fast map
     through did_not_pass_subset keeps it (soundness).
     """
-    from orchestrator.merge_shadow import build_fail_fast_map, did_not_pass_subset
+    from orchestrator.merge_lane.shadow import build_fail_fast_map, did_not_pass_subset
 
     planned = ['crate a::x', 'crate a::y', 'crate a::z']
     verdicts = {'crate a::x': 'pass', 'crate a::y': 'fail'}
@@ -1028,7 +1028,7 @@ def test_merge_retry_shadow_baseline_carries_forward_and_retry_overwrites() -> N
     only_cold → phantom divergence).  C did-not-pass in attempt-0 and the fresh
     retry pass is the latest verdict, so it overwrites C's attempt-0 'fail'.
     """
-    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+    from orchestrator.merge_lane.shadow import merge_retry_shadow_baseline
 
     attempt0 = {'A': 'pass', 'B': 'pass', 'C': 'fail'}
     retry = {'C': 'pass'}
@@ -1041,7 +1041,7 @@ def test_merge_retry_shadow_baseline_carries_forward_and_retry_overwrites() -> N
 
 def test_merge_retry_shadow_baseline_retry_precedence_over_inconclusive() -> None:
     """retry verdict wins on overlap even over an attempt-0 'inconclusive'."""
-    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+    from orchestrator.merge_lane.shadow import merge_retry_shadow_baseline
 
     attempt0 = {'A': 'pass', 'C': 'inconclusive'}
     retry = {'C': 'pass'}
@@ -1055,14 +1055,14 @@ def test_merge_retry_shadow_baseline_drops_attempt0_non_pass_absent_from_retry()
     the full cold suite into a genuine-looking divergence — the exact phantom
     this helper exists to remove.  Only attempt-0 PASSES are carried forward.
     """
-    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+    from orchestrator.merge_lane.shadow import merge_retry_shadow_baseline
 
     assert merge_retry_shadow_baseline({'A': 'pass', 'C': 'fail'}, {}) == {'A': 'pass'}
 
 
 def test_merge_retry_shadow_baseline_does_not_mutate_inputs() -> None:
     """The input maps are treated as read-only (no in-place mutation)."""
-    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+    from orchestrator.merge_lane.shadow import merge_retry_shadow_baseline
 
     attempt0 = {'A': 'pass', 'C': 'fail'}
     retry = {'C': 'pass'}
@@ -1078,7 +1078,7 @@ def test_build_warm_shadow_results_narrowed_merges_attempt0_passes() -> None:
     re-run test; ``attempt0_verdicts`` supplies the attempt-0 pass that the
     narrowed run omitted.  The result must be the merged full-suite baseline.
     """
-    from orchestrator.merge_shadow import build_warm_shadow_results
+    from orchestrator.merge_lane.shadow import build_warm_shadow_results
 
     test_output = 'PASS [   0.05s] reify-spec test_retried\n'
     attempt0 = {'reify-spec test_passed': 'pass'}
@@ -1095,7 +1095,7 @@ def test_build_warm_shadow_results_non_narrowed_is_parse_only() -> None:
     both return exactly ``parse_per_test_results(test_output)`` — the
     non-narrowed warm path stays byte-identical.
     """
-    from orchestrator.merge_shadow import (
+    from orchestrator.merge_lane.shadow import (
         build_warm_shadow_results,
         parse_per_test_results,
     )
@@ -1120,7 +1120,7 @@ def test_build_warm_shadow_results_empty_parse_returned_unchanged() -> None:
     fail-closed ``_alarm_warm_shadow_unparseable`` and feeding the shadow
     compare the exact partial map D4 exists to eliminate).
     """
-    from orchestrator.merge_shadow import build_warm_shadow_results
+    from orchestrator.merge_lane.shadow import build_warm_shadow_results
 
     assert build_warm_shadow_results('', {'reify-spec test_passed': 'pass'}) == {}
 
@@ -1217,7 +1217,7 @@ class TestColdShadowVerifyHoldsLaneLease:
             being fixed.  (c) passes vacuously in the RED state, which is why
             (a) leads.
         """
-        from orchestrator.merge_shadow import _run_cold_shadow_verify
+        from orchestrator.merge_lane.shadow import _run_cold_shadow_verify
 
         head = await _shadow_head_sha(shadow_git_ops.project_root)
         recorded: list[tuple[str, bool, Path]] = []
@@ -1243,7 +1243,7 @@ class TestColdShadowVerifyHoldsLaneLease:
         req.config = OrchestratorConfig(project_root=shadow_git_repo)
 
         with patch(
-            'orchestrator.merge_queue.run_scoped_verification', _reaping_scoped,
+            'orchestrator.merge_lane.worker.run_scoped_verification', _reaping_scoped,
         ):
             result = await _run_cold_shadow_verify(shadow_git_ops, req, head, None, verifier=PRODUCTION_VERIFIER)
 

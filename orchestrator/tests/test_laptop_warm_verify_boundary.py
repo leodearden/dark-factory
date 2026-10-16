@@ -97,7 +97,10 @@ import orchestrator.cli as cli_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_queue import _run_post_merge_verify, _verify_worktree_contention_sentinel
+from orchestrator.merge_lane.worker import (
+    _run_post_merge_verify,
+    _verify_worktree_contention_sentinel,
+)
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
     collect_descendants,
     kill_process_tree,
