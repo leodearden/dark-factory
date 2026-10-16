@@ -431,6 +431,55 @@ async def test_blast_radius_expansion_invoked_when_files_grow(tmp_path: Path):
     f.handle_blast_radius_expansion.assert_awaited_once()
 
 
+def _conflicting_plan() -> dict:
+    plan = _good_plan()
+    plan['files'] = ['mod_b/x.py']  # a module the task does not hold
+    return plan
+
+
+@pytest.mark.asyncio
+async def test_simple_task_lock_conflict_requeues(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_conflicting_plan(), blast_radius_grants=False,
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    f.handle_blast_radius_expansion.assert_awaited_once()
+    assert f.wf.modules == ['mod_a']
+    assert not [
+        c for c in f.update_task.call_args_list
+        if len(c.args) >= 2
+        and isinstance(c.args[1], dict)
+        and 'optimistic_path' in c.args[1]
+    ]
+    assert not [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.phase_skipped
+        and c.kwargs['data']['reason'] == 'architect_skipped_simple_task'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_simple_task_lock_conflict_with_dead_repend_requeues(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_conflicting_plan(), blast_radius_grants=False,
+    )
+    f.handle_blast_radius_expansion.return_value = BlastRadiusResult(
+        applied=False,
+        repend_error=RuntimeError(
+            'set_task_status(500, pending) failed after 4 transient retries',
+        ),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+
+
 @pytest.mark.asyncio
 async def test_should_run_simple_task_true_for_clean_simple_task(tmp_path: Path):
     """The extracted SIMPLE_TASK gate returns True for a clean author-declared
