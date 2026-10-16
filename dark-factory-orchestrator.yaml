@@ -946,6 +946,15 @@ verify_admission_pytest_n: "8"
 # plans/verify-admission-task-slots-gate.md.
 verify_admission_task_slots: 1
 
+# TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
+# plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a
+# role class instead of the unordered poll. This is a TAIL fix only, not a
+# mean-duration or throughput change. Prediction to check against the recorded
+# verify_admission_plan events (rows with order='arrival'): mean plan completion
+# unchanged, p90 about -30%, maximum wait about 34h -> 12h. Revert by setting
+# 'unordered' (green tier: applies at the next reload_config or restart).
+verify_admission_order: arrival
+
 # Run each verify leg in its own weighted cgroup scope, a sibling of this unit
 # under app.slice, so agents stop losing thread-for-thread to verify xdist
 # workers (task 5206, operator decision Leo 2026-09-08; per-role weights from
