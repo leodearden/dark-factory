@@ -105,7 +105,8 @@ class TestOfflineLaneWiring:
         harness.git_ops.get_main_sha = AsyncMock(return_value='HEAD1')
         harness.git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=worktree)
         harness.git_ops.is_ancestor_checked = AsyncMock(return_value=True)
-        harness.scheduler.submit_task = AsyncMock(return_value=SubmittedTask('7001', 'deferred'))
+        submit_task = AsyncMock(return_value=SubmittedTask('7001', 'deferred'))
+        harness.scheduler.submit_task = submit_task
         harness.scheduler.dispatch_tool = AsyncMock(return_value={})
         git = harness.config.git
         git.offline_lane_enabled = True
@@ -119,14 +120,15 @@ class TestOfflineLaneWiring:
             await harness._start_offline_lane()
         try:
             await _until(lambda: bool(EpisodeStore(tmp_path, clock=clock).load(_COMMAND).episodes))
-            harness.scheduler.submit_task.assert_not_awaited()
+            submit_task.assert_not_awaited()
             clock.advance(minutes=30)
-            await _until(lambda: harness.scheduler.submit_task.await_count > 0)
+            await _until(lambda: submit_task.await_count > 0)
         finally:
             await harness._stop_offline_lane()
 
-        harness.scheduler.submit_task.assert_awaited_once()
-        arguments = harness.scheduler.submit_task.await_args.args[0]
+        submit_task.assert_awaited_once()
+        assert submit_task.await_args is not None
+        arguments = submit_task.await_args.args[0]
         assert arguments['metadata']['spawn_context'] == 'offline_lane_red'
         assert arguments['project_root'] == str(tmp_path)
 
