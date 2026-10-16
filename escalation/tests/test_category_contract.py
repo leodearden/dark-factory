@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _filing_tools import call_blocker, call_info
 
 from escalation.categories import (
     EscalationCategory,
@@ -19,6 +20,7 @@ from escalation.categories import (
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from escalation.server import create_server
 
 _CATEGORIES_THIS_TASK_REGISTERS = (
     'cascade_status_rejection',
@@ -204,3 +206,79 @@ class TestQueueChokepoint:
         archived = queue.get('esc-legacy-1')
         assert archived is not None
         assert archived.status == 'resolved'
+
+
+_FILING = {'task_id': 't1', 'agent_role': 'implementer', 'summary': 's'}
+
+
+@pytest.mark.asyncio
+class TestMcpToolGate:
+    @pytest.fixture
+    def queue(self, tmp_path: Path) -> EscalationQueue:
+        return EscalationQueue(tmp_path / 'esc')
+
+    async def test_blocker_rejects_unregistered_with_suggestion(self, queue: EscalationQueue):
+        result = await call_blocker(create_server(queue), **_FILING, category='infra_isue')
+
+        assert 'id' not in result
+        assert 'infra_isue' in result['error']
+        assert 'infra_issue' in result['error']
+        assert queue.get_pending() == []
+
+    async def test_info_rejects_case_variant(self, queue: EscalationQueue):
+        result = await call_info(create_server(queue), **_FILING, category='Design_Concern')
+
+        assert 'id' not in result
+        assert 'Design_Concern' in result['error']
+        assert queue.get_pending() == []
+
+    async def test_promote_rejects_unregistered_and_mints_no_l2(self, queue: EscalationQueue):
+        member = Escalation(
+            id='esc-t1-1',
+            task_id='t1',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='L1 cluster member',
+            level=1,
+        )
+        queue.submit(member)
+        tool = await create_server(queue).get_tool('promote_to_l2')
+
+        result = await tool.fn(
+            task_id='t1',
+            agent_role='escalation-watcher-auto',
+            member_ids=[member.id],
+            root_cause='one cause',
+            evidence='e',
+            options=['A: fix'],
+            summary='cluster',
+            category='not_registered',
+        )
+
+        assert 'not_registered' in result['error']
+        assert [e for e in queue.get_pending() if e.level == 2] == []
+        stored = queue.get(member.id)
+        assert stored is not None
+        assert (stored.status, stored.level) == ('pending', 1)
+
+    async def test_agent_instructed_categories_still_file(self, queue: EscalationQueue):
+        server = create_server(queue)
+
+        blocker = await call_blocker(server, **_FILING, category='missing_premise')
+        info = await call_info(server, **_FILING, category='planning_stalled')
+
+        for result in (blocker, info):
+            assert 'id' in result, result
+            assert result['status'] == 'queued'
+
+    @pytest.mark.parametrize('call', [call_blocker, call_info])
+    async def test_unregistered_with_invalid_severity_files_nothing(
+        self, queue: EscalationQueue, call,
+    ):
+        result = await call(
+            create_server(queue), **_FILING, category='nope', severity='LOUD',
+        )
+
+        assert 'error' in result
+        assert queue.get_pending() == []
