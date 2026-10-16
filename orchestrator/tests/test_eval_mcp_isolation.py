@@ -33,11 +33,10 @@ from shared.cli_invoke import AgentResult, build_claude_argv
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import ARCHITECT, AgentRole
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.evals import runner
+from orchestrator.evals import runner, snapshots
 from orchestrator.evals.compare import _assess_task, compare_models
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.judge import judge_plan_quality, run_judge
-from orchestrator.evals.profile import EVAL_PROFILE, apply_eval_profile
 from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
@@ -101,8 +100,6 @@ def _write_fixture(tmp_path: Path) -> Path:
 
 async def _drive_architect_eval(monkeypatch, tmp_path: Path) -> dict:
     """Run the REAL ``run_architect_eval`` up to its invoke; return the kwargs ``invoke_agent`` received."""
-    from orchestrator.evals import snapshots
-
     worktree = tmp_path / 'wt'
     worktree.mkdir()
     monkeypatch.setattr(snapshots, 'create_eval_worktree',
@@ -244,32 +241,9 @@ async def test_compare_synthesizer_carries_no_mcp_servers(monkeypatch, tmp_path:
 
 
 # ---------------------------------------------------------------------------
-# The workflow path: OrchestratorConfig.strict_mcp_config, off in production,
-# turned on by EVAL_PROFILE.
-# ---------------------------------------------------------------------------
-
-
-def test_production_default_leaves_strict_mcp_config_off(tmp_path: Path) -> None:
-    assert OrchestratorConfig(project_root=tmp_path).strict_mcp_config is False
-
-
-def test_eval_profile_turns_strict_mcp_config_on(tmp_path: Path) -> None:
-    assert EVAL_PROFILE['strict_mcp_config'] is True
-    assert apply_eval_profile(OrchestratorConfig(project_root=tmp_path)).strict_mcp_config is True
-
-
-def test_build_eval_orch_config_carries_strict_mcp_config(tmp_path: Path) -> None:
-    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
-    task = {'id': _FIXTURE_ID, 'project_root': str(tmp_path)}
-
-    eval_cfg = runner.build_eval_orch_config(cfg, task, OrchestratorConfig(project_root=tmp_path))
-
-    assert eval_cfg.strict_mcp_config is True
-
-
-# ---------------------------------------------------------------------------
-# TaskWorkflow._invoke: the leaf is forwarded, and never swallowed by a role
-# whose families compose no config.
+# TaskWorkflow._invoke: OrchestratorConfig.strict_mcp_config (off in
+# production, on under EVAL_PROFILE: boundary test B10) is forwarded, and never
+# swallowed by a role whose families compose no config.
 # ---------------------------------------------------------------------------
 
 
@@ -340,10 +314,23 @@ async def test_invoke_strict_config_scopes_every_role(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('role', [ARCHITECT, _NO_MCP], ids=['plan-tools-composed', 'no-families'])
-async def test_invoke_production_default_is_unchanged(tmp_path: Path, role: AgentRole) -> None:
+async def test_invoke_production_default_keeps_the_composed_plan_tools_config(tmp_path: Path) -> None:
+    kw = await _invoke_probe(tmp_path, ARCHITECT, strict=False)
+
+    assert kw.get('strict_mcp_config') is False
+    assert kw['mcp_config'].keys() == {'mcpServers'}
+    assert kw['mcp_config']['mcpServers'].keys() == {'plan-tools'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('role', 'composed'), [
+    (_ORCH_ONLY, {}),
+    (_NO_MCP, None),
+], ids=['falsy-orchestrator-config', 'no-families'])
+async def test_invoke_production_default_passes_a_falsy_config_through(
+    tmp_path: Path, role: AgentRole, composed: dict | None,
+) -> None:
     kw = await _invoke_probe(tmp_path, role, strict=False)
 
     assert kw.get('strict_mcp_config') is False
-    if role is _NO_MCP:
-        assert kw['mcp_config'] is None
+    assert kw['mcp_config'] == composed
