@@ -2,15 +2,39 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import sqlite3
+from collections import Counter
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
 
-WRITE_OPS_SCHEMA = """
+_READ_ROLLUP_SOURCE = (
+    Path(__file__).resolve().parents[2]
+    / 'fused-memory' / 'src' / 'fused_memory' / 'services' / 'read_rollup.py'
+)
+_READ_ROLLUP_DDL_NAME = 'READ_OP_COUNTS_SCHEMA_SQL'
+
+
+def _read_op_counts_ddl() -> str:
+    """``read_rollup.py::READ_OP_COUNTS_SCHEMA_SQL``, read from source because
+    the dashboard package does not depend on fused-memory."""
+    for node in ast.parse(_READ_ROLLUP_SOURCE.read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == _READ_ROLLUP_DDL_NAME
+            for target in node.targets
+        ):
+            ddl = ast.literal_eval(node.value)
+            assert isinstance(ddl, str), f'{_READ_ROLLUP_DDL_NAME} is not a str literal'
+            return ddl
+    raise AssertionError(f'{_READ_ROLLUP_SOURCE} no longer assigns {_READ_ROLLUP_DDL_NAME}')
+
+
+PRE_ROLLUP_WRITE_OPS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS write_ops (
     id TEXT PRIMARY KEY,
     causation_id TEXT,
@@ -46,6 +70,10 @@ CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 """
+
+# Every fixture journal also carries the read rollup table (task 5405), except
+# the deploy-window journals built from PRE_ROLLUP_WRITE_OPS_SCHEMA directly.
+WRITE_OPS_SCHEMA = PRE_ROLLUP_WRITE_OPS_SCHEMA + _read_op_counts_ddl()
 
 
 @pytest.fixture()
@@ -425,14 +453,14 @@ class TestDataLayerErrorHandling:
         assert result == {'labels': [], 'values': []}
 
 
-def _seed_write_ops(db_path, rows):
+def _seed_write_ops(db_path, rows, *, schema=WRITE_OPS_SCHEMA):
     """Create a write_ops SQLite DB at *db_path* seeded with *rows*.
 
     Each row is ``(op_id, operation, project_id, agent_id, kind, created_at)``,
     matching the column order used throughout this module's fixtures.
     """
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(WRITE_OPS_SCHEMA)
+    conn.executescript(schema)
     for op_id, operation, project_id, agent_id, kind, created_at in rows:
         conn.execute(
             'INSERT INTO write_ops (id, operation, project_id, agent_id, kind, created_at)'
@@ -583,10 +611,10 @@ class TestMemoryOpsQueryPlan:
 
         db_path = tmp_path / 'ops_plan.db'
         _seed_ops_breakdown_plan_fixture(db_path)
-        window = (
-            _PLAN_FIXTURE_BASE.isoformat(),
-            (_PLAN_FIXTURE_BASE + timedelta(days=21)).isoformat(),
-        )
+        window = {
+            'start': _PLAN_FIXTURE_BASE.isoformat(),
+            'end': (_PLAN_FIXTURE_BASE + timedelta(days=21)).isoformat(),
+        }
 
         async with (
             aiosqlite.connect(str(db_path)) as conn,
@@ -600,6 +628,9 @@ class TestMemoryOpsQueryPlan:
             f'created_at must be the seek constraint, got: {plan}'
         )
         assert 'SCAN' not in plan, f'still full-scanning write_ops: {plan}'
+        assert 'SEARCH read_op_counts USING PRIMARY KEY (hour_start>? AND hour_start<?)' in plan, (
+            f'the rollup arm must range-seek its primary key on hour_start, got: {plan}'
+        )
 
 
 async def _memory_ops_with_sql(conn, sql, monkeypatch, **kwargs):
@@ -720,3 +751,212 @@ class TestMemoryOpsMissingIndexFallback:
             and 'idx_wo_created' in record.getMessage()
             for record in caplog.records
         ), f'expected an ERROR naming idx_wo_created, got: {caplog.record_tuples}'
+
+
+def _seed_read_op_counts(db_path, rows):
+    """Insert ``(hour_start, project_id, agent_id, operation, count)`` rows."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        'INSERT INTO read_op_counts (hour_start, project_id, agent_id, operation, count)'
+        ' VALUES (?, ?, ?, ?, ?)',
+        [(at.isoformat(), project, agent, operation, count)
+         for at, project, agent, operation, count in rows],
+    )
+    conn.commit()
+    conn.close()
+
+
+async def _ops_value_at(db_path, **kwargs):
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        return await _ops_value(conn, **kwargs)
+
+
+def _seed_ops_rows(db_path):
+    _seed_write_ops(db_path, [
+        (op_id, operation, project, agent, kind, at.isoformat())
+        for op_id, operation, project, agent, kind, at in _OPS_ROWS
+    ])
+
+
+class TestMemoryOpsReadRollup:
+    """Every read is journalled exactly once — a write_ops row or a
+    read_op_counts count (task 5405) — so the panel ADDS the two sources."""
+
+    @pytest.mark.asyncio
+    async def test_rollup_counts_add_to_raw_rows_of_the_same_hour_and_operation(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / 'rollup_adds.db'
+        _seed_ops_rows(db_path)
+        raw_only = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+        _seed_read_op_counts(db_path, [
+            (_OPS_FLOOR, 'dark_factory', '', 'get_entity', 5),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.reads[-1] == raw_only.reads[-1] + 5 == 6
+        assert dict(ops.by_operation)['get_entity'] == 6
+        assert ops.writes == raw_only.writes
+        assert ops.other == raw_only.other
+
+    @pytest.mark.asyncio
+    async def test_rollup_window_includes_its_start_hour_and_excludes_both_outside_hours(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / 'rollup_edges.db'
+        _seed_write_ops(db_path, [])
+        _seed_read_op_counts(db_path, [
+            (_OPS_WINDOW_START, 'p', '', 'get_task', 2),
+            (_OPS_WINDOW_START - timedelta(hours=1), 'p', '', 'get_task', 30),
+            (_OPS_FLOOR + timedelta(hours=1), 'p', '', 'get_task', 400),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.reads[0] == 2
+        assert sum(ops.reads) == 2
+        assert ops.by_operation == (('get_task', 2),)
+
+    @pytest.mark.asyncio
+    async def test_rollup_sums_every_project_and_agent_row_of_one_hour_and_operation(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / 'rollup_grain.db'
+        _seed_write_ops(db_path, [])
+        hour = _OPS_FLOOR - timedelta(hours=3)
+        _seed_read_op_counts(db_path, [
+            (hour, 'p', '', 'get_statuses', 1),
+            (hour, 'p', 'agent-a', 'get_statuses', 2),
+            (hour, 'q', '', 'get_statuses', 4),
+            (hour, '', 'agent-b', 'get_statuses', 8),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.reads[_ops_bucket(hour)] == 15
+        assert ops.by_operation == (('get_statuses', 15),)
+
+    @pytest.mark.asyncio
+    async def test_rollup_empty_operation_is_unknown(self, tmp_path):
+        db_path = tmp_path / 'rollup_unknown.db'
+        _seed_write_ops(db_path, [])
+        _seed_read_op_counts(db_path, [(_OPS_FLOOR, 'p', '', '', 3)])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        assert ops.by_operation == (('unknown', 3),)
+
+    @pytest.mark.asyncio
+    async def test_series_still_reconcile_with_by_operation(self, tmp_path):
+        db_path = tmp_path / 'rollup_reconcile.db'
+        _seed_ops_rows(db_path)
+        _seed_read_op_counts(db_path, [
+            (_OPS_FLOOR, 'dark_factory', '', 'get_entity', 5),
+            (_OPS_WINDOW_START, 'dark_factory', '', 'get_task', 7),
+            (_OPS_FLOOR - timedelta(hours=6), '', '', '', 11),
+        ])
+
+        ops = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        series_total = sum(ops.reads) + sum(ops.writes) + sum(ops.other)
+        assert series_total == sum(count for _, count in ops.by_operation) == 9 + 23
+
+
+_MOVE_BASE = datetime(2026, 10, 2, 13, 0, tzinfo=UTC)
+
+
+def _equivalence_rows():
+    """Raw rows across hours, projects and agents: count-only reads, search
+    reads and writes, at minute offsets inside each hour."""
+    rows = []
+    for i in range(120):
+        at = _MOVE_BASE + timedelta(minutes=3 * i + 1)
+        operation, kind = [
+            ('get_task', 'read'), ('get_statuses', 'read'), (None, 'read'),
+            ('search', 'read'), ('add_memory', 'write'),
+        ][i % 5]
+        project = ['dark_factory', 'reify', None][(i // 10) % 3]
+        agent = ['agent-a', None][(i // 20) % 2]
+        rows.append((f'eq-{i}', operation, project, agent, kind, at))
+    return rows
+
+
+def _is_count_only(operation, kind):
+    return kind == 'read' and operation != 'search'
+
+
+class TestMemoryOpsRollupEquivalence:
+    """Moving successful non-search reads from write_ops into read_op_counts —
+    what the history migration does — leaves the panel's numbers unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_moving_reads_into_the_rollup_renders_identical_numbers(self, tmp_path):
+        db_path = tmp_path / 'rollup_move.db'
+        rows = _equivalence_rows()
+        _seed_write_ops(db_path, [
+            (op_id, operation, project, agent, kind, at.isoformat())
+            for op_id, operation, project, agent, kind, at in rows
+        ])
+        now = _MOVE_BASE + timedelta(hours=26, minutes=10)
+        before = await _ops_value_at(db_path, hours=28, now=now)
+
+        moved = [row for row in rows if _is_count_only(row[1], row[4])]
+        counts = Counter(
+            (at.replace(minute=0, second=0, microsecond=0), project or '', agent or '',
+             operation or '')
+            for _, operation, project, agent, _, at in moved
+        )
+        conn = sqlite3.connect(str(db_path))
+        conn.executemany('DELETE FROM write_ops WHERE id = ?', [(row[0],) for row in moved])
+        conn.commit()
+        conn.close()
+        _seed_read_op_counts(db_path, [(*key, count) for key, count in counts.items()])
+        after = await _ops_value_at(db_path, hours=28, now=now)
+
+        assert moved and len(counts) < len(moved)
+        assert after == before
+        assert sum(before.reads) == 96
+
+
+class TestMemoryOpsMissingRollupTableFallback:
+    """The deploy window (task 5405): the dashboard restarts on merge, while
+    fused-memory may run an older build for hours. Its journal has no
+    read_op_counts and journals every read per row, so the raw arm alone is
+    EXACT — a fresh reading, never an unknown one."""
+
+    @pytest.mark.asyncio
+    async def test_journal_without_rollup_table_reads_raw_rows_fresh(
+        self, tmp_path, caplog,
+    ):
+        from dashboard.data import write_journal
+        from dashboard.data.datum import DatumState, validate_datum
+
+        raw_rows = [
+            (op_id, operation, project, agent, kind, at.isoformat())
+            for op_id, operation, project, agent, kind, at in _OPS_ROWS
+        ]
+        with_table = tmp_path / 'with_rollup.db'
+        _seed_write_ops(with_table, raw_rows)
+        without_table = tmp_path / 'pre_rollup.db'
+        _seed_write_ops(without_table, raw_rows, schema=PRE_ROLLUP_WRITE_OPS_SCHEMA)
+        expected = await _ops_value_at(with_table, hours=24, now=_OPS_NOW)
+
+        async with aiosqlite.connect(str(without_table)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.INFO, logger='dashboard.data.write_journal'):
+                result = await write_journal.get_memory_ops(conn, hours=24, now=_OPS_NOW)
+
+        assert result.state is DatumState.FRESH
+        assert result.value == expected
+        validate_datum(result, served_at=_OPS_NOW)
+        journal_records = [
+            record for record in caplog.records
+            if record.name == 'dashboard.data.write_journal'
+        ]
+        assert any(
+            record.levelno == logging.INFO and 'read_op_counts' in record.getMessage()
+            for record in journal_records
+        ), f'expected an INFO naming read_op_counts, got: {caplog.record_tuples}'
+        assert all(record.levelno < logging.WARNING for record in journal_records)
