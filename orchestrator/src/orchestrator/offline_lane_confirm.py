@@ -6,6 +6,10 @@ the last two from the pass's detect record and one confirm sub-run: it narrows a
 structured pytest command to the detection's failing tests and runs them
 serially, and otherwise re-runs the whole command and intersects the two runs.
 The numeric leg's outcome comes from its confirm alone.
+
+A generic command's failing ids must keep their bracket pairs balanced, and on a
+narrowed confirm must also survive narrowing and re-parsing; there is no
+cross-check against junit ids, because a record's junit outcomes omit its failing tests.
 """
 
 from __future__ import annotations
@@ -216,6 +220,10 @@ def _brackets_balance(node_id: str) -> bool:
     return depth == 0
 
 
+def _first_unbalanced(ids: Sequence[str]) -> str | None:
+    return next((node_id for node_id in ids if not _brackets_balance(node_id)), None)
+
+
 def round_trip_failure(cmd: LaneCommand, ids: Sequence[str]) -> str | None:
     """The first of *ids* that does not survive narrowing *cmd* to it and re-parsing; ``None`` when all do."""
     parsed = parse_config_command(cmd.command)
@@ -294,11 +302,12 @@ async def _confirm_generic(
 ) -> Confirmed | Unconfirmable:
     run_cwd = worktree / cmd.cwd
     mode = confirm_mode(cmd, detect)
-    if mode is ConfirmMode.NARROWED:
-        ids = node_ids_of(_as_pytest_failures(detect))
-        failing_id = round_trip_failure(cmd, ids)
-        if failing_id is not None:
-            return Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, failing_id)
+    ids = node_ids_of(_as_pytest_failures(detect))
+    narrowed = mode is ConfirmMode.NARROWED
+    failing_id = round_trip_failure(cmd, ids) if narrowed else _first_unbalanced(ids)
+    if failing_id is not None:
+        return Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, failing_id)
+    if narrowed:
         junit_path = runner.junit_path
         command = serial_confirm_command(cmd, ids, invocation_dir=run_cwd, junit_path=junit_path)
     else:

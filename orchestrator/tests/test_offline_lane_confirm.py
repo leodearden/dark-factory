@@ -568,3 +568,15 @@ class TestJunitNodeOutcomes:
 
     def test_no_report_is_none(self, tmp_path: Path) -> None:
         assert junit_node_outcomes(tmp_path / 'absent.xml', tmp_path) is None
+
+
+class TestIntersectedRoundTrip:
+    @pytest.mark.asyncio
+    async def test_an_intersected_id_with_unbalanced_brackets_runs_no_confirm(self, tmp_path: Path) -> None:
+        runner = _FakeRunner(_rerun(('tests/t.py::test_a[x', 'failed')))
+        detect = _run(('tests/t.py::test_ok', 'failed'), ('tests/t.py::test_a[x', 'failed'))
+
+        outcome = await confirm(_generic(tmp_path, 'make check'), detect, runner)
+
+        assert outcome == Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, 'tests/t.py::test_a[x')
+        assert runner.calls == []
