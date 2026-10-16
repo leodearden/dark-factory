@@ -51,3 +51,18 @@ COUNT_ONLY_READ_PREDICATE = (
     "kind = 'read' AND success = 1 "
     f'AND (operation IS NULL OR operation NOT IN ({_KEPT_OPERATIONS_SQL}))'
 )
+
+# History migration (fused-memory/scripts/roll_up_journal_reads.py). Parameters
+# for both: a rowid window (lo, hi), half-open. Rowids are a sequential table
+# b-tree range in insertion (= time) order, so no index is built on write_ops.
+_COLUMN_KEY = _rollup_key('created_at', 'project_id', 'agent_id', 'operation')
+
+RAW_READS_BY_ROLLUP_KEY_SQL = (
+    f'SELECT {_COLUMN_KEY}, COUNT(*) FROM write_ops '
+    f'WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE} '
+    'GROUP BY 1, 2, 3, 4'
+)
+
+DELETE_COUNT_ONLY_READS_SQL = (
+    f'DELETE FROM write_ops WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE}'
+)
