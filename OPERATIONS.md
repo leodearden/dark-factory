@@ -2655,8 +2655,11 @@ attempts (task 6548). The gap is measured from `last_scheduled_target_date`,
 the target of the last SCHEDULED pass
 (`scripts/legibility/trickle_state.py::never_run_dates`). A manual
 `nightly.py run --date` pass never moves that cursor, so a backfill is not
-mistaken for a gap. An outage of up to `RETRY_MAX_AGE_DAYS` missed nights is
-fully recovered, one date per finished night.
+mistaken for a gap. When every later night finishes, an outage of up to
+`RETRY_MAX_AGE_DAYS` missed nights is fully recovered, one date per night;
+each later night that does not finish costs the oldest owed date. Never-run
+dates already past the window are abandoned in one WARNING,
+`abandoning <n> never-run date(s) <first>..<last>`.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own

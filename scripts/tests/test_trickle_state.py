@@ -911,16 +911,17 @@ def _simulate_outage(outage_nights, *, healthy_nights):
     return outage, retried, abandoned, backlog
 
 
-def _simulate_missed_elapses(missed, *, nights):
+def _simulate_missed_elapses(missed, *, nights, failed_nights=()):
     """Drive the backlog policy over a systemd outage with no I/O.
 
     The last scheduled pass covered ``_d(1)``; the timer then misses
     *missed* elapses and its catch-up covers ``_d(1 + missed)``. Each of
-    *nights* finished scheduled passes, from the catch-up on, covers the
-    next date, is recorded the next day, owes the dates since the previous
-    scheduled pass, and folds a finished retry of each date due. Returns
-    the dates retried in order, every abandoned entry, and the final
-    backlog."""
+    *nights* scheduled passes, from the catch-up on, covers the next date,
+    is recorded the next day, and owes the dates since the previous
+    scheduled pass. A night whose index is in *failed_nights* is unfinished
+    and retries nothing; every other night folds a finished retry of each
+    date due. Returns the dates retried in order, every abandoned entry,
+    and the final backlog."""
     cursor = _d(1)
     catch_up = cursor + timedelta(days=missed)
     backlog = {}
@@ -929,13 +930,17 @@ def _simulate_missed_elapses(missed, *, nights):
     for night in range(nights):
         target = catch_up + timedelta(days=night)
         today = target + timedelta(days=1)
+        failed = night in failed_nights
         fold = _fold(
-            backlog, target_date=target, owes_retry=False, today=today,
-            never_run=trickle_state.never_run_dates(cursor, target_date=target),
+            backlog, target_date=target, owes_retry=failed, today=today,
+            never_run=trickle_state.never_run_dates(
+                cursor, target_date=target, today=today).owed,
         )
         cursor = target
         backlog = fold.backlog
         abandoned.update(fold.abandoned)
+        if failed:
+            continue
         for due in trickle_state.select_due_retries(backlog, today=today):
             fold = _fold(backlog, target_date=due, owes_retry=False,
                          today=today)
@@ -1029,13 +1034,33 @@ class TestRetryBacklogPolicy:
         self, last_scheduled, target_date
     ):
         assert trickle_state.never_run_dates(
-            last_scheduled, target_date=target_date) == ()
+            last_scheduled, target_date=target_date, today=_d(6),
+        ) == trickle_state.NeverRun(owed=(), expired=0)
 
     def test_the_never_run_dates_are_strictly_inside_the_gap_oldest_first(
         self,
     ):
         assert trickle_state.never_run_dates(
-            _d(1), target_date=_d(4)) == (_d(2), _d(3))
+            _d(1), target_date=_d(4), today=_d(5),
+        ) == trickle_state.NeverRun(owed=(_d(2), _d(3)), expired=0)
+
+    def test_a_gap_far_past_the_window_lists_only_its_in_window_dates(self):
+        today = _d(21)
+        oldest = today - timedelta(days=trickle_state.RETRY_MAX_AGE_DAYS)
+        hand_edited = date(2020, 1, 1)
+
+        gap = trickle_state.never_run_dates(
+            hand_edited, target_date=_d(20), today=today)
+
+        assert gap.owed == tuple(
+            oldest + timedelta(days=n) for n in range((_d(20) - oldest).days))
+        assert gap.expired == (oldest - date(2020, 1, 2)).days
+
+    def test_a_gap_wholly_past_the_window_lists_nothing(self):
+        gap = trickle_state.never_run_dates(
+            _d(1), target_date=_d(5), today=_d(30))
+
+        assert gap == trickle_state.NeverRun(owed=(), expired=3)
 
     def test_a_never_run_date_enters_with_zero_attempts(self):
         fold = _fold({}, target_date=_d(4), owes_retry=False, today=_d(5),
@@ -1166,6 +1191,24 @@ class TestRetryBacklogPolicy:
 
         assert retried == [_d(day) for day in range(2, missed + 1)]
         assert abandoned == {}
+        assert backlog == {}
+
+    def test_a_failed_night_after_the_catch_up_costs_the_oldest_owed_date(
+        self,
+    ):
+        """The full-recovery bound holds only when every later night
+        finishes: a failed night retries nothing, so the date it would have
+        retried ages out."""
+        missed = trickle_state.RETRY_MAX_AGE_DAYS
+        failed_target = _d(2 + missed)
+
+        retried, abandoned, backlog = _simulate_missed_elapses(
+            missed, nights=missed + 3, failed_nights={1})
+
+        assert abandoned == {_d(3): 0}
+        assert retried == [
+            _d(day) for day in range(2, missed + 1) if day != 3
+        ] + [failed_target]
         assert backlog == {}
 
     def test_a_poison_date_is_abandoned_after_the_attempt_bound(self):
@@ -1517,26 +1560,45 @@ class TestRecordRunScheduleCursor:
         assert doc['retry_backlog'] == {}
         assert doc['last_scheduled_target_date'] == '2026-07-04'
 
-    def test_a_gap_past_the_window_abandons_its_older_dates_with_a_warning(
-        self, caplog
-    ):
+    def test_a_gap_past_the_window_owes_its_in_window_dates_only(self):
         max_age = trickle_state.RETRY_MAX_AGE_DAYS
         last = 1 + max_age + 2
-        jumped = range(2, last)
         _record(day=1, scheduled=True)
 
-        with caplog.at_level('WARNING'):
-            doc = _record(day=last, scheduled=True)
+        doc = _record(day=last, scheduled=True)
 
-        in_window = [day for day in jumped if last - day <= max_age]
-        too_old = [day for day in jumped if last - day > max_age]
-        assert too_old
         assert doc['retry_backlog'] == {
-            _d(day).isoformat(): 0 for day in in_window
+            _d(day).isoformat(): 0 for day in range(last - max_age, last)
         }
-        for day in too_old:
-            abandoning = f'abandoning {_d(day).isoformat()}'
-            assert len(_warnings_naming(caplog, abandoning)) == 1
+
+    def test_a_gap_of_years_is_abandoned_with_one_summary_warning(
+        self, caplog
+    ):
+        doc = _record(day=1, scheduled=True)
+        _rewrite_state({**doc, 'last_scheduled_target_date': '2020-01-01'})
+        oldest_owed = _d(20) - timedelta(days=trickle_state.RETRY_MAX_AGE_DAYS)
+        expired = (oldest_owed - date(2020, 1, 2)).days
+
+        with caplog.at_level('WARNING'):
+            doc = _record(day=20, scheduled=True)
+
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert f'abandoning {expired} never-run date(s)' in message
+        assert '2020-01-02..2026-07-12' in message
+        assert min(doc['retry_backlog']) == oldest_owed.isoformat()
+        assert len(doc['retry_backlog']) == trickle_state.RETRY_MAX_AGE_DAYS
+
+    def test_a_scheduled_run_behind_the_cursor_never_moves_it_back(self):
+        _record(day=5, scheduled=True)
+
+        skewed = _record(day=3, scheduled=True)
+        next_night = _record(day=6, scheduled=True)
+
+        assert skewed['last_scheduled_target_date'] == '2026-07-05'
+        assert next_night['retry_backlog'] == {}
+        assert next_night['last_scheduled_target_date'] == '2026-07-06'
 
     def test_a_retry_leaves_the_cursor_untouched(self):
         _record(day=1, scheduled=True)

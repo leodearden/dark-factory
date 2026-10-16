@@ -430,11 +430,13 @@ RETRY_MAX_AGE_DAYS = 7
 """Age in days past which an owed target date is abandoned.
 
 At :data:`RETRIES_PER_NIGHT` retries per finished night, oldest first,
-every date of a k-night outage is retried at age k+1, so an outage of up
-to ``RETRY_MAX_AGE_DAYS - 1`` nights is fully recovered and a longer one
-loses only its oldest dates. A systemd outage of up to
-``RETRY_MAX_AGE_DAYS`` missed elapses is fully recovered, since its
-catch-up pass covers the last date itself. A module constant, not a
+every date of a k-night outage is retried at age k+1, so, when every
+later night finishes, an outage of up to ``RETRY_MAX_AGE_DAYS - 1``
+nights is fully recovered and a longer one loses only its oldest dates.
+On the same condition a systemd outage of up to ``RETRY_MAX_AGE_DAYS``
+missed elapses is fully recovered, since its catch-up pass covers the
+last date itself. Each later night that does not finish retries nothing,
+so it costs the oldest owed date. A module constant, not a
 ``legibility.yaml`` field, for the same bare-``python3`` reason as
 :data:`DEFAULT_MAX_BARREN_RUNS`."""
 
@@ -455,6 +457,15 @@ class RetryFold(NamedTuple):
 
     backlog: dict[date, int]
     abandoned: dict[date, int]
+
+
+class NeverRun(NamedTuple):
+    """The target dates a scheduled pass jumped over: the ``owed`` ones
+    still inside the age window, oldest first, and how many older ones
+    ``expired`` before any pass could run them."""
+
+    owed: tuple[date, ...]
+    expired: int
 
 
 def finished(*, exit_code: int, capped: bool) -> bool:
@@ -497,20 +508,31 @@ def _is_attempt_count(raw: object) -> bool:
     return isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0
 
 
+def _oldest_in_window(today: date) -> date:
+    return today - timedelta(days=RETRY_MAX_AGE_DAYS)
+
+
 def _within_window(owed: date, today: date) -> bool:
-    return (today - owed).days <= RETRY_MAX_AGE_DAYS
+    return owed >= _oldest_in_window(today)
 
 
 def never_run_dates(
-    last_scheduled: date | None, *, target_date: date
-) -> tuple[date, ...]:
+    last_scheduled: date | None, *, target_date: date, today: date
+) -> NeverRun:
     """The target dates no scheduled pass ran: strictly after the last
-    scheduled pass's target, strictly before this one's, oldest first."""
+    scheduled pass's target and strictly before this one's. Only those
+    inside the age window on *today* are listed; older ones would be
+    abandoned on arrival, so they are counted, never listed."""
     if last_scheduled is None:
-        return ()
-    return tuple(
-        last_scheduled + timedelta(days=n)
-        for n in range(1, (target_date - last_scheduled).days)
+        return NeverRun(owed=(), expired=0)
+    gap_start = last_scheduled + timedelta(days=1)
+    owed_start = min(max(gap_start, _oldest_in_window(today)), target_date)
+    return NeverRun(
+        owed=tuple(
+            owed_start + timedelta(days=n)
+            for n in range((target_date - owed_start).days)
+        ),
+        expired=max(0, (owed_start - gap_start).days),
     )
 
 
@@ -600,10 +622,11 @@ def record_run(
     :func:`fold_retry_backlog`, so a date whose pass did not finish stays
     owed a run.
 
-    A *scheduled* pass records its target as ``last_scheduled_target_date``
-    and owes, with 0 attempts, the :func:`never_run_dates` since the
-    previous scheduled pass. A manual pass neither moves that cursor nor
-    owes them, because it rewrites ``target_date`` (the backfill case).
+    A *scheduled* pass advances ``last_scheduled_target_date`` to its
+    target, never backwards, and owes, with 0 attempts, the
+    :func:`never_run_dates` since the previous scheduled pass. A manual
+    pass neither moves that cursor nor owes them, because it rewrites
+    ``target_date`` (the backfill case).
 
     ``recorded_at`` is an INJECTED parameter, not a ``datetime.now()``
     inside this function, so the whole module stays clock-injectable and
@@ -688,7 +711,11 @@ def record_run(
         last_productive_at = recorded_at_iso
 
     cursor, never_run = _schedule_cursor(
-        prev, target_date=target_date, scheduled=scheduled
+        project_id,
+        prev,
+        target_date=target_date,
+        today=recorded_at.date(),
+        scheduled=scheduled,
     )
 
     doc = {
@@ -737,7 +764,12 @@ def record_run(
 
 
 def _schedule_cursor(
-    prev: dict | None, *, target_date: date, scheduled: bool
+    project_id: str,
+    prev: dict | None,
+    *,
+    target_date: date,
+    today: date,
+    scheduled: bool,
 ) -> tuple[date | None, tuple[date, ...]]:
     """The schedule cursor to record, and the never-run dates this pass owes."""
     prev_cursor = (
@@ -746,7 +778,28 @@ def _schedule_cursor(
     )
     if not scheduled:
         return prev_cursor, ()
-    return target_date, never_run_dates(prev_cursor, target_date=target_date)
+    if prev_cursor is None:
+        return target_date, ()
+    gap = never_run_dates(prev_cursor, target_date=target_date, today=today)
+    if gap.expired:
+        _warn_expired_never_run(project_id, prev_cursor, gap.expired)
+    return max(prev_cursor, target_date), gap.owed
+
+
+def _warn_expired_never_run(
+    project_id: str, last_scheduled: date, expired: int
+) -> None:
+    first = last_scheduled + timedelta(days=1)
+    logger.warning(
+        'trickle retry backlog: abandoning %d never-run date(s) %s..%s for '
+        'project=%s, already past the %d-day window — their sightings are '
+        'permanently lost to the trickle',
+        expired,
+        first.isoformat(),
+        (first + timedelta(days=expired - 1)).isoformat(),
+        project_id,
+        RETRY_MAX_AGE_DAYS,
+    )
 
 
 def record_retry(
