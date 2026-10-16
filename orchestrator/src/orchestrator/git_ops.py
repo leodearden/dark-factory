@@ -105,7 +105,7 @@ from orchestrator.verify_cancel import (
     remove_lock_holder_pgid,
     write_lock_holder_pgid,
 )
-from orchestrator.verify_classify import _ENOSPC_MARKERS
+from orchestrator.verify_classify import reports_disk_full
 from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus
 from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -252,11 +252,6 @@ _INDEX_LOCK_STALE_FLOOR_S = 300.0
 # that RETRY one, via git_ops.py::GitOps._worktree_add_with_retry.
 _WORKTREE_ADD_MAX_ATTEMPTS = 3
 
-# `_ENOSPC_MARKERS` is imported from verify_classify (see the import block
-# above) rather than re-declared here; extend that constant when a new
-# grounded ENOSPC sample appears. merge_queue.py::_ENOSPC_MARKERS is still a
-# separate verbatim copy — consolidating all three is not this module's call.
-
 
 def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
     """Is a failed ``git worktree add`` worth retrying?
@@ -273,8 +268,7 @@ def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
     ENOSPC is the counter-case: a full disk does not heal in 1.5s of
     backoff, so retrying there only delays the operator signal.
     """
-    haystack = f'{out}\n{err}'.lower()
-    return not any(marker in haystack for marker in _ENOSPC_MARKERS)
+    return not reports_disk_full(f'{out}\n{err}')
 
 
 class MergeParkError(Exception):

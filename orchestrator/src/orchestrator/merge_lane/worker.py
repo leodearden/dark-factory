@@ -201,6 +201,7 @@ from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
+from orchestrator.verify_classify import reports_disk_full
 from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
@@ -589,27 +590,19 @@ Shared by ``SpeculativeMergeWorker._finalize_inflight`` and
 halt-triggering results ever changes, this one constant updates both."""
 
 
-_ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
-"""Substrings (matched case-insensitively) that mark a disk-full failure.
-There is no structured ENOSPC field on ``VerifyResult`` — the signal only
-appears in captured tool output — so detection is a string match."""
-
-
 def _verify_hit_enospc(verify: VerifyResult) -> bool:
     """True when a failed ``VerifyResult`` bears a disk-full signature.
 
     Scans the human-readable failure report and each captured output stream
-    (test/lint/type) for any ``_ENOSPC_MARKERS`` entry.
+    (test/lint/type) with ``verify_classify.py::reports_disk_full``.
     """
-    haystack = ' '.join(
-        s for s in (
-            verify.failure_report(),
-            verify.test_output,
-            verify.lint_output,
-            verify.type_output,
-        ) if isinstance(s, str)
-    ).lower()
-    return any(marker in haystack for marker in _ENOSPC_MARKERS)
+    streams = (
+        verify.failure_report(),
+        verify.test_output,
+        verify.lint_output,
+        verify.type_output,
+    )
+    return reports_disk_full(' '.join(filter(lambda s: isinstance(s, str), streams)))
 
 
 _SPECULATION_RACE_MARKER = 'not something we can merge'
@@ -626,8 +619,7 @@ def _is_speculation_race(stderr: str) -> bool:
     """True when *stderr* from a failed merge contains the speculation-race signature.
 
     Uses a load-bearing exact substring match against ``_SPECULATION_RACE_MARKER``
-    (the git porcelain phrase ``not something we can merge``).  Mirrors the
-    ``_verify_hit_enospc`` / ``_ENOSPC_MARKERS`` pattern.
+    (the git porcelain phrase ``not something we can merge``).
     """
     return _SPECULATION_RACE_MARKER in stderr
 

@@ -176,12 +176,23 @@ _TREE_SITTER_GENERATE_RE = re.compile(r'tree-sitter generate', re.MULTILINE)
 # does not apply here.
 # ---------------------------------------------------------------------------
 
-# ENOSPC markers reused VERBATIM from merge_queue._ENOSPC_MARKERS (single
-# grounded vocabulary shared with merge_queue's _verify_hit_enospc and
-# git_ops's disk-pressure detection) — do not invent new ENOSPC strings;
-# extend that constant instead if a new grounded sample appears. Matched
-# case-insensitively against the whole output, same as _verify_hit_enospc.
-_ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
+# The OS's own ENOSPC renderings: the strerror (Python, git, bash, ld, Node)
+# and Rust's "(os error 28)" suffix. A bare ENOSPC token is how tests, ids and
+# log lines NAME the condition, so it is not evidence (task 7032).
+_DISK_FULL_OS_ERROR_MARKERS = ('no space left on device', 'os error 28')
+
+
+def reports_disk_full(text: str) -> bool:
+    """Does *text* carry an OS error report of a full disk (ENOSPC)?
+
+    The one disk-full text predicate, shared by ``_classify_environmental``,
+    ``git_ops.py::_worktree_add_failure_is_retryable`` and
+    ``merge_lane/worker.py::_verify_hit_enospc``. Known residual: a failing
+    test whose own message quotes the full phrase still reads as disk-full.
+    """
+    folded = text.casefold()
+    return any(marker in folded for marker in _DISK_FULL_OS_ERROR_MARKERS)
+
 
 # Linker SIGBUS-on-full-disk (git_ops.py: "proceeding into an ENOSPC build
 # that SIGBUSes the linker") — a real secondary disk-full mode where the
@@ -975,8 +986,7 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     #      stays load-bearing; scoping changes WHICH TEXT each arm reads,
     #      never the order they are tried in.
     scoped = _redact_passed_suite_blocks(output)
-    lower = scoped.lower()
-    if any(marker in lower for marker in _ENOSPC_MARKERS):
+    if reports_disk_full(scoped):
         return FailureCategory.DISK_FULL
     if _LINKER_CONTEXT_RE.search(scoped) and _LINKER_SIGNAL_RE.search(scoped):
         return FailureCategory.DISK_FULL

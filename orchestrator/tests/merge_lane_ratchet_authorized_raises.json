@@ -3289,6 +3289,30 @@
           "current": 31943
         }
       ]
+    },
+    {
+      "task_id": "7032",
+      "reason": "Net-additive test hermeticity guard: conftest's autouse _hermetic_disk_usage fixture (the whole raise) installs _orch_helpers.py::ample_disk_usage as shutil.disk_usage, so no orchestrator test reads the host's free disk through the 10 GiB pre-verify guard. With the disk faked at 9.99 GiB, 163 tests failed on main and 0 fail with the fixture (esc-5509-2). The same task's ENOSPC change lowers worker.py and git_ops.py.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1257,
+          "current": 1270
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 783,
+          "current": 790
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31943,
+          "current": 31945
+        }
+      ]
     }
   ]
 }

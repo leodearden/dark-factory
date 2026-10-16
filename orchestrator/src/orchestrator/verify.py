@@ -120,7 +120,8 @@ _suppressed_flake_records: list[dict] = []
 
 #: Errno values that indicate a transient infrastructure failure (disk
 #: pressure, quota, read-only fs, I/O error, fd exhaustion).  Mirrors the
-#: set used in merge_queue._ENOSPC_MARKERS and git_ops.WarmLaneDiskPressure.
+#: set used in git_ops.WarmLaneDiskPressure; disk-full detection in tool
+#: OUTPUT is verify_classify.py::reports_disk_full.
 _INFRA_ERRNOS: frozenset[int] = frozenset({
     errno.ENOSPC,   # No space left on device
     errno.EDQUOT,   # Quota exceeded
