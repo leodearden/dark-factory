@@ -21,10 +21,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeClock, FakeVerifier
+from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
@@ -1220,4 +1222,57 @@ class TestAutoHealConcurrentSameSignature:
         )
         assert not call_kwargs_b.get('escalate_to_human'), (
             f'Task B must NOT set escalate_to_human (indicates wrong branch); got {call_kwargs_b}'
+        )
+
+
+class TestAutoHealHaltOwnerSurvivesOwnBlock:
+    def test_halt_owner_is_l1_and_survives_mark_blocked(self, tmp_path: Path) -> None:
+        """The halt owner must outlive the _mark_blocked call that blocks its task.
+
+        Filed at L0, it did not: the happy path registers the halt owner and
+        then calls _mark_blocked(skip_escalation=True), which dismisses every
+        pending L0 for the task, once in its skip_escalation cleanup and again
+        in its orphan-L0 fall-through.  In production that dismissal reaches
+        harness.py::Harness._on_escalation_resolved, where is_halt_owner ->
+        unhalt_wip() releases the normal-lane halt while main is still red.
+        """
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt-survives'
+        worktree.mkdir()
+        outcome = _make_compile_error_outcome()
+
+        workflow = _make_workflow(config, worktree)
+        workflow.merge_queue = asyncio.Queue()
+        workflow.scheduler.update_task = AsyncMock()
+        real_lane = MergeLane(
+            git_ops=_make_mock_git_ops(tmp_path), queue=asyncio.Queue(),
+            verifier=FakeVerifier(), clock=FakeClock(),
+        )
+        workflow.merge_worker = real_lane
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        workflow.escalation_queue = escalation_queue
+
+        async def _fake_post_submit(arguments_list: list[dict]) -> None:
+            return None
+
+        workflow._post_submit_tasks = _fake_post_submit  # type: ignore[method-assign]
+
+        asyncio.run(workflow._auto_heal_main_health(outcome, merge_phase=True))
+
+        main_breaks = [
+            esc for esc in escalation_queue.get_pending()
+            if esc.category == 'preexisting_main_break'
+        ]
+        assert len(main_breaks) == 1, (
+            f'Expected the halt owner to survive the block; pending: '
+            f'{escalation_queue.get_pending()}'
+        )
+        esc = main_breaks[0]
+        assert esc.level == 1, f'Expected level 1; got {esc.level}'
+        assert esc.suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'Expected the in-flight auto-heal action; got {esc.suggested_action!r}'
+        )
+        assert real_lane.lane_owned_by(esc.id) == 'normal', (
+            f'{esc.id!r} must own the normal-lane halt; got '
+            f'{real_lane.lane_owned_by(esc.id)!r}'
         )
