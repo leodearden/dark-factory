@@ -724,7 +724,7 @@ class PassKind(Enum):
     - ``SCHEDULED``: the timer's nightly pass; it advances the schedule
       cursor and owes the dates it jumped over.
     - ``RETRY``: a backlog retry.
-    - ``MANUAL``: an operator's ``--date`` pass, or any direct call.
+    - ``MANUAL``: an operator's ``--date`` pass.
     """
 
     SCHEDULED = 'scheduled'
@@ -1295,7 +1295,7 @@ def run_nightly(
     committer=None,
     recorder=None,
     retry_recorder=None,
-    pass_kind: PassKind = PassKind.MANUAL,
+    pass_kind: PassKind,
 ) -> NightlyResult:
     """Run one full nightly trickle pass for a single project (PRD §5.5).
 
@@ -1342,10 +1342,11 @@ def run_nightly(
     :func:`trickle_state.record_retry`, which rewrites only the backlog) is
     the same seam for a retry pass.
 
-    *pass_kind* (:class:`PassKind`) defaults to ``MANUAL``. A ``RETRY``
-    pass, run by :func:`run_scheduled_night` after the ``SCHEDULED`` one,
-    skips sessions the session ledger already holds, never evaluates the
-    census trigger, and records through *retry_recorder*.
+    *pass_kind* (:class:`PassKind`) has no default: it decides whether the
+    pass moves the schedule cursor. A ``RETRY`` pass, run by
+    :func:`run_scheduled_night` after the ``SCHEDULED`` one, skips sessions
+    the session ledger already holds, never evaluates the census trigger,
+    and records through *retry_recorder*.
 
     Happy-path wiring only in this step: inventory+sample -> digest ->
     code -> merge -> docs-only commit (only when the merge actually

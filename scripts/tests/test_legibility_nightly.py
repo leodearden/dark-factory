@@ -713,6 +713,7 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=None,
         poster=lambda url, envelope: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert seen['select'] is not None, 'run_nightly passed no render cache to costing'
@@ -1511,6 +1512,7 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=lambda: {'statuses': {}},
         poster=lambda url, envelope: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert len(calls) == 1
@@ -1571,6 +1573,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
         invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
         status_fetcher=lambda: {'statuses': {}},
         poster=lambda url, envelope: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.census_fire is True
@@ -1653,6 +1656,7 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             target_date=date(2026, 7, 13),
             invoke=lambda prompt, model: '{"proposals": []}',
             poster=lambda url, envelope: None,
+            pass_kind=nightly.PassKind.MANUAL,
             **kwargs,
         )
         return load_config(config_path)
@@ -1804,6 +1808,7 @@ def _run_one_digest_night(tmp_path, **kwargs):
     poster, escalations = _capture_poster()
     kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
     kwargs.setdefault('poster', poster)
+    kwargs.setdefault('pass_kind', nightly.PassKind.MANUAL)
     result = nightly.run_nightly(
         config_path=config_path,
         projects_root=projects_root,
@@ -2243,6 +2248,7 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         invoke=_fake_invoke_known_cause,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -2282,6 +2288,7 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         invoke=_fake_invoke_known_cause,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result_2.exit_code == 0
@@ -2339,6 +2346,7 @@ def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplo
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -2374,6 +2382,7 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -2450,6 +2459,7 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     # Exit code stays 0 ON PURPOSE: a non-zero exit would flip
@@ -2531,6 +2541,7 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -2669,6 +2680,7 @@ def test_run_nightly_capped_leaves_the_codebook_byte_identical(tmp_path):
         invoke=_fake_invoke_capped,
         status_fetcher=None,
         poster=lambda url, envelope: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -2737,6 +2749,7 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         invoke=_fake_invoke_unparseable,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code != 0
@@ -2803,6 +2816,7 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
         committer=_failing_committer,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code != 0
@@ -2921,6 +2935,7 @@ def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     result = _run()
@@ -3003,6 +3018,7 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, 
         invoke=_fake_invoke_deletion_directive,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3081,6 +3097,7 @@ def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_
         invoke=_fake_invoke_deletion_then_match,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert len(invocations) == 2, 'both sessions must reach the coder'
@@ -3144,6 +3161,7 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
         invoke=_fake_invoke_deletion_directive,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3189,6 +3207,7 @@ def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
         invoke=_fake_invoke_deletion_directive,
         status_fetcher=None,
         poster=_dead_poster,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3281,6 +3300,7 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         invoke=_fake_invoke_rejected_candidate,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3312,6 +3332,7 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         invoke=_fake_invoke_rejected_candidate,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result_2.exit_code == 0
@@ -3363,6 +3384,7 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
         invoke=_fake_invoke_empty,
         status_fetcher=None,
         poster=lambda url, envelope: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3414,6 +3436,7 @@ def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
             invoke=_fake_invoke_empty,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -3487,6 +3510,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         invoke=_unexpected_invoke,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code != 0
@@ -3816,7 +3840,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
                      transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
                      invariants_doc: str | None = None,
-                     unreadable_transcripts: bool = False, pass_kind=None):
+                     unreadable_transcripts: bool = False,
+                     pass_kind=nightly.PassKind.MANUAL):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3845,8 +3870,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     is committed as the project's design-invariants doc, and
     *recorder* / *committer* / *poster* / *invoke* are the injected seams
     (*poster* defaults to a no-op, so a test that does not care about
-    escalations never has to build one), and *pass_kind*, when given, is
-    passed through. *unreadable_transcripts* is the
+    escalations never has to build one), and *pass_kind* (default
+    ``MANUAL``) is passed through. *unreadable_transcripts* is the
     exception: it strips every permission bit from the projects root for the
     run, so enumerating the transcripts raises inside sampling.
     """
@@ -3884,13 +3909,12 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         invoke=invoke,
         status_fetcher=None,
         poster=poster if poster is not None else (lambda url, envelope: None),
+        pass_kind=pass_kind,
     )
     if recorder is not None:
         kwargs['recorder'] = recorder
     if committer is not None:
         kwargs['committer'] = committer
-    if pass_kind is not None:
-        kwargs['pass_kind'] = pass_kind
 
     if branch == 'extractor':
         assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
@@ -4119,6 +4143,7 @@ class TestRunNightlyRecordsTrickleState:
             nightly.run_nightly(
                 project_id='testproj', target_date=date(2026, 7, 13),
                 now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+                pass_kind=nightly.PassKind.MANUAL,
             )
 
         doc = _one_recorded(calls)
@@ -4137,6 +4162,7 @@ class TestRunNightlyRecordsTrickleState:
             nightly.run_nightly(
                 config_path=config_path, target_date=date(2026, 7, 13),
                 now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+                pass_kind=nightly.PassKind.MANUAL,
             )
 
         assert calls == []
@@ -4297,6 +4323,7 @@ class _NightRunner:
         self._prepare(day, kind)
         return nightly.run_nightly(
             **self._pass_kwargs(day, on_night=day, invoke=invoke or self._coder(kind)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     def scheduled_night(self, day, kind, *, retry_recorder=None):
@@ -4622,6 +4649,7 @@ class TestScheduledPassRetryBacklog:
             nightly.run_nightly(
                 project_id='testproj', target_date=date(2026, 7, 13),
                 now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+                pass_kind=nightly.PassKind.MANUAL,
             )
 
         assert _testproj_state()['retry_backlog'] == {'2026-07-13': 1}
@@ -4966,6 +4994,19 @@ class TestRunScheduledNight:
         assert len(calls) == 1
         assert calls[0]['target_date'] == date(2026, 7, 13)
         assert calls[0]['pass_kind'] is nightly.PassKind.MANUAL
+
+    def test_run_nightly_refuses_a_pass_of_unstated_kind(self, tmp_path):
+        """The kind decides whether the schedule cursor moves, so no caller
+        may get one by omission."""
+        with pytest.raises(TypeError, match='pass_kind'):
+            nightly.run_nightly(
+                config_path=_write_config(tmp_path, project_id='proj_a'),
+                projects_root=tmp_path / 'projects',
+                target_date=date(2026, 7, 13),
+                invoke=lambda prompt, model: '{"proposals": []}',
+                status_fetcher=lambda: {'statuses': {}},
+                poster=lambda url, envelope: None,
+            )
 
     def test_a_scheduled_pass_that_raises_propagates_and_runs_no_retry(self, monkeypatch):
         fake, calls = _scripted_run_nightly(FileNotFoundError('no legibility.yaml'))
@@ -5741,6 +5782,7 @@ def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog)
             invoke=_fake_invoke_deletion_directive,
             status_fetcher=None,
             poster=lambda url, env: escalations.append((url, env)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
