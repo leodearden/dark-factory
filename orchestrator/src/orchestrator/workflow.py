@@ -2843,24 +2843,19 @@ class TaskWorkflow:
             if self._should_run_simple_task():
                 self._enter_phase(WorkflowState.PLAN)
                 simple_outcome = await self._run_simple_task()
-                if simple_outcome == WorkflowOutcome.PLANNED:
-                    # Plan written + step(s) marked done by SIMPLE_TASK.
-                    # _execute_iterations will see no pending steps and
-                    # return cleanly, allowing VERIFY to take over.
-                    pass  # fall through to the post-PLAN section below
-                elif simple_outcome != WorkflowOutcome.REQUEUED:
-                    # An exit handler's verdict (DONE, BLOCKED, ESCALATED,
-                    # CANCELLED) ends this dispatch.
-                    return simple_outcome
-                else:
-                    # Fallthrough sentinel — drop the plan so the
-                    # architect path runs cleanly.
+                if simple_outcome is None:
+                    # SIMPLE_TASK gave up — drop the plan so the architect
+                    # path runs cleanly.
                     if self.artifacts is not None:
                         plan_path = self.artifacts.root / 'plan.json'
                         plan_path.unlink(missing_ok=True)
                         (self.artifacts.root / 'plan.lock').unlink(
                             missing_ok=True,
                         )
+                elif simple_outcome != WorkflowOutcome.PLANNED:
+                    # Any other verdict, REQUEUED included, already settled
+                    # this dispatch and ends it.
+                    return simple_outcome
 
             # PLAN (skip if initial_plan was provided — eval mode, or if
             # the SIMPLE_TASK path above already populated self.plan)
@@ -5701,7 +5696,7 @@ class TaskWorkflow:
             and not RoutingState.from_metadata(metadata).simple_saturated
         )
 
-    async def _run_simple_task(self) -> WorkflowOutcome:
+    async def _run_simple_task(self) -> WorkflowOutcome | None:
         """Lever C — single-agent simple-task path.
 
         Dispatches the SIMPLE_TASK role (sonnet) to explore, register a
@@ -5714,8 +5709,9 @@ class TaskWorkflow:
                 invoking the implementer.
             ``DONE`` — SIMPLE_TASK reported the work is already on main.
             ``BLOCKED`` — SIMPLE_TASK reported the task is unactionable.
-            ``REQUEUED`` (sentinel) — SIMPLE_TASK gave up partway; caller
-                falls through to the architect path.
+            An exit handler may also return ``REQUEUED`` or another verdict.
+            ``None`` — SIMPLE_TASK gave up partway; the caller drops the plan
+                and falls through to the architect path.
         """
         assert self.worktree is not None and self.artifacts is not None
 
@@ -5732,7 +5728,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id, exc,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         if not result.success:
             cls = classify_agent_failure(result)
@@ -5750,7 +5746,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id, cls.kind.value,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Architect-style escape hatches — same artifacts so the existing
         # handlers work unchanged.
@@ -5765,7 +5761,7 @@ class TaskWorkflow:
             # Falling through — the architect path's
             # _handle_blocking_dep_report logic re-acquires base_commit
             # context and registers the dependency cleanly.
-            return WorkflowOutcome.REQUEUED
+            return None
 
         plan = self.artifacts.read_plan()
         if not plan or not plan.get('steps'):
@@ -5773,7 +5769,7 @@ class TaskWorkflow:
                 'Task %s: SIMPLE_TASK wrote no plan — falling through',
                 self.task_id,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Verify at least one step is done — the SIMPLE_TASK contract is
         # plan + implement + mark-done. Anything less and we let the
@@ -5790,7 +5786,7 @@ class TaskWorkflow:
                 'falling through to architect path',
                 self.task_id,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
 
         # Stamp provenance + acquire plan lock (same shape as _plan()).
         try:
@@ -5801,7 +5797,7 @@ class TaskWorkflow:
                 'falling through',
                 self.task_id, exc,
             )
-            return WorkflowOutcome.REQUEUED
+            return None
         self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
