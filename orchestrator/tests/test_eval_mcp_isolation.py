@@ -281,9 +281,9 @@ async def _invoke_probe(tmp_path: Path, role: AgentRole, *, strict: bool) -> dic
     cwd = (await git_ops.create_worktree(assignment.task_id)).path
     workflow = TaskWorkflow(
         assignment=assignment, config=config, git_ops=git_ops,
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=_FalsyMcpStub(),  # type: ignore[arg-type]
+        scheduler=FakeScheduler(),
+        briefing=FakeBriefing(),
+        mcp=_FalsyMcpStub(),
     )
     workflow.artifacts = None
 
