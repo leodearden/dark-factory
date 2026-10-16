@@ -3920,6 +3920,16 @@ class OrchestratorConfig(BaseSettings):
         description='Deprecated — set max_turns.simple_task instead.',
     )
 
+    strict_mcp_config: bool = Field(
+        default=False,
+        description=(
+            'Scope every TaskWorkflow agent invocation to ONLY the orchestrator-built '
+            'mcp_config (--strict-mcp-config), ignoring the ambient project .mcp.json. '
+            'False in production (argv unchanged); EVAL_PROFILE sets it True so an eval '
+            'agent cannot reach live escalation / task DB / fused-memory (task 4757).'
+        ),
+    )
+
     # Auto-eval — when the optimistic path (B-skip or C-simple) blocks at
     # plan/execute/verify/review, automatically rerun the same task from the
     # same branchpoint via the full architect path. The original branch and

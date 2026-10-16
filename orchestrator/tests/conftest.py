@@ -1251,4 +1251,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
+    # read a truthy Mock and run every mock-config workflow test strictly scoped.
+    config.strict_mcp_config = False
     return config

@@ -970,6 +970,7 @@ class AgentStub:
         working_idle_secs: float | None = None,
         absolute_cap_secs: float | None = None,
         prices: dict[str, Any] | None = None,
+        strict_mcp_config: bool = False,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
