@@ -10181,7 +10181,13 @@ def create_mcp_server(
                 change this behavior.  ``allow_mcp_markup=True`` bypasses the
                 MCP-markup boundary guard for deliberately quoted markup; it is
                 write-time-only and stripped before the merge, so it is never
-                persisted.
+                persisted. It must be a JSON object: a dict, or a JSON string
+                encoding one. Anything else is refused in every
+                ``metadata_mode`` and nothing is written: unparseable text, or
+                a JSON string encoding a string, number or boolean, returns
+                ``error == 'metadata_not_an_object'``; an array (or a string
+                encoding one) fails argument validation before the tool runs,
+                and ``'null'`` reads as an omitted ``metadata``.
             metadata_mode: Controls how ``metadata`` is merged with the existing
                 blob. One of:
                 - ``'merge'`` (default when omitted) — shallow last-write-wins.
