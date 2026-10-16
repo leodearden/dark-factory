@@ -10,24 +10,33 @@ the CLI.  ``plans/inv12-exceptions-owned-or-ratified-prd.md`` D11, Contract
 
 from __future__ import annotations
 
+import datetime
+import json
+import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 
 import exception_register
 import pytest
+from _task_db_scan import tasks_db_path
 from exception_owner_sweep import (
     FINDING_KEY_FIELD,
     INLINE_SCOPE,
     OVERFLOW_KEY,
     OWNS_NOTE_FIELD,
     TIGHTEN_KEY,
+    ActOutcome,
     Citation,
     FailureStage,
     FindingKey,
     FindingKind,
+    Ports,
     RegisterView,
     SweepFailure,
+    act,
     parse_register,
     read_register,
+    scan,
 )
 from inline_suppression_fixtures import RUFF_CONFIG, track_fixture_tree
 from shared.governed_exceptions import (
@@ -275,3 +284,281 @@ def test_a_failing_register_is_a_register_failure(tmp_path: Path):
     with pytest.raises(SweepFailure) as excinfo:
         read_register(root, tmp_path / 'absent.json')
     assert excinfo.value.stage is FailureStage.REGISTER
+
+
+# ---------------------------------------------------------------------------
+# The scan/act harness: a real temp tasks.db and an in-process StubMcp.
+
+NOW = datetime.datetime(2026, 10, 17, 6, 0, tzinfo=datetime.UTC)
+
+#: Where the stub's curator inserts the tasks it creates: clear of every seeded id.
+FIRST_CREATED_ID = 9001
+
+
+class StubMcp:
+    """Both MCP servers, in process, at the sweep's ToolCall port signature.
+
+    Records every call as ``(server, tool, args)``.  On the fused-memory side it
+    plays the curator: a submitted candidate resolves per ``submit_outcome``,
+    and a created task is INSERTED into the temp store with the submitted
+    metadata.  The stub writes; the sweep only reads.
+    """
+
+    def __init__(
+        self,
+        db: Path,
+        *,
+        owner_tickets: Mapping[str, dict] | None = None,
+        submit_outcome: str = 'created',
+        combine_into: int | None = None,
+        fail_on: frozenset[str] = frozenset(),
+    ) -> None:
+        self.db = db
+        self.owner_tickets = dict(owner_tickets or {})
+        self.submit_outcome = submit_outcome
+        self.combine_into = combine_into
+        self.fail_on = fail_on
+        self.calls: list[tuple[str, str, dict]] = []
+        self.pending: list[dict] = []
+        self.submitted: dict[str, dict] = {}
+        self.next_task_id = FIRST_CREATED_ID
+
+    def tool_calls(self, tool: str) -> list[dict]:
+        return [args for _, called, args in self.calls if called == tool]
+
+    def _record(self, server: str, tool: str, args: Mapping[str, object]) -> None:
+        self.calls.append((server, tool, dict(args)))
+        if tool in self.fail_on:
+            raise ConnectionError(f'{tool}: connection refused')
+
+    def fused_memory(self, tool: str, args: Mapping[str, object]) -> Mapping[str, object]:
+        self._record('fused-memory', tool, args)
+        if tool == 'submit_task':
+            if self.submit_outcome == 'error':
+                return {'error': 'curator queue closed', 'error_type': 'RuntimeError'}
+            ticket = f'tkt_S{len(self.submitted) + 1}'
+            self.submitted[ticket] = dict(args)
+            return {'ticket': ticket}
+        if tool == 'resolve_ticket':
+            ticket = str(args['ticket'])
+            if ticket in self.owner_tickets:
+                return self.owner_tickets[ticket]
+            return self._resolve_submitted(self.submitted[ticket])
+        if tool == 'update_task':
+            return self._update(int(str(args['id'])), args['metadata'])
+        raise AssertionError(f'unexpected fused-memory tool {tool}')
+
+    def _resolve_submitted(self, args: dict) -> dict:
+        if self.submit_outcome == 'created':
+            task_id = self.next_task_id
+            self.next_task_id += 1
+            with sqlite3.connect(self.db) as conn:
+                conn.execute(
+                    "INSERT INTO tasks (tag, id, title, status, metadata, updated_at) "
+                    "VALUES ('master', ?, ?, 'pending', ?, '2026-10-17T06:00:00+00:00')",
+                    (task_id, args['title'], json.dumps(args['metadata'])),
+                )
+            return {'status': 'created', 'task_id': str(task_id)}
+        if self.submit_outcome == 'combined':
+            return {'status': 'combined', 'task_id': str(self.combine_into)}
+        if self.submit_outcome == 'refused':
+            return {'status': 'refused', 'reason': 'premise_cancelled'}
+        if self.submit_outcome == 'pending':
+            return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
+        raise AssertionError(f'unexpected submit_outcome {self.submit_outcome}')
+
+    def _update(self, task_id: int, metadata: object) -> dict:
+        assert isinstance(metadata, dict)
+        with sqlite3.connect(self.db) as conn:
+            (raw,) = conn.execute(
+                "SELECT metadata FROM tasks WHERE tag = 'master' AND id = ?", (task_id,)
+            ).fetchone()
+            merged = {**json.loads(raw or '{}'), **metadata}
+            conn.execute(
+                "UPDATE tasks SET metadata = ? WHERE tag = 'master' AND id = ?",
+                (json.dumps(merged), task_id),
+            )
+        return {'id': task_id, 'updated': True}
+
+    def escalation(self, tool: str, args: Mapping[str, object]) -> Mapping[str, object]:
+        self._record('escalation', tool, args)
+        if tool == 'get_pending_escalations':
+            return {'result': [{'task_id': entry['task_id']} for entry in self.pending]}
+        if tool == 'escalate_info':
+            self.pending.append(dict(args))
+            return {'id': f'esc-{len(self.pending)}', 'status': 'queued', 'level': 0}
+        raise AssertionError(f'unexpected escalation tool {tool}')
+
+
+@pytest.fixture
+def project_root(tmp_path: Path) -> Path:
+    root = tmp_path / 'proj'
+    (root / '.taskmaster' / 'tasks').mkdir(parents=True)
+    return root
+
+
+@pytest.fixture
+def seed(make_tasks_db, project_root: Path):
+    """Seed the project's tasks.db with *rows*; return its path."""
+
+    def _seed(rows: list[dict]) -> Path:
+        return make_tasks_db(rows, directory=project_root / '.taskmaster' / 'tasks')
+
+    return _seed
+
+
+def ports_for(project_root: Path, stub: StubMcp) -> Ports:
+    return Ports(
+        project_root=project_root,
+        db=tasks_db_path(project_root),
+        fused_memory=stub.fused_memory,
+        escalation=stub.escalation,
+    )
+
+
+def sweep_once(register: RegisterView, ports: Ports) -> ActOutcome:
+    return act(scan(register, ports, now=NOW), ports, now=NOW)
+
+
+def view(*citations: Citation, slack_total: int = 0) -> RegisterView:
+    return RegisterView(citations=citations, slack_total=slack_total)
+
+
+def set_status(db: Path, task_id: int, status: str) -> None:
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE tag = 'master' AND id = ?", (status, task_id))
+
+
+LIST_SCOPE = 'pkg.mod.LIST'
+
+
+def test_scenario_16_a_dead_owner_is_filed_or_escalated_once_by_scope(project_root, seed):
+    db = seed([{'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    register = view(
+        Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',)),
+        Citation(LIST_SCOPE, TaskRef(2733), ('default',)),
+    )
+
+    first = sweep_once(register, ports)
+
+    (submitted,) = stub.tool_calls('submit_task')
+    inline_key = FindingKey(FindingKind.DEAD_OWNER, INLINE_SCOPE, TaskRef(2733))
+    assert submitted['metadata'][FINDING_KEY_FIELD] == inline_key.record()
+    assert 'planning_mode' not in submitted
+    assert len(stub.tool_calls('resolve_ticket')) == 1
+    (escalated,) = stub.tool_calls('escalate_info')
+    list_key = FindingKey(FindingKind.DEAD_OWNER, LIST_SCOPE, TaskRef(2733))
+    assert escalated['task_id'] == list_key.escalation_task_id()
+    assert (first.findings, first.filed, first.escalated) == (2, 1, 1)
+
+    second = sweep_once(register, ports)
+
+    assert len(stub.tool_calls('submit_task')) == 1
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert second.skipped_existing == 2
+    assert (second.filed, second.escalated) == (0, 0)
+
+
+def test_scenario_17_every_kind_of_dead_owner_is_one_finding(project_root, seed):
+    db = seed([{'id': 20, 'status': 'cancelled'}])
+    failed, created = TicketRef('tkt_0F'), TicketRef('tkt_0C')
+    stub = StubMcp(
+        db,
+        owner_tickets={
+            failed.id: {'status': 'failed', 'reason': 'worker_dead'},
+            created.id: {'status': 'created', 'task_id': '20'},
+        },
+    )
+    register = view(
+        Citation(INLINE_SCOPE, TaskRef(99), ('a.py:1',)),
+        Citation(INLINE_SCOPE, failed, ('b.py:1',)),
+        Citation(INLINE_SCOPE, created, ('c.py:1',)),
+    )
+
+    outcome = sweep_once(register, ports_for(project_root, stub))
+
+    assert (outcome.checked, outcome.findings, outcome.filed) == (3, 3, 3)
+    keys = [args['metadata'][FINDING_KEY_FIELD] for args in stub.tool_calls('submit_task')]
+    assert keys == [
+        FindingKey(FindingKind.DEAD_OWNER, INLINE_SCOPE, owner).record()
+        for owner in (TaskRef(99), failed, created)
+    ]
+
+
+def test_scenario_19_a_closed_finding_task_escalates_and_is_never_refiled(project_root, seed):
+    key = FindingKey(FindingKind.DEAD_OWNER, INLINE_SCOPE, TaskRef(2733))
+    db = seed(
+        [
+            {'id': 2733, 'status': 'done'},
+            {'id': 5000, 'status': 'done', 'metadata': {FINDING_KEY_FIELD: key.record()}},
+        ]
+    )
+    stub = StubMcp(db)
+
+    outcome = sweep_once(view(Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',))), ports_for(project_root, stub))
+
+    assert stub.tool_calls('submit_task') == []
+    (escalated,) = stub.tool_calls('escalate_info')
+    assert escalated['task_id'] == key.escalation_task_id()
+    assert outcome.escalated == 1
+
+
+def test_scenario_22_an_owner_that_dies_between_scan_and_act_is_filed(project_root, seed):
+    db = seed([{'id': 2733, 'status': 'pending'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    register = view(Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',)))
+
+    measured = scan(register, ports, now=NOW)
+    set_status(db, 2733, 'done')
+    outcome = act(measured, ports, now=NOW)
+
+    assert len(stub.tool_calls('submit_task')) == 1
+    assert outcome.filed == 1
+
+
+def test_scenario_22_an_owner_revived_between_scan_and_act_is_not_filed(project_root, seed):
+    db = seed([{'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    register = view(Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',)))
+
+    measured = scan(register, ports, now=NOW)
+    set_status(db, 2733, 'pending')
+    outcome = act(measured, ports, now=NOW)
+
+    assert stub.tool_calls('submit_task') == []
+    assert stub.tool_calls('escalate_info') == []
+    assert (outcome.findings, outcome.filed) == (0, 0)
+
+
+def test_live_owners_direct_or_via_a_successor_produce_no_output(project_root, seed):
+    db = seed(
+        [
+            {'id': 10, 'status': 'pending'},
+            {'id': 11, 'status': 'done', 'metadata': {'x_coalesced_into': 12}},
+            {'id': 12, 'status': 'in-progress'},
+        ]
+    )
+    stub = StubMcp(db)
+    register = view(
+        Citation(INLINE_SCOPE, TaskRef(10), ('a.py:1',)),
+        Citation(LIST_SCOPE, TaskRef(11), ('default',)),
+    )
+
+    outcome = sweep_once(register, ports_for(project_root, stub))
+
+    assert stub.tool_calls('submit_task') == []
+    assert stub.tool_calls('escalate_info') == []
+    assert (outcome.checked, outcome.findings, outcome.via_successor) == (2, 0, 1)
+
+
+def test_scan_is_read_only(project_root, seed):
+    db = seed([{'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+
+    scan(view(Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',))), ports_for(project_root, stub), now=NOW)
+
+    assert [tool for _, tool, _ in stub.calls] == ['get_pending_escalations']
