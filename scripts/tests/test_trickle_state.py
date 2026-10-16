@@ -969,9 +969,6 @@ class TestRecordRunCensusFireStreak:
         with pytest.raises(TypeError, match='census'):
             trickle_state.record_run('dark_factory', **without_census)
 
-    def test_the_unadvanced_fire_threshold_is_three(self):
-        assert trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES == 3
-
 
 class TestReadCensusFireStreak:
     """``read_census_fire_streak(doc)``: the ONE parser of the recorded
@@ -1031,6 +1028,40 @@ class TestReadCensusFireStreak:
         assert trickle_state.read_census_fire_streak(
             {'census_fire_streak': raw}
         ) is None
+
+
+class TestReadLastCensusAt:
+    """``read_last_census_at(path)``: the ONE quiet read of census-state's
+    raw ``last_census_at``, shared by the nightly's pre-launch anchor and
+    the census progress probe's live comparison."""
+
+    def test_a_missing_file_is_missing(self, tmp_path):
+        assert trickle_state.read_last_census_at(
+            tmp_path / 'census-state.json'
+        ) == ('missing', None)
+
+    @pytest.mark.parametrize('content, expected', [
+        pytest.param('{"last_census_at": "2026-08-02"}', '2026-08-02', id='dated'),
+        pytest.param('{}', None, id='never-censused'),
+        pytest.param('{"last_census_at": 20260802}', 20260802, id='raw-not-validated'),
+    ])
+    def test_a_json_object_yields_its_raw_value(self, tmp_path, content, expected):
+        path = tmp_path / 'census-state.json'
+        path.write_text(content, encoding='utf-8')
+        assert trickle_state.read_last_census_at(path) == ('ok', expected)
+
+    @pytest.mark.parametrize('content', [
+        pytest.param('{not json', id='invalid-json'),
+        pytest.param('[1, 2]', id='not-an-object'),
+    ])
+    def test_an_unusable_file_is_malformed_and_quiet(self, tmp_path, caplog, content):
+        """Quiet because census_trigger.load_census_state already logs the
+        malformed WARNING for the same file on the same night."""
+        path = tmp_path / 'census-state.json'
+        path.write_text(content, encoding='utf-8')
+        with caplog.at_level('DEBUG'):
+            assert trickle_state.read_last_census_at(path) == ('malformed', None)
+        assert caplog.records == []
 
 
 class TestRecordedAgeHours:

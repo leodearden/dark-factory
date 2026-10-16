@@ -4386,6 +4386,26 @@ class TestRunNightlyRecordsTheCensusObservation:
         assert runner.recorded()['census_fire_streak'][
             'last_census_at'] == '2026-06-01'
 
+    def test_a_malformed_census_state_warns_once_per_night(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """The trigger's own read owns the malformed WARNING; the anchor
+        read must not repeat it in the journal."""
+        launches = _stub_census_launcher(monkeypatch)
+        runner = _NightRunner(tmp_path)
+        _census_state(runner.repo).write_text('{not json', encoding='utf-8')
+
+        with caplog.at_level('WARNING'):
+            runner.night(13, 'quiet')
+
+        malformed = [
+            r.getMessage() for r in caplog.records
+            if 'census state at' in r.getMessage()
+        ]
+        assert len(malformed) == 1, malformed
+        assert launches == []
+        assert runner.recorded()['census_fired'] is False
+
     @pytest.mark.parametrize('branch', ['storm', 'capped'])
     def test_a_night_that_returns_before_the_census_step_records_none(
         self, tmp_path, monkeypatch, branch,

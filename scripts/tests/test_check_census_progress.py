@@ -340,10 +340,10 @@ def test_a_record_without_census_facts_passes(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_the_threshold_defaults_to_the_module_constant(tmp_path, monkeypatch):
-    assert trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES == 3
+    default = trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES
     _write_census_state(_census_state_path(tmp_path), "2026-08-02")
 
-    _seed(tmp_path, monkeypatch, nights=["fire"] * 2)
+    _seed(tmp_path, monkeypatch, nights=["fire"] * (default - 1))
     below, _ = _run_probe(tmp_path, "dark_factory")
     _seed(tmp_path, monkeypatch, nights=["fire"])
     at, git_marker = _run_probe(tmp_path, "dark_factory")

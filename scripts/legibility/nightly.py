@@ -1430,11 +1430,9 @@ def _nothing_sampled() -> sampling.SampleResult:
 
 def _census_anchor(state_path: Path) -> str | None:
     """census-state's raw ``last_census_at``, or ``None`` when it has none
-    or cannot be read. Never raises: ``load_census_state`` does not."""
-    status, state = census_trigger.load_census_state(state_path)
-    if status != 'ok' or state is None:
-        return None
-    anchor = state.get('last_census_at')
+    or cannot be read. Never raises, and never logs: the trigger's own read
+    of the same file owns the malformed WARNING."""
+    _status, anchor = trickle_state.read_last_census_at(state_path)
     return anchor if isinstance(anchor, str) else None
 
 

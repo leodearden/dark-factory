@@ -651,6 +651,27 @@ def read_census_fire_streak(doc) -> CensusFireStreak | None:
     )
 
 
+def read_last_census_at(path: Path) -> tuple[str, object]:
+    """``('missing', None)``, ``('malformed', None)`` or ``('ok', raw
+    last_census_at)`` for census-state.json at *path*: the ONE read shared
+    by the nightly's pre-launch anchor and ``check_census_progress.py``'s
+    live comparison, so the two sides of its exact-equality test agree.
+
+    QUIET: ``census_trigger.load_census_state`` owns the malformed WARNING
+    for this file. Timestamps are deliberately not validated: the trigger
+    never FIREs on a malformed census-state, so no streak can be anchored
+    on one."""
+    if not path.exists():
+        return 'missing', None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return 'malformed', None
+    if not isinstance(data, dict):
+        return 'malformed', None
+    return 'ok', data.get('last_census_at')
+
+
 def _fold_census_fire_streak(
     prev: CensusFireStreak | None,
     census: CensusObservation | None,
@@ -1041,8 +1062,10 @@ before ``check_census_progress.py`` fails.
 WHY 3. One or two unadvanced fires can be a census deferred for usage
 headroom, which ``census.py``'s ``_defer`` already escalates at info. A
 census that DID advance blocks the trigger for the next ``floor_days``
-(stock 5) nights, so three consecutive unadvanced fires are persistent,
-and the threshold bounds the paid reruns at three. A deferred census
+(stock 5) nights, so three consecutive unadvanced fires are persistent.
+The threshold bounds how many unadvanced paid censuses run BEFORE an
+operator is alerted, not how many run: nothing here stops the trigger, so
+every later FIRE still launches one until someone acts. A deferred census
 COUNTS toward the streak: nothing the pipeline records tells it apart.
 
 A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason

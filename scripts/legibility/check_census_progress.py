@@ -21,7 +21,6 @@ freshness, so this probe does not re-check freshness.
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -47,22 +46,6 @@ def _parse_args(args: list[str]) -> tuple[str, int] | None:
     if threshold < 1:
         return None
     return args[0], threshold
-
-
-def _read_last_census_at(path: Path) -> tuple[str, object]:
-    """``('missing', None)``, ``('malformed', None)`` or ``('ok', raw
-    last_census_at)``. Timestamps are deliberately not validated: the
-    trigger never FIREs on a malformed census-state, so no streak can be
-    anchored on one."""
-    if not path.exists():
-        return 'missing', None
-    try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        return 'malformed', None
-    if not isinstance(data, dict):
-        return 'malformed', None
-    return 'ok', data.get('last_census_at')
 
 
 def _fail(message: str) -> int:
@@ -101,7 +84,7 @@ def _assess_census_state(
     project_id: str, streak: trickle_state.CensusFireStreak, threshold: int,
 ) -> int:
     path = Path(streak.census_state_path)
-    status, current = _read_last_census_at(path)
+    status, current = trickle_state.read_last_census_at(path)
 
     if status == 'malformed':
         return _fail(
