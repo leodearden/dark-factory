@@ -31,7 +31,7 @@ tests/test_corpus_smoke.py::test_live_population_smoke   kind: failed
   pass 20261001T140922-7c41d0 confirm: AssertionError: 3 rows carried '[unverified_claim]' ..."""
 
 
-def _counted(pass_id: str, started_at: datetime, head: str = FIRST_RED, **overrides):
+def _counted(pass_id: str, started_at: datetime | None, head: str = FIRST_RED, **overrides):
     fields = {
         'pass_id': pass_id,
         'head': head,
@@ -45,8 +45,10 @@ def _counted(pass_id: str, started_at: datetime, head: str = FIRST_RED, **overri
     return CountedPassEvidence(**fields)
 
 
+SECOND_START = T0 + timedelta(minutes=48)
 FIRST_PASS = _counted('20261001T132104-e935a2', T0)
-SECOND_PASS = _counted('20261001T140922-7c41d0', T0 + timedelta(minutes=48))
+SECOND_PASS = _counted('20261001T140922-7c41d0', SECOND_START)
+PSEUDO_NODE = f'{COMMAND}::unconfirmable'
 
 
 def _test(node: str = NODE, passes=(FIRST_PASS, SECOND_PASS), **overrides) -> _Evidence:
@@ -243,7 +245,16 @@ def test_the_table_lists_each_counted_pass_with_head_start_and_mode():
     details = _build()['details']
 
     assert f'  {FIRST_PASS.pass_id} | {FIRST_RED} | {T0.isoformat()} | narrowed' in details
-    assert f'| {SECOND_PASS.started_at.isoformat()} | narrowed' in details
+    assert f'| {SECOND_START.isoformat()} | narrowed' in details
+
+
+def test_a_pass_whose_start_is_unknown_renders_unknown_and_sorts_last():
+    unread = _counted('p-unread', None, head='unknown', mode='unknown')
+
+    details = _build([_test(passes=(unread, FIRST_PASS))])['details']
+
+    assert '  p-unread | unknown | unknown | unknown' in details
+    assert details.index(f'  {FIRST_PASS.pass_id} | ') < details.index('  p-unread | ')
 
 
 def test_hook_notes_are_rendered_with_their_source_and_node():
@@ -297,8 +308,11 @@ def _command_level(**overrides):
         'priority': 'high',
         'head': FIRST_RED,
         'passes': [SECOND_PASS, FIRST_PASS, FIRST_PASS],
+        'node': PSEUDO_NODE,
         'reason': 'no_detect_record',
         'reproduce': 'cd integration && make check',
+        'prior_task_ids': [],
+        'notes': [],
     }
     arguments.update(overrides)
     return build_lane_command_task_arguments(**arguments)
@@ -330,7 +344,17 @@ def test_the_command_level_details_list_each_pass_once_in_start_order():
     assert f'  - {FIRST_PASS.record_dir}' in details
 
 
-def test_the_command_level_block_carries_the_lane_metadata_with_no_nodes():
+def test_the_command_level_task_renders_its_hook_notes_and_prior_tasks_as_a_test_task_does():
+    unnamed = EvidenceNote(source='hook', node=None, text='suite-wide leak record')
+
+    arguments = _command_level(prior_task_ids=['6001', '6002'], notes=[unnamed])
+
+    assert 'Hook notes:\n  [hook] (all reproduced tests): suite-wide leak record' in arguments['details']
+    assert f'Prior lane tasks for these tests:\n  {PSEUDO_NODE}: 6001, 6002' in arguments['details']
+    assert arguments['metadata']['x_offline_lane']['prior_task_ids'] == ['6001', '6002']
+
+
+def test_the_command_level_block_carries_the_lane_metadata_naming_its_pseudo_test():
     arguments = _command_level()
 
     assert arguments['metadata'] == {
@@ -339,7 +363,7 @@ def test_the_command_level_block_carries_the_lane_metadata_with_no_nodes():
         'x_offline_lane': {
             'command': COMMAND,
             'leg': 'generic',
-            'nodes': [],
+            'nodes': [PSEUDO_NODE],
             'first_red_head': FIRST_RED,
             'last_green_head': None,
             'pass_ids': [FIRST_PASS.pass_id, SECOND_PASS.pass_id],

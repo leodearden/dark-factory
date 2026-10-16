@@ -721,7 +721,7 @@ def apply_pass(
         if step.ended is not None:
             ended.append(step.ended)
     counted = [node for node, step in steps.items() if step.counted]
-    applier.with_notes(episodes, counted)
+    applier.with_notes(episodes, reproduced_nodes(observation))
     crossing = [node for node, step in steps.items() if applier.crossed(record.episodes.get(node), step)]
     to_file = tuple(
         node for node in crossing

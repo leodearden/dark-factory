@@ -8,12 +8,12 @@ raises the lane's escalation records.  :meth:`LaneEngine.observe` and
 :meth:`LaneEngine.tick` are its interface, with one read beside them,
 :meth:`LaneEngine.pinned_pass_ids`.
 
-Rules settled at implementation (task 6860):
+Rules the engine and its pure rules keep beyond the PRD's text:
 
 - R1 a new episode's ``last_green_head`` is the previous pass's head when that pass's
   detect record shows the test passed, else the command's ``last_green_head``.
 - R2 the digest reads every counted pass's run record; an unreadable one keeps its id
-  with an unknown head and mode, no failure lines, and the episode's last counted start.
+  with an unknown head, start and mode, and no failure lines.
 - R3 the reproduce line is fixed when a filing first falls due and kept on the due
   episodes; ``fix_task_priority`` is kept on the command record for retries.
 - R4 a cancelled or absent covering task whose escalation record is closed (resolved
@@ -75,7 +75,7 @@ from orchestrator.offline_lane_escalations import (
     resolve_stuck_filing,
 )
 from orchestrator.offline_lane_filing import (
-    UNKNOWN_HEAD,
+    UNKNOWN,
     CountedPassEvidence,
     TestEvidence,
     build_lane_command_task_arguments,
@@ -231,8 +231,7 @@ def _counted_pass(
     command: str, episode: Episode, pass_id: str, record: PassRecord | None, record_dir: Path, mode: str | None,
 ) -> CountedPassEvidence:
     if record is None:
-        started_at = episode.last_counted_started_at or episode.last_refreshed_at
-        return CountedPassEvidence(pass_id, UNKNOWN_HEAD, started_at, mode or UNKNOWN_MODE, None, None, str(record_dir))
+        return CountedPassEvidence(pass_id, UNKNOWN, None, mode or UNKNOWN_MODE, None, None, str(record_dir))
     any_node = episode.node == unconfirmable_node(command)
     return CountedPassEvidence(
         pass_id=pass_id,
@@ -336,7 +335,7 @@ class LaneEngine:
     async def _pass_reads(
         self, record: CommandRecord, observation: PassObservation,
     ) -> tuple[PassReads, dict[str, str]]:
-        """D10's reads for the red-again bound tests, the batched refresh read, and R1's previous detect record."""
+        """D10's reads for the red-again bound tests, the batched refresh read, and the previous pass's detect record."""
         terminal = await self._terminal_task_ids(record)
         reproduced = reproduced_nodes(observation)
         bound = {
@@ -525,8 +524,9 @@ class LaneEngine:
             episode = episodes[0]
             return build_lane_command_task_arguments(
                 command=record.command, leg=leg, priority=priority, head=episode.first_red_head,
-                passes=await self._counted_evidence(record.command, episode, modes),
-                reason=episode.kind, reproduce=reproduce,
+                node=episode.node, passes=await self._counted_evidence(record.command, episode, modes),
+                reason=episode.kind, reproduce=reproduce, prior_task_ids=episode.prior_task_ids,
+                notes=episode.notes,
             )
         tests = [
             TestEvidence(
@@ -571,7 +571,7 @@ class LaneEngine:
                 command=record.command,
                 covering_task_id=task_id,
                 task_status=statuses.get(task_id, UNKNOWN_STATUS),
-                nodes=nodes,
+                nodes=tuple(episode.node for episode in bound if episode.live),
                 filed_at=min(e.filed_at for e in bound if e.filed_at is not None),
                 record_dirs=tuple(
                     str(self._records.pass_directory(record.command, pass_id))

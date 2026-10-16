@@ -12,7 +12,7 @@ FAILURE_LINE_MAX_CHARS = 300
 HEAD_PREFIX_CHARS = 12
 SPAWN_CONTEXT = 'offline_lane_red'
 MERGE_LANE = 'normal'
-UNKNOWN_HEAD = 'unknown'
+UNKNOWN = 'unknown'
 NO_FAILURE_LINE = '(no failure line)'
 
 
@@ -27,7 +27,7 @@ class EvidenceNote:
 class CountedPassEvidence:
     pass_id: str
     head: str
-    started_at: datetime
+    started_at: datetime | None
     mode: str
     detect_first_line: str | None
     confirm_first_line: str | None
@@ -53,9 +53,18 @@ def _bulleted(items: Sequence[str]) -> str:
     return '\n'.join(f'  - {item}' for item in items)
 
 
+def _start_order(counted: CountedPassEvidence) -> tuple[bool, float, str]:
+    started_at = counted.started_at
+    return started_at is None, 0.0 if started_at is None else started_at.timestamp(), counted.pass_id
+
+
 def _distinct_passes(passes: Sequence[CountedPassEvidence]) -> list[CountedPassEvidence]:
     by_id = {p.pass_id: p for p in passes}
-    return sorted(by_id.values(), key=lambda p: (p.started_at, p.pass_id))
+    return sorted(by_id.values(), key=_start_order)
+
+
+def _instant(at: datetime | None) -> str:
+    return UNKNOWN if at is None else at.isoformat()
 
 
 def _distinct_in_order(items: Sequence[str]) -> list[str]:
@@ -90,24 +99,18 @@ def _tests_section(tests: Sequence[TestEvidence]) -> str:
 
 def _passes_table(passes: Sequence[CountedPassEvidence]) -> str:
     rows = [
-        f'  {p.pass_id} | {p.head} | {p.started_at.isoformat()} | {p.mode}' for p in passes
+        f'  {p.pass_id} | {p.head} | {_instant(p.started_at)} | {p.mode}' for p in passes
     ]
     return 'Counted passes (pass id | head | started | outcome mode):\n' + '\n'.join(rows)
 
 
-def _notes_section(tests: Sequence[TestEvidence]) -> str | None:
-    rows = [
-        f'  [{note.source}] {note.node or "(all reproduced tests)"}: {note.text}'
-        for test in tests
-        for note in test.notes
-    ]
+def _notes_section(notes: Sequence[EvidenceNote]) -> str | None:
+    rows = [f'  [{note.source}] {note.node or "(all reproduced tests)"}: {note.text}' for note in notes]
     return 'Hook notes:\n' + '\n'.join(rows) if rows else None
 
 
-def _prior_tasks_section(tests: Sequence[TestEvidence]) -> str | None:
-    rows = [
-        f'  {test.node}: {", ".join(test.prior_task_ids)}' for test in tests if test.prior_task_ids
-    ]
+def _prior_tasks_section(prior_by_node: Sequence[tuple[str, Sequence[str]]]) -> str | None:
+    rows = [f'  {node}: {", ".join(prior)}' for node, prior in prior_by_node if prior]
     return 'Prior lane tasks for these tests:\n' + '\n'.join(rows) if rows else None
 
 
@@ -125,11 +128,11 @@ def _join_sections(sections: Sequence[str | None]) -> str:
 
 
 def _earliest_first_red(tests: Sequence[TestEvidence]) -> TestEvidence:
-    return min(tests, key=lambda test: min(p.started_at for p in test.passes))
+    return min(tests, key=lambda test: min(_start_order(p) for p in test.passes))
 
 
 def _suspect_range(test: TestEvidence) -> str:
-    return f'{test.last_green_head or UNKNOWN_HEAD}..{test.first_red_head}'
+    return f'{test.last_green_head or UNKNOWN}..{test.first_red_head}'
 
 
 def _lane_metadata(
@@ -198,8 +201,8 @@ def build_lane_fix_task_arguments(
     details = _join_sections([
         _tests_section(tests),
         _passes_table(passes),
-        _notes_section(tests),
-        _prior_tasks_section(tests),
+        _notes_section([note for test in tests for note in test.notes]),
+        _prior_tasks_section([(test.node, test.prior_task_ids) for test in tests]),
         _owners_section(tests, deflake_owners),
         _record_dirs_section(passes),
     ])
@@ -231,13 +234,17 @@ def build_lane_command_task_arguments(
     leg: str,
     priority: str,
     head: str,
+    node: str,
     passes: Sequence[CountedPassEvidence],
     reason: str,
     reproduce: str,
+    prior_task_ids: Sequence[str],
+    notes: Sequence[EvidenceNote],
 ) -> dict[str, Any]:
     """The command-level fix task: the command exits non-zero and no test reproduces.
 
-    *reproduce* is the whole command line with its working directory.
+    *node* is the command's pseudo-test, the one node the task covers.  *reproduce* is
+    the whole command line with its working directory.
     """
     counted = _distinct_passes(passes)
     description = _join_sections([
@@ -249,6 +256,8 @@ def build_lane_command_task_arguments(
     details = _join_sections([
         '\n\n'.join(_command_pass_block(c) for c in counted),
         _passes_table(counted),
+        _notes_section(notes),
+        _prior_tasks_section([(node, prior_task_ids)]),
         _record_dirs_section(counted),
     ])
     return {
@@ -263,10 +272,10 @@ def build_lane_command_task_arguments(
         'metadata': _lane_metadata(
             command=command,
             leg=leg,
-            nodes=[],
+            nodes=[node],
             first_red_head=head,
             last_green_head=None,
             passes=counted,
-            prior_task_ids=[],
+            prior_task_ids=prior_task_ids,
         ),
     }

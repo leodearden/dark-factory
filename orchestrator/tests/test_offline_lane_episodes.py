@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -518,6 +519,15 @@ def test_a_new_episode_falls_back_to_the_command_last_green_head():
     assert applied.record.episodes[A].last_green_head == 'e' * 40
 
 
+def test_an_unnamed_note_reaches_a_reproduced_test_whose_pass_is_not_counted():
+    unnamed = EvidenceNote('hook', None, 'unnamed')
+
+    applied = _apply(_record(_episode()), _red(at=T0 + timedelta(minutes=3), notes=(unnamed,)))
+
+    assert applied.effect.tests_counted == ()
+    assert applied.record.episodes[A].notes == (unnamed,)
+
+
 def test_named_notes_go_to_their_test_and_unnamed_ones_to_every_reproduced_test():
     named = EvidenceNote('hook', B, 'named')
     unnamed = EvidenceNote('hook', None, 'unnamed')
@@ -743,10 +753,11 @@ class Lane:
     async def green(self, *, head: str = HEAD1) -> PassEffect:
         return await self._observe(head, None, _run('detect', head, self.clock()), None)
 
-    async def unconfirmable(self, *, head: str = HEAD1) -> PassEffect:
+    async def unconfirmable(self, *, head: str = HEAD1, notes: tuple[EvidenceNote, ...] = ()) -> PassEffect:
         at = self.clock()
         outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
-        return await self._observe(head, outcome, _run('detect', head, at, failing=(A,)), _run('confirm', head, at, returncode=2))
+        detect = _run('detect', head, at, failing=(A,))
+        return await self._observe(head, outcome, detect, _run('confirm', head, at, returncode=2), notes)
 
     async def spaced_red(self, *nodes: str, minutes: float = 30, **fields: Any) -> PassEffect:
         self.clock.advance(minutes=minutes)
@@ -1407,3 +1418,56 @@ async def test_a_due_filing_with_one_live_episode_left_still_files(tmp_path):
     assert tick.tasks_filed == ('7001',)
     assert lane.lane_metadata()['nodes'] == [A, B]
     assert lane.episode(B).covering_task_id == '7001'
+
+
+@pytest.mark.asyncio
+async def test_a_command_level_task_after_a_contained_one_names_it_and_carries_the_hook_note(tmp_path):
+    lane = Lane(tmp_path)
+    note = EvidenceNote('hook', None, 'suite-wide leak')
+    await lane.unconfirmable(notes=(note,))
+    lane.clock.advance(minutes=30)
+    (first,) = (await lane.unconfirmable(notes=(note,))).tasks_filed
+    _done(lane, first, commit=None)
+    lane.clock.advance(minutes=30)
+    await lane.unconfirmable(head=HEAD2, notes=(note,))
+    lane.clock.advance(minutes=30)
+
+    (second,) = (await lane.unconfirmable(head=HEAD2, notes=(note,))).tasks_filed
+
+    pseudo = unconfirmable_node(COMMAND)
+    details = lane.client.submitted[1]['details']
+    assert second != first
+    assert lane.lane_metadata(0)['nodes'] == lane.lane_metadata(1)['nodes'] == [pseudo]
+    assert lane.lane_metadata(1)['prior_task_ids'] == [first]
+    assert f'Prior lane tasks for these tests:\n  {pseudo}: {first}' in details
+    assert '  [hook] (all reproduced tests): suite-wide leak' in details
+
+
+@pytest.mark.asyncio
+async def test_a_counted_pass_whose_record_is_unreadable_renders_an_unknown_head_start_and_mode(tmp_path):
+    lane = Lane(tmp_path)
+    await lane.red()
+    (unread,) = lane.episode().counted_passes
+    shutil.rmtree(lane.records.pass_directory(COMMAND, unread))
+
+    await lane.spaced_red()
+
+    assert f'  {unread} | unknown | unknown | unknown' in lane.client.submitted[0]['details']
+
+
+@pytest.mark.asyncio
+async def test_the_unlanded_record_names_the_tests_still_red_and_every_test_of_the_task_holds_its_id(tmp_path):
+    lane = Lane(tmp_path)
+    await lane.red((A, B, C))
+    await lane.spaced_red(A, B, C)
+    lane.clock.advance(minutes=30)
+    await lane.red((A, B), cleared=(C,))
+
+    for _ in range(12):
+        await lane.spaced_red(A, B, minutes=150)
+
+    (record,) = lane.pending(UNLANDED_RED_CATEGORY)
+    assert {lane.episode(node).escalation_id for node in (A, B, C)} == {record.id}
+    assert not lane.episode(C).live
+    assert f'  - {A}' in record.detail and f'  - {B}' in record.detail
+    assert C not in record.detail
