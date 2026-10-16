@@ -49,17 +49,39 @@ logger = logging.getLogger(__name__)
 # fallback guards against is narrower than "nothing else catches it": a
 # schema edit that lands without that suite running, or a journal DB produced
 # by an older fused-memory build.
-MEMORY_OPS_SQL = (
+_RAW_OPS_ARM = (
     "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour, kind, operation, COUNT(*)"
     ' FROM write_ops INDEXED BY idx_wo_created'
-    ' WHERE created_at >= ? AND created_at < ?'
+    ' WHERE created_at >= :start AND created_at < :end'
     ' GROUP BY hour, kind, operation'
 )
+
+# Second schema dependency (task 5405): read_op_counts, owned by
+# fused-memory/src/fused_memory/services/read_rollup.py::READ_OP_COUNTS_SCHEMA_SQL.
+# A journal without it falls back to RAW_ONLY_MEMORY_OPS_SQL (see
+# `_memory_ops_rows`).
+_COUNTED_READS_ARM = (
+    "SELECT strftime('%Y-%m-%dT%H:00', hour_start) AS hour, 'read' AS kind, operation,"
+    ' SUM(count)'
+    ' FROM read_op_counts'
+    ' WHERE hour_start >= :start AND hour_start < :end'
+    ' GROUP BY hour, operation'
+)
+
+# ONE statement, so ONE read snapshot: a migration chunk committing between
+# two separate statements would count its rows twice or not at all.
+MEMORY_OPS_SQL = _RAW_OPS_ARM + ' UNION ALL ' + _COUNTED_READS_ARM
 
 # Fallback used by `get_memory_ops` when idx_wo_created is unexpectedly
 # absent (see the coupling comment above). Derived from MEMORY_OPS_SQL by
 # construction, rather than retyped, so the two strings cannot diverge.
 MEMORY_OPS_SQL_UNHINTED = MEMORY_OPS_SQL.replace(' INDEXED BY idx_wo_created', '')
+
+# Fallback for a journal without read_op_counts: a fused-memory build that
+# predates it journals every read per row, so the raw arm alone is exact.
+RAW_ONLY_MEMORY_OPS_SQL = _RAW_OPS_ARM
+
+_MISSING_ROLLUP_TABLE_ERROR = 'no such table: read_op_counts'
 
 _HOUR_KEY_FORMAT = '%Y-%m-%dT%H:00'
 
@@ -143,6 +165,11 @@ async def get_memory_ops(
 ) -> Datum[MemoryOps]:
     """Memory operations over the *hours* whole hours ending with now's hour.
 
+    Every read is journalled exactly once (task 5405): as a ``write_ops`` row
+    (search, failed reads, not-yet-migrated history) or as a ``read_op_counts``
+    count, so the two sources ADD inside one statement. The rollup is defined
+    in fused-memory/src/fused_memory/services/read_rollup.py.
+
     The window is hour-ALIGNED and bounded on both sides:
     ``[floor(now) - (hours-1)h, floor(now) + 1h)``, exactly the hour buckets
     the chart labels, so no row can count in one view and not the other — a
@@ -188,10 +215,10 @@ async def get_memory_ops(
     measured_at = resolve_now(now)
     newest_hour = measured_at.replace(minute=0, second=0, microsecond=0)
     hour_keys = _hour_keys(newest_hour, hours)
-    window = (
-        (newest_hour - timedelta(hours=hours - 1)).isoformat(),
-        (newest_hour + timedelta(hours=1)).isoformat(),
-    )
+    window = {
+        'start': (newest_hour - timedelta(hours=hours - 1)).isoformat(),
+        'end': (newest_hour + timedelta(hours=1)).isoformat(),
+    }
     if db is None:
         return unknown_datum(
             'the write journal is missing or could not be opened',
@@ -215,15 +242,21 @@ async def get_memory_ops(
 
 
 async def _memory_ops_rows(
-    db: aiosqlite.Connection, window: tuple[str, str],
+    db: aiosqlite.Connection, window: dict[str, str],
 ) -> Iterable[Sequence[Any]]:
     """The ``(hour, kind, operation, count)`` rows of *window*, hinted when it can be."""
     try:
         async with db.execute(MEMORY_OPS_SQL, window) as cursor:
             return await cursor.fetchall()
     except sqlite3.OperationalError as exc:
-        if 'no such index' not in str(exc):
-            raise
+        fallback_sql = _memory_ops_fallback(exc)
+        async with db.execute(fallback_sql, window) as cursor:
+            return await cursor.fetchall()
+
+
+def _memory_ops_fallback(exc: sqlite3.OperationalError) -> str:
+    """The query to retry after *exc*, logged; re-raises an unexpected error."""
+    if 'no such index' in str(exc):
         # idx_wo_created is missing — see the coupling comment at
         # MEMORY_OPS_SQL. Fall back to the unhinted query so the chart
         # stays correct (just slow), and log loudly enough to name the
@@ -233,8 +266,16 @@ async def _memory_ops_rows(
             'falling back to unhinted scan',
             exc_info=True,
         )
-        async with db.execute(MEMORY_OPS_SQL_UNHINTED, window) as cursor:
-            return await cursor.fetchall()
+        return MEMORY_OPS_SQL_UNHINTED
+    if str(exc) == _MISSING_ROLLUP_TABLE_ERROR:
+        # An expected deploy transient: the dashboard restarts on merge,
+        # fused-memory up to ~8 h later via its staleness backstop.
+        logger.info(
+            'write journal has no read_op_counts yet (older fused-memory build) '
+            '— memory ops reading raw write_ops rows only, which is exact there'
+        )
+        return RAW_ONLY_MEMORY_OPS_SQL
+    raise exc
 
 
 async def get_agent_breakdown(
