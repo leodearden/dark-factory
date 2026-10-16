@@ -474,6 +474,18 @@ async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
     assert task['metadata']['files'] == ['x.py']
 
 
+async def _seed_task_with_done_provenance(interceptor, root: str) -> dict:
+    """Add task 1 carrying a done_provenance and return its stored metadata."""
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T',
+        metadata=json.dumps({
+            'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
+            'files': ['x.py'],
+        }),
+    )
+    return (await interceptor.get_task('1', root))['metadata']
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('payload', 'received'),
@@ -487,21 +499,14 @@ async def test_update_task_non_object_metadata_rejection_byte_identical_across_s
     blob, done_provenance included, is left untouched (task 6130).
 
     The payloads are ones FastMCP's argument pre-parse hands to the tool body
-    as strings: it decodes '[]' to a list, which fails argument validation
-    before the tool runs, and 'null' to an absent metadata argument."""
+    as strings; '[]' and 'null' are decoded before the tool runs and are
+    pinned separately below."""
     from fused_memory.backends.task_backend_errors import metadata_not_an_object_error
     from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 
     server, interceptor = real_task_stack
     root = str(tmp_path)
-    await interceptor.taskmaster.add_task(
-        project_root=root, title='T',
-        metadata=json.dumps({
-            'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
-            'files': ['x.py'],
-        }),
-    )
-    before = (await interceptor.get_task('1', root))['metadata']
+    before = await _seed_task_with_done_provenance(interceptor, root)
 
     dict_tools = await server._tool_manager.call_tool(
         'update_task', {'id': '1', 'project_root': root, 'metadata': payload},
@@ -517,6 +522,48 @@ async def test_update_task_non_object_metadata_rejection_byte_identical_across_s
     )
     assert interceptor_write_succeeded(dict_tools) is False
     assert interceptor_write_succeeded(dict_interceptor) is False
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', ['[]', '["a"]'])
+async def test_update_task_array_metadata_fails_mcp_argument_validation(
+    real_task_stack, tmp_path, payload,
+):
+    """'[]' is the payload that wiped done_provenance in the original bug
+    (task 6130). Through the MCP tool, FastMCP's argument pre-parse decodes it
+    to a list, which fails argument validation before the tool body runs, and
+    the stored blob, done_provenance included, is left untouched."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    with pytest.raises(ToolError, match=r'validation errors? for update_taskArguments\nmetadata\.'):
+        await server._tool_manager.call_tool(
+            'update_task', {'id': '1', 'project_root': root, 'metadata': payload},
+        )
+    assert (await interceptor.get_task('1', root))['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
+    real_task_stack, tmp_path,
+):
+    """Through the MCP tool, a 'null' metadata payload is decoded to an
+    omitted metadata argument (task 6130): the call writes no metadata, so the
+    stored blob, done_provenance included, is left untouched."""
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    before = await _seed_task_with_done_provenance(interceptor, root)
+
+    result = await server._tool_manager.call_tool(
+        'update_task', {'id': '1', 'project_root': root, 'metadata': 'null'},
+    )
+    assert interceptor_write_succeeded(result), result
     assert (await interceptor.get_task('1', root))['metadata'] == before
 
 
