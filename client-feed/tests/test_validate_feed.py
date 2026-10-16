@@ -7,6 +7,7 @@ uv run python -c "from pathlib import Path; from client_feed.contract import par
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -188,6 +189,41 @@ def test_a_missing_file_is_named(tmp_path: Path, missing: str) -> None:
     problem = only_problem(validate_out_dir(out_dir))
     assert problem.kind == ProblemKind.MISSING_FILE
     assert missing in problem.detail
+
+
+@pytest.mark.parametrize('unreadable', [FEED_FILENAME, STATE_FILENAME])
+def test_an_unreadable_file_is_a_reported_problem(
+    tmp_path: Path, unreadable: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = altered_copy(tmp_path)
+    (out_dir / unreadable).unlink()
+    (out_dir / unreadable).mkdir()
+    problem = only_problem(validate_out_dir(out_dir))
+    assert problem.kind == ProblemKind.UNREADABLE_FILE
+    assert unreadable in problem.detail
+    assert main(['validate-feed', '--out-dir', str(out_dir)]) == 1
+    assert json.loads(capsys.readouterr().out)['problems'][0]['kind'] == 'unreadable_file'
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file')
+def test_a_file_without_read_permission_is_unreadable(tmp_path: Path) -> None:
+    out_dir = altered_copy(tmp_path)
+    (out_dir / STATE_FILENAME).chmod(0)
+    problem = only_problem(validate_out_dir(out_dir))
+    assert problem.kind == ProblemKind.UNREADABLE_FILE
+    assert STATE_FILENAME in problem.detail
+
+
+def test_swapped_lines_past_the_watermark_are_a_corrupt_feed(tmp_path: Path) -> None:
+    out_dir = altered_copy(tmp_path)
+
+    def swap_the_last_two(objects: list[dict[str, Any]]) -> None:
+        objects[-2], objects[-1] = objects[-1], objects[-2]
+
+    rewrite_feed(out_dir, swap_the_last_two)
+    problem = only_problem(validate_out_dir(out_dir))
+    assert committed_state(out_dir).watermark_seq < 27
+    assert (problem.kind, problem.seq) == (ProblemKind.CORRUPT_FEED, 27)
 
 
 @pytest.mark.parametrize('text', ['{', '[]', '{"project_id": "demo-client"}'])

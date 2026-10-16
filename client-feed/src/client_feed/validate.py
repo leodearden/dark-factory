@@ -25,6 +25,7 @@ from client_feed.fold import CorruptFeed, ProjectMismatch, fold
 
 class ProblemKind(StrEnum):
     MISSING_FILE = 'missing_file'
+    UNREADABLE_FILE = 'unreadable_file'
     CONTRACT_VIOLATION = 'contract_violation'
     UNSUPPORTED_VERSION = 'unsupported_version'
     CORRUPT_FEED = 'corrupt_feed'
@@ -87,6 +88,10 @@ def _read_text(path: Path) -> str:
         raise _Halted(
             Problem(kind=ProblemKind.MISSING_FILE, detail=f'{path.name} not found in {path.parent}')
         ) from exc
+    except OSError as exc:
+        raise _Halted(
+            Problem(kind=ProblemKind.UNREADABLE_FILE, detail=f'{path.name} cannot be read: {exc}')
+        ) from exc
     except UnicodeDecodeError as exc:
         raise _Halted(
             Problem(kind=ProblemKind.CONTRACT_VIOLATION, detail=f'{path.name} is not UTF-8: {exc}')
@@ -125,15 +130,24 @@ def _parse_lines(texts: list[str]) -> list[FeedLine]:
     return lines
 
 
-def _checked_fold(lines: list[FeedLine], project_id: str, *, upto_seq: int | None) -> FeedState:
+def _checked_fold(
+    lines: list[FeedLine], project_id: str, *, start: FeedState | None = None
+) -> FeedState:
     try:
-        return fold(lines, project_id=project_id, upto_seq=upto_seq)
+        return fold(lines, project_id=project_id, start=start)
     except (CorruptFeed, ProjectMismatch) as error:
         raise _Halted(_problem(error, seq=error.seq)) from error
 
 
-def _compare_with_state(lines: list[FeedLine], project_id: str, state: FeedState) -> None:
-    folded = _checked_fold(lines, project_id, upto_seq=state.watermark_seq)
+def _fold_at_watermark(lines: list[FeedLine], project_id: str, watermark_seq: int) -> FeedState:
+    """The fold up to watermark_seq; the lines past it are checked by resuming from that fold."""
+    past = next((i for i, line in enumerate(lines) if line.seq > watermark_seq), len(lines))
+    at_watermark = _checked_fold(lines[:past], project_id)
+    _checked_fold(lines[past:], project_id, start=at_watermark)
+    return at_watermark
+
+
+def _compare_with_state(folded: FeedState, state: FeedState) -> None:
     differing = [
         name for name in FeedState.model_fields if getattr(folded, name) != getattr(state, name)
     ]
@@ -159,8 +173,7 @@ def validate_out_dir(out_dir: Path, *, expected_project_id: str | None = None) -
         texts = _read_text(out_dir / FEED_FILENAME).splitlines()
         lines_checked = len(texts)
         lines = _parse_lines(texts)
-        _checked_fold(lines, project_id, upto_seq=None)
-        _compare_with_state(lines, project_id, state)
+        _compare_with_state(_fold_at_watermark(lines, project_id, state.watermark_seq), state)
     except _Halted as halted:
         problems = halted.problems
     return ValidationReport(
