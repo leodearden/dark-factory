@@ -7,9 +7,11 @@ structured pytest command to the detection's failing tests and runs them
 serially, and otherwise re-runs the whole command and intersects the two runs.
 The numeric leg's outcome comes from its confirm alone.
 
-A generic command's failing ids must keep their bracket pairs balanced, and on a
-narrowed confirm must also survive narrowing and re-parsing; there is no
-cross-check against junit ids, because a record's junit outcomes omit its failing tests.
+A generic command's failing ids must keep their bracket pairs balanced.  On a
+narrowed confirm they must also survive narrowing and re-parsing, and each must
+be a failing node of the detection's junit report where that report can say,
+because a parametrize id holding whitespace and a bracket can still balance
+after the output parse truncates it.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from orchestrator.offline_lane_runs import (
     RUN_OFFLINE_DEEP_SCRIPT,
     ConfirmRunner,
     OutputFormat,
+    junit_failing_node_ids,
 )
 from orchestrator.verify import (
     FailureKind,
@@ -80,7 +83,10 @@ class UnconfirmableReason(StrEnum):
 
 @dataclass(frozen=True)
 class Confirmed:
-    """``reproduced``, ``cleared`` and ``inconclusive`` partition the detection's failing nodes, in detection order."""
+    """``reproduced``, ``cleared`` and ``inconclusive`` partition the detection's failing nodes, in detection order.
+
+    LEG_NATIVE is the exception: ``reproduced`` is what the confirm printed, and the other two are empty.
+    """
 
     mode: ConfirmMode
     reproduced: tuple[str, ...]
@@ -234,6 +240,16 @@ def round_trip_failure(cmd: LaneCommand, ids: Sequence[str]) -> str | None:
     return None
 
 
+def _first_not_failing_in_junit(ids: Sequence[str], detect: RunRecord, cwd: Path) -> str | None:
+    """The first of *ids* *detect*'s junit report does not name as failing; ``None`` if it names all or cannot say."""
+    if detect.junit_path is None:
+        return None
+    failing = junit_failing_node_ids(Path(detect.junit_path), cwd)
+    if failing is None:
+        return None
+    return next((node_id for node_id in ids if node_id not in failing), None)
+
+
 def _as_pytest_failures(record: RunRecord) -> tuple[PytestFailure, ...]:
     return tuple(
         PytestFailure(failure.node, FailureKind(failure.kind), failure.first_line)
@@ -302,7 +318,10 @@ async def _confirm_generic(
     mode = confirm_mode(cmd, detect)
     ids = node_ids_of(_as_pytest_failures(detect))
     narrowed = mode is ConfirmMode.NARROWED
-    failing_id = round_trip_failure(cmd, ids) if narrowed else _first_unbalanced(ids)
+    if narrowed:
+        failing_id = round_trip_failure(cmd, ids) or _first_not_failing_in_junit(ids, detect, run_cwd)
+    else:
+        failing_id = _first_unbalanced(ids)
     if failing_id is not None:
         return Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, failing_id)
     if narrowed:

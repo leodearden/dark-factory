@@ -62,7 +62,6 @@ from typing import IO, TYPE_CHECKING, Protocol
 
 from orchestrator import offline_lane_confirm, offline_lane_runs
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
-from orchestrator.offline_lane_confirm import ConfirmTarget
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
     LEGACY_NUMERIC_COMMAND,
@@ -935,19 +934,27 @@ class OfflineLaneWorker:
 
     async def _default_confirmation_run(self, wt: Path, head: str) -> list[str]:
         """Default ``confirmation_runner``: the numeric leg's confirm, projected to the legacy id list."""
-        return await self._confirmed_ids(ConfirmTarget.numeric(wt), LEGACY_NUMERIC_COMMAND)
+        return await self._confirmed_ids(
+            offline_lane_confirm.ConfirmTarget.numeric(wt), LEGACY_NUMERIC_COMMAND,
+        )
 
     async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
         """Default ``infra_confirmation_runner``: the infra leg's confirm, projected to the legacy id list."""
-        return await self._confirmed_ids(ConfirmTarget.infra(wt), LEGACY_INFRA_COMMAND)
+        return await self._confirmed_ids(
+            offline_lane_confirm.ConfirmTarget.infra(wt), LEGACY_INFRA_COMMAND,
+        )
 
     async def _default_command_confirmation_run(
         self, cmd: LaneCommand, wt_path: Path, head: str,
     ) -> list[str]:
         """Default ``command_confirmation_runner``: *cmd*'s confirm, projected to the legacy id list."""
-        return await self._confirmed_ids(ConfirmTarget.generic(cmd, wt_path), cmd.name)
+        return await self._confirmed_ids(
+            offline_lane_confirm.ConfirmTarget.generic(cmd, wt_path), cmd.name,
+        )
 
-    async def _confirmed_ids(self, target: ConfirmTarget, command_name: str) -> list[str]:
+    async def _confirmed_ids(
+        self, target: offline_lane_confirm.ConfirmTarget, command_name: str,
+    ) -> list[str]:
         detect = self.records.last_record(command_name, Phase.DETECT)
         runner = offline_lane_runs.confirm_runner(
             self.records, offline_lane_runs.require_current_pass(self.records, command_name),

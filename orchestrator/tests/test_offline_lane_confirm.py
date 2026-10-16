@@ -12,7 +12,7 @@ import os
 import shlex
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from pathlib import Path
@@ -62,10 +62,12 @@ from orchestrator.offline_lane_runs import (
     command_runner,
     confirm_runner,
     infra_runner,
+    junit_failing_node_ids,
     junit_node_outcomes,
     require_current_pass,
     suite_runner,
 )
+from orchestrator.verify import parse_pytest_failures
 from orchestrator.verify_cmd import ToolKind, parse_config_command
 
 T0 = datetime(2026, 10, 16, 9, 0, 0, tzinfo=UTC)
@@ -599,6 +601,123 @@ class TestJunitNodeOutcomes:
         assert junit_node_outcomes(tmp_path / 'absent.xml', tmp_path) is None
 
 
+def _junit_report(path: Path, *testcases: str) -> Path:
+    path.write_text(f'<testsuites><testsuite name="pytest">{"".join(testcases)}</testsuite></testsuites>')
+    return path
+
+
+def _failing_case(classname: str, name: str) -> str:
+    return f'<testcase classname="{classname}" name="{name}"><failure message="boom"/></testcase>'
+
+
+class TestJunitFailingNodeIds:
+    def test_failing_and_erroring_tests_resolve_to_node_ids_and_passing_ones_are_left_out(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 't.py').write_text('')
+        report = _junit_report(
+            tmp_path / 'r.xml',
+            _failing_case('tests.t', 'test_a[a] b]'),
+            '<testcase classname="tests.t.TestK" name="test_e"><error message="setup"/></testcase>',
+            '<testcase classname="tests.t" name="test_ok"/>',
+        )
+        assert junit_failing_node_ids(report, tmp_path) == frozenset(
+            {'tests/t.py::test_a[a] b]', 'tests/t.py::TestK::test_e'},
+        )
+
+    def test_a_module_that_failed_to_collect_is_its_path(self, tmp_path: Path) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 't.py').write_text('')
+        report = _junit_report(
+            tmp_path / 'r.xml', '<testcase classname="" name="tests.t"><error message="collect"/></testcase>',
+        )
+        assert junit_failing_node_ids(report, tmp_path) == frozenset({'tests/t.py'})
+
+    def test_a_failing_test_whose_classname_names_no_file_leaves_the_report_unable_to_say(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 't.py').write_text('')
+        report = _junit_report(
+            tmp_path / 'r.xml', _failing_case('tests.t', 'test_a'), _failing_case('elsewhere.t', 'test_b'),
+        )
+        assert junit_failing_node_ids(report, tmp_path) is None
+
+    def test_no_report_is_none(self, tmp_path: Path) -> None:
+        assert junit_failing_node_ids(tmp_path / 'absent.xml', tmp_path) is None
+
+
+_TRUNCATING_OUTPUT = 'FAILED tests/t.py::test_a[a] b] - assert 0\nFAILED tests/t.py::test_ok - assert 0\n'
+
+
+class TestJunitCrossCheck:
+    """A narrowed confirm refuses a detected id its detection's junit report does not name as failing."""
+
+    @staticmethod
+    def _target(tmp_path: Path) -> ConfirmTarget:
+        target = _generic(tmp_path)
+        (target.worktree / 'fused-memory' / 'tests').mkdir()
+        (target.worktree / 'fused-memory' / 'tests' / 't.py').write_text('')
+        return target
+
+    @staticmethod
+    def _detect(junit_path: Path | None) -> RunRecord:
+        failures = parse_pytest_failures(_TRUNCATING_OUTPUT)
+        detect = _run(*((failure.node_id, failure.kind.value) for failure in failures))
+        return replace(detect, junit_path=None if junit_path is None else str(junit_path))
+
+    @pytest.mark.asyncio
+    async def test_an_id_the_output_parse_truncated_inside_balanced_brackets_runs_no_confirm(
+        self, tmp_path: Path,
+    ) -> None:
+        target = self._target(tmp_path)
+        report = _junit_report(
+            tmp_path / 'r.xml', _failing_case('tests.t', 'test_a[a] b]'), _failing_case('tests.t', 'test_ok'),
+        )
+        runner = _FakeRunner(_rerun())
+        assert round_trip_failure(_lane_command(), ['tests/t.py::test_a[a]']) is None
+
+        outcome = await confirm(target, self._detect(report), runner)
+
+        assert outcome == Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, 'tests/t.py::test_a[a]')
+        assert runner.calls == []
+
+    @pytest.mark.asyncio
+    async def test_ids_the_report_names_as_failing_are_confirmed(self, tmp_path: Path) -> None:
+        target = self._target(tmp_path)
+        report = _junit_report(
+            tmp_path / 'r.xml', _failing_case('tests.t', 'test_a[a]'), _failing_case('tests.t', 'test_ok'),
+        )
+        runner = _FakeRunner(_rerun(('tests/t.py::test_a[a]', 'failed')))
+
+        outcome = await confirm(target, self._detect(report), runner)
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, ('tests/t.py::test_a[a]',), ('tests/t.py::test_ok',), ())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('report', ['unresolved', 'absent', 'none'])
+    async def test_a_report_that_cannot_say_leaves_the_decision_to_the_round_trip(
+        self, tmp_path: Path, report: str,
+    ) -> None:
+        target = self._target(tmp_path)
+        junit_path = {
+            'unresolved': _junit_report(
+                tmp_path / 'r.xml',
+                _failing_case('tests.t', 'test_a[a] b]'),
+                _failing_case('elsewhere.t', 'test_ok'),
+            ),
+            'absent': tmp_path / 'absent.xml',
+            'none': None,
+        }[report]
+        runner = _FakeRunner(_rerun(('tests/t.py::test_a[a]', 'failed')))
+
+        outcome = await confirm(target, self._detect(junit_path), runner)
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, ('tests/t.py::test_a[a]',), ('tests/t.py::test_ok',), ())
+        assert len(runner.calls) == 1
+
+
 class TestIntersectedRoundTrip:
     @pytest.mark.asyncio
     async def test_an_intersected_id_with_unbalanced_brackets_runs_no_confirm(self, tmp_path: Path) -> None:
@@ -733,6 +852,23 @@ class TestRealPytestGenericLeg:
         outcome = await _confirm(store, LANE, project, await _detect(store, LANE, project))
 
         assert outcome == Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, node_id('test_param[x'))
+        assert store.last_record(LANE.name, Phase.CONFIRM) is None
+
+    @pytest.mark.asyncio
+    async def test_11_an_id_truncated_inside_balanced_brackets_fails_the_junit_cross_check(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = tmp_path / 'wt'
+        (project / 'tests').mkdir(parents=True)
+        (project / 'pyproject.toml').write_text('[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider"\n')
+        (project / 'tests' / 'test_t.py').write_text(
+            "import pytest\n\n\n@pytest.mark.parametrize('word', ['a] b'])\n"
+            "def test_a(word):\n    assert word == 'ab'\n",
+        )
+
+        outcome = await _confirm(store, LANE, project, await _detect(store, LANE, project))
+
+        assert outcome == Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, 'tests/test_t.py::test_a[a]')
         assert store.last_record(LANE.name, Phase.CONFIRM) is None
 
 

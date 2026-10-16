@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -30,7 +30,11 @@ from orchestrator.offline_lane_records import (
     RunRecordStore,
     classify_exit,
 )
-from orchestrator.verify import extract_test_outcomes_from_junit, parse_pytest_failures
+from orchestrator.verify import (
+    _extract_failing_test_ids_from_junit,
+    extract_test_outcomes_from_junit,
+    parse_pytest_failures,
+)
 from orchestrator.verify_cmd import parse_config_command, render, with_junitxml
 
 if TYPE_CHECKING:
@@ -137,27 +141,62 @@ def _node_prefix(classname: str, cwd: Path) -> str | None:
     return None
 
 
-def junit_node_outcomes(junit_path: Path, cwd: Path) -> dict[str, str] | None:
-    """The junit report's per-test outcomes keyed by pytest node id, resolved against *cwd*.
+def _node_id_resolver(cwd: Path) -> Callable[[str], str | None]:
+    """Maps one report's junit ids to pytest node ids under *cwd*, caching each classname's resolution.
 
     A junit id is ``<dotted classname>::<name>``; the classname's longest dotted
     prefix naming a ``.py`` file under *cwd* is the module, the rest its class
-    nesting.  A test whose classname resolves to no file has no entry.
-    ``None`` when no report could be read.
+    nesting.  A bare id is a module that failed to collect.  ``None`` for an id
+    whose classname resolves to no file.
+    """
+    prefixes: dict[str, str | None] = {}
+
+    def node_id(junit_id: str) -> str | None:
+        classname, separator, name = junit_id.partition('::')
+        if classname not in prefixes:
+            prefixes[classname] = _node_prefix(classname, cwd)
+        prefix = prefixes[classname]
+        if prefix is None or not separator:
+            return prefix
+        return f'{prefix}::{name}'
+
+    return node_id
+
+
+def junit_node_outcomes(junit_path: Path, cwd: Path) -> dict[str, str] | None:
+    """The junit report's per-test outcomes keyed by pytest node id, resolved against *cwd*.
+
+    A test whose classname resolves to no file has no entry.  ``None`` when no report could be read.
     """
     outcomes = extract_test_outcomes_from_junit(junit_path)
     if outcomes is None:
         return None
-    prefixes: dict[str, str | None] = {}
+    resolve = _node_id_resolver(cwd)
     node_outcomes: dict[str, str] = {}
     for junit_id, verdict in outcomes.items():
-        classname, _, name = junit_id.partition('::')
-        if classname not in prefixes:
-            prefixes[classname] = _node_prefix(classname, cwd)
-        prefix = prefixes[classname]
-        if prefix is not None:
-            node_outcomes[f'{prefix}::{name}'] = verdict
+        node_id = resolve(junit_id)
+        if node_id is not None:
+            node_outcomes[node_id] = verdict
     return node_outcomes
+
+
+def junit_failing_node_ids(junit_path: Path, cwd: Path) -> frozenset[str] | None:
+    """The pytest node ids the junit report names as failing, resolved against *cwd*.
+
+    ``None`` when no report could be read, or when any failing test's classname
+    resolves to no file: such a report cannot say which node ids failed.
+    """
+    failing = _extract_failing_test_ids_from_junit(junit_path)
+    if failing is None:
+        return None
+    resolve = _node_id_resolver(cwd)
+    node_ids: set[str] = set()
+    for junit_id in failing:
+        node_id = resolve(junit_id)
+        if node_id is None:
+            return None
+        node_ids.add(node_id)
+    return frozenset(node_ids)
 
 
 def _outcomes(
