@@ -11,20 +11,27 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-from collections.abc import MutableMapping
+import functools
+from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
 
 import _task_db_scan
 import pytest
 from exception_owner_liveness import (
+    MAX_SUCCESSOR_HOPS,
+    DeathCause,
+    Liveness,
+    OwnerVerdict,
     TaskRow,
     TicketOutcome,
     TicketState,
     TicketUnreadable,
     read_tasks,
     read_tasks_carrying,
+    resolve_owner,
     ticket_outcome,
 )
+from shared.governed_exceptions import TaskRef, TicketRef
 from shared.task_deferral import CarriedByDeferral, PlanningDeferral, record_to_json
 from shared.task_statuses import OwnerLiveness, owner_liveness
 
@@ -264,3 +271,253 @@ def test_a_ticket_outcome_is_frozen():
     field = 'status'
     with pytest.raises(dataclasses.FrozenInstanceError):
         setattr(outcome, field, 'created')
+
+
+# ---------------------------------------------------------------------------
+# resolve_owner: a real temp store plus a dict-backed resolve_ticket.
+
+TICKET_PENDING = TicketRef('tkt_01')
+TICKET_UNKNOWN = TicketRef('tkt_02')
+TICKET_FAILED = TicketRef('tkt_03')
+TICKET_REFUSED = TicketRef('tkt_04')
+TICKET_CREATED = TicketRef('tkt_05')
+TICKET_COMBINED = TicketRef('tkt_06')
+TICKET_CANCELLED = TicketRef('tkt_07')
+
+_TICKET_WIRE: Mapping[TicketRef, dict] = {
+    TICKET_PENDING: {'status': 'failed', 'reason': 'timeout', 'task_id': None},
+    TICKET_UNKNOWN: {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None},
+    TICKET_FAILED: {'status': 'failed', 'reason': 'worker_dead'},
+    TICKET_REFUSED: {'status': 'refused', 'reason': 'premise_cancelled'},
+    TICKET_CREATED: {'status': 'created', 'task_id': '20'},
+    TICKET_COMBINED: {'status': 'combined', 'task_id': '20'},
+    TICKET_CANCELLED: {'status': 'cancelled', 'reason': 'user_cancelled'},
+}
+
+
+def _resolve_ticket(ref: TicketRef) -> TicketOutcome:
+    return ticket_outcome(_TICKET_WIRE[ref])
+
+
+def _resolver(make_tasks_db, store_dir: Path, rows: list[dict]) -> Callable[..., OwnerVerdict]:
+    db = make_tasks_db(rows, directory=store_dir)
+    return functools.partial(
+        resolve_owner,
+        read_tasks=functools.partial(read_tasks, db),
+        resolve_ticket=_resolve_ticket,
+    )
+
+
+def test_a_pending_task_owner_is_live(make_tasks_db, store_dir):
+    verdict = _resolver(make_tasks_db, store_dir, [{'id': 10, 'status': 'pending'}])(TaskRef(10))
+    assert verdict.owner == TaskRef(10)
+    assert verdict.liveness is Liveness.LIVE
+    assert verdict.owning_task == 10
+    assert verdict.path == (10,)
+    assert verdict.cause is None
+
+
+def test_an_absent_task_owner_is_dead(make_tasks_db, store_dir):
+    """Scenario 17: an owner the store does not hold."""
+    verdict = _resolver(make_tasks_db, store_dir, [{'id': 10, 'status': 'pending'}])(TaskRef(99))
+    assert verdict.liveness is Liveness.DEAD
+    assert verdict.cause is DeathCause.OWNER_ABSENT
+    assert verdict.owning_task is None
+
+
+@pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred'])
+def test_a_closed_owner_with_no_successor_is_dead_and_says_how(make_tasks_db, store_dir, status):
+    verdict = _resolver(make_tasks_db, store_dir, [{'id': 10, 'status': status}])(TaskRef(10))
+    assert verdict.liveness is Liveness.DEAD
+    assert verdict.cause is DeathCause.OWNER_CLOSED
+    assert verdict.closed_status == status
+    assert verdict.owning_task is None
+
+
+def test_a_closed_owner_lives_through_a_coalesced_successor(make_tasks_db, store_dir):
+    """Scenario 18."""
+    resolve = _resolver(
+        make_tasks_db,
+        store_dir,
+        [
+            {'id': 10, 'status': 'done', 'metadata': {'x_coalesced_into': 11}},
+            {'id': 11, 'status': 'pending'},
+        ],
+    )
+    verdict = resolve(TaskRef(10))
+    assert verdict.liveness is Liveness.LIVE_VIA_SUCCESSOR
+    assert verdict.owning_task == 11
+    assert verdict.path == (10, 11)
+    assert verdict.cause is None
+
+
+def test_a_deferred_owner_lives_through_its_carrier(make_tasks_db, store_dir):
+    resolve = _resolver(
+        make_tasks_db,
+        store_dir,
+        [
+            {'id': 10, 'status': 'deferred', 'metadata': {'deferral': _carried_by(11)}},
+            {'id': 11, 'status': 'in-progress'},
+        ],
+    )
+    verdict = resolve(TaskRef(10))
+    assert verdict.liveness is Liveness.LIVE_VIA_SUCCESSOR
+    assert verdict.owning_task == 11
+
+
+def test_a_successor_chain_is_followed_to_its_first_live_task(make_tasks_db, store_dir):
+    resolve = _resolver(
+        make_tasks_db,
+        store_dir,
+        [
+            {'id': 10, 'status': 'done', 'metadata': {'x_coalesced_into': 11}},
+            {'id': 11, 'status': 'cancelled', 'metadata': {'x_coalesced_into': '12'}},
+            {'id': 12, 'status': 'pending'},
+        ],
+    )
+    verdict = resolve(TaskRef(10))
+    assert verdict.liveness is Liveness.LIVE_VIA_SUCCESSOR
+    assert verdict.owning_task == 12
+    assert verdict.path == (10, 11, 12)
+
+
+def test_a_successor_cycle_terminates_dead(make_tasks_db, store_dir):
+    resolve = _resolver(
+        make_tasks_db,
+        store_dir,
+        [
+            {'id': 10, 'status': 'done', 'metadata': {'x_coalesced_into': 11}},
+            {'id': 11, 'status': 'done', 'metadata': {'x_coalesced_into': 10}},
+        ],
+    )
+    verdict = resolve(TaskRef(10))
+    assert verdict.liveness is Liveness.DEAD
+    assert verdict.cause is DeathCause.SUCCESSOR_UNRESOLVED
+    assert verdict.path == (10, 11)
+
+
+def test_a_successor_the_store_does_not_hold_is_unresolved(make_tasks_db, store_dir):
+    resolve = _resolver(
+        make_tasks_db,
+        store_dir,
+        [{'id': 10, 'status': 'done', 'metadata': {'x_coalesced_into': 11}}],
+    )
+    verdict = resolve(TaskRef(10))
+    assert verdict.cause is DeathCause.SUCCESSOR_UNRESOLVED
+    assert verdict.closed_status == 'done'
+
+
+def _chain(hops: int) -> list[dict]:
+    """Task 100 handing on through *hops* successor links to a live last task."""
+    closed = [
+        {'id': 100 + index, 'status': 'done', 'metadata': {'x_coalesced_into': 101 + index}}
+        for index in range(hops)
+    ]
+    return [*closed, {'id': 100 + hops, 'status': 'pending'}]
+
+
+def test_a_chain_of_exactly_the_bound_is_followed(make_tasks_db, store_dir):
+    resolve = _resolver(make_tasks_db, store_dir, _chain(MAX_SUCCESSOR_HOPS))
+    verdict = resolve(TaskRef(100))
+    assert verdict.liveness is Liveness.LIVE_VIA_SUCCESSOR
+    assert verdict.owning_task == 100 + MAX_SUCCESSOR_HOPS
+
+
+def test_a_chain_longer_than_the_bound_is_unresolved(make_tasks_db, store_dir):
+    resolve = _resolver(make_tasks_db, store_dir, _chain(MAX_SUCCESSOR_HOPS + 1))
+    verdict = resolve(TaskRef(100))
+    assert verdict.liveness is Liveness.DEAD
+    assert verdict.cause is DeathCause.SUCCESSOR_UNRESOLVED
+
+
+def test_a_pending_ticket_owner_is_live_with_no_task_yet(make_tasks_db, store_dir):
+    verdict = _resolver(make_tasks_db, store_dir, [])(TICKET_PENDING)
+    assert verdict.liveness is Liveness.LIVE
+    assert verdict.owning_task is None
+    assert verdict.path == ()
+    assert verdict.ticket == _resolve_ticket(TICKET_PENDING)
+
+
+@pytest.mark.parametrize(
+    ('ticket', 'cause'),
+    [
+        (TICKET_UNKNOWN, DeathCause.TICKET_ABSENT),
+        (TICKET_FAILED, DeathCause.TICKET_FAILED),
+        (TICKET_REFUSED, DeathCause.TICKET_REFUSED),
+        (TICKET_CANCELLED, DeathCause.TICKET_CANCELLED),
+    ],
+)
+def test_a_ticket_that_yields_no_task_is_a_dead_owner(make_tasks_db, store_dir, ticket, cause):
+    """Scenario 17's ticket owners."""
+    verdict = _resolver(make_tasks_db, store_dir, [])(ticket)
+    assert verdict.liveness is Liveness.DEAD
+    assert verdict.cause is cause
+    assert verdict.ticket == _resolve_ticket(ticket)
+
+
+def test_a_created_ticket_is_owned_by_its_task(make_tasks_db, store_dir):
+    verdict = _resolver(make_tasks_db, store_dir, [{'id': 20, 'status': 'pending'}])(TICKET_CREATED)
+    assert verdict.liveness is Liveness.LIVE
+    assert verdict.owning_task == 20
+    assert verdict.path == (20,)
+
+
+def test_a_ticket_whose_task_was_cancelled_is_a_dead_owner(make_tasks_db, store_dir):
+    """Scenario 17: a TicketRef resolving to a cancelled task."""
+    verdict = _resolver(make_tasks_db, store_dir, [{'id': 20, 'status': 'cancelled'}])(TICKET_CREATED)
+    assert verdict.liveness is Liveness.DEAD
+    assert verdict.cause is DeathCause.OWNER_CLOSED
+    assert verdict.closed_status == 'cancelled'
+
+
+def test_a_combined_ticket_follows_its_task_to_a_successor(make_tasks_db, store_dir):
+    resolve = _resolver(
+        make_tasks_db,
+        store_dir,
+        [
+            {'id': 20, 'status': 'done', 'metadata': {'x_coalesced_into': 21}},
+            {'id': 21, 'status': 'pending'},
+        ],
+    )
+    verdict = resolve(TICKET_COMBINED)
+    assert verdict.liveness is Liveness.LIVE_VIA_SUCCESSOR
+    assert verdict.owning_task == 21
+    assert verdict.path == (20, 21)
+
+
+def test_an_unreadable_ticket_propagates_and_is_never_a_verdict(make_tasks_db, store_dir):
+    """INV-11: a server that cannot answer must not mass-produce dead owners."""
+    db = make_tasks_db([], directory=store_dir)
+
+    def unreadable(ref: TicketRef) -> TicketOutcome:
+        return ticket_outcome({'status': 'failed', 'reason': 'server_closed', 'task_id': None})
+
+    with pytest.raises(TicketUnreadable):
+        resolve_owner(
+            TICKET_CREATED,
+            read_tasks=functools.partial(read_tasks, db),
+            resolve_ticket=unreadable,
+        )
+
+
+@pytest.mark.parametrize(
+    ('liveness', 'cause'),
+    [
+        (Liveness.DEAD, None),
+        (Liveness.LIVE, DeathCause.OWNER_CLOSED),
+        (Liveness.LIVE_VIA_SUCCESSOR, DeathCause.OWNER_ABSENT),
+    ],
+)
+def test_a_verdict_has_a_cause_exactly_when_it_is_dead(liveness, cause):
+    with pytest.raises(ValueError) as excinfo:
+        OwnerVerdict(
+            owner=TaskRef(10),
+            liveness=liveness,
+            owning_task=None,
+            path=(10,),
+            cause=cause,
+            closed_status=None,
+            ticket=None,
+        )
+    assert str(liveness) in str(excinfo.value)
+    assert str(cause) in str(excinfo.value)
