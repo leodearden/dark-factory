@@ -2,6 +2,7 @@
 # Built at decompose 2026-10-16 by seats M-A and M-B, FAILs resolved by the lead
 # (config group to β, γ rule in role system prompts, η soak rows to ζ2, ι map via 6972 + β archive).
 # task_id values are stamped by commit_planning.
+# Revised after the batch critic 2026-10-16: β→β1/β2, λ→λ1/λ2, δ1b added, ε roles.py exposure, η train path.
 prd: plans/defect-tests-prd.md
 schema_version: 1
 tasks:
@@ -59,6 +60,15 @@ tasks:
     delivered_check:
       kind: manual
       reason: symbol names for the table and grammar are not fixed by the PRD; judged by α1's own table-driven tests (every legal transition accepted, every other refused)
+  - name: issue-kind-accessor
+    binding: 'producer:α1 — issue_kind_of(issue): fail-closed default defect, flagged (decision 16)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def issue_kind_of
+      paths:
+      - shared/src/shared/defects.py
+      expect: present
 - label: α2
   task_id: null
   title: declare_defect / record_defect_outcome write path, creation floor, update_task rejection, authority drift test
@@ -120,9 +130,9 @@ tasks:
     delivered_check:
       kind: manual
       reason: symbol names are not fixed by the PRD; B17 and the round-trip through get_task are the observable proof
-- label: β
+- label: β1
   task_id: null
-  title: Injected pytest plugin, collection map, static defect enumerator, -p and PYTHONPATH injection
+  title: Injected pytest plugin, verify-leg injection, map archiving, defect_tests config, marker registration
   capabilities:
   - name: pytest-leg-structured-injection-seam
     binding: capability→producer (wired) — orchestrator/src/orchestrator/verify_cmd.py::with_junitxml and with_pytest_timeout (structured PYTEST legs only; raw-retained and OPAQUE are no-ops), applied at orchestrator/src/orchestrator/verify.py inject-junit site; the INFO log on a suppressed injection is the B22 precedent
@@ -133,14 +143,11 @@ tasks:
   - name: tool-classification-pytest-vs-opaque
     binding: capability→producer (wired) — orchestrator/src/orchestrator/verify_cmd.py::ToolKind and parse_config_command (PYTEST, OPAQUE, raw-retained chains)
     verdict: PASS
-  - name: static-mark-grammar-primitives
-    binding: 'capability→producer (wired) — shared/src/shared/pytest_mark_grammar.py::marker_name, mark_elements, pytestmark_value (consumed by orchestrator/src/orchestrator/pytest_markers.py). Extent: name-level only; decorator walk, argument extraction and skip/xfail detection are β''s own work'
-    verdict: PASS
   - name: marker-registration-drift-test
     binding: capability→producer (wired) — orchestrator/tests/test_marker_registration_drift.py (β extends it for the defect marker in member pyprojects)
     verdict: PASS
   - name: defect-tests-mode-off-skips-injection
-    binding: 'producer:β — the defect_tests: config group (mode, max_plan_repairs, max_proof_replans, proof_timeout_secs, streak_threshold, test_file_pattern; reload green tier) moved to β on 2026-10-16 so β, ε, ζ1, ζ2 and η all read it from an upstream leaf; injection is skipped when mode == off'
+    binding: 'producer:β1 — the defect_tests: config group (mode, max_plan_repairs, max_proof_replans, proof_timeout_secs, streak_threshold, test_file_pattern; reload green tier) moved to β on 2026-10-16 so β, ε, ζ1, ζ2 and η all read it from an upstream leaf; injection is skipped when mode == off'
     verdict: PASS
     delivered_check:
       kind: grep
@@ -149,7 +156,7 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
   - name: plugin-file-alone-in-its-directory
-    binding: producer:β — absent on main
+    binding: producer:β1 — absent on main
     verdict: PASS
     delivered_check:
       kind: path
@@ -157,7 +164,7 @@ tasks:
       - shared/src/shared/_pytest_inject/_df_defect_plugin.py
       expect: present
   - name: plugin-registers-markers-additively
-    binding: producer:β — addinivalue_line registration so a target's own markers list is never overridden
+    binding: producer:β1 — addinivalue_line registration so a target's own markers list is never overridden
     verdict: PASS
     delivered_check:
       kind: grep
@@ -166,7 +173,7 @@ tasks:
       - shared/src/shared/_pytest_inject/
       expect: present
   - name: collection-map-written-next-to-junit
-    binding: producer:β — <junit>.tests.json collection map (consumed by client-feed ε 6972)
+    binding: producer:β1 — <junit>.tests.json collection map (consumed by client-feed ε 6972)
     verdict: PASS
     delivered_check:
       kind: grep
@@ -174,16 +181,8 @@ tasks:
       paths:
       - shared/src/shared/_pytest_inject/
       expect: present
-  - name: static-enumerator-module
-    binding: producer:β — absent on main
-    verdict: PASS
-    delivered_check:
-      kind: path
-      paths:
-      - shared/src/shared/defect_enumerator.py
-      expect: present
   - name: dash-p-flag-added-to-structured-pytest-legs
-    binding: producer:β — orchestrator adds -p _df_defect_plugin; identifier absent from orchestrator/src on main
+    binding: producer:β1 — orchestrator adds -p _df_defect_plugin; identifier absent from orchestrator/src on main
     verdict: PASS
     delivered_check:
       kind: grep
@@ -192,25 +191,13 @@ tasks:
       - orchestrator/src/orchestrator/
       expect: present
   - name: plugin-directory-on-pythonpath
-    binding: producer:β — only the _pytest_inject directory goes on PYTHONPATH; identifier absent from orchestrator/src on main
+    binding: producer:β1 — only the _pytest_inject directory goes on PYTHONPATH; identifier absent from orchestrator/src on main
     verdict: PASS
     delivered_check:
       kind: grep
       pattern: _pytest_inject
       paths:
       - orchestrator/src/orchestrator/
-      expect: present
-  - name: member-pyprojects-list-the-defect-marker
-    binding: producer:β — dark-factory members register the marker (with drift test)
-    verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: defect[(:]
-      paths:
-      - pyproject.toml
-      - orchestrator/pyproject.toml
-      - shared/pyproject.toml
-      - fused-memory/pyproject.toml
       expect: present
   - name: no-shadowing-and-non-workspace-verification
     binding: rejection-mechanism — B21 and B18 fixtures (project with its own top-level testing module, filterwarnings=error) built by β and observed
@@ -219,13 +206,115 @@ tasks:
       kind: manual
       reason: no-shadowing is a runtime property of the one-file directory, proven by fixture, not by grep
   - name: tests-json-archived-beside-the-archived-junit
-    binding: producer:β — verify.py::_archive_junit_report (cost and attributing paths) also archives the sibling <junit>.tests.json under the junit's stem, so client-feed's archive reader (6969) and ι see the map
+    binding: producer:β1 — verify.py::_archive_junit_report (cost and attributing paths) also archives the sibling <junit>.tests.json under the junit's stem, so client-feed's archive reader (6969) and ι see the map
     verdict: PASS
     delivered_check:
       kind: grep
       pattern: tests\.json
       paths:
       - orchestrator/src/orchestrator/verify.py
+      expect: present
+  - name: defect-marker-registered-in-root
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - pyproject.toml
+      expect: present
+  - name: defect-marker-registered-in-cockpit
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - cockpit/pyproject.toml
+      expect: present
+  - name: defect-marker-registered-in-dashboard
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - dashboard/pyproject.toml
+      expect: present
+  - name: defect-marker-registered-in-escalation
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - escalation/pyproject.toml
+      expect: present
+  - name: defect-marker-registered-in-fused-memory
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - fused-memory/pyproject.toml
+      expect: present
+  - name: defect-marker-registered-in-orchestrator
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - orchestrator/pyproject.toml
+      expect: present
+  - name: defect-marker-registered-in-sampler
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - sampler/pyproject.toml
+      expect: present
+  - name: defect-marker-registered-in-shared
+    binding: producer:β1 — marker registration (per member; one check per file because grep paths are disjunctive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: defect[(:]
+      paths:
+      - shared/pyproject.toml
+      expect: present
+  - name: outcome-recorder-reads-call-excinfo-xdist-safe
+    binding: producer:β1 — outcomes from pytest_runtest_makereport hookwrapper and pytest_exception_interact (call.excinfo); ImportError module=e.name symbol=e.name_from; single designated writer, atomic replace (decision 9)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: judged by β1's fixtures including an -n 2 run and B4
+- label: β2
+  task_id: null
+  title: 'Static defect enumerator: enumerate_source, tree walker, completeness, skip/xfail, CLI'
+  capabilities:
+  - name: static-mark-grammar-primitives
+    binding: 'capability→producer (wired) — shared/src/shared/pytest_mark_grammar.py::marker_name, mark_elements, pytestmark_value (consumed by orchestrator/src/orchestrator/pytest_markers.py). Extent: name-level only; decorator walk, argument extraction and skip/xfail detection are β2''s own work'
+    verdict: PASS
+  - name: static-enumerator-module
+    binding: producer:β2 — absent on main
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/defect_enumerator.py
+      expect: present
+  - name: enumerate-source-entry-point
+    binding: producer:β2 — pure per-file entry point enumerate_source(path, text) so η enumerates from git objects
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def enumerate_source
+      paths:
+      - shared/src/shared/defect_enumerator.py
       expect: present
 - label: γ
   task_id: null
@@ -241,7 +330,7 @@ tasks:
     binding: 'producer:γ — decision 17 (amended 2026-10-16): DEFECT_TEST_RULE is spliced into the system prompts of ARCHITECT (covers replan), IMPLEMENTER (covers amender), SIMPLE_TASK, DEBUGGER and STEWARD, one site per dispatch; declared defects are listed only in the task-preamble briefings via _format_task (the debugger and amender briefings carry no task record by design)'
     verdict: PASS
   - name: marker-binding-the-rule-names
-    binding: producer:β upstream — @pytest.mark.defect registration and the static enumerator (β is a γ prerequisite)
+    binding: producer:β1 upstream — @pytest.mark.defect registration and the static enumerator (β is a γ prerequisite)
     verdict: PASS
   - name: defects-metadata-type-for-rendering
     binding: producer:α1 upstream — DefectDeclaration and the registered defects slice
@@ -319,9 +408,6 @@ tasks:
   - name: issue-validator-seam
     binding: 'producer:task-5494 upstream (pending, no deps) — per-issue shape and vocabulary validation derived from _REVIEWER_CONTRACT_TEMPLATE in _submit_review_verdict. Extent caveat: 5494 prefers normalise-and-flag and rejects only unusable issues, so δ1''s hard refusal of a missing or unknown kind is δ1''s own rule on top of that seam'
     verdict: PASS
-  - name: review-payload-normaliser-for-legacy-default
-    binding: producer:task-6739 upstream (pending; deps 6736, 6737) — orchestrator/src/orchestrator/review_payload.py::normalize_review does not exist on main; 6739 creates it and rewrites TaskArtifacts.aggregate_reviews over it, which is the seam where the legacy kind default applies
-    verdict: PASS
   - name: verdict-contract-edit-sequencing
     binding: producer:task-5224 upstream (pending; deps 5221, 5223) — adds note_dispositions to the same verdict tool and contract template; one harness bump per landing
     verdict: PASS
@@ -355,6 +441,25 @@ tasks:
     delivered_check:
       kind: manual
       reason: rejection quality is judged by B7 fixtures; the harness-version literal is not predictable because 5224 or 5494 may bump first
+  - name: legacy-kind-default-via-accessor
+    binding: producer:α1 upstream — issue_kind_of; δ1 no longer waits on 6739
+    verdict: PASS
+- label: δ1b
+  task_id: null
+  title: Route the review-payload normaliser (6739) through issue_kind_of
+  capabilities:
+  - name: review-payload-normaliser-for-legacy-default
+    binding: producer:task-6739 upstream — review_payload.py::normalize_review (absent on main; 6739 creates it); δ1b routes its kind read through α1 issue_kind_of
+    verdict: PASS
+  - name: normaliser-uses-accessor
+    binding: producer:δ1b
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: issue_kind_of
+      paths:
+      - orchestrator/src/orchestrator/review_payload.py
+      expect: present
 - label: δ2
   task_id: null
   title: 'Reviewer consumption: in-task defect declaration writer, ruling application, reviewer briefing'
@@ -407,6 +512,49 @@ tasks:
     delivered_check:
       kind: manual
       reason: section heading is not fixed by the PRD; judged by the persisted reviewer briefing test
+- label: θ1
+  task_id: null
+  title: 'Auto-filing sites declare defects: submit_only_instructions, steward and deep-reviewer templates, curator candidate and combine'
+  capabilities:
+  - name: submit-only-instructions-defects-parameter
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/agents/roles.py::submit_only_instructions, called by _FOLLOWUP_FILING_INSTRUCTIONS, the STEWARD templates and DEEP_REVIEWER, and by review_checkpoint.py::_build_prompt; the defects parameter is this leaf's deliverable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^\s+defects\s*:'
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: review-checkpoint-prompt-declares-defects
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/review_checkpoint.py::_build_prompt calls submit_only_instructions; passing the defects block is this leaf's deliverable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \bdefects\b
+      paths:
+      - orchestrator/src/orchestrator/review_checkpoint.py
+      expect: present
+  - name: agent-followup-ref-keys-already-in-the-template
+    binding: capability→producer (wired) — _FOLLOWUP_FILING_INSTRUCTIONS metadata already carries spawned_from and suggestion_hash, the two inputs of ref followup:<spawned_from>:<suggestion_hash>; the ref grammar is producer:α1 upstream
+    verdict: PASS
+  - name: submit-task-accepts-open-defects
+    binding: 'producer:α2 upstream (submit_task creation floor: defects accepted only as open entries with no proof and no ruling)'
+    verdict: PASS
+  - name: curator-candidate-carries-declarations
+    binding: capability→producer (wired) — fused-memory/src/fused_memory/middleware/task_interceptor.py::_build_candidate constructs task_curator.py::CandidateTask (no defects field on main); the field, its payload_hash inclusion and the metadata plumb are this leaf's deliverable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \bdefects\b
+      paths:
+      - fused-memory/src/fused_memory/middleware/task_curator.py
+      expect: present
+  - name: combine-declares-only-onto-a-pending-target
+    binding: capability→producer (wired) — task_curator.py::is_combine_eligible_status is pending-only and task_interceptor.py::_execute_combine already takes candidate_metadata and aborts to create on an ineligible target, so the in-progress half of B15 is existing behaviour; the declare_defect call on the pending branch is producer:α2 upstream plus this leaf
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: B15 behaviour (pending target gains entries via declare_defect, in-progress target gets a separate task); no stable symbol is fixed by the PRD, and declare_defect may legitimately already appear in the interceptor once α2 lands
 - label: ε
   task_id: null
   title: Plan tools (reproduces, declare_not_reproducible, declare_withdrawn, retire_defect_test), plan check, defect_tests config
@@ -505,7 +653,7 @@ tasks:
       - orchestrator/src/orchestrator/artifacts.py
       expect: present
   - name: defect-tests-config-group
-    binding: 'producer:β upstream — the defect_tests: config group (moved from ε to β, 2026-10-16)'
+    binding: 'producer:β1 upstream — the defect_tests: config group (moved from ε to β, 2026-10-16)'
     verdict: PASS
   - name: simple-path-veto-and-shadow-recording
     binding: producer:ε — veto in _should_run_simple_task under enforce; post-hoc recording check in _run_simple_task under shadow
@@ -531,6 +679,27 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/event_store.py
       expect: present
+  - name: plan-tools-in-plan-creator-allowlist
+    binding: producer:ε — the three plan tools join roles.py::_PLAN_CREATOR_TOOLS
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mcp__plan-tools__declare_not_reproducible
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: declare-defect-exposed-to-fixing-roles
+    binding: producer:ε — mcp__fused-memory__declare_defect in IMPLEMENTER, DEBUGGER, STEWARD, SIMPLE_TASK allowed_tools; DEFECT_TEST_RULE gains the declaration clause
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mcp__fused-memory__declare_defect
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: theta1-roles-serialization
+    binding: producer:θ1 upstream (roles.py serialization γ → δ1 → θ1 → ε)
+    verdict: PASS
 - label: ζ1
   task_id: null
   title: 'Proof runner: PROOF_BASE worktree, test-side overlay, injected-plugin legs, DefectProof, scripts/prove_defect.py'
@@ -569,13 +738,13 @@ tasks:
     binding: capability→producer (wired) — orchestrator/src/orchestrator/verify.py::_run_cmd (async, timeout) and verify.py::_target_subprocess_env (target-venv env scrub); base-tree venv via verify.py::_preprovision_shared_venv (wired at the verify pre-provision site)
     verdict: PASS
   - name: injected-plugin-outcome-recorder-and-static-enumerator
-    binding: producer:β upstream — β scope covers the single-file plugin (markers, collection map, outcome recorder), the -p injection in verify_cmd.py and shared/src/shared/defect_enumerator.py; record-file location and the recorder's activation switch are not pinned in the PRD, see notes
+    binding: producer:β1/β2 upstream — β scope covers the single-file plugin (markers, collection map, outcome recorder), the -p injection in verify_cmd.py and shared/src/shared/defect_enumerator.py; record-file location and the recorder's activation switch are not pinned in the PRD, see notes
     verdict: PASS
   - name: defect-vocabulary-and-record-defect-outcome-write-path
     binding: producer:α2 upstream (record_defect_outcome applying Proof and Rule events) over producer:α1 (DefectProof, Ruling, transition table); orchestrator-side call via orchestrator/src/orchestrator/mcp_lifecycle.py::mcp_call (scripts) and scheduler.py SchedulerFacade.dispatch_tool (workflow) — generic tool passthrough, no allowlist
     verdict: PASS
   - name: defect-tests-config-group-readable-by-the-proof
-    binding: 'producer:β upstream — the defect_tests: config group (moved to β, 2026-10-16)'
+    binding: 'producer:β1/β2 upstream — the defect_tests: config group (moved to β, 2026-10-16)'
     verdict: PASS
   - name: scripts-prove-defect-cli
     binding: own deliverable — scripts/prove_defect.py <task> [--rule <ref> accept|reject --reason ...] recording through record_defect_outcome
@@ -663,12 +832,15 @@ tasks:
     delivered_check:
       kind: manual
       reason: behavioural; judged by the B1, B3, B5 defect_proof events in runs.db and the soak report output
+  - name: process-level-streak-in-harness
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/harness.py constructs workflows via workflow.py::build_workflow; ζ2 constructs one KeyedStreaks there and passes it in
+    verdict: PASS
 - label: η
   task_id: null
   title: 'Merge presence check and keep-ratchet: merge_lane/defect_checks.py, typed DefectMergeRefusal, defect_keep_check event'
   capabilities:
   - name: merge-gate-call-site-with-candidate-and-parent-trees
-    binding: capability→producer (wired) — orchestrator/src/orchestrator/merge_lane/worker.py::classify_and_merge step 6 drop-guard (merge_lane/gates.py::_check_plan_targets_in_tree is handed merge_commit and base_sha, the speculative or main parent); MergeRequest.config carries OrchestratorConfig
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/merge_lane/worker.py::classify_and_merge step 6 drop-guard (merge_lane/gates.py::_check_plan_targets_in_tree is handed merge_commit and base_sha, the speculative or main parent); MergeRequest.config carries OrchestratorConfig; AND merge_lane/worker.py::_do_train_merge per member (trains skip classify_and_merge), each member against its own parent
     verdict: PASS
   - name: git-object-reads-for-both-trees
     binding: capability→producer (wired) — merge_lane/gates.py already runs git ls-tree -r and git show <rev>:<path> against commits, never a working copy
@@ -686,13 +858,13 @@ tasks:
       - orchestrator/src/orchestrator/merge_lane/types.py
       expect: present
   - name: static-enumeration-from-file-contents
-    binding: producer:β upstream (shared/src/shared/defect_enumerator.py with per-file completeness and skip/xfail detection); the PRD does not pin a pure per-file source-text entry point, which η needs to enumerate from git objects, see notes
+    binding: producer:β1/β2 upstream (shared/src/shared/defect_enumerator.py with per-file completeness and skip/xfail detection); the PRD does not pin a pure per-file source-text entry point, which η needs to enumerate from git objects, see notes
     verdict: PASS
   - name: proof-records-and-retirement-records-readable
     binding: producer:α1 upstream (DefectProof.node_ids, Retirement, Ruling) and producer:α2 upstream (declare_defect/record_defect_outcome, usable to seed B23's accepted retirement); producer:ζ1 upstream for PROVEN records; event type defect_keep_check from producer:ε upstream
     verdict: PASS
   - name: defect-tests-mode-readable-at-the-merge-gate
-    binding: 'producer:β upstream — the defect_tests: config group (moved to β, 2026-10-16)'
+    binding: 'producer:β1/β2 upstream — the defect_tests: config group (moved to β, 2026-10-16)'
     verdict: PASS
   - name: defect-checks-module
     binding: own deliverable — orchestrator/src/orchestrator/merge_lane/defect_checks.py, every function at or below cognitive complexity 15 (merge_lane_ratchet_baseline.json params.new_function_cognitive_ceiling); merge_lane/**/*.py is in params.cluster_paths
@@ -721,49 +893,9 @@ tasks:
     delivered_check:
       kind: manual
       reason: behavioural; judged by B10 to B14, B16 and B23 at the merge lane, not by a grep
-- label: θ1
-  task_id: null
-  title: 'Auto-filing sites declare defects: submit_only_instructions, steward and deep-reviewer templates, curator candidate and combine'
-  capabilities:
-  - name: submit-only-instructions-defects-parameter
-    binding: capability→producer (wired) — orchestrator/src/orchestrator/agents/roles.py::submit_only_instructions, called by _FOLLOWUP_FILING_INSTRUCTIONS, the STEWARD templates and DEEP_REVIEWER, and by review_checkpoint.py::_build_prompt; the defects parameter is this leaf's deliverable
+  - name: fleet-streak-injected-into-merge-worker
+    binding: producer:ζ2 upstream — the process-level KeyedStreaks constructed in harness.py; η injects it into SpeculativeMergeWorker
     verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: '^\s+defects\s*:'
-      paths:
-      - orchestrator/src/orchestrator/agents/roles.py
-      expect: present
-  - name: review-checkpoint-prompt-declares-defects
-    binding: capability→producer (wired) — orchestrator/src/orchestrator/review_checkpoint.py::_build_prompt calls submit_only_instructions; passing the defects block is this leaf's deliverable
-    verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: \bdefects\b
-      paths:
-      - orchestrator/src/orchestrator/review_checkpoint.py
-      expect: present
-  - name: agent-followup-ref-keys-already-in-the-template
-    binding: capability→producer (wired) — _FOLLOWUP_FILING_INSTRUCTIONS metadata already carries spawned_from and suggestion_hash, the two inputs of ref followup:<spawned_from>:<suggestion_hash>; the ref grammar is producer:α1 upstream
-    verdict: PASS
-  - name: submit-task-accepts-open-defects
-    binding: 'producer:α2 upstream (submit_task creation floor: defects accepted only as open entries with no proof and no ruling)'
-    verdict: PASS
-  - name: curator-candidate-carries-declarations
-    binding: capability→producer (wired) — fused-memory/src/fused_memory/middleware/task_interceptor.py::_build_candidate constructs task_curator.py::CandidateTask (no defects field on main); the field, its payload_hash inclusion and the metadata plumb are this leaf's deliverable
-    verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: \bdefects\b
-      paths:
-      - fused-memory/src/fused_memory/middleware/task_curator.py
-      expect: present
-  - name: combine-declares-only-onto-a-pending-target
-    binding: capability→producer (wired) — task_curator.py::is_combine_eligible_status is pending-only and task_interceptor.py::_execute_combine already takes candidate_metadata and aborts to create on an ineligible target, so the in-progress half of B15 is existing behaviour; the declare_defect call on the pending branch is producer:α2 upstream plus this leaf
-    verdict: PASS
-    delivered_check:
-      kind: manual
-      reason: B15 behaviour (pending target gains entries via declare_defect, in-progress target gets a separate task); no stable symbol is fixed by the PRD, and declare_defect may legitimately already appear in the interceptor once α2 lands
 - label: θ2
   task_id: null
   title: 'Docs and skills: findings-contract pointer, hand-filing recipes, flake-ledger reciprocal sentence'
@@ -866,10 +998,10 @@ tasks:
     binding: producer:task-6972 upstream (amended 2026-10-16 to read β's <junit>.tests.json map; 6972 depends on β) for the criterion half; ι itself reads the map's defects field in criteria.py
     verdict: PASS
   - name: tests-json-map-written-beside-junit-by-the-plugin
-    binding: producer:β upstream (plugin writes <junit>.tests.json beside --junitxml, mode not off)
+    binding: producer:β1 upstream (plugin writes <junit>.tests.json beside --junitxml, mode not off)
     verdict: PASS
   - name: tests-json-map-archived-beside-the-archived-junit
-    binding: producer:β upstream — β archives the sibling <junit>.tests.json beside the archived junit (verify.py::_archive_junit_report)
+    binding: producer:β1 upstream — β archives the sibling <junit>.tests.json beside the archived junit (verify.py::_archive_junit_report)
     verdict: PASS
   - name: merge-run-junit-archived-at-full-merge-breadth
     binding: capability→producer (wired) for dark-factory — dark-factory-orchestrator.yaml sets merge_verify_breadth full and verify.py::_JunitReportPlan kind 'attributing' archives the merge-run junit; for client projects producer:task-7008 (pending, flips the shipped default scoped to full)
@@ -898,12 +1030,12 @@ tasks:
     delivered_check:
       kind: manual
       reason: judged by fixtures with and without a map; not_recorded already appears in 6969's archive reader, so a grep would not isolate this leaf's work
-  - name: observed-not-seeded-real-defect-row
-    binding: own signal — publisher run over dark-factory's own merge-run junit and map shows a real defect ref with its outcome
+  - name: latest-real-run-reports-ref-or-explicit-zero
+    binding: own signal — a run over the latest real dark-factory merge-run junit and map reports a real ref or an explicit zero distinct from not_recorded (the observed real row moved to ξ)
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: needs a real defect-marked test merged on dark-factory main under the shipped pipeline; observed, never seeded
+      reason: judged by the run output; zero is legitimate before the first proven defect
 - label: κ
   task_id: null
   title: 'Debugger-edit fact to the reviewer: edited_failing_tests with could_not_determine'
@@ -939,45 +1071,57 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/
       expect: present
-- label: λ
+- label: λ1
   task_id: null
-  title: 'Integration gate: boundary module implementing B1 to B23 against the real seams'
+  title: 'Integration gate, workflow seam: B1–B9, B15, B17–B22'
   capabilities:
   - name: workflow-seam-hooks-for-b1-to-b9
     binding: producer:δ2, producer:ε, producer:ζ2 upstream (in-task declarations, plan check and mode, proof hook and replan), over producer:ζ1 (proof runner) and producer:δ1 (reviewer contract, B7); all in λ's transitive closure
-    verdict: PASS
-  - name: merge-seam-hooks-for-b10-to-b16-and-b23
-    binding: producer:η upstream (presence check, keep-ratchet, typed refusal); the speculative-train harness is orchestrator/tests/_merge_queue_harness.py (wired, in the ratchet cluster)
     verdict: PASS
   - name: filing-seam-for-b15
     binding: producer:θ1 upstream (curator combine onto a pending target)
     verdict: PASS
   - name: injection-seam-for-b18-b19-b21-b22
-    binding: producer:β upstream (plugin, enumerator, -p injection, PYTHONPATH entry) and producer:ζ1 (MARKER_NOT_STATIC and PROOF_UNSUPPORTED_RUNNER outcomes); reached through ζ2/η
+    binding: producer:β1 upstream (plugin, enumerator, -p injection, PYTHONPATH entry) and producer:ζ1 (MARKER_NOT_STATIC and PROOF_UNSUPPORTED_RUNNER outcomes); reached through ζ2/η
     verdict: PASS
   - name: authority-seam-for-b17-and-b20
     binding: producer:α2 upstream (record_defect_outcome in no role's allowed_tools drift test; update_task rejection) and producer:ζ1 (scripts/prove_defect.py --rule)
     verdict: PASS
-  - name: unblock-path-for-b14
-    binding: capability→producer (wired) — escalation/src/escalation/server.py builds MergeRequest for the merge_request MCP tool, which lands on the same merge worker η instruments
-    verdict: PASS
   - name: fake-agent-and-git-fixture-harness
     binding: capability→producer (wired) — orchestrator/tests/_workflow_helpers.py::FakeScheduler and the workflow test helpers; the fixture pytest workspace and the non-workspace pytest fixture project are this leaf's own deliverable
     verdict: PASS
-  - name: boundary-module-b1-to-b23
-    binding: own deliverable — one boundary module in the orchestrator suite; file name not fixed by the PRD, this manifest pins orchestrator/tests/test_defect_tests_boundary.py and the λ brief must name the same file
+  - name: boundary-module-workflow
+    binding: own deliverable
     verdict: PASS
     delivered_check:
       kind: path
       paths:
-      - orchestrator/tests/test_defect_tests_boundary.py
+      - orchestrator/tests/test_defect_tests_boundary_workflow.py
+      expect: present
+- label: λ2
+  task_id: null
+  title: 'Integration gate, merge seam: B10–B14, B16 (real train), B23'
+  capabilities:
+  - name: merge-seam-hooks-for-b10-to-b16-and-b23
+    binding: producer:η upstream (presence check, keep-ratchet, typed refusal); the speculative-train harness is orchestrator/tests/_merge_queue_harness.py (wired, in the ratchet cluster)
+    verdict: PASS
+  - name: unblock-path-for-b14
+    binding: capability→producer (wired) — escalation/src/escalation/server.py builds MergeRequest for the merge_request MCP tool, which lands on the same merge worker η instruments
+    verdict: PASS
+  - name: boundary-module-merge
+    binding: own deliverable
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_defect_tests_boundary_merge.py
       expect: present
 - label: μ
   task_id: null
   title: 'Human gate: flip defect_tests.mode to enforce'
   capabilities:
   - name: soak-report-available-to-the-decider
-    binding: producer:ζ2 upstream (scripts/defect_tests_soak_report.py, rows for defect_plan_check, defect_proof, defect_keep_check) via λ
+    binding: producer:ζ2 upstream (scripts/defect_tests_soak_report.py) via λ1/λ2; metadata.milestone delayed 14 days
     verdict: PASS
   - name: mode-flip-is-hot-reloadable
     binding: 'producer:ε upstream (defect_tests: group in the reload green tier) over orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS and the mcp__escalation__reload_config tool (wired)'
@@ -1014,3 +1158,9 @@ tasks:
     delivered_check:
       kind: manual
       reason: Leo decides whether about-lde.md (scoping-intake repo) may again say 'every bug or gap found during the build gets its own test, kept and run on every later version'; the gate has no code deliverable
+  - name: observed-real-defect-row-and-live-mode
+    binding: own — proceed only if the live yaml shows defect_tests.mode enforce; check an observed (not seeded) real defect row on the client display
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: human gate
