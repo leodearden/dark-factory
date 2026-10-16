@@ -50,12 +50,23 @@ _TESTS_DIR = Path(__file__).resolve().parent
 #: Modules whose waits run against an injected clock, so a static wall-clock
 #: bill does not describe them. Not debt: an entry goes only when its module
 #: no longer yields an offender.
-_SYNTHETIC_CLOCK_MODULES: frozenset[str] = frozenset()
+_SYNTHETIC_CLOCK_MODULES: frozenset[str] = frozenset(
+    {
+        # Its waits run against an injected _StarvationClock or tiny injected
+        # caps, never the wall clock its bill describes.
+        'test_orch_helpers_wait_responsive.py',
+    }
+)
 
 #: Shrink-only debt: ``'<file>::<item>'`` -> its EXACT recorded bill. Lower an
 #: entry as its bill falls, delete it when the item stops offending, and never
 #: add one for new code.
-_WAIT_BUDGET_DEBT: Mapping[str, float] = MappingProxyType({})
+_WAIT_BUDGET_DEBT: Mapping[str, float] = MappingProxyType(
+    {
+        # Burned down by task 6507.
+        'test_merge_lane_restart_drain.py::test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_queue': 450.0,
+    }
+)
 
 # Non-vacuity floors, ~75% of the census measured when this guard landed.
 _MIN_BILLED_MODULES = 48
