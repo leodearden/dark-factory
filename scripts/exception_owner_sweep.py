@@ -628,23 +628,67 @@ def _escalate(key: FindingKey, body: _Body, ports: Ports, now: datetime.datetime
     _call(ports.escalation, FailureStage.ESCALATION, 'escalate_info', args)
 
 
+TIGHTEN_COMMAND = 'uv run --project shared python scripts/inline_suppressions.py --tighten'
+
+MAX_OUTPUTS_PER_RUN = 10
+"""INV-4's storm bound: filings and escalations per run, plus one overflow roll-up."""
+
+
+def _tighten_body(slack: int) -> _Body:
+    remedy = f'Run `{TIGHTEN_COMMAND}` and commit the tightened baseline.'
+    return _Body(
+        summary=f'INV-12: tighten the inline-suppression baseline ({slack} slack)',
+        detail='\n'.join(
+            [
+                f'The inline-suppression baseline allows {slack} more unowned sites than the tree holds.',
+                f'Remedy: {remedy}',
+                f'Report: {REPORT_COMMAND}',
+            ]
+        ),
+        remedy=remedy,
+        observation=f'baseline slack_total {slack}',
+    )
+
+
+def _overflow_body(count: int) -> _Body:
+    remedy = f'Run `{REPORT_COMMAND}` to see every finding now; the sweep retries them next run.'
+    return _Body(
+        summary=f'INV-12 owner sweep: {count} finding(s) over the per-run output bound',
+        detail='\n'.join(
+            [
+                f'{count} finding(s) were neither filed nor escalated this run: the sweep sends '
+                f'at most {MAX_OUTPUTS_PER_RUN} outputs per run (INV-4).',
+                f'Remedy: {remedy}',
+            ]
+        ),
+        remedy=remedy,
+        observation=f'{count} finding(s) over the bound of {MAX_OUTPUTS_PER_RUN}',
+    )
+
+
 class _Outputs:
-    """One act() run's outputs: what it has filed, escalated and skipped so far."""
+    """One act() run's outputs: what it has sent, skipped and held back so far."""
 
     def __init__(self, ports: Ports, pending: frozenset[str], now: datetime.datetime) -> None:
         self.ports = ports
         self.pending = set(pending)
         self.now = now
+        self.budget = MAX_OUTPUTS_PER_RUN
         self.counts: collections.Counter[str] = collections.Counter()
 
     def raise_finding(self, key: FindingKey, body: _Body) -> None:
-        """Re-read the carriers, decide, and perform at most one output for *key*."""
+        """Re-read the carriers, decide, and perform at most one budgeted output for *key*."""
         action = decide(
             key, carriers=_carriers(self.ports, FINDING_KEY_FIELD), pending=frozenset(self.pending)
         )
         if action in (Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION):
             self.counts['skipped_existing'] += 1
-        elif action is Action.FILE_TASK:
+            return
+        if self.budget == 0:
+            self.counts['overflow'] += 1
+            return
+        self.budget -= 1
+        if action is Action.FILE_TASK:
             self._file(key, body)
         else:
             self._escalate(key, body)
@@ -661,6 +705,12 @@ class _Outputs:
         self.pending.add(key.escalation_task_id())
         self.counts['escalated'] += 1
 
+    def roll_up(self) -> None:
+        """The one unbudgeted message: how many findings the bound held back."""
+        held_back = self.counts['overflow']
+        if held_back and OVERFLOW_KEY.escalation_task_id() not in self.pending:
+            self._escalate(OVERFLOW_KEY, _overflow_body(held_back))
+
 
 def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
     """Re-resolve each cited owner immediately before acting on it, then act (INV-3)."""
@@ -674,4 +724,7 @@ def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
             outputs.counts['findings'] += 1
             key = FindingKey(FindingKind.DEAD_OWNER, citation.scope, citation.owner)
             outputs.raise_finding(key, _dead_owner_body(citation, verdict))
+    if scan.register.slack_total > 0:
+        outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
+    outputs.roll_up()
     return ActOutcome(**outputs.counts)
