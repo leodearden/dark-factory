@@ -948,21 +948,13 @@ async def test_prune_idempotent_ops_never_raises(journal):
 # list or GROUP BY affects whether that constraint is seekable. It is the
 # shape-independent floor and it cannot drift.
 #
-# The two constants after it are copied VERBATIM from the dashboard's consumers
-# — `get_memory_timeseries` and `get_agent_breakdown` in
-# `dashboard/src/dashboard/data/write_journal.py` (cited by FUNCTION NAME, never
-# by line number: line numbers in another package go stale on the next edit
-# there, which is exactly how this comment's first version broke). The two
-# packages have separate venvs and cannot import each other, and the schema
-# under test is produced by fused-memory, so the copy is deliberate.
-#
-# KNOWN GAP: nothing here detects the dashboard changing its SQL (e.g. adding a
-# `project_id = ?` filter or a BETWEEN range) — these copies would keep testing
-# the old shape and stay green while the real endpoint regressed. The test that
-# would close it belongs on the dashboard side, where the real SQL is
-# importable; that file is outside this task's lock, so it is filed as
-# follow-up rather than faked here. PREDICATE_SQL bounds the damage: the index's
-# own contract stays pinned regardless of what the consumers do.
+# TIMESERIES_SQL after it is the unhinted hour/kind rollup shape of the
+# dashboard's former `get_memory_timeseries`, which task 5597 folded into
+# `get_memory_ops` in `dashboard/src/dashboard/data/write_journal.py`. That
+# function's real compound statement is pinned against this schema on the
+# dashboard side, by
+# dashboard/tests/test_write_journal.py::TestMemoryOpsQueryPlan, so no copy of
+# a dashboard query is kept here.
 
 PREDICATE_SQL = 'SELECT COUNT(*) FROM write_ops WHERE created_at >= ?'
 
@@ -973,16 +965,9 @@ TIMESERIES_SQL = (
     ' GROUP BY hour, kind'
 )
 
-AGENT_BREAKDOWN_SQL = (
-    "SELECT COALESCE(agent_id, 'unknown') AS agent, COUNT(*) AS cnt"
-    ' FROM write_ops WHERE created_at >= ?'
-    ' GROUP BY agent ORDER BY cnt DESC'
-)
-
 SEEKABLE_QUERIES = (
     ('predicate only', PREDICATE_SQL),
-    ('get_memory_timeseries', TIMESERIES_SQL),
-    ('get_agent_breakdown', AGENT_BREAKDOWN_SQL),
+    ('hourly kind rollup', TIMESERIES_SQL),
 )
 
 

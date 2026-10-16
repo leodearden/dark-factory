@@ -157,8 +157,8 @@ CREATE TABLE IF NOT EXISTS write_ops (
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
--- idx_wo_created (task 3304): the dashboard filters a BARE `WHERE created_at >= ?`
--- in get_memory_timeseries / get_operations_breakdown / get_agent_breakdown
+-- idx_wo_created (task 3304): the dashboard range-filters `created_at` alone
+-- in get_memory_ops
 -- (dashboard/src/dashboard/data/write_journal.py — cited by function name, not
 -- line number, so the reference survives edits to that file). Every other
 -- write_ops index has created_at in SECOND position, so none of them can
