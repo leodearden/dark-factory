@@ -32,10 +32,11 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from _lane_episode_fakes import Clock, FakeLedgerClient
 from _orch_helpers import pydantic_spec
+from escalation.queue import EscalationQueue
 from pydantic import ValidationError
 from shared.testing_virtual_clock import virtual_clock_test
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_confirm import (
     Confirmed,
@@ -1457,6 +1458,59 @@ async def test_run_once_a_red_the_confirm_clears_files_nothing(tmp_path: Path):
     assert client.submitted == []
 
 
+async def _drive_one_pass(worker: OfflineLaneWorker, command: str) -> None:
+    """A merge lands and ``run()`` is driven as a background task until *command*'s next pass has recorded its effect."""
+    before = worker.records.current_pass(command)
+    await worker.on_post_merge('task-1', 'BASE', 'HEAD1')
+    task = asyncio.create_task(worker.run())
+    try:
+        while True:
+            assert not task.done(), f'the loop died: {task.exception()!r}'
+            current = worker.records.current_pass(command)
+            if current is not None and current is not before:
+                record = worker.records.load_pass(command, current.pass_id)
+                if record is not None and record.effect is not None:
+                    return
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_a_pass_record_older_than_the_retention_survives_while_a_held_episode_counts_it(tmp_path: Path):
+    """The run-record prune spares every pass an episode the engine still holds counted: the red that opened an
+    episode bound to an open task outlives the retention, while an unreferenced pass of that age is pruned."""
+    cmd = LaneCommand(name='q', command='pytest -m integration')
+    clock = Clock()
+    client = FakeLedgerClient([])
+    worker = _make_worker(
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=tmp_path / '_offline-deep'),
+        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd]),
+        command_runner=AsyncMock(return_value=(1, 'tail')),
+        confirm=_RecordingConfirm(_HELD),
+        task_client=client,
+        escalation_queue=EscalationQueue(tmp_path / 'queue'),
+        now=clock,
+    )
+    await _drive_one_pass(worker, 'q')
+    counted_pass_id = _pass_record(worker, 'q').pass_id
+    unreferenced = worker.records.allocate_pass('stale', Leg.GENERIC, 'HEAD9')
+    clock.advance(minutes=30)
+    await _drive_one_pass(worker, 'q')
+    (task_id,) = client.tasks
+    client.set_status(task_id, 'in-progress')
+
+    for _ in range(15):
+        clock.advance(hours=23)
+        await _drive_one_pass(worker, 'q')
+
+    assert worker.records.load_pass('q', counted_pass_id) is not None
+    assert not worker.records.pass_directory('stale', unreferenced.pass_id).exists()
+
+
 @pytest.mark.asyncio
 async def test_run_once_no_generic_commands_is_reify_byte_identical(tmp_path: Path):
     """With no generic commands and the legacy numeric gate ON, _run_once runs the numeric suite and
@@ -1570,6 +1624,17 @@ class _LoopRig:
         await self._event(f'{cmd.name}@{head}')
         return (0, '')
 
+    async def run_for(self, seconds: float) -> None:
+        """Run the loop for *seconds* of loop time."""
+        task = asyncio.create_task(self.worker.run())
+        try:
+            await asyncio.sleep(seconds)
+            assert not task.done(), f'the loop died: {task.exception()!r}'
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     async def run_until(self, ticks: int) -> list[str]:
         """Run the loop until the engine has been ticked *ticks* times; the events up to that tick."""
         task = asyncio.create_task(self.worker.run())
@@ -1606,6 +1671,26 @@ async def test_a_poll_timeout_ticks_the_engine_at_the_current_head(tmp_path: Pat
 
     assert events == ['tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD1', 'tick@HEAD1']
     assert rig.engine.tick_times == [_POLL_SECS, 2 * _POLL_SECS, 3 * _POLL_SECS]
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_poll_timeout_with_no_main_head_neither_ticks_the_engine_nor_rechecks(tmp_path: Path):
+    """When main reads no head, the poll ticks nothing and runs nothing, however long the loop idles; the
+    first poll that reads a head ticks as usual."""
+    rig = _LoopRig(tmp_path, [_due('q')])
+    rig.head = ''
+
+    await rig.run_for(5 * _POLL_SECS)
+
+    assert rig.events == []
+    assert rig.engine.tick_times == []
+
+    rig.head = 'HEAD1'
+    events = await rig.run_until(ticks=1)
+
+    assert events == ['tick@HEAD1']
 
 
 @pytest.mark.timeout(10)

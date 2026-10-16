@@ -42,7 +42,6 @@ from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_episode_state import (
-    EPISODE_RETENTION,
     EPISODES_FILE,
     CommandRecord,
     EpisodeStore,
@@ -621,7 +620,7 @@ class TestOfflineLaneEpisodeRecordSurvivesRedeploy:
 
     @pytest.mark.parametrize(
         ('idle', 'submitted'),
-        [(EPISODE_RETENTION - timedelta(minutes=1), 1), (EPISODE_RETENTION, 2)],
+        [(timedelta(days=14) - timedelta(minutes=1), 1), (timedelta(days=14), 2)],
         ids=['kept', 'expired'],
     )
     async def test_the_record_expires_fourteen_days_after_its_last_write(

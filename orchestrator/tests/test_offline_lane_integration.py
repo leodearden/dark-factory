@@ -1616,10 +1616,13 @@ async def test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_o
     task_id = lane.episode().covering_task_id
     assert task_id is not None
 
-    await _drive_lane_pass(lane, 'green')
+    green = await _drive_lane_pass(lane, 'green')
     await _drive_lane_pass(lane, 'red')
     await _drive_lane_pass(lane, 'red', minutes=11 * 60)
 
+    assert [(ended['node'], ended['reason']) for ended in green.effect['episodes_ended']] == [
+        (_TARGET, 'passed'),
+    ]
     assert len(lane.client.submitted) == 1
     assert lane.episode().covering_task_id == task_id
     assert lane.unlanded() == []
