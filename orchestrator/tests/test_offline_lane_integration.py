@@ -132,7 +132,7 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 # The measured worst-case count of subprocess spawns inside a single
 # `_run_lane` window -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check
 # is sized against. Measured in the SIBLING infra module's
-# `test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task`: 3 git
+# `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`: 3 git
 # spawns from `_run_once` plus 2 real infra `run_all.sh` spawns. See
 # `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` for the
 # full derivation.
@@ -1031,7 +1031,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     guessed: it is the measured worst-case count of subprocess spawns that
     occur INSIDE a single `_run_lane` window, and that worst case lives in
     the SIBLING infra module (``test_offline_lane_infra_integration.py``'s
-    `test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task`):
+    `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`):
     `_run_once`'s 3 git spawns (`get_main_sha`, `worktree list`, `worktree
     add`) plus the real infra seam spawning `run_all.sh` twice (the initial
     run and the isolated confirmation re-run). Later passes swap `worktree
@@ -1088,7 +1088,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The '
         f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}-spawn multiplier is the measured worst-case '
         f'count of subprocess spawns inside a single _run_lane window (see '
-        f'test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task in '
+        f'test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task in '
         f'test_offline_lane_infra_integration.py: 3 git spawns from _run_once plus 2 '
         f'real infra run_all.sh spawns).'
     )
@@ -1101,6 +1101,9 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     )
     from test_offline_lane_infra_integration import (  # noqa: PLC0415
         _SPAWNS_PER_DRIVE_ADVANCE as _infra_spawns_per_drive_advance,
+    )
+    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+        _SPAWNS_PER_FIXTURE_COMMIT as _infra_spawns_per_fixture_commit,
     )
     from test_offline_lane_infra_integration import (  # noqa: PLC0415
         _SPAWNS_PER_REPO_FIXTURE as _infra_spawns_per_repo_fixture,
@@ -1132,6 +1135,15 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'({_infra_spawns_per_drive_advance}) — both modules share byte-identical '
         f'_drive_advance bodies and harness fixture stubs, so a real divergence here '
         f"means one module's measurement (or fixture) has silently changed."
+    )
+    # Task 6861 — the same anti-drift rationale, for the fixture commit both
+    # modules' red-path rows pay once.
+    assert _infra_spawns_per_fixture_commit == _SPAWNS_PER_FIXTURE_COMMIT, (
+        f"this module's _SPAWNS_PER_FIXTURE_COMMIT ({_SPAWNS_PER_FIXTURE_COMMIT}) has "
+        f"drifted from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_spawns_per_fixture_commit}) — both modules commit their fixture '
+        f"with one add and one commit, so a real divergence here means one module's "
+        f'measurement (or helper) has silently changed.'
     )
     # Reviewer amendment (task 4203) — same anti-drift rationale, for the third
     # multiplicand test_b3_never_a_gate / test_ib2_infra_run_in_flight_never_gates_merge
