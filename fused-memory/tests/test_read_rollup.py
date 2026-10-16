@@ -7,12 +7,15 @@ public SQL constants; nothing is mocked.
 import itertools
 import sqlite3
 import uuid
+from collections import Counter
 
 import pytest
 
 from fused_memory.services.read_rollup import (
     COUNT_ONLY_READ_PREDICATE,
     COUNT_READ_SQL,
+    DELETE_COUNT_ONLY_READS_SQL,
+    RAW_READS_BY_ROLLUP_KEY_SQL,
     READ_OP_COUNTS_SCHEMA_SQL,
     keeps_read_row,
 )
@@ -171,3 +174,148 @@ class TestCountOnlyPredicateAgreesWithKeepsReadRow:
 
         assert selected == expected_count_only
         assert expected_count_only
+
+
+def _journal_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(':memory:')
+    conn.executescript(WRITE_OPS_SCHEMA_SQL)
+    conn.executescript(READ_OP_COUNTS_SCHEMA_SQL)
+    return conn
+
+
+_HOURS = ('2026-10-11T19', '2026-10-11T20', '2026-10-11T21')
+_COUNT_ONLY_OPERATIONS = ('get_task', 'get_statuses', None)
+
+
+def _seed_history(conn: sqlite3.Connection) -> list[dict]:
+    """Interleave count-only reads with search, failed and write rows by rowid.
+
+    Returns the seeded rows, rowid included, in insertion order.
+    """
+    seeded = []
+    for i in range(60):
+        at = f'{_HOURS[(i // 20) % 3]}:{(i * 7) % 60:02d}:{i % 60:02d}.{i:06d}+00:00'
+        shape = i % 5
+        if shape == 4:
+            kind, operation, success = 'write', 'add_memory', 1
+        elif shape == 3:
+            kind, operation, success = 'read', 'search', 1
+        elif shape == 2 and i % 10 == 2:
+            kind, operation, success = 'read', 'get_entity', 0
+        else:
+            kind, operation, success = 'read', _COUNT_ONLY_OPERATIONS[i % 3], 1
+        row = {
+            'id': f'op-{i}',
+            'operation': operation,
+            'project_id': ('dark_factory', 'reify')[(i // 2) % 2],
+            'agent_id': ('agent-a', None)[(i // 3) % 2],
+            'kind': kind,
+            'success': success,
+            'error': None if success else 'boom',
+            'params': '{"query": "q"}',
+            'created_at': at,
+        }
+        cursor = conn.execute(
+            'INSERT INTO write_ops (id, operation, project_id, agent_id, kind, success, error,'
+            ' params, created_at) VALUES (:id, :operation, :project_id, :agent_id, :kind,'
+            ' :success, :error, :params, :created_at)',
+            row,
+        )
+        seeded.append({**row, 'rowid': cursor.lastrowid})
+    return seeded
+
+
+def _is_count_only(row: dict) -> bool:
+    return row['kind'] == 'read' and not keeps_read_row(
+        operation=row['operation'], success=bool(row['success'])
+    )
+
+
+def _full_rows(conn: sqlite3.Connection) -> dict[int, tuple]:
+    return {row[0]: row[1:] for row in conn.execute('SELECT rowid, * FROM write_ops')}
+
+
+def _live_path_counts(rows: list[dict]) -> Counter:
+    """Key -> count, produced by the LIVE upsert applied once per row."""
+    conn = sqlite3.connect(':memory:')
+    conn.executescript(READ_OP_COUNTS_SCHEMA_SQL)
+    for row in rows:
+        conn.execute(
+            COUNT_READ_SQL,
+            (row['created_at'], row['project_id'], row['agent_id'], row['operation'], 1),
+        )
+    return Counter({
+        tuple(key): count
+        for *key, count in conn.execute(
+            'SELECT hour_start, project_id, agent_id, operation, count FROM read_op_counts'
+        )
+    })
+
+
+class TestMigrationChunkSql:
+    _LO, _HI = 8, 47
+
+    def _window_count_only(self, seeded: list[dict]) -> list[dict]:
+        return [
+            row for row in seeded
+            if self._LO <= row['rowid'] < self._HI and _is_count_only(row)
+        ]
+
+    def test_seed_covers_every_shape(self):
+        seeded = _seed_history(_journal_db())
+        count_only = [row for row in seeded if _is_count_only(row)]
+        assert {row['created_at'][:13] for row in count_only} == set(_HOURS)
+        assert {row['agent_id'] for row in count_only} == {'agent-a', None}
+        assert {row['project_id'] for row in count_only} == {'dark_factory', 'reify'}
+        assert {row['operation'] for row in seeded if not _is_count_only(row)} == {
+            'add_memory', 'search', 'get_entity',
+        }
+
+    def test_preview_matches_the_live_upsert_for_count_only_rows_in_the_window(self):
+        conn = _journal_db()
+        seeded = _seed_history(conn)
+
+        preview = conn.execute(RAW_READS_BY_ROLLUP_KEY_SQL, (self._LO, self._HI)).fetchall()
+
+        expected = _live_path_counts(self._window_count_only(seeded))
+        assert Counter({tuple(key): n for *key, n in preview}) == expected
+        assert sum(n for *_, n in preview) == len(self._window_count_only(seeded))
+        assert len(preview) == len(expected)
+
+    def test_preview_rows_fed_back_through_the_live_upsert_keep_their_keys(self):
+        conn = _journal_db()
+        _seed_history(conn)
+        preview = conn.execute(RAW_READS_BY_ROLLUP_KEY_SQL, (self._LO, self._HI)).fetchall()
+
+        conn.executemany(COUNT_READ_SQL, preview)
+
+        stored = conn.execute(
+            'SELECT hour_start, project_id, agent_id, operation, count FROM read_op_counts'
+        ).fetchall()
+        assert sorted(stored) == sorted(preview)
+
+    def test_delete_removes_exactly_the_window_count_only_rows(self):
+        conn = _journal_db()
+        seeded = _seed_history(conn)
+        before = _full_rows(conn)
+        preview = conn.execute(RAW_READS_BY_ROLLUP_KEY_SQL, (self._LO, self._HI)).fetchall()
+
+        deleted = conn.execute(DELETE_COUNT_ONLY_READS_SQL, (self._LO, self._HI)).rowcount
+
+        removed = {row['rowid'] for row in self._window_count_only(seeded)}
+        assert deleted == sum(n for *_, n in preview) == len(removed)
+        after = _full_rows(conn)
+        assert set(after) == set(before) - removed
+        assert all(after[rowid] == before[rowid] for rowid in after)
+
+    def test_rows_outside_the_window_are_untouched(self):
+        conn = _journal_db()
+        seeded = _seed_history(conn)
+        before = _full_rows(conn)
+
+        conn.execute(DELETE_COUNT_ONLY_READS_SQL, (self._LO, self._HI))
+
+        outside = [row for row in seeded if not self._LO <= row['rowid'] < self._HI]
+        assert any(_is_count_only(row) for row in outside)
+        after = _full_rows(conn)
+        assert all(after[row['rowid']] == before[row['rowid']] for row in outside)
