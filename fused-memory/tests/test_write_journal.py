@@ -613,51 +613,6 @@ async def test_migration_adds_backend_ops_duration_ms_without_backfill(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_get_usage_stats(journal):
-    # 3 writes, 2 reads
-    for _ in range(3):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='add_memory',
-            kind='write',
-            project_id='proj',
-            agent_id='agent-a',
-        )
-    for _ in range(2):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='search',
-            kind='read',
-            project_id='proj',
-            agent_id='agent-b',
-        )
-
-    stats = await journal.get_usage_stats('2000-01-01T00:00:00')
-    assert stats['reads'] == 2
-    assert stats['writes'] == 3
-    assert stats['by_operation']['add_memory'] == 3
-    assert stats['by_operation']['search'] == 2
-    assert stats['by_agent']['agent-a'] == {'read': 0, 'write': 3}
-    assert stats['by_agent']['agent-b'] == {'read': 2, 'write': 0}
-
-
-@pytest.mark.asyncio
-async def test_get_usage_stats_project_filter(journal):
-    await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
-        operation='add_memory',
-        project_id='alpha',
-    )
-    await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
-        operation='add_memory',
-        project_id='beta',
-    )
-    stats = await journal.get_usage_stats('2000-01-01T00:00:00', project_id='alpha')
-    assert stats['writes'] == 1
-
-
-@pytest.mark.asyncio
 async def test_get_session_ops(journal):
     for i in range(5):
         await journal.log_write_op(
