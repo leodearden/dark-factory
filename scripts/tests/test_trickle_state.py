@@ -31,7 +31,6 @@ import pwd
 import tempfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 from legibility import trickle_state
@@ -960,14 +959,19 @@ class TestRecordRunCensusFireStreak:
     def test_census_is_a_required_keyword(self):
         """A defaulted ``census=None`` is how a future caller would silently
         blind the census progress probe into a permanent OK."""
-        without_census: dict[str, Any] = dict(
-            target_date=date(2026, 7, 1),
-            recorded_at=datetime(2026, 7, 1, tzinfo=UTC),
-            exit_code=0,
-            **_counters(),
-        )
         with pytest.raises(TypeError, match='census'):
-            trickle_state.record_run('dark_factory', **without_census)
+            trickle_state.record_run(  # pyright: ignore[reportCallIssue]
+                'dark_factory',
+                target_date=date(2026, 7, 1),
+                recorded_at=datetime(2026, 7, 1, tzinfo=UTC),
+                exit_code=0,
+                total_records=0,
+                zero_signal_dropped=0,
+                dedupe_collapsed=0,
+                below_sampling_cut=0,
+                budget_skipped=0,
+                selected_count=0,
+            )
 
 
 class TestReadCensusFireStreak:
