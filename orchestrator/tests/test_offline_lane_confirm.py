@@ -7,7 +7,6 @@ scenarios follow in this file under ``TestRealPytest…`` classes.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shlex
 import sys
@@ -34,7 +33,6 @@ from orchestrator.offline_lane_confirm import (
     UnconfirmableReason,
     confirm,
     confirm_mode,
-    legacy_confirmed_ids,
     outcome_from_json,
     outcome_to_json,
     partition,
@@ -509,36 +507,6 @@ class TestConfirmTarget:
     def test_a_command_goes_with_the_generic_leg_only(self, tmp_path: Path, leg: Leg, with_command: bool) -> None:
         with pytest.raises(ValueError, match='generic'):
             ConfirmTarget(leg, tmp_path, _lane_command() if with_command else None)
-
-
-class TestLegacyConfirmedIds:
-    def test_confirmed_projects_to_its_sorted_reproduced_ids(self) -> None:
-        outcome = Confirmed(ConfirmMode.NARROWED, ('tests/t.py::b', 'tests/t.py::a'), ('tests/t.py::c',), ())
-        assert legacy_confirmed_ids(outcome, command_name='unit', leg=Leg.GENERIC) == ['tests/t.py::a', 'tests/t.py::b']
-
-    def test_a_generic_confirm_exiting_nonzero_naming_no_test_is_the_command_sentinel(self) -> None:
-        outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
-        assert legacy_confirmed_ids(outcome, command_name='unit', leg=Leg.GENERIC) == ['unit::unconfirmable']
-
-    @pytest.mark.parametrize(
-        ('reason', 'leg'),
-        [
-            (UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, Leg.INFRA),
-            (UnconfirmableReason.DETECT_RED_NAMED_NO_TEST, Leg.GENERIC),
-            (UnconfirmableReason.CONFIRM_SIGNAL_ENDED, Leg.GENERIC),
-            (UnconfirmableReason.ID_FAILED_ROUND_TRIP, Leg.GENERIC),
-            (UnconfirmableReason.NUMERIC_EXIT, Leg.NUMERIC),
-        ],
-    )
-    def test_every_other_unconfirmable_confirms_nothing_with_a_warning(
-        self, caplog: pytest.LogCaptureFixture, reason: UnconfirmableReason, leg: Leg,
-    ) -> None:
-        with caplog.at_level(logging.WARNING, logger='orchestrator.offline_lane_confirm'):
-            ids = legacy_confirmed_ids(Unconfirmable(reason, 'why'), command_name=LEGACY_INFRA_COMMAND, leg=leg)
-        assert ids == []
-        assert [r.getMessage() for r in caplog.records] == [
-            f'offline-lane: {LEGACY_INFRA_COMMAND} pass unconfirmable: {reason} why',
-        ]
 
 
 _PROBE = ProbeResult(result='outage', returncode=2, failed_dependency='qdrant', first_line='refused', duration=1.5)
