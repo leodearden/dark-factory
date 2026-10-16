@@ -3816,7 +3816,7 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
                      transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
                      invariants_doc: str | None = None,
-                     unreadable_transcripts: bool = False):
+                     unreadable_transcripts: bool = False, pass_kind=None):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3845,7 +3845,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     is committed as the project's design-invariants doc, and
     *recorder* / *committer* / *poster* / *invoke* are the injected seams
     (*poster* defaults to a no-op, so a test that does not care about
-    escalations never has to build one). *unreadable_transcripts* is the
+    escalations never has to build one), and *pass_kind*, when given, is
+    passed through. *unreadable_transcripts* is the
     exception: it strips every permission bit from the projects root for the
     run, so enumerating the transcripts raises inside sampling.
     """
@@ -3888,6 +3889,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         kwargs['recorder'] = recorder
     if committer is not None:
         kwargs['committer'] = committer
+    if pass_kind is not None:
+        kwargs['pass_kind'] = pass_kind
 
     if branch == 'extractor':
         assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
@@ -4296,12 +4299,13 @@ class _NightRunner:
             **self._pass_kwargs(day, on_night=day, invoke=invoke or self._coder(kind)),
         )
 
-    def scheduled_night(self, day, kind):
+    def scheduled_night(self, day, kind, *, retry_recorder=None):
         """Run night *day* as main() does for an undated run: through
         run_scheduled_night, so any retry the backlog owes runs too."""
         self._prepare(day, kind)
         return nightly.run_scheduled_night(
             **self._pass_kwargs(day, on_night=day, invoke=self._coder(kind)),
+            retry_recorder=retry_recorder,
         )
 
     def _prepare(self, day, kind):
@@ -4332,7 +4336,8 @@ class _NightRunner:
         """Run night *on_night*'s retry pass of *day*'s date, on that night's
         clock, over the config and transcripts already on disk."""
         return nightly.run_nightly(
-            **self._pass_kwargs(day, on_night=on_night, invoke=invoke), retry=True,
+            **self._pass_kwargs(day, on_night=on_night, invoke=invoke),
+            pass_kind=nightly.PassKind.RETRY,
             recorder=recorder, retry_recorder=retry_recorder,
         )
 
@@ -4668,7 +4673,7 @@ def _owed_after_storm_then_productive(tmp_path) -> tuple[_NightRunner, dict]:
 
 
 class TestRetryPass:
-    """``run_nightly(retry=True)`` re-runs an owed date and touches ONLY the
+    """A ``PassKind.RETRY`` pass re-runs an owed date and touches ONLY the
     backlog: the recorded health keeps describing the scheduled night."""
 
     def test_a_recovered_date_lands_its_sightings_and_leaves_the_backlog(self, tmp_path):
@@ -4725,7 +4730,8 @@ class TestRetryPass:
 
         with pytest.raises(FileNotFoundError):
             nightly.run_nightly(
-                project_id='testproj', target_date=date(2026, 7, 13), retry=True,
+                project_id='testproj', target_date=date(2026, 7, 13),
+                pass_kind=nightly.PassKind.RETRY,
                 now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
             )
 
@@ -4757,7 +4763,8 @@ class TestRetryPass:
 
         with pytest.raises(FileNotFoundError):
             nightly.run_nightly(
-                project_id='testproj', target_date=date(2026, 7, 13), retry=True,
+                project_id='testproj', target_date=date(2026, 7, 13),
+                pass_kind=nightly.PassKind.RETRY,
                 now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
                 recorder=recorder, retry_recorder=retry_recorder,
             )
@@ -4911,8 +4918,10 @@ class TestRunScheduledNight:
             committer=committer, recorder=recorder, retry_recorder=retry_recorder,
         )
         assert calls == [
-            {**shared, 'target_date': date(2026, 7, 14), 'retry': False},
-            {**shared, 'target_date': date(2026, 7, 13), 'retry': True},
+            {**shared, 'target_date': date(2026, 7, 14),
+             'pass_kind': nightly.PassKind.SCHEDULED},
+            {**shared, 'target_date': date(2026, 7, 13),
+             'pass_kind': nightly.PassKind.RETRY},
         ]
 
     def test_main_retries_the_owed_date_after_an_undated_run(self, monkeypatch):
@@ -4928,7 +4937,8 @@ class TestRunScheduledNight:
         assert len(calls) == 2
         scheduled, retried = calls
         assert retried['target_date'] == date(2026, 7, 13)
-        assert retried['retry'] is True
+        assert scheduled['pass_kind'] is nightly.PassKind.SCHEDULED
+        assert retried['pass_kind'] is nightly.PassKind.RETRY
         for key in ('project_id', 'config_path', 'projects_root'):
             assert retried[key] == scheduled[key]
 
@@ -4955,6 +4965,7 @@ class TestRunScheduledNight:
         assert exit_code == 0
         assert len(calls) == 1
         assert calls[0]['target_date'] == date(2026, 7, 13)
+        assert calls[0]['pass_kind'] is nightly.PassKind.MANUAL
 
     def test_a_scheduled_pass_that_raises_propagates_and_runs_no_retry(self, monkeypatch):
         fake, calls = _scripted_run_nightly(FileNotFoundError('no legibility.yaml'))
@@ -4964,6 +4975,79 @@ class TestRunScheduledNight:
             nightly.main(['run', '--project-id', 'proj_a'])
 
         assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# task 6548: a date the timer never ran is owed like an unfinished one
+# ---------------------------------------------------------------------------
+
+class TestNeverRunDates:
+    """A SCHEDULED pass owes, with 0 attempts, every date since the previous
+    scheduled pass; a MANUAL pass never moves that schedule cursor."""
+
+    def test_a_multi_night_outage_is_retried_one_date_per_night(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+
+        results = runner.scheduled_night(16, 'productive', retry_recorder=retry_recorder)
+
+        assert [result.exit_code for result in results] == [0, 0]
+        assert len(retried) == 1
+        assert retried[0][0]['target_date'] == date(2026, 7, 14)
+        assert retried[0][0]['exit_code'] == 0
+        assert retried[0][0]['capped'] is False
+        doc = runner.recorded()
+        assert doc['retry_backlog'] == {'2026-07-15': 0}
+        assert doc['last_scheduled_target_date'] == '2026-07-16'
+        assert doc['target_date'] == '2026-07-16'
+
+        runner.scheduled_night(17, 'productive')
+
+        assert runner.recorded()['retry_backlog'] == {}
+
+    def test_a_manual_backfill_never_reads_as_a_gap(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        runner.night(9, 'productive')
+
+        results = runner.scheduled_night(14, 'productive')
+
+        assert len(results) == 1
+        doc = runner.recorded()
+        assert doc['retry_backlog'] == {}
+        assert doc['last_scheduled_target_date'] == '2026-07-14'
+
+    def test_a_scheduled_pass_tells_the_recorder_seam_it_is_scheduled(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(
+            tmp_path, recorder=recorder, pass_kind=nightly.PassKind.SCHEDULED,
+        )
+
+        assert calls[0][0]['scheduled'] is True
+
+    def test_a_pass_of_no_stated_kind_is_not_scheduled(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(tmp_path, recorder=recorder)
+
+        assert calls[0][0]['scheduled'] is False
+
+    def test_a_scheduled_pass_whose_config_does_not_load_still_advances_the_cursor(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+                pass_kind=nightly.PassKind.SCHEDULED,
+            )
+
+        assert _testproj_state()['last_scheduled_target_date'] == '2026-07-13'
 
 
 # ---------------------------------------------------------------------------
