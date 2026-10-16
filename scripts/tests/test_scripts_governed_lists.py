@@ -15,7 +15,7 @@ import inline_suppressions
 import merge_lane_metrics
 import test_design_invariants_consistency as design_invariants_consistency
 import test_merge_state_vocabulary_consistency as merge_state_vocabulary_consistency
-from shared.governed_exceptions import GovernedList, governed_exceptions
+from shared.governed_exceptions import Debt, GovernedList, TaskRef, governed_exceptions
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -25,6 +25,8 @@ SIZE_CEILING_EXEMPT_LIST = governed_exceptions(
     'FILE_LINE_CEILING, because its split into smaller modules is owed by a '
     'follow-up PRD.',
     sorted(merge_lane_metrics.SIZE_CEILING_EXEMPT),
+    default=Debt(TaskRef(5603)),
+    default_covers=1,
 )
 
 DIVERGENCE_ALLOWLIST_LIST = governed_exceptions(
@@ -33,6 +35,8 @@ DIVERGENCE_ALLOWLIST_LIST = governed_exceptions(
     'does not compare between the committed and installed units, because the '
     'value is host-local by design; its presence is still compared.',
     sorted(check_dashboard_unit_parity.DIVERGENCE_ALLOWLIST),
+    default=Debt(TaskRef(5603)),
+    default_covers=2,
 )
 
 DESIGN_INVARIANT_PINNED_SITES_LIST = governed_exceptions(
@@ -40,6 +44,8 @@ DESIGN_INVARIANT_PINNED_SITES_LIST = governed_exceptions(
     'A file whose relationship to the design-invariant family is pinned in that '
     'module instead of being flagged as an unregistered enumeration site.',
     sorted(design_invariants_consistency.PINNED_SITES),
+    default=Debt(TaskRef(5603)),
+    default_covers=5,
 )
 
 MERGE_STATE_PINNED_SITES_LIST = governed_exceptions(
@@ -48,6 +54,8 @@ MERGE_STATE_PINNED_SITES_LIST = governed_exceptions(
     'shared/src/shared/merge_state.py instead of being flagged as an '
     'unregistered enumeration.',
     sorted(merge_state_vocabulary_consistency.PINNED_SITES),
+    default=Debt(TaskRef(5603)),
+    default_covers=5,
 )
 
 INLINE_SUPPRESSION_BASELINE = governed_exceptions(
@@ -56,6 +64,8 @@ INLINE_SUPPRESSION_BASELINE = governed_exceptions(
     'multiset that may only shrink; a suppression absent from it needs an inline '
     'disposition.',
     [inline_suppressions.BASELINE_PATH],
+    default=Debt(TaskRef(5603)),
+    default_covers=1,
 )
 
 
