@@ -5266,3 +5266,42 @@ class TestConnectClosesOnPragmaFailure:
             f'leaked {after - before} file descriptors across 30 calls '
             f'(before={before}, after={after})'
         )
+
+
+class TestResolvingCommit:
+    def test_a_done_provenance_with_a_commit_yields_it(self) -> None:
+        from orchestrator.flake_ledger import resolving_commit
+
+        assert resolving_commit(_done_task('task-1', 'c0ffee')) == 'c0ffee'
+
+    def test_a_done_provenance_without_a_commit_yields_none(self) -> None:
+        from orchestrator.flake_ledger import resolving_commit
+
+        task = {'id': 'task-1', 'status': 'done', 'metadata': {'done_provenance': {'kind': 'deterministic-gate'}}}
+        assert resolving_commit(task) is None
+
+    def test_a_task_with_no_metadata_yields_none(self) -> None:
+        from orchestrator.flake_ledger import resolving_commit
+
+        assert resolving_commit({'id': 'task-1', 'status': 'done'}) is None
+
+
+class TestFixContained:
+    HEAD = 'a' * 40
+
+    def test_a_commitless_done_task_is_contained_whatever_the_ancestry(self) -> None:
+        from orchestrator.flake_ledger import fix_contained
+
+        task = {'id': 'task-1', 'status': 'done'}
+        assert [fix_contained(task, self.HEAD, a) for a in (True, False, None)] == [True] * 3
+
+    def test_an_unread_ancestry_leaves_the_answer_undecided(self) -> None:
+        from orchestrator.flake_ledger import fix_contained
+
+        assert fix_contained(_done_task('task-1', 'c0ffee'), self.HEAD, None) is None
+
+    @pytest.mark.parametrize('ancestry', [True, False])
+    def test_a_read_ancestry_is_the_answer(self, ancestry: bool) -> None:
+        from orchestrator.flake_ledger import fix_contained
+
+        assert fix_contained(_done_task('task-1', 'c0ffee'), self.HEAD, ancestry) is ancestry
