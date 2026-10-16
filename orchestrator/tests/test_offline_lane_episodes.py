@@ -1341,3 +1341,19 @@ async def test_an_unreadable_status_batch_refreshes_every_binding_and_decides_no
     assert effect.no_decision == (A,)
     assert lane.episode().last_refreshed_at == lane.clock()
     assert sum('unreadable' in r.getMessage() for r in caplog.records) >= 2
+
+
+@pytest.mark.asyncio
+async def test_an_ended_episode_bound_to_an_unreadable_task_is_still_refreshed(tmp_path):
+    lane = Lane(tmp_path)
+    await _filed(lane)
+    lane.clock.advance(minutes=30)
+    await lane.green()
+    ended_at = lane.episode().ended_at
+    lane.client.statuses_error = ConnectionError('task store unreachable')
+    lane.clock.advance(days=3)
+
+    await lane.green()
+
+    assert lane.episode().ended_at == ended_at
+    assert lane.episode().last_refreshed_at == lane.clock()
