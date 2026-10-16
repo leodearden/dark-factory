@@ -66,7 +66,6 @@ from orchestrator.offline_lane_runs import (
     require_current_pass,
     suite_runner,
 )
-from orchestrator.verify import _serial_pytest_str
 from orchestrator.verify_cmd import ToolKind, parse_config_command
 
 T0 = datetime(2026, 10, 16, 9, 0, 0, tzinfo=UTC)
@@ -219,7 +218,10 @@ class TestConfirmMode:
         else:
             assert outcome == Confirmed(ConfirmMode.INTERSECTED, ('tests/t.py::test_a',), (), ())
             assert call.junit_path is None
-            assert call.argv[-1] == (_serial_pytest_str(command, invocation_dir=run_cwd) or command)
+            if parse_config_command(command).tool is ToolKind.PYTEST:
+                assert '-p no:xdist' in call.argv[-1] and call.argv[-1] != command
+            else:
+                assert call.argv[-1] == command
 
 
 class TestSerialConfirmCommand:
@@ -278,6 +280,11 @@ class TestRoundTrip:
 
     def test_the_first_failing_id_is_named(self) -> None:
         assert round_trip_failure(_lane_command(), ['tests/t.py::a]', 'tests/t.py::b[']) == 'tests/t.py::a]'
+
+    def test_an_id_that_closes_a_bracket_before_opening_one_fails(self) -> None:
+        assert round_trip_failure(_lane_command(), ['tests/t.py::test_ok', 'tests/t.py::test_a]b[']) == (
+            'tests/t.py::test_a]b['
+        )
 
 
 class TestPartition:

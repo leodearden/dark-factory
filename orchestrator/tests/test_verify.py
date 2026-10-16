@@ -2491,9 +2491,6 @@ class TestExtractTestOutcomesFromJunit:
         }
 
 
-# -----------------------------------------------------------------------
-
-
 # ---------------------------------------------------------------------------
 # Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
 # — a plain JSON-native `list[str] | None` (mirrors the `contention` (task

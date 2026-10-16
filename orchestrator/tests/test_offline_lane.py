@@ -1773,6 +1773,33 @@ async def test_default_infra_confirmation_run_no_fail_lines_means_no_confirmed_f
     assert confirmed == []
 
 
+@pytest.mark.asyncio
+async def test_default_infra_confirmation_run_nonzero_exit_naming_no_test_confirms_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    """Only a generic command earns the ``::unconfirmable`` sentinel: an infra confirm
+    that exits non-zero naming no test confirms nothing, with a warning naming the reason.
+    """
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+
+    worker.records.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'HEAD1')
+    await _detect(
+        lambda: worker.infra_runner(wt_path, 'HEAD1', 4),
+        b'  RESULT: FAIL (test_reflink_fs.sh)\n',
+        returncode=1,
+    )
+
+    with patch(
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'run_all.sh: lock held elsewhere\n', returncode=2),
+    ), caplog.at_level(logging.WARNING):
+        confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == []
+    assert 'unconfirmable: confirm_exited_nonzero_naming_no_test' in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # _handle_red_run — optional confirmation_runner kwarg for infra reuse
 # (task 1959, IE1, step-9/10)

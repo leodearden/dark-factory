@@ -627,38 +627,57 @@ def _add_lane_script(tmp_path: Path, relative_path: str, body: str) -> None:
     script.chmod(0o755)
 
 
-class _PassFailureWatch(logging.Handler):
-    """Remembers the first ``run() pass failed`` line the lane worker logs."""
+class _LaneLogWatch(logging.Handler):
+    """Remembers the first ``run() pass failed`` line the lane worker logs, and every sub-run line."""
 
-    MARKER = 'offline-lane: run() pass failed'
+    FAILURE_MARKER = 'offline-lane: run() pass failed'
 
     def __init__(self) -> None:
-        super().__init__(logging.ERROR)
-        self.line: str | None = None
+        super().__init__(logging.INFO)
+        self.failure_line: str | None = None
+        self.sub_run_lines: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         message = record.getMessage()
-        if self.line is None and message.startswith(self.MARKER):
-            self.line = message
+        if record.levelno >= logging.ERROR and self.failure_line is None and message.startswith(self.FAILURE_MARKER):
+            self.failure_line = message
+        if ' sub-run head=' in message and ' ended_by=' in message:
+            self.sub_run_lines.append(message)
+
+    def logged_sub_run(self, label: str) -> bool:
+        return any(line.startswith(f'offline-lane: {label} sub-run head=') for line in self.sub_run_lines)
 
 
-async def _until(done: Callable[[], bool], watch: _PassFailureWatch) -> None:
+async def _until(done: Callable[[], bool], watch: _LaneLogWatch) -> None:
     deadline = time.monotonic() + _PASS_DEADLINE_SECS
     while not done():
-        assert watch.line is None, f'the lane worker logged: {watch.line}'
-        assert time.monotonic() < deadline, 'the lane pass left no record in time'
+        assert watch.failure_line is None, f'the lane worker logged: {watch.failure_line}'
+        assert time.monotonic() < deadline, 'the lane pass left no record, or no awaited sub-run line, in time'
         await asyncio.sleep(0.02)
 
 
-async def _drive_one_pass(worker: OfflineLaneWorker, command: str, until_phase: Phase) -> None:
-    """Drive one lane pass through ``on_post_merge`` + ``run()`` until *command*'s *until_phase* is recorded."""
-    watch = _PassFailureWatch()
+async def _drive_one_pass(
+    worker: OfflineLaneWorker, command: str, until_phase: Phase, *, sub_run_label: str | None = None,
+) -> None:
+    """Drive one lane pass through ``on_post_merge`` + ``run()`` until *command*'s *until_phase* is recorded.
+
+    With *sub_run_label*, also until the worker has logged that sub-run's ``ended_by=`` line,
+    which it does only after the seam that wrote the record returns.
+    """
+    watch = _LaneLogWatch()
     lane_logger = logging.getLogger('orchestrator.offline_lane')
+    assert sub_run_label is None or lane_logger.isEnabledFor(logging.INFO), (
+        'awaiting a sub-run line needs the lane logger at INFO'
+    )
     lane_logger.addHandler(watch)
     task = asyncio.create_task(worker.run())
     try:
         await worker.on_post_merge('t', 'base', 'head')
-        await _until(lambda: worker.records.last_record(command, until_phase) is not None, watch)
+        await _until(
+            lambda: worker.records.last_record(command, until_phase) is not None
+            and (sub_run_label is None or watch.logged_sub_run(sub_run_label)),
+            watch,
+        )
     finally:
         lane_logger.removeHandler(watch)
         task.cancel()
@@ -666,9 +685,13 @@ async def _drive_one_pass(worker: OfflineLaneWorker, command: str, until_phase: 
             await task
 
 
-async def _run_one_pass(tmp_path: Path, command: str, *, until_phase: Phase) -> OfflineLaneWorker:
+async def _run_one_pass(
+    tmp_path: Path, command: str, *, until_phase: Phase, until_logged: bool = False,
+) -> OfflineLaneWorker:
     worker = _generic_worker(tmp_path, command)
-    await _drive_one_pass(worker, _LANE_COMMAND, until_phase)
+    await _drive_one_pass(
+        worker, _LANE_COMMAND, until_phase, sub_run_label=_LANE_COMMAND if until_logged else None,
+    )
     return worker
 
 
@@ -725,7 +748,10 @@ class TestLanePassRecords:
     ) -> None:
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
             worker = await _run_one_pass(
-                tmp_path, "printf '=== 3 passed in 0.10s ===\\n'; exit 0", until_phase=Phase.DETECT,
+                tmp_path,
+                "printf '=== 3 passed in 0.10s ===\\n'; exit 0",
+                until_phase=Phase.DETECT,
+                until_logged=True,
             )
 
         detect = _current_pass_record(worker).detect
@@ -823,7 +849,7 @@ class TestLanePassRecords:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, command: str, returncode: int
     ) -> None:
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            worker = await _run_one_pass(tmp_path, command, until_phase=Phase.DETECT)
+            worker = await _run_one_pass(tmp_path, command, until_phase=Phase.DETECT, until_logged=True)
 
         record = _current_pass_record(worker)
         assert record.detect is not None
@@ -951,7 +977,7 @@ class TestLegacyLegRecords:
         _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, 'kill -9 $$')
 
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.DETECT)
+            await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.DETECT, sub_run_label='infra')
 
         assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
         assert _current_pass_record(worker, LEGACY_INFRA_COMMAND).confirm is None
@@ -977,7 +1003,7 @@ class TestLegacyLegRecords:
         _add_lane_script(tmp_path, RUN_OFFLINE_DEEP_SCRIPT, body)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
-            await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, Phase.DETECT)
+            await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, Phase.DETECT, sub_run_label='numeric')
 
         record = _current_pass_record(worker, LEGACY_NUMERIC_COMMAND)
         assert record.leg == Leg.NUMERIC
