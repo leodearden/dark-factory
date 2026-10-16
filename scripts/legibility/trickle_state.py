@@ -45,8 +45,8 @@ import logging
 import os
 import pwd
 import tempfile
-from collections.abc import Mapping
-from datetime import UTC, date, datetime
+from collections.abc import Iterable, Mapping
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -431,14 +431,17 @@ RETRY_MAX_AGE_DAYS = 7
 At :data:`RETRIES_PER_NIGHT` retries per finished night, oldest first,
 every date of a k-night outage is retried at age k+1, so an outage of up
 to ``RETRY_MAX_AGE_DAYS - 1`` nights is fully recovered and a longer one
-loses only its oldest dates. A module constant, not a ``legibility.yaml``
-field, for the same bare-``python3`` reason as
+loses only its oldest dates. A systemd outage of up to
+``RETRY_MAX_AGE_DAYS`` missed elapses is fully recovered, since its
+catch-up pass covers the last date itself. A module constant, not a
+``legibility.yaml`` field, for the same bare-``python3`` reason as
 :data:`DEFAULT_MAX_BARREN_RUNS`."""
 
 RETRY_MAX_ATTEMPTS = 3
 """Unfinished passes of one date (its scheduled pass plus retries) after
 which it is abandoned, so a date that fails deterministically cannot hold
-the head of the oldest-first queue until it ages out."""
+the head of the oldest-first queue until it ages out. It counts unfinished
+passes only, so a date no pass ran gets this many retries."""
 
 RETRIES_PER_NIGHT = 1
 """Retry passes one invocation runs after its own scheduled pass finished.
@@ -468,8 +471,8 @@ def parse_retry_backlog(raw: object) -> dict[date, int]:
     """Read a recorded ``retry_backlog`` ({ISO date: unfinished attempts}).
 
     Never raises. A non-mapping gives an empty backlog, and an entry whose
-    key is not an ISO date or whose count is not a positive int is dropped:
-    a damaged backlog under-reports, like a lost streak."""
+    key is not an ISO date or whose count is not a non-negative int is
+    dropped: a damaged backlog under-reports, like a lost streak."""
     if not isinstance(raw, dict):
         return {}
     backlog: dict[date, int] = {}
@@ -490,11 +493,24 @@ def _parse_iso_date(raw: object) -> date | None:
 
 
 def _is_attempt_count(raw: object) -> bool:
-    return isinstance(raw, int) and not isinstance(raw, bool) and raw > 0
+    return isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0
 
 
 def _within_window(owed: date, today: date) -> bool:
     return (today - owed).days <= RETRY_MAX_AGE_DAYS
+
+
+def never_run_dates(
+    last_scheduled: date | None, *, target_date: date
+) -> tuple[date, ...]:
+    """The target dates no scheduled pass ran: strictly after the last
+    scheduled pass's target, strictly before this one's, oldest first."""
+    if last_scheduled is None:
+        return ()
+    return tuple(
+        last_scheduled + timedelta(days=n)
+        for n in range(1, (target_date - last_scheduled).days)
+    )
 
 
 def fold_retry_backlog(
@@ -503,13 +519,17 @@ def fold_retry_backlog(
     target_date: date,
     owes_retry: bool,
     today: date,
+    never_run: Iterable[date] = (),
 ) -> RetryFold:
     """Fold one pass of *target_date* into a copy of *backlog*.
 
-    An unfinished pass adds its date or counts one more attempt; a
-    finished pass removes it. Every entry then outside the age window, or
-    at :data:`RETRY_MAX_ATTEMPTS`, moves to ``abandoned``."""
+    Each *never_run* date not already owed enters with 0 attempts. An
+    unfinished pass adds its date or counts one more attempt; a finished
+    pass removes it. Every entry then outside the age window, or at
+    :data:`RETRY_MAX_ATTEMPTS`, moves to ``abandoned``."""
     folded = dict(backlog)
+    for owed in never_run:
+        folded.setdefault(owed, 0)
     if owes_retry:
         folded[target_date] = folded.get(target_date, 0) + 1
     else:
