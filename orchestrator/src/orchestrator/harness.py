@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
+from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
@@ -7366,21 +7367,6 @@ class Harness:
     # task for this condition, matched via get_by_task + this exact role.
     _CASCADE_REJECTION_ROLE: str = 'harness-cascade'
 
-    # Category for the same records.  A NAMED CONSTANT rather than a literal at
-    # the filing site because escalation categories are prose, not a checked
-    # contract: nothing rejects a typo'd category at submit time, and every
-    # categorized reader (auto-watcher triage, category-filtered queue scans)
-    # depends on filer and reader spelling it identically — so the one spelling
-    # this file owns lives in exactly one place.
-    #
-    # escalation/src/escalation/models.py carries a standing REFACTOR TRIGGER
-    # (task 3709) saying the NEXT category addition promotes that prose
-    # vocabulary to an enum or a submit-time lint.  This IS that addition, but
-    # models.py is outside task 3538's locked module scope, so the promotion is
-    # filed as follow-up work instead of done here; this constant is the
-    # interim single source of truth for the spelling.
-    _CASCADE_REJECTION_CATEGORY: str = 'cascade_status_rejection'
-
     def _escalate_cascade_status_rejection(
         self,
         task_id: str,
@@ -7457,7 +7443,7 @@ class Harness:
                 agent_role=self._CASCADE_REJECTION_ROLE,
                 severity='blocking',
                 level=1,
-                category=self._CASCADE_REJECTION_CATEGORY,
+                category=EscalationCategory.CASCADE_STATUS_REJECTION,
                 summary=(
                     f'Cascade resume failed to set task {task_id} to '
                     f'{target_status!r}'

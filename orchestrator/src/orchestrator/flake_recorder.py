@@ -45,6 +45,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from escalation.categories import EscalationCategory
+
 from orchestrator.flake_ledger import (
     DueItem,
     FlakeVerdict,
@@ -191,7 +193,7 @@ def _bump_suppression_streak_and_maybe_escalate(
         agent_role='orchestrator-merge-flake-monitor',
         severity='critical',
         level=2,
-        category='merge_flake_suppression_storm',
+        category=EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM,
         summary=summary,
         detail=detail,
         suggested_action=(
