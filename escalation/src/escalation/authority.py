@@ -128,9 +128,9 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # docstring. 'design_concern' is NOT pinned that way, deliberately: it has no
 # single owning constant to import. It is filed as a bare literal from several
 # orchestrator call sites (twice in ``orchestrator.workflow``, once in
-# ``orchestrator.harness``) AND is a member of ``escalation.server``'s
-# operator-facing CATEGORIES vocabulary — a SHARED term, not one module's
-# duplicate, so there is no upstream definition a lockstep test could bind to.
+# ``orchestrator.harness``) AND is a registered EscalationCategory with no
+# single owning filer constant — a SHARED term, not one module's duplicate,
+# so there is no upstream definition a lockstep test could bind to.
 # Checked BEFORE the allowlist (denylist-first).
 L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset(
     {'design_concern', 'milestone_gate', 'milestone_check_failed',

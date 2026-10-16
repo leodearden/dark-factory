@@ -45,6 +45,7 @@ from escalation.authority import (
     l2_auto_close_class,
 )
 from escalation.canonical import canonical_root_cause
+from escalation.categories import UnregisteredEscalationCategory, require_registered_category
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe_off_loop as _dedupe_submit_or_dedupe_off_loop
@@ -538,29 +539,6 @@ def _project_task_runtime_entry(s: Any) -> TaskRuntimeEntry:
 RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
 # park is no longer dismissed — it keeps the record open at L2 (version-a).
 _DISMISS_ACTIONS: frozenset[str] = frozenset({'abandon', 'close_only'})
-
-CATEGORIES = [
-    'scope_violation',
-    'design_concern',
-    'cleanup_needed',
-    'dependency_discovered',
-    'risk_identified',
-    'infra_issue',
-    'task_failure',
-    # Reconciliation categories
-    'recon_failure',
-    'recon_backlog_overflow',
-    'recon_stale_run',
-    'recon_integrity_issue',
-    # Review triage
-    'review_suggestions',
-    # Stranded-blocked recovery (PRD-3 D5 / C6)
-    'stranded_blocked',
-    # Verified-green stranded remediation: durable merge/verify failure of a
-    # reaper-submitted branch (stranding-remediation-scheduler-ergonomics-prd.md
-    # leaf α).  Inert/unvalidated (action_effects.py:23) — vocabulary parity only.
-    'stranded_merge_failed',
-]
 
 # OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
 # watcher needs to decide whether to pull a full record.  NOTE these are output
@@ -1837,7 +1815,10 @@ def create_server(
         """Report a non-blocking observation. The agent continues working after this call.
 
         Categories: scope_violation, design_concern, cleanup_needed,
-        dependency_discovered, risk_identified, infra_issue.
+        dependency_discovered, risk_identified, infra_issue.  Any category must
+        be a registered ``escalation.categories.EscalationCategory`` value; an
+        unregistered one is rejected with an ``{'error': ...}`` response naming
+        the closest registered values.
 
         *severity* defaults to ``'info'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
@@ -1891,6 +1872,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
         esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
             id=esc_id,
@@ -1933,7 +1918,10 @@ def create_server(
         the repeat is bounded at one).
 
         Categories: scope_violation, design_concern, cleanup_needed,
-        dependency_discovered, risk_identified, infra_issue.
+        dependency_discovered, risk_identified, infra_issue.  Any category must
+        be a registered ``escalation.categories.EscalationCategory`` value; an
+        unregistered one is rejected with an ``{'error': ...}`` response naming
+        the closest registered values.
 
         *severity* defaults to ``'blocking'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
@@ -2032,6 +2020,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
         # Task 3236: validate `level` BEFORE constructing the Escalation, using
         # the same {'error': ...} early-return shape as the severity guard above,
         # so a misconfigured caller gets immediate feedback instead of a
@@ -3281,7 +3273,10 @@ def create_server(
         summary:
             One-line cluster hypothesis.
         category:
-            Escalation category; defaults to ``'design_concern'``.
+            Escalation category; defaults to ``'design_concern'``.  Must be a
+            registered ``escalation.categories.EscalationCategory`` value; an
+            unregistered one is rejected with an ``{'error': ...}`` response
+            naming the closest registered values.
         severity:
             Severity tag, decoupled from ``level=2`` — the tool sets
             ``level=2`` explicitly.  **Omit it (or pass ``None``) and the L2
@@ -3429,6 +3424,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
 
         # Everything from here on is inside the lock: the FIND and the WRITE it
         # decides between must not interleave with another promote on this

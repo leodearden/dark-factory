@@ -44,9 +44,7 @@ __all__ = [
     'stale_evidence_fingerprint',
 ]
 
-# Free-form category — escalation/server.CATEGORIES is inert/unvalidated
-# (see plan.json design_decisions), so no escalation/ package change is
-# needed to introduce this category.
+# Registered in escalation/src/escalation/categories.py::EscalationCategory.
 PROVENANCE_CONFLICT_CATEGORY = 'provenance_conflict'
 
 # Born-at-L2 sentinel role (mirrors deterministic_runner's
