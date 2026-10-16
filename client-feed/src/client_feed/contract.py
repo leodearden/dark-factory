@@ -171,6 +171,7 @@ class CriterionOutcome(StrEnum):
 
 class _Record(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
+    __test__ = False  # pytest never collects a model imported into a test module
 
 
 class _Envelope(_Record):

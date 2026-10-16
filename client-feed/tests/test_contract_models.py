@@ -392,18 +392,6 @@ def test_an_event_refuses_another_wire_type() -> None:
         contract.Heartbeat.model_validate(event_dict('heartbeat', type='factory_state'))
 
 
-def test_no_contract_model_is_named_like_a_pytest_class() -> None:
-    model_names = [
-        name
-        for name, value in vars(contract).items()
-        if isinstance(value, type)
-        and issubclass(value, BaseModel)
-        and value.__module__ == contract.__name__
-    ]
-    assert model_names
-    assert [name for name in model_names if name.startswith('Test')] == []
-
-
 def test_task_status_vocabulary_matches_the_factory() -> None:
     assert {s.value for s in contract.TaskStatus} == {s.value for s in FactoryTaskStatus}
 
