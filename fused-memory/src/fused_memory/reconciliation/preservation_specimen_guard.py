@@ -65,7 +65,8 @@ LEAF CONTRACT.  This module imports only from
 ``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
 task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
 matcher), ``services.memory_service`` (for the canonical raw-payload content
-extractor) and, optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
+extractor), ``shared.task_statuses`` (the closed status vocabulary) and,
+optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
 nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
 calls in.  It performs detection only — it drops flags, never writes tasks or
 memories.
@@ -91,6 +92,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+from shared.task_statuses import TaskStatus
 
 from fused_memory.reconciliation.flag_shape import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
@@ -200,11 +203,25 @@ STRANDED_ACTION_TARGET_FAMILY: tuple[str, ...] = ('in-progress', 'in progress')
 #: different fields.
 _STRANDED_ACTION_FIELDS: tuple[str, ...] = ('suggested_action', 'description')
 
-#: A :data:`STRANDED_ACTION_VERB_FAMILY` verb whose object is the task itself —
-#: "reset task 3105", "redispatch the task" — and not something the task owns
-#: ("reset the task's priority override").
+#: The destinations a reset out of in-progress can name, derived from
+#: ``TaskStatus`` so the list has one home.  Longest first, so no member can
+#: shadow a longer one in an alternation.
+_STATUSES_OUT_OF_IN_PROGRESS: tuple[str, ...] = tuple(
+    sorted((s.value for s in TaskStatus if s is not TaskStatus.IN_PROGRESS), key=len, reverse=True)
+)
+
+
+def _alternation(members: tuple[str, ...]) -> str:
+    return '|'.join(map(re.escape, members))
+
+
+#: A :data:`STRANDED_ACTION_VERB_FAMILY` verb whose object is the task itself:
+#: "task" or "the task" with an optional id, then the clause ends (a comma does
+#: not end it) or names a destination status.  Anything else after it is
+#: something the task OWNS: "task 3105's priority override", "to its default".
 _RESET_AIMED_AT_THE_TASK: re.Pattern[str] = re.compile(
-    r'\b(?:' + '|'.join(map(re.escape, STRANDED_ACTION_VERB_FAMILY)) + r")\s+(?:the\s+)?tasks?\b(?!['’])",
+    rf'\b(?:{_alternation(STRANDED_ACTION_VERB_FAMILY)})\s+(?:the\s+)?tasks?(?:\s+#?\d+)?'
+    rf'(?=\s*(?:[.;:!?)]|$)|\s+(?:back\s+)?to\s+(?:{_alternation(_STATUSES_OUT_OF_IN_PROGRESS)})\b)',
     re.IGNORECASE,
 )
 
