@@ -59,9 +59,9 @@ from _orch_helpers import (
     UNDER_LOAD_HEADROOM_FACTOR,
     wait_responsive,
 )
-from _wait_budget_audit import (
-    suppressed_result_wait_methods,
-    unguarded_worker_teardown_methods,
+from _wait_hygiene_scan import (
+    suppressed_result_wait_items,
+    unguarded_worker_teardown_items,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -253,7 +253,7 @@ async def _stop_worker(
     ``stop()`` entirely and leaked a live merge worker plus its run task into
     pytest-asyncio teardown. That leak is why one red test used to cascade
     into unrelated failures elsewhere in the session.
-    ``_wait_budget_audit.py::unguarded_worker_teardown_methods`` enforces
+    ``_wait_hygiene_scan.py::unguarded_worker_teardown_items`` enforces
     the ``finally:``.
 
     Safe on the give-up path even when a gate was never released: ``stop()``
@@ -6038,24 +6038,20 @@ class TestLoudWaitMigrationRatchet:
     """
 
     def test_no_suppressed_result_waits(self) -> None:
-        """`suppressed_result_wait_methods` finds nothing in this module's
+        """`suppressed_result_wait_items` finds nothing in this module's
         own source -- a fresh suppressed wait, in either recognised
         spelling, or a migrated method that regressed, fails loudly, naming
         the class and method and pointing at the two blessed replacements.
         """
         source = Path(__file__).read_text()
-        scanned = suppressed_result_wait_methods(source)
+        scanned = suppressed_result_wait_items(source)
 
-        assert scanned == {}, (
+        assert not scanned, (
             'The following test methods contain a suppressed result wait '
             '(either `with contextlib.suppress(TimeoutError): await '
             'asyncio.wait_for(...)`, or `try: ... await asyncio.wait_for(...) '
             'except TimeoutError: ... = None`):\n'
-            + '\n'.join(
-                f'  - {class_name}::{method_name}'
-                for class_name, methods in sorted(scanned.items())
-                for method_name in sorted(methods)
-            )
+            + '\n'.join(f'  - {item}' for item in scanned)
             + '\n\nThis is the `outcome is None` anti-pattern: a genuine '
             'timeout is swallowed and a downstream assertion reports a '
             'confusing None/wrong-value failure instead of a loud, '
@@ -6073,7 +6069,7 @@ class TestLoudWaitMigrationRatchet:
         cascade into unrelated failures elsewhere in the session.
         """
         source = Path(__file__).read_text()
-        offenders = unguarded_worker_teardown_methods(source)
+        offenders = unguarded_worker_teardown_items(source)
 
         assert not offenders, (
             'The following methods call wait_responsive but do not call '
