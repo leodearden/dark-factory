@@ -1407,6 +1407,13 @@ class TestWaitBudgetOffenders:
             ('TestUnreadable::test_it', None)
         ], f'got {offenders!r}'
 
+    def test_only_the_three_mark_levels_count_as_a_mark(self) -> None:
+        assert {source for source in LimitSource if source.is_mark} == {
+            LimitSource.FUNCTION_MARK,
+            LimitSource.CLASS_MARK,
+            LimitSource.MODULE_MARK,
+        }
+
     def test_unparseable_source_has_no_offenders_and_does_not_raise(self) -> None:
         assert wait_budget_offenders('def not valid python(:', {}) == []
 

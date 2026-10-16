@@ -12,6 +12,8 @@ compare with the timeout the item actually runs under.
 from __future__ import annotations
 
 import ast
+import dataclasses
+import enum
 import math
 from collections.abc import Callable, Iterator, Mapping
 
@@ -39,9 +41,10 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 }
 
 
-def _wait_seconds(value: object) -> float | None:
-    """*value* as a wait in seconds, or None when it is not a plain number
-    (a bool is not a wait). A negative number waits no time, so 0.0."""
+def _as_seconds(value: object) -> float | None:
+    """*value* as a duration in seconds, or None when it is not a plain
+    number (a bool is not a duration). A negative number lasts no time, so
+    0.0."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return max(float(value), 0.0)
     return None
@@ -87,7 +90,7 @@ def _visible_wait_constants(
     for node in ast.walk(fn):
         if not isinstance(node, ast.Name) or node.id in bound or node.id in visible:
             continue
-        seconds = _wait_seconds(namespace.get(node.id))
+        seconds = _as_seconds(namespace.get(node.id))
         if seconds is None:
             seconds = _KNOWN_WAIT_CONSTANTS.get(node.id)
         if seconds is not None:
@@ -109,7 +112,7 @@ def _resolve_wait_value(node: ast.expr | None, visible: Mapping[str, float]) -> 
     keeps every recognised shape's bill an upper bound.
     """
     if isinstance(node, ast.Constant):
-        seconds = _wait_seconds(node.value)
+        seconds = _as_seconds(node.value)
         return math.inf if seconds is None else seconds
     if isinstance(node, ast.Name) and node.id in visible:
         return visible[node.id]
@@ -288,6 +291,33 @@ def _iter_test_items(
                     yield node.name, method
 
 
+def _parse(source: str) -> ast.Module | None:
+    """*source* parsed, or None when it does not parse."""
+    try:
+        return ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def _item_bills(
+    tree: ast.Module, module_constants: Mapping[str, object] | None
+) -> dict[tuple[str | None, str], float]:
+    """Each pytest item's bill, keyed ``(owner_class_name, function_name)``;
+    a name defined twice keeps the larger bill."""
+    bills: dict[tuple[str | None, str], float] = {}
+    for owner, function in _iter_test_items(tree):
+        key = (owner, function.name)
+        budget = _method_wait_budget(function, module_constants)
+        bills[key] = max(budget, bills.get(key, budget))
+    return bills
+
+
+def _item_id(owner: str | None, function_name: str) -> str:
+    """The item's id within its module: ``'Class::method'``, or a
+    module-level function's bare name."""
+    return function_name if owner is None else f'{owner}::{function_name}'
+
+
 def item_wait_budgets(
     source: str, module_constants: Mapping[str, object] | None = None
 ) -> dict[str, float]:
@@ -307,17 +337,13 @@ def item_wait_budgets(
     Must never raise: a crash here would fail the whole suite over an
     unrelated edit to a scanned file. Unparseable source returns {}.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
+    tree = _parse(source)
+    if tree is None:
         return {}
-
-    budgets: dict[str, float] = {}
-    for owner, function in _iter_test_items(tree):
-        key = function.name if owner is None else f'{owner}::{function.name}'
-        budget = _method_wait_budget(function, module_constants)
-        budgets[key] = max(budget, budgets.get(key, budget))
-    return budgets
+    return {
+        _item_id(owner, name): budget
+        for (owner, name), budget in _item_bills(tree, module_constants).items()
+    }
 
 
 def worst_per_method_wait_budget(
@@ -326,11 +352,13 @@ def worst_per_method_wait_budget(
     """Per top-level ``Test*`` class, the MAX of its methods' bills in
     ``item_wait_budgets``; module-level test functions are not included.
     Unparseable source returns {}."""
+    tree = _parse(source)
+    if tree is None:
+        return {}
     budgets: dict[str, float] = {}
-    for key, budget in item_wait_budgets(source, module_constants).items():
-        class_name, separator, _ = key.partition('::')
-        if separator:
-            budgets[class_name] = max(budget, budgets.get(class_name, budget))
+    for (owner, _), budget in _item_bills(tree, module_constants).items():
+        if owner is not None:
+            budgets[owner] = max(budget, budgets.get(owner, budget))
     return budgets
 
 
@@ -567,6 +595,165 @@ def unguarded_worker_teardown_methods(source: str) -> list[str]:
 # CLI (the merge-gating run).  Why the two differ, and why verify's is the
 # tighter one, is recorded once at `_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`.
 AMBIENT_TEST_TIMEOUT = min(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)
+
+
+class LimitSource(enum.Enum):
+    """Where the timeout a pytest item runs under comes from."""
+
+    FUNCTION_MARK = "the test's own @pytest.mark.timeout"
+    CLASS_MARK = "its class's @pytest.mark.timeout"
+    MODULE_MARK = "its module's pytestmark timeout"
+    AMBIENT = (
+        f'no timeout mark: the ambient budget, the tighter of the '
+        f"{PYPROJECT_DEFAULT_TIMEOUT}s ini default and verify's "
+        f'--timeout={VERIFY_CLI_PER_TEST_TIMEOUT}'
+    )
+    UNRESOLVED = 'unreadable: the test is not in its module namespace'
+
+    @property
+    def is_mark(self) -> bool:
+        """Whether the limit came from a timeout mark, at any level."""
+        return self not in (LimitSource.AMBIENT, LimitSource.UNRESOLVED)
+
+
+@dataclasses.dataclass(frozen=True)
+class WaitBudgetOffender:
+    """A pytest item whose wait bill the timeout it runs under does not
+    clear. *limit* is None when no number could be read for it."""
+
+    item: str
+    budget: float
+    limit: float | None
+    limit_source: LimitSource
+
+    def describe(self) -> str:
+        bill = (
+            'unbounded (some wait has no resolvable wall-clock cap)'
+            if math.isinf(self.budget)
+            else f'{self.budget}s'
+        )
+        limit = 'none' if self.limit is None else f'{self.limit}s'
+        return (
+            f'{self.item}: waits bill {bill}; limit {limit}, from '
+            f'{self.limit_source.value}'
+        )
+
+
+def _timeout_marks(carrier: object) -> list[object]:
+    """The ``timeout`` marks in a ``pytestmark`` value: one MarkDecorator or
+    Mark, or a list of them, in the order pytest reads them."""
+    marks = carrier if isinstance(carrier, (list, tuple)) else [carrier]
+    return [
+        getattr(mark, 'mark', mark)
+        for mark in marks
+        if getattr(mark, 'name', None) == 'timeout'
+    ]
+
+
+def _mark_seconds(mark: object) -> float | None:
+    """A timeout mark's seconds, from its first argument else its
+    ``timeout=`` keyword; None when that is not a plain number."""
+    args = getattr(mark, 'args', ())
+    value = args[0] if args else getattr(mark, 'kwargs', {}).get('timeout')
+    return _as_seconds(value)
+
+
+def _closest_timeout_mark(
+    function_obj: object,
+    owner_cls: object | None,
+    module_namespace: Mapping[str, object],
+) -> tuple[float | None, LimitSource] | None:
+    """The seconds of the timeout mark pytest applies to an item, and the
+    level it sits at: the test's own marks, then its class's (MRO-inclusive),
+    then the module's ``pytestmark``. None when no level carries one.
+
+    The closest level wins, as in ``_pytest.nodes.Node.get_closest_marker``;
+    why a mark then wins over the CLI/ini budget outright is recorded in
+    shared/src/shared/testing_timeout_markers.py.
+    """
+    levels = (
+        (getattr(function_obj, 'pytestmark', None), LimitSource.FUNCTION_MARK),
+        (getattr(owner_cls, 'pytestmark', None), LimitSource.CLASS_MARK),
+        (module_namespace.get('pytestmark'), LimitSource.MODULE_MARK),
+    )
+    for carrier, source in levels:
+        marks = _timeout_marks(carrier)
+        if marks:
+            return _mark_seconds(marks[0]), source
+    return None
+
+
+def _item_limit(
+    owner: str | None, function_name: str, namespace: Mapping[str, object]
+) -> tuple[float | None, LimitSource]:
+    """The timeout an item runs under and where it comes from, read off the
+    item's real objects in *namespace*."""
+    owner_cls = None if owner is None else namespace.get(owner)
+    function_obj = (
+        namespace.get(function_name)
+        if owner is None
+        else getattr(owner_cls, function_name, None)
+    )
+    if function_obj is None:
+        return None, LimitSource.UNRESOLVED
+    closest = _closest_timeout_mark(function_obj, owner_cls, namespace)
+    if closest is None:
+        return float(AMBIENT_TEST_TIMEOUT), LimitSource.AMBIENT
+    return closest
+
+
+def _offends(budget: float, limit: float | None, limit_source: LimitSource) -> bool:
+    """Whether *budget* breaches the limit: an unmarked item offends once its
+    bill REACHES the ambient budget; a marked one when the mark is below the
+    bill (a mark replaces the ambient budget, at any bill); an item with no
+    readable limit -- unresolved, or an unreadable mark -- always."""
+    if limit is None:
+        return True
+    if limit_source is LimitSource.AMBIENT:
+        return budget >= limit
+    return limit < budget
+
+
+def _billed_item_limits(
+    source: str, namespace: Mapping[str, object]
+) -> list[tuple[str, float, float | None, LimitSource]]:
+    """``(item, bill, limit, limit_source)`` for every item of *source* with
+    a bill above zero, sorted by item; [] when *source* does not parse."""
+    tree = _parse(source)
+    if tree is None:
+        return []
+    billed = [
+        (_item_id(owner, name), budget, *_item_limit(owner, name, namespace))
+        for (owner, name), budget in _item_bills(tree, namespace).items()
+        if budget > 0
+    ]
+    return sorted(billed, key=lambda row: row[0])
+
+
+def wait_budget_offenders(
+    source: str, namespace: Mapping[str, object]
+) -> list[WaitBudgetOffender]:
+    """Every item of *source* whose wait bill the timeout it runs under does
+    not clear, sorted by item. *namespace* is the module's runtime globals:
+    it resolves the names the waits spell and holds the objects whose marks
+    are read. Must never raise; unparseable source returns []."""
+    return [
+        WaitBudgetOffender(item, budget, limit, limit_source)
+        for item, budget, limit, limit_source in _billed_item_limits(source, namespace)
+        if _offends(budget, limit, limit_source)
+    ]
+
+
+def item_limit_sources(
+    source: str, namespace: Mapping[str, object]
+) -> dict[str, LimitSource]:
+    """Where the timeout of every item of *source* with a bill above zero
+    comes from, offending or not. Must never raise; unparseable source
+    returns {}."""
+    return {
+        item: limit_source
+        for item, _, _, limit_source in _billed_item_limits(source, namespace)
+    }
 
 
 def timeout_mark_offenders(
