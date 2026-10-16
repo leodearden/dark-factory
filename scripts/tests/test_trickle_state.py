@@ -520,7 +520,7 @@ class TestLoadState:
 
 def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
             applied=0, commit_made=False, budget_suppressed=False,
-            capped=False, **counters):
+            capped=False, scheduled=False, **counters):
     """Call record_run with a derived-total counter set and an injected
     clock (the module is deliberately clock-injectable — no time faking)."""
     kw = _counters(**counters)
@@ -534,6 +534,7 @@ def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
         commit_made=commit_made,
         budget_suppressed=budget_suppressed,
         capped=capped,
+        scheduled=scheduled,
         **kw,
     )
 
@@ -566,6 +567,7 @@ class TestRecordRun:
         assert doc['budget_suppressed'] is False
         assert doc['consecutive_barren_runs'] == 0
         assert doc['consecutive_failed_runs'] == 0
+        assert doc['last_scheduled_target_date'] is None
         assert doc['counters'] == {
             'total_records': 6,
             'zero_signal_dropped': 4,
@@ -1422,6 +1424,128 @@ class TestRecordRetry:
         assert [p.name for p in state_dir.iterdir()] == [
             trickle_state.STATE_FILENAME
         ]
+
+
+def _rewrite_state(doc):
+    trickle_state.trickle_state_path('dark_factory').write_text(
+        json.dumps(doc))
+
+
+class TestRecordRunScheduleCursor:
+    """record_run's ``last_scheduled_target_date``: only a scheduled pass
+    moves it, and a scheduled pass owes, with 0 attempts, every date it
+    jumped over since the previous scheduled pass."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_a_first_scheduled_run_sets_the_cursor_and_owes_nothing(self):
+        doc = _record(day=1, scheduled=True)
+
+        assert doc['last_scheduled_target_date'] == '2026-07-01'
+        assert doc['retry_backlog'] == {}
+
+    def test_a_first_manual_run_leaves_no_cursor(self):
+        assert _record(day=1)['last_scheduled_target_date'] is None
+
+    def test_a_scheduled_run_owes_the_dates_it_jumped_over(self):
+        _record(day=1, scheduled=True)
+
+        doc = _record(day=4, scheduled=True, selected_count=1)
+
+        assert doc['retry_backlog'] == {'2026-07-02': 0, '2026-07-03': 0}
+        assert doc['last_scheduled_target_date'] == '2026-07-04'
+
+    def test_a_post_midnight_catch_up_owes_the_skipped_date_once(self):
+        _record(day=1, scheduled=True)
+
+        catch_up = _record(day=3, scheduled=True)
+        again = _record(day=3, scheduled=True)
+
+        assert catch_up['retry_backlog'] == {'2026-07-02': 0}
+        assert again['retry_backlog'] == {'2026-07-02': 0}
+
+    def test_a_manual_backfill_never_reads_as_a_gap(self):
+        _record(day=5, scheduled=True)
+
+        backfill = _record(day=1, selected_count=1)
+        next_night = _record(day=6, scheduled=True)
+
+        assert backfill['last_scheduled_target_date'] == '2026-07-05'
+        assert backfill['target_date'] == '2026-07-01'
+        assert next_night['retry_backlog'] == {}
+        assert next_night['last_scheduled_target_date'] == '2026-07-06'
+
+    def test_a_later_manual_run_never_moves_the_cursor(self):
+        _record(day=1, scheduled=True)
+        _record(day=9)
+
+        assert _record(day=2, scheduled=True)['retry_backlog'] == {}
+
+    def test_an_owed_never_run_date_keeps_its_attempt_count(self):
+        _record(day=1, scheduled=True)
+        _record(day=2, exit_code=1)
+
+        doc = _record(day=3, scheduled=True)
+
+        assert doc['retry_backlog'] == {'2026-07-02': 1}
+
+    def test_a_predecessor_without_a_cursor_owes_no_never_run_dates(self):
+        pre_6548 = _record(day=1, scheduled=True)
+        del pre_6548['last_scheduled_target_date']
+        _rewrite_state(pre_6548)
+
+        doc = _record(day=4, scheduled=True)
+
+        assert doc['retry_backlog'] == {}
+        assert doc['last_scheduled_target_date'] == '2026-07-04'
+
+    @pytest.mark.parametrize('garbage', [
+        pytest.param('yesterday', id='not-a-date'),
+        pytest.param(7, id='an-int'),
+        pytest.param(None, id='null'),
+    ])
+    def test_a_garbage_cursor_is_treated_as_absent_never_raised(
+        self, garbage
+    ):
+        doc = _record(day=1, scheduled=True)
+        _rewrite_state({**doc, 'last_scheduled_target_date': garbage})
+
+        doc = _record(day=4, scheduled=True)
+
+        assert doc['retry_backlog'] == {}
+        assert doc['last_scheduled_target_date'] == '2026-07-04'
+
+    def test_a_gap_past_the_window_abandons_its_older_dates_with_a_warning(
+        self, caplog
+    ):
+        max_age = trickle_state.RETRY_MAX_AGE_DAYS
+        last = 1 + max_age + 2
+        jumped = range(2, last)
+        _record(day=1, scheduled=True)
+
+        with caplog.at_level('WARNING'):
+            doc = _record(day=last, scheduled=True)
+
+        in_window = [day for day in jumped if last - day <= max_age]
+        too_old = [day for day in jumped if last - day > max_age]
+        assert too_old
+        assert doc['retry_backlog'] == {
+            _d(day).isoformat(): 0 for day in in_window
+        }
+        for day in too_old:
+            abandoning = f'abandoning {_d(day).isoformat()}'
+            assert len(_warnings_naming(caplog, abandoning)) == 1
+
+    def test_a_retry_leaves_the_cursor_untouched(self):
+        _record(day=1, scheduled=True)
+        _record(day=3, scheduled=True)
+
+        retried = _retried(day=2, recorded_day=3)
+
+        assert retried['last_scheduled_target_date'] == '2026-07-03'
+        assert retried['retry_backlog'] == {}
 
 
 class TestDueRetries:
