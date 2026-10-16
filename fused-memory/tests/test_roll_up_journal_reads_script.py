@@ -412,3 +412,103 @@ class TestStatus:
 
         assert report is not None and report['count_only_span'] is None
         assert report['rollup_rows'] == len(_rollup_counts(journal))
+
+
+def _never_active() -> bool:
+    return False
+
+
+def _always_active() -> bool:
+    return True
+
+
+def _run_reclaim(capsys, journal: Path, *extra: str, unit_active=_never_active):
+    code = _script.main(['reclaim', '--journal', str(journal), *extra], unit_active=unit_active)
+    captured = capsys.readouterr()
+    report = json.loads(captured.out) if captured.out.strip() else None
+    return code, report, captured.err
+
+
+def _db_bytes(db_path: Path) -> bytes:
+    """The database file itself; a mode=ro reader may still leave empty WAL sidecars."""
+    return db_path.read_bytes()
+
+
+def _table_row_counts(db_path: Path) -> dict[str, int]:
+    names = [row[0] for row in _rows(db_path, "SELECT name FROM sqlite_master WHERE type = 'table'")]
+    return {name: _rows(db_path, f'SELECT COUNT(*) FROM "{name}"')[0][0] for name in names}
+
+
+def _bulky_migrated_journal(tmp_path, capsys) -> Path:
+    """A journal whose migration deleted enough wide rows to leave a freelist."""
+    db_path = _initialized_journal(tmp_path / 'bulky')
+    base = _WINDOW_END - timedelta(hours=40)
+    _insert_rows(db_path, [
+        {
+            'id': f'bulk-{i}', 'operation': 'get_task' if i % 4 else 'search',
+            'project_id': 'p', 'agent_id': None, 'kind': 'read', 'success': 1,
+            'error': None, 'params': 'x' * 2048,
+            'created_at': (base + timedelta(seconds=30 * i)).isoformat(),
+        }
+        for i in range(2000)
+    ])
+    code, _, err = _run(
+        capsys, 'migrate', '--journal', str(db_path), '--apply',
+        '--chunk-rowids', '500', '--pause-seconds', '0',
+    )
+    assert code == 0, err
+    return db_path
+
+
+class TestReclaim:
+    def test_refuses_while_count_only_raw_reads_remain(self, journal, capsys):
+        before = _db_bytes(journal)
+
+        code, _, err = _run_reclaim(capsys, journal, '--apply')
+
+        assert code != 0
+        assert 'first_rowid=1' in err and f'max_rowid={len(_history_rows())}' in err
+        assert _db_bytes(journal) == before
+
+    def test_refuses_while_fused_memory_is_active(self, tmp_path, capsys):
+        db_path = _bulky_migrated_journal(tmp_path, capsys)
+        before = _db_bytes(db_path)
+
+        code, _, err = _run_reclaim(capsys, db_path, '--apply', unit_active=_always_active)
+
+        assert code != 0
+        assert 'fused-memory' in err
+        assert _db_bytes(db_path) == before
+
+    def test_dry_run_reports_page_figures_and_changes_nothing(self, tmp_path, capsys):
+        db_path = _bulky_migrated_journal(tmp_path, capsys)
+        before = _db_bytes(db_path)
+
+        code, report, err = _run_reclaim(capsys, db_path)
+
+        assert code == 0, err
+        assert report is not None and report['applied'] is False
+        pages = report['before']
+        assert pages['freelist_count'] > 0
+        assert pages['page_size'] > 0 and pages['page_count'] >= pages['freelist_count']
+        assert report['reclaimable_bytes'] == pages['freelist_count'] * pages['page_size']
+        assert report['blockers'] == []
+        assert _db_bytes(db_path) == before
+
+    def test_apply_vacuums_in_place_and_keeps_every_row(self, tmp_path, capsys):
+        db_path = _bulky_migrated_journal(tmp_path, capsys)
+        rows_before = _table_row_counts(db_path)
+        size_before = db_path.stat().st_size
+        inode_before = db_path.stat().st_ino
+
+        code, report, err = _run_reclaim(capsys, db_path, '--apply', '--temp-dir', str(tmp_path))
+
+        assert code == 0, err
+        assert report is not None and report['applied'] is True
+        assert report['after']['freelist_count'] == 0
+        assert report['before']['freelist_count'] > 0
+        assert report['after_bytes'] < report['before_bytes']
+        assert report['seconds'] >= 0
+        assert db_path.stat().st_size < size_before
+        assert db_path.stat().st_ino == inode_before
+        assert _table_row_counts(db_path) == rows_before
