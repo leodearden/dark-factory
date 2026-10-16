@@ -13,25 +13,26 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import pytest
 
-_READ_ROLLUP_SOURCE = (
-    Path(__file__).resolve().parents[2]
-    / 'fused-memory' / 'src' / 'fused_memory' / 'services' / 'read_rollup.py'
-)
-_READ_ROLLUP_DDL_NAME = 'READ_OP_COUNTS_SCHEMA_SQL'
+_FUSED_MEMORY = Path(__file__).resolve().parents[2] / 'fused-memory'
+_READ_ROLLUP_SOURCE = _FUSED_MEMORY / 'src' / 'fused_memory' / 'services' / 'read_rollup.py'
+_ROLL_UP_SCRIPT_SOURCE = _FUSED_MEMORY / 'scripts' / 'roll_up_journal_reads.py'
+
+
+def _fused_memory_str_constant(source: Path, name: str) -> str:
+    """The module-level str literal *name* assigned in *source*, read with ast
+    because the dashboard package does not depend on fused-memory."""
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            assert isinstance(value, str), f'{source}: {name} is not a str literal'
+            return value
+    raise AssertionError(f'{source} no longer assigns {name}')
 
 
 def _read_op_counts_ddl() -> str:
-    """``read_rollup.py::READ_OP_COUNTS_SCHEMA_SQL``, read from source because
-    the dashboard package does not depend on fused-memory."""
-    for node in ast.parse(_READ_ROLLUP_SOURCE.read_text()).body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == _READ_ROLLUP_DDL_NAME
-            for target in node.targets
-        ):
-            ddl = ast.literal_eval(node.value)
-            assert isinstance(ddl, str), f'{_READ_ROLLUP_DDL_NAME} is not a str literal'
-            return ddl
-    raise AssertionError(f'{_READ_ROLLUP_SOURCE} no longer assigns {_READ_ROLLUP_DDL_NAME}')
+    return _fused_memory_str_constant(_READ_ROLLUP_SOURCE, 'READ_OP_COUNTS_SCHEMA_SQL')
 
 
 PRE_ROLLUP_WRITE_OPS_SCHEMA = """
@@ -877,3 +878,53 @@ class TestMemoryOpsMissingRollupTableFallback:
             record.levelno == logging.ERROR and 'idx_wo_created' in record.getMessage()
             for record in records
         ), caplog.record_tuples
+
+
+class TestMigrationVerifyOracleMatchesPanel:
+    """roll_up_journal_reads.py's ``verify`` restates this panel's numbers in
+    SQL (``_PANEL_COUNTS_SQL``), because fused-memory cannot import the
+    dashboard. This holds that copy to get_memory_ops over one journal, so a
+    change to either side's bucketing cannot leave verify checking the old
+    shape."""
+
+    @pytest.mark.asyncio
+    async def test_oracle_and_panel_agree_per_hour_and_per_operation(self, tmp_path):
+        db_path = tmp_path / 'oracle.db'
+        _seed_ops_rows(db_path)
+        _seed_write_ops(db_path, [
+            ('blank-op', '', 'dark_factory', None, 'read',
+             (_OPS_FLOOR - timedelta(hours=2)).isoformat()),
+        ])
+        _seed_read_op_counts(db_path, [
+            (_OPS_FLOOR, 'dark_factory', '', 'get_entity', 5),
+            (_OPS_WINDOW_START, 'dark_factory', 'agent-a', 'get_task', 7),
+            (_OPS_FLOOR - timedelta(hours=6), '', '', '', 11),
+            (_OPS_WINDOW_START - timedelta(hours=1), 'p', '', 'get_task', 30),
+            (_OPS_FLOOR + timedelta(hours=1), 'p', '', 'get_task', 400),
+        ])
+        panel = await _ops_value_at(db_path, hours=24, now=_OPS_NOW)
+
+        conn = sqlite3.connect(str(db_path))
+        oracle_rows = conn.execute(
+            _fused_memory_str_constant(_ROLL_UP_SCRIPT_SOURCE, '_PANEL_COUNTS_SQL'),
+            {
+                'start': _OPS_WINDOW_START.isoformat(),
+                'end': (_OPS_FLOOR + timedelta(hours=1)).isoformat(),
+            },
+        ).fetchall()
+        conn.close()
+
+        series: dict[str, Counter[str]] = {'read': Counter(), 'write': Counter(), 'other': Counter()}
+        by_operation: Counter[str] = Counter()
+        for hour, kind, operation, n in oracle_rows:
+            series[kind if kind in ('read', 'write') else 'other'][hour] += n
+            by_operation[operation] += n
+        hour_keys = [
+            (_OPS_WINDOW_START + timedelta(hours=i)).strftime('%Y-%m-%dT%H:00')
+            for i in range(24)
+        ]
+        assert panel.reads == tuple(series['read'][hour] for hour in hour_keys)
+        assert panel.writes == tuple(series['write'][hour] for hour in hour_keys)
+        assert panel.other == tuple(series['other'][hour] for hour in hour_keys)
+        assert dict(panel.by_operation) == dict(by_operation)
+        assert dict(panel.by_operation)['unknown'] == 1 + 1 + 11

@@ -58,11 +58,13 @@ _ROLLUP_COUNT_SQL = (
 
 # The Memory panel's numbers as an independent oracle: raw write_ops rows
 # plus read_op_counts counts, in ONE statement so one read snapshot, keyed
-# finer than both panel views. Mirrors
+# finer than both panel views. Restates
 # dashboard/src/dashboard/data/write_journal.py::get_memory_ops, which
-# fused-memory cannot import. NULL and '' operations both read 'unknown'
-# there, so they share a key here.
-_PANEL_COUNTS_SQL = f"""
+# fused-memory cannot import; NULL and '' operations both read 'unknown'
+# there, so they share a key here. A plain literal, because
+# dashboard/tests/test_write_journal.py::TestMigrationVerifyOracleMatchesPanel
+# reads it with ast to hold the two to agreement.
+_PANEL_COUNTS_SQL = """
 SELECT hour, kind, operation, SUM(n) FROM (
     SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour, kind,
            IFNULL(NULLIF(operation, ''), 'unknown') AS operation, COUNT(*) AS n
@@ -72,7 +74,7 @@ SELECT hour, kind, operation, SUM(n) FROM (
     UNION ALL
     SELECT strftime('%Y-%m-%dT%H:00', hour_start), 'read',
            IFNULL(NULLIF(operation, ''), 'unknown'), SUM(count)
-    FROM {ROLLUP_TABLE}
+    FROM read_op_counts
     WHERE hour_start >= :start AND hour_start < :end
     GROUP BY 1, 2, 3
 )
