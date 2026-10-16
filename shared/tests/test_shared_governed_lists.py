@@ -17,7 +17,7 @@ from pathlib import Path
 import config_dir_archival_allowlist
 import silent_fallthrough_allowlist
 
-from shared.governed_exceptions import governed_exceptions
+from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
 from shared.task_metadata import _BLESSED_METADATA_KEYS, _LEGACY_RETRY_LEDGER_COUNTER_KEYS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -88,6 +88,8 @@ SILENT_FALLTHROUGH_ALLOWLIST = governed_exceptions(
     'A pre-existing site that swallows an error into an empty value or a discarded '
     'error slot, tolerated by the silent-fallthrough gate until it is fixed.',
     _occurrence_keys(entry[:3] for entry in silent_fallthrough_allowlist.ALLOWLIST_ENTRIES),
+    default=Debt(TaskRef(5603)),
+    default_covers=12,
 )
 
 CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
@@ -99,6 +101,8 @@ CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
         for site in config_dir_archival_allowlist.AUDITED_SITES
         if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
     ),
+    default=Debt(TaskRef(5603)),
+    default_covers=6,
 )
 
 BLESSED_TASK_METADATA_KEYS = governed_exceptions(
@@ -106,6 +110,8 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     'A task-metadata key outside the typed TaskMetadata schema that the metadata census '
     'accepts without an unknown-key warning.',
     sorted(_BLESSED_METADATA_KEYS),
+    default=Debt(TaskRef(5603)),
+    default_covers=52,
 )
 
 LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
@@ -113,6 +119,8 @@ LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
     'A RetryLedger counter that legacy metadata blobs still carry as a top-level key '
     'instead of nested under retry_ledger, tolerated rather than reported.',
     list(_LEGACY_RETRY_LEDGER_COUNTER_KEYS),
+    default=Debt(TaskRef(5603)),
+    default_covers=2,
 )
 
 RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
@@ -120,6 +128,8 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     'A ruff rule turned off in a workspace pyproject.toml, globally or for a file glob, '
     'instead of being fixed at its sites or disposed inline.',
     ruff_suppression_keys(REPO_ROOT),
+    default=Debt(TaskRef(5603)),
+    default_covers=2,
 )
 
 
