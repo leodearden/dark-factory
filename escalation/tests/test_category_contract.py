@@ -3,6 +3,8 @@
 ``escalation.categories.EscalationCategory`` is the one registered vocabulary
 every filed ``Escalation.category`` must belong to, and
 ``require_registered_category`` is the one check every enforcement point calls.
+A category some filer passes is pinned by ``test_category_census.py``; the
+lists here pin only what no source the census walks can show.
 """
 
 from __future__ import annotations
@@ -23,28 +25,18 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
-_CATEGORIES_THIS_TASK_REGISTERS = (
-    'cascade_status_rejection',
-    'already_landed',
-    'reconciliation_standing_decision_storm',
-    'regressed_after_resolution',
+_REGISTERED_AHEAD_OF_ANY_PRODUCER = (
     'milestone_check_stalled',
     'review_due',
 )
 
-_RETIRED_PROSE_LIST = (
+_AGENT_INSTRUCTED = (
     'scope_violation',
     'design_concern',
     'cleanup_needed',
     'dependency_discovered',
     'risk_identified',
     'infra_issue',
-    'reconciliation_stale_human_operator',
-    'reconciliation_stale_gate_backlog',
-    'recon_missing_index',
-)
-
-_AGENT_INSTRUCTED = (
     'missing_premise',
     'planning_stalled',
     'out_of_scope',
@@ -55,12 +47,8 @@ _AGENT_INSTRUCTED = (
 
 
 class TestRegistry:
-    @pytest.mark.parametrize('value', _CATEGORIES_THIS_TASK_REGISTERS)
-    def test_outstanding_categories_are_registered(self, value: str):
-        assert value in EscalationCategory
-
-    @pytest.mark.parametrize('value', _RETIRED_PROSE_LIST)
-    def test_retired_prose_list_stays_registered(self, value: str):
+    @pytest.mark.parametrize('value', _REGISTERED_AHEAD_OF_ANY_PRODUCER)
+    def test_registered_ahead_of_any_producer(self, value: str):
         assert value in EscalationCategory
 
     @pytest.mark.parametrize('value', _AGENT_INSTRUCTED)
