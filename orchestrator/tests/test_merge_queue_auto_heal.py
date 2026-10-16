@@ -1241,6 +1241,7 @@ class TestAutoHealHaltOwnerSurvivesOwnBlock:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
         workflow.scheduler.update_task = AsyncMock()
+        workflow.mcp = None
         real_lane = MergeLane(
             git_ops=_make_mock_git_ops(tmp_path), queue=asyncio.Queue(),
             verifier=FakeVerifier(), clock=FakeClock(),
@@ -1249,12 +1250,13 @@ class TestAutoHealHaltOwnerSurvivesOwnBlock:
         escalation_queue = EscalationQueue(tmp_path / 'escalations')
         workflow.escalation_queue = escalation_queue
 
-        async def _fake_post_submit(arguments_list: list[dict]) -> None:
-            return None
+        async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
+            request.result.set_result(outcome)
 
-        workflow._post_submit_tasks = _fake_post_submit  # type: ignore[method-assign]
-
-        asyncio.run(workflow._auto_heal_main_health(outcome, merge_phase=True))
+        with patch('orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue):
+            asyncio.run(
+                workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
+            )
 
         main_breaks = [
             esc for esc in escalation_queue.get_pending()
