@@ -20,13 +20,14 @@ of what the caller hands in.
 from __future__ import annotations
 
 import enum
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
 import _checkout as _checkout
 from _task_db_scan import connect_ro, decode_metadata
+from shared.governed_exceptions import TaskRef, TicketRef
 from shared.task_deferral import CarriedByDeferral, parse_record
 from shared.task_statuses import OwnerLiveness, owner_liveness
 
@@ -103,6 +104,18 @@ def read_tasks_carrying(db: Path, field: str) -> tuple[TaskRow, ...]:
     return tuple(row for row in rows if row.metadata.get(field) is not None)
 
 
+class DeathCause(enum.StrEnum):
+    """Why a cited owner no longer owns its debt."""
+
+    OWNER_ABSENT = 'owner_absent'
+    OWNER_CLOSED = 'owner_closed'
+    SUCCESSOR_UNRESOLVED = 'successor_unresolved'
+    TICKET_ABSENT = 'ticket_absent'
+    TICKET_FAILED = 'ticket_failed'
+    TICKET_REFUSED = 'ticket_refused'
+    TICKET_CANCELLED = 'ticket_cancelled'
+
+
 class TicketState(enum.Enum):
     """What a ticket says about its owner: still curating, a task, or nothing."""
 
@@ -113,12 +126,22 @@ class TicketState(enum.Enum):
 
 @dataclass(frozen=True)
 class TicketOutcome:
-    """``resolve_ticket``'s answer, parsed once: the state plus the wire facts behind it."""
+    """``resolve_ticket``'s answer, parsed once: the state plus the wire facts behind it.
+
+    ``task_id`` is set exactly when the ticket resolved to a task.
+    """
 
     state: TicketState
     status: str
     task_id: int | None
     reason: str | None
+
+    def __post_init__(self) -> None:
+        if (self.task_id is not None) != (self.state is TicketState.RESOLVED_TO_TASK):
+            raise ValueError(
+                f'TicketOutcome: state={self.state} with task_id={self.task_id!r} -- '
+                'a ticket names a task exactly when it resolved to one'
+            )
 
 
 class TicketUnreadable(Exception):
@@ -135,12 +158,12 @@ class TicketUnreadable(Exception):
         super().__init__(message)
 
 
-UNKNOWN_TICKET_REASON = 'unknown_ticket'
+_UNKNOWN_TICKET_REASON = 'unknown_ticket'
 
 _UNPERSISTED_FAILURES: Mapping[str, TicketState | None] = MappingProxyType(
     {
         'timeout': TicketState.PENDING,
-        UNKNOWN_TICKET_REASON: TicketState.DEAD,
+        _UNKNOWN_TICKET_REASON: TicketState.DEAD,
         'server_closed': None,
         'ticket_store not configured': None,
     }
@@ -154,7 +177,15 @@ ticket at all.  None marks a server that could not look: the answer is
 unreadable, not a verdict."""
 
 _RESOLVED_STATUSES = frozenset({'created', 'combined'})
-_DEAD_STATUSES = frozenset({'failed', 'refused', 'cancelled'})
+
+_TICKET_DEATH_CAUSES: Mapping[str, DeathCause] = MappingProxyType(
+    {
+        'failed': DeathCause.TICKET_FAILED,
+        'refused': DeathCause.TICKET_REFUSED,
+        'cancelled': DeathCause.TICKET_CANCELLED,
+    }
+)
+"""The persisted terminal ticket statuses that yield no task, and what each means."""
 
 
 def _ticket_state(status: str, reason: str | None, task_id: int | None) -> TicketState | None:
@@ -164,9 +195,15 @@ def _ticket_state(status: str, reason: str | None, task_id: int | None) -> Ticke
         return TicketState.RESOLVED_TO_TASK if task_id is not None else None
     if status == 'failed' and reason is not None and reason in _UNPERSISTED_FAILURES:
         return _UNPERSISTED_FAILURES[reason]
-    if status in _DEAD_STATUSES:
+    if status in _TICKET_DEATH_CAUSES:
         return TicketState.DEAD
     return None
+
+
+def _ticket_death_cause(outcome: TicketOutcome) -> DeathCause:
+    if outcome.reason == _UNKNOWN_TICKET_REASON:
+        return DeathCause.TICKET_ABSENT
+    return _TICKET_DEATH_CAUSES[outcome.status]
 
 
 def ticket_outcome(result: object) -> TicketOutcome:
@@ -182,4 +219,117 @@ def ticket_outcome(result: object) -> TicketOutcome:
         raise TicketUnreadable(
             f'resolve_ticket answered {result!r}, which names no ticket state', result=result
         )
-    return TicketOutcome(state=state, status=status, task_id=task_id, reason=reason)
+    resolved = state is TicketState.RESOLVED_TO_TASK
+    return TicketOutcome(
+        state=state, status=status, task_id=task_id if resolved else None, reason=reason
+    )
+
+
+class Liveness(enum.StrEnum):
+    """Whether a cited owner still owns its debt, and whether directly."""
+
+    LIVE = 'live'
+    LIVE_VIA_SUCCESSOR = 'live_via_successor'
+    DEAD = 'dead'
+
+
+MAX_SUCCESSOR_HOPS = 10
+"""How many successor links one owner may be followed through before giving up."""
+
+
+@dataclass(frozen=True)
+class OwnerVerdict:
+    """One owner's liveness, with the facts the sweep renders; it carries no prose.
+
+    Attributes:
+        owning_task: The task that owns the debt now, if any.
+        path: The task ids read, in order: the owner (or its ticket's task),
+            then each successor followed.
+        cause: Why the owner is dead; set exactly when it is.
+        closed_status: The first task's status when it is not open.
+        ticket: A ticket owner's outcome.
+    """
+
+    owner: TaskRef | TicketRef
+    liveness: Liveness
+    owning_task: int | None
+    path: tuple[int, ...]
+    cause: DeathCause | None
+    closed_status: str | None
+    ticket: TicketOutcome | None
+
+    def __post_init__(self) -> None:
+        if (self.cause is not None) != (self.liveness is Liveness.DEAD):
+            raise ValueError(
+                f'OwnerVerdict: liveness={self.liveness!s} with cause={self.cause!s} -- '
+                'a verdict names a death cause exactly when it is dead'
+            )
+
+
+ReadTasks = Callable[[Collection[int]], Mapping[int, TaskRow]]
+ResolveTicket = Callable[[TicketRef], TicketOutcome]
+
+
+def _follow(
+    owner: TaskRef | TicketRef, first: int, read_tasks: ReadTasks, ticket: TicketOutcome | None
+) -> OwnerVerdict:
+    """Read *first*, then its successors, until a live task, a dead end or the bound."""
+    path: list[int] = []
+    closed_status: str | None = None
+
+    def verdict(
+        liveness: Liveness, owning_task: int | None = None, cause: DeathCause | None = None
+    ) -> OwnerVerdict:
+        return OwnerVerdict(
+            owner=owner,
+            liveness=liveness,
+            owning_task=owning_task,
+            path=tuple(path),
+            cause=cause,
+            closed_status=closed_status,
+            ticket=ticket,
+        )
+
+    task_id: int | None = first
+    while task_id is not None:
+        if task_id in path or len(path) > MAX_SUCCESSOR_HOPS:
+            return verdict(Liveness.DEAD, cause=DeathCause.SUCCESSOR_UNRESOLVED)
+        path.append(task_id)
+        is_owner = len(path) == 1
+        row = read_tasks((task_id,)).get(task_id)
+        if row is None:
+            absent = DeathCause.OWNER_ABSENT if is_owner else DeathCause.SUCCESSOR_UNRESOLVED
+            return verdict(Liveness.DEAD, cause=absent)
+        if row.liveness() is OwnerLiveness.OPEN:
+            live = Liveness.LIVE if is_owner else Liveness.LIVE_VIA_SUCCESSOR
+            return verdict(live, owning_task=task_id)
+        if is_owner:
+            closed_status = row.status
+        task_id = row.successor()
+    return verdict(Liveness.DEAD, cause=DeathCause.OWNER_CLOSED)
+
+
+def resolve_owner(
+    owner: TaskRef | TicketRef, *, read_tasks: ReadTasks, resolve_ticket: ResolveTicket
+) -> OwnerVerdict:
+    """Whether *owner* still owns its debt, given the two lookups.
+
+    A ticket owner maps through its outcome first: still curating is live with
+    no task yet, a ticket that yields no task is dead, and a resolved ticket is
+    followed as its task.  Store errors and :class:`TicketUnreadable` propagate.
+    """
+    if isinstance(owner, TaskRef):
+        return _follow(owner, owner.id, read_tasks, ticket=None)
+    outcome = resolve_ticket(owner)
+    if outcome.task_id is not None:
+        return _follow(owner, outcome.task_id, read_tasks, ticket=outcome)
+    pending = outcome.state is TicketState.PENDING
+    return OwnerVerdict(
+        owner=owner,
+        liveness=Liveness.LIVE if pending else Liveness.DEAD,
+        owning_task=None,
+        path=(),
+        cause=None if pending else _ticket_death_cause(outcome),
+        closed_status=None,
+        ticket=outcome,
+    )
