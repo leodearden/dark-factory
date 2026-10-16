@@ -12,13 +12,31 @@ contract, and ``test_harness_offline_lane_trigger.py`` (β1) for the
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _lane_episode_fakes import Clock
+from shared.task_submit import SubmittedTask
 
+from orchestrator.config import LaneCommand
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_episode_state import EpisodeStore
+
+_COMMAND = 'lane-q'
+_FAILING_ONE_TEST = "printf 'FAILED tests/test_q.py::test_a - AssertionError: boom\\n'; exit 1"
+_WAIT_SECS = 60.0
+
+
+async def _until(done: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + _WAIT_SECS
+    while not done():
+        assert time.monotonic() < deadline, 'the harness-built lane worker did not get there in time'
+        await asyncio.sleep(0.02)
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -69,41 +87,48 @@ class TestOfflineLaneWiring:
         finally:
             await harness._stop_offline_lane()
 
-    async def test_start_offline_lane_wires_task_client_and_escalation_queue(
-        self, harness: Harness
+    @pytest.mark.timeout(120)
+    async def test_the_lane_files_a_reproduced_red_through_the_harness_scheduler(
+        self, harness: Harness, tmp_path: Path
     ):
-        """_start_offline_lane wires a concrete task_client + the harness's
-        escalation_queue into the worker (task 2016, closing Bug #1).
+        """The harness-built worker files through the harness's OWN scheduler (task 2016, Bug #1).
 
-        Without this wiring, a confirmed red run's _file_new_fix_task /
-        _file_info_escalation / _file_blocker_escalation all degrade to
-        log-only no-ops (offline_lane.py task_client/escalation_queue None
-        checks) — a confirmed red run files NOTHING.
-
-        Step 5 (RED): _start_offline_lane currently builds the worker with
-        neither task_client= nor escalation_queue=, so both default to None
-        — must fail before impl (step-6).
+        A real fixture command fails one test. Its first pass holds an episode and files
+        nothing; with main idle, the engine's tick names it due 30 minutes on, the worker
+        re-runs it, and the second reproduced pass files ONE lane fix task through
+        ``scheduler.submit_task``, carrying the harness's project root. The worker's clock
+        is its module default, replaced here because ``_start_offline_lane`` takes none.
         """
-        from orchestrator.harness import _OfflineLaneTaskClient
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        harness.git_ops = MagicMock()
+        harness.git_ops.get_main_sha = AsyncMock(return_value='HEAD1')
+        harness.git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=worktree)
+        harness.git_ops.is_ancestor_checked = AsyncMock(return_value=True)
+        harness.scheduler.submit_task = AsyncMock(return_value=SubmittedTask('7001', 'deferred'))
+        harness.scheduler.dispatch_tool = AsyncMock(return_value={})
+        git = harness.config.git
+        git.offline_lane_enabled = True
+        git.persistent_offline_deep_worktree = True
+        git.offline_lane_legacy_numeric_enabled = False
+        git.offline_lane_poll_interval_secs = 0.05
+        git.offline_lane_commands = [LaneCommand(name=_COMMAND, command=_FAILING_ONE_TEST, cwd='.')]
+        clock = Clock()
 
-        harness.config.git.offline_lane_enabled = True
-        harness.config.git.persistent_offline_deep_worktree = True
-        harness._escalation_queue = MagicMock()
-
-        await harness._start_offline_lane()
-
+        with patch('orchestrator.offline_lane._utc_now', new=clock):
+            await harness._start_offline_lane()
         try:
-            worker = harness._offline_lane_worker
-            assert isinstance(worker, OfflineLaneWorker)
-            assert worker.task_client is not None
-            assert isinstance(worker.task_client, _OfflineLaneTaskClient)
-            assert worker.task_client._scheduler is harness.scheduler, (
-                'the adapter must wrap the harness\'s own scheduler, not a '
-                'stub or a different instance'
-            )
-            assert worker.escalation_queue is harness._escalation_queue
+            await _until(lambda: bool(EpisodeStore(tmp_path, clock=clock).load(_COMMAND).episodes))
+            harness.scheduler.submit_task.assert_not_awaited()
+            clock.advance(minutes=30)
+            await _until(lambda: harness.scheduler.submit_task.await_count > 0)
         finally:
             await harness._stop_offline_lane()
+
+        harness.scheduler.submit_task.assert_awaited_once()
+        arguments = harness.scheduler.submit_task.await_args.args[0]
+        assert arguments['metadata']['spawn_context'] == 'offline_lane_red'
+        assert arguments['project_root'] == str(tmp_path)
 
     async def test_start_offline_lane_noop_when_offline_lane_disabled(
         self, harness: Harness
@@ -180,54 +205,3 @@ class TestOfflineLaneWiring:
         assert harness._offline_lane_task is None
         assert harness._offline_lane_worker is None
         assert harness._offline_lane_notifiee is None
-
-
-# ---------------------------------------------------------------------------
-# _OfflineLaneTaskClient — concrete MCP adapter wrapping the scheduler
-# (task 2016, step-3/4)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_offline_lane_task_client_dispatches_via_scheduler():
-    """_OfflineLaneTaskClient's three methods delegate to the scheduler.
-
-    Covers the concrete implementation of the ``offline_lane.OfflineLaneTaskClient``
-    Protocol that the harness wires into ``OfflineLaneWorker`` — submit via
-    ``dispatch_tool('submit_task', ...)``, suspect-range append via
-    ``update_task(..., metadata_mode='additive')`` (atomic list-union, no
-    read-modify-write), and status via ``get_statuses([id])``.
-
-    Step 3 (RED): ``_OfflineLaneTaskClient`` does not exist on
-    ``orchestrator.harness`` yet — the import must fail before impl (step-4).
-    """
-    from orchestrator.harness import _OfflineLaneTaskClient
-
-    scheduler = MagicMock()
-    scheduler.dispatch_tool = AsyncMock(return_value={'task_id': 'fix-7'})
-    scheduler.update_task = AsyncMock(return_value=True)
-    scheduler.get_statuses = AsyncMock(return_value=({'fix-7': 'in-progress'}, None))
-
-    client = _OfflineLaneTaskClient(scheduler)
-
-    # (a) submit_fix_task dispatches 'submit_task' with the arguments dict and
-    # extracts the new task's id from the MCP response envelope.
-    arguments = {'title': 't'}
-    task_id = await client.submit_fix_task(arguments)
-    assert task_id == 'fix-7'
-    scheduler.dispatch_tool.assert_awaited_once()
-    await_args = scheduler.dispatch_tool.await_args
-    assert await_args.args[0] == 'submit_task'
-    assert await_args.args[1] == arguments
-
-    # (b) append_suspect_range additive-updates metadata.suspect_ranges —
-    # a recursive list-union append, not a read-modify-write.
-    await client.append_suspect_range('fix-7', 'A..B')
-    scheduler.update_task.assert_awaited_once_with(
-        'fix-7', {'suspect_ranges': ['A..B']}, metadata_mode='additive',
-    )
-
-    # (c) get_status resolves via get_statuses([task_id]).
-    status = await client.get_status('fix-7')
-    assert status == 'in-progress'
-    scheduler.get_statuses.assert_awaited_once_with(['fix-7'])
