@@ -67,8 +67,9 @@ fallback, so no reader can MIS-READ a document that lacks it. Bumping
 would make every live state file on every project read ``malformed`` on
 the first post-deploy probe — one guaranteed false alarm per project,
 plus a reset streak — which is precisely the degradation this module
-exists to close. ``capped`` and ``retry_backlog`` (task 5678) are further
-additive fields under the same rule.
+exists to close. ``capped`` and ``retry_backlog`` (task 5678), and
+``last_scheduled_target_date`` (task 6548), are further additive fields
+under the same rule.
 
 THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
 OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
@@ -590,6 +591,7 @@ def record_run(
     commit_made: bool = False,
     budget_suppressed: bool = False,
     capped: bool = False,
+    scheduled: bool = False,
 ) -> dict:
     """Classify this run, fold it into the running streak, and write the
     state file atomically. Returns the document it wrote.
@@ -597,6 +599,11 @@ def record_run(
     The run is also folded into ``retry_backlog`` by
     :func:`fold_retry_backlog`, so a date whose pass did not finish stays
     owed a run.
+
+    A *scheduled* pass records its target as ``last_scheduled_target_date``
+    and owes, with 0 attempts, the :func:`never_run_dates` since the
+    previous scheduled pass. A manual pass neither moves that cursor nor
+    owes them, because it rewrites ``target_date`` (the backfill case).
 
     ``recorded_at`` is an INJECTED parameter, not a ``datetime.now()``
     inside this function, so the whole module stays clock-injectable and
@@ -680,6 +687,10 @@ def record_run(
     if outcome == OUTCOME_PRODUCTIVE and finished(exit_code=exit_code, capped=capped):
         last_productive_at = recorded_at_iso
 
+    cursor, never_run = _schedule_cursor(
+        prev, target_date=target_date, scheduled=scheduled
+    )
+
     doc = {
         'schema_version': STATE_SCHEMA_VERSION,
         'project_id': project_id,
@@ -700,6 +711,7 @@ def record_run(
             prev_failed + 1 if outcome == OUTCOME_FAILED else 0
         ),
         'last_productive_at': last_productive_at,
+        'last_scheduled_target_date': cursor.isoformat() if cursor else None,
         'counters': {
             'total_records': total_records,
             'zero_signal_dropped': zero_signal_dropped,
@@ -716,11 +728,25 @@ def record_run(
             exit_code=exit_code,
             capped=capped,
             commit_made=commit_made,
+            never_run=never_run,
         ),
     }
 
     _write_state(path, doc)
     return doc
+
+
+def _schedule_cursor(
+    prev: dict | None, *, target_date: date, scheduled: bool
+) -> tuple[date | None, tuple[date, ...]]:
+    """The schedule cursor to record, and the never-run dates this pass owes."""
+    prev_cursor = (
+        None if prev is None
+        else _parse_iso_date(prev.get('last_scheduled_target_date'))
+    )
+    if not scheduled:
+        return prev_cursor, ()
+    return target_date, never_run_dates(prev_cursor, target_date=target_date)
 
 
 def record_retry(
@@ -776,6 +802,7 @@ def _next_retry_backlog(
     exit_code: int,
     capped: bool,
     commit_made: bool,
+    never_run: tuple[date, ...] = (),
 ) -> dict[str, int]:
     today = recorded_at.date()
     fold = fold_retry_backlog(
@@ -785,6 +812,7 @@ def _next_retry_backlog(
             exit_code=exit_code, capped=capped, commit_made=commit_made
         ),
         today=today,
+        never_run=never_run,
     )
     for owed, attempts in sorted(fold.abandoned.items()):
         logger.warning(
