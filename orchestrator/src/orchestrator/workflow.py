@@ -5801,14 +5801,17 @@ class TaskWorkflow:
         self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
-        # Refresh module assignments from the plan's files (handles the
-        # case where the SIMPLE_TASK agent expanded scope by one file).
+        # A conflict means the scheduler already re-pended the row and
+        # released every lock (or, with repend_error, failed that write with
+        # the locks held), so this dispatch exits here.
         plan_files = self.plan.get('files', [])
-        if plan_files:
-            # Silent no-op on lock conflict (same as before this was
-            # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
-            # fail out here, it just doesn't re-tighten the lock.
-            await self._reconcile_plan_scope(plan_files)
+        if plan_files and not (
+            scope := await self._reconcile_plan_scope(plan_files)
+        ).applied:
+            return await self._requeue_on_lock_conflict(
+                scope, plan_files, 'plan_blast_radius_lock_conflict',
+                'SIMPLE_TASK plan expansion',
+            )
 
         await self._stamp_optimistic_path('simple_task')
 
