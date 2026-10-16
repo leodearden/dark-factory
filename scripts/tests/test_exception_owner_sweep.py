@@ -565,3 +565,73 @@ def test_scan_is_read_only(project_root, seed):
     scan(view(Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',))), ports_for(project_root, stub), now=NOW)
 
     assert [tool for _, tool, _ in stub.calls] == ['get_pending_escalations']
+
+
+# ---------------------------------------------------------------------------
+# D11: the curator is not the dedup mechanism.  A finding counts as filed only
+# when its ticket yields a LIVE task carrying the key; otherwise it escalates.
+
+DEAD_2733 = FindingKey(FindingKind.DEAD_OWNER, INLINE_SCOPE, TaskRef(2733))
+INLINE_2733 = view(Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',)))
+
+
+def test_a_created_task_carrying_the_key_is_filed(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]), submit_outcome='created')
+
+    outcome = sweep_once(INLINE_2733, ports_for(project_root, stub))
+
+    assert (outcome.filed, outcome.escalated) == (1, 0)
+    assert stub.tool_calls('escalate_info') == []
+
+
+def test_a_finding_combined_onto_a_closed_task_escalates_naming_the_outcome(project_root, seed):
+    stub = StubMcp(
+        seed([{'id': 2733, 'status': 'done'}, {'id': 4000, 'status': 'done'}]),
+        submit_outcome='combined',
+        combine_into=4000,
+    )
+    ports = ports_for(project_root, stub)
+
+    outcome = sweep_once(INLINE_2733, ports)
+
+    assert (outcome.filed, outcome.escalated) == (0, 1)
+    (escalated,) = stub.tool_calls('escalate_info')
+    assert escalated['task_id'] == DEAD_2733.escalation_task_id()
+    detail = escalated['detail']
+    for fact in ('tkt_S1', 'combined', 'task 4000', "'done'"):
+        assert fact in detail
+
+    again = sweep_once(INLINE_2733, ports)
+
+    assert len(stub.tool_calls('submit_task')) == 1
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert again.skipped_existing == 1
+
+
+@pytest.mark.parametrize(
+    ('submit_outcome', 'combine_into'),
+    [('combined', 4001), ('refused', None), ('pending', None)],
+)
+def test_a_submit_that_yields_no_live_task_carrying_the_key_escalates(
+    project_root, seed, submit_outcome, combine_into
+):
+    stub = StubMcp(
+        seed([{'id': 2733, 'status': 'done'}, {'id': 4001, 'status': 'pending'}]),
+        submit_outcome=submit_outcome,
+        combine_into=combine_into,
+    )
+
+    outcome = sweep_once(INLINE_2733, ports_for(project_root, stub))
+
+    assert (outcome.filed, outcome.escalated) == (0, 1)
+    (escalated,) = stub.tool_calls('escalate_info')
+    assert escalated['task_id'] == DEAD_2733.escalation_task_id()
+
+
+def test_a_submit_error_is_a_fused_memory_failure(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]), submit_outcome='error')
+
+    with pytest.raises(SweepFailure) as excinfo:
+        sweep_once(INLINE_2733, ports_for(project_root, stub))
+
+    assert excinfo.value.stage is FailureStage.FUSED_MEMORY
