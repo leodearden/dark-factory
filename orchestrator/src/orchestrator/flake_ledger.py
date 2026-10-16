@@ -68,7 +68,7 @@ import contextlib
 import json
 import logging
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -77,7 +77,7 @@ from typing import Any, Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.task_metadata import DoneProvenance, parse_metadata
-from shared.task_statuses import TERMINAL
+from shared.task_statuses import TERMINAL, owner_liveness
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 logger = logging.getLogger(__name__)
@@ -956,56 +956,6 @@ class _OwnerRead:
         return None if self.task is None else self.task.get('status')
 
 
-def _owner_liveness(status: str | None) -> str:
-    """Four-way verdict on a stored owner's LIVE status:
-    ``open`` | ``deferred`` | ``done`` | ``closed``.
-
-    Mirrors ``orchestrator/src/orchestrator/chronic_flake.py::_is_open_status``'s
-    ``status not in TERMINAL and status != 'deferred'`` predicate against the same source
-    of truth (``shared.task_statuses.TERMINAL``), REFINED from a boolean to four values
-    so ``deferred`` and ``done`` stay distinguishable.
-
-    Why that refinement is load-bearing and not a nicety: ``planning_mode=True`` creates
-    the task ``deferred``, so between ``submit_task`` and ``commit_planning`` there is a
-    real window in which a crash or a failed second round-trip leaves a task that EXISTS
-    but will never be dispatched.  The boolean predicate classifies that as NOT open, so
-    every subsequent suppression of the same test would file another orphan — a
-    duplicate-generating loop that gets worse the more the test flakes.  The
-    ``deferred`` branch finishes the half-done filing instead.
-
-    ``done`` is split out of ``closed`` (task η) for the same reason: its correct action
-    differs.  With a ``task_client`` wired, :func:`open_debt`'s lazy close resolves a
-    done owner's cycle and the re-entry upsert discharges that owner, so a done owner on
-    an OPEN row can only mean that resolution did not land: ``get_task`` failed, raised,
-    timed out or is missing and the ``get_statuses`` fallback read the owner done, or
-    the stamp itself failed.  Replacing it would overwrite the only pointer to the fix
-    that did not hold, so the cycle would never close, ``prior_resolving_commit`` would
-    never be written, and no ``regressed_after_resolution`` L2 would fire.  ``closed``
-    therefore means only a non-done terminal status (``cancelled``) or an absent owner.
-
-    Empty/absent is ``closed``: a SUCCESSFUL read that finds no such task — ``get_task``
-    answering ``TaskNotFoundError``, or ``get_statuses`` silently OMITTING the id — is a
-    corroborated absence (the task was deleted).  A FAILED read never reaches here — see
-    :func:`_ensure_owner_task`, where an unreadable status is explicitly not treated as
-    evidence of anything.
-
-    That last sentence is a GUARANTEE, not an aspiration, and it rests on both reads
-    reporting failure in band — ``get_task``'s ``(task, error)`` and
-    :class:`FlakeLedgerTaskClient.get_statuses`' ``(statuses, error)`` pair: the caller
-    returns early on a non-``None`` error, so only a successful read is classified here.
-    It was NOT true while the adapter swallowed failures into a bare ``{}`` — that
-    arrived indistinguishable from an absence and was classified ``closed``, filing a
-    replacement task for an owner that was alive and merely unread.
-    """
-    if not status:
-        return 'closed'
-    if status == 'deferred':
-        return 'deferred'
-    if status == 'done':
-        return 'done'
-    return 'closed' if status in TERMINAL else 'open'
-
-
 class _OwnerClaimLost(RuntimeError):
     """The conditional owner UPDATE matched no row — another lane won the claim, or the
     row is gone.  Raised by :func:`_write_owner_task_id` so the filed task is reported as
@@ -1177,7 +1127,34 @@ async def _ensure_owner_task(
     *owner_read* when :func:`open_debt`'s lazy close made one of this owner, so each call
     reads its owner once (:func:`_owner_status`).  Only a cancelled or absent owner is
     REPLACED: a done one is kept, because on an open row it means the lazy close did not
-    land and the next suppression retries it (:func:`_owner_liveness`).
+    land and the next suppression retries it (the ``done`` verdict below).
+
+    Why :func:`shared.task_statuses.owner_liveness` has four verdicts and not a boolean.
+    ``planning_mode=True`` creates the task ``deferred``, so between ``submit_task`` and
+    ``commit_planning`` a crash or a failed second round-trip leaves a task that EXISTS
+    but will never be dispatched.  A boolean "open" predicate classifies that as not
+    open, so every subsequent suppression of the same test would file another orphan —
+    a duplicate-generating loop that gets worse the more the test flakes.  The
+    ``deferred`` branch finishes the half-done filing instead.
+
+    ``done`` is split out of ``closed`` (task η) because its correct action differs.
+    With a ``task_client`` wired, :func:`open_debt`'s lazy close resolves a done owner's
+    cycle and the re-entry upsert discharges that owner, so a done owner on an OPEN row
+    can only mean that resolution did not land: ``get_task`` failed, raised, timed out
+    or is missing and the ``get_statuses`` fallback read the owner done, or the stamp
+    itself failed.  Replacing it would overwrite the only pointer to the fix that did
+    not hold, so the cycle would never close, ``prior_resolving_commit`` would never be
+    written, and no ``regressed_after_resolution`` L2 would fire.
+
+    A SUCCESSFUL read that finds no such task — ``get_task`` answering
+    ``TaskNotFoundError``, or ``get_statuses`` silently OMITTING the id — is a
+    corroborated absence (the task was deleted) and classifies ``closed``.  A FAILED read
+    never reaches the classification: both reads report failure in band — ``get_task``'s
+    ``(task, error)`` and :class:`FlakeLedgerTaskClient.get_statuses`' ``(statuses,
+    error)`` pair — and the code below returns early on a non-``None`` error.  That was
+    NOT true while the adapter swallowed failures into a bare ``{}``: it arrived
+    indistinguishable from an absence and was classified ``closed``, filing a replacement
+    task for an owner that was alive and merely unread.
 
     COUPLING RULE, binding (§5.9): the ledger READS task status but never WRITES it,
     except the initial filing.  It never marks a task done, never blocks one, never
@@ -1213,9 +1190,9 @@ async def _ensure_owner_task(
         # next suppression of the same test retries, and θ's age backstop catches a row
         # that stays stuck; a duplicate task tree is not.
         #
-        # It is the TYPED PAIR, not the caller's exception discipline, that now makes
-        # `_owner_liveness`'s standing claim ("a FAILED read never reaches here") true
-        # through the production composition rather than merely aspirational.
+        # It is the TYPED PAIR, not the caller's exception discipline, that makes "a
+        # FAILED read never reaches the classification" true through the production
+        # composition rather than merely aspirational.
         status, read_error = await _owner_status(task_client, row.owner_task_id, owner_read)
         if read_error is not None:
             logger.warning(
@@ -1227,7 +1204,7 @@ async def _ensure_owner_task(
                 exc_info=read_error,
             )
             return row
-        liveness = _owner_liveness(status)
+        liveness = owner_liveness(status)
         if liveness == 'open':
             logger.debug(
                 'flake_ledger: debt for test_id=%s is already owned by live task %s',
@@ -1237,8 +1214,8 @@ async def _ensure_owner_task(
             return row
         if liveness == 'deferred':
             # A half-completed initial filing, not a closed one.  Finish it — filing a
-            # SECOND task here is the duplicate-generating loop _owner_liveness exists
-            # to prevent.  Completing the initial filing is explicitly exempted from
+            # SECOND task here is the duplicate-generating loop the deferred
+            # verdict exists to prevent.  Completing the initial filing is explicitly exempted from
             # §5.9's coupling rule; this is still never lifecycle management.
             logger.info(
                 'flake_ledger: completing the half-filed de-flake task %s for test_id=%s '
@@ -1258,7 +1235,7 @@ async def _ensure_owner_task(
                 )
             return row
         if liveness == 'done':
-            # The resolution did not land this call (see `_owner_liveness`).  Keep the
+            # The resolution did not land this call (see this function's docstring).  Keep the
             # pointer and file nothing, the unreadable-status branch's fail-safe
             # direction: the next lazy resolve_debt closes the cycle through it, where a
             # replacement would erase it for good.
@@ -1768,7 +1745,7 @@ def _finished_task(owner: _OwnerRead, test_id: str) -> dict | None:
     return owner.task
 
 
-def _resolving_commit(task: dict) -> str | None:
+def resolving_commit(task: Mapping[str, Any]) -> str | None:
     """The commit that landed *task*'s fix, from its ``metadata.done_provenance``, read
     with the one typed metadata parser.  ``None`` when none was recorded: a task that
     predates ``done_provenance``, or a commitless kind.
@@ -1780,6 +1757,21 @@ def _resolving_commit(task: dict) -> str | None:
     metadata, _warnings = parse_metadata(task.get('metadata'), direction='read')
     provenance = metadata.done_provenance
     return provenance.commit if isinstance(provenance, DoneProvenance) else None
+
+
+def fix_contained(task: Mapping[str, Any], ancestry: bool | None) -> bool | None:
+    """Whether *task*'s fix is contained in the head the caller asked about: ``True``,
+    ``False``, or ``None`` when that is undecided.
+
+    ``True`` when *task* recorded no fix commit (:func:`resolving_commit` is ``None``):
+    a done task with nothing to be missing from the head is contained.  Otherwise
+    *ancestry* decides: it is the caller's already-performed
+    ``is_ancestor_checked(commit, head)`` read for that commit, and ``None`` there (the
+    read failed) leaves the answer ``None``.
+    """
+    if resolving_commit(task) is None:
+        return True
+    return ancestry
 
 
 def _stamp_resolution(
@@ -1902,7 +1894,7 @@ async def _resolve(
         task = None if owner is None else _finished_task(owner, test_id)
         if task is None:
             return False, owner
-        commit = _resolving_commit(task)
+        commit = resolving_commit(task)
         if not _stamp_resolution(
             db_path, test_id, owner_task_id=owner_task_id, resolving_commit=commit, stamp=stamp,
         ):
