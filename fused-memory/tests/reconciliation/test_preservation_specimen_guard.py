@@ -276,13 +276,18 @@ class TestFlagAssertsStranded:
         [
             'Reset the priority override back to its default.',
             "Reset the task's priority override back to its default.",
+            "Reset task 3105's priority override to its default.",
+            'Reset the task priority override.',
+            'Redispatch the task dependency 4223 first.',
+            'Reset task 3105 to its default priority.',
         ],
     )
     def test_a_reset_aimed_elsewhere_does_not_pair_with_a_status_mention(self, suggested_action):
-        """Across fields, the verb pairs with the status only when it resets the task.
+        """Across fields, the verb pairs with the status only when the task is its object.
 
-        A preserved specimen is permanently in-progress, so its unrelated
-        findings state that status routinely.
+        Nothing may follow the task but the clause's end or a destination
+        status.  A preserved specimen is permanently in-progress, so its
+        unrelated findings state that status routinely.
         """
         flag = {
             'task_id': '3105',
@@ -291,6 +296,20 @@ class TestFlagAssertsStranded:
             'suggested_action': suggested_action,
         }
         assert flag_asserts_stranded(flag) is False
+
+    @pytest.mark.parametrize(
+        'suggested_action',
+        ['Reset task 3105.', 'Reset task #3105 back to pending.', 'Un-stick the task; nothing is driving it.'],
+    )
+    def test_a_reset_of_the_task_itself_pairs_with_a_status_mention(self, suggested_action):
+        """The anchored form still accepts a reset of the task, ended by punctuation or a destination status."""
+        flag = {
+            'task_id': '3105',
+            'flag_type': 'liveness_anomaly_unattended_workflow',
+            'description': 'Task 3105 is in-progress with no claimant and no heartbeat.',
+            'suggested_action': suggested_action,
+        }
+        assert flag_asserts_stranded(flag) is True
 
     def test_a_status_mention_without_a_reset_verb_does_not_match(self):
         """The verb half stays required when the match spans both fields."""
