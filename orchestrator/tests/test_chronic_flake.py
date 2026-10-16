@@ -292,9 +292,9 @@ class TestComputeChronicFlakes:
 
 
 class TestBuildChronicFlakeFixTaskArguments:
-    """``build_chronic_flake_fix_task_arguments``: models
-    ``workflow.build_offline_lane_fix_task_arguments`` — deterministic
-    title/priority/project_root, an evidence-bearing description with an
+    """``build_chronic_flake_fix_task_arguments``: models the offline lane's
+    fix-task builder (``offline_lane_filing.build_lane_fix_task_arguments``) —
+    deterministic title/priority/project_root, an evidence-bearing description with an
     explicit root-cause (never blind timeout bumps) instruction, and
     correlation metadata."""
 
