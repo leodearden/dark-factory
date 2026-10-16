@@ -404,9 +404,7 @@ deliberate permanent ruling rather than debt. No entry may be neither.
 Inline suppressions are in scope, under their own register and ratchet.
 Entries predating the register's seeding may carry no disposition, but their
 count may only fall, never rise; every entry added or touched after it
-carries one. The ratification table lands with the mechanism (House pattern,
-step γ2) and is not in the tree yet, so `Debt(owner)` is today's only
-available disposition.
+carries one.
 
 **Checkable design question(s)**: Does this feature add or touch an
 allow-list, registry, or inline suppression whose entries silence a
@@ -438,7 +436,10 @@ and entries remain.
 **House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
 disposition vocabulary, the ratification table, the inline-marker grammar,
 the multiset ratchet kernel, the exception register and the owner-liveness
-sweep. Re-point this at the landed paths once the mechanism lands.
+sweep. The landed mechanism is `scripts/exception_register.py` (the exception
+register and the ratification-table loader),
+`scripts/inline_suppressions.py` (the inline-suppression gate and ratchet) and
+`docs/legibility/exception-ratifications.yaml` (the ratification table).
 
 **Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
 adjacent — both ask who owns a thing and what notices when the owner is
