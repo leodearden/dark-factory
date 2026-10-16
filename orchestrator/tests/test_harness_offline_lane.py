@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _lane_episode_fakes import Clock
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from shared.task_submit import SubmittedTask
 
 from orchestrator.config import LaneCommand
@@ -87,7 +88,7 @@ class TestOfflineLaneWiring:
         finally:
             await harness._stop_offline_lane()
 
-    @pytest.mark.timeout(120)
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_the_lane_files_a_reproduced_red_through_the_harness_scheduler(
         self, harness: Harness, tmp_path: Path
     ):

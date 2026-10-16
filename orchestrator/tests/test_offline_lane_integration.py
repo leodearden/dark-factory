@@ -1550,7 +1550,7 @@ async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
 # the fixture commit and two _drive_advance rounds out of bound (5 + 2 + 2 x 4 = 15 spawns x
 # 4.71s = 70.65s); required = 130.65s, enforced by this test's rows in
 # test_every_composing_caller_carries_a_timeout_override.
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
 async def test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_task(
@@ -1644,7 +1644,7 @@ async def test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_o
 
 
 # Two _drive_lane_pass calls; the same 130.65s requirement as B4.
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
 async def test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing(
@@ -1786,7 +1786,7 @@ _VERIFY_USAGE_DUMP = (
 
 # Two _drive_lane_pass calls; the same 130.65s requirement as B4 (the stub commit is the
 # fixture commit).
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.asyncio
 async def test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task(
     harness, git_ops, repo, tmp_path,

@@ -1418,7 +1418,7 @@ async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo,
 # the stub commit and two _drive_advance rounds out of bound (5 + 2 + 2 x 4 = 15 spawns x
 # 4.71s = 70.65s); required = 130.65s, enforced by this test's rows in
 # test_every_composing_caller_carries_a_timeout_override.
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.asyncio
 async def test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task(
     harness, git_ops, repo, tmp_path,
@@ -1516,7 +1516,7 @@ async def test_ib4_a_persistent_infra_red_under_an_open_task_files_once_and_esca
 
 
 # Two _drive_infra_pass calls; the same 130.65s requirement as IB3.
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.asyncio
 async def test_ib5_an_infra_red_the_confirm_clears_ends_its_episode_and_files_nothing(
     harness, git_ops, repo, tmp_path,
