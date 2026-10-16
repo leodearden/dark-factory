@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,10 +19,10 @@ from typing import Any
 
 import pytest
 from escalation.queue import EscalationQueue
-from shared import safe_io
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 from orchestrator.config import LaneCommand, OrchestratorConfig
+from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
@@ -29,6 +30,7 @@ from orchestrator.offline_lane_confirm import (
     UnconfirmableReason,
 )
 from orchestrator.offline_lane_episode_state import (
+    EPISODE_RETENTION,
     EPISODES_FILE,
     Applied,
     CommandRecord,
@@ -75,10 +77,15 @@ POLICY = LanePolicy()
 
 
 class Clock:
+    """An injected clock; each reader of it is first shown to every observer."""
+
     def __init__(self, start: datetime = T0) -> None:
         self.at = start
+        self.observers: list[Callable[[], None]] = []
 
     def __call__(self) -> datetime:
+        for observe in self.observers:
+            observe()
         return self.at
 
     def advance(self, **delta: float) -> None:
@@ -252,49 +259,81 @@ def test_an_unknown_command_loads_an_empty_record(tmp_path: Path):
     assert store.load(COMMAND) == CommandRecord.empty(COMMAND)
 
 
+def _episodes_path(tmp_path: Path) -> Path:
+    path = guard_path(tmp_path, EPISODES_FILE)
+    assert path is not None
+    return path
+
+
+def _stored_raw(tmp_path: Path, command: str, payload: object) -> None:
+    """Store *payload* under *command* as the episode store's own map would, bypassing its checks."""
+    PersistentMap(_episodes_path(tmp_path), ttl=EPISODE_RETENTION, now=Clock())[command] = payload
+
+
 def test_a_malformed_record_is_logged_loudly_and_loads_empty(tmp_path: Path, caplog):
-    clock = Clock()
-    EpisodeStore(tmp_path, clock=clock).save(_full_record())
-    path = tmp_path / 'data' / 'orchestrator' / 'guards' / EPISODES_FILE
-    payload = json.loads(path.read_text())
-    payload[COMMAND]['value']['episodes'][0]['counted_passes'] = 'p0'
-    path.write_text(json.dumps(payload))
+    payload = _full_record().to_json()
+    payload['episodes'][0]['counted_passes'] = 'p0'
+    _stored_raw(tmp_path, COMMAND, payload)
 
     with caplog.at_level(logging.ERROR):
-        record = EpisodeStore(tmp_path, clock=clock).load(COMMAND)
+        record = EpisodeStore(tmp_path, clock=Clock()).load(COMMAND)
 
     assert record == CommandRecord.empty(COMMAND)
     assert any(r.levelno == logging.ERROR and 'malformed' in r.getMessage() for r in caplog.records)
 
 
-class _WriteCounter:
-    def __init__(self, monkeypatch, log: list[str] | None = None) -> None:
-        self.payloads: list[dict[str, Any]] = []
+def test_a_record_stored_under_another_command_loads_empty(tmp_path: Path, caplog):
+    _stored_raw(tmp_path, 'other', _full_record().to_json())
+
+    with caplog.at_level(logging.ERROR):
+        record = EpisodeStore(tmp_path, clock=Clock()).load('other')
+
+    assert record == CommandRecord.empty('other')
+    assert any(r.levelno == logging.ERROR and repr(COMMAND) in r.getMessage() for r in caplog.records)
+
+
+class StoreWrites:
+    """Each write of the episode file, seen as a change of the file's identity, with the record it left.
+
+    :meth:`sample` runs whenever the code under test reads the clock or calls the task
+    client, which every store write is preceded by; call it once more after the last.
+    """
+
+    def __init__(self, tmp_path: Path, clock: Clock, log: list[str] | None = None) -> None:
+        self._tmp_path = tmp_path
+        self._path = _episodes_path(tmp_path)
+        self._clock = clock
         self._log = log
-        real = safe_io.atomic_write_text
+        self._seen = self._identity()
+        self.records: list[CommandRecord] = []
 
-        def counting(path, text, *args, **kwargs):
-            if Path(path).name == EPISODES_FILE:
-                self.payloads.append(json.loads(text))
-                if self._log is not None:
-                    self._log.append('write')
-            return real(path, text, *args, **kwargs)
+    def _identity(self) -> tuple[int, int] | None:
+        try:
+            stat = self._path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_ino, stat.st_mtime_ns
 
-        monkeypatch.setattr(safe_io, 'atomic_write_text', counting)
+    def sample(self) -> None:
+        identity = self._identity()
+        if identity == self._seen:
+            return
+        self._seen = identity
+        self.records.append(EpisodeStore(self._tmp_path, clock=Clock(self._clock.at)).load(COMMAND))
+        if self._log is not None:
+            self._log.append('write')
 
-    def episode(self, index: int, node: str = A) -> dict[str, Any]:
-        episodes = self.payloads[index][COMMAND]['value']['episodes']
-        return next(e for e in episodes if e['node'] == node)
 
-
-def test_one_save_is_one_file_write(tmp_path: Path, monkeypatch):
-    writes = _WriteCounter(monkeypatch)
-    store = EpisodeStore(tmp_path, clock=Clock())
+def test_one_save_is_one_file_write(tmp_path: Path):
+    clock = Clock()
+    writes = StoreWrites(tmp_path, clock)
+    clock.observers.append(writes.sample)
+    store = EpisodeStore(tmp_path, clock=clock)
 
     store.save(_full_record())
+    writes.sample()
 
-    assert len(writes.payloads) == 1
-    assert EpisodeStore(tmp_path, clock=Clock()).load(COMMAND) == _full_record()
+    assert writes.records == [_full_record()]
 
 
 def test_pinned_pass_ids_cover_live_and_ended_episodes_across_commands(tmp_path: Path):
@@ -497,6 +536,32 @@ def test_a_held_episode_no_pass_extends_expires_after_red_unlanded_hours():
     assert not applied.record.episodes[A].live
 
 
+def test_expiry_is_measured_from_the_pass_start_not_from_the_clock():
+    started = T0 + POLICY.red_unlanded - timedelta(seconds=1)
+
+    applied = _apply(_record(_episode()), _red(reproduced=(B,), at=started), now=started + timedelta(hours=1))
+
+    assert applied.record.episodes[A].live
+
+
+def test_persist_passes_of_one_files_a_restarted_episode_on_its_first_counted_pass():
+    applied = _apply(
+        _record(_covered()), _red(), verdicts={A: CoveringVerdict.DONE_CONTAINED}, policy=LanePolicy(persist_passes=1),
+    )
+
+    assert applied.effect.episodes_started == (A,)
+    assert applied.to_file == ((A,),)
+
+
+def test_a_crossing_test_whose_filing_is_already_due_is_not_filed_again():
+    due = _episode(filing_due=True, filing_due_since=T0, reproduce='cd integration && pytest -m integration tests')
+
+    applied = _apply(_record(due), _red())
+
+    assert applied.effect.threshold_reached == (A,)
+    assert applied.to_file == ()
+
+
 def test_a_held_episode_just_inside_red_unlanded_hours_does_not_expire():
     applied = _apply(_record(_episode()), _red(reproduced=(B,), at=T0 + POLICY.red_unlanded - timedelta(seconds=1)))
 
@@ -585,6 +650,16 @@ def test_an_unlanded_covering_task_is_named_on_a_counted_pass_at_red_unlanded_ho
     assert raised.unlanded == ()
 
 
+def test_an_unlanded_covering_task_is_named_only_on_a_counted_pass():
+    at = T0 + POLICY.red_unlanded
+    record = _record(_covered(last_counted_started_at=at - timedelta(minutes=3)))
+
+    applied = _apply(record, _red(at=at), verdicts={A: CoveringVerdict.OPEN})
+
+    assert applied.effect.tests_counted == ()
+    assert applied.unlanded == ()
+
+
 @pytest.mark.parametrize(
     'verdict',
     [CoveringVerdict.UNREADABLE, CoveringVerdict.DONE_STALE_HEAD, CoveringVerdict.DONE_CONTAINED,
@@ -612,7 +687,13 @@ class FakeLedgerClient:
         self.statuses_error: Exception | None = None
         self.unreadable: set[str] = set()
         self.commit_failures = 0
+        self.observers: list[Callable[[], None]] = []
         self._next_id = 7000
+
+    def _called(self, name: str) -> None:
+        for observe in self.observers:
+            observe()
+        self.log.append(name)
 
     def fail_submissions(self, *reasons: str) -> None:
         self.outcomes = [SubmitFailed(reason) for reason in reasons]
@@ -621,7 +702,7 @@ class FakeLedgerClient:
         self.tasks[task_id] = {'id': task_id, 'status': status, 'metadata': metadata}
 
     async def submit_task(self, arguments: dict) -> SubmitOutcome:
-        self.log.append('submit_task')
+        self._called('submit_task')
         self.submitted.append(arguments)
         if self.outcomes:
             outcome = self.outcomes.pop(0)
@@ -634,19 +715,19 @@ class FakeLedgerClient:
         return SubmittedTask(task_id, 'deferred')
 
     async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
-        self.log.append('get_statuses')
+        self._called('get_statuses')
         if self.statuses_error is not None:
             return {}, self.statuses_error
         return {i: self.tasks[i]['status'] for i in ids if i in self.tasks}, None
 
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
-        self.log.append('get_task')
+        self._called('get_task')
         if task_id in self.unreadable:
             return None, ConnectionError('task store unreachable')
         return self.tasks.get(task_id), None
 
     async def commit_planning(self, task_ids: list[str]) -> None:
-        self.log.append('commit_planning')
+        self._called('commit_planning')
         if self.commit_failures:
             self.commit_failures -= 1
             logger.warning('commit_planning failed for %s; they stay deferred', task_ids)
@@ -660,9 +741,12 @@ class FakeAncestry:
     def __init__(self) -> None:
         self.answers: dict[tuple[str, str], bool | None] = {}
         self.calls: list[tuple[str, str]] = []
+        self.failure: Exception | None = None
 
     async def is_ancestor_checked(self, ancestor: str, descendant: str) -> bool | None:
         self.calls.append((ancestor, descendant))
+        if self.failure is not None:
+            raise self.failure
         return self.answers.get((ancestor, descendant), True)
 
 
@@ -778,6 +862,12 @@ class Lane:
 
     def lane_metadata(self, index: int = -1) -> dict[str, Any]:
         return self.client.submitted[index]['metadata']['x_offline_lane']
+
+    def watch_writes(self) -> StoreWrites:
+        writes = StoreWrites(self.tmp_path, self.clock, self.log)
+        self.clock.observers.append(writes.sample)
+        self.client.observers.append(writes.sample)
+        return writes
 
 
 @pytest.mark.asyncio
@@ -1139,8 +1229,7 @@ async def test_a_legacy_leg_filing_reproduces_with_the_leg_script(tmp_path):
 async def test_scenario_21_an_unreadable_store_with_an_open_task_costs_at_most_one_duplicate(tmp_path, caplog):
     lane = Lane(tmp_path)
     await _filed(lane)
-    path = tmp_path / 'data' / 'orchestrator' / 'guards' / EPISODES_FILE
-    path.write_text('{ not json')
+    _episodes_path(tmp_path).write_text('{ not json')
 
     with caplog.at_level(logging.WARNING):
         lane.restarted()
@@ -1152,20 +1241,21 @@ async def test_scenario_21_an_unreadable_store_with_an_open_task_costs_at_most_o
 
 
 @pytest.mark.asyncio
-async def test_the_six_filing_writes_happen_in_order(tmp_path, monkeypatch):
+async def test_the_six_filing_writes_happen_in_order(tmp_path):
     lane = Lane(tmp_path)
     await lane.red()
-    writes = _WriteCounter(monkeypatch, lane.log)
+    writes = lane.watch_writes()
     del lane.log[:]
 
     await lane.spaced_red()
+    writes.sample()
 
     assert lane.log == [
         'write', 'write', 'submit_task', 'write', 'commit_planning', 'get_task', 'write', 'write',
     ]
     states = [
-        (e['filing_due'], e['covering_task_id'], e['planning_committed'])
-        for e in (writes.episode(i) for i in range(len(writes.payloads)))
+        (e.filing_due, e.covering_task_id, e.planning_committed)
+        for e in (record.episodes[A] for record in writes.records)
     ]
     assert states == [
         (False, None, False),
@@ -1177,14 +1267,15 @@ async def test_the_six_filing_writes_happen_in_order(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_pass_that_files_nothing_is_one_store_write(tmp_path, monkeypatch):
+async def test_a_pass_that_files_nothing_is_one_store_write(tmp_path):
     lane = Lane(tmp_path)
     await lane.red((A, B))
-    writes = _WriteCounter(monkeypatch)
+    writes = lane.watch_writes()
 
     await lane.spaced_red(A, minutes=3)
+    writes.sample()
 
-    assert len(writes.payloads) == 1
+    assert len(writes.records) == 1
 
 
 @pytest.mark.asyncio
@@ -1471,3 +1562,135 @@ async def test_the_unlanded_record_names_the_tests_still_red_and_every_test_of_t
     assert not lane.episode(C).live
     assert f'  - {A}' in record.detail and f'  - {B}' in record.detail
     assert C not in record.detail
+
+
+@pytest.mark.asyncio
+async def test_one_batched_status_read_per_pass_covers_every_bound_task(tmp_path):
+    lane = Lane(tmp_path)
+    await lane.red((A, B))
+    await lane.spaced_red(A, B)
+    await lane.spaced_red(A, B, C)
+    await lane.spaced_red(A, B, C)
+    assert {lane.episode(node).covering_task_id for node in (A, B, C)} == {'7001', '7002'}
+    del lane.log[:]
+
+    await lane.spaced_red(A, B, C)
+
+    assert lane.log.count('get_statuses') == 1
+
+
+@pytest.mark.asyncio
+async def test_tests_sharing_a_covering_task_share_one_read_of_it(tmp_path):
+    lane = Lane(tmp_path)
+    await lane.red((A, B))
+    await lane.spaced_red(A, B)
+    del lane.log[:]
+
+    await lane.spaced_red(A, B)
+
+    assert lane.log.count('get_task') == 1
+
+
+@pytest.mark.asyncio
+async def test_a_new_episode_takes_its_last_green_head_from_the_previous_pass_record(tmp_path):
+    lane = Lane(tmp_path)
+    await lane.red((B,), head=HEAD0, outcomes={A: 'passed', B: 'failed'})
+    lane.clock.advance(minutes=30)
+
+    await lane.red((A, B))
+
+    assert lane.episode(A).last_green_head == HEAD0
+    assert lane.stored().last_green_head is None
+
+
+@pytest.mark.asyncio
+async def test_an_ancestry_read_that_raises_is_no_decision_logged_loudly(tmp_path, caplog):
+    lane = Lane(tmp_path)
+    task_id = await _filed(lane)
+    _done(lane, task_id)
+    lane.ancestry.failure = OSError('git exited 128')
+    before = lane.episode()
+
+    with caplog.at_level(logging.ERROR):
+        effect = await lane.spaced_red()
+
+    assert effect.no_decision == (A,)
+    assert lane.episode().counted_passes == before.counted_passes
+    assert any(r.levelno >= logging.ERROR and r.exc_info and FIX_COMMIT in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_due_filings_that_fell_due_on_different_passes_file_separate_tasks(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.fail_submissions('down', 'down', 'down')
+    await lane.red((A,))
+    await lane.spaced_red(A, C)
+    await lane.spaced_red(A, C)
+    lane.clock.advance(minutes=1)
+
+    tick = await lane.tick()
+
+    assert tick.tasks_filed == ('7001', '7002')
+    assert [lane.lane_metadata(i)['nodes'] for i in (-2, -1)] == [[A], [C]]
+
+
+@pytest.mark.asyncio
+async def test_a_filing_retried_in_a_pass_is_reported_in_that_pass_effect(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.fail_submissions('down')
+    await lane.red()
+    failed = await lane.spaced_red()
+
+    retried = await lane.spaced_red()
+
+    assert failed.tasks_filed == ()
+    assert retried.tasks_filed == ('7001',)
+
+
+async def _command_level_filed(lane: Lane) -> tuple[str, ...]:
+    await lane.unconfirmable()
+    lane.clock.advance(minutes=30)
+    await lane.unconfirmable()
+    return lane.episode(unconfirmable_node(COMMAND)).counted_passes
+
+
+@pytest.mark.asyncio
+async def test_a_command_level_digest_takes_the_opening_pass_mode_from_its_outcome(tmp_path):
+    lane = Lane(tmp_path)
+
+    *_earlier, opening = await _command_level_filed(lane)
+
+    row = f'  {opening} | {HEAD1} | {lane.clock().isoformat()} | unconfirmable'
+    assert row in lane.client.submitted[0]['details']
+
+
+@pytest.mark.asyncio
+async def test_a_command_level_digest_carries_each_pass_failure_line_whatever_its_test(tmp_path):
+    lane = Lane(tmp_path)
+
+    counted = await _command_level_filed(lane)
+
+    details = lane.client.submitted[0]['details']
+    for pass_id in counted:
+        assert f'  pass {pass_id} detect : AssertionError in {A}' in details
+
+
+@pytest.mark.asyncio
+async def test_the_title_counts_the_distinct_passes_of_its_tests(tmp_path):
+    lane = Lane(tmp_path)
+    await lane.red((A,))
+    await lane.spaced_red(B)
+
+    await lane.spaced_red(A, B)
+
+    (arguments,) = lane.client.submitted
+    assert f'offline-lane[{COMMAND}]: 2 test(s) red on 3 passes since ' in arguments['title']
+
+
+@pytest.mark.asyncio
+async def test_no_recheck_for_a_test_already_held_at_the_threshold(tmp_path):
+    lane = Lane(tmp_path)
+    await _filed(lane)
+    lane.clock.advance(minutes=31)
+
+    assert (await lane.tick()).commands_due == ()
