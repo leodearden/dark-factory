@@ -3945,11 +3945,12 @@ def test_resolution_snapshot_slug_invariant_holds_on_every_shape(
         ({'session_id': '  ', 'cwd': cwd}, {'CLAUDE_SPAWN_SESSION_ID': adopted}),
     ]
     for hook_input, env in shapes:
-        probes = sh._EventProbes(env, claude_process_tree(None))
+        tree = claude_process_tree(None)
+        probes = sh._EventProbes(env, tree)
         resolution = sh._resolve_hook_slug(hook_input, env, tmp_path, probes=probes)
         assert resolution.snapshot is None or resolution.snapshot.slug == resolution.slug
         # hook_session_slug's public signature and str return are unchanged.
-        public = sh.hook_session_slug(hook_input, env, root=tmp_path)
+        public = sh.hook_session_slug(hook_input, env, root=tmp_path, process_tree=tree)
         assert isinstance(public, str)
         assert public == resolution.slug
 

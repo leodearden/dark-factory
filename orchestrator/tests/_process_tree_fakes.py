@@ -16,6 +16,8 @@ def fake_process_tree(chain: Sequence[tuple[int, str]]) -> sh.ProcessTree:
     The chain starts at THIS hook's parent, so the ancestor walk starts
     inside it rather than at the real parent.
     """
+    if not chain:
+        raise ValueError('fake_process_tree needs at least the hook parent')
     parents = {pid: chain[i + 1][0] for i, (pid, _) in enumerate(chain[:-1])}
     comms = dict(chain)
     return sh.ProcessTree(

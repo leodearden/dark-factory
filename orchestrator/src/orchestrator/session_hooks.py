@@ -972,7 +972,7 @@ class _EventProbes:
 
     def __init__(self, env: Mapping[str, str], process_tree: ProcessTree | None) -> None:
         self._env = env
-        self._tree = process_tree or ProcessTree()
+        self._tree = ProcessTree() if process_tree is None else process_tree
         self._pid: Any = _UNRESOLVED
         self._verdict: Any = _UNRESOLVED
 
