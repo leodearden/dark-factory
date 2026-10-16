@@ -1133,6 +1133,29 @@ def idle_psi_sample() -> PsiSample:
     )
 
 
+class HostDiskUsage(NamedTuple):
+    """The ``(total, used, free)`` shape ``shutil.disk_usage`` returns."""
+
+    total: int
+    used: int
+    free: int
+
+
+_AMPLE_FREE_BYTES = 1024**4
+
+
+def ample_disk_usage(path: str | os.PathLike[str]) -> HostDiskUsage:
+    """Return the hermetic default disk reading: 1 TiB free on any volume.
+
+    Far above every free-space floor a test can reach, starting with the
+    merge-lane pre-verify guard's 10 GiB default
+    (``OrchestratorConfig.merge_verify_min_free_disk_bytes``), so the guards
+    take their healthy-host path whatever disk the host has. Installed as
+    ``shutil.disk_usage`` by conftest's autouse ``_hermetic_disk_usage``.
+    """
+    return HostDiskUsage(total=2 * _AMPLE_FREE_BYTES, used=_AMPLE_FREE_BYTES, free=_AMPLE_FREE_BYTES)
+
+
 class HermeticMcpSession:
     """In-process ``McpSessionLike`` double that performs zero network I/O.
 
