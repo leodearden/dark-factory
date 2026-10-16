@@ -39,7 +39,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.verify import VerifyResult
 
@@ -1832,26 +1832,50 @@ class TestGroupNodeIdsBySubproject:
         """(g) A ModuleConfig keyed on prefix='' must not match every node-id
         (pathlib drops the empty component) nor yield a '/'-leading qualified
         id: it is skipped with a WARNING, real prefixes still map unambiguously,
-        and an id only the empty prefix could own is unmapped (None)."""
+        and an id only the empty prefix could own is unmapped (None). The
+        WARNING names the caller's log_label and the stray config's
+        test_command, once per call."""
         from orchestrator import verify as verify_module
 
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
-        with_empty = {'': mcs['alpha'], **mcs}
+        stray = ModuleConfig(prefix='', test_command='pytest stray-root')
+        expected_warning_args = [('unit', 'pytest stray-root')]
 
         with patch.object(verify_module, 'logger') as mock_logger:
-            groups = self._group(tmp_path, with_empty, ['tests/test_a.py::test_a'])
-            only_empty = self._group(
-                tmp_path, {'': mcs['alpha']}, ['tests/test_a.py::test_a'],
+            groups = self._group(
+                tmp_path, {'': stray, **mcs}, ['tests/test_a.py::test_a'],
             )
-
         assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
+        assert [
+            call.args[1:] for call in mock_logger.warning.call_args_list
+        ] == expected_warning_args, mock_logger.warning.call_args_list
+
+        with patch.object(verify_module, 'logger') as mock_logger:
+            only_empty = self._group(
+                tmp_path, {'': stray}, ['tests/test_a.py::test_a'],
+            )
         assert only_empty is None, only_empty
-        assert mock_logger.warning.call_count == 2, mock_logger.warning.call_args_list
-        assert all(
-            'empty prefix' in call.args[0]
-            for call in mock_logger.warning.call_args_list
-        ), mock_logger.warning.call_args_list
+        assert [
+            call.args[1:] for call in mock_logger.warning.call_args_list
+        ] == expected_warning_args, mock_logger.warning.call_args_list
+
+    def test_empty_prefix_config_does_not_warn_without_node_ids(
+        self, tmp_path: Path
+    ) -> None:
+        """(h) With nothing to map, the empty-prefix config is never consulted,
+        so it costs no WARNING and the result stays ``{}``."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+        stray = ModuleConfig(prefix='', test_command='pytest stray-root')
+
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = self._group(tmp_path, {'': stray, **mcs}, [])
+
+        assert groups == {}, groups
+        mock_logger.warning.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

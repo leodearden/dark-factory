@@ -10161,13 +10161,14 @@ def _group_node_ids_by_subproject(
         log_label: Caller name, embedded in every log line so an operator can
             attribute the message to the right call site.
     """
-    probe_prefixes = [prefix for prefix in module_configs if prefix]
-    if len(probe_prefixes) != len(module_configs):
+    if node_ids and '' in module_configs:
         logger.warning(
-            '%s: ignoring ModuleConfig with an empty prefix — an empty prefix '
-            'would match every node-id and qualify it as %r',
-            log_label, '/<node_id>',
+            '%s: ignoring ModuleConfig with an empty prefix (test_command=%r) '
+            "— an empty prefix would match every node-id and qualify it as "
+            "'/<node_id>'",
+            log_label, module_configs[''].test_command,
         )
+    probe_prefixes = [prefix for prefix in module_configs if prefix]
     groups: dict[str, list[str]] = {}
     for node_id in node_ids:
         file_part = node_id.split('::', 1)[0]
