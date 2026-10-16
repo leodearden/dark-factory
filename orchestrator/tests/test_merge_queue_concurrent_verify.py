@@ -6756,14 +6756,18 @@ class TestMergeResultTimeoutName:
 
     def test_heavy_barrier_test_timeout_name_resolves_to_its_value(self) -> None:
         """`timeout=HEAVY_BARRIER_TEST_TIMEOUT` resolves the name reference
-        to the constant's numeric value rather than billing it as unbounded.
+        through the scanned module's namespace to the constant's numeric
+        value rather than billing it as unbounded.
         """
         source = '''
 class TestHeavyBarrierTimeoutName:
     async def test_it(self):
         await asyncio.wait_for(x, timeout=HEAVY_BARRIER_TEST_TIMEOUT)
 '''
-        budgets = _worst_per_method_wait_budget(source)
+        budgets = _worst_per_method_wait_budget(
+            source,
+            module_constants={'HEAVY_BARRIER_TEST_TIMEOUT': HEAVY_BARRIER_TEST_TIMEOUT},
+        )
 
         assert math.isfinite(budgets['TestHeavyBarrierTimeoutName']), (
             f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to a '
@@ -6773,6 +6777,126 @@ class TestHeavyBarrierTimeoutName:
         assert budgets == {'TestHeavyBarrierTimeoutName': expected}, (
             f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to '
             f'{expected}, got {budgets!r}.'
+        )
+
+    def test_module_constant_name_resolves_from_the_namespace(self) -> None:
+        """A module-local constant the static table cannot know resolves
+        through the scanned module's namespace: `timeout=_SETTLE` with
+        `_SETTLE = 30.0` bills 30.0, not unbounded.
+        """
+        source = '''
+class TestModuleConstant:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=_SETTLE)
+'''
+        budgets = _worst_per_method_wait_budget(source, module_constants={'_SETTLE': 30.0})
+
+        assert budgets == {'TestModuleConstant': 30.0}, (
+            f'Expected timeout=_SETTLE to resolve to its namespace value '
+            f'30.0, got {budgets!r}.'
+        )
+
+    def test_wait_responsive_nominal_resolves_from_the_namespace(self) -> None:
+        """A `wait_responsive` nominal spelled as a module constant
+        (`_GATE = 15`) is stretched like a literal one: 2 x 15 = 30.0.
+        """
+        source = '''
+class TestModuleGate:
+    async def test_it(self, g):
+        await wait_responsive(g.wait(), timeout=_GATE, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source, module_constants={'_GATE': 15})
+
+        assert budgets == {'TestModuleGate': 30.0}, (
+            f'Expected a namespace-resolved nominal of 15 to bill the '
+            f'stretched 30.0, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        'method',
+        [
+            pytest.param(
+                'async def test_it(self, _SETTLE):\n'
+                '        await asyncio.wait_for(x, timeout=_SETTLE)\n',
+                id='parameter',
+            ),
+            pytest.param(
+                'async def test_it(self):\n'
+                '        _SETTLE = compute()\n'
+                '        await asyncio.wait_for(x, timeout=_SETTLE)\n',
+                id='local-assignment',
+            ),
+            pytest.param(
+                'async def test_it(self):\n'
+                '        for _SETTLE in (1, 2):\n'
+                '            await asyncio.wait_for(x, timeout=_SETTLE)\n',
+                id='for-target',
+            ),
+        ],
+    )
+    def test_a_name_the_method_binds_is_never_resolved(self, method: str) -> None:
+        """A name the method binds locally is not the module constant of
+        the same name, so it bills unbounded even though the namespace
+        holds it: the scan cannot read the local value.
+        """
+        source = f'class TestShadowed:\n    {method}'
+        budgets = _worst_per_method_wait_budget(source, module_constants={'_SETTLE': 30.0})
+
+        assert budgets == {'TestShadowed': math.inf}, (
+            f'Expected a locally bound _SETTLE to shadow the namespace value '
+            f'and bill math.inf, got {budgets!r}.'
+        )
+
+    def test_a_shadowed_static_table_name_is_never_resolved(self) -> None:
+        """The shadow rule is uniform: a method that rebinds a name the
+        static known-constant table holds bills unbounded too.
+        """
+        source = '''
+class TestShadowedStaticName:
+    async def test_it(self):
+        MERGE_RESULT_TIMEOUT = 999
+        await asyncio.wait_for(x, timeout=MERGE_RESULT_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestShadowedStaticName': math.inf}, (
+            f'Expected a locally rebound MERGE_RESULT_TIMEOUT to bill '
+            f'math.inf, got {budgets!r}.'
+        )
+
+    @pytest.mark.parametrize('value', [True, '30', None], ids=['bool', 'str', 'none'])
+    def test_a_non_numeric_namespace_value_is_unbounded(self, value: object) -> None:
+        """Only an int or float that is not a bool resolves; any other
+        namespace value is unreadable as a wait, so it bills unbounded.
+        """
+        source = '''
+class TestNonNumeric:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=_SETTLE)
+'''
+        budgets = _worst_per_method_wait_budget(source, module_constants={'_SETTLE': value})
+
+        assert budgets == {'TestNonNumeric': math.inf}, (
+            f'Expected a namespace value of {value!r} to bill math.inf, '
+            f'got {budgets!r}.'
+        )
+
+    def test_a_namespace_value_wins_over_the_static_table(self) -> None:
+        """The namespace is what the scanned module's code actually sees, so
+        it wins over the static table for the same name.
+        """
+        source = '''
+class TestNamespaceWins:
+    async def test_it(self):
+        await asyncio.wait_for(x, timeout=MERGE_GATE_BARRIER_TIMEOUT)
+'''
+        budgets = _worst_per_method_wait_budget(
+            source, module_constants={'MERGE_GATE_BARRIER_TIMEOUT': 7}
+        )
+
+        assert budgets == {'TestNamespaceWins': 7.0}, (
+            f'Expected the namespace value 7 to win over the static table, '
+            f'got {budgets!r}.'
         )
 
     def test_wait_responsive_bare_bills_the_stretched_hidden_default(self) -> None:
