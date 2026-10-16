@@ -222,8 +222,8 @@ taskmaster:
 # restarts. That covers peak accrual (1.13M/day) plus a ~7-day drain of the
 # backlog (2.02M/day). The row budget and deadline are unchanged: no pass ever
 # reached the budget, and a longer deadline would lengthen every startup, which
-# prunes before READY. Once drained, each pass removes ~20k rows (985k / 48)
-# in ~7-8 s, finishes inside the deadline and logs no WARNING.
+# prunes before READY. Once drained, each pass would have removed ~20k rows
+# (985k / 48) in ~7-8 s; task 5405, below, has since removed that accrual.
 #
 # SERVING COST, which sets prune_batch_size. The periodic pass runs while
 # serving, and every journalled tool call (~11.4/s at 985k rows/day) queues on
@@ -238,9 +238,21 @@ taskmaster:
 #
 # Each partial pass logs a WARNING naming the horizons still behind AND the
 # rows/sec it achieved. If periodic WARNINGs persist about a week after deploy,
-# re-measure from their rows/sec and lower prune_interval_seconds. Task 5405
-# (read-row rollup) changes the accrual rate and should re-size this block
-# when it lands.
+# re-measure from their rows/sec and lower prune_interval_seconds.
+#
+# SINCE TASK 5405 (re-checked against this block 2026-10-19) successful
+# non-search reads are COUNTED into read_op_counts, never stored, so
+# read_retention_days governs only failed reads and history not yet moved by
+# fused-memory/scripts/roll_up_journal_reads.py. Per-row inserts fall from
+# ~985k/day to the 19,001/day 7-day mean (peak 38,759) measured 2026-10-16 in
+# the growth-alarm block below, and nearly all of those are writes and searches
+# on the 730/365-day horizons, so the read horizon accrues almost nothing and
+# the capacity above is spent only on pre-5405 history. No value here changes:
+# - prune_batch_size: a counted read still takes the journal's connection lock
+#   for its read_op_counts upsert, so tool calls still queue at ~11.4/s behind
+#   the batch in flight and the serving-cost basis above stands.
+# - prune_interval_seconds: a pass with nothing expired seeks each horizon from
+#   its resume point, milliseconds, so frequent passes cost nothing once drained.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}

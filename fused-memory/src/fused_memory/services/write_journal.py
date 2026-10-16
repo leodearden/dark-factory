@@ -1219,7 +1219,10 @@ class WriteJournal:
         short horizon would silently starve the metric, and a long one is nearly
         free (365 days is ~1.1M rows). WRITES are the durable audit trail joined
         by ``causation_id`` in ``reconciliation/stats_verifier.py`` and are 0.73%
-        of volume, so 730 days costs essentially nothing.
+        of volume, so 730 days costs essentially nothing. Since task 5405 a
+        successful non-search read is counted into ``read_op_counts`` and never
+        stored, so the 'read' horizon now governs only failed reads and history
+        not yet moved by ``scripts/roll_up_journal_reads.py``.
 
         BATCHED AND DOUBLY BOUNDED, unlike this file's two sibling prunes, whose
         tables are small enough for a single unbounded DELETE. This one runs
@@ -1343,7 +1346,8 @@ class WriteJournal:
                     'write_ops prune stopped early on the %s after %d rows in %.1fs '
                     '(%.0f rows/sec); horizons still holding a backlog: %s. Compare '
                     'that rate with the sizing basis in the write_journal block of '
-                    'fused-memory/config/config.yaml.',
+                    'fused-memory/config/config.yaml. Since task 5405 a read backlog '
+                    'is history not yet moved by scripts/roll_up_journal_reads.py.',
                     halted, total, elapsed, total / elapsed, ', '.join(backlog),
                 )
             return total
