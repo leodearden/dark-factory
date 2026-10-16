@@ -448,8 +448,10 @@ These in-flight tasks edit the same surfaces, so the leaves named depend on them
 - **5494** (verdict issue validation), **6739** (`review_payload.py`) and **5224** (verdict contract
   `note_dispositions`; one harness-version bump per landing) → δ1.
 - **5369** (reviewer task record) and **6967** (client-feed θ, same loop exits) → δ2.
-- **6972 / 7002** (client-feed ε / α2) → amended at decompose to consume β's map, with a paired edit
-  of `plans/client-feed-prd.md` §7.7 and its decision 17.
+- **6972** (client-feed ε) → amended at decompose to consume β's map and to depend on β, with a
+  paired edit of `plans/client-feed-prd.md` §3, §7.7, decision 17, the ε row and its sidecar block
+  (done 2026-10-16, client-feed §12). 7002 (α2) needs no change: its contract work does not touch
+  the map.
 - **7008** → ξ only.
 
 δ2, ε and ζ2 all edit `workflow.py::TaskWorkflow._execute_verify_review_loop`, so they are chained
@@ -462,7 +464,7 @@ capability manifest at decompose.
 
 | Other PRD / task | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
-| `plans/client-feed-prd.md` ε 6972, α2 7002, §7.7, decision 17 | this → other | the injected plugin's collection map `<junit>.tests.json` `{nodeid: {defects, criterion}}`; β also owns the `criterion` marker registration | this PRD (β); paired edit of §7.7 and decision 17 plus task amendments at decompose | at decompose, before 6972 dispatch |
+| `plans/client-feed-prd.md` ε 6972, §3, §7.7, decision 17 | this → other | the injected plugin's collection map `<junit>.tests.json` `{nodeid: {defects, criterion}}`; β also owns the `criterion` marker registration | this PRD (β); paired edit and 6972 amendment made at decompose (client-feed §12, 2026-10-16) | amended; 6972 depends on β |
 | `plans/client-feed-prd.md` display | this → other | `cases[].defects`, `defects_results` fold, `not_recorded` | this PRD (ι) | queued |
 | `plans/client-feed-prd.md` θ 6967 | both | `review_completed.by_kind` counts | client-feed θ, amended at decompose | at decompose |
 | client-feed PRD **revision** (unwritten) | other → this | `defect_reported` inbox event + privileged filer calling `submit_task`/`declare_defect` with `origin: client` | client-feed revision (ruling 6) | human gate ν |
