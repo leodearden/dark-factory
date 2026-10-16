@@ -10576,13 +10576,23 @@ class GitOps:
         else:
             logger.debug('delete_solo_branch: deleted %s', solo_branch)
 
-    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        """Return True if *ancestor* is an ancestor of *descendant*."""
+    async def is_ancestor_checked(
+        self, ancestor: str, descendant: str,
+    ) -> bool | None:
+        """True if *ancestor* is an ancestor of *descendant*, False if not, None on a git error."""
         rc, _, _ = await _run(
             ['git', 'merge-base', '--is-ancestor', ancestor, descendant],
             cwd=self.project_root,
         )
-        return rc == 0
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        return None
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return True if *ancestor* is an ancestor of *descendant*."""
+        return (await self.is_ancestor_checked(ancestor, descendant)) is True
 
     async def merge_base_with_main(self, ref: str) -> str | None:
         """Return *ref*'s FORK POINT from ``config.main_branch``, or None.
