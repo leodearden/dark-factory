@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from escalation.categories import EscalationCategory
 from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
 from escalation.models import Escalation
 
@@ -44,8 +45,7 @@ __all__ = [
     'stale_evidence_fingerprint',
 ]
 
-# Registered in escalation/src/escalation/categories.py::EscalationCategory.
-PROVENANCE_CONFLICT_CATEGORY = 'provenance_conflict'
+PROVENANCE_CONFLICT_CATEGORY = EscalationCategory.PROVENANCE_CONFLICT
 
 # Born-at-L2 sentinel role (mirrors deterministic_runner's
 # 'orchestrator-deterministic' pattern) — keeps severity='urgent'/level=2

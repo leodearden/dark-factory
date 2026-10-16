@@ -7500,7 +7500,7 @@ class Harness:
     # so the orphan-L0 reaper (L0-only), _on_escalation (no registered event),
     # and reconcile (no such task) all leave it alone.
     _SCHEDULER_PAUSE_SENTINEL: str = '__scheduler__'
-    _SCHEDULER_PAUSE_CATEGORY: str = 'scheduler_paused'
+    _SCHEDULER_PAUSE_CATEGORY: str = EscalationCategory.SCHEDULER_PAUSED
 
     # Synthetic task_id for the no-landings circuit-breaker INFO escalation.
     # Deduped to one open at a time (via get_by_task + agent_role filter).
