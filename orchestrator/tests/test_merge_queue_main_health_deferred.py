@@ -43,6 +43,7 @@ from orchestrator.flake_ledger import (
     ledger_db_path,
     read_occurrences,
 )
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     OutcomeKind,
@@ -416,6 +417,14 @@ class TestDeferredProbeHappyPath:
             f'Expected detail derived from the main-red reason; '
             f'got {esc.detail!r}'
         )
+        assert esc.level == 1, (
+            f'A main-health escalation is for the auto-watcher, never a '
+            f'steward: expected level 1; got {esc.level}'
+        )
+        assert esc.suggested_action == MainHealthNextAction.NO_FIX_OWNER, (
+            f'The escalation-only fallback has no fix owner; got '
+            f'{esc.suggested_action!r}'
+        )
 
         calls = event_store.emit.call_args_list
         main_health_calls = [
@@ -594,6 +603,7 @@ class TestDeferredProbeDedupeFold:
             category='preexisting_main_break',
             summary='Pre-existing main-red (sibling probe)',
             dedupe_fingerprint=fp,
+            level=1,
         )
         escalation_queue.submit(parent)
 
@@ -806,6 +816,13 @@ class TestAutoHealMainHealthDeferredHappyPath:
             f'outcome; got {esc.dedupe_fingerprint!r} vs '
             f'{outcome.dedupe_fingerprint!r}'
         )
+        assert esc.level == 1, (
+            f'The halt-owner escalation must be L1; got {esc.level}'
+        )
+        assert esc.suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'The halt owner names the in-flight auto-heal; got '
+            f'{esc.suggested_action!r}'
+        )
         esc_id = esc.id
 
         sig = RetryLedger.compute_merge_outcome_signature(
@@ -909,6 +926,13 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected category=preexisting_main_break; got '
             f'{pending[0].category!r}'
         )
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.NO_FIX_OWNER, (
+            f'A non-mechanical break has no fix owner; got '
+            f'{pending[0].suggested_action!r}'
+        )
 
     def test_attempt_cap_hard_escalates_without_halt_or_spawn(
         self, tmp_path: Path,
@@ -945,6 +969,13 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected exactly one preexisting_main_break escalation to be '
             f'filed; got {pending}'
         )
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.AUTO_HEAL_EXHAUSTED, (
+            f'An attempt-capped re-break has exhausted the auto-heal; got '
+            f'{pending[0].suggested_action!r}'
+        )
 
     def test_already_halted_no_second_attempt_or_spawn(
         self, tmp_path: Path,
@@ -977,6 +1008,13 @@ class TestAutoHealMainHealthDeferredGuards:
         assert len(pending) == 1, (
             f'Expected the idempotency branch to still file/fold exactly one '
             f'pending escalation; got {pending}'
+        )
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'The idempotency branch files the halt owner; got '
+            f'{pending[0].suggested_action!r}'
         )
 
     def test_no_escalation_queue_escalates_only_without_raising_or_halting(
