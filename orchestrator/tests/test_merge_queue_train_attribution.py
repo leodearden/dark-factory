@@ -30,6 +30,7 @@ from orchestrator.merge_queue import (
     _do_train_merge,
 )
 from orchestrator.merge_types import QueuedBranch
+from orchestrator.verify_runner import HostAllocator
 
 # ---------------------------------------------------------------------------
 # Helpers shared by both test classes
@@ -70,6 +71,7 @@ def _make_host(git_ops: MagicMock) -> MagicMock:
     host.halt_for_wip = MagicMock()
     host.unhalt_wip = MagicMock()
     host._abandon_outcome = MagicMock(return_value=MergeOutcome('blocked', reason='abandoned'))
+    host._ensure_host_allocator = MagicMock(return_value=HostAllocator([]))
     return host
 
 
