@@ -256,31 +256,34 @@ write_journal:
 # check_interval_seconds the checkpoint loop samples write_journal.db; a crossed
 # ceiling logs a WARNING naming the measured size and files an escalation. The
 # alarm DELETES NOTHING: rows are bounded by the write_journal prune above, and
-# the volume fix and reclaim are task 5405's. Task 5405 must re-anchor both
-# ceilings after it lands.
+# the reclaim is fused-memory/scripts/roll_up_journal_reads.py's (runbook:
+# fused-memory/scripts/README_roll_up_journal_reads.md). Task 7027 re-measures
+# both ceilings one week after that reclaim.
 #
-# MEASURED BASIS (2026-10-09, live journal, read-only):
-#   file      17,296,526,128 B including -wal/-shm, 366.8 MB of it on the freelist
-#   net file  +901.8 MB over ~29.5 days (~30.6 MB/day), despite the task-5247
-#             prune running throughout
-#   inserts   trailing-7d mean 931,647 rows/day; highest 24 h window 1,108,612;
-#             d-10..d-21 ran 412k-642k/day, so a ~1.9x step around 2026-09-30
+# MEASURED BASIS (2026-10-16, post-task-5405 projection; live journal read-only,
+# keep-set rebuilt on a scratch copy; figures in the README's 'Measured'):
+#   per-row   since 5405 only writes, search and failed reads insert write_ops
+#             rows: 5.4k-38.8k/day over 2026-10-08..15, RISING; highest day
+#             38,759 (2026-10-15), trailing-7d mean 19,001
+#   size      post-reclaim 2,325,856,256 B (2.17 GiB); normal growth
+#             (write_ops + backend_ops) ~35 MB/day on the 7d mean, ~66 MB/day
+#             on the peak day
+#   regress   per-read journalling would add ~1.01M rows/day, ~477 MB/day
 #
-# max_file_bytes = 18 GiB is ~2.03 GB above today's file. If the prune stopped
-# deleting, inserts (~439 MB/day = 931,647 rows x 471 B/row, the last exact
-# bytes/row measurement, 2026-09-10) would absorb the freelist and cross it in
-# ~5.5 days; at today's ~30.6 MB/day net creep it is crossed in ~66 days.
-# `auto_vacuum` is NONE, so the file never shrinks without an offline VACUUM: a
-# size breach stays breached until an operator VACUUMs or deliberately raises
-# this ceiling, recording the reason here.
+# max_file_bytes = 6 GiB is ~4.1 GB above the post-reclaim size: normal growth
+# crosses it in ~2-4 months, a per-read-journalling regression in ~8 days.
+# `auto_vacuum` is NONE, so the file never shrinks without an offline VACUUM.
+# This ceiling is BREACHED from the 5405 deploy until the operator reclaim runs
+# (task 7026). That one folded escalation is expected, and the README's reclaim
+# clears it.
 #
-# max_rows_inserted_per_day = 1.5M is 1.35x the highest 24 h window and 1.61x
-# the 7-day mean. A repeat of the late-September step would cross it within a
-# day. It clears by itself when the rate falls.
+# max_rows_inserted_per_day = 75,000 is ~1.9x the highest post-change day and
+# ~3.9x the 7-day mean. A regression to per-read journalling crosses it within
+# ~2 h of trailing window. It clears by itself when the rate falls.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal_growth_alarm:
-  max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:19327352832}
-  max_rows_inserted_per_day: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY:1500000}
+  max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:6442450944}
+  max_rows_inserted_per_day: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY:75000}
   check_interval_seconds: ${WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS:3600}
 
 

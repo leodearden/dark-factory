@@ -513,14 +513,14 @@ class WriteJournalGrowthAlarmConfig(BaseModel):
     Restart-only, in the same posture as ``WriteJournalConfig``: absent from
     ``config/reload.py::RELOADABLE_FIELDS``. The measured basis of both ceilings
     lives in the ``write_journal_growth_alarm`` block of
-    ``fused-memory/config/config.yaml``. Task 5405 must re-anchor both values
-    after its rollup lands.
+    ``fused-memory/config/config.yaml``, re-anchored on the post-task-5405
+    volume.
     """
 
     #: On-disk bytes of ``write_journal.db`` plus its ``-wal`` / ``-shm`` sidecars.
-    max_file_bytes: int = Field(default=19_327_352_832, gt=0)
+    max_file_bytes: int = Field(default=6_442_450_944, gt=0)
     #: ``write_ops`` rows inserted in the trailing 24 h.
-    max_rows_inserted_per_day: int = Field(default=1_500_000, gt=0)
+    max_rows_inserted_per_day: int = Field(default=75_000, gt=0)
     #: Minimum seconds between two checks. Checks ride the checkpoint loop's tick
     #: (``server/main.py::_CHECKPOINT_INTERVAL``), so the effective interval is
     #: this value rounded UP to a whole number of ticks: below one tick, every tick.
