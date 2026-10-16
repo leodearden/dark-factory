@@ -288,6 +288,7 @@ class TestAllocatePass:
     def test_header_only_pass_is_well_formed(self, store: RunRecordStore) -> None:
         lane_pass = store.allocate_pass('unit', Leg.NUMERIC, HEAD)
         loaded = store.load_pass('unit', lane_pass.pass_id)
+        assert lane_pass.directory == store.pass_directory('unit', lane_pass.pass_id)
         assert loaded is not None
         assert (loaded.detect, loaded.confirm, loaded.outcome, loaded.effect) == (None,) * 4
 

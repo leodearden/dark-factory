@@ -81,7 +81,7 @@ from orchestrator.offline_lane_filing import (
     build_lane_command_task_arguments,
     build_lane_fix_task_arguments,
 )
-from orchestrator.offline_lane_records import PassRecord, RunRecord, RunRecordStore, command_key
+from orchestrator.offline_lane_records import PassRecord, RunRecord, RunRecordStore
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -389,7 +389,7 @@ class LaneEngine:
             return read
         commit = resolving_commit(read.task)
         ancestry = None if commit is None else await self._ancestry(commit, head)
-        return replace(read, contained=fix_contained(read.task, head, ancestry))
+        return replace(read, contained=fix_contained(read.task, ancestry))
 
     async def _ancestry(self, commit: str, head: str) -> bool | None:
         try:
@@ -550,7 +550,7 @@ class LaneEngine:
         evidence = []
         for pass_id in episode.counted_passes:
             record = await asyncio.to_thread(self._records.load_pass, command, pass_id)
-            record_dir = self._records.root / command_key(command) / pass_id
+            record_dir = self._records.pass_directory(command, pass_id)
             evidence.append(_counted_pass(command, episode, pass_id, record, record_dir, modes.get(pass_id)))
         return tuple(evidence)
 
@@ -574,7 +574,7 @@ class LaneEngine:
                 nodes=nodes,
                 filed_at=min(e.filed_at for e in bound if e.filed_at is not None),
                 record_dirs=tuple(
-                    str(self._records.root / command_key(record.command) / pass_id)
+                    str(self._records.pass_directory(record.command, pass_id))
                     for pass_id in dict.fromkeys(p for e in bound for p in e.counted_passes)
                 ),
             )

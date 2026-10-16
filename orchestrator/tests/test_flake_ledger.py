@@ -5287,21 +5287,19 @@ class TestResolvingCommit:
 
 
 class TestFixContained:
-    HEAD = 'a' * 40
-
     def test_a_commitless_done_task_is_contained_whatever_the_ancestry(self) -> None:
         from orchestrator.flake_ledger import fix_contained
 
         task = {'id': 'task-1', 'status': 'done'}
-        assert [fix_contained(task, self.HEAD, a) for a in (True, False, None)] == [True] * 3
+        assert [fix_contained(task, a) for a in (True, False, None)] == [True] * 3
 
     def test_an_unread_ancestry_leaves_the_answer_undecided(self) -> None:
         from orchestrator.flake_ledger import fix_contained
 
-        assert fix_contained(_done_task('task-1', 'c0ffee'), self.HEAD, None) is None
+        assert fix_contained(_done_task('task-1', 'c0ffee'), None) is None
 
     @pytest.mark.parametrize('ancestry', [True, False])
     def test_a_read_ancestry_is_the_answer(self, ancestry: bool) -> None:
         from orchestrator.flake_ledger import fix_contained
 
-        assert fix_contained(_done_task('task-1', 'c0ffee'), self.HEAD, ancestry) is ancestry
+        assert fix_contained(_done_task('task-1', 'c0ffee'), ancestry) is ancestry

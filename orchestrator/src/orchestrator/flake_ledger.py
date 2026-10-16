@@ -1759,14 +1759,15 @@ def resolving_commit(task: Mapping[str, Any]) -> str | None:
     return provenance.commit if isinstance(provenance, DoneProvenance) else None
 
 
-def fix_contained(task: Mapping[str, Any], head: str, ancestry: bool | None) -> bool | None:
-    """Whether *task*'s fix is contained in *head*: ``True``, ``False``, or ``None`` when
-    that is undecided.
+def fix_contained(task: Mapping[str, Any], ancestry: bool | None) -> bool | None:
+    """Whether *task*'s fix is contained in the head the caller asked about: ``True``,
+    ``False``, or ``None`` when that is undecided.
 
     ``True`` when *task* recorded no fix commit (:func:`resolving_commit` is ``None``):
-    a done task with nothing to be missing from *head* is contained.  Otherwise *ancestry*
-    decides: it is the caller's already-performed ``is_ancestor_checked(commit, head)``
-    read for that commit, and ``None`` there (the read failed) leaves the answer ``None``.
+    a done task with nothing to be missing from the head is contained.  Otherwise
+    *ancestry* decides: it is the caller's already-performed
+    ``is_ancestor_checked(commit, head)`` read for that commit, and ``None`` there (the
+    read failed) leaves the answer ``None``.
     """
     if resolving_commit(task) is None:
         return True
