@@ -837,9 +837,8 @@ RESPONSIVE_WAIT_STRETCH = 2.0
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
 # the scaled per-call cap above whatever nominal a call site passes.  Whether
 # the waits a test stacks on it fit that test's timeout mark is checked, not
-# restated here: each guarded module's TestTimeoutMarkCoverage recomputes
-# every class's budget from source
-# (`_wait_budget_audit.py::item_wait_budgets`).
+# restated here: test_wait_budget_coverage_guard.py recomputes every test's
+# budget from source (`_wait_budget_audit.py::item_wait_budgets`).
 # Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
 

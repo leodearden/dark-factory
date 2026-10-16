@@ -13,11 +13,11 @@ OPT-OUT over every ``orchestrator/tests/test_*.py``: a new module is covered
 the moment it exists. Known offenders live in two shrink-only mechanisms
 below; a timeout is never widened to pass.
 
-This is not a rule in the stdlib-only
-fused-memory/scripts/check_bare_magicmock_config.py because it reads each
-module's runtime marks and namespace, which needs the module imported inside
-this pytest session (conftest.py puts the tests dir and the repo root on
-``sys.path``).
+This is not a rule in fused-memory/scripts/check_bare_magicmock_config.py:
+that checker holds a stdlib-only contract (hooks/project-checks runs it under
+a bare ``python3``), while this guard reads each module's runtime marks and
+namespace, which needs the module imported inside this pytest session
+(conftest.py puts the tests dir and the repo root on ``sys.path``).
 """
 
 from __future__ import annotations

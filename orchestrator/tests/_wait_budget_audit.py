@@ -15,7 +15,7 @@ import ast
 import dataclasses
 import enum
 import math
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
@@ -354,21 +354,6 @@ def item_wait_budgets(
         for (owner, name), budget in _item_bills(tree, module_constants).items()
     }
 
-
-def worst_per_method_wait_budget(
-    source: str, module_constants: Mapping[str, object] | None = None
-) -> dict[str, float]:
-    """Per top-level ``Test*`` class, the MAX of its methods' bills in
-    ``item_wait_budgets``; module-level test functions are not included.
-    Unparseable source returns {}."""
-    tree = _parse(source)
-    if tree is None:
-        return {}
-    budgets: dict[str, float] = {}
-    for (owner, _), budget in _item_bills(tree, module_constants).items():
-        if owner is not None:
-            budgets[owner] = max(budget, budgets.get(owner, budget))
-    return budgets
 
 
 def suppressed_result_wait_methods(source: str) -> dict[str, set[str]]:
@@ -763,78 +748,3 @@ def item_limit_sources(
         item: limit_source
         for item, _, _, limit_source in _billed_item_limits(source, namespace)
     }
-
-
-def timeout_mark_offenders(
-    budgets: dict[str, float],
-    resolve: Callable[[str], object | None],
-) -> list[str]:
-    """Pure offender-accumulation for the timeout-mark coverage guard: every
-    class's computed worst-case per-method *budget* must be cleared by the
-    timeout it actually runs under.
-
-    For each ``class_name -> budget`` pair, in sorted order:
-
-    - a budget <= 0 has nothing to cover and is skipped;
-    - a *class_name* that *resolve* cannot look up is an offender;
-    - a class carrying a ``timeout`` mark runs under THAT mark, whatever
-      the ambient budget -- a mark replaces it rather than raising a floor
-      under it -- so it is an offender iff the mark value is None or below
-      *budget*, at any budget;
-    - an unmarked class runs under ``AMBIENT_TEST_TIMEOUT``, so it is an
-      offender iff *budget* reaches it.
-
-    Returns one formatted offender string per failing class; an empty list
-    means every class is adequately covered.
-
-    Pure (independent of any module's ``globals()``) so its failure
-    branches -- unresolvable class name, missing mark, mark value too
-    tight -- are each directly testable with synthetic stubs.
-    """
-    offenders: list[str] = []
-    for class_name, budget in sorted(budgets.items()):
-        if budget <= 0:
-            continue
-        budget_text = (
-            'unbounded (some wait in the method has no resolvable '
-            'wall-clock cap)'
-            if math.isinf(budget)
-            else f'{budget}s'
-        )
-
-        cls = resolve(class_name)
-        if cls is None:
-            offenders.append(
-                f'{class_name}: computed budget {budget_text}, but the '
-                f'class could not be resolved from module globals to '
-                f'inspect its marks.'
-            )
-            continue
-
-        mark = next(
-            (m for m in getattr(cls, 'pytestmark', []) if m.name == 'timeout'),
-            None,
-        )
-        if mark is None:
-            if budget < AMBIENT_TEST_TIMEOUT:
-                continue
-            offenders.append(
-                f'{class_name}: computed worst-case per-method wait '
-                f'budget is {budget_text}, reaching the '
-                f'{AMBIENT_TEST_TIMEOUT}s an unmarked class runs under '
-                f'(the tighter of the {PYPROJECT_DEFAULT_TIMEOUT}s ini '
-                f'default and verify\'s --timeout='
-                f'{VERIFY_CLI_PER_TEST_TIMEOUT}), but the class carries '
-                f'no @pytest.mark.timeout mark at all.'
-            )
-            continue
-
-        mark_value = mark.args[0] if mark.args else None
-        if mark_value is None or mark_value < budget:
-            offenders.append(
-                f'{class_name}: computed worst-case per-method wait '
-                f'budget is {budget_text}, but its @pytest.mark.timeout '
-                f'mark is only {mark_value!r} -- too tight to clear '
-                f'it.'
-            )
-    return offenders

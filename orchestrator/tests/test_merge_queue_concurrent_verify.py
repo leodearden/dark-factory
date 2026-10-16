@@ -31,7 +31,6 @@ import contextlib
 import dataclasses
 import inspect
 import logging
-import math
 import traceback
 from collections.abc import Mapping
 from pathlib import Path
@@ -58,15 +57,11 @@ from _orch_helpers import (
     PYPROJECT_DEFAULT_TIMEOUT,
     STOP_WORKER_JOIN_TIMEOUT,
     UNDER_LOAD_HEADROOM_FACTOR,
-    VERIFY_CLI_PER_TEST_TIMEOUT,
     wait_responsive,
 )
 from _wait_budget_audit import (
-    AMBIENT_TEST_TIMEOUT,
     suppressed_result_wait_methods,
-    timeout_mark_offenders,
     unguarded_worker_teardown_methods,
-    worst_per_method_wait_budget,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -190,6 +185,19 @@ def _make_real_item(
     )
 
 
+# THIS FILE CARRIES DEBT under rule `wall-clock-deadline` in
+# fused-memory/scripts/check_bare_magicmock_config.py (task 4246), which checks
+# the SHAPE of a load-bearing wait: a `MergeRequest.result` future or a
+# zero-argument `.wait()` barrier must be awaited through `wait_responsive(...)`
+# with a descriptive `label=`, its bound derived from MERGE_RESULT_TIMEOUT rather
+# than written as a number. This file is on that rule's shrink-only, opt-out
+# `_WALL_CLOCK_DEADLINE_DEBT` baseline: its pre-existing sites are
+# grandfathered, but the budget is CHECKED -- add one more offending wait and
+# the gate reports the overrun. New load-bearing waits here must therefore use
+# `wait_responsive(...)`, and the recorded number may only be lowered as sites
+# migrate, never raised.
+
+
 async def _await_outcome(
     fut: asyncio.Future[MergeOutcome],
     *,
@@ -275,10 +283,11 @@ async def _stop_worker(
 # budget. SHARED, not per-class, so the marks cannot drift apart (task 3477
 # found two that had; task 3492 generalized CASCADE_TEST_TIMEOUT into this).
 #
-# No class's budget is written here or beside its mark: TestTimeoutMarkCoverage
-# recomputes each one from source on every run (_wait_budget_audit.py)
-# and checks it against the class's mark, or against the ambient budget for an
-# unmarked class -- so leaving a class unmarked is a checked decision too.
+# No test's budget is written here or beside its mark:
+# test_wait_budget_coverage_guard.py recomputes each one from source on every
+# run and checks it against the closest timeout mark, or against the ambient
+# budget for an unmarked test -- so leaving a class unmarked is a checked
+# decision too.
 #
 # A literal, pinned by TestHeavyBarrierTimeoutConstant against the measured
 # worst case below x UNDER_LOAD_HEADROOM_FACTOR and against
@@ -6075,179 +6084,11 @@ class TestLoudWaitMigrationRatchet:
         )
 
 
-# ---------------------------------------------------------------------------
-# task 3492 amend: cover timeout_mark_offenders' failure branches directly
-# ---------------------------------------------------------------------------
-
-
-#: A synthetic per-method wait budget on the GUARDED side of the threshold
-#: `timeout_mark_offenders` applies to an unmarked class -- one second over
-#: `AMBIENT_TEST_TIMEOUT` -- for the offender-loop unit tests below. Derived
-#: rather than written, mirroring the `AMBIENT_TEST_TIMEOUT - 1` spelling its
-#: sibling `test_budget_below_threshold_is_skipped_even_with_no_mark` uses for
-#: the UNGUARDED side, so both sides of the threshold stay pinned to it.
-#:
-#: WHY IT IS NOT A LITERAL: it was `200.0`, chosen when the ini default was 60.
-#: Raising `[tool.pytest.ini_options].timeout` to 300 (2026-09-12) dropped 200
-#: BELOW the threshold, at which point all three failure branches below stopped
-#: being exercised at all -- they would have gone green by being skipped, which
-#: is the vacuity this whole class exists to prevent.
-_SYNTHETIC_HEAVY_BUDGET = float(AMBIENT_TEST_TIMEOUT + 1)
-
-#: A mark value that comfortably clears :data:`_SYNTHETIC_HEAVY_BUDGET`, for the
-#: happy-path case. Derived for the same reason.
-_SYNTHETIC_ADEQUATE_MARK = _SYNTHETIC_HEAVY_BUDGET + 1
-
-
-class TestTimeoutMarkOffenders:
-    """`timeout_mark_offenders` is the pure offender-accumulation loop
-    behind `TestTimeoutMarkCoverage`'s guard. Driven here from synthetic
-    stub classes (not this module's own, now fully-marked, classes) so its
-    failure branches -- no mark at all, a mark too tight for the budget,
-    and an unresolvable class name -- are each independently non-vacuous,
-    rather than only ever exercised by the happy path.
-    """
-
-    def test_class_with_no_pytestmark_is_one_offender(self) -> None:
-        """A resolved class with no `timeout` mark at all yields exactly
-        one offender naming the missing mark.
-        """
-
-        class _NoMark:
-            pass
-
-        offenders = timeout_mark_offenders(
-            {'_NoMark': _SYNTHETIC_HEAVY_BUDGET}, {'_NoMark': _NoMark}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_NoMark' in offenders[0]
-        assert 'no @pytest.mark.timeout mark' in offenders[0]
-
-    def test_mark_too_tight_for_budget_is_one_offender(self) -> None:
-        """A class whose mark sits just UNDER its computed budget yields
-        exactly one offender naming the too-tight value -- this is the exact
-        failure mode task 3477 hit (a mark present but too tight to clear the
-        real wait profile).
-        """
-
-        too_tight_mark = _SYNTHETIC_HEAVY_BUDGET - 1
-
-        @pytest.mark.timeout(too_tight_mark)
-        class _TooTight:
-            pass
-
-        offenders = timeout_mark_offenders(
-            {'_TooTight': _SYNTHETIC_HEAVY_BUDGET}, {'_TooTight': _TooTight}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_TooTight' in offenders[0]
-        assert str(too_tight_mark) in offenders[0]
-
-    def test_unresolvable_class_name_is_one_offender(self) -> None:
-        """A budgeted class name that *resolve* cannot look up (e.g. it was
-        renamed or removed after the scan ran) yields exactly one offender
-        rather than raising -- the guard degrades to a loud failure, never
-        a silent skip.
-        """
-        offenders = timeout_mark_offenders({'DoesNotExist': _SYNTHETIC_HEAVY_BUDGET}, {}.get)
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert 'DoesNotExist' in offenders[0]
-        assert 'could not be resolved' in offenders[0]
-
-    def test_adequate_mark_yields_no_offenders(self) -> None:
-        """A class whose mark value clears its computed budget yields no
-        offenders -- pins the happy path so it stays non-vacuous too.
-
-        The budget is on the GUARDED side of the threshold, so this really
-        exercises the "mark clears it" branch rather than the skip.
-        """
-
-        @pytest.mark.timeout(_SYNTHETIC_ADEQUATE_MARK)
-        class _Adequate:
-            pass
-
-        offenders = timeout_mark_offenders(
-            {'_Adequate': _SYNTHETIC_HEAVY_BUDGET}, {'_Adequate': _Adequate}.get
-        )
-
-        assert offenders == [], f'Expected no offenders, got {offenders!r}.'
-
-    def test_budget_below_threshold_is_skipped_even_with_no_mark(self) -> None:
-        """An UNMARKED class computing below `AMBIENT_TEST_TIMEOUT` yields
-        no offender -- the budget it runs under already clears it.
-        """
-
-        class _LightNoMark:
-            pass
-
-        offenders = timeout_mark_offenders(
-            {'_LightNoMark': AMBIENT_TEST_TIMEOUT - 1},
-            {'_LightNoMark': _LightNoMark}.get,
-        )
-
-        assert offenders == [], f'Expected no offenders below threshold, got {offenders!r}.'
-
-    def test_marked_class_below_the_ambient_budget_is_still_checked(self) -> None:
-        """A mark REPLACES the ambient budget rather than raising a floor
-        under it (see `_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`), so a mark
-        below the class's budget is fatal however generous the ambient is.
-        """
-
-        @pytest.mark.timeout(200)
-        class _MarkedTooTight:
-            pass
-
-        offenders = timeout_mark_offenders(
-            {'_MarkedTooTight': 250.0}, {'_MarkedTooTight': _MarkedTooTight}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_MarkedTooTight' in offenders[0]
-        assert 'too tight' in offenders[0]
-
-    def test_unmarked_class_at_the_verify_cli_budget_is_an_offender(self) -> None:
-        """An unmarked class runs under verify's `--timeout`, not the looser
-        ini default, so a budget reaching it needs a mark.
-        """
-
-        class _UnmarkedAtCli:
-            pass
-
-        offenders = timeout_mark_offenders(
-            {'_UnmarkedAtCli': float(VERIFY_CLI_PER_TEST_TIMEOUT)},
-            {'_UnmarkedAtCli': _UnmarkedAtCli}.get,
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_UnmarkedAtCli' in offenders[0]
-        assert 'no @pytest.mark.timeout mark' in offenders[0]
-
-    def test_unbounded_budget_is_reported_as_unbounded(self) -> None:
-        """An infinite budget -- some wait with no resolvable wall-clock cap
-        -- is one offender whatever the mark, and says so in words rather
-        than rendering a meaningless `infs`.
-        """
-
-        @pytest.mark.timeout(10**6)
-        class _Unbounded:
-            pass
-
-        offenders = timeout_mark_offenders(
-            {'_Unbounded': math.inf}, {'_Unbounded': _Unbounded}.get
-        )
-
-        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
-        assert '_Unbounded' in offenders[0]
-        assert 'unbounded' in offenders[0]
-
-
 class TestHeavyBarrierTimeoutConstant:
     """HEAVY_BARRIER_TEST_TIMEOUT is a literal held up by two floors.
 
-    The per-class WAIT floor is TestTimeoutMarkCoverage's job, not this one's.
+    Whether each marked test's waits fit under it is checked per item by
+    test_wait_budget_coverage_guard.py, not here.
     """
 
     def test_clears_the_measured_wall_clock_with_headroom(self) -> None:
@@ -6270,86 +6111,4 @@ class TestHeavyBarrierTimeoutConstant:
             '_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT), so below the ini default '
             'the merge-barrier classes carrying this mark run TIGHTER than every '
             'unmarked test on a bare local or agent run. Raise the constant.'
-        )
-
-
-# ---------------------------------------------------------------------------
-# task 3492 step-3: enforced coverage invariant over THIS module's own source
-# ---------------------------------------------------------------------------
-#
-# RELATED, BUT ENFORCED ELSEWHERE (task 4246): the SHAPE of a load-bearing wait
-# — a `MergeRequest.result` future or a zero-argument `.wait()` barrier reached through a
-# bare `asyncio.wait_for(...)`, or carrying a raw numeric `timeout=` literal —
-# is now checked repo-wide by rule `wall-clock-deadline` in
-# fused-memory/scripts/check_bare_magicmock_config.py, run by the seven package
-# lint_commands, dark-factory-orchestrator.yaml and hooks/project-checks. That
-# rule and this class are complements, not overlaps: the rule says a wait must
-# be loop-responsive (`wait_responsive(...)` with a descriptive `label=`, bound
-# derived from MERGE_RESULT_TIMEOUT rather than a written number); this class
-# says whatever budget the resulting waits add up to must be covered by an
-# adequate `@pytest.mark.timeout`. It stays here because it needs runtime marks
-# and imported helper constants, which the stdlib-only checker cannot have —
-# see the policy note above test_merge_speculation.py::TestTimeoutMarkCoverage.
-#
-# THIS FILE CARRIES DEBT under that rule: it is on the shrink-only, opt-out
-# `_WALL_CLOCK_DEADLINE_DEBT` baseline, recorded at its measured day-one count
-# (90 violations) and lowered as sites migrate, so its pre-existing sites are
-# grandfathered but the budget is
-# CHECKED — add one more offending wait and the gate reports the overrun. New
-# load-bearing waits added here must therefore use `wait_responsive(...)`, and
-# the recorded number may only be lowered as sites are migrated, never raised.
-
-
-class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module must have its computed
-    worst-case per-method wait budget cleared by the timeout it actually
-    runs under -- its own `@pytest.mark.timeout` mark if it has one, else
-    the ambient budget (see `timeout_mark_offenders`).
-
-    This is what stops the recurrence task 3492 exists to fix: task 2350
-    widened a wait region without adding a mark, task 2376 widened five more
-    sites without a mark, and task 3477 then found its own two marks had
-    drifted too tight for the wait profile they were guarding ("was a bare
-    180, too tight"). Literal values can still drift, but a class going
-    under-marked can no longer land silently -- this guard recomputes the
-    audit from the module's own source on every run.
-
-    The guard is a conservative FLOOR, not the whole audit -- see
-    `_wait_budget_audit.py::_call_wait_budget`'s docstring for exactly
-    which call shapes are
-    counted and why under-demanding (never over-demanding) is the
-    deliberate failure direction.
-    """
-
-    def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class's computed worst-case per-method wait budget
-        must be cleared by the timeout it actually runs under (its own mark
-        if it has one, else the ambient budget).
-
-        First run (task 3492 step-3, before step-4 added marks) flagged six
-        classes computing >= 60s with no timeout mark at all --
-        TestSingleHostSerialByteIdentical, TestOverlapSignal,
-        TestChainInvalidationUnderOverlap, TestHaltAndUnavailable,
-        TestRunInflightVerifyRemoteCancelOnAbort, TestCascadeErrorContainment.
-        Marks were added for those six (plus TestRedispatchSpeculativeConservation,
-        over-marked on the strength of a wait shape this scan cannot see) in
-        the same change; the two task-3477 cascade classes already passed.
-        """
-        source = Path(__file__).read_text()
-        budgets = worst_per_method_wait_budget(source, module_constants=globals())
-        offenders = timeout_mark_offenders(budgets, globals().get)
-
-        assert not offenders, (
-            'The following classes have a computed worst-case per-method '
-            'wait budget that the timeout they actually run under (their '
-            'own mark if they have one, else the ambient budget) does not '
-            'clear:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
-            'the xdist worker under --max-worker-restart=0, so a '
-            'slow-but-correct run reports as a worker death instead of a '
-            'clean per-test failure. Add '
-            '@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (or another '
-            'value clearing the computed budget) directly above each '
-            'offending class.'
         )
