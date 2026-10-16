@@ -9,15 +9,17 @@ with no disposition fails this suite before any test runs.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import config_dir_archival_allowlist
+import loop_blocking_allowlist
 import silent_fallthrough_allowlist
 
-from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
+from shared.governed_exceptions import Debt, TaskRef, TicketRef, governed_exceptions
 from shared.task_metadata import _BLESSED_METADATA_KEYS, _LEGACY_RETRY_LEDGER_COUNTER_KEYS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -133,6 +135,35 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
 )
 
 
+LOOP_BLOCKING_LEDGER = governed_exceptions(
+    'shared.tests.loop_blocking_allowlist.AUDITED_SITES',
+    'A coroutine call site in fused-memory/src that reaches a blocking primitive on the '
+    'event loop thread, tolerated by the INV-8 loop-blocking gate with a recorded '
+    'justification until it is offloaded.',
+    _occurrence_keys(row[:3] for row in loop_blocking_allowlist.AUDITED_SITES),
+)
+
+_OWNER_TYPE_BY_LEDGER_DISPOSITION = {'accepted': None, 'filed': TaskRef, 'to_file': TicketRef}
+
+
+def _override_follows_row(
+    owner_type: type[TaskRef] | type[TicketRef] | None, override: object, justification: str
+) -> bool:
+    if owner_type is None:
+        return override is None
+    if not isinstance(override, Debt) or not isinstance(override.owner, owner_type):
+        return False
+    return re.search(rf'\b{re.escape(str(override.owner.id))}\b', justification) is not None
+
+
+def _loop_blocking_mismatch(row: tuple[str, str, str, str, str], key: str) -> str | None:
+    disposition, justification = row[3], row[4]
+    override = LOOP_BLOCKING_LEDGER.overrides.get(key)
+    if _override_follows_row(_OWNER_TYPE_BY_LEDGER_DISPOSITION[disposition], override, justification):
+        return None
+    return f'{key}: ledger disposition {disposition!r}, override found {override!r}'
+
+
 def test_repeated_sites_keep_distinct_keys() -> None:
     assert _occurrence_keys([('a.py', 'f', 'h'), ('a.py', 'f', 'h'), ('b.py', 'g', 'h')]) == [
         'a.py::f::h',
@@ -157,3 +188,18 @@ def test_ruff_suppression_keys_come_from_every_workspace_pyproject(tmp_path: Pat
         'tool.ruff.extend-ignore::B008',
         'tool.ruff.lint.ignore::E501',
     ]
+
+
+def test_loop_blocking_overrides_follow_the_ledger_vocabulary() -> None:
+    assert set(_OWNER_TYPE_BY_LEDGER_DISPOSITION) == loop_blocking_allowlist.DISPOSITIONS, (
+        'loop_blocking_allowlist.DISPOSITIONS changed: decide which INV-12 disposition '
+        'each ledger disposition maps to in _OWNER_TYPE_BY_LEDGER_DISPOSITION.'
+    )
+    rows = zip(loop_blocking_allowlist.AUDITED_SITES, LOOP_BLOCKING_LEDGER.keys, strict=True)
+    mismatches = [mismatch for row, key in rows if (mismatch := _loop_blocking_mismatch(row, key))]
+    assert not mismatches, (
+        'Each loop-blocking override must match its ledger row: none for accepted, '
+        'Debt(TaskRef(<task>)) for filed, Debt(TicketRef(<ticket>)) for to_file, and the '
+        "owner id must appear in the row's justification. Correct the override in this "
+        'module, or the ledger row in loop_blocking_allowlist.py:\n  ' + '\n  '.join(mismatches)
+    )
