@@ -5,7 +5,8 @@ the pure effect of a pass live in
 ``orchestrator/src/orchestrator/offline_lane_episode_state.py``; :class:`LaneEngine`
 reads what :func:`apply_pass` needs, saves its result, files the fix tasks it names and
 raises the lane's escalation records.  :meth:`LaneEngine.observe` and
-:meth:`LaneEngine.tick` are the whole interface.
+:meth:`LaneEngine.tick` are its interface, with one read beside them,
+:meth:`LaneEngine.pinned_pass_ids`.
 
 Rules settled at implementation (task 6860):
 
@@ -15,8 +16,8 @@ Rules settled at implementation (task 6860):
   with an unknown head and mode, no failure lines, and the episode's last counted start.
 - R3 the reproduce line is fixed when a filing first falls due and kept on the due
   episodes; ``fix_task_priority`` is kept on the command record for retries.
-- R4 a cancelled or absent covering task whose escalation record is resolved reads
-  ``CLOSED_RELEASED`` and is treated as ``DONE_CONTAINED``.
+- R4 a cancelled or absent covering task whose escalation record is closed (resolved
+  or dismissed) reads ``CLOSED_RELEASED`` and is treated as ``DONE_CONTAINED``.
 - R5 :func:`apply_pass` takes the pass's reads as one :class:`PassReads`.
 - R6 a failed filing keeps its reason on the due episodes; due groups are the
   episodes sharing a covering task, else sharing ``filing_due_since``.
@@ -28,6 +29,10 @@ Rules settled at implementation (task 6860):
   task is deferred.
 - R9 a filing combined into a terminal task binds it as swallowed, and a swallowed
   binding reads ``CLOSED`` whatever the task's live status.
+- R10 :meth:`LaneEngine.pinned_pass_ids` is the one read beside ``observe`` and ``tick``,
+  answered from the engine's own store for the run-record prune.
+- R11 a due filing with no covering task whose every episode has ended is cancelled,
+  not retried; one live episode keeps the whole group's filing going.
 """
 
 from __future__ import annotations
@@ -89,7 +94,7 @@ logger = logging.getLogger(__name__)
 UNKNOWN_MODE = 'unknown'
 UNKNOWN_STATUS = 'unknown'
 PENDING_ESCALATION = 'pending'
-RESOLVED_ESCALATION = 'resolved'
+CLOSED_ESCALATION_STATES = frozenset({'resolved', 'dismissed'})
 DEFERRED_STATUS = 'deferred'
 
 
@@ -240,6 +245,17 @@ def _counted_pass(
     )
 
 
+def _abandoned(record: CommandRecord, nodes: Sequence[str]) -> bool:
+    episodes = [record.episodes[node] for node in nodes]
+    return episodes[0].covering_task_id is None and not any(episode.live for episode in episodes)
+
+
+def _cancelled(record: CommandRecord, nodes: Sequence[str]) -> CommandRecord:
+    return _with_episodes(
+        record, nodes, filing_due=False, filing_due_since=None, reproduce=None, filing_failure=None,
+    )
+
+
 def _stuck_reason(stuck: Sequence[Episode]) -> str:
     reasons = dict.fromkeys(episode.filing_failure for episode in stuck if episode.filing_failure)
     return '; '.join(reasons) or 'no filing attempt has completed'
@@ -304,6 +320,10 @@ class LaneEngine:
             if record != saved:
                 await self._save(record)
         return TickResult(tuple(due), tuple(filed))
+
+    def pinned_pass_ids(self) -> frozenset[str]:
+        """The counted pass ids the held episodes refer to; synchronous, for the run-record prune off the loop."""
+        return self._store.pinned_pass_ids()
 
     async def _save(self, record: CommandRecord) -> None:
         await asyncio.to_thread(self._store.save, record)
@@ -406,7 +426,7 @@ class LaneEngine:
         except Exception:
             logger.exception('offline-lane: state of escalation %s unreadable', escalation_id)
             return False
-        return state == RESOLVED_ESCALATION
+        return state in CLOSED_ESCALATION_STATES
 
     async def _previous_detect(self, record: CommandRecord) -> RunRecord | None:
         if record.last_pass_id is None:
@@ -419,6 +439,11 @@ class LaneEngine:
             return record, []
         filed: list[str] = []
         for group in _due_groups(record):
+            if _abandoned(record, group):
+                logger.warning('offline-lane: %s: filing cancelled: no live episode in its group %s',
+                               record.command, list(group))
+                record = await self._saved(record, _cancelled(record, group))
+                continue
             record, task_id = await self._file(self._tasks, record, group, opening=None)
             filed.extend([task_id] if task_id else [])
         return record, filed

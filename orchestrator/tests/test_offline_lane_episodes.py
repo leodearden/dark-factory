@@ -921,8 +921,9 @@ async def test_scenario_14_a_covered_test_red_again_after_green_files_nothing_ne
     assert lane.episode().covering_task_id == task_id
 
 
+@pytest.mark.parametrize('dismiss', [False, True], ids=['resolved', 'dismissed'])
 @pytest.mark.asyncio
-async def test_scenario_15_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it(tmp_path):
+async def test_scenario_15_a_cancelled_task_escalates_once_and_after_closure_a_new_task_names_it(tmp_path, dismiss):
     lane = Lane(tmp_path)
     task_id = await _filed(lane)
     lane.client.set_status(task_id, 'cancelled')
@@ -931,7 +932,7 @@ async def test_scenario_15_a_cancelled_task_escalates_once_and_after_resolution_
     (record,) = lane.pending(UNLANDED_RED_CATEGORY)
     assert len(lane.client.submitted) == 1
     assert lane.queue is not None
-    lane.queue.resolve(record.id, 'seen; refile when it persists', resolved_by='operator')
+    lane.queue.resolve(record.id, 'seen; refile when it persists', dismiss=dismiss, resolved_by='operator')
 
     held = await lane.spaced_red()
     refiled = await lane.spaced_red()
@@ -1357,3 +1358,52 @@ async def test_an_ended_episode_bound_to_an_unreadable_task_is_still_refreshed(t
 
     assert lane.episode().ended_at == ended_at
     assert lane.episode().last_refreshed_at == lane.clock()
+
+
+@pytest.mark.asyncio
+async def test_the_engine_reports_the_pass_ids_its_held_episodes_pin(tmp_path):
+    lane = Lane(tmp_path)
+
+    await lane.red()
+
+    assert lane.engine.pinned_pass_ids() == frozenset(lane.episode().counted_passes)
+    assert len(lane.engine.pinned_pass_ids()) == 1
+
+
+async def _due_group_of_two(lane: Lane) -> None:
+    lane.client.fail_submissions('task store unreachable', 'task store unreachable')
+    await lane.red((A, B))
+    await lane.spaced_red(A, B)
+    assert lane.episode(A).filing_due and lane.episode(B).filing_due
+
+
+@pytest.mark.asyncio
+async def test_a_due_uncovered_filing_whose_episodes_all_ended_is_cancelled(tmp_path, caplog):
+    lane = Lane(tmp_path)
+    await _due_group_of_two(lane)
+    lane.clock.advance(minutes=30)
+    await lane.red(reproduced=(), cleared=(A, B))
+    lane.clock.advance(minutes=1)
+
+    with caplog.at_level(logging.WARNING):
+        tick = await lane.tick()
+
+    assert tick.tasks_filed == ()
+    assert len(lane.client.submitted) == 2
+    assert (lane.episode(A).filing_due, lane.episode(B).filing_due) == (False, False)
+    assert any('filing cancelled: no live episode' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_due_filing_with_one_live_episode_left_still_files(tmp_path):
+    lane = Lane(tmp_path)
+    await _due_group_of_two(lane)
+    lane.clock.advance(minutes=30)
+    await lane.red(reproduced=(B,), cleared=(A,))
+    lane.clock.advance(minutes=1)
+
+    tick = await lane.tick()
+
+    assert tick.tasks_filed == ('7001',)
+    assert lane.lane_metadata()['nodes'] == [A, B]
+    assert lane.episode(B).covering_task_id == '7001'
