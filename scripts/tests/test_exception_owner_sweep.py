@@ -22,8 +22,11 @@ from _task_db_scan import tasks_db_path
 from exception_owner_sweep import (
     FINDING_KEY_FIELD,
     INLINE_SCOPE,
+    MAX_OUTPUTS_PER_RUN,
     OVERFLOW_KEY,
     OWNS_NOTE_FIELD,
+    REPORT_COMMAND,
+    TIGHTEN_COMMAND,
     TIGHTEN_KEY,
     ActOutcome,
     Citation,
@@ -635,3 +638,116 @@ def test_a_submit_error_is_a_fused_memory_failure(project_root, seed):
         sweep_once(INLINE_2733, ports_for(project_root, stub))
 
     assert excinfo.value.stage is FailureStage.FUSED_MEMORY
+
+
+# ---------------------------------------------------------------------------
+# INV-4: the storm bound, and the slack tighten task (scenarios 20 and 24).
+
+
+def dead_owners(first: int, count: int) -> list[dict]:
+    return [{'id': first + index, 'status': 'done'} for index in range(count)]
+
+
+def inline_citations(first: int, count: int) -> tuple[Citation, ...]:
+    return tuple(
+        Citation(INLINE_SCOPE, TaskRef(first + index), (f'm{index}.py:1',)) for index in range(count)
+    )
+
+
+def keys_of(stub: StubMcp) -> list[dict]:
+    return [args['metadata'][FINDING_KEY_FIELD] for args in stub.tool_calls('submit_task')]
+
+
+def test_scenario_20_outputs_stop_at_the_bound_and_one_roll_up_reports_the_rest(project_root, seed):
+    stub = StubMcp(seed(dead_owners(3001, 14)))
+    ports = ports_for(project_root, stub)
+    register = view(*inline_citations(3001, 14))
+
+    first = sweep_once(register, ports)
+
+    assert MAX_OUTPUTS_PER_RUN == 10
+    assert keys_of(stub) == [
+        FindingKey(FindingKind.DEAD_OWNER, INLINE_SCOPE, TaskRef(3001 + index)).record()
+        for index in range(10)
+    ]
+    (roll_up,) = stub.tool_calls('escalate_info')
+    assert roll_up['task_id'] == OVERFLOW_KEY.escalation_task_id()
+    assert '4' in roll_up['detail']
+    assert REPORT_COMMAND in roll_up['detail']
+    assert (first.filed, first.overflow, first.findings) == (10, 4, 14)
+
+    second = sweep_once(register, ports)
+
+    assert len(stub.tool_calls('submit_task')) == 14
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert (second.skipped_existing, second.filed, second.overflow) == (10, 4, 0)
+
+
+def test_no_second_roll_up_while_the_first_is_pending(project_root, seed):
+    stub = StubMcp(seed(dead_owners(3001, 11)))
+    stub.pending.append({'task_id': OVERFLOW_KEY.escalation_task_id()})
+
+    outcome = sweep_once(view(*inline_citations(3001, 11)), ports_for(project_root, stub))
+
+    assert outcome.overflow == 1
+    assert stub.tool_calls('escalate_info') == []
+
+
+def test_skips_never_consume_the_budget(project_root, seed):
+    carried = [
+        {
+            'id': 8000 + index,
+            'status': 'pending',
+            'metadata': {
+                FINDING_KEY_FIELD: FindingKey(FindingKind.DEAD_OWNER, INLINE_SCOPE, TaskRef(3001 + index)).record()
+            },
+        }
+        for index in range(10)
+    ]
+    stub = StubMcp(seed(dead_owners(3001, 11) + carried))
+
+    outcome = sweep_once(view(*inline_citations(3001, 11)), ports_for(project_root, stub))
+
+    assert (outcome.skipped_existing, outcome.filed, outcome.overflow) == (10, 1, 0)
+
+
+def test_scenario_24_slack_files_one_tighten_task_across_runs(project_root, seed):
+    stub = StubMcp(seed([]))
+    ports = ports_for(project_root, stub)
+    register = view(slack_total=54)
+
+    sweep_once(register, ports)
+    sweep_once(register, ports)
+
+    (submitted,) = stub.tool_calls('submit_task')
+    assert submitted['metadata'][FINDING_KEY_FIELD] == TIGHTEN_KEY.record()
+    assert TIGHTEN_COMMAND == 'uv run --project shared python scripts/inline_suppressions.py --tighten'
+    assert TIGHTEN_COMMAND in submitted['description']
+
+
+def test_no_slack_files_no_tighten_task(project_root, seed):
+    stub = StubMcp(seed([]))
+
+    sweep_once(view(slack_total=0), ports_for(project_root, stub))
+
+    assert stub.tool_calls('submit_task') == []
+
+
+def test_a_closed_tighten_task_is_followed_by_a_new_one_never_an_escalation(project_root, seed):
+    stub = StubMcp(seed([{'id': 5000, 'status': 'done', 'metadata': {FINDING_KEY_FIELD: TIGHTEN_KEY.record()}}]))
+
+    sweep_once(view(slack_total=3), ports_for(project_root, stub))
+
+    assert keys_of(stub) == [TIGHTEN_KEY.record()]
+    assert stub.tool_calls('escalate_info') == []
+
+
+def test_the_tighten_task_comes_after_findings_and_inside_the_bound(project_root, seed):
+    stub = StubMcp(seed(dead_owners(3001, 10)))
+
+    outcome = sweep_once(view(*inline_citations(3001, 10), slack_total=54), ports_for(project_root, stub))
+
+    assert TIGHTEN_KEY.record() not in keys_of(stub)
+    assert (outcome.filed, outcome.overflow) == (10, 1)
+    (roll_up,) = stub.tool_calls('escalate_info')
+    assert roll_up['task_id'] == OVERFLOW_KEY.escalation_task_id()
