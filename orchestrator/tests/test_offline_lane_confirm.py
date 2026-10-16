@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from itertools import count
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _lane_confirm_project import Sabotage, arm, disarm, lane_project, node_id, write_script
 
 from orchestrator.config import LaneCommand
 from orchestrator.offline_lane_confirm import (
@@ -39,12 +44,14 @@ from orchestrator.offline_lane_confirm import (
 )
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
+    LEGACY_NUMERIC_COMMAND,
     EndedBy,
     FailureRecord,
     Leg,
     Phase,
     ProbeResult,
     RunRecord,
+    RunRecordStore,
 )
 from orchestrator.offline_lane_runs import (
     INFRA_SCOPE,
@@ -52,7 +59,12 @@ from orchestrator.offline_lane_runs import (
     RUN_OFFLINE_DEEP_SCRIPT,
     Launched,
     OutputFormat,
+    command_runner,
+    confirm_runner,
+    infra_runner,
     junit_node_outcomes,
+    require_current_pass,
+    suite_runner,
 )
 from orchestrator.verify import _serial_pytest_str
 from orchestrator.verify_cmd import ToolKind, parse_config_command
@@ -590,3 +602,222 @@ class TestIntersectedRoundTrip:
 
         assert outcome == Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, 'tests/t.py::test_a[x')
         assert runner.calls == []
+
+
+LANE = LaneCommand(name='lane', command='pytest -q tests', cwd='.')
+OPAQUE = LaneCommand(name='opaque', command='timeout 600 pytest -q tests', cwd='.')
+KILLED = LaneCommand(name='killed', command='kill -9 $$', cwd='.')
+HEAD = 'c0ffee1234'
+SPACING = timedelta(minutes=31)
+
+
+def _clock_every(step: timedelta) -> Callable[[], datetime]:
+    ticks = count()
+    return lambda: T0 + step * next(ticks)
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> RunRecordStore:
+    return RunRecordStore(tmp_path / 'records', clock=_clock_every(SPACING))
+
+
+@pytest.fixture
+def pytest_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('PATH', f'{Path(sys.executable).parent}{os.pathsep}{os.environ["PATH"]}')
+
+
+async def _detect(store: RunRecordStore, cmd: LaneCommand, project: Path) -> RunRecord:
+    store.allocate_pass(cmd.name, Leg.GENERIC, HEAD)
+    await command_runner(store)(cmd, project, HEAD)
+    detect = store.last_record(cmd.name, Phase.DETECT)
+    assert detect is not None
+    return detect
+
+
+async def _confirm(
+    store: RunRecordStore, cmd: LaneCommand, project: Path, detect: RunRecord,
+) -> Confirmed | Unconfirmable:
+    runner = confirm_runner(store, require_current_pass(store, cmd.name))
+    return await confirm(ConfirmTarget.generic(cmd, project), detect, runner)
+
+
+def _confirm_record(store: RunRecordStore, command: str) -> RunRecord:
+    record = store.last_record(command, Phase.CONFIRM)
+    assert record is not None
+    return record
+
+
+@pytest.mark.usefixtures('pytest_on_path')
+class TestRealPytestGenericLeg:
+    """PRD §6 scenarios 6–11 against real nested pytest sessions in a tmp project."""
+
+    @pytest.mark.asyncio
+    async def test_6_failing_detection_then_passing_the_narrowed_confirm_clears(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_flaky', 'test_ok')
+
+        outcome = await _confirm(store, LANE, project, await _detect(store, LANE, project))
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, (), (node_id('test_flaky'),), ())
+        evidence = _confirm_record(store, LANE.name)
+        assert evidence.junit_path == str(require_current_pass(store, LANE.name).junit_path(Phase.CONFIRM))
+        assert evidence.outcomes == {node_id('test_flaky'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_7_an_opaque_confirm_red_only_on_another_test_reproduces_only_the_detected_one(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_steady_fail', 'test_red_on_rerun', 'test_ok')
+        assert not _narrowable(OPAQUE.command)
+
+        outcome = await _confirm(store, OPAQUE, project, await _detect(store, OPAQUE, project))
+
+        assert outcome == Confirmed(ConfirmMode.INTERSECTED, (node_id('test_steady_fail'),), (), ())
+        assert node_id('test_red_on_rerun') in {f.node for f in _confirm_record(store, OPAQUE.name).failures}
+
+    @pytest.mark.asyncio
+    async def test_8_a_confirm_exiting_nonzero_naming_no_test_is_unconfirmable_on_each_spaced_pass(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_steady_fail')
+        outcomes: list[Confirmed | Unconfirmable] = []
+        pass_starts: list[datetime] = []
+        for _ in range(2):
+            disarm(project, Sabotage.CRASH_AT_IMPORT)
+            detect = await _detect(store, LANE, project)
+            arm(project, Sabotage.CRASH_AT_IMPORT)
+            outcomes.append(await _confirm(store, LANE, project, detect))
+            pass_starts.append(require_current_pass(store, LANE.name).started_at)
+
+        crashed = str(_confirm_record(store, LANE.name).returncode)
+        assert crashed != '0'
+        assert outcomes == [Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, crashed)] * 2
+        assert pass_starts[1] - pass_starts[0] >= SPACING
+
+    @pytest.mark.asyncio
+    async def test_9_failed_in_detection_and_errored_at_setup_in_the_confirm_is_inconclusive(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_uses_worker_id', 'test_ok')
+
+        outcome = await _confirm(store, LANE, project, await _detect(store, LANE, project))
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, (), (), (node_id('test_uses_worker_id'),))
+
+    @pytest.mark.asyncio
+    async def test_10_a_held_test_skipped_in_the_confirm_is_inconclusive_and_a_passing_one_cleared(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_skips_on_rerun', 'test_flaky', 'test_ok')
+
+        outcome = await _confirm(store, LANE, project, await _detect(store, LANE, project))
+
+        assert outcome == Confirmed(
+            ConfirmMode.NARROWED, (), (node_id('test_flaky'),), (node_id('test_skips_on_rerun'),),
+        )
+
+    @pytest.mark.asyncio
+    async def test_11_an_id_containing_whitespace_fails_the_round_trip_and_runs_no_confirm(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_param', 'test_ok')
+
+        outcome = await _confirm(store, LANE, project, await _detect(store, LANE, project))
+
+        assert outcome == Unconfirmable(UnconfirmableReason.ID_FAILED_ROUND_TRIP, node_id('test_param[x'))
+        assert store.last_record(LANE.name, Phase.CONFIRM) is None
+
+
+@pytest.mark.usefixtures('pytest_on_path')
+class TestRealPytestSignalEnded:
+    """PRD §6 scenario 2, outcome half: a sub-run killed by a signal."""
+
+    @pytest.mark.asyncio
+    async def test_2_a_signal_ended_detection_is_unconfirmable_carrying_its_returncode(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_ok')
+
+        detect = await _detect(store, KILLED, project)
+        outcome = await _confirm(store, KILLED, project, detect)
+
+        assert detect.ended_by == EndedBy.SIGNAL
+        assert outcome == Unconfirmable(UnconfirmableReason.DETECT_SIGNAL_ENDED, str(detect.returncode))
+        assert store.last_record(KILLED.name, Phase.CONFIRM) is None
+
+    @pytest.mark.asyncio
+    async def test_2_a_confirm_killed_after_its_first_test_is_unconfirmable_carrying_its_returncode(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_steady_fail', 'test_flaky')
+        detect = await _detect(store, LANE, project)
+        arm(project, Sabotage.KILL_AFTER_FIRST_TEST)
+
+        outcome = await _confirm(store, LANE, project, detect)
+
+        killed = _confirm_record(store, LANE.name)
+        assert killed.ended_by == EndedBy.SIGNAL
+        assert outcome == Unconfirmable(UnconfirmableReason.CONFIRM_SIGNAL_ENDED, str(killed.returncode))
+
+
+def _numeric_stub(worktree: Path, *, confirm_exit: int, printed: str) -> None:
+    write_script(
+        worktree,
+        RUN_OFFLINE_DEEP_SCRIPT,
+        'case "$*" in\n'
+        f'  *--confirm-failed*) printf %s {shlex.quote(printed)}; exit {confirm_exit} ;;\n'
+        'esac\n'
+        "echo 'test result: FAILED. 2 failed'\n"
+        'exit 1\n',
+    )
+
+
+class TestRealPytestLegacyLegs:
+    """PRD §6 scenario 22: the numeric and infra legs against stub runner scripts."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('confirm_exit', 'printed', 'expected'),
+        [
+            (
+                NUMERIC_CONFIRM_IDS_EXIT,
+                'tests::test_a\ntests::test_b\n',
+                Confirmed(ConfirmMode.LEG_NATIVE, ('tests::test_a', 'tests::test_b'), (), ()),
+            ),
+            (0, '', Confirmed(ConfirmMode.LEG_NATIVE, (), (), ())),
+            (64, '', Unconfirmable(UnconfirmableReason.NUMERIC_EXIT, '64')),
+        ],
+        ids=['ids', 'green', 'other-exit'],
+    )
+    async def test_22_the_numeric_confirm_exit_decides(
+        self, tmp_path: Path, store: RunRecordStore, confirm_exit: int, printed: str, expected: PassOutcome,
+    ) -> None:
+        _numeric_stub(tmp_path, confirm_exit=confirm_exit, printed=printed)
+        lane_pass = store.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, HEAD)
+        await suite_runner(store)(tmp_path, HEAD, 4)
+
+        outcome = await confirm(
+            ConfirmTarget.numeric(tmp_path),
+            store.last_record(LEGACY_NUMERIC_COMMAND, Phase.DETECT),
+            confirm_runner(store, lane_pass),
+        )
+
+        assert outcome == expected
+
+    @pytest.mark.asyncio
+    async def test_22_an_infra_confirm_crashing_with_no_failing_line_is_unconfirmable(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        write_script(tmp_path, RUN_ALL_INFRA_SCRIPT, "echo '  RESULT: FAIL (test_x.sh)'\nexit 1\n")
+        lane_pass = store.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, HEAD)
+        await infra_runner(store)(tmp_path, HEAD, 1)
+        write_script(tmp_path, RUN_ALL_INFRA_SCRIPT, "echo 'run_all.sh: lost the host lock'\nexit 2\n")
+
+        outcome = await confirm(
+            ConfirmTarget.infra(tmp_path),
+            store.last_record(LEGACY_INFRA_COMMAND, Phase.DETECT),
+            confirm_runner(store, lane_pass),
+        )
+
+        assert outcome == Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
