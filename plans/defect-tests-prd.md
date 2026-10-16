@@ -464,6 +464,8 @@ These in-flight tasks edit the same surfaces, so the leaves named depend on them
 2026-10-16):
 
 - **5752** (plan-deviation β; `plan_tools.py`) → ε.
+- **5753** (plan-deviation γ; the IMPLEMENTER and DEBUGGER `allowed_tools`, `_FOLLOWUP_FILING_INSTRUCTIONS`)
+  → ε and θ1. Both are far downstream, so the edge costs nothing.
 - **5494** (verdict issue validation) and **5224** (verdict contract `note_dispositions`, which edits
   the same template and tool; one harness-version bump per landing) → δ1.
 - **6739** (`review_payload.py` normaliser) → δ1b only. Its chain 6736 → 6737 is held, so δ1 does not
@@ -483,6 +485,7 @@ different regions of the same files, so the merge lane's rebase is the accepted 
 | 5532 (architect recipe SPOT, low) | `roles.py`, `briefing.py` | γ |
 | 5357 (`build_debugger_prompt`, `VerifyResult.failure_report`) | `briefing.py`, `verify.py` | γ, β1 |
 | 5369 / 5224 (the reviewer prompt and contract) | `roles.py`, `briefing.py` | γ |
+| 6739 (`aggregate_reviews` rewrite) | `artifacts.py` | δ1 |
 
 Whichever lands second rebases. If 5753's parity guard lands first, γ's splice test follows its shape.
 
@@ -604,7 +607,7 @@ and the merge-lane ratchet where it applies. Revised at decompose on 2026-10-16 
   curator `CandidateTask.defects` is included in `payload_hash`; combine adds to a pending target only,
   via α2's core.
 - *Signal:* B15; an implementer follow-up carries `origin: agent_followup`.
-- *Prereqs:* α2, δ1.
+- *Prereqs:* α2, δ1, 5753.
 
 **ε Plan tools, declaration exposure, plan check, event types.**
 - *Scope:*
@@ -620,7 +623,7 @@ and the merge-lane ratchet where it applies. Revised at decompose on 2026-10-16 
     the persisted `defect_plan_repairs_total`.
   - All three event types; emit `defect_plan_check`.
 - *Signal:* B2 in shadow and enforce; the declaration half of B8, B9 and B23.
-- *Prereqs:* α2, β1, δ2, θ1, 5752.
+- *Prereqs:* α2, β1, δ2, θ1, 5752, 5753.
 
 **ζ1 Proof runner.**
 - *Scope:* `PROOF_BASE` (git_ops.py; ratchet baseline and authorized raise recorded with the stamped task
@@ -649,7 +652,9 @@ and the merge-lane ratchet where it applies. Revised at decompose on 2026-10-16 
     `_do_train_merge` (per member, each against its own parent).
   - Git-object enumeration via β2's `enumerate_source`.
   - Fail-closed on a None scheduler or a git error.
-  - Typed `DefectMergeRefusal` on `MergeOutcome`.
+  - Typed `DefectMergeRefusal` on `MergeOutcome`, chosen from each entry's latest proof:
+    `PROOF_UNAVAILABLE` gives `defect_proof_unavailable`; otherwise an `open` or `pending` entry gives
+    `defect_unresolved`, including `PROOF_UNSUPPORTED_RUNNER` (B13).
   - ζ2's streak injected into `SpeculativeMergeWorker` in `harness.py` (KEEP_CHECK_INCOMPLETE feeds it).
   - The ratchet baseline and authorized raise recorded.
   - Emit `defect_keep_check`.
@@ -695,7 +700,7 @@ and the merge-lane ratchet where it applies. Revised at decompose on 2026-10-16 
   a real coalesced train in `_merge_queue_harness.py`) and B23. If λ2 edits a ratchet-cluster file
   (`_merge_queue_harness.py`, `tests/conftest.py`), it records the authorized raise.
 - *Signal:* the module passes in the orchestrator suite.
-- *Prereqs:* η.
+- *Prereqs:* η, λ1 (reuses its fixtures module).
 
 **μ Human gate: flip `defect_tests.mode` to `enforce`.**
 - *Scope:* `task_kind: deterministic`, `always_escalates`, `metadata.milestone {mode: delayed,
