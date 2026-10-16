@@ -1935,7 +1935,7 @@ member over a bare string, and lists `escalation/src/escalation/categories.py`
 in its `files`, because that list is the lock.
 `escalation/tests/test_category_census.py` fails verify on an unregistered
 filer reached through literals, constants, imports or forwarding wrappers. It
-cannot see fully dynamic values (subscripts, values read from payload dicts);
+cannot see fully dynamic values (subscripts, call results from other modules);
 only the submit-time check catches those.
 
 ## 10. Rotating a long-running audit-trail task
