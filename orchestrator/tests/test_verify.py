@@ -2102,6 +2102,54 @@ class TestParsePytestFailures:
         ]
 
 
+class TestReproducedFailures:
+    """``reproduced_failures(original, rerun)`` — the one home of the kind rule."""
+
+    FAILED = verify.FailureKind.FAILED
+    ERROR = verify.FailureKind.ERROR
+
+    def _failure(self, node_id: str, kind: verify.FailureKind) -> verify.PytestFailure:
+        return verify.PytestFailure(node_id, kind, '')
+
+    def test_failed_then_failed_is_reproduced(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_failed_then_error_is_not_reproduced(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == ()
+
+    def test_error_then_error_is_reproduced(self):
+        original = [self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_error_then_failed_is_reproduced(self):
+        original = [self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_a_rerun_node_absent_from_the_original_is_dropped(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::b', self.FAILED), self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == (rerun[1],)
+
+    def test_result_follows_rerun_order(self):
+        original = [self._failure('t.py::a', self.FAILED), self._failure('t.py::b', self.FAILED)]
+        rerun = [self._failure('t.py::b', self.FAILED), self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_an_original_with_failed_and_error_for_one_node_accepts_error(self):
+        original = [self._failure('t.py::a', self.FAILED), self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_no_original_reproduces_nothing(self):
+        assert verify.reproduced_failures([], [self._failure('t.py::a', self.FAILED)]) == ()
+
+
 class TestExtractFailingTestIdsFromJunit:
     """``_extract_failing_test_ids_from_junit(path)`` parses a pytest junitxml
     report into a sorted, de-duplicated list of stable ``classname::name`` ids
@@ -2345,6 +2393,102 @@ class TestExtractTestIdsFromJunit:
     @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
     def test_unparseable_report_returns_none(self, tmp_path: Path, content: str):
         assert self._parse(tmp_path, content) is None
+
+
+class TestExtractTestOutcomesFromJunit:
+    """``extract_test_outcomes_from_junit(path)`` — passed and skipped per testcase, failing excluded."""
+
+    @staticmethod
+    def _read(tmp_path: Path, xml: str) -> dict[str, str] | None:
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(xml)
+        return verify.extract_test_outcomes_from_junit(junit_path)
+
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
+        )
+
+    def test_passed_and_skipped_are_reported_by_classname_and_name(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="tests.test_a.TestX" name="test_pass" />',
+                '<testcase classname="tests.test_a" name="test_skip">'
+                '<skipped type="pytest.skip" message="no checkout">x</skipped></testcase>',
+            ),
+        )
+        assert outcomes == {
+            'tests.test_a.TestX::test_pass': 'passed',
+            'tests.test_a::test_skip': 'skipped',
+        }
+
+    def test_an_xfail_and_a_strict_xpass_ran_so_they_are_passed(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_xpass">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+            ),
+        )
+        assert outcomes == {'t::test_xfail': 'passed', 't::test_xpass': 'passed'}
+
+    def test_failing_and_erroring_testcases_are_excluded(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_ok" />',
+                '<testcase classname="t" name="test_fail"><failure message="boom" /></testcase>',
+                '<testcase classname="t" name="test_err"><error message="boom" /></testcase>',
+            ),
+        )
+        assert outcomes == {'t::test_ok': 'passed'}
+
+    def test_a_bare_testsuite_root_is_read(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            '<testsuite name="pytest"><testcase classname="t" name="test_ok" /></testsuite>',
+        )
+        assert outcomes == {'t::test_ok': 'passed'}
+
+    def test_several_testsuites_under_a_wrapper_are_merged(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            '<testsuites>'
+            '<testsuite name="one"><testcase classname="a" name="test_x" /></testsuite>'
+            '<testsuite name="two"><testcase classname="b" name="test_y" /></testsuite>'
+            '</testsuites>',
+        )
+        assert outcomes == {'a::test_x': 'passed', 'b::test_y': 'passed'}
+
+    def test_a_report_without_testcases_is_an_empty_mapping_not_none(self, tmp_path: Path):
+        assert self._read(tmp_path, self._suite()) == {}
+
+    def test_a_missing_report_is_none(self, tmp_path: Path):
+        assert verify.extract_test_outcomes_from_junit(tmp_path / 'missing.xml') is None
+
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_an_unreadable_report_is_none(self, tmp_path: Path, content: str):
+        assert self._read(tmp_path, content) is None
+
+    def test_ids_use_the_spelling_of_the_failing_reader(self, tmp_path: Path):
+        xml = self._suite(
+            '<testcase classname="tests.test_a" name="test_pass" />',
+            '<testcase file="tests/test_b.py" name="test_nofile" />',
+            '<testcase name="test_bare" />',
+        )
+        outcomes = self._read(tmp_path, xml)
+        assert outcomes == {
+            'tests.test_a::test_pass': 'passed',
+            'tests/test_b.py::test_nofile': 'passed',
+            'test_bare': 'passed',
+        }
 
 
 # ---------------------------------------------------------------------------

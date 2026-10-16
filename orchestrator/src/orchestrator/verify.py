@@ -20,7 +20,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1076,6 +1076,28 @@ def node_ids_of(failures: Iterable[PytestFailure]) -> list[str]:
     return list(dict.fromkeys(failure.node_id for failure in failures))
 
 
+def reproduced_failures(
+    original: Sequence[PytestFailure], rerun: Sequence[PytestFailure],
+) -> tuple[PytestFailure, ...]:
+    """The *rerun* failures that confirm a failure of *original*, in *rerun* order.
+
+    A re-run failure confirms an original for the same node id only, and a
+    setup or collection ERROR confirms only an original ERROR of that node: a
+    FAILED original is not reproduced by an ERROR the re-run's own form can
+    produce.  Both outputs must come from the same command run from the same
+    cwd, because pytest's summary ids are cwd-relative.
+    """
+    original_kinds: dict[str, set[FailureKind]] = {}
+    for failure in original:
+        original_kinds.setdefault(failure.node_id, set()).add(failure.kind)
+    return tuple(
+        failure
+        for failure in rerun
+        if failure.node_id in original_kinds
+        and (failure.kind is FailureKind.FAILED or FailureKind.ERROR in original_kinds[failure.node_id])
+    )
+
+
 def _extract_failing_test_ids(test_output: str) -> list[str]:
     """Node-ids of failing/errored/crashed tests in first-seen order, de-duplicated.
 
@@ -1166,6 +1188,27 @@ def _extract_test_ids_from_junit(path: Path) -> _JunitTestIds | None:
         elif _junit_testcase_never_ran(testcase):
             skipped.add(_junit_testcase_id(testcase))
     return _JunitTestIds(failing=sorted(failing), skipped=sorted(skipped))
+
+
+def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
+    """``{junit id: 'passed' | 'skipped'}`` for every testcase of the report at *path* that did not fail.
+
+    Ids use the spelling of :func:`_extract_test_ids_from_junit`.  ``'skipped'``
+    means the test never executed; an xfail or a strict XPASS ran and counts as
+    ``'passed'``.  A testcase with a ``<failure>`` or ``<error>`` child is
+    absent.  ``None`` when *path* is missing, empty or malformed; never raises.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    if root is None:
+        return None
+    return {
+        _junit_testcase_id(testcase): 'skipped' if _junit_testcase_never_ran(testcase) else 'passed'
+        for testcase in root.iter('testcase')
+        if testcase.find('failure') is None and testcase.find('error') is None
+    }
 
 
 def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:

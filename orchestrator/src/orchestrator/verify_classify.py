@@ -357,33 +357,25 @@ _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
 # note above (cf. `_SLOT_ACQUIRE_DEADLINE_RE`, `verify._match_clock_marker`):
 # run_all emits two leading spaces, and verify output is aggregated from
 # wrappers that routinely indent captured sub-output. It adopts the shape
-# already source-verified in `offline_lane._INFRA_RESULT_FAIL_RE`, widened to
-# PASS|FAIL|SKIP, and stops before any trailing
-# ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
+# already source-verified in `offline_lane_runs.py::INFRA_RESULT_RE`, and stops
+# before any trailing ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
 #
 # ---> SIBLING ENCODING, KEEP IN SYNC (review amendment #4). This is the
 # SECOND in-repo encoding of run_all.sh's per-suite RESULT framing; the other
-# is `offline_lane._INFRA_RESULT_FAIL_RE` (offline_lane.py:102), which parses
-# the same lines for the infra confirmation runner. They intentionally
-# DIVERGE in three ways, none of them accidental:
+# is `offline_lane_runs.py::INFRA_RESULT_RE`, which parses the same lines into
+# the offline lane's infra run records. Both match PASS|FAIL|SKIP, leave the
+# tail open and capture the name as `[^)]+`. They DIVERGE in one way, not by
+# accident:
 #
-#   * TAIL — offline_lane end-anchors (`\s*$`); this one does NOT, because the
-#     close may carry run_all's ` [flaky: ...]` suffix. Traced consequence of
-#     the open tail here: a close can only ever match EARLIER, which only ever
-#     SHRINKS a redaction window — i.e. it stays in the fail-safe direction.
-#   * SEPARATORS — offline_lane uses `\s*` between tokens; this one requires
-#     the literal single spaces run_all actually emits. Stricter, and correct
-#     per the ANCHORING CONTRACT: a looser separator is another way for quoted
-#     assertion prose to impersonate the producer.
-#   * NAME — offline_lane uses `.+?`; this one uses `[^)]+`, which cannot run
-#     past the closing paren into a ` [flaky: ...]` suffix.
+#   * SEPARATORS — offline_lane_runs uses `\s*` between tokens; this one
+#     requires the literal single spaces run_all actually emits. Stricter, and
+#     correct per the ANCHORING CONTRACT: a looser separator is another way for
+#     quoted assertion prose to impersonate the producer.
 #
 # Neither site is generated from the other, so a future run_all framing change
 # must be fixed in BOTH. This cross-reference exists so that is discoverable
 # from either end. If a THIRD consumer ever appears, lift the patterns into
-# one small shared module rather than adding a fourth copy. (The reciprocal
-# `cf. verify_classify._RUN_ALL_SUITE_CLOSE_RE` comment in offline_lane.py is
-# NOT in task 4492's lock scope and is filed as follow-up work.)
+# one small shared module rather than adding a fourth copy.
 _RUN_ALL_SUITE_OPEN_RE = re.compile(r'^--- Running: (?P<name>.+?) ---[ \t]*$')
 _RUN_ALL_SUITE_CLOSE_RE = re.compile(
     r'^[ \t]*RESULT: (?P<verdict>PASS|FAIL|SKIP) \((?P<name>[^)]+)\)'
