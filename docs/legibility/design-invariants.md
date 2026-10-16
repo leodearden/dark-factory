@@ -436,10 +436,15 @@ and entries remain.
 **House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
 disposition vocabulary, the ratification table, the inline-marker grammar,
 the multiset ratchet kernel, the exception register and the owner-liveness
-sweep. The landed mechanism is `scripts/exception_register.py` (the exception
-register and the ratification-table loader),
-`scripts/inline_suppressions.py` (the inline-suppression gate and ratchet) and
-`docs/legibility/exception-ratifications.yaml` (the ratification table).
+sweep. The landed mechanism is `shared/src/shared/governed_exceptions.py`
+(the disposition vocabulary and the inline-marker grammar),
+`shared/src/shared/ratchet.py` (the multiset ratchet kernel),
+`scripts/exception_register.py` (the exception register and the
+ratification-table loader), `scripts/inline_suppressions.py` (the
+inline-suppression gate and ratchet) and
+`docs/legibility/exception-ratifications.yaml` (the ratification table). The
+owner-liveness sweep (PRD step η) has not landed yet; the PRD is its only
+reference.
 
 **Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
 adjacent — both ask who owns a thing and what notices when the owner is
