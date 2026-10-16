@@ -4,8 +4,8 @@
 Run only after BOTH fused-memory and the dashboard are restarted on a build
 containing task 5405. ``migrate`` is online-safe: short chunks, each one verified
 transaction, resumable and abortable at any moment. ``status``, ``snapshot``
-and ``verify`` are read-only. ``reclaim`` (VACUUM) needs fused-memory stopped
-and disabled. Runbook: fused-memory/scripts/README_roll_up_journal_reads.md.
+and ``verify`` are read-only. ``reclaim`` (VACUUM) needs fused-memory disabled
+and its socket stopped. Runbook: fused-memory/scripts/README_roll_up_journal_reads.md.
 """
 
 from __future__ import annotations
@@ -32,13 +32,15 @@ from fused_memory.services.read_rollup import (
 )
 
 DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
-DEFAULT_CHUNK_ROWIDS = 2000
+DEFAULT_CHUNK_ROWIDS = 5000
 DEFAULT_PAUSE_SECONDS = 0.5
 DEFAULT_DEPLOY_GRACE_MINUTES = 15.0
 DEFAULT_WINDOW_HOURS = (1, 24, 168)
 BUSY_TIMEOUT_MS = 30000
 ROLLUP_TABLE = 'read_op_counts'
-FUSED_MEMORY_UNIT = 'fused-memory.service'
+#: The service, and the socket that would re-activate it on the next connection.
+FUSED_MEMORY_UNITS = ('fused-memory.service', 'fused-memory.socket')
+_ACTIVE_STATES = frozenset({'active', 'activating', 'reloading', 'deactivating'})
 
 _ROLLUP_KEY_COLUMNS = ('hour_start', 'project_id', 'agent_id', 'operation')
 
@@ -118,6 +120,10 @@ class MigrationReport:
     rows_per_second: float
     remaining: RowidSpan | None
     preview: tuple[tuple[Any, ...], ...]
+    #: Each chunk's transaction time, which bounds its write-lock hold; keep it
+    #: well under fused-memory's 5000 ms busy_timeout.
+    mean_chunk_seconds: float = 0.0
+    max_chunk_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -355,12 +361,14 @@ def _limit_reached(limits: MigrationLimits, chunks: int, elapsed: float) -> bool
 def migrate(conn: sqlite3.Connection, limits: MigrationLimits) -> MigrationReport:
     started = time.monotonic()
     span = count_only_span(conn)
-    chunks = rows_moved = 0
+    rows_moved = 0
+    chunk_seconds: list[float] = []
     if span is not None:
         lo, hi = span.first_rowid, span.max_rowid + 1
-        while lo < hi and not _limit_reached(limits, chunks, time.monotonic() - started):
+        while lo < hi and not _limit_reached(limits, len(chunk_seconds), time.monotonic() - started):
+            chunk_started = time.monotonic()
             result = migrate_chunk(conn, lo, min(lo + limits.chunk_rowids, hi))
-            chunks += 1
+            chunk_seconds.append(time.monotonic() - chunk_started)
             rows_moved += result.rows_moved
             lo = result.hi
             if lo < hi:
@@ -368,25 +376,28 @@ def migrate(conn: sqlite3.Connection, limits: MigrationLimits) -> MigrationRepor
     seconds = time.monotonic() - started
     return MigrationReport(
         applied=True,
-        chunks=chunks,
+        chunks=len(chunk_seconds),
         rows_moved=rows_moved,
         seconds=round(seconds, 3),
         rows_per_second=round(rows_moved / seconds, 1) if seconds > 0 else 0.0,
         remaining=count_only_span(conn),
         preview=(),
+        mean_chunk_seconds=round(sum(chunk_seconds) / len(chunk_seconds), 3) if chunk_seconds else 0.0,
+        max_chunk_seconds=round(max(chunk_seconds, default=0.0), 3),
     )
 
 
 def fused_memory_unit_active() -> bool:
-    """True unless systemd confirms the unit is NOT active; fails closed."""
+    """True unless systemd confirms every FUSED_MEMORY_UNITS unit is NOT active; fails closed."""
     try:
         probe = subprocess.run(
-            ['systemctl', '--user', 'is-active', FUSED_MEMORY_UNIT],
+            ['systemctl', '--user', 'is-active', *FUSED_MEMORY_UNITS],
             capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return True
-    return probe.stdout.strip() in ('active', 'activating', 'reloading', 'deactivating')
+    states = probe.stdout.split()
+    return len(states) != len(FUSED_MEMORY_UNITS) or bool(_ACTIVE_STATES.intersection(states))
 
 
 def page_figures(conn: sqlite3.Connection) -> PageFigures:
@@ -417,8 +428,8 @@ def reclaim_blockers(conn: sqlite3.Connection, *, unit_active: Callable[[], bool
         )
     if unit_active():
         blockers.append(
-            f'{FUSED_MEMORY_UNIT} is active (or its state could not be confirmed): '
-            f'systemctl --user disable --now {FUSED_MEMORY_UNIT} first'
+            f'{" or ".join(FUSED_MEMORY_UNITS)} is active (or the state could not be '
+            'confirmed): stop the socket and disable --now the service first'
         )
     return blockers
 

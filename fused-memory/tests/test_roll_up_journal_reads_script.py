@@ -185,6 +185,7 @@ class TestMigrateApply:
         assert report is not None and report['applied'] is True
         assert report['rows_moved'] == sum(1 for row in history if _is_count_only(row))
         assert report['chunks'] > 1
+        assert report['max_chunk_seconds'] >= report['mean_chunk_seconds'] > 0
         assert _rollup_counts(journal) == expected
         after_rows = _write_ops_by_id(journal)
         kept_ids = {row['id'] for row in history if not _is_count_only(row)}
