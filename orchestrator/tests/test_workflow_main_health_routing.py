@@ -5,7 +5,7 @@ Step-1: compute_preexisting_main_break_fingerprint helper produces the same
         returns '' on failure.
 Step-13: _submit_to_merge_queue routes a MAIN_HEALTH_RED_REASON_PREFIX outcome
          to _mark_blocked(escalate_to_human=True, category='preexisting_main_break',
-         dedupe_fingerprint=..., suggested_action='await_preexisting_main_hotfix').
+         dedupe_fingerprint=...).
 """
 from __future__ import annotations
 
@@ -142,8 +142,8 @@ class TestComputePreexistingMainBreakFingerprint:
 class TestSubmitToMergeQueueMainHealthRouting:
     """_submit_to_merge_queue must route a MAIN_HEALTH_RED_REASON_PREFIX blocked
     outcome to _mark_blocked(escalate_to_human=True, category='preexisting_main_break',
-    dedupe_fingerprint=..., suggested_action='await_preexisting_main_hotfix'),
-    and must NOT touch the steward or the generic task-fault path.
+    dedupe_fingerprint=...), and must NOT touch the steward or the generic
+    task-fault path.
 
     Pattern mirrors test_workflow_e2e.py: set workflow.merge_queue, patch
     enqueue_merge_request to deliver the MergeOutcome, call with a branch name.
@@ -191,9 +191,6 @@ class TestSubmitToMergeQueueMainHealthRouting:
         )
         assert call_kwargs.get('dedupe_fingerprint') == fp, (
             f'Expected dedupe_fingerprint={fp!r}; got {call_kwargs}'
-        )
-        assert call_kwargs.get('suggested_action') == 'await_preexisting_main_hotfix', (
-            f'Expected suggested_action=await_preexisting_main_hotfix; got {call_kwargs}'
         )
         assert call_kwargs.get('merge_phase') is True, (
             f'Expected merge_phase=True (forwarded); got {call_kwargs}'

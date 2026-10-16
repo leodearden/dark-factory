@@ -119,6 +119,7 @@ from orchestrator.git_ops import (
     _run,
     is_wip_safety_commit,
 )
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
@@ -12252,7 +12253,6 @@ class TaskWorkflow:
                 escalate_to_human=True,
                 category='preexisting_main_break',
                 dedupe_fingerprint=fp,
-                suggested_action='await_preexisting_main_hotfix',
             )
 
         # Sha-independent signature for attempt-cap / re-break-loop detection.
@@ -12296,7 +12296,6 @@ class TaskWorkflow:
                 category='preexisting_main_break',
                 dedupe_fingerprint=fp,
                 root_cause=f'main-health-auto-heal-rebreak:{sig}',
-                suggested_action='await_preexisting_main_hotfix',
             )
 
         # Build and submit the dedup'd L1 escalation (shared across all three
@@ -12311,10 +12310,11 @@ class TaskWorkflow:
                 category='preexisting_main_break',
                 summary=reason[:200],
                 detail=reason,
-                suggested_action='main_health_auto_heal_in_flight',
+                suggested_action=MainHealthNextAction.AUTO_HEAL_IN_FLIGHT,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 filing_claimant_run_id=self._filing_claimant_run_id,
+                level=1,
             )
             if fp:
                 esc.dedupe_fingerprint = fp

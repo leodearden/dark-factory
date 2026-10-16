@@ -694,9 +694,6 @@ class TestAutoHealNonMechanicalEscalates:
         assert call_kwargs.get('dedupe_fingerprint') == 'fp-test-001', (
             f'[{category}] Expected dedupe_fingerprint forwarded; got {call_kwargs}'
         )
-        assert call_kwargs.get('suggested_action') == 'await_preexisting_main_hotfix', (
-            f'[{category}] Expected suggested_action=await_preexisting_main_hotfix; got {call_kwargs}'
-        )
         assert result == WorkflowOutcome.BLOCKED
 
 
