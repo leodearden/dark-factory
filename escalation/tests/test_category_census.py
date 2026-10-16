@@ -10,7 +10,24 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import pytest
 from _category_census import CensusResult, run_census
+
+from escalation.categories import EscalationCategory
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_PRODUCER_ROOTS = (
+    'escalation/src',
+    'orchestrator/src',
+    'fused-memory/src',
+    'fused-memory/scripts',
+    'shared/src',
+    'dashboard/src',
+    'cockpit/src',
+    'sampler/src',
+    'scripts',
+    'skills',
+)
 
 
 def _write(root: Path, rel: str, source: str) -> None:
@@ -199,3 +216,37 @@ class TestWhatIsNotASite:
         assert _values(result) == {'ok'}
         assert result.files_parsed == 1
         assert [Path(p).name for p in result.parse_failures] == ['broken.py']
+
+
+def _existing_roots() -> list[Path]:
+    return [REPO_ROOT / rel for rel in _PRODUCER_ROOTS if (REPO_ROOT / rel).is_dir()]
+
+
+@pytest.fixture(scope='module')
+def repository_census() -> CensusResult:
+    return run_census(_existing_roots())
+
+
+@pytest.mark.xdist_group('category_census')
+class TestRepositoryCensus:
+    def test_every_filed_category_is_registered(self, repository_census: CensusResult):
+        unregistered = [s for s in repository_census.sites if s.value not in EscalationCategory]
+
+        assert unregistered == [], (
+            'unregistered escalation categories:\n'
+            + '\n'.join(
+                f'  {s.path.relative_to(REPO_ROOT)}:{s.line} {s.value}' for s in unregistered
+            )
+            + '\nregister it in escalation/src/escalation/categories.py::EscalationCategory, '
+            'or, if this call is not an escalation filer, the census over-matched a wrapper '
+            'name — see _category_census._discover_wrappers'
+        )
+
+    def test_census_reaches_the_tree(self, repository_census: CensusResult):
+        assert repository_census.parse_failures == ()
+        for root in _existing_roots():
+            assert any(p.is_relative_to(root) for p in repository_census.parsed_paths), root
+        site_paths = [s.path for s in repository_census.sites]
+        assert any(p.is_relative_to(REPO_ROOT / 'orchestrator/src') for p in site_paths)
+        assert any(p.is_relative_to(REPO_ROOT / 'fused-memory/src') for p in site_paths)
+        assert repository_census.wrappers

@@ -40,20 +40,24 @@ class CensusSite:
 class CensusResult:
     sites: tuple[CensusSite, ...]
     wrappers: frozenset[str]
-    files_parsed: int
+    parsed_paths: tuple[Path, ...]
     parse_failures: tuple[str, ...]
+
+    @property
+    def files_parsed(self) -> int:
+        return len(self.parsed_paths)
 
 
 @dataclass(frozen=True)
 class _ModuleIndex:
     path: Path
     module: str | None
-    tree: ast.Module
     constants: Mapping[str, ast.expr]
     class_names: frozenset[str]
     class_constants: Mapping[str, ast.expr]
     imports: Mapping[str, str]
     functions: tuple[_Function, ...]
+    calls: tuple[tuple[_Function | None, ast.Call], ...]
 
 
 @dataclass(frozen=True)
@@ -107,34 +111,46 @@ def _assigned(statement: ast.stmt) -> Iterator[tuple[str, ast.expr]]:
         yield statement.target.id, statement.value
 
 
-def _imports(tree: ast.Module, module: str | None, is_package: bool) -> dict[str, str]:
-    bound: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            base = _absolute_module(module, is_package, node)
-            for alias in node.names:
-                bound[alias.asname or alias.name] = f'{base}.{alias.name}'
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.asname:
-                    bound[alias.asname] = alias.name
-                else:
-                    head = alias.name.split('.')[0]
-                    bound[head] = head
-    return bound
+def _import_bindings(node: ast.Import | ast.ImportFrom, module: str | None,
+                     is_package: bool) -> Iterator[tuple[str, str]]:
+    if isinstance(node, ast.ImportFrom):
+        base = _absolute_module(module, is_package, node)
+        for alias in node.names:
+            yield alias.asname or alias.name, f'{base}.{alias.name}'
+        return
+    for alias in node.names:
+        head = alias.name.split('.')[0]
+        yield (alias.asname, alias.name) if alias.asname else (head, head)
 
 
 def _index(path: Path, module: str | None, is_package: bool, tree: ast.Module) -> _ModuleIndex:
-    classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    """One traversal; every call is paired with its innermost enclosing function."""
+    classes: list[ast.ClassDef] = []
+    functions: list[_Function] = []
+    imports: dict[str, str] = {}
+    calls: list[tuple[_Function | None, ast.Call]] = []
+    pending: list[tuple[ast.AST, _Function | None]] = [(tree, None)]
+    while pending:
+        node, function = pending.pop()
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Call):
+                calls.append((function, child))
+            elif isinstance(child, ast.ClassDef):
+                classes.append(child)
+            elif isinstance(child, _Function):
+                functions.append(child)
+            elif isinstance(child, ast.Import | ast.ImportFrom):
+                imports.update(_import_bindings(child, module, is_package))
+            pending.append((child, child if isinstance(child, _Function) else function))
     return _ModuleIndex(
         path=path,
         module=module,
-        tree=tree,
         constants=dict(pair for stmt in tree.body for pair in _assigned(stmt)),
         class_names=frozenset(cls.name for cls in classes),
         class_constants=dict(pair for cls in classes for stmt in cls.body for pair in _assigned(stmt)),
-        imports=_imports(tree, module, is_package),
-        functions=tuple(node for node in ast.walk(tree) if isinstance(node, _Function)),
+        imports=imports,
+        functions=tuple(functions),
+        calls=tuple(calls),
     )
 
 
@@ -258,19 +274,9 @@ def _discover_wrappers(indexes: Sequence[_ModuleIndex]) -> tuple[dict[str, int |
     return known, wrappers
 
 
-def _calls_by_enclosing_function(tree: ast.Module) -> Iterator[tuple[_Function | None, ast.Call]]:
-    pending: list[tuple[ast.AST, _Function | None]] = [(tree, None)]
-    while pending:
-        node, function = pending.pop()
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.Call):
-                yield function, child
-            pending.append((child, child if isinstance(child, _Function) else function))
-
-
 def _call_sites(index: _ModuleIndex, known: Mapping[str, int | None],
                 modules: Mapping[str, _ModuleIndex]) -> Iterator[CensusSite]:
-    for function, call in _calls_by_enclosing_function(index.tree):
+    for function, call in index.calls:
         argument = _known_call_category(call, known)
         if argument is not None:
             for value in _resolve(argument, index, function, modules):
@@ -303,6 +309,6 @@ def run_census(roots: Sequence[Path]) -> CensusResult:
     return CensusResult(
         sites=tuple(sites),
         wrappers=frozenset(w.function.name for w in wrappers),
-        files_parsed=len(indexes),
+        parsed_paths=tuple(index.path for index in indexes),
         parse_failures=tuple(failures),
     )
