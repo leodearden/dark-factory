@@ -77,44 +77,6 @@ WRITE_OPS_SCHEMA = PRE_ROLLUP_WRITE_OPS_SCHEMA + _read_op_counts_ddl()
 
 
 @pytest.fixture()
-def journal_db(tmp_path):
-    """Create a write_journal DB with sample data spanning several hours."""
-    db_path = tmp_path / 'write_journal.db'
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript(WRITE_OPS_SCHEMA)
-
-    now = datetime.now(UTC)
-    rows = [
-        # Recent reads
-        ('op-1', 'search', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=1)).isoformat()),
-        ('op-2', 'search', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=1, minutes=30)).isoformat()),
-        ('op-3', 'get_entity', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=2)).isoformat()),
-        # Recent writes
-        ('op-4', 'add_memory', 'dark_factory', 'claude-interactive', 'write',
-         (now - timedelta(hours=1)).isoformat()),
-        ('op-5', 'add_memory', 'dark_factory', 'recon-stage-consolidator', 'write',
-         (now - timedelta(hours=3)).isoformat()),
-        ('op-6', 'delete_memory', 'dark_factory', 'recon-stage-consolidator', 'write',
-         (now - timedelta(hours=3)).isoformat()),
-        # Old data (>24h) — should be excluded
-        ('op-7', 'search', 'dark_factory', 'claude-interactive', 'read',
-         (now - timedelta(hours=25)).isoformat()),
-    ]
-    for op_id, operation, project_id, agent_id, kind, created_at in rows:
-        conn.execute(
-            'INSERT INTO write_ops (id, operation, project_id, agent_id, kind, created_at)'
-            ' VALUES (?, ?, ?, ?, ?, ?)',
-            (op_id, operation, project_id, agent_id, kind, created_at),
-        )
-    conn.commit()
-    conn.close()
-    return db_path
-
-
-@pytest.fixture()
 def empty_journal_db(tmp_path):
     """Write journal DB with schema but no data."""
     db_path = tmp_path / 'write_journal.db'
@@ -123,13 +85,6 @@ def empty_journal_db(tmp_path):
     conn.commit()
     conn.close()
     return db_path
-
-
-@pytest.fixture()
-async def journal_conn(journal_db):
-    async with aiosqlite.connect(str(journal_db)) as conn:
-        conn.row_factory = aiosqlite.Row
-        yield conn
 
 
 @pytest.fixture()
@@ -327,43 +282,6 @@ class TestGetMemoryOps:
         validate_datum(result, served_at=_OPS_NOW)
 
 
-class TestGetAgentBreakdown:
-    @pytest.mark.asyncio
-    async def test_returns_all_agents(self, journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(journal_conn)
-        assert set(result['labels']) == {'claude-interactive', 'recon-stage-consolidator'}
-
-    @pytest.mark.asyncio
-    async def test_sorted_by_count_desc(self, journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(journal_conn)
-        assert result['values'] == sorted(result['values'], reverse=True)
-
-    @pytest.mark.asyncio
-    async def test_excludes_old_data(self, journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(journal_conn)
-        assert sum(result['values']) == 6
-
-    @pytest.mark.asyncio
-    async def test_empty_db(self, empty_journal_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(empty_journal_conn)
-        assert result == {'labels': [], 'values': []}
-
-    @pytest.mark.asyncio
-    async def test_missing_db(self):
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        result = await get_agent_breakdown(None)
-        assert result == {'labels': [], 'values': []}
-
-
 @pytest.fixture()
 async def no_table_conn(tmp_path):
     """Connection to an empty DB with no write_ops table."""
@@ -394,7 +312,7 @@ def _assert_unknown_memory_ops(result, *reason_fragments):
 
 
 class TestDataLayerErrorHandling:
-    """Verify both write_journal functions handle errors at data layer."""
+    """Verify get_memory_ops handles errors at the data layer."""
 
     @pytest.mark.asyncio
     async def test_memory_ops_is_unknown_on_none_db(self):
@@ -403,24 +321,12 @@ class TestDataLayerErrorHandling:
         _assert_unknown_memory_ops(result, 'write journal')
 
     @pytest.mark.asyncio
-    async def test_agents_returns_default_on_none_db(self):
-        from dashboard.data.write_journal import get_agent_breakdown
-        result = await get_agent_breakdown(None)
-        assert result == {'labels': [], 'values': []}
-
-    @pytest.mark.asyncio
     async def test_memory_ops_is_unknown_naming_the_operational_error(
         self, no_table_conn,
     ):
         from dashboard.data.write_journal import get_memory_ops
         result = await get_memory_ops(no_table_conn, now=_OPS_NOW)
         _assert_unknown_memory_ops(result, 'OperationalError', 'no such table')
-
-    @pytest.mark.asyncio
-    async def test_agents_returns_default_on_operational_error(self, no_table_conn):
-        from dashboard.data.write_journal import get_agent_breakdown
-        result = await get_agent_breakdown(no_table_conn)
-        assert result == {'labels': [], 'values': []}
 
     @pytest.mark.asyncio
     async def test_memory_ops_is_unknown_naming_the_os_error(self, tmp_path):
@@ -437,20 +343,6 @@ class TestDataLayerErrorHandling:
                 result = await get_memory_ops(conn, now=_OPS_NOW)
         _assert_unknown_memory_ops(result, 'OSError', 'disk I/O error')
 
-    @pytest.mark.asyncio
-    async def test_agents_returns_default_on_os_error(self, tmp_path):
-        from dashboard.data.write_journal import get_agent_breakdown
-        db_path = tmp_path / 'test.db'
-        sqlite3.connect(str(db_path)).close()
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            mock_cursor = AsyncMock()
-            mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
-            mock_cursor.__aexit__ = AsyncMock(return_value=False)
-            mock_cursor.fetchall = AsyncMock(side_effect=OSError('disk I/O error'))
-            with patch.object(conn, 'execute', return_value=mock_cursor):
-                result = await get_agent_breakdown(conn)
-        assert result == {'labels': [], 'values': []}
 
 
 def _seed_write_ops(db_path, rows, *, schema=WRITE_OPS_SCHEMA):
@@ -520,24 +412,6 @@ class TestNowThreading:
             result = await _ops_value(conn)
         assert sum(result.reads) == 1
 
-    @pytest.mark.asyncio
-    async def test_agent_breakdown_uses_provided_now_at_minute_boundary(self, tmp_path):
-        """get_agent_breakdown(now=fixed): fixed-24h+1min is counted, fixed-24h-1min is not."""
-        from dashboard.data.write_journal import get_agent_breakdown
-
-        db_path = tmp_path / 'agents_fixed_now_boundary.db'
-        cutoff = self.FIXED_NOW - timedelta(hours=24)
-        just_inside = cutoff + timedelta(minutes=1)
-        just_outside = cutoff - timedelta(minutes=1)
-        _seed_write_ops(db_path, [
-            ('in-1', 'search', 'dark_factory', 'agent-a', 'read', just_inside.isoformat()),
-            ('out-1', 'search', 'dark_factory', 'agent-a', 'read', just_outside.isoformat()),
-        ])
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
-            result = await get_agent_breakdown(conn, now=self.FIXED_NOW)
-        assert sum(result['values']) == 1
 
 
 # Deliberately UNEQUAL per-operation weights (sum to 500, matching the

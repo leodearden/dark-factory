@@ -26,7 +26,6 @@ from typing import Any
 import aiosqlite
 
 from dashboard.data.datum import Datum, DatumState, unknown_datum
-from dashboard.data.db import with_db
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -276,44 +275,3 @@ def _memory_ops_fallback(exc: sqlite3.OperationalError) -> str:
         )
         return RAW_ONLY_MEMORY_OPS_SQL
     raise exc
-
-
-async def get_agent_breakdown(
-    db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
-) -> dict:
-    """Agent distribution for the last *hours* hours.
-
-    Returns ``{labels: [str, ...], values: [int, ...]}``.
-
-    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
-    pass an explicit value for deterministic results.
-
-    Deliberately NOT hinted with ``INDEXED BY idx_wo_created`` (task 3519 —
-    decided and recorded, not left to chance): (1) zero production callers
-    today — ``api_memory_graphs`` in :mod:`dashboard.app` calls only
-    :func:`get_memory_ops` — so the oversubscription argument that justifies
-    the hint on that query does not apply here; (2) once ``sqlite_stat1`` exists, the planner
-    already reaches the same ``created_at`` range seek via a strictly better
-    COVERING skip-scan on ``idx_wo_kind_time`` (``SEARCH ... COVERING INDEX
-    idx_wo_kind_time (ANY(kind) AND created_at>?)``), which pinning
-    ``idx_wo_created`` here would forbid; and (3) fused-memory's
-    ``test_created_at_range_is_seekable_for_dashboard_queries`` already pins
-    that seekability property at the schema owner. Hinting here would only
-    add cross-package coupling cost for no benefit.
-    """
-    since = (resolve_now(now) - timedelta(hours=hours)).isoformat()
-
-    async def _query(db: aiosqlite.Connection) -> dict:
-        async with db.execute(
-            "SELECT COALESCE(agent_id, 'unknown') AS agent, COUNT(*) AS cnt"
-            ' FROM write_ops WHERE created_at >= ?'
-            ' GROUP BY agent ORDER BY cnt DESC',
-            (since,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return {
-            'labels': [r[0] for r in rows],
-            'values': [r[1] for r in rows],
-        }
-
-    return await with_db(db, _query, {'labels': [], 'values': []})
