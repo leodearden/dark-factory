@@ -1134,8 +1134,8 @@ class TestStateMachineLegalityAndConsistency:
 
         Neither dispatch site may read CANCELLED as "keep going": the plan
         site must not fall through toward EXECUTE, and the simple-task site
-        must not mistake it for its REQUEUED fall-through sentinel and head
-        for an architect.  Either move leaves the absorbing CANCELLED state,
+        must not mistake it for its give-up fall-through and head for an
+        architect.  Either move leaves the absorbing CANCELLED state,
         which crashes the run.
         """
         from orchestrator.scheduler import TerminalExitRejection

@@ -507,8 +507,8 @@ def is_transient_rejection(rejection: str | None) -> bool:
 # today: the architect path writes it via ``_mark_blocked('Planning failed:
 # ...')`` and ``_handle_no_plan_failure``.  The EXECUTE phase never calls
 # ``classify_agent_failure`` at all (PRD background §3), and
-# ``_run_simple_task`` uses the classification only as an internal REQUEUED
-# fall-through sentinel — it does not write block_reason.
+# ``_run_simple_task`` uses the classification only to decide its
+# fall-through to the architect path — it does not write block_reason.
 _API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
 
 
