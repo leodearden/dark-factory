@@ -1044,19 +1044,14 @@ class TestReportEnumerationSplitsTheTwoHalves:
 
 
 def _committed_tree(tmp_path: Path, files: dict[str, str]) -> Path:
-    """A throwaway committed repo holding *files*, built by the suite's own recipe.
-
-    ``sweep_repo`` takes the importer count's domain from git, so a fixture tree
-    for it is a repository. It lives under ``tmp_path`` so that no git call can
-    walk up out of it into the checkout this suite runs in.
-    """
+    """A throwaway tree holding *files* under ``tmp_path``, built by the suite's own repo recipe."""
     return build_repo(
         tmp_path / 'repo', RepoSeed(files=tuple(files.items()), message='seed')
     )
 
 
 class TestTestTreeSweep:
-    """The test-tree half of `sweep_repo` in isolation -- no complexipy, so ms."""
+    """`sweep_repo` in isolation -- no complexipy, so ms."""
 
     @staticmethod
     def _tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
