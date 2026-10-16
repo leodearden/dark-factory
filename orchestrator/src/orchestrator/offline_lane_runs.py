@@ -47,7 +47,6 @@ INFRA_SCOPE = 'host-infra'
 # One H9 per-test verdict line, e.g. '  RESULT: FAIL (test_x.sh)' or
 # '  RESULT: PASS (test_y.sh) [flaky: passed on serial retry]'.
 INFRA_RESULT_RE = re.compile(r'^\s*RESULT:\s*(?P<verdict>PASS|FAIL|SKIP)\s*\((?P<name>[^)]+)\)')
-INFRA_RESULT_FAIL_RE = re.compile(r'^\s*RESULT:\s*FAIL\s*\((?P<name>.+?)\)\s*$')
 
 _INFRA_OUTCOMES = {'PASS': 'passed', 'SKIP': 'skipped'}
 

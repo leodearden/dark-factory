@@ -54,17 +54,15 @@ import asyncio
 import fcntl
 import logging
 import os
-import re
 import time
 from collections.abc import Awaitable, Callable, MutableMapping, MutableSet
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Protocol
 
-from shared.verify_admission import nice_prefix
-
-from orchestrator import offline_lane_runs
+from orchestrator import offline_lane_confirm, offline_lane_runs
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
+from orchestrator.offline_lane_confirm import ConfirmTarget
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
     LEGACY_NUMERIC_COMMAND,
@@ -73,7 +71,6 @@ from orchestrator.offline_lane_records import (
     RunRecordStore,
     classify_exit,
 )
-from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -104,63 +101,6 @@ _OFFLINE_LANE_FAILURE_BACKOFF_SECS: float = 60.0
 # per consecutive failure (capped here) bounds that cost while preserving
 # fail-open retry — never a permanent give-up.
 _OFFLINE_LANE_MAX_FAILURE_BACKOFF_SECS: float = 900.0
-
-def _parse_infra_failures(text: str) -> list[str]:
-    """Extract still-failing test-file-names from reify H9's stdout (IE1).
-
-    Matches per-line ``RESULT: FAIL (<name>)`` lines (PASS lines and any
-    other output are ignored) and returns the sorted, de-duplicated set of
-    captured names.  Used by
-    :meth:`OfflineLaneWorker._default_infra_confirmation_run` (kept
-    module-level so it is trivially unit-testable in isolation).
-    """
-    names = {
-        m.group('name')
-        for line in text.splitlines()
-        if (m := offline_lane_runs.INFRA_RESULT_FAIL_RE.match(line))
-    }
-    return sorted(names)
-
-
-# Markers of reify verify.sh's usage()/error output (task 5308): a whole
-# stripped line that is exactly ``Usage:`` or ``Options:`` — verify.sh's
-# usage() section headers, which survive its ``# `` strip verbatim — or any
-# ``verify.sh: ERROR`` banner line.  run-offline-deep.sh merges stderr into
-# stdout, so a malformed/usage-dumping invocation floods the numeric
-# confirmation seam with this text; real confirmed-failing test-ID output
-# never contains these markers.
-_VERIFY_USAGE_MARKER_RE = re.compile(r'^\s*(?:Usage|Options):\s*$|^\s*verify\.sh:\s*ERROR\b')
-
-
-def _parse_confirmed_failures(text: str) -> list[str]:
-    """Parse the numeric confirmation seam's stdout into confirmed test IDs.
-
-    Normal output is newline-separated test IDs, one per line
-    (blank/whitespace-only lines are skipped so trailing/blank output never
-    becomes a spurious "confirmed" entry).  But ``run-offline-deep.sh`` merges
-    stderr into stdout, so a malformed reify ``verify.sh`` invocation dumps its
-    ``usage()``/error text here; without a guard every non-blank usage line
-    would become a bogus "confirmed" test ID and file a corrupt fix task (task
-    5308; reify:5264 incident).  If any line matches
-    :data:`_VERIFY_USAGE_MARKER_RE` the whole output is rejected — a
-    usage/help/error dump is not a set of failing tests — logging a warning and
-    returning ``[]`` (which routes into :meth:`OfflineLaneWorker._handle_red_run`'s
-    existing empty-``confirmed`` guard: log-only, no fix task, no escalation).
-
-    The sibling infra seam (:func:`_parse_infra_failures`) is exempt and left
-    unchanged: it only captures ``RESULT: FAIL (<name>)`` lines, which a
-    usage/help/error dump never contains.  Kept module-level so it is trivially
-    unit-testable in isolation (mirrors :func:`_parse_infra_failures`).
-    """
-    if any(_VERIFY_USAGE_MARKER_RE.search(line) for line in text.splitlines()):
-        logger.warning(
-            'offline-lane: numeric confirmation re-run output looked like '
-            'reify verify.sh usage/help/error text, not a list of failing '
-            'tests; rejecting it and confirming no failures (task 5308)'
-        )
-        return []
-    return [line.strip() for line in text.splitlines() if line.strip()]
-
 
 #: Signature of the injectable heavy-suite seam: (worktree path, head SHA,
 #: test-thread count) -> (return code, output tail).
@@ -258,8 +198,7 @@ class OfflineLaneWorker:
             2789), ``(LaneCommand, wt_path, head) -> confirmed_still_failing_ids``,
             bound per-command by :meth:`_run_once` into :meth:`_handle_red_run`'s
             ``confirmation_runner`` contract for a generic command's red path.
-            Defaults to :meth:`_default_confirm_command` (serial re-run via
-            ``_serial_pytest_str`` + ``_extract_failing_test_ids``) when not
+            Defaults to :meth:`_default_command_confirmation_run` when not
             supplied.
         task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
             file/update the dedup'd fix task for a confirmed red run.
@@ -328,7 +267,7 @@ class OfflineLaneWorker:
         self.command_confirmation_runner: CommandConfirmationRunner = (
             command_confirmation_runner
             if command_confirmation_runner is not None
-            else self._default_confirm_command
+            else self._default_command_confirmation_run
         )
         self.task_client = task_client
         self.escalation_queue = escalation_queue
@@ -995,135 +934,25 @@ class OfflineLaneWorker:
     # ------------------------------------------------------------------
 
     async def _default_confirmation_run(self, wt: Path, head: str) -> list[str]:
-        """Default ``confirmation_runner`` seam — re-runs failures serially, isolated (β3).
-
-        Cross-project scope boundary (same as
-        ``orchestrator/src/orchestrator/offline_lane_runs.py::suite_runner``):
-        the real reify-side confirm-failures invocation — discover which
-        tests just failed, re-run them isolated/serial once, report those
-        still failing — is ζ's job; this default builds the invocation
-        unconditionally.
-
-        ``--test-threads=1`` forces the confirmation re-run serial/isolated
-        (a flake filter must never share state across parallel test
-        workers). ``--confirm-failed`` is the confirm-failures flag
-        distinguishing this from a normal suite run. ``env``/``cwd`` mirror
-        the numeric detect seam exactly (same ``DF_VERIFY_ROLE=offline``
-        overlay onto a full ``os.environ`` copy). ``head`` is accepted for
-        seam-signature symmetry with injected runners.
-
-        Parses stdout via the module-level :func:`_parse_confirmed_failures`
-        helper: normal output is newline-separated test IDs (blank/whitespace-
-        only lines are skipped so trailing/blank output never becomes a
-        spurious "confirmed" entry), but a reify verify.sh usage/help/error
-        dump — which ``run-offline-deep.sh`` merges from stderr into stdout — is
-        rejected to ``[]`` rather than turned into bogus confirmed IDs (task
-        #5308).
-        """
-        argv = [
-            offline_lane_runs.RUN_OFFLINE_DEEP_SCRIPT, '--test-threads=1', '--confirm-failed',
-        ]
-        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        launched = await offline_lane_runs.launch(
-            argv,
-            cwd=wt,
-            env=env,
-            store=self.records,
-            lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_NUMERIC_COMMAND),
-            phase=Phase.CONFIRM,
-            output_format=offline_lane_runs.OutputFormat.OPAQUE,
-        )
-        return _parse_confirmed_failures(launched.text)
+        """Default ``confirmation_runner``: the numeric leg's confirm, projected to the legacy id list."""
+        return await self._confirmed_ids(ConfirmTarget.numeric(wt), LEGACY_NUMERIC_COMMAND)
 
     async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
-        """Default ``infra_confirmation_runner`` seam — re-runs H9 host-infra (IE1).
+        """Default ``infra_confirmation_runner``: the infra leg's confirm, projected to the legacy id list."""
+        return await self._confirmed_ids(ConfirmTarget.infra(wt), LEGACY_INFRA_COMMAND)
 
-        Cross-project scope boundary (same as
-        ``orchestrator/src/orchestrator/offline_lane_runs.py::infra_runner``).
-        Re-invokes reify's H9 with the SAME argv/env/cwd as that detect
-        seam — the whole host-exclusive set is small
-        and self-serializes under its own flock (IE-D2), so re-running the
-        full scope is an acceptable flake filter (mirrors
-        :meth:`_default_confirmation_run`'s serial re-run, without needing
-        a separate "confirm only these" flag since the set is already
-        tiny).
-
-        Parses stdout via the module-level :func:`_parse_infra_failures`
-        helper, which extracts H9's ``RESULT: FAIL (<name>)`` lines — a
-        different wire format from the numeric seam's newline-separated
-        test IDs (:meth:`_default_confirmation_run`), since reify H9 emits
-        one line per test with an explicit PASS/FAIL verdict rather than
-        listing only failures.
-        """
-        argv = [offline_lane_runs.RUN_ALL_INFRA_SCRIPT, '--scope', offline_lane_runs.INFRA_SCOPE]
-        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        launched = await offline_lane_runs.launch(
-            argv,
-            cwd=wt,
-            env=env,
-            store=self.records,
-            lane_pass=offline_lane_runs.require_current_pass(self.records, LEGACY_INFRA_COMMAND),
-            phase=Phase.CONFIRM,
-            output_format=offline_lane_runs.OutputFormat.INFRA,
-        )
-        return _parse_infra_failures(launched.text)
-
-    async def _default_confirm_command(
+    async def _default_command_confirmation_run(
         self, cmd: LaneCommand, wt_path: Path, head: str,
     ) -> list[str]:
-        """Default ``command_confirmation_runner`` seam — serial confirm re-run (task 2789).
+        """Default ``command_confirmation_runner``: *cmd*'s confirm, projected to the legacy id list."""
+        return await self._confirmed_ids(ConfirmTarget.generic(cmd, wt_path), cmd.name)
 
-        Reuses the reify-side confirm primitives named by the PRD (sec 5):
-        :func:`~orchestrator.verify._serial_pytest_str` rewrites ``cmd.command``
-        to run serial (``-p no:xdist``; the run cwd's governing addopts kept minus xdist), falling
-        back to the raw command when it is not a pytest invocation; the command is
-        launched exactly like
-        ``orchestrator/src/orchestrator/offline_lane_runs.py::command_runner`` (idle nice/ionice
-        ``sh -c`` in ``<wt_path>/<cmd.cwd>``, ``DF_VERIFY_ROLE=offline``); and
-        :func:`~orchestrator.verify._extract_failing_test_ids` extracts the
-        still-failing pytest node-ids from the FULL captured stdout (not the
-        2000-char tail — so no failure line is truncated before extraction).
-
-        This default path is PYTEST-ORIENTED: node-id extraction only
-        recognizes pytest ``FAILED``/``ERROR`` lines. When no node-ids parse,
-        the exit code disambiguates (loud-over-silent / no-silent-fail-soft
-        norm): rc == 0 means the command reproduced GREEN — a real flake (B6),
-        so an empty list is returned and :meth:`_handle_red_run` files no task;
-        rc != 0 means the command reproduced RED but emitted no parseable
-        node-id (a non-pytest command like ``make check``/``cargo test``, or a
-        pytest crash), so a stable ``<cmd.name>::nonzero-exit`` sentinel is
-        returned instead of ``[]`` — the red is filed/escalated rather than
-        silently swallowed as a flake. A project wanting richer per-failure
-        dedup for a non-pytest command injects its own
-        ``command_confirmation_runner``.
-        """
-        run_cwd = wt_path / cmd.cwd
-        serial_command = _serial_pytest_str(cmd.command, invocation_dir=run_cwd) or cmd.command
-        argv = [*nice_prefix('background'), 'sh', '-c', serial_command]
-        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
-        launched = await offline_lane_runs.launch(
-            argv,
-            cwd=run_cwd,
-            env=env,
-            store=self.records,
-            lane_pass=offline_lane_runs.require_current_pass(self.records, cmd.name),
-            phase=Phase.CONFIRM,
-            output_format=offline_lane_runs.OutputFormat.PYTEST,
+    async def _confirmed_ids(self, target: ConfirmTarget, command_name: str) -> list[str]:
+        detect = self.records.last_record(command_name, Phase.DETECT)
+        runner = offline_lane_runs.confirm_runner(
+            self.records, offline_lane_runs.require_current_pass(self.records, command_name),
         )
-        ids = _extract_failing_test_ids(launched.text)
-        if ids:
-            return ids
-        # No pytest node-ids parsed from the serial re-run. Disambiguate a
-        # genuine flake from a genuinely-red-but-unparseable command by the
-        # exit code (loud-over-silent / no-silent-fail-soft norm):
-        #   rc == 0 -> reproduced GREEN -> a real flake -> [] (no task filed).
-        #   rc != 0 -> reproduced RED but emitted no FAILED/ERROR node-id (a
-        #     non-pytest command like `make check`/`cargo test`, or a pytest
-        #     crash) -> DO NOT swallow it as a flake. Return a stable,
-        #     cmd.name-keyed sentinel so _handle_red_run still fingerprints,
-        #     files a dedup'd fix task, and stages to L2. Keyed on cmd.name
-        #     alone (not rc or an output hash) so repeated reds of the same
-        #     command dedup to one open fix task and stall->L2 cleanly.
-        if launched.record.returncode != 0:
-            return [f'{cmd.name}::nonzero-exit']
-        return []
+        outcome = await offline_lane_confirm.confirm(target, detect, runner)
+        return offline_lane_confirm.legacy_confirmed_ids(
+            outcome, command_name=command_name, leg=target.leg,
+        )
