@@ -4909,6 +4909,7 @@ def _seed_state(*, day: int, exit_code: int) -> None:
         recorded_at=datetime(2026, 7, day + 1, 3, 0, tzinfo=UTC), exit_code=exit_code,
         total_records=0, zero_signal_dropped=0, dedupe_collapsed=0,
         below_sampling_cut=0, budget_skipped=0, selected_count=0,
+        census=None,
     )
 
 
