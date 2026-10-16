@@ -442,6 +442,142 @@ class TestCancelRequestReportsWhatItKilled:
 
 
 # ---------------------------------------------------------------------------
+# Task 5301: kill_process_tree — the snapshot -> walk -> SIGKILL -> killpg
+# algorithm shared by cancel_request and the boundary suite's kill_holder_tree
+# (orchestrator/tests/test_laptop_warm_verify_boundary.py::kill_holder_tree).
+# Every seam appends to ONE ordered event log, so ordering is asserted, not
+# merely membership.
+# ---------------------------------------------------------------------------
+
+
+class TestKillProcessTree:
+    """kill_process_tree contract with injected ppid_map_provider, kill, killpg spies."""
+
+    TREE = {200: 100, 201: 100, 300: 200, 999: 1}
+
+    def _run(self, root, ppid_map, *, backstop_pgid, kill_raises=None, killpg_raises=None):
+        """Run kill_process_tree with every seam logging to one ordered event list.
+
+        Events are ``('snapshot',)``, ``('kill', pid, sig)`` and
+        ``('killpg', pgid, sig)``.  *kill_raises* maps pid -> exception.
+        """
+        from orchestrator.verify_cancel import kill_process_tree
+
+        events: list[tuple] = []
+        kill_raises = kill_raises or {}
+
+        def provider():
+            events.append(('snapshot',))
+            return ppid_map
+
+        def kill(pid, sig):
+            events.append(('kill', pid, sig))
+            if pid in kill_raises:
+                raise kill_raises[pid]
+
+        def killpg(pgid, sig):
+            events.append(('killpg', pgid, sig))
+            if killpg_raises is not None:
+                raise killpg_raises
+
+        refused = kill_process_tree(
+            root,
+            backstop_pgid=backstop_pgid,
+            ppid_map_provider=provider,
+            kill=kill,
+            killpg=killpg,
+        )
+        return refused, events
+
+    @staticmethod
+    def _killed(events):
+        return [event[1] for event in events if event[0] == 'kill']
+
+    def test_snapshot_precedes_every_signal(self):
+        """(a) The /proc snapshot is the first event, taken exactly once."""
+        _, events = self._run(100, self.TREE, backstop_pgid=100)
+
+        assert events[0] == ('snapshot',), (
+            f'a signal preceded the ppid snapshot: {events} -- killing the '
+            f'root first reparents survivors and severs the /proc chain'
+        )
+        assert events.count(('snapshot',)) == 1
+
+    def test_sigkills_root_and_transitive_descendants_then_backstops_once(self):
+        """(b) Exactly the tree is SIGKILLed; the killpg backstop fires once, last."""
+        import signal
+
+        refused, events = self._run(100, self.TREE, backstop_pgid=100)
+
+        assert refused == frozenset()
+        killed = self._killed(events)
+        assert sorted(killed) == [100, 200, 201, 300], (
+            'every transitive descendant plus the root, each once, and never '
+            'the unrelated pid 999'
+        )
+        assert all(event[2] == signal.SIGKILL for event in events if event[0] == 'kill')
+        killpg_positions = [i for i, event in enumerate(events) if event[0] == 'killpg']
+        assert [events[i] for i in killpg_positions] == [('killpg', 100, signal.SIGKILL)]
+        last_kill = max(i for i, event in enumerate(events) if event[0] == 'kill')
+        assert killpg_positions[0] > last_kill, (
+            f'the killpg backstop must follow the per-pid sweep: {events}'
+        )
+
+    def test_no_backstop_pgid_skips_killpg_but_still_sweeps(self):
+        """(c) ``backstop_pgid=None`` never calls killpg; the per-pid sweep still runs."""
+        refused, events = self._run(100, self.TREE, backstop_pgid=None)
+
+        assert refused == frozenset()
+        assert [event for event in events if event[0] == 'killpg'] == []
+        assert sorted(self._killed(events)) == [100, 200, 201, 300]
+
+    def test_permission_refusals_are_returned_and_do_not_stop_the_sweep(self):
+        """(d) ProcessLookupError is success; PermissionError pids come back as a frozenset."""
+        refused, events = self._run(
+            100,
+            self.TREE,
+            backstop_pgid=100,
+            kill_raises={200: ProcessLookupError(), 201: PermissionError()},
+        )
+
+        assert isinstance(refused, frozenset)
+        assert refused == frozenset({201}), (
+            'only the live-but-unkillable pid is a refusal; an already-dead '
+            'pid counts as success'
+        )
+        assert sorted(self._killed(events)) == [100, 200, 201, 300], (
+            'a refusal must not abort the sweep -- every remaining target is '
+            'still signalled'
+        )
+
+    @pytest.mark.parametrize(
+        'killpg_exc', [OSError('group gone'), ProcessLookupError()], ids=['OSError', 'ProcessLookupError'],
+    )
+    def test_killpg_errors_are_suppressed_without_touching_the_result(self, killpg_exc):
+        """(e) A raising killpg backstop is suppressed; the refused set is unaffected."""
+        refused, events = self._run(
+            100,
+            self.TREE,
+            backstop_pgid=100,
+            kill_raises={201: PermissionError()},
+            killpg_raises=killpg_exc,
+        )
+
+        assert refused == frozenset({201})
+        assert [event[0] for event in events].count('killpg') == 1
+
+    def test_backstop_pgid_is_a_required_keyword(self):
+        """(f) Every caller must state its group-safety policy -- None included."""
+        from orchestrator.verify_cancel import kill_process_tree
+
+        def declawed(*_args):
+            raise AssertionError('a call missing backstop_pgid must not signal anything')
+
+        with pytest.raises(TypeError):
+            kill_process_tree(100, ppid_map_provider=dict, kill=declawed, killpg=declawed)  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
 # Step-7: start_own_process_group — setsid + fallback
 # ---------------------------------------------------------------------------
 
@@ -1795,6 +1931,49 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     )
 
 
+_UNDECODABLE_COMM_CHILD_SCRIPT = (
+    'import ctypes, sys\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'sys.stdin.read()\n'
+)
+
+
+class TestReadPpidMap:
+    """read_ppid_map() walks every process on the host, whatever its name."""
+
+    @pytest.mark.timeout(15)
+    def test_a_child_with_an_undecodable_comm_is_still_mapped_to_its_parent(self):
+        """comm is arbitrary bytes; one foreign name must neither fail nor thin the walk."""
+        import subprocess
+        import sys
+
+        from orchestrator.verify_cancel import read_ppid_map
+
+        child = subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_CHILD_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert child.stdout is not None
+            assert child.stdout.readline().strip() == b'ready'
+            assert b'(\xff\xfe)' in Path(f'/proc/{child.pid}/stat').read_bytes(), (
+                'harness failure: the child did not rename itself to undecodable bytes'
+            )
+
+            assert read_ppid_map()[child.pid] == os.getpid()
+        finally:
+            assert child.stdin is not None
+            child.stdin.close()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+
 # ---------------------------------------------------------------------------
 # Task 4195 step-1: run_stdin_heartbeat — the PRODUCER half of the same
 # connection-death wire protocol whose CONSUMER (run_stdin_watchdog) is tested
@@ -2115,8 +2294,9 @@ class TestRunStdinWatchdog:
 class TestFireWatchdogKill:
     """fire_watchdog_kill(pgid, ...) — SIGTERM descendants, grace, SIGKILL survivors, exit."""
 
-    def test_signals_only_descendants_grace_then_sigkill_then_exit(self):
+    def test_signals_only_descendants_grace_then_sigkill_then_exit(self, monkeypatch):
         """(a)-(d): descendants only, grace between passes, SIGKILL survivors, exit is final."""
+        import os
         import signal
 
         from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
@@ -2140,6 +2320,8 @@ class TestFireWatchdogKill:
         def fake_killpg(pgid, sig):
             killpg_calls.append((pgid, sig))
 
+        monkeypatch.setattr(os, 'killpg', fake_killpg)
+
         def fake_sleep(secs):
             events.append(('sleep', secs))
 
@@ -2152,7 +2334,6 @@ class TestFireWatchdogKill:
             grace_secs=5.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
-            killpg=fake_killpg,
             sleep=fake_sleep,
             exit_fn=fake_exit,
         )
@@ -2176,7 +2357,7 @@ class TestFireWatchdogKill:
 
         # Design decision: the watchdog signals only descendants and never
         # killpg's its own group (it runs inside the target group, unlike
-        # cancel_request) -- killpg is accepted for signature symmetry only.
+        # cancel_request), so it has no killpg seam at all.
         assert killpg_calls == []
 
     def test_dead_descendant_process_lookup_error_tolerated(self):
@@ -2188,9 +2369,6 @@ class TestFireWatchdogKill:
 
         def fake_kill(pid, sig):
             raise ProcessLookupError()
-
-        def fake_killpg(pgid, sig):
-            raise AssertionError('fire_watchdog_kill must not killpg its own group')
 
         def fake_sleep(secs):
             pass
@@ -2205,7 +2383,6 @@ class TestFireWatchdogKill:
             grace_secs=0.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
-            killpg=fake_killpg,
             sleep=fake_sleep,
             exit_fn=fake_exit,
         )
@@ -2264,7 +2441,6 @@ def _fire_with_recording_stderr(trigger, events, *, stderr=None):
         grace_secs=5.0,
         ppid_map_provider=lambda: {200: 100, 300: 200, 999: 1},  # 999 is unrelated
         kill=fake_kill,
-        killpg=lambda pgid, sig: events.append(('killpg', pgid)),
         sleep=lambda secs: events.append(('sleep', secs)),
         exit_fn=lambda code: events.append(('exit', code)),
         stderr=stderr if stderr is not None else _RecordingStderr(events),
@@ -2329,7 +2505,6 @@ class TestFireWatchdogKillTriggerLine:
         assert all(events.index(('term', pid)) < sleep_idx for pid in (200, 300))
         assert all(events.index(('kill', pid)) > sleep_idx for pid in (200, 300))
 
-        assert [e for e in events if e[0] == 'killpg'] == []
         assert len([e for e in events if e[0] == 'exit']) == 1
 
     @pytest.mark.parametrize(
@@ -2354,6 +2529,59 @@ class TestFireWatchdogKillTriggerLine:
 
         assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
         assert events[-1] == ('exit', 1)
+
+    @pytest.mark.parametrize(
+        'good_snapshots,expected_term',
+        [([], set()), ([{200: 100, 300: 200, 999: 1}], {200, 300})],
+        ids=['first', 'second'],
+    )
+    def test_a_failed_snapshot_is_reported_and_still_self_exits(
+        self, good_snapshots, expected_term, monkeypatch
+    ):
+        """A raising /proc snapshot is diagnosed on stderr and never skips the self-exit."""
+        import os
+        import signal
+
+        from orchestrator.verify_cancel import (
+            WATCHDOG_FIRE_TRIGGER_TOKEN,
+            WatchdogTrigger,
+            fire_watchdog_kill,
+        )
+
+        snapshots = iter(good_snapshots)
+
+        def ppid_map_provider():
+            snapshot = next(snapshots, None)
+            if snapshot is None:
+                raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
+            return snapshot
+
+        events = []
+        # No killpg fallback for a failed walk: the group is the watchdog's own.
+        monkeypatch.setattr(os, 'killpg', lambda pgid, sig: events.append(('killpg', pgid)))
+        fire_watchdog_kill(
+            100,
+            trigger=WatchdogTrigger.HEARTBEAT_STARVATION,
+            grace_secs=5.0,
+            ppid_map_provider=ppid_map_provider,
+            kill=lambda pid, sig: events.append(
+                ('term' if sig == signal.SIGTERM else 'kill', pid)
+            ),
+            sleep=lambda secs: events.append(('sleep', secs)),
+            exit_fn=lambda code: events.append(('exit', code)),
+            stderr=_RecordingStderr(events),
+        )
+
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1), 'exit_fn must stay the final action'
+
+        written = _written(events)
+        assert written.endswith(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=heartbeat_starvation\n')
+        assert 'UnicodeDecodeError' in written
+
+        assert {e[1] for e in events if e[0] == 'term'} == expected_term
+        assert [e for e in events if e[0] == 'kill'] == []
+        assert [e for e in events if e[0] == 'killpg'] == []
 
     def test_default_stream_is_sys_stderr_resolved_at_call_time(self, monkeypatch):
         """With no stderr= override the token lands on stderr — never on stdout.
@@ -2383,7 +2611,6 @@ class TestFireWatchdogKillTriggerLine:
             grace_secs=0.0,
             ppid_map_provider=dict,
             kill=lambda pid, sig: None,
-            killpg=lambda pgid, sig: None,
             sleep=lambda secs: None,
             exit_fn=lambda code: None,
         )

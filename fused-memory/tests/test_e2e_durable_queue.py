@@ -751,7 +751,7 @@ async def _sole_queue_write_op_id(svc) -> str:
     """Recover the enqueued `_write_op_id` — the caller never sees it."""
     import json
 
-    db = svc.durable_queue._db
+    db = svc.durable_queue._require_access().connection
     async with db.execute('SELECT payload FROM write_queue ORDER BY id') as cursor:
         rows = await cursor.fetchall()
     ids = [

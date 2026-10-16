@@ -726,6 +726,7 @@ from pathlib import Path  # noqa: E402
 
 from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES, ALLOWLIST_KEYS  # noqa: E402
 from silent_fallthrough_scan import (  # noqa: E402
+    SCOPE_ROOTS,
     reconcile_against_allowlist,
     violation_key,
 )
@@ -816,17 +817,27 @@ class TestGateSelfIntegrity:
             f"({_REPO_ROOT})"
         )
 
-    def test_known_first_party_files_are_included(self, tree_scan_data):
-        """Known first-party files must be present in the scan set."""
-        files = {str(f) for f in tree_scan_data.files}
-        expected = [
-            "orchestrator/src/orchestrator/scheduler.py",
-            "orchestrator/src/orchestrator/harness.py",
-            "fused-memory/src/fused_memory/services/memory_service.py",
+    def test_every_scope_root_contributes_a_scanned_module(self, first_party_tree):
+        """Each DECLARED scope root yields a real module, not just a stray ``__init__.py``.
+
+        Keyed on ``SCOPE_ROOTS`` rather than on named files, so renaming a
+        module in a sibling package cannot red this self-check. Its complement,
+        ``test_auth_failed.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root``,
+        checks the DISCOVERED ``<pkg>/src`` roots with the same relpath idiom.
+        """
+        silent = [
+            root
+            for root in SCOPE_ROOTS
+            if not any(
+                record.relpath.startswith(f"{root}/")
+                and not record.relpath.endswith("/__init__.py")
+                for record in first_party_tree
+            )
         ]
-        for rel in expected:
-            candidate = str(_REPO_ROOT / rel)
-            assert candidate in files, f"Expected file missing from scan: {rel}"
+        assert not silent, (
+            f"Scope roots contributing no scanned module: {silent} — the gate "
+            f"is scanning less than SCOPE_ROOTS declares ({_REPO_ROOT})"
+        )
 
     def test_excluded_paths_are_absent(self, tree_scan_data):
         """Submodule dirs (mem0/, graphiti/) and tests/ are excluded."""

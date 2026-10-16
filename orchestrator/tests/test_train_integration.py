@@ -36,11 +36,12 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _serial_merge_worker import MergeWorker
+from _merge_lane_fakes import make_lane, merge_through_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
     GroupMergeRequest,
     MergeOutcome,
@@ -333,10 +334,10 @@ class TestTrainIntegrationB1B7:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy)
+        lane = MergeLane(git_ops, queue, event_store=spy)
 
         with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
-            outcome = await worker._do_merge(req)
+            outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is done.
         assert outcome is not None
@@ -472,12 +473,12 @@ class TestTrainIntegrationB2:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy)
+        lane = MergeLane(git_ops, queue, event_store=spy)
 
         # The @pytest.mark.exercise_merge_verify marker (above) makes the autouse
-        # fixture skip the passed=True stub; the real run_scoped_verification runs
-        # here automatically — no in-body patch needed or added.
-        outcome = await worker._do_merge(req)
+        # fixture skip the passed=True stub; the lane's production verifier then
+        # runs the real run_scoped_verification — no in-body patch needed or added.
+        outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is NOT done — compile break blocked the train.
         assert outcome is not None
@@ -669,7 +670,7 @@ class TestTrainIntegrationB8:
     """B8 anti-starvation: a single merge-ready task merges solo without a train.
 
     A plain MergeRequest (not GroupMergeRequest) is driven through
-    MergeWorker._do_merge.  It must land directly with outcome.status=='done',
+    the production merge lane.  It must land directly with outcome.status=='done',
     its edit present on main, and NO train_started / train_merged events emitted.
 
     This establishes the solo-merge baseline (1 verify → 1 landed task =
@@ -712,9 +713,9 @@ class TestTrainIntegrationB8:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy)
+        lane = make_lane(git_ops, queue, event_store=spy)
 
-        outcome = await worker._do_merge(req)
+        outcome = await merge_through_lane(lane, queue, req)
 
         # (1) Outcome is done.
         assert outcome is not None

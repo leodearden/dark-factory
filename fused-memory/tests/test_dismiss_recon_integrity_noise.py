@@ -101,30 +101,35 @@ class TestRunTargetStorePreflight:
         assert not target.exists()
         assert not (tmp_path / 'data').exists()
 
-    def test_main_does_not_return_zero_for_a_missing_queue_dir(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize('create_empty_dir', [False, True], ids=['missing', 'empty'])
+    def test_main_does_not_return_zero_for_a_missing_or_empty_queue_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, create_empty_dir: bool,
     ):
         """The regression pin: the refusal must RAISE, not report.
 
-        Routed through the normal report path, a missing dir reads as an empty
-        queue — nothing to dismiss, so nothing ``vanished`` — which
+        Routed through the normal report path, a missing or empty dir reads as
+        an empty queue — nothing to dismiss, so nothing ``vanished`` — which
         ``resolve_exit_code`` grades as a clean 0: the very
         ``no-silent-fail-soft`` defect the guard exists to fix.
         """
-        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        target = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        if create_empty_dir:
+            target.mkdir(parents=True)
         monkeypatch.setattr(
             'sys.argv',
-            ['dismiss_recon_integrity_noise.py', '--queue-dir', str(missing)],
+            ['dismiss_recon_integrity_noise.py', '--queue-dir', str(target)],
         )
 
         with pytest.raises(TargetStoreMissing):
             main()
 
-    def test_existing_queue_dir_passes_the_guard(self, tmp_path: Path):
-        """The guard does not require absoluteness, or a non-empty queue."""
-        report = run(tmp_path, apply=False)
+    def test_an_empty_existing_queue_dir_is_refused(self, tmp_path: Path):
+        """An empty queue dir is refused before the scan (task 5468).
 
-        assert report['pending_before'] == 0
+        The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
+        """
+        with pytest.raises(TargetStoreMissing):
+            run(tmp_path, apply=False)
 
 
 class TestRunBaseline:

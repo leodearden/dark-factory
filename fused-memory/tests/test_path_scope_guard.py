@@ -1023,7 +1023,7 @@ class TestLocalDeliverableAttested:
         'fused-memory' (no trailing slash, no file after it) is exactly the
         shape find_paths deliberately does NOT lex as a path (task 3120's
         two-sided anchoring).  Attribution uses the certain project_for_path
-        lookup instead, so metadata.modules-style directory entries count.
+        lookup instead, so a declared directory entry counts.
         """
         from fused_memory.middleware.path_scope_guard import local_deliverable_attested
 
@@ -1037,9 +1037,10 @@ class TestLocalDeliverableAttested:
         """A FOREIGN entry anywhere in the union vetoes attestation.
 
         The caller's upstream check_files_for_scope classifies a NARROWER
-        list — only ``files``, or (when absent) ``files_to_modify``, never
-        ``modules`` — so a foreign entry in the union's non-overlapping
-        remainder was never seen by the hard reject. Declining to attest
+        list — only ``files``, or (when absent) ``files_to_modify``, never a
+        ``files_to_modify`` entry shadowed by ``files`` — so a foreign entry
+        in the union's non-overlapping remainder was never seen by the hard
+        reject. Declining to attest
         keeps such a mixed declaration on the unchanged advisory path
         instead of letting one local entry buy silence for it.
         """

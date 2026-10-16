@@ -76,9 +76,21 @@ from typing import Any
 
 from fused_memory.models.reconciliation import RunStatus, StageReport
 
-# Imported, not re-declared: ``recon_report._UUID_RE`` and
-# ``citation_verifier._CANONICAL_UUID_RE`` already exist, and a third copy of the
-# same gate is exactly the lockstep duplication INV-5 forbids.
+# Imported, not re-declared. The one shape GATE for a memory id is
+# ``utils.validation.is_full_uuid`` (task 3132, INV-5), which
+# ``citation_verifier.is_concrete_memory_id`` routes to and which this module
+# therefore reaches through a single import rather than a local copy; a second
+# declaration of the same gate is exactly the lockstep duplication INV-5 forbids.
+#
+# ``citation_verifier._PROSE_UUID_RE`` (task 4818) is NOT such a copy, and the
+# distinction is worth keeping straight. A GATE decides whether a CANDIDATE is a
+# well-formed id and stays single-sourced at ``is_full_uuid``. A FINDER locates
+# candidate substrings inside free text, takes a haystack rather than a
+# candidate, and has no equivalent anywhere else in the repo — ``is_full_uuid``
+# structurally cannot do that job, being anchored on the whole value and
+# rejecting even surrounding whitespace by design. The finder routes every
+# candidate it extracts back through the gate, so the shape authority stays
+# single-sourced.
 from fused_memory.reconciliation.citation_verifier import is_concrete_memory_id
 from fused_memory.reconciliation.journal import (
     CITATION_REPAIRS_KEY,
@@ -505,9 +517,11 @@ def _verification_error(memory_id: str, role: str, exc: BaseException) -> dict[s
 def _is_citation_of(entry: Any, memory_id: str) -> bool:
     """True when ``entry`` is a mem0 citation of ``memory_id``.
 
-    Case-insensitive on the id for the same reason ``recon_report._UUID_RE``
-    carries ``re.IGNORECASE``: neither Graphiti/Neo4j nor mem0 normalises UUID
-    case on read-back, so a case-differing stored id is the same citation.
+    Case-insensitive on the id for the same reason
+    ``utils.validation.is_full_uuid`` tolerates case: casing is a rendering
+    choice, not a different identifier, and neither Graphiti/Neo4j nor mem0
+    normalises UUID case on read-back, so a case-differing stored id is the same
+    citation.
     """
     return (
         isinstance(entry, dict)

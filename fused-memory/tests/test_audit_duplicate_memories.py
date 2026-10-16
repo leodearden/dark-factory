@@ -23,6 +23,8 @@ from _store_mutation_preflight_contract import (
 )
 from shared.testing_streams import StdoutWithAFailingFlush
 
+from fused_memory.config.schema import WriteTriageProjectCalibration
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
@@ -3927,13 +3929,24 @@ class TestRepeatedCategoryDoesNotDoubleIngest:
 # --- _run wiring doubles -----------------------------------------------------
 
 def _fake_config(t_high: float | None = 0.9,
-                 t_high_by_category: dict[str, float] | None = None):
-    return types.SimpleNamespace(
+                 t_high_by_category: dict[str, float] | None = None,
+                 project_calibrations: dict[str, dict[str, float]] | None = None):
+    """*project_calibrations* maps project -> cutoffs; None omits the section."""
+    config = types.SimpleNamespace(
         write_triage=types.SimpleNamespace(
             t_high=t_high, t_high_by_category=t_high_by_category,
         ),
         mem0=types.SimpleNamespace(collection_prefix='mem0'),
     )
+    if project_calibrations is not None:
+        config.write_triage_project_calibrations = {
+            project: WriteTriageProjectCalibration(
+                calibration_report_path=f'calibration/{project}.json',
+                t_high_by_category=cutoffs,
+            )
+            for project, cutoffs in project_calibrations.items()
+        }
+    return config
 
 
 class _FakeQdrant:
@@ -3992,7 +4005,8 @@ class _FakeMemoryService:
 
 def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None = 0.9,
                          t_high_by_category: dict[str, float] | None = None,
-                         ann_hits: dict[tuple, list[tuple]] | None = None):
+                         ann_hits: dict[tuple, list[tuple]] | None = None,
+                         project_calibrations: dict[str, dict[str, float]] | None = None):
     import fused_memory.config.schema as schema_mod  # noqa: PLC0415
     import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
 
@@ -4001,7 +4015,7 @@ def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None =
     _FakeMemoryService.ann_hits = ann_hits or {}
     monkeypatch.setattr(
         schema_mod, 'FusedMemoryConfig',
-        lambda: _fake_config(t_high, t_high_by_category),
+        lambda: _fake_config(t_high, t_high_by_category, project_calibrations),
     )
     monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
     return _FakeMemoryService
@@ -4192,13 +4206,15 @@ class TestRunApplyAnnOnlyClusters:
     _NEW = '2026-01-03T00:00:00+00:00'
 
     async def _invoke(self, monkeypatch, raw, ann_hits, tmp_path, *argv,
-                      t_high_by_category=None):
+                      t_high_by_category=None, project_id='p',
+                      project_calibrations=None):
         _install_run_doubles(
             monkeypatch, raw, ann_hits=ann_hits,
             t_high_by_category=t_high_by_category,
+            project_calibrations=project_calibrations,
         )
         args = _build_parser().parse_args([
-            '--project-id', 'p', '--metrics-root', str(tmp_path), '--apply',
+            '--project-id', project_id, '--metrics-root', str(tmp_path), '--apply',
             '--threshold', '0.99', *argv,
         ])
         return await _run(args), _FakeMemoryService.instances[-1]
@@ -4239,6 +4255,34 @@ class TestRunApplyAnnOnlyClusters:
         assert plan['apply_withheld_groups'][0]['reason'] == (
             'ann_cutoff_not_evidenced_for_category'
         )
+
+    async def test_the_runs_own_project_cutoff_evidences_the_category(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Task 5547: the dark_factory corpus measured this category's cutoff."""
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            project_id='dark_factory', project_calibrations={'dark_factory': {_OS: 0.9}},
+        )
+        capsys.readouterr()
+
+        assert rc == 0
+        assert service.deleted == ['m2']
+
+    async def test_another_projects_cutoff_does_not_evidence_this_run(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            project_id='dark_factory', project_calibrations={'other_project': {_OS: 0.9}},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert service.deleted == []
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+        assert rc == 1
 
     async def test_the_same_clique_in_a_calibrated_category_still_deletes(
         self, monkeypatch, tmp_path, capsys,

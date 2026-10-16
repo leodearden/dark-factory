@@ -68,8 +68,15 @@ from inotify_simple import INotify, flags
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+from escalation.queue import read_escalation_for_scan
 
 logger = logging.getLogger(__name__)
+
+#: UnicodeDecodeError: a long-lived watcher must survive one undecodable record
+#: (see ``escalation/queue.py::read_escalation_for_scan``).
+_WATCHER_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError,
+)
 
 
 def _matches(
@@ -97,7 +104,8 @@ def _initial_scan(
     """Scan the queue directory for already-pending matching escalations.
 
     Returns the OLDEST by timestamp, or None if no match found.
-    Malformed / unreadable JSON files are skipped (never silently dropped).
+    Malformed / unreadable files are skipped with a log line from
+    ``read_escalation_for_scan`` (WARNING; DEBUG for a record archived mid-scan).
     Mirrors the get_pending + find_pending_l2_by_root_cause idiom in queue.py.
     """
     best: Escalation | None = None
@@ -107,9 +115,10 @@ def _initial_scan(
         if path.stem in exclude_ids:
             continue
 
-        try:
-            esc = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, OSError, TypeError):
+        esc, _reason = read_escalation_for_scan(
+            path, context='watcher._initial_scan', parse_errors=_WATCHER_PARSE_ERRORS,
+        )
+        if esc is None:
             continue
 
         if not _matches(esc, task_id, level, exclude_ids):
@@ -311,9 +320,10 @@ def main() -> None:
                 continue
 
             path = queue_dir / name
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, OSError, TypeError):
+            esc, _reason = read_escalation_for_scan(
+                path, context='watcher.main', parse_errors=_WATCHER_PARSE_ERRORS,
+            )
+            if esc is None:
                 continue
 
             if not _matches(esc, args.task_id, args.level, excludes):

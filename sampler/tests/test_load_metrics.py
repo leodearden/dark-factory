@@ -14,9 +14,16 @@ from typing import NamedTuple
 
 import pytest
 
+from sampler.metrics import SampleKey
+
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
+
+
+def host_keys(*metrics: str) -> set[SampleKey]:
+    """The keys of host-level metrics, which carry no leaf."""
+    return {SampleKey(metric) for metric in metrics}
 
 # Realistic /proc/pressure/* text with both some and full lines
 PSI_CPU_TEXT = (
@@ -250,11 +257,11 @@ class TestCollectPsi:
 
         mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
         result = collect_psi(read=self._fake_read(mapping))
-        expected_keys = {
+        expected_keys = host_keys(
             'psi_cpu_some_avg10', 'psi_cpu_full_avg10',
             'psi_mem_some_avg10', 'psi_mem_full_avg10',
             'psi_io_some_avg10', 'psi_io_full_avg10',
-        }
+        )
         assert set(result.keys()) == expected_keys
 
     def test_values_match_parsed_text(self):
@@ -263,12 +270,12 @@ class TestCollectPsi:
         mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
         result = collect_psi(read=self._fake_read(mapping))
 
-        assert result['psi_cpu_some_avg10'] == pytest.approx(2.50)
-        assert result['psi_cpu_full_avg10'] == pytest.approx(0.30)
-        assert result['psi_mem_some_avg10'] == pytest.approx(1.23)
-        assert result['psi_mem_full_avg10'] == 0.0          # missing full -> 0.0
-        assert result['psi_io_some_avg10'] == pytest.approx(0.75)
-        assert result['psi_io_full_avg10'] == pytest.approx(0.45)
+        assert result[SampleKey('psi_cpu_some_avg10')] == pytest.approx(2.50)
+        assert result[SampleKey('psi_cpu_full_avg10')] == pytest.approx(0.30)
+        assert result[SampleKey('psi_mem_some_avg10')] == pytest.approx(1.23)
+        assert result[SampleKey('psi_mem_full_avg10')] == 0.0          # missing full -> 0.0
+        assert result[SampleKey('psi_io_some_avg10')] == pytest.approx(0.75)
+        assert result[SampleKey('psi_io_full_avg10')] == pytest.approx(0.45)
 
     def test_all_values_are_floats(self):
         from sampler.metrics import collect_psi
@@ -299,13 +306,13 @@ class TestCollectPsi:
             result = collect_psi(read=self._fake_read(mapping))
 
         # cpu keys must be absent — no fabricated 0.0
-        assert 'psi_cpu_some_avg10' not in result
-        assert 'psi_cpu_full_avg10' not in result
+        assert SampleKey('psi_cpu_some_avg10') not in result
+        assert SampleKey('psi_cpu_full_avg10') not in result
         # memory and io keys must be present
-        assert set(result) == {
+        assert set(result) == host_keys(
             'psi_mem_some_avg10', 'psi_mem_full_avg10',
             'psi_io_some_avg10', 'psi_io_full_avg10',
-        }
+        )
         # At least one WARNING record must mention the skipped source name
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any('cpu' in msg for msg in warning_messages), (
@@ -563,14 +570,14 @@ class TestParserRehomedToShared:
             return mapping[name]
 
         result = collect_psi(read=read)
-        expected_keys = {
+        expected_keys = host_keys(
             'psi_cpu_some_avg10',
             'psi_cpu_full_avg10',
             'psi_mem_some_avg10',
             'psi_mem_full_avg10',
             'psi_io_some_avg10',
             'psi_io_full_avg10',
-        }
+        )
         assert set(result.keys()) == expected_keys
 
 
@@ -626,8 +633,8 @@ class TestDiscoverPressureCgroups:
         globs to ``*/df-*`` and ``*/orchestrator-*`` left the suite green — and
         a cgroup manager plants more than services beside a service:
         ``orchestrator-*.socket`` and ``.scope`` units live in the same
-        directory. Sweeping one in would emit ``own_cpu_some10:<name>`` rows
-        named after a cgroup that is not the unit the arm is about, and ε2
+        directory. Sweeping one in would emit ``own_cpu_some10`` rows whose
+        leaf is a cgroup that is not the unit the arm is about, and ε2
         would average them in without a way to tell.
 
         Both branches get a decoy, because the two globs are separate spellings
@@ -797,8 +804,8 @@ class TestCollectLoadMetricsRunqueue:
             cgroup_root=tree.cgroup_root,
         )
 
-        assert result['runqueue_ratio'] == pytest.approx(2.75)
-        assert result['runqueue_read_ok'] == 1.0
+        assert result[SampleKey('runqueue_ratio')] == pytest.approx(2.75)
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
 
     def test_failed_read_emits_ok_zero_and_no_ratio(self, tmp_path):
         """α degrades to RunqueueReading(0.0, False) — a value, not a reading.
@@ -819,8 +826,8 @@ class TestCollectLoadMetricsRunqueue:
             cgroup_root=tree.cgroup_root,
         )
 
-        assert result['runqueue_read_ok'] == 0.0
-        assert 'runqueue_ratio' not in result
+        assert result[SampleKey('runqueue_read_ok')] == 0.0
+        assert SampleKey('runqueue_ratio') not in result
 
     def test_a_genuine_zero_ratio_is_still_recorded(self, tmp_path):
         """A real 0.0 reading is distinguishable from a failed one: read_ok=1."""
@@ -835,8 +842,8 @@ class TestCollectLoadMetricsRunqueue:
             cgroup_root=tree.cgroup_root,
         )
 
-        assert result['runqueue_ratio'] == 0.0
-        assert result['runqueue_read_ok'] == 1.0
+        assert result[SampleKey('runqueue_ratio')] == 0.0
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
 
     @pytest.mark.parametrize('read_ok', [True, False])
     def test_every_value_is_a_float(self, tmp_path, read_ok):
@@ -892,7 +899,7 @@ def _collect(tree, **overrides):
 class TestCollectLoadMetricsOwnPressure:
     """One own_cpu_some10 + one own_read_ok row per DISCOVERED leaf, and no more.
 
-    ``own_read_ok:<leaf>`` is per-LEAF evidence — it answers "did THIS
+    ``own_read_ok`` is per-LEAF evidence — it answers "did THIS
     cgroup's pressure file read". Every degradation is therefore carried by
     value against a real leaf name (INV-11), and never fabricated against an
     invented one.
@@ -903,15 +910,15 @@ class TestCollectLoadMetricsOwnPressure:
 
         result = _collect(tree)
 
-        own = {k: v for k, v in result.items() if k.startswith('own_')}
+        own = {k: v for k, v in result.items() if k.metric.startswith('own_')}
         assert len(own) == 14
         # live_topology gives leaf i a `some avg10` of 0.5 + i, in
         # LIVE_ORCHESTRATOR_LEAVES order.
         for i, leaf in enumerate(LIVE_ORCHESTRATOR_LEAVES):
-            assert own[f'own_cpu_some10:{leaf}'] == pytest.approx(0.5 + i)
-            assert own[f'own_read_ok:{leaf}'] == 1.0
-        # The leaf tail is the FULL leaf directory name, verbatim.
-        assert 'own_cpu_some10:orchestrator-dark-factory.service' in own
+            assert own[SampleKey('own_cpu_some10', leaf)] == pytest.approx(0.5 + i)
+            assert own[SampleKey('own_read_ok', leaf)] == 1.0
+        # The leaf is the FULL leaf directory name, verbatim.
+        assert SampleKey('own_cpu_some10', 'orchestrator-dark-factory.service') in own
 
     def test_the_live_none_branch_resolves_its_own_cgroup_hermetically(self, tmp_path):
         """The branch production actually takes, driven without touching /proc.
@@ -938,14 +945,14 @@ class TestCollectLoadMetricsOwnPressure:
             cgroup_root=tree.cgroup_root,
         )
 
-        own = {k: v for k, v in result.items() if k.startswith('own_')}
+        own = {k: v for k, v in result.items() if k.metric.startswith('own_')}
         assert len(own) == 14, (
             'the live None branch discovered no leaves, so the resolved anchor '
             f'disagrees with the injected one; got {sorted(own)}'
         )
         for i, leaf in enumerate(LIVE_ORCHESTRATOR_LEAVES):
-            assert own[f'own_cpu_some10:{leaf}'] == pytest.approx(0.5 + i)
-            assert own[f'own_read_ok:{leaf}'] == 1.0
+            assert own[SampleKey('own_cpu_some10', leaf)] == pytest.approx(0.5 + i)
+            assert own[SampleKey('own_read_ok', leaf)] == 1.0
 
     def test_the_resolution_reads_the_injected_proc_file_not_the_live_one(
         self, tmp_path, caplog
@@ -981,13 +988,13 @@ class TestCollectLoadMetricsOwnPressure:
                 cgroup_root=tree.cgroup_root,
             )
 
-        assert not [k for k in result if k.startswith('own_')], (
+        assert not [k for k in result if k.metric.startswith('own_')], (
             'own_* rows were emitted from an unanchorable 0:: line, so the '
             'resolution read the live /proc/self/cgroup and not the seam'
         )
         assert 'no pressure cgroups discovered' in caplog.text
         # The runqueue group is independent and still reports.
-        assert result['runqueue_read_ok'] == 1.0
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
 
     def test_absent_pressure_file_degrades_only_its_own_leaf(self, tmp_path):
         broken = 'orchestrator-reify.service'
@@ -995,14 +1002,14 @@ class TestCollectLoadMetricsOwnPressure:
 
         result = _collect(tree)
 
-        assert result[f'own_read_ok:{broken}'] == 0.0
-        assert f'own_cpu_some10:{broken}' not in result
+        assert result[SampleKey('own_read_ok', broken)] == 0.0
+        assert SampleKey('own_cpu_some10', broken) not in result
         # The other six are untouched — the failure is isolated, not pooled.
         for leaf in LIVE_ORCHESTRATOR_LEAVES:
             if leaf == broken:
                 continue
-            assert result[f'own_read_ok:{leaf}'] == 1.0
-            assert f'own_cpu_some10:{leaf}' in result
+            assert result[SampleKey('own_read_ok', leaf)] == 1.0
+            assert SampleKey('own_cpu_some10', leaf) in result
 
     def test_unparseable_pressure_file_behaves_exactly_like_an_absent_one(self, tmp_path):
         broken = 'orchestrator-reify.service'
@@ -1011,14 +1018,14 @@ class TestCollectLoadMetricsOwnPressure:
 
         result = _collect(tree)
 
-        assert result[f'own_read_ok:{broken}'] == 0.0
-        assert f'own_cpu_some10:{broken}' not in result
-        assert len([k for k in result if k.startswith('own_')]) == 13
+        assert result[SampleKey('own_read_ok', broken)] == 0.0
+        assert SampleKey('own_cpu_some10', broken) not in result
+        assert len([k for k in result if k.metric.startswith('own_')]) == 13
 
     def test_zero_discovered_leaves_emit_no_own_rows_and_warn(self, tmp_path, caplog):
         """Decision 2: no leaf means no subject, so no row — and one WARNING.
 
-        A synthesised ``own_read_ok:<invented>`` = 0.0 would put a key into
+        A synthesised ``own_read_ok`` = 0.0 for an invented leaf would put a key into
         the DB that ε2 would then average, so the assertion is on the ABSENCE
         of any own_ key rather than on a particular invented name.
         """
@@ -1027,9 +1034,9 @@ class TestCollectLoadMetricsOwnPressure:
         with caplog.at_level(logging.WARNING):
             result = _collect(tree)
 
-        assert [k for k in result if k.startswith('own_')] == []
+        assert [k for k in result if k.metric.startswith('own_')] == []
         # The runqueue half is unaffected — the two halves degrade separately.
-        assert result['runqueue_read_ok'] == 1.0
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any('user@1000.service' in msg for msg in warnings), (
             f'Expected a WARNING naming the attempted anchor; got: {warnings}'
@@ -1056,8 +1063,8 @@ class TestCollectLoadMetricsOwnPressure:
         with caplog.at_level(logging.DEBUG, logger='sampler.metrics'):
             result = _collect(tree, own_cgroup_path='/system.slice/nowhere.service')
 
-        assert [k for k in result if k.startswith('own_')] == []
-        assert result['runqueue_read_ok'] == 1.0
+        assert [k for k in result if k.metric.startswith('own_')] == []
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
         assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
         debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
         assert any('nowhere.service' in msg for msg in debug), (
@@ -1076,17 +1083,17 @@ class TestCollectLoadMetricsOwnPressure:
 
         result = _collect(tree)
 
-        assert result[f'own_read_ok:{leaf}'] == 1.0
-        assert result[f'own_cpu_some10:{leaf}'] == pytest.approx(3.25)
+        assert result[SampleKey('own_read_ok', leaf)] == 1.0
+        assert result[SampleKey('own_cpu_some10', leaf)] == pytest.approx(3.25)
 
     def test_df_topology_names_rows_by_the_slice_leaf(self, tmp_path):
         tree = df_topology(tmp_path, 'dark_factory', 'reify')
 
         result = _collect(tree)
 
-        assert result['own_read_ok:df-dark_factory.slice'] == 1.0
-        assert result['own_read_ok:df-reify.slice'] == 1.0
-        assert len([k for k in result if k.startswith('own_')]) == 4
+        assert result[SampleKey('own_read_ok', 'df-dark_factory.slice')] == 1.0
+        assert result[SampleKey('own_read_ok', 'df-reify.slice')] == 1.0
+        assert len([k for k in result if k.metric.startswith('own_')]) == 4
 
     def test_every_value_is_a_float(self, tmp_path):
         tree = live_topology(tmp_path, orchestrator_reify_service=None)
@@ -1095,6 +1102,23 @@ class TestCollectLoadMetricsOwnPressure:
 
         for key, value in result.items():
             assert type(value) is float, f'{key} is {type(value).__name__}: {value!r}'
+
+    def test_per_leaf_keys_carry_the_leaf_as_data(self, tmp_path):
+        """The leaf travels in its own field, never encoded into the metric name."""
+        tree = live_topology(tmp_path)
+
+        result = _collect(tree)
+
+        assert [k for k in result if ':' in k.metric] == []
+        own = [k for k in result if k.metric.startswith('own_')]
+        assert {k.leaf for k in own} == set(LIVE_ORCHESTRATOR_LEAVES)
+        assert {k.leaf for k in result if k.metric.startswith('runqueue_')} == {None}
+
+    def test_a_sample_key_defaults_to_a_host_level_leaf(self):
+        """``label()`` is display rendering only: nothing parses it back."""
+        assert SampleKey('x').leaf is None
+        assert SampleKey('own_cpu_some10', 'a.service').label() == 'own_cpu_some10:a.service'
+        assert SampleKey('runqueue_ratio').label() == 'runqueue_ratio'
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1169,7 @@ class TestArmMetricStemParity:
         from sampler.metrics import ARM_METRIC_STEMS, collect_psi
 
         mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
-        emitted = set(collect_psi(read=lambda name: mapping[name]))
+        emitted = {k.metric for k in collect_psi(read=lambda name: mapping[name]) if k.leaf is None}
 
         psi_stems = {
             stem for stem in ARM_METRIC_STEMS.values() if stem.startswith('psi_')
@@ -1157,19 +1181,19 @@ class TestArmMetricStemParity:
         from sampler.metrics import ARM_METRIC_STEMS
 
         tree = live_topology(tmp_path)
-        emitted = set(_collect(tree))
+        emitted = {k.metric for k in _collect(tree) if k.leaf is None}
 
         assert ARM_METRIC_STEMS['runqueue_ratio'] in emitted
 
-    def test_own_cpu_stem_is_emitted_as_a_colon_prefix(self, tmp_path):
+    def test_own_cpu_metric_is_emitted_per_leaf(self, tmp_path):
         from sampler.metrics import ARM_METRIC_STEMS
 
         tree = live_topology(tmp_path)
         emitted = set(_collect(tree))
 
         stem = ARM_METRIC_STEMS['own_cpu_some_avg10']
-        assert any(key.startswith(f'{stem}:') for key in emitted), (
-            f'no emitted key carries the stem {stem!r}; emitted: {sorted(emitted)}'
+        assert any(k.metric == stem and k.leaf for k in emitted), (
+            f'no emitted key records {stem!r} for a leaf; emitted: {sorted(emitted)}'
         )
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1226,7 @@ class TestCalibrationScriptArmTableLockstep:
         assert spec is not None, f'Could not build spec from {script}'
         assert spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        spec.loader.exec_module(module)
         return module
 
     def test_the_script_exposes_a_public_arm_to_selector_mapping(self):
@@ -1243,16 +1267,15 @@ class TestCalibrationScriptArmTableLockstep:
             'at gate time and cannot import sampler.'
         )
 
-    def test_the_script_reads_a_corpus_THIS_STORE_wrote(self, tmp_path):
-        """The THIRD copy of the samples schema, and until now the unguarded one.
+    def test_the_script_reads_a_corpus_THIS_STORE_wrote(self, tmp_path, capsys):
+        """The schema copy the calibration suite cannot import, guarded here.
 
-        The schema is spelled in sampler.store (the writer), in
-        dashboard/.../load.py (guarded by its own reconciler) and a third time
-        as a fixture in scripts/tests/test_load_threshold_calibration.py, which
+        The schema is published once, as sampler.store.SCHEMA, and copied as a
+        fixture into scripts/tests/test_load_threshold_calibration.py, which
         cannot import sampler at all. That fixture is what every calibration
         test reads from, so the whole suite can stay green against a DDL the
-        real store stopped writing years ago, and the first sign would be the
-        gate returning `no_samples_in_window` against the live corpus.
+        real store no longer writes, and the first sign would be the gate
+        misreading the live corpus.
 
         Guarded from the WRITER's side rather than by comparing two DDL strings.
         A string comparison would pin the schema's SPELLING -- it would go red
@@ -1266,6 +1289,11 @@ class TestCalibrationScriptArmTableLockstep:
         the series, and that count is the denominator of every coverage row --
         so this is the only place it can be checked against the number of ticks
         ``write_tick`` actually wrote.
+
+        And it reconciles the LEAF: what the store writes per cgroup leaf, the
+        script reads back per leaf, pairing each value series with the
+        readability series of the same leaf, including a leaf that never read
+        and so wrote no value row at all.
         """
         from sampler.store import LoadSampleStore
 
@@ -1275,20 +1303,53 @@ class TestCalibrationScriptArmTableLockstep:
         for i in range(3):
             store.write_tick(
                 1_000_000 + i * 5,
-                unwindowed={'psi_cpu_some_avg10': 10.0 + i},
-                windowed={'runqueue_ratio': 1.0 + i, 'runqueue_read_ok': 1.0},
+                unwindowed={SampleKey('psi_cpu_some_avg10'): 10.0 + i},
+                windowed={
+                    SampleKey('runqueue_ratio'): 1.0 + i,
+                    SampleKey('runqueue_read_ok'): 1.0,
+                    SampleKey('own_cpu_some10', 'orchestrator-a.service'): 10.0 + i,
+                    SampleKey('own_read_ok', 'orchestrator-a.service'): 1.0,
+                    SampleKey('own_read_ok', 'orchestrator-b.service'): 0.0,
+                },
             )
 
         read = module.read_series(db_path, None)
 
         assert read.degradations == [], read.degradations
-        assert [v for _, v in read.series['runqueue_ratio']] == [1.0, 2.0, 3.0]
-        assert [v for _, v in read.series['psi_cpu_some_avg10']] == [10.0, 11.0, 12.0]
-        assert [v for _, v in read.readability['runqueue_read_ok']] == [1.0, 1.0, 1.0]
+        assert [v for _, v in read.series[('runqueue_ratio', None)]] == [1.0, 2.0, 3.0]
+        assert [v for _, v in read.series[('psi_cpu_some_avg10', None)]] == [
+            10.0, 11.0, 12.0]
+        assert [k for k in read.series if k[0] == 'own_cpu_some10'] == [
+            ('own_cpu_some10', 'orchestrator-a.service')]
+        assert [v for _, v in read.series[
+            ('own_cpu_some10', 'orchestrator-a.service')]] == [10.0, 11.0, 12.0]
+        assert [v for _, v in read.readability[('runqueue_read_ok', None)]] == [
+            1.0, 1.0, 1.0]
+        assert [v for _, v in read.readability[
+            ('own_read_ok', 'orchestrator-a.service')]] == [1.0, 1.0, 1.0]
+        assert [v for _, v in read.readability[
+            ('own_read_ok', 'orchestrator-b.service')]] == [0.0, 0.0, 0.0]
         assert read.ticks_in_corpus == 3, (
             'the script counted a different number of ticks than write_tick '
             f'wrote: {read.ticks_in_corpus} against 3'
         )
+
+        coverage = module.coverage_table(
+            read.series, read.readability,
+            list(module.ARM_METRIC_SELECTORS.values()), ticks_in_corpus=3,
+        )
+        dark = coverage[('own_cpu_some10', 'orchestrator-b.service')]
+        assert dark is not None
+        assert (dark['ticks_with_a_row'], dark['readable']) == (3, 0), dark
+
+        absent = tmp_path / 'absent'
+        module.main([
+            '--db', str(db_path), '--arm', 'own_cpu_some_avg10', '--no-report',
+            '--config', str(absent / 'local.yaml'),
+            '--peer-config', str(absent / 'peer.yaml'),
+            '--uv-bin', str(absent / 'uv'),
+        ])
+        assert '### `own_cpu_some10:orchestrator-a.service` —' in capsys.readouterr().out
 
     def test_every_declared_readability_metric_is_one_the_collectors_emit(
         self, tmp_path
@@ -1317,7 +1378,7 @@ class TestCalibrationScriptArmTableLockstep:
             own_cgroup_path=tree.own_cgroup_path,
             cgroup_root=tree.cgroup_root,
         ))
-        emitted_stems = {name.split(':', 1)[0] for name in emitted}
+        emitted_stems = {k.metric for k in emitted}
 
         declared = {
             spec.readability
@@ -1356,9 +1417,7 @@ class TestCalibrationScriptArmTableLockstep:
             own_cgroup_path=tree.own_cgroup_path,
             cgroup_root=tree.cgroup_root,
         ))
-        emitted_read_ok = {
-            name.split(':', 1)[0] for name in emitted if '_read_ok' in name
-        }
+        emitted_read_ok = {k.metric for k in emitted if k.metric.endswith('_read_ok')}
 
         declared = {
             spec.readability
@@ -1395,7 +1454,7 @@ class TestCalibrationScriptArmTableLockstep:
             cgroup_root=tree.cgroup_root,
         )
 
-        assert module.TICK_METRIC in emitted, (
+        assert SampleKey(module.TICK_METRIC) in emitted, (
             f'scripts/load-threshold-calibration.py::TICK_METRIC '
             f'({module.TICK_METRIC!r}) is missing from a completed tick with no '
             f'leaves and read_ok={read_ok}; emitted: {sorted(emitted)}'
@@ -1469,7 +1528,7 @@ class TestEmittedNamesAreAdmittedByRunTick:
 
         tree = live_topology(tmp_path)
         groups = self._collect_all(tree)
-        emitted = {name for group in groups.values() for name in group}
+        emitted = {key for group in groups.values() for key in group}
         # 14 own_* (7 leaves x value+read_ok) + 2 runqueue + 6 psi + 3 process
         # — the 25 metrics/tick the retention sizing was measured against.
         assert len(emitted) == 14 + 2 + 6 + 3, (
@@ -1483,19 +1542,22 @@ class TestEmittedNamesAreAdmittedByRunTick:
 
         conn = sqlite3.connect(str(db_path))
         try:
-            stored = {row[0] for row in conn.execute('SELECT DISTINCT metric FROM samples')}
+            stored = {
+                SampleKey(*row)
+                for row in conn.execute('SELECT DISTINCT metric, leaf FROM samples')
+            }
         finally:
             conn.close()
         assert stored == emitted
 
     def test_the_df_topology_vocabulary_is_admitted_too(self, tmp_path):
-        """Post-3394 the leaf names change shape; the stem must still admit them."""
+        """Post-3394 the leaf names change shape; admission must still take them."""
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
         tree = df_topology(tmp_path, 'dark-factory', 'reify')
         groups = self._collect_all(tree)
         load = groups['load_metrics']
-        assert 'own_cpu_some10:df-dark-factory.slice' in load, sorted(load)
+        assert SampleKey('own_cpu_some10', 'df-dark-factory.slice') in load, sorted(load)
 
         run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, **groups)

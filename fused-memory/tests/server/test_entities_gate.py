@@ -24,6 +24,7 @@ import json
 import pytest
 
 from fused_memory.server.entities_gate import entities_gate
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
 
 GROUP = 'dark_factory'
@@ -33,6 +34,9 @@ _CITES_3127 = 'the fix for Task 3127 landed'
 #: Content naming no referent of any kind — the scan comes back empty, which
 #: gamma treats as UNINFORMATIVE rather than contradictory.
 _CITES_NOTHING = 'the merge-lane hardening work'
+#: ``_CITES_3127`` padded past the 200-char excerpt with prose naming nothing
+#: else, so the scan still sees exactly Task 3127.
+_LONG_CITES_3127 = _CITES_3127 + ', and the merge lane settled the cycle afterwards' * 6
 
 #: The falsy NON-list shapes, as ``(id, value)`` pairs.  Their own arm below
 #: pins the property that singles them out — that the gate short-circuits on
@@ -381,3 +385,45 @@ class TestTheGateStaysPermissiveWhileTheProducerNarrows:
         assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
         assert block['conflicts'] == ['Task 3129'], f'{block!r}'
         assert block['content_referents'] == ['evil_proj:132'], f'{block!r}'
+
+
+class TestBlocksDiscloseTheirExcerptClip:
+    """A block whose 200-char excerpt cut the content says so (task 5365).
+
+    The excerpt itself stays ``content[:200]``; the cut rides beside it as the
+    same ``truncation_facts`` every sibling pre-service guard carries.
+    """
+
+    def test_a_conflict_block_reports_its_cut_excerpt(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}], content=_LONG_CITES_3127, group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['content_excerpt'] == _LONG_CITES_3127[:200], f'{block!r}'
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': len(_LONG_CITES_3127) - 200},
+        ], f'{block!r}'
+
+    def test_a_malformed_block_reports_its_cut_excerpt(self):
+        block = entities_gate([{'id': 'abc'}], content=_LONG_CITES_3127, group_id=GROUP)
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['content_excerpt'] == _LONG_CITES_3127[:200], f'{block!r}'
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': len(_LONG_CITES_3127) - 200},
+        ], f'{block!r}'
+
+    def test_an_uncut_block_carries_no_truncation_facts(self):
+        conflict = entities_gate([{'kind': 'task', 'id': 3129}], content=_CITES_3127, group_id=GROUP)
+        malformed = entities_gate([{'id': 'abc'}], content=_CITES_3127, group_id=GROUP)
+
+        assert isinstance(conflict, dict) and TRUNCATION_FACTS_KEY not in conflict, f'{conflict!r}'
+        assert isinstance(malformed, dict) and TRUNCATION_FACTS_KEY not in malformed, f'{malformed!r}'
+
+    def test_a_cut_block_stays_json_safe(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}], content=_LONG_CITES_3127, group_id=GROUP,
+        )
+
+        assert json.loads(json.dumps(block)) == block

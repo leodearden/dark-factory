@@ -2,13 +2,18 @@
 
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
-``FakeVerifier`` scripts the verify outcome per task id; ``FakeClock`` is a
-hand-advanced clock whose ``sleep`` advances it instead of waiting;
+``FakeVerifier`` scripts the verify outcome per task id or in call order,
+and records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
+hand-advanced clock whose ``sleep`` advances it and waits at most
+``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
+in-flight verify keeps writing;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
-that owns its worker never falls back to a production adapter by omission,
-and ``drive_merge`` plays the merger for a caller that enqueues onto a queue
+that owns its worker never falls back to a production adapter by omission;
+``running_lane`` runs such a lane for the body of a block and
+``merge_through_lane`` until it resolves one request; ``drive_merge`` plays
+the merger for a caller that enqueues onto a queue
 nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``MergeOutcome`` whether it left a detached main-health probe running, and
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
@@ -20,9 +25,10 @@ Imported by bare module name (``from _merge_lane_fakes import ...``), like
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import dataclasses
-from collections.abc import Collection, Coroutine, Mapping
+from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -103,15 +109,27 @@ def lane_scene_config(
 
 @dataclasses.dataclass(frozen=True)
 class VerifyScript:
-    """What ``FakeVerifier.run_scoped`` does for one task.
+    """What one ``FakeVerifier.run_scoped`` call does.
 
     Exactly one of the shapes below applies: return ``result``, raise
     ``error``, or wait for ``release`` first and then return ``result``.
+    *entered*, when given, is set the moment a call reaches this script,
+    before any release wait; it is the arrival half of a release gate.
     """
 
     result: VerifyResult
     error: BaseException | None = None
     release: asyncio.Event | None = None
+    entered: asyncio.Event | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopedVerifyCall:
+    """What one ``FakeVerifier.run_scoped`` call was handed."""
+
+    task_id: str | None
+    worktree: Path
+    module_configs: tuple[Any, ...]
 
 
 def passes(summary: str = 'fake verify passed') -> VerifyScript:
@@ -131,27 +149,40 @@ def raises(error: BaseException) -> VerifyScript:
     return VerifyScript(result=passes().result, error=error)
 
 
-def hangs_until(release: asyncio.Event) -> VerifyScript:
-    return VerifyScript(result=passes().result, release=release)
+def hangs_until(
+    release: asyncio.Event, *, entered: asyncio.Event | None = None,
+) -> VerifyScript:
+    return VerifyScript(result=passes().result, release=release, entered=entered)
+
+
+def times_out(summary: str = 'Verification timed out') -> VerifyScript:
+    return VerifyScript(result=VerifyResult(
+        passed=False, test_output='', lint_output='', type_output='',
+        summary=summary, timed_out=True,
+    ))
 
 
 class FakeVerifier:
-    """``VerifyPort`` scripted per task id.
+    """``VerifyPort`` scripted per task id or in call order.
 
-    ``run_scoped`` follows ``scripts[task_id]``, or ``default`` for a task
-    without a script, and records every task id it was asked about in
-    ``verified``. ``await_entry(n)`` waits for the *n*-th entry into
-    ``run_scoped``, which is how a test waits for a scripted hang to be
-    genuinely under way before it probes the lane -- per CALL, so a test
-    that drives two verifies can wait for the SECOND one instead of being
-    let through early by the first. The gates a merge passes through after a
-    green scoped verify all report clean, the disk guard reports
-    *disk_reason* (``None``, the default, being "proceed"), and dry-run
-    investigations are recorded in ``investigations`` rather than run.
+    Each ``run_scoped`` call follows the next of the ordered ``sequence``
+    scripts while any remain, then ``scripts[task_id]``, then ``default``.
+    It records every task id it was asked about in ``verified`` and what each
+    call was handed in ``verify_calls``, one ``ScopedVerifyCall`` per entry
+    into the BASE ``run_scoped`` (an override that does not delegate records
+    only ``verified``/``entered_count``, through ``_note_entry``).
+    ``await_entry(n)`` waits for the *n*-th entry into ``run_scoped``, which
+    is how a test waits for a scripted hang to be genuinely under way before
+    it probes the lane -- per CALL, so a test that drives two verifies can
+    wait for the SECOND one instead of being let through early by the first.
+    The gates a merge passes through after a green scoped verify all report
+    clean, the disk guard reports *disk_reason* (``None``, the default, being
+    "proceed"), and dry-run investigations are recorded in ``investigations``
+    rather than run.
 
-    A subclass that overrides ``run_scoped`` to script a per-CALL sequence
-    calls ``_note_entry`` itself, so ``verified`` and ``entered_count`` stay
-    truthful for it too.
+    Script a per-CALL sequence with ``sequence=``; a subclass that must vary
+    the selection further overrides ``next_script``. A legacy subclass that
+    overrides ``run_scoped`` itself must still call ``_note_entry``.
     """
 
     def __init__(
@@ -159,12 +190,15 @@ class FakeVerifier:
         default: VerifyScript | None = None,
         scripts: Mapping[str | None, VerifyScript] | None = None,
         *,
+        sequence: Iterable[VerifyScript] = (),
         disk_reason: str | None = None,
     ) -> None:
         self.default = passes() if default is None else default
         self.scripts: dict[str | None, VerifyScript] = dict(scripts or {})
+        self._ordered = collections.deque(sequence)
         self.disk_reason = disk_reason
         self.verified: list[str | None] = []
+        self.verify_calls: list[ScopedVerifyCall] = []
         self.investigations: list[dict[str, Any]] = []
         self.entered_count = 0
         self._entry_bell = asyncio.Event()
@@ -188,6 +222,17 @@ class FakeVerifier:
             self._entry_bell.clear()
             await self._entry_bell.wait()
 
+    def next_script(self, task_id: str | None) -> VerifyScript:
+        """The script the current ``run_scoped`` call for *task_id* follows.
+
+        The selection a subclass overrides to vary which script a call
+        follows; recording the call and playing the script stay in
+        ``run_scoped``.
+        """
+        if self._ordered:
+            return self._ordered.popleft()
+        return self.scripts.get(task_id, self.default)
+
     async def run_scoped(
         self,
         worktree: Path,
@@ -197,8 +242,13 @@ class FakeVerifier:
         **options: Any,
     ) -> VerifyResult:
         task_id = options.get('task_id')
+        self.verify_calls.append(ScopedVerifyCall(
+            task_id=task_id, worktree=worktree, module_configs=tuple(module_configs),
+        ))
         self._note_entry(task_id)
-        script = self.scripts.get(task_id, self.default)
+        script = self.next_script(task_id)
+        if script.entered is not None:
+            script.entered.set()
         if script.release is not None:
             await script.release.wait()
         if script.error is not None:
@@ -252,24 +302,30 @@ class FakeClock:
     Two independent readings, exactly as production has them: ``now`` reads
     the wall-clock ``time`` (what the lane stamps with) and ``monotonic``
     reads ``mono`` (what it measures durations against). ``sleep`` advances
-    BOTH by the requested seconds and yields once so other tasks run,
-    keeping every requested sleep in ``sleeps``.
+    BOTH by the requested seconds and really waits ``min(secs, sleep_cap)``,
+    keeping every requested sleep in ``sleeps``. The real wait stops a
+    started lane's periodic loops (``_heartbeat_loop``, ``_reprobe_loop``)
+    from spinning a core; the cap keeps their production-sized periods off
+    the wall clock. ``sleep_cap=0`` restores the bare yield, for a test that
+    drives a single loop through a production-sized poll count with nothing
+    else needing real time.
 
     ``wait_for_any`` is the lane's poll cadence, and it charges ``mono``
     the FULL requested timeout while really waiting only ``wait_cap``.
     So a loop that polls on this clock and measures its budget off
     ``monotonic()`` -- the in-flight verify abort-poll is the one that does
-    -- reaches that budget in a bounded number of polls with no real time
-    elapsed, and the task being polled still gets real timer slack to
-    finish in. Every requested timeout lands in ``waits``.
+    -- reaches that budget with no real time elapsed. Every requested
+    timeout lands in ``waits``.
 
-    That slack is finite and DERIVED, so it is worth stating: a polled task
-    gets ``budget / poll * wait_cap`` seconds of real time before the loop
-    exhausts its budget and calls the task dead -- 0.2s at the settings
-    test_merge_queue_lifecycle_registry.py uses (budget 0.2, poll 0.02). A
-    test whose fake verify genuinely needs longer -- an awaited subprocess,
-    a git operation, a loaded host -- raises ``wait_cap`` rather than
-    false-aborting a healthy verify.
+    How much real time the polled task gets before that is NOT dependable.
+    A started lane's loops charge 150s (heartbeat 30s + reprobe 120s) per
+    ``sleep_cap`` of real sleep and the abort poll charges its full poll
+    interval per ``wait_cap``, so at the defaults a parked verify's
+    no-progress budget runs out in under a second of real time. Load
+    only lengthens that, but it is still no load-safe slack: a scene that must not call a verify dead shows the
+    content progress a healthy verify makes -- ``healthy_verify_clock`` --
+    and only a scene exercising the dead-verify abort leaves
+    ``content_mtime`` frozen.
 
     ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
     for a lane loop that measures elapsed time off this clock but waits on
@@ -295,6 +351,7 @@ class FakeClock:
         content_mtime: float | None = None,
         content_tick: float = 0.0,
         wait_cap: float = 0.02,
+        sleep_cap: float = 0.02,
     ) -> None:
         self.time = time
         self.mono = time
@@ -302,6 +359,7 @@ class FakeClock:
         self.content_mtime = content_mtime
         self.content_tick = content_tick
         self.wait_cap = wait_cap
+        self.sleep_cap = sleep_cap
         self.sleeps: list[float] = []
         self.waits: list[float] = []
         self.content_probes: list[Path] = []
@@ -325,7 +383,7 @@ class FakeClock:
         self.sleeps.append(secs)
         self.time += secs
         self.mono += secs
-        await asyncio.sleep(0)
+        await asyncio.sleep(min(secs, self.sleep_cap))
 
     async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
         self.waits.append(timeout)
@@ -336,6 +394,13 @@ class FakeClock:
         done, _ = await asyncio.wait(aws, timeout=min(timeout, self.wait_cap))
         self.mono += timeout
         return done
+
+
+def healthy_verify_clock() -> FakeClock:
+    """A ``FakeClock`` on which an in-flight verify keeps writing to its merge
+    worktree, as a healthy one does, so the lane's no-progress abort never
+    calls it dead however far the lane's loops have run ``monotonic()``."""
+    return FakeClock(content_mtime=1.0, content_tick=1.0)
 
 
 class RecordingEscalations:
@@ -378,9 +443,9 @@ def make_lane(
 
     The verifier and clock default to fresh fakes rather than to the
     production adapters, so a test that forgets to pass one still gets a
-    lane that neither shells out nor waits on the wall clock. *queue*
-    defaults to a fresh ``asyncio.Queue`` on the running loop. Anything else
-    ``MergeLane`` accepts passes through in *kwargs*.
+    lane that neither shells out nor waits out a production-sized sleep.
+    *queue* defaults to a fresh ``asyncio.Queue`` on the running loop.
+    Anything else ``MergeLane`` accepts passes through in *kwargs*.
     """
     return MergeLane(
         git_ops,
@@ -390,6 +455,66 @@ def make_lane(
         clock=FakeClock() if clock is None else clock,
         **kwargs,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneRun:
+    """A lane's ``run()`` task, as ``running_lane`` yields it."""
+
+    task: asyncio.Task[None]
+
+    async def outcome(self, request: Any, *, timeout: float = 120.0) -> MergeOutcome:
+        """The outcome the lane resolves *request* with.
+
+        Watches the ``run()`` task while waiting, so a lane that crashes or
+        returns first raises that, instead of surfacing as a timeout.
+        """
+        done, _ = await asyncio.wait(
+            {self.task, request.result}, timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if request.result in done:
+            return request.result.result()
+        if self.task in done:
+            self.task.result()
+            raise AssertionError('the lane stopped before resolving the request')
+        raise TimeoutError(f'the lane did not resolve the request within {timeout}s')
+
+
+@contextlib.asynccontextmanager
+async def running_lane(
+    lane: MergeLane, *, stop_timeout: float = 60.0,
+) -> AsyncIterator[LaneRun]:
+    """Run *lane* for the body of the block, then stop it.
+
+    On the way out, whatever happened, the lane is stopped and its ``run()``
+    awaited, so a failure of ``run()`` itself is raised rather than lost.
+    """
+    run = asyncio.create_task(lane.run())
+    try:
+        yield LaneRun(run)
+    finally:
+        await lane.stop()
+        await asyncio.wait_for(run, stop_timeout)
+
+
+async def merge_through_lane(
+    lane: MergeLane,
+    queue: asyncio.Queue[Any],
+    request: Any,
+    *,
+    timeout: float = 120.0,
+) -> MergeOutcome:
+    """Run *lane* until it resolves *request*, then stop it; return the outcome.
+
+    *queue* is the one *lane* was built on. The request -- a single
+    ``MergeRequest`` or a train's ``GroupMergeRequest`` -- goes in through the
+    lane's queue like any submission, so it takes the production dispatch
+    route rather than a test-chosen internal entry point.
+    """
+    async with running_lane(lane) as run:
+        await queue.put(request)
+        return await run.outcome(request, timeout=timeout)
 
 
 @dataclasses.dataclass(frozen=True)

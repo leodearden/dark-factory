@@ -28,7 +28,7 @@ selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``
         'heartbeat_at': '2026-08-08T12:00:00+00:00',  # MCP get_tasks claim column; None if never
         'stranded': False,          # tasks.task_is_stranded(task, now) — in-progress with no live
                                     # claimant (null/blank claimant, or a heartbeat older than
-                                    # STRANDED_HEARTBEAT_TTL). Independent of 'agent': a leftover
+                                    # DEFAULT_CLAIMANT_HEARTBEAT_TTL). Independent of 'agent': a leftover
                                     # worktree makes 'agent' truthy while nothing is running.
         'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot);
                                     # None when the entry's own started is None
@@ -70,7 +70,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -81,14 +81,14 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
+from dashboard.data.mcp_fanout import project_label
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.task_snapshot import (
     SnapshotFailure,
-    SnapshotHealth,
     TaskSnapshot,
     acquire_snapshot,
-    classify,
     unmeasured_snapshot,
+    withhold_rows,
 )
 from dashboard.data.tasks import fetch_external_statuses, task_is_stranded
 from dashboard.data.utils import resolve_now
@@ -248,22 +248,6 @@ _TASKS_TOTAL_BUDGET = 20.0
 # ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
 _TASKS_ROOT_CONCURRENCY = 4
 
-def _project_label(root: Path) -> str:
-    """Display label for a project root path: the directory's basename."""
-    return root.name or str(root)
-
-
-def _all_project_roots(config: DashboardConfig) -> list[Path]:
-    """All known project roots, deduped, primary first."""
-    seen: set[Path] = {config.project_root}
-    roots: list[Path] = [config.project_root]
-    for r in config.known_project_roots:
-        if r not in seen:
-            seen.add(r)
-            roots.append(r)
-    return roots
-
-
 def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
     """Every configured root whose display label is *label*, primary first.
 
@@ -272,7 +256,7 @@ def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
     root to survive. A caller that needs one root must refuse rather than guess
     when the list is not exactly one long.
     """
-    return [root for root in _all_project_roots(config) if _project_label(root) == label]
+    return [root for root in config.all_project_roots if project_label(root) == label]
 
 
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
@@ -292,8 +276,8 @@ def _reset_root_rotation() -> None:
     _root_rotation_offset = 0
 
 
-def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
-    """``_all_project_roots`` rotated left by one more slot on each call.
+def _rotated_project_roots(config: DashboardConfig) -> tuple[Path, ...]:
+    """``DashboardConfig.all_project_roots`` rotated left by one more slot on each call.
 
     WHAT THIS CLOSES. `collect_tasks_with_counts` cannot always serve every
     root inside `_TASKS_TOTAL_BUDGET`, and with a FIXED walk order the roots
@@ -321,18 +305,11 @@ def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
     Reproducibility in an incident is worth more here than any property a
     random order would buy.
 
-    SEPARATE HELPER, deliberately. ``_all_project_roots`` stays byte-identical
-    and primary-first: ``app.py``, ``scheduler.py``, ``collect_done_counts``
-    and ``test_app.py``'s patch point all depend on that ordering, so rotating
-    in place would silently repoint every one of them at a different project.
-    Only ``collect_tasks_with_counts``' admission loop calls this.
-
-    Rotation changes ADMISSION order only. Output is re-assembled in canonical
-    ``_all_project_roots`` order by the caller, so the rendered table does not
-    reshuffle on every 3 s poll.
+    Rotation changes ADMISSION order only: the caller re-assembles output in
+    ``DashboardConfig.all_project_roots`` order.
     """
     global _root_rotation_offset
-    roots = _all_project_roots(config)
+    roots = config.all_project_roots
     if not roots:
         return roots
     offset = _root_rotation_offset % len(roots)
@@ -685,7 +662,7 @@ def _shape_one_project(
     degrade to an honest ``None`` via :func:`_runtime_fields`, which is a
     DIFFERENT fault domain from the task-tree read the snapshot reports on.
     """
-    project = _project_label(project_root)
+    project = project_label(project_root)
     tasks = snapshot.rows.value or []
     if not tasks:
         return []
@@ -750,7 +727,7 @@ def shape_terminal_rows(
     ``lower_bound`` state is what tells it the list is a window rather than a
     population.
     """
-    project = _project_label(project_root)
+    project = project_label(project_root)
     runtime_status = _probe_status(None)
     shaped: list[dict] = []
     for task in rows:
@@ -786,6 +763,170 @@ async def _acquire_and_shape(
     snapshot = await acquire_snapshot(client, config, project_root, now=now)
     rows = _shape_one_project(project_root, snapshot, now=now, runtime=runtime)
     return rows, snapshot
+
+
+_RootShare = Callable[[Path], Awaitable[tuple[list[dict], TaskSnapshot]]]
+"""ONE root's whole share of a render: its rows (possibly none) and its unit."""
+
+
+async def _serve_roots_within_budget(
+    config: DashboardConfig,
+    share: _RootShare,
+    *,
+    now: datetime,
+    deadline: float,
+) -> list[tuple[Path, list[dict], TaskSnapshot]]:
+    """Run *share* for every configured root inside the Tasks budget.
+
+    THE budgeted per-root fan-out, shared by every collector of the snapshot
+    units so they honour the same invariants: one bad root must not blank the
+    render, a root the budget never reached still owes the wire a unit, and
+    rotation keeps the starved set from being the same roots every render.
+    What a root's share DOES is the caller's: :func:`collect_tasks_with_counts`
+    acquires and shapes, :func:`collect_census_snapshots` acquires and
+    withholds the rows.
+
+    *deadline* is a ``loop.time()`` instant the CALLER takes, so a caller with
+    work before the fan-out (the runtime probe) can spend the same budget on
+    it. *now* is the caller's single resolved instant, stamped on every unit
+    this fan-out builds for a root it could not serve.
+
+    Returns one ``(root, rows, unit)`` per configured root, in CANONICAL root
+    order — neither completion order nor admission order.
+    """
+    loop = asyncio.get_running_loop()
+    # ROTATED for admission, canonical for output. The rotation is what stops
+    # the same trailing roots being starved on every render; see
+    # _rotated_project_roots. `roots` below is the canonical order the results
+    # are re-assembled in.
+    roots = config.all_project_roots
+    admission_order = _rotated_project_roots(config)
+    # Admission control, not a work queue: the coroutines are all created up
+    # front and the semaphore decides how many shares are running at once.
+    # See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
+    slots = asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)
+
+    def _unreached(
+        root: Path, reason: str, failure: SnapshotFailure,
+    ) -> tuple[list[dict], TaskSnapshot]:
+        """No rows, plus the unit a root this render did not measure still owes."""
+        return [], unmeasured_snapshot(root, now=now, reason=reason, failure=failure)
+
+    async def _one(root: Path) -> tuple[list[dict], TaskSnapshot]:
+        """Serve ONE root, returning its rows and its unit — never mutating shared state.
+
+        Every branch returns a result instead of appending to an outer list.
+        Appending from inside a concurrent coroutine would order the payload by
+        COMPLETION, and the Tasks tab renders the rows in payload order, so the
+        table would reshuffle on every 3 s poll. The results are re-assembled
+        in ROOT order below.
+
+        The result carries NO label: it is paired with the root that produced
+        it, which is the only identity that is unique (see the re-assembly
+        below).
+
+        Every non-happy branch still returns a UNIT, never a marker flag: a
+        root the budget never reached owes the wire an entry exactly as much
+        as a healthy one, and its kind is what routes it to a banner. The
+        reason is composed HERE, where the branch knows which budget expired
+        and how much of it remained, and is then carried verbatim by both the
+        WARNING and the unit — one sentence, one place, two readers.
+        """
+        label = project_label(root)
+        async with slots:
+            # AFTER admission, deliberately: a root that queued for a slot has
+            # already spent part of the whole-handler budget, and handing it a
+            # `remaining` measured before the wait would let the walk overrun
+            # the deadline by up to one wave.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Never got its turn. A silently missing project reads as "no
+                # active work" on the Tasks tab, which is the same class of
+                # invisible failure the fan-out logging policy was raised to
+                # WARNING to close.
+                reason = (
+                    f'skipped — the {_TASKS_TOTAL_BUDGET:.1f}s Tasks budget was '
+                    'already spent before this project was reached'
+                )
+                logger.warning(
+                    'project %s: %s; its rows and census are UNKNOWN for this '
+                    'render (not zero, and not offline)',
+                    label, reason,
+                )
+                return _unreached(root, reason, SnapshotFailure.BUDGET)
+            try:
+                return await asyncio.wait_for(
+                    share(root), timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
+                )
+            except TimeoutError:
+                reason = (
+                    f'exceeded its {_TASKS_PER_PROJECT_BUDGET:.1f}s share of the '
+                    f'{_TASKS_TOTAL_BUDGET:.1f}s Tasks budget '
+                    f'({remaining:.1f}s remained)'
+                )
+                logger.warning(
+                    'project %s: %s — its rows and census are UNKNOWN for this '
+                    'render (not zero, and not offline)',
+                    label, reason,
+                )
+                return _unreached(root, reason, SnapshotFailure.BUDGET)
+            except Exception:
+                # DEFENSE IN DEPTH, and deliberately broad. The fan-out
+                # normally converts a failed read into the offline marker, so
+                # nothing here is a demonstrated crash — but without this
+                # clause ANY unexpected exception (a decode error, a shaping
+                # bug, an httpx transport error that escaped the fan-out)
+                # unwinds the whole GATHER and 500s the handler, throwing away
+                # every healthy project. That is the same "one bad root blanks
+                # the whole tab" failure TASKS_OFFLINE exists to close,
+                # relocated from the banner to the handler, and one root must
+                # not be able to cause it.
+                #
+                # It must stay INSIDE _one for that to hold: hoisted to the
+                # gather (as return_exceptions=True) it would still catch the
+                # exception, but only after asyncio.gather had already been
+                # given the chance to propagate it, and the per-root offline/
+                # degraded routing would have nothing to key on.
+                #
+                # OFFLINE, not degraded: the read demonstrably FAILED, which is
+                # what offline means. degraded is reserved for "the budget
+                # never let us find out" — the distinction the two branches
+                # above draw, and merging them here would undo it.
+                #
+                # exc_info is load-bearing: an exception absorbed into a
+                # routine offline marker with no traceback is a bug that
+                # renders as an outage forever. The log is what separates
+                # "fused-memory is down" from "our own shaping code raised".
+                logger.warning(
+                    'project %s: unexpected error while serving its share — the '
+                    'project is marked offline for this render so the remaining '
+                    'roots still render; this is a BUG, not an outage',
+                    label, exc_info=True,
+                )
+                return _unreached(
+                    root,
+                    'unexpected error while serving this project (see the '
+                    'WARNING and its traceback)',
+                    SnapshotFailure.UNREACHABLE,
+                )
+
+    # return_exceptions=False is correct here BECAUSE the broad `except
+    # Exception` above lives INSIDE _one: nothing can escape to the gather, so
+    # there is no exception for it to swallow, and a real escape (a bug in this
+    # assembly code, a CancelledError) must still propagate rather than be
+    # silently converted into a result object.
+    results = await asyncio.gather(*(_one(root) for root in admission_order))
+    # Keyed by ROOT, never by label. `project_label` is the directory
+    # BASENAME, so two configured roots can share one (``/a/proj`` and
+    # ``/b/proj``) — and a label-keyed dict collapses them, which would emit
+    # the survivor's rows TWICE (duplicate `task_uid`s, the React tab's map
+    # key) and drop the other root's rows entirely. Roots are deduped by
+    # `DashboardConfig.all_project_roots`, so this pairing is total and 1:1;
+    # `strict=True` says so rather than trusting it. (The callers' snapshot dicts are
+    # label-keyed because the wire addresses projects by label; the collision
+    # costs an ENTRY there, never a row.)
+    by_root = dict(zip(admission_order, results, strict=True))
+    return [(root, *by_root[root]) for root in roots]
 
 
 async def collect_tasks_with_counts(
@@ -870,7 +1011,7 @@ async def collect_tasks_with_counts(
     ``fetch_external_statuses`` call (skipped when the union is empty), and
     overwrites each entry's status.  Deps absent from the map keep the honest
     ``'unknown'`` sentinel.  Defaults to ``False`` so the scheduler-page path
-    (``collect_active_tasks``) issues no extra MCP round-trip.
+    (``scheduler.collect_scheduler_state``) issues no extra MCP round-trip.
 
     That call runs AFTER the per-project walk and is inside the same deadline:
     it is both CHECKED (skipped outright once the budget is spent) and BOUNDED
@@ -906,156 +1047,25 @@ async def collect_tasks_with_counts(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _TASKS_TOTAL_BUDGET
     runtime_by_label = await fetch_task_runtime(client, config.escalation_urls)
-    all_active: list[dict] = []
-    snapshots: dict[str, TaskSnapshot] = {}
 
-    # ROTATED for admission, canonical for output. The rotation is what stops
-    # the same trailing roots being starved on every render; see
-    # _rotated_project_roots. `roots` below is the canonical order the results
-    # are re-assembled in.
-    roots = _all_project_roots(config)
-    admission_order = _rotated_project_roots(config)
-    # Admission control, not a work queue: the coroutines are all created up
-    # front and the semaphore decides how many are inside _acquire_and_shape
-    # at once. See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
-    slots = asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)
-
-    def _unreached(
-        root: Path, reason: str, failure: SnapshotFailure,
-    ) -> tuple[list[dict], TaskSnapshot]:
-        """No rows, plus the unit a root this render did not measure still owes."""
-        return [], unmeasured_snapshot(
-            root, now=effective_now, reason=reason, failure=failure,
+    async def _share(root: Path) -> tuple[list[dict], TaskSnapshot]:
+        return await _acquire_and_shape(
+            client, config, root,
+            now=effective_now,
+            runtime=runtime_by_label.get(project_label(root)),
         )
 
-    async def _one(root: Path) -> tuple[list[dict], TaskSnapshot]:
-        """Serve ONE root, returning its rows and its unit — never mutating shared state.
-
-        Every branch returns a result instead of appending to the outer list.
-        Appending from inside a concurrent coroutine would order the payload by
-        COMPLETION, and the Tasks tab renders ``all_active`` directly, so the
-        table would reshuffle on every 3 s poll. The caller re-assembles these
-        results in ROOT order below.
-
-        The result carries NO label: the caller pairs each one with the root
-        that produced it, which is the only identity that is unique (see the
-        re-assembly below).
-
-        Every non-happy branch still returns a UNIT, never a marker flag: a
-        root the budget never reached owes the wire an entry exactly as much
-        as a healthy one, and its kind is what routes it to a banner. The
-        reason is composed HERE, where the branch knows which budget expired
-        and how much of it remained, and is then carried verbatim by both the
-        WARNING and the unit — one sentence, one place, two readers.
-        """
-        label = _project_label(root)
-        async with slots:
-            # AFTER admission, deliberately: a root that queued for a slot has
-            # already spent part of the whole-handler budget, and handing it a
-            # `remaining` measured before the wait would let the walk overrun
-            # the deadline by up to one wave.
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                # Never got its turn. A silently missing project reads as "no
-                # active work" on the Tasks tab, which is the same class of
-                # invisible failure the fan-out logging policy was raised to
-                # WARNING to close.
-                reason = (
-                    f'skipped — the {_TASKS_TOTAL_BUDGET:.1f}s Tasks budget was '
-                    'already spent before this project was reached'
-                )
-                logger.warning(
-                    'project %s: %s; its rows and census are UNKNOWN for this '
-                    'render (not zero, and not offline)',
-                    label, reason,
-                )
-                return _unreached(root, reason, SnapshotFailure.BUDGET)
-            try:
-                active, snapshot = await asyncio.wait_for(
-                    _acquire_and_shape(
-                        client, config, root,
-                        now=effective_now,
-                        runtime=runtime_by_label.get(label),
-                    ),
-                    timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
-                )
-            except TimeoutError:
-                reason = (
-                    f'exceeded its {_TASKS_PER_PROJECT_BUDGET:.1f}s share of the '
-                    f'{_TASKS_TOTAL_BUDGET:.1f}s Tasks budget '
-                    f'({remaining:.1f}s remained)'
-                )
-                logger.warning(
-                    'project %s: %s — its rows and census are UNKNOWN for this '
-                    'render (not zero, and not offline)',
-                    label, reason,
-                )
-                return _unreached(root, reason, SnapshotFailure.BUDGET)
-            except Exception:
-                # DEFENSE IN DEPTH, and deliberately broad. The fan-out
-                # normally converts a failed read into the offline marker, so
-                # nothing here is a demonstrated crash — but without this
-                # clause ANY unexpected exception (a decode error, a shaping
-                # bug, an httpx transport error that escaped the fan-out)
-                # unwinds the whole GATHER and 500s the handler, throwing away
-                # every healthy project. That is the same "one bad root blanks
-                # the whole tab" failure TASKS_OFFLINE exists to close,
-                # relocated from the banner to the handler, and one root must
-                # not be able to cause it.
-                #
-                # It must stay INSIDE _one for that to hold: hoisted to the
-                # gather (as return_exceptions=True) it would still catch the
-                # exception, but only after asyncio.gather had already been
-                # given the chance to propagate it, and the per-root offline/
-                # degraded routing below would have nothing to key on.
-                #
-                # OFFLINE, not degraded: the read demonstrably FAILED, which is
-                # what offline means. degraded is reserved for "the budget
-                # never let us find out" — the distinction the two branches
-                # above draw, and merging them here would undo it.
-                #
-                # exc_info is load-bearing: an exception absorbed into a
-                # routine offline marker with no traceback is a bug that
-                # renders as an outage forever. The log is what separates
-                # "fused-memory is down" from "our own shaping code raised".
-                logger.warning(
-                    'project %s: unexpected error while shaping its rows — the '
-                    'project is marked offline for this render so the remaining '
-                    'roots still render; this is a BUG, not an outage',
-                    label, exc_info=True,
-                )
-                return _unreached(
-                    root,
-                    'unexpected error while shaping this project (see the '
-                    'WARNING and its traceback)',
-                    SnapshotFailure.UNREACHABLE,
-                )
-        return active, snapshot
-
-    # return_exceptions=False is correct here BECAUSE the broad `except
-    # Exception` above lives INSIDE _one: nothing can escape to the gather, so
-    # there is no exception for it to swallow, and a real escape (a bug in this
-    # assembly code, a CancelledError) must still propagate rather than be
-    # silently converted into a result object.
-    results = await asyncio.gather(*(_one(root) for root in admission_order))
-    # Keyed by ROOT, never by label. `_project_label` is the directory
-    # BASENAME, so two configured roots can share one (``/a/proj`` and
-    # ``/b/proj``) — and a label-keyed dict collapses them, which would extend
-    # the survivor's rows into `all_active` TWICE (duplicate `task_uid`s, the
-    # React tab's map key) and drop the other root's rows entirely. Roots are
-    # deduped by `_all_project_roots`, so this pairing is total and 1:1;
-    # `strict=True` says so rather than trusting it. (`snapshots` below is
-    # label-keyed because the wire addresses projects by label; the collision
-    # costs an ENTRY there, never a row.)
-    by_root = dict(zip(admission_order, results, strict=True))
-
-    # CANONICAL ROOT order — neither completion order nor admission order.
-    # This is the only place the shared accumulators are written.
-    for root in roots:
-        rows, snapshot = by_root[root]
+    all_active: list[dict] = []
+    snapshots: dict[str, TaskSnapshot] = {}
+    served = await _serve_roots_within_budget(
+        config, _share, now=effective_now, deadline=deadline,
+    )
+    # This is the only place the shared accumulators are written, in the
+    # canonical root order the fan-out hands back.
+    for root, rows, snapshot in served:
         if snapshot.rows.value is not None:
             snapshot = replace(snapshot, rows=replace(snapshot.rows, value=rows))
-        snapshots[_project_label(root)] = snapshot
+        snapshots[project_label(root)] = snapshot
         all_active.extend(rows)
 
     if resolve_external:
@@ -1118,43 +1128,39 @@ async def collect_tasks_with_counts(
     return all_active, snapshots
 
 
-async def collect_active_tasks(
+async def collect_census_snapshots(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     *,
     now: datetime | None = None,
-) -> tuple[list[dict], list[str]]:
-    """Collect active tasks across all known projects.
+) -> dict[str, TaskSnapshot]:
+    """Every root's task snapshot with its rows WITHHELD: the census-only render.
 
-    Returns ``(active_tasks, offline_projects)`` where *offline_projects* is
-    the list of project labels whose read DEMONSTRABLY failed.  The handler
-    turns a non-empty *offline_projects* into ``offline: True`` on the
-    dashboard payload.
+    What ``GET /api/v2/dashboard/tasks?projection=census`` serves, and the
+    dashboard chrome's census source on every tab that renders no task rows.
+    Returns an entry, keyed by label, for EVERY configured root, exactly as
+    :func:`collect_tasks_with_counts` does.
 
-    The labels are DERIVED from each root's unit through
-    ``task_snapshot.classify``, not carried alongside it: there is one place
-    that decides what "offline" means, and this narrower contract reads it
-    rather than restating it.
+    It reads the SAME units: ``acquire_snapshot`` under the same 15 s cache,
+    admitted through the same budgeted fan-out (:func:`_serve_roots_within_budget`),
+    so a root's census, its failure kind and therefore its banner are the ones
+    the full render reports for it. What it skips is everything only rows
+    need: the runtime probe, row shaping and the external-dep read.
 
-    *now* is forwarded to ``collect_tasks_with_counts`` so every row's
-    ``started`` derives from a single shared instant; see that function's
-    docstring for details. Defaults to the live clock.
-
-    Lock state is surfaced via the scheduler endpoint — see
-    /api/v2/dashboard/scheduler.
-
-    The whole-handler budget applies here too, but a DEGRADED root is absorbed
-    rather than forwarded: this narrower two-element contract has nowhere to
-    put it, and a degraded project is emphatically NOT offline, so
-    reclassifying it into *offline_projects* would be a lie.  It is still
-    logged at WARNING by ``collect_tasks_with_counts``.  Callers that need to
-    distinguish "unknown" from "reachable and empty" — or that want the census
-    at all — must use ``collect_tasks_with_counts`` directly and read the
-    units.
+    A measured rows half comes back as ``task_snapshot.withhold_rows`` leaves
+    it — an ``unknown`` ``Datum`` naming the projection — so no raw MCP row,
+    which carries the whole ``metadata`` blob, can reach the wire through a
+    caller forgetting to strip it. An unmeasured half keeps its producer's
+    reason.
     """
-    active, snapshots = await collect_tasks_with_counts(client, config, now=now)
-    offline = [
-        label for label, snapshot in snapshots.items()
-        if classify(snapshot) is SnapshotHealth.OFFLINE
-    ]
-    return active, offline
+    effective_now = resolve_now(now)
+    deadline = asyncio.get_running_loop().time() + _TASKS_TOTAL_BUDGET
+
+    async def _share(root: Path) -> tuple[list[dict], TaskSnapshot]:
+        snapshot = await acquire_snapshot(client, config, root, now=effective_now)
+        return [], withhold_rows(snapshot)
+
+    served = await _serve_roots_within_budget(
+        config, _share, now=effective_now, deadline=deadline,
+    )
+    return {project_label(root): snapshot for root, _rows, snapshot in served}

@@ -3,9 +3,9 @@
 THE INVARIANT UNDER TEST
 ────────────────────────
 Every on-disk transcript read reachable from ``_run_subprocess`` —
-``count_transcript_turns`` in the startup-regime poll, in the working-regime
-progress-extension poll, and in the post-kill ``except TimeoutError:`` re-read,
-plus ``read_transcript_records`` on the normal-exit path — must execute on a
+``count_transcript_turns`` in the startup-regime poll and in the working-regime
+progress-extension poll, plus ``read_transcript_records`` in the post-kill
+``except TimeoutError:`` re-read and on the normal-exit path — must execute on a
 worker thread (``asyncio.to_thread``), NOT on the thread running the event loop.
 
 WHY IT MATTERS.  The orchestrator runs every role of every concurrent task on
@@ -172,8 +172,9 @@ def _ident_recorder_growing(recorded: list[int]):
 
 
 def _ident_recorder(recorded: list[int], return_value):
-    """A sync ``count_transcript_turns`` stand-in appending the CALLING thread's
-    ident to *recorded* and returning *return_value*.
+    """A sync transcript-read stand-in (``count_transcript_turns`` or
+    ``read_transcript_records``) appending the CALLING thread's ident to
+    *recorded* and returning *return_value*.
 
     Same closure shape as the existing ``_always_growing_turns`` side-effect
     idiom in ``test_cli_invoke.py``.  Under
@@ -409,31 +410,29 @@ class TestTimeoutPathRereadOffLoop:
     """The one-shot post-kill re-read inside ``_run_subprocess``'s
     ``except TimeoutError:`` handler must run off the loop.
 
-    This read stamps ``transcript_turns`` onto the returned ``_SubprocessResult``,
-    which ``classify_agent_failure`` surfaces in its ``diagnostic_detail`` — so
-    the value must still arrive intact across the thread hop, not just off-loop.
+    This read stamps ``transcript_turns`` (surfaced in
+    ``classify_agent_failure``'s ``diagnostic_detail``) and ``model_id`` onto the
+    returned ``_SubprocessResult`` — so both values must still arrive intact
+    across the thread hop, not just off-loop.
+
+    NOTE ON ISOLATION.  The watchdog polls read through ``count_transcript_turns``,
+    patched here to a fixed 7 so ``seen_turn`` latches on the first poll and the
+    run is killed by the flat ``timeout_seconds`` ceiling.  Because that patch
+    replaces the whole function, every entry recorded by the
+    ``read_transcript_records`` stand-in came from the handler's re-read.
     """
 
     async def test_timeout_path_transcript_reread_runs_off_the_loop_thread(self, tmp_path):
-        """The post-kill re-read runs on a worker thread, and its value still lands.
-
-        The fake returns a fixed sentinel 7 on every call.  7 >= 1 latches
-        ``seen_turn`` on the first poll, so the run is killed by the flat
-        ``timeout_seconds`` ceiling rather than the startup-wedge branch — either
-        route reaches the same ``except TimeoutError:`` handler and its re-read.
-
-        Because the extension params are NOT passed, ``extension_engaged`` stays
-        False and no further poll reads happen after the latch: ``recorded`` is
-        the (off-loop, post-step-2) latching poll plus the handler's re-read, so
-        any loop-thread ident in it can only have come from the handler.
-        """
+        """The post-kill re-read runs on a worker thread, ONCE, and both derived
+        signals still fall out of the thread-returned list."""
         loop_ident = threading.get_ident()
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
 
         proc, _ = _make_hanging_proc()
-        recorded: list[int] = []
+        handler_reads: list[int] = []
+        records = [{'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}}] * 7
 
         with (
             patch(
@@ -441,9 +440,10 @@ class TestTimeoutPathRereadOffLoop:
                 side_effect=_fake_exec_returning(proc),
             ),
             patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=7),
             patch(
-                'shared.cli_invoke.count_transcript_turns',
-                side_effect=_ident_recorder(recorded, 7),
+                'shared.cli_invoke.read_transcript_records',
+                side_effect=_ident_recorder(handler_reads, records),
             ),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):
@@ -454,16 +454,22 @@ class TestTimeoutPathRereadOffLoop:
             )
 
         assert result.timed_out is True, 'Expected the ceiling kill to fire'
-        assert result.transcript_turns == 7, (
-            f'The one-shot re-read must still execute and its value still reach the '
-            f'_SubprocessResult stamp across the thread hop; got '
-            f'transcript_turns={result.transcript_turns}'
+        assert len(handler_reads) == 1, (
+            f'Expected exactly ONE post-kill transcript read feeding both stamped '
+            f'signals; got {len(handler_reads)} read(s).'
         )
-        assert loop_ident not in recorded, (
-            f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — the '
+        assert loop_ident not in handler_reads, (
+            f'read_transcript_records ran on the event-loop thread ({loop_ident}) — the '
             f'post-kill re-read in the except-TimeoutError handler blocks the shared '
             f'loop. '
-            f'Recorded idents: {sorted(set(recorded))}'
+            f'Recorded idents: {sorted(set(handler_reads))}'
+        )
+        assert result.transcript_turns == 7, (
+            f'Expected the assistant-turn count derived from the thread-returned list, '
+            f'got transcript_turns={result.transcript_turns}'
+        )
+        assert result.model_id == 'claude-sonnet-5', (
+            f'Expected the served model id derived from the same list, got {result.model_id!r}'
         )
 
     async def test_timeout_path_skips_read_when_session_id_missing(self, tmp_path):
@@ -490,6 +496,10 @@ class TestTimeoutPathRereadOffLoop:
             patch(
                 'shared.cli_invoke.count_transcript_turns',
                 side_effect=_ident_recorder(recorded, 7),
+            ),
+            patch(
+                'shared.cli_invoke.read_transcript_records',
+                side_effect=_ident_recorder(recorded, []),
             ),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):

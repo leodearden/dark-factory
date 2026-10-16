@@ -30,6 +30,9 @@ from _orch_helpers import make_placeholder_future
 from test_verify_merge_flake_suppression import _module_config
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore
+from orchestrator.merge_lane import MergeOutcome
+from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
 from orchestrator.merge_queue import (
     GroupMergeRequest,
     MergeRequest,
@@ -469,6 +472,8 @@ class TestRecoverPendingMerges:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # --- queue assertions ---
@@ -567,6 +572,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # Exactly ONE enqueued winner; the duplicate coalesced.
@@ -607,6 +614,43 @@ class TestRecoverPendingMergesRegistryDedup:
         assert req2.request_id not in remaining_ids, 'loser must be store.remove()d'
         assert req1.request_id in remaining_ids, 'winner stays journaled'
 
+    async def test_attached_loser_resolves_to_the_winner_after_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """The recovery loser never gets a merge_finalized row of its own, so the
+        winner's row lists it and a fresh run still resolves it (task 4830,
+        PRD plans/merge-status-durable-non-landed-prd.md boundary row B7)."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req1 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        req2 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        store.record(req1)
+        store.record(req2)
+
+        report = await recover_pending_merges(
+            store, asyncio.Queue(), self._make_git_ops(full_branch='task/5326'),
+            config, event_store=EventStore(tmp_path / 'runs.db', 'run-1'),
+            main_branch='main', branch_prefix='task/',
+            registry=InFlightMergeRegistry(),
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
+        )
+        assert report['coalesced'] == 1
+
+        report['requests'][0].result.set_result(MergeOutcome('blocked', reason='r'))
+        await asyncio.sleep(0)
+
+        row = EventStore(tmp_path / 'runs.db', 'run-2').merge_finalized_absorbing(
+            req2.request_id, cross_run=True,
+        )
+        assert row is not None
+        assert (row['request_id'], row['state'], row['is_current_run']) == (
+            req1.request_id, 'blocked', False,
+        )
+
     async def test_descendant_wins_ancestor_first(self, tmp_path: Path) -> None:
         """Journal order [ancestor, descendant] → the DESCENDANT is enqueued (REPLACE)."""
         config = _real_config(tmp_path)
@@ -628,6 +672,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -659,6 +705,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -709,6 +757,8 @@ class TestRecoverPendingMergesRegistryDedup:
             report = await recover_pending_merges(
                 store, queue, git_ops, config, event_store=None,
                 main_branch='main', branch_prefix='task/', registry=registry,
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert queue.qsize() == 1
@@ -750,6 +800,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/',
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 2, (
@@ -803,6 +855,8 @@ class TestRecoverPendingMergesRegistryDedup:
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/',
             registry=registry, retention=_FakeRetention(),
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # Nothing enqueued — both recovered records coalesced onto the entry.
@@ -957,6 +1011,8 @@ class TestRecoverPendingMergesCorruptSignal:
                 event_store=None,
                 main_branch='main',
                 branch_prefix='task/',
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert report.get('journal_corrupt') is True, (
@@ -993,6 +1049,8 @@ class TestRecoverPendingMergesCorruptSignal:
                 event_store=None,
                 main_branch='main',
                 branch_prefix='task/',
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert report.get('journal_corrupt') is False, (
@@ -1155,6 +1213,8 @@ class TestRecoverPendingMergesPrefixedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # --- live branch: re-enqueued, NOT dropped ---
@@ -1248,6 +1308,8 @@ class TestRecoverPendingMergesPrefixedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
@@ -1363,6 +1425,8 @@ class TestRecoverPendingMergesTypedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'

@@ -20,6 +20,7 @@ from dashboard.data.metrics import (
     get_memory_sparks,
     get_queue_pending_series,
 )
+from dashboard.data.utils import resolve_now
 
 router = APIRouter()
 
@@ -40,12 +41,13 @@ _MEMORY_ENDPOINT_TIMEOUT_SECONDS = 5.0
 
 @router.get('/api/v2/dashboard/memory')
 async def api_memory(request: Request) -> JSONResponse:
-    """MEMORY_STATUS, including queue counts and per-project totals."""
+    """MEMORY_STATUS, including the write-queue Datum and per-project totals."""
     http_client = request.app.state.http_client
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     metrics_db = await pool.get(config.metrics_db)
-    status, queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
+    render_at = resolve_now(None)
+    status, raw_queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
         memory_data.get_memory_status(
             http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
         ),
@@ -59,10 +61,14 @@ async def api_memory(request: Request) -> JSONResponse:
             http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
         ),
     )
+    # Resolved AFTER the fan-out, as api/merge_queue.py::api_merge_queue
+    # does: every as_of above was stamped at or before this instant.
+    served_at = resolve_now(None)
     return JSONResponse(
         redux_api.shape_memory(
             status,
-            queue,
+            memory_data.write_queue_datum(raw_queue, measured_at=render_at),
+            served_at=served_at,
             sparks=sparks,
             queue_spark=queue_spark,
             delta_24h=delta_24h,

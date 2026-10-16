@@ -23,11 +23,7 @@ clone some of these helpers; task 5172 owns folding them in.
 This module follows the flat-helper convention ``_merge_queue_harness.py``
 documents: conftest.py puts the tests dir on ``sys.path``, so consumers import
 it by bare module name, and the leading underscore keeps pytest from collecting
-it.  The same underscore also takes it out of
-``fused-memory/scripts/check_bare_magicmock_config.py``'s scan, which discovers
-``test_*.py`` and ``conftest.py`` only; task 5269 owns widening that.  Until
-then, hand-audit the mock factories here, and prefer a real ``VerifyResult`` or
-``_make_config(...)`` to a ``MagicMock``.
+it.
 
 CRITICAL: every ``merge_queue`` MODULE-LEVEL function is reached as
 ``_mq.<name>``, resolved on the live module at call time, never through a

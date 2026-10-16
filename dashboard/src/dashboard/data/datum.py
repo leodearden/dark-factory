@@ -19,9 +19,9 @@ the clock says when the validator happens to run.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Generic, Protocol, TypeVar, runtime_checkable
+from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar('T')
 
@@ -140,12 +140,18 @@ class DatumInvariant(enum.StrEnum):
 
     Carried as a structured field so a caller recovers WHICH rule broke
     without parsing the message — the message is free to be reworded.
+
+    ``DATUM_REQUIRED`` is a payload's rule rather than the envelope's: a field
+    the payload declares as a ``Datum`` holds one. A shaper raises it instead
+    of inventing an ``unknown`` placeholder, because a field its route never
+    filled is a wiring bug, not a measurement.
     """
 
     UNKNOWN_TRIAD = 'unknown_triad'
     TZ_AWARE = 'tz_aware'
     REASON_REQUIRED = 'reason_required'
     FRESHNESS_BOUND = 'freshness_bound'
+    DATUM_REQUIRED = 'datum_required'
 
 
 class DatumContractError(ValueError):
@@ -158,6 +164,16 @@ class DatumContractError(ValueError):
     def __init__(self, invariant: DatumInvariant, message: str) -> None:
         super().__init__(message)
         self.invariant = invariant
+
+
+def unknown_datum(reason: str, freshness_bound_seconds: int) -> Datum[Any]:
+    """A datum with no measurement: no value, no ``as_of``, and *reason* saying why.
+
+    The one constructor of the ``unknown`` triad, so every producer builds it
+    the way :func:`validate_datum` checks it. ``datum.js``'s ``unknownDatum``
+    is its client twin.
+    """
+    return Datum(None, None, DatumState.UNKNOWN, reason, freshness_bound_seconds)
 
 
 def validate_datum(datum: Datum, served_at: datetime) -> None:
@@ -233,3 +249,30 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
                 f'freshness_bound_seconds={datum.freshness_bound_seconds!r}, '
                 f'as_of={datum.as_of!r}, served_at={served_at!r}',
             )
+
+
+def aged_at(datum: Datum[T], served_at: datetime) -> Datum[T]:
+    """*datum* as it reads at *served_at*: ``stale`` once past its freshness bound.
+
+    A producer stamps a measurement once, and a cache or a slow fan-out can
+    carry it past its bound before a payload carrying it is served. That is
+    a fact about the serving instant, not a producer bug, so the datum is
+    re-read here rather than reaching :func:`validate_datum` still claiming to
+    be fresh: same value, same ``as_of``, and a reason naming its age. A datum
+    that is already anything but ``fresh`` keeps its producer's own reason.
+
+    Pure, and *served_at* is injected, so this module still reads no clock.
+    """
+    if datum.state is not DatumState.FRESH or datum.as_of is None:
+        return datum
+    age = (served_at - datum.as_of).total_seconds()
+    if age <= datum.freshness_bound_seconds:
+        return datum
+    return replace(
+        datum,
+        state=DatumState.STALE,
+        reason=(
+            f'measured {int(age)}s before it was served, past the '
+            f'{datum.freshness_bound_seconds}s freshness bound'
+        ),
+    )

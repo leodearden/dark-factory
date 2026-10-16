@@ -7,14 +7,17 @@ would otherwise terminalise silently in :class:`TicketStore`. The janitor
 runs on a fixed interval, batches such failures by
 ``(project_id, task_id, escalation_id)``, and submits one info-severity
 ``ticket_failure`` escalation per batch so the next steward loop can re-stamp
-metadata and retriage if it chooses.
+metadata and retriage if it chooses. It also emits a second kind of
+escalation, a blocking ``infra_issue`` for the curator dedup-outage signature
+(see ``plans/curator-dedup-outage-2026-08-15-rca.md``).
 
 Routing parallels :mod:`curator_escalator`:
 
 * Per-project :class:`EscalationQueue` instances built lazily.
-* Orchestrator liveness probed via ``flock(LOCK_SH | LOCK_NB)`` on
-  ``{project_root}/data/orchestrator/orchestrator.lock``. No live orchestrator
-  → log + retry on the next tick (failures stay flagged until somebody runs).
+* Orchestrator liveness via
+  ``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``.
+  No live orchestrator → log + retry on the next tick (failures stay flagged
+  until somebody runs).
 * Per-group rolling cooldown to prevent escalation storms when the curator
   flaps. When the cooldown suppresses a fresh group, the rows still get
   ``escalated_at`` stamped — accepted loss-of-signal in exchange for no spam.
@@ -31,22 +34,26 @@ Notes:
 
 from __future__ import annotations
 
-import fcntl
+import asyncio
 import json
 import logging
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from pathlib import Path
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from shared.project_layout import escalation_queue_dir
+
 from fused_memory.models.scope import build_known_projects_map
+from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    from fused_memory.middleware.ticket_store import TicketStore
+    from fused_memory.config.schema import DedupOutageDetectorConfig
+    from fused_memory.middleware.ticket_store import DedupHealth, TicketStore
 
 # Match curator_escalator's defensive import so the janitor degrades to a
 # log-only no-op in minimal envs without the escalation package.
@@ -59,9 +66,6 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-
-_LOCK_FILENAME = 'data/orchestrator/orchestrator.lock'
-_QUEUE_DIRNAME = 'data/escalations'
 
 # Sentinel project_id used when the candidate_json is unparseable, so we can
 # still group those rows and emit a single escalation for the batch.
@@ -79,36 +83,19 @@ _NO_ESCALATION = '_no_escalation_'
 # escalation_id) triples derived from candidate metadata.
 _PROBE_DEFECT = '_probe_defect_'
 
+# Cooldown-key sentinel for dedup-outage escalations, in the same style.
+_DEDUP_OUTAGE = '_dedup_outage_'
 
 
-def _orchestrator_running(project_root: str) -> bool:
-    """Return True if the project's orchestrator holds its exclusive lock.
+def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool:
+    """True when a window holds enough curated tickets, none combined, resolved implausibly fast."""
+    return (
+        health.resolved >= cfg.min_samples
+        and health.combined == 0
+        and health.median_resolve_seconds is not None
+        and health.median_resolve_seconds <= cfg.max_median_resolve_seconds
+    )
 
-    Mirrors :meth:`CuratorEscalator._orchestrator_running` so the janitor
-    does not double-escalate when no orchestrator is around to handle the
-    queue.
-    """
-    lock_path = Path(project_root) / _LOCK_FILENAME
-    if not lock_path.exists():
-        return False
-    try:
-        fd = lock_path.open('rb')
-    except OSError:
-        return False
-    try:
-        try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        except OSError as exc:
-            import errno
-            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                return True
-            raise
-        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-        return False
-    finally:
-        fd.close()
 
 
 class TicketJanitor:
@@ -151,8 +138,11 @@ class TicketJanitor:
         signal_ticket_resolved: Callable[[str], None] | None = None,
         known_projects: dict[str, str] | None = None,
         probe_defect_threshold: int = 3,
+        dedup_outage: DedupOutageDetectorConfig | None = None,
     ) -> None:
         self._store = store
+        # None (the default) leaves the dedup-outage detector off.
+        self._dedup_outage_cfg = dedup_outage
         self._cooldown_secs = cooldown_secs
         self._batch_limit = batch_limit
         self._primary_root = primary_project_root
@@ -198,7 +188,7 @@ class TicketJanitor:
     def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(escalation_queue_dir(project_root))
             self._queues[project_root] = q
         return q
 
@@ -232,21 +222,84 @@ class TicketJanitor:
                 'parseable': False,
             }
 
-    def _cooldown_blocks(self, key: tuple[str, str, str], now: float) -> bool:
-        """Return True if this group has escalated within the cooldown window."""
-        cutoff = now - self._cooldown_secs
+    def _cooldown_blocks(
+        self,
+        key: tuple[str, str, str],
+        now: float,
+        cooldown_secs: float | None = None,
+    ) -> bool:
+        """Return True if this group has escalated within the cooldown window.
+
+        *cooldown_secs* overrides the janitor-wide cooldown for this key.
+        """
+        cutoff = now - (self._cooldown_secs if cooldown_secs is None else cooldown_secs)
         log = [t for t in self._escalation_log[key] if t >= cutoff]
         self._escalation_log[key] = log
         return bool(log)
 
-    def _surface_probe_defect(self, pid: str, count: int) -> None:
+    async def _submit_infra_escalation(
+        self, pid: str, *, severity: str, summary: str, detail: str,
+    ) -> bool:
+        """Route one janitor ``infra_issue`` escalation to *pid*'s queue.
+
+        The routing ladder used by tick() step 4:
+        HAS_ESCALATION → _known_projects → is_orchestrator_lock_held → submit.
+        Returns True only on a successful ``queue.submit``. A caller records its
+        rate limit only on True, so every bail-out (no escalation package,
+        unresolved root, no orchestrator, submit failure) retries next tick.
+        """
+        if not HAS_ESCALATION:
+            logger.warning(
+                'ticket_janitor: escalation package unavailable; not surfaced '
+                'for %s: %s', pid, summary,
+            )
+            return False
+
+        project_root = self._known_projects.get(pid)
+        if project_root is None:
+            logger.warning(
+                'ticket_janitor: cannot resolve project_root for %s; not '
+                'surfaced: %s', pid, summary,
+            )
+            return False
+
+        if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
+            logger.info(
+                'ticket_janitor: orchestrator not running for %s; will retry '
+                'on next tick: %s', pid, summary,
+            )
+            return False
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('ticket-janitor'),
+            task_id='task-curator',
+            agent_role='fused-memory/ticket-janitor',
+            severity=severity,
+            category='infra_issue',
+            level=1,
+            summary=summary,
+            detail=detail,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.warning(
+                'ticket_janitor: failed to submit infra escalation for %s; '
+                'will retry next tick: %s', pid, summary,
+            )
+            return False
+        logger.warning(
+            'ticket_janitor: surfaced infra escalation %s for %s: %s',
+            escalation.id, pid, summary,
+        )
+        return True
+
+    async def _surface_probe_defect(self, pid: str, count: int) -> None:
         """Surface an infra_issue escalation when the liveness probe has raised consecutively.
 
-        Mirrors the routing guard ladder used by tick() step 4:
-        cooldown → HAS_ESCALATION → _known_projects → _orchestrator_running → submit.
-        Bail-out branches (no orchestrator / unresolved root / submit failure) do NOT
-        record the cooldown so the next tick retries — identical to the ticket_failure
-        flow.  Only a successful queue.submit records the cooldown timestamp.
+        Only a successful submit records the cooldown timestamp and resets the
+        per-project counter; see :meth:`_submit_infra_escalation`.
         """
         now = time.monotonic()
         key = (pid, _PROBE_DEFECT, _PROBE_DEFECT)
@@ -257,36 +310,9 @@ class TicketJanitor:
             )
             return
 
-        if not HAS_ESCALATION:
-            logger.warning(
-                'ticket_janitor: probe defect for %s (count=%d) but escalation '
-                'package unavailable; defect not surfaced', pid, count,
-            )
-            return
-
-        project_root = self._known_projects.get(pid)
-        if project_root is None:
-            logger.warning(
-                'ticket_janitor: probe defect for %s (count=%d) but cannot '
-                'resolve project_root; unable to surface escalation', pid, count,
-            )
-            return
-
-        if not _orchestrator_running(project_root):
-            logger.info(
-                'ticket_janitor: probe defect for %s (count=%d) but orchestrator '
-                'not running; will retry on next tick', pid, count,
-            )
-            return
-
-        queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('ticket-janitor'),
-            task_id='task-curator',
-            agent_role='fused-memory/ticket-janitor',
+        submitted = await self._submit_infra_escalation(
+            pid,
             severity='info',
-            category='infra_issue',
-            level=1,
             summary=(
                 f'liveness probe raised {count} consecutive time(s) for '
                 f'project {pid}; pending tickets may be silently stranded'
@@ -300,25 +326,59 @@ class TicketJanitor:
                 ),
             }),
         )
-        try:
-            queue.submit(escalation)
-        except Exception:
-            logger.warning(
-                'ticket_janitor: failed to submit probe-defect escalation for '
-                'project %s (count=%d); will retry next tick', pid, count,
-            )
+        if not submitted:
             return
 
-        # Record in the cooldown log only after a successful submit.
         self._escalation_log[key].append(now)
         # Reset the per-project counter so the next post-cooldown escalation
         # reports failures-since-last-surface rather than failures-since-start.
         self._probe_failures.pop(pid, None)
-        logger.warning(
-            'ticket_janitor: surfaced probe-defect escalation %s for '
-            'project %s (consecutive probe raises: %d)',
-            escalation.id, pid, count,
+
+    async def _check_dedup_outage(self, cfg: DedupOutageDetectorConfig) -> None:
+        """Escalate each known project whose recent tickets show the dedup-outage signature.
+
+        Rate-limited per project on ``cfg.window_seconds``, so a sustained
+        outage yields at most one escalation per window of fresh evidence.
+        """
+        for pid in self._known_projects:
+            try:
+                await self._check_project_dedup_outage(pid, cfg)
+            except Exception:
+                logger.exception('ticket_janitor: dedup-outage check failed for %s', pid)
+
+    async def _check_project_dedup_outage(
+        self, pid: str, cfg: DedupOutageDetectorConfig,
+    ) -> None:
+        since = datetime.now(UTC) - timedelta(seconds=cfg.window_seconds)
+        health = await self._store.dedup_health(pid, since=since)
+        if not is_dedup_outage(health, cfg):
+            return
+        now = time.monotonic()
+        key = (pid, _DEDUP_OUTAGE, _DEDUP_OUTAGE)
+        if self._cooldown_blocks(key, now, cooldown_secs=cfg.window_seconds):
+            return
+        median = health.median_resolve_seconds
+        submitted = await self._submit_infra_escalation(
+            pid,
+            severity='blocking',
+            summary=(
+                f'curator dedup outage signature for project {pid}: '
+                f'{health.resolved} tickets resolved, {health.combined} combined, '
+                f'median resolve {median:.1f}s'
+            ),
+            detail=json.dumps({
+                'project_id': pid,
+                'window_seconds': cfg.window_seconds,
+                'resolved': health.resolved,
+                'combined': health.combined,
+                'median_resolve_seconds': median,
+                'top_create_reasons': [
+                    [reason, count] for reason, count in health.top_create_reasons
+                ],
+            }),
         )
+        if submitted:
+            self._escalation_log[key].append(now)
 
     async def tick(self) -> None:
         """One janitor pass.
@@ -350,7 +410,7 @@ class TicketJanitor:
                     self._probe_failures[pid] += 1
                     if self._probe_failures[pid] >= self._probe_defect_threshold:
                         try:
-                            self._surface_probe_defect(pid, self._probe_failures[pid])
+                            await self._surface_probe_defect(pid, self._probe_failures[pid])
                         except Exception:
                             logger.exception(
                                 'ticket_janitor: _surface_probe_defect raised for %s', pid,
@@ -401,6 +461,11 @@ class TicketJanitor:
                 for _stale_pid in _stale:
                     self._probe_failures.pop(_stale_pid, None)
 
+        # 1b) the dedup-outage detector, fault-isolated per project.
+        cfg = self._dedup_outage_cfg
+        if cfg is not None and cfg.enabled:
+            await self._check_dedup_outage(cfg)
+
         # 2) collect rows that haven't been escalated yet
         try:
             rows = await self._store.fetch_unescalated_failures(
@@ -449,7 +514,7 @@ class TicketJanitor:
                 )
                 continue
 
-            if not _orchestrator_running(project_root):
+            if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
                 logger.info(
                     'ticket_janitor: orchestrator not running for project %s; '
                     'leaving %d ticket(s) for retry on next tick',
@@ -529,8 +594,6 @@ class TicketJanitor:
 
     async def run_loop(self, interval_seconds: float) -> None:
         """Long-running tick loop. Cancellation is the only exit path."""
-        import asyncio
-
         while True:
             try:
                 await asyncio.sleep(interval_seconds)

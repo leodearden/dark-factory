@@ -291,14 +291,14 @@ class TestRunVerificationEnvRecovery:
     async def test_env_transient_recovery_logs_addopts_clearing_note(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
-        """Amendment regression (reviewer_comprehensive robustness_false_signal,
-        verify.py:637): serial_pytest's `-o addopts=` clears ALL
-        pyproject addopts, not just `-n auto` — including any marker filters
-        (e.g. `-m 'not integration'`) — so the single recovery run can
-        exercise a materially different test selection than the original.
-        At minimum this must be observable in the log so an operator
-        investigating a recovery-path result knows a broader test selection
-        may have run.
+        """The recovery WARNING shows the addopts the recovery run applies.
+
+        serial_pytest's `-o addopts=<value>` replaces the ini addopts, and a
+        blank one lets the recovery run exercise a broader test selection than
+        the original. The WARNING carries the recovered command itself, so an
+        operator investigating a recovery-path result reads which addopts it
+        ran under (task 5079; originally reviewer_comprehensive
+        robustness_false_signal).
         """
         import logging
 
@@ -318,11 +318,11 @@ class TestRunVerificationEnvRecovery:
         assert result.passed is True
         addopts_warnings = [
             r for r in caplog.records
-            if 'shared-venv transient' in r.getMessage() and 'addopts' in r.getMessage()
+            if 'shared-venv transient' in r.getMessage() and '-o addopts=' in r.getMessage()
         ]
         assert addopts_warnings, (
-            f'Expected the recovery WARNING to mention addopts/marker-filter '
-            f'clearing; got: {[r.getMessage() for r in caplog.records]}'
+            f'Expected the recovery WARNING to carry the recovered command and '
+            f'its -o addopts= value; got: {[r.getMessage() for r in caplog.records]}'
         )
 
     @pytest.mark.asyncio

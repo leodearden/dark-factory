@@ -8,10 +8,10 @@ without conflicting with sibling subprojects' conftests under
 import asyncio
 import itertools
 import json
-import logging
 import os
 import shutil
 import sys
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -80,7 +80,6 @@ from df_pytest_isolation import (  # noqa: E402
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
-from orchestrator import merge_queue  # noqa: E402
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
@@ -90,18 +89,20 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
+from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
+from orchestrator.merge_lane import worker  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_queue was imported (by another conftest/plugin) before
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
-merge_queue._DEBUG_ASSERTS = True
+worker._DEBUG_ASSERTS = True
 
 track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _drain_leaked_tasks():
+async def _drain_leaked_tasks(_no_unexpected_exit_contract_violation):
     """Cancel every task a test left pending, then wait, before its loop closes.
 
     A task cancelled between spawning a subprocess and connecting its pipes
@@ -110,6 +111,9 @@ async def _drain_leaked_tasks():
     delivers exactly one, and hung on it. This cancel is the first of the two
     such a task needs, and the bounded wait lets it land before ``Runner.close``
     throws the second. Pinned end to end by test_leaked_task_drain.py.
+    Requesting ``_no_unexpected_exit_contract_violation`` keeps that guard
+    tearing down AFTER this drain, so a leaked run() that exits while being
+    cancelled is judged against the test that leaked it.
     """
     yield
     own = asyncio.current_task()
@@ -122,7 +126,7 @@ async def _drain_leaked_tasks():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reap_leaked_merge_workers(_drain_leaked_tasks):
-    """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
+    """Gracefully stop any merge worker orphaned onto the test event loop (task 1907).
 
     A merge-queue test that raises before its own ``await worker.stop()`` leaks
     the worker's ``run()`` task and its background loops, which do real ``git``
@@ -314,17 +318,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     ``dark-factory-orchestrator.yaml`` (absolute path) so tests load the
     operational config deterministically, independent of the process CWD.
 
-    Config source (task 2719): previously this fixture *deleted*
-    ORCH_CONFIG_PATH and relied on ``settings_customise_sources`` falling back
-    to the *relative* ``Path('config.yaml')`` — which, under ``cd orchestrator
-    && pytest`` (how the per-subproject test command invokes us), resolved via
-    the ``orchestrator/config.yaml`` symlink to the operational config.  That
-    transitional symlink was retired, so we now pin the absolute canonical path
-    explicitly.  It is byte-identical to the removed symlink's target, so the
-    operational values every test relies on (e.g. ``lock_depth``,
-    ``merge_verify_breadth='full'``) are unchanged; the absolute path is also
-    CWD-independent, so the config no longer depends on running from
-    ``orchestrator/``.
+    Config source (task 2719): the absolute path (not the retired relative
+    ``config.yaml`` symlink) keeps the operational values every test relies on
+    (e.g. ``lock_depth``, ``merge_verify_breadth='full'``) CWD-independent.
 
     project_root isolation (the other load-bearing part): any test that builds a
     bare ``OrchestratorConfig()`` and drives ``acquire_next`` writes
@@ -333,10 +329,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     state.  Pin ``project_root`` (via the ``ORCH_`` env prefix) to this test's
     ``tmp_path`` so those writes land in tmp instead.
 
-    Precedence keeps this safe: ``init_settings`` (explicit ``project_root=...``
-    kwargs) still win over the env, and ``env_settings`` only overrides
-    ``project_root`` — every other field still loads from config.yaml/defaults,
-    so tests that depend on config values (e.g. lock_depth) are unaffected.
+    Precedence keeps this safe: explicit kwargs still win over the env, which overrides
+    only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
+    (task 5053) and ``verify_use_cgroup_scope`` (task 5206), so a bare config never
+    ssh's the laptop or spawns a real systemd scope; all else loads from yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
@@ -345,6 +341,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
+    monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
+    monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
 
 
 @pytest.fixture
@@ -380,6 +379,9 @@ def code_default_config(monkeypatch, tmp_path):
     rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+    monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_USE_CGROUP_SCOPE", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
@@ -497,13 +499,8 @@ def _no_unexpected_exit_contract_violation(request):
     of ``real_verify_admission`` above: only for a test that DELIBERATELY
     drives a violation.
     """
-    collector = ExitContractViolationCollector()
-    contract_logger = logging.getLogger('orchestrator.exit_contract')
-    contract_logger.addHandler(collector)
-    try:
+    with ExitContractViolationCollector.listening() as collector:
         yield
-    finally:
-        contract_logger.removeHandler(collector)
     if not collector.violations:
         return
     if request.node.get_closest_marker('exit_contract_violation_expected') is not None:
@@ -661,7 +658,7 @@ def forbid_live_mcp(monkeypatch):
     NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
     ``mcp_call`` via ``from ... import``, a distinct binding from the
     canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
-    ``orchestrator.agents.briefing.mcp_call``).  Every alias, however,
+    ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
     network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
     one-shot fallback path inside ``mcp_call``, since the module-global
@@ -751,7 +748,7 @@ def _restore_sandbox_backend():
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
-    """Clear verify._PROBE_CACHE (and its sibling _BASELINE_FAILING_IDS_CACHE)
+    """Reset verify's main-probe caches (``verify.clear_main_probe_caches``)
     before and after every test.
 
     ``verify_failure_is_preexisting_on_main`` stores results in the
@@ -762,12 +759,12 @@ def _clear_probe_cache():
     short-circuits the probe path in the later test — causing it to skip
     worktree creation / cleanup and return the wrong result.
 
-    ``_BASELINE_FAILING_IDS_CACHE`` (task μ, verify-scope-inversion-prd.md) is
-    the sibling per-main-SHA failing-test-id baseline cache keyed on
-    ``main_sha`` alone — the same cross-test-pollution hazard applies (an
-    earlier test's seeded/probed baseline for a reused MAIN_SHA would
-    silently serve a later test's ``main_baseline_failing_ids`` call from
-    cache instead of exercising its own probe/seed path).
+    The per-main-SHA failing- and skipped-test-id baselines (task μ,
+    verify-scope-inversion-prd.md; task 3226) are keyed on ``main_sha`` alone
+    — the same cross-test-pollution hazard applies (an earlier test's
+    seeded/probed baseline for a reused MAIN_SHA would silently serve a later
+    test's ``main_baseline_failing_ids`` call from cache instead of
+    exercising its own probe/seed path).
 
     Clearing the caches before *and* after each test ensures:
     - every test starts with empty caches regardless of prior teardown;
@@ -778,26 +775,37 @@ def _clear_probe_cache():
 
     **Maintainer note — adding new verify.py process-globals:**
     If ``orchestrator/src/orchestrator/verify.py`` gains additional
-    module-level caches (e.g. a sibling result cache), add a matching
-    ``.clear()`` call here so they are also reset between tests.  The
-    relevant globals are defined near ``_PROBE_CACHE``/``_PROBE_CACHE_TTL``
-    and ``_BASELINE_FAILING_IDS_CACHE``.
+    module-level caches (e.g. a sibling result cache), clear them in
+    ``verify.clear_main_probe_caches`` — the single reset this fixture calls
+    — so they are also reset between tests.
     """
     from orchestrator import verify
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
     yield
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_merge_provenance(tmp_path_factory):
+    """Start every test with MergeProvenance on a fresh, empty landed outbox.
+
+    MergeProvenance is process-global, and every lane built over a real repo
+    binds its own outbox there (SpeculativeMergeWorker.__init__) with nothing
+    to unbind it, so a row one test's lane recorded would answer a later test's
+    lookup in the same worker (task 5034). The file is never created unless
+    something records through the facade.
+    """
+    basetemp = tmp_path_factory.getbasetemp()
+    MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
 
 
 @pytest.fixture(autouse=True)
 def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
-    MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
-    internal calls; tests that create a live MergeWorker need this patched or
-    pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
+    A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
+    orchestrator.merge_queue.run_scoped_verification on every call; tests that run
+    one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
 
@@ -935,18 +943,18 @@ def make_steward(tmp_path: Path):
       serve exactly one consumer.  That factory instead adopted this one's
       ``project_root`` recipe directly (task 3551), so the sandbox invariant is
       shared even though the construction is not;
-    * a THIRD sanctioned site exists, which the lineage had missed:
-      ``test_verdict_servers_integration_gate.py``'s
-      ``_build_steward_for_triage``, added by task 2488 AFTER the 3514
-      consolidation.  It takes a REAL ``OrchestratorConfig`` and a real on-disk
-      meta-root, which this fixture's ``spec_set`` ``MagicMock`` cannot supply;
-      whether to grow a ``config=`` passthrough for it is filed as a follow-up,
-      not decided here.
+    * ``test_verdict_servers_integration_gate.py``'s ``_build_steward_for_triage``
+      (task 2488, after 3514) was FOLDED onto this fixture by task 4452 with NO
+      ``config=`` passthrough: its real config was only needed for
+      ``config.routing.*``, which ``stamp_stock_routing_config`` supplies, and its
+      meta-root pre-init is test-side seeding (``triage_steward``).  A passthrough
+      is a second mode with no consumer; add one only when a caller needs a real
+      config's VALUES, not just its routing containers.
 
     ENFORCEMENT, so the ruling is checkable rather than merely asserted in prose
     a fourth time: ``test_steward_scaffolding_guards.py`` censuses every steward
     construction in this tree against an allowlist that carries the reason for
-    each.  A fourth idiom cannot appear silently — its author must either use
+    each.  Another idiom cannot appear silently — its author must either use
     this fixture or record why they cannot.  That module also owns the
     recurrence guard for the sandboxed-``project_root`` block; the assertion
     itself is ``_orch_helpers.assert_sandboxed_project_root``, which the

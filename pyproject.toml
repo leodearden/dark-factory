@@ -79,7 +79,7 @@ asyncio_mode = "auto"
 #   (a) scripts/orchestrator.yaml's test_command is `uv run --project shared
 #       pytest tests/scripts/ scripts/tests/ ... -n auto --dist loadgroup`, run
 #       from the repo root. MEASURED: those args report `rootdir: <repo>`,
-#       `configfile: pyproject.toml`, `timeout: 540.0s`. So THIS config is what
+#       `configfile: pyproject.toml`, `timeout: 420.0s`. So THIS config is what
 #       a 32-worker merge-gate leg resolves.
 #   (b) verify.py::_with_pytest_numprocesses_str appends
 #       `-n <verify_admission_pytest_n>` — "8" in dark-factory-orchestrator.yaml
@@ -94,14 +94,14 @@ asyncio_mode = "auto"
 # escalation/pyproject.toml record themselves measured green under exactly those
 # flags (task 5408) — not because anything rooted here is serial. NOT flipped to
 # `thread`, and that trade is not reopened here: it lives once, in
-# fused-memory/pyproject.toml's own timeout_method block.
+# tests/scripts/test_timeout_method_policy.py.
 #
 # The VALUE's provenance is
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md; the RATIONALE for the
 # setting existing at all is shared/pyproject.toml's block. Neither is restated
 # here. Every pytest config in the repo carries the same value — enforced by
 # tests/scripts/test_pytest_per_test_timeout_policy.py.
-timeout = 540
+timeout = 420
 timeout_method = "signal"
 
 # ── ruff: the rule set for everything OUTSIDE a workspace member ──────────────

@@ -39,6 +39,10 @@ import pytest
 from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
+from fused_memory.reconciliation.prompts import (
+    FLAG_FOR_STAGE2_MARKER_KIND,
+    STAGE2_SUPPRESS_GUARD_KIND,
+)
 from fused_memory.server import tools, write_triage
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
@@ -63,6 +67,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, TruncationFact
 
 _PROJECT_ID = 'dark_factory'
 
@@ -1053,8 +1058,11 @@ class TestC1HoldsEndToEnd:
         the one a reasonable implementation is most tempted to act on — by
         editing, retracting or flagging the parent record itself. Triage
         DETECTS, it does not adjudicate (D3): the contradiction is recorded as
-        a flagged child and the canonical is left exactly as it was, for the
-        existing gate machinery and a human to settle.
+        a flagged child and the canonical is left exactly as it was. Nothing
+        adjudicates that child; its readers surface it, as grouped_read keeps
+        it a full search hit and
+        `orchestrator/src/orchestrator/agents/memory_recall.py::render_memory_results`
+        renders it in the briefing naming its parent.
         """
         _install_counter(monkeypatch)
         scenarios = [
@@ -1501,6 +1509,59 @@ class TestEveryWiredAttachKindReachesThePersistedChild:
         assert counter.live_count() == 0, 'a wired attach outcome is not a failure'
 
 
+class TestTheAckDisclosesClippedCandidates:
+    """The ack carries the decision's truncation facts, and only when there are some."""
+
+    @pytest.mark.asyncio
+    async def test_a_retrieval_that_fills_candidate_k_is_on_the_ack(self) -> None:
+        mock_service = AsyncMock()
+        _configure_config(mock_service, candidate_k=1)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = SearchResults([_candidate('m1', 0.97)])
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
+        assert result[TRUNCATION_FACTS_KEY] == [
+            {'field': 'triage_candidates', 'cap': 1, 'elided': None},
+        ], f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_every_fact_on_the_decision_reaches_the_ack_as_plain_dicts(self, monkeypatch) -> None:
+        facts = (
+            TruncationFact(field='triage_candidates', cap=20, elided=None),
+            TruncationFact(field='judge_candidates', cap=5, elided=15),
+        )
+        mock_service = AsyncMock()
+        _configure_config(mock_service)
+        _configure_pass_through_add_memory(mock_service)
+        monkeypatch.setattr(tools, 'triage_write', AsyncMock(return_value=BandDecision(
+            OUTCOME_RESTATED, 'canonical-A', 0.95, _T_HIGH, _T_LOW, truncation_facts=facts,
+        )))
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[TRUNCATION_FACTS_KEY] == [
+            {'field': 'triage_candidates', 'cap': 20, 'elided': None},
+            {'field': 'judge_candidates', 'cap': 5, 'elided': 15},
+        ], f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_decision_with_no_facts_adds_no_key(self) -> None:
+        mock_service = AsyncMock()
+        _configure_config(mock_service)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = SearchResults([_candidate('m1', 0.97)])
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
+        assert TRUNCATION_FACTS_KEY not in result, f'{result!r}'
+
+
 #: The judge as `tools.py` binds it, for `patch()`. Patched at the CONSUMER's
 #: module path rather than at `write_triage_judge.judge_write`, because
 #: `tools.py` imports the name into its own namespace at import time — patching
@@ -1768,8 +1829,11 @@ class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:
 
     The judge DETECTS a contradiction; it does not adjudicate one (D3). So a
     contested write lands as a child carrying the full submitted text, flagged
-    with `grouped_read.CONTESTED_METADATA_KEY` for the gate machinery that
-    already reads that flag — and the canonical it contradicts is not touched.
+    with `grouped_read.CONTESTED_METADATA_KEY` for the readers that surface it
+    (`fused-memory/src/fused_memory/server/grouped_read.py::is_contested_child`,
+    and `orchestrator/src/orchestrator/agents/memory_recall.py::render_memory_results`
+    via grouped_read's `contested` marker) — nothing adjudicates it, and the
+    canonical it contradicts is not touched.
     """
 
     @staticmethod
@@ -1889,3 +1953,95 @@ class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:
         mock_service.update_memory.assert_not_awaited()
         mock_service.delete_memory.assert_not_awaited()
         assert mock_service.add_memory.await_count == 1
+
+
+#: Neutral marker text: no task-status or completion claim, so no recon-stage
+#: reject gate fires and the declared kind is the only variable.
+_MARKER_CONTENT = (
+    'Two worktree-hygiene memories overlap in scope and are relayed for a '
+    'second look at whether they should be merged.'
+)
+
+#: The two recon marker writes the stage prompts dictate: agent id, metadata.
+_RECON_MARKERS = {
+    'stage1-flag': (
+        'recon-stage-memory_consolidator',
+        {
+            'flag_for_stage2': True,
+            'run_id': 'run-6150',
+            'task_id': '4242',
+            'kind': FLAG_FOR_STAGE2_MARKER_KIND,
+        },
+    ),
+    'stage2-guard': (
+        'recon-stage-task_knowledge_sync',
+        {'stage2_suppress': True, 'task_id': '4242', 'kind': STAGE2_SUPPRESS_GUARD_KIND},
+    ),
+}
+
+
+class TestReconMarkerWritesSkipTriage:
+    """A recon marker declares its kind, so triage stores it standalone.
+
+    The Stage 1 flag and the Stage 2 guard are control records read back by
+    their metadata. Their stage prompts dictate a ``kind``, and a declared kind
+    force-stores (``write_triage.declares_attach_keys``), so neither is ever
+    filed as a child of a memory it happens to resemble.
+    """
+
+    @staticmethod
+    def _service() -> AsyncMock:
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('canonical-A', _MIDDLE_BAND)]
+        return mock_service
+
+    @staticmethod
+    async def _write(mock_service: AsyncMock, agent_id: str, metadata: dict) -> dict:
+        return await _call(
+            create_mcp_server(mock_service),
+            content=_MARKER_CONTENT,
+            category='observations_and_summaries',
+            agent_id=agent_id,
+            metadata=metadata,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('marker', sorted(_RECON_MARKERS))
+    async def test_a_marker_is_stored_standalone_without_asking_the_judge(
+        self, monkeypatch, marker: str,
+    ) -> None:
+        agent_id, metadata = _RECON_MARKERS[marker]
+        counter = _install_counter(monkeypatch)
+        mock_service = self._service()
+        judge = AsyncMock(return_value=OUTCOME_CONTESTED)
+
+        with patch(_JUDGE_PATH, new=judge):
+            result = await self._write(mock_service, agent_id, dict(metadata))
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f'{result!r}'
+        assert judge.await_count == 0
+        persisted = mock_service.add_memory.await_args.kwargs['metadata']
+        assert persisted['kind'] == metadata['kind'], f'{persisted!r}'
+        assert PARENT_ID_KEY not in persisted, f'{persisted!r}'
+        assert is_contested_child(persisted) is False, f'{persisted!r}'
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_the_same_marker_without_a_kind_reaches_the_judge(
+        self, monkeypatch,
+    ) -> None:
+        """The control: without its kind the marker IS triaged, so the
+        exemption above is the kind's doing and not the harness's."""
+        agent_id, metadata = _RECON_MARKERS['stage1-flag']
+        unkinded = {key: value for key, value in metadata.items() if key != 'kind'}
+        _install_counter(monkeypatch)
+        mock_service = self._service()
+        judge = AsyncMock(return_value=OUTCOME_CONTESTED)
+
+        with patch(_JUDGE_PATH, new=judge):
+            await self._write(mock_service, agent_id, unkinded)
+
+        assert judge.await_count == 1

@@ -341,3 +341,28 @@ DAG: α → γ; α → ε; β → ε; γ → ε; δ → ε; ε → ζ. (β indep
 4. **`--report` liveness merge.** Fold the port probe into the report table or
    keep staleness/merge-only. Suggested: add merge-idle + deploy-age; leave
    liveness to the timer path. Decide in ε.
+
+---
+
+## 2026-10-05: task 5371 (scope option 7) — the drain predicate
+
+Records the decision task 3801 asked for: should a non-empty but
+non-progressing merge queue count as "mid-merge"?
+
+- **Decision.** Under `--drain`, merge admission is halted (Stage A), so
+  "busy" no longer means a non-empty queue. It means a merge verify in flight
+  on any host, bounded by that verify's own command timeout: option B in
+  spirit, implemented as an admission halt plus an in-flight wait
+  (`scripts/drain_check.py::classify`, `orchestrator/src/orchestrator/fleet_drain.py`).
+  The legacy merge-idle predicate survives only for pre-5371 units and for
+  requests a unit refuses.
+- **I3 superseded for drain-capable units.** The force-fire
+  (`ORCH_RESTART_FORCE_FIRE_AFTER_SECS`, 600 s) no longer bounds a verifying
+  unit; the bounds are the verify's own deadline and the sweep-wide
+  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (11400 s, from Stage A).
+- **Lease max-age re-derived.** The worst legitimate sweep is now about
+  13,300 s, so `orchestrator_restart_lease_max_age_secs` is 14400 (was 7200).
+- **Coordinator parity.** The merge-landed orchestrator coordinator passes
+  `--drain`, like the staleness backstop (it remains config-disabled until
+  task 5020).
+- Operator reading guide: `OPERATIONS.md` §"Reading a drain".

@@ -411,6 +411,70 @@ async def test_update_task_rejects_metadata_done_provenance_json_string(
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
+    real_task_stack, tmp_path,
+):
+    """Through the MCP tool, a whole-blob replace on a done task that carries
+    the stamped done_provenance verbatim is accepted and retires the omitted
+    key; dropping done_provenance is refused with the same canonical dict the
+    interceptor returns. Metadata is sent as a dict, so the tool's own
+    json.dumps coercion is on the path."""
+    from _fm_helpers import _init_git_repo
+
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    sha = _init_git_repo(repo)
+    root = str(repo)
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T',
+        metadata=json.dumps({'files': ['x.py'], 'stale_key': 1}),
+    )
+    done = await interceptor.set_task_status(
+        '1', 'done', root, done_provenance={'kind': 'merged', 'commit': sha},
+    )
+    assert 'error' not in done, done
+    stamped = (await interceptor.get_task('1', root))['metadata']
+
+    without_done_provenance = {
+        key: value for key, value in stamped.items()
+        if key not in ('stale_key', 'done_provenance')
+    }
+    refused_tools = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': root,
+            'metadata': without_done_provenance, 'metadata_mode': 'replace',
+        },
+    )
+    refused_interceptor = await interceptor.update_task(
+        '1', root,
+        metadata=json.dumps(without_done_provenance), metadata_mode='replace',
+    )
+    assert refused_tools == done_provenance_via_update_task_error('1')
+    assert refused_tools == refused_interceptor
+
+    passthrough = {key: value for key, value in stamped.items() if key != 'stale_key'}
+    accepted = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': root,
+            'metadata': passthrough, 'metadata_mode': 'replace',
+        },
+    )
+    assert interceptor_write_succeeded(accepted), accepted
+
+    task = await interceptor.get_task('1', root)
+    assert task['status'] == 'done'
+    assert 'stale_key' not in task['metadata']
+    assert task['metadata']['done_provenance'] == stamped['done_provenance']
+    assert task['metadata']['files'] == ['x.py']
+
+
+@pytest.mark.asyncio
 async def test_update_task_allows_unrelated_metadata(
     mcp_server_with_tasks, task_interceptor,
 ):
@@ -2321,6 +2385,152 @@ async def test_submit_task_accepts_none_metadata(
 
 
 # ---------------------------------------------------------------------------
+# Retired-key guard — retired_key_modules_error at the MCP boundary (task 4529)
+#
+# The unit matrix lives in test_retired_key_modules_guard.py. These drive the
+# REAL stack: a NEW submission carrying metadata.modules is rejected on both
+# creation paths and persists nothing, while update_task and commit_planning
+# stay tolerant of the historical carriers already in the corpus
+# (plans/metadata-modules-retirement-prd.md decision 3). Paths are UNOWNED by
+# any project prefix so the interceptor's path-scope guard never answers first.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_modules_carrier(interceptor, root):
+    """Write a historical carrier straight through the backend, bypassing the
+    submit-time guard exactly as every pre-retirement record did."""
+    added = await interceptor.taskmaster.add_task(
+        project_root=root, title='Legacy carrier',
+        metadata=json.dumps({'files': ['src/a.py'], 'modules': ['src']}),
+    )
+    return added['id']
+
+
+_MODULES_CARRIER_METADATA = {'modules': ['widget'], 'files': ['widget/src/widget/app.py']}
+
+
+async def _submit_carrier_shaped(server, root, planning_mode, metadata):
+    """Submit the one payload both paired tests share, varying only metadata.
+    The description quotes the retired key, which must never trip the guard."""
+    return await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Declare widget scope',
+            'description': 'metadata.modules is retired; scope is declared in files',
+            'planning_mode': planning_mode,
+            'metadata': metadata,
+        },
+    )
+
+
+_ENCODINGS = pytest.mark.parametrize('encode', [dict, json.dumps], ids=['dict', 'json'])
+_CREATION_PATHS = pytest.mark.parametrize(
+    'planning_mode', [True, False], ids=['planning', 'curator'],
+)
+
+
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_modules_carrier_returns_retired_key_modules_error(
+    planning_mode, encode, real_task_stack, tmp_path,
+):
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+
+    result = await _submit_carrier_shaped(
+        server, root, planning_mode, encode(_MODULES_CARRIER_METADATA),
+    )
+
+    assert result.get('error_type') == 'RetiredMetadataKey', f'got {result!r}'
+    assert result['retired_key'] == 'modules'
+    assert result['replacement_key'] == 'files'
+    assert result['error']
+    assert result['hint']
+    assert 'ticket' not in result
+    assert 'task_id' not in result
+    assert await interceptor.get_statuses(root) == {}
+
+
+@_ENCODINGS
+@_CREATION_PATHS
+@pytest.mark.asyncio
+async def test_submit_task_without_modules_key_succeeds(
+    planning_mode, encode, real_task_stack, tmp_path,
+):
+    """Paired positive: the rejected payload minus ``modules`` is accepted, so
+    dropping the key is the whole fix."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    metadata = {k: v for k, v in _MODULES_CARRIER_METADATA.items() if k != 'modules'}
+
+    result = await _submit_carrier_shaped(server, root, planning_mode, encode(metadata))
+
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+        persisted = (await interceptor.get_task(result['task_id'], root))['metadata']
+        assert persisted['files'] == metadata['files']
+        assert 'modules' not in persisted
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_rewrite_of_existing_modules_carrier_is_not_rejected_by_retired_key_modules_error(
+    real_task_stack, tmp_path,
+):
+    """Amendments re-write an existing carrier whole, so the update path must
+    stay tolerant of the key it already holds."""
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    task_id = await _seed_modules_carrier(interceptor, root)
+
+    replaced = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': task_id, 'project_root': root,
+            'metadata': {'files': ['src/a.py'], 'modules': ['src'], 'note': 'rewritten'},
+            'metadata_mode': 'replace',
+        },
+    )
+    assert interceptor_write_succeeded(replaced), replaced
+
+    merged = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': task_id, 'project_root': root, 'metadata': {'note': 'amended'}},
+    )
+    assert interceptor_write_succeeded(merged), merged
+
+    persisted = (await interceptor.get_task(task_id, root))['metadata']
+    assert persisted['modules'] == ['src']
+    assert persisted['note'] == 'amended'
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_of_modules_carrier_is_not_rejected_by_retired_key_modules_error(
+    real_task_stack, tmp_path,
+):
+    """A deferred historical carrier still commits: commit_planning releases
+    existing rows and mints no new carrier."""
+    server, interceptor = real_task_stack
+    root = str(tmp_path)
+    task_id = await _seed_modules_carrier(interceptor, root)
+    deferred = await interceptor.set_task_status(task_id, 'deferred', root)
+    assert 'error' not in deferred, deferred
+
+    result = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    assert 'error' not in result, result
+    assert await interceptor.get_statuses(root, ids=[task_id]) == {task_id: 'pending'}
+
+
+# ---------------------------------------------------------------------------
 # Lock-charter guard γ — commit_planning wiring tests (step-7 RED / step-8 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -2551,6 +2761,7 @@ async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
         'missing_labels': [],
         'errors': [],
     }
+    assert 'manifest_stamping_action_required' not in result
 
     alpha_task = await server._tool_manager.call_tool(
         'get_task', {'id': alpha_id, 'project_root': root},
@@ -2605,6 +2816,68 @@ async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
     reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
     by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
     assert by_label == {'alpha': int(alpha_id), 'beta': int(beta_id)}
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_surfaces_unlabeled_task_without_blocking_flip(
+    real_task_stack, tmp_path,
+):
+    """A PRD-bound task whose label sits under a near-miss key never blocks
+    the flip, but the response carries a top-level action list naming it.
+    Repairing the key and re-running commit_planning on the now-pending task
+    stamps the label and clears the action list."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_FOO_PRD_SIDECAR_YAML, encoding='utf-8')
+
+    server, _interceptor = real_task_stack
+    root = str(tmp_path)
+
+    submitted = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Producer alpha',
+            'planning_mode': True,
+            'metadata': {
+                'files': ['src/alpha.py'],
+                'prd_path': 'plans/foo-prd.md',
+                'prd_label': 'alpha',
+            },
+        },
+    )
+    assert submitted['status'] == 'deferred', f'got {submitted!r}'
+    task_id = submitted['task_id']
+
+    result = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    task = await server._tool_manager.call_tool(
+        'get_task', {'id': task_id, 'project_root': root},
+    )
+    assert task['status'] == 'pending'
+    assert result['manifest_stamping']['near_miss_keys'] == [
+        {'task_id': task_id, 'key': 'prd_label', 'value': 'alpha', 'sidecar_label': 'alpha'},
+    ]
+    action = result['manifest_stamping_action_required']
+    assert action
+    assert any(task_id in line for line in action)
+
+    await server._tool_manager.call_tool(
+        'update_task',
+        {'id': task_id, 'project_root': root, 'metadata': {'prd_task_label': 'alpha'}},
+    )
+    rerun = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    assert rerun['manifest_stamping']['stamped'] == ['alpha']
+    assert 'manifest_stamping_action_required' not in rerun
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'alpha': int(task_id), 'beta': None}
 
 
 @pytest.mark.asyncio

@@ -166,9 +166,9 @@ tasks:
     task_id: null               # int | null; stamped by commit_planning — never author-supplied
     title: "…"                  # human aid, not load-bearing
     note: "…"                   # OPTIONAL durable task-level provenance (why a label was
-                                # split/renamed/re-homed). MUST NOT be a YAML comment:
-                                # commit_planning's stamp rewrites this file with
-                                # yaml.safe_dump and discards every comment in it.
+                                # split/renamed/re-homed). Prefer it to a YAML comment:
+                                # comments survive the stamp (it rewrites only task_id
+                                # values), but only this field is declared and validated.
     capabilities:
       - name: "kebab-case-capability-name"
         binding: "capability→producer (wired) — grep:shared/src/shared/task_metadata.py register_metadata_submodel"

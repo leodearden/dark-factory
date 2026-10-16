@@ -130,21 +130,13 @@ class TestFinaliseRecoveryDone:
     async def test_mark_done_rejection_routes_to_mark_blocked_not_phantom_done(
         self, tmp_path: Path,
     ):
-        """A rejected mark_done must route to _mark_blocked, not report DONE."""
+        """A rejected mark_done blocks the row behind one L1, not a phantom DONE."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         rejection = SetTaskStatusRejected(
             task_id=f.wf.task_id, error_code='conflict', raw='row already terminal',
         )
         f.wf.scheduler.mark_done = AsyncMock(side_effect=rejection)
-        # STUBBED DELIBERATELY (esc-5026-4): this chokepoint enters the DONE
-        # phase BEFORE mark_done, so the real `_mark_blocked` sees a terminal
-        # machine, logs 'already done, ignoring late blocked transition' and
-        # returns DONE — the sibling `_finalise_merged_done` marks done first
-        # and does return BLOCKED (see that test below, which runs the real
-        # path).  Un-stubbing here would change what this test asserts, so the
-        # stub stays until the production ordering question is adjudicated.
-        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        queue = _arm_escalation_queue(f, tmp_path)
 
         outcome = await f.wf._finalise_recovery_done(
             basis='fallback', sha='mainsha123', kind='found_on_main',
@@ -152,10 +144,10 @@ class TestFinaliseRecoveryDone:
         )
 
         assert outcome == WorkflowOutcome.BLOCKED
-        mark_blocked.assert_awaited_once()
-        assert mark_blocked.await_args is not None
-        _args, kwargs = mark_blocked.await_args
-        assert kwargs.get('escalate_to_human') is True
+        assert f.wf.state == WorkflowState.BLOCKED
+        assert f.set_task_status.await_args is not None
+        assert f.set_task_status.await_args.args[1] == 'blocked'
+        assert len(queue.get_by_task(f.wf.task_id, status='pending', level=1)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +192,8 @@ class TestRecoverIfAlreadyMerged:
     async def test_journal_miss_on_main_with_prior_work_falls_back_to_found_on_main(
         self, tmp_path: Path,
     ):
-        """Journal miss + on-main + prior implementation work → fallback DONE."""
+        """Journal miss + on-main + prior implementation work → fallback DONE,
+        anchored on the task's own citation (task 4704), never main's tip."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
@@ -212,7 +205,7 @@ class TestRecoverIfAlreadyMerged:
         assert outcome == WorkflowOutcome.DONE
         assert f.wf._merge_recovery_basis == 'fallback'
         f.mark_done.assert_awaited_once_with(
-            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            f.wf.task_id, kind='found_on_main', sha='citationsha123',
             note='branch already on main at workflow start (pre-PLAN recovery)',
         )
 
@@ -417,7 +410,7 @@ class TestRecoverBeforeExecute:
     ):
         """Journal miss + on-main + non-empty branch-content diff (Layer C,
         task 2372: the ground-truth `git diff base..wt_head` gate) → fallback
-        DONE."""
+        DONE, anchored on the task's own citation (task 4704)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
@@ -429,7 +422,7 @@ class TestRecoverBeforeExecute:
         assert outcome == WorkflowOutcome.DONE
         assert f.wf._merge_recovery_basis == 'fallback'
         f.mark_done.assert_awaited_once_with(
-            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            f.wf.task_id, kind='found_on_main', sha='citationsha123',
             note='branch already on main at workflow start (pre-EXECUTE recovery)',
         )
 
@@ -536,7 +529,8 @@ class TestRecoverBeforeMerge:
         self, tmp_path: Path,
     ):
         """Journal miss + branch is ancestor of main + prior implementation
-        work → fallback DONE (provenance sha is main_sha, not branch_head)."""
+        work → fallback DONE (provenance sha is the task's own citation — task
+        4704 — never main_sha or branch_head)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
         _record_prior_work(f)
 
@@ -545,10 +539,10 @@ class TestRecoverBeforeMerge:
         assert outcome == WorkflowOutcome.DONE
         assert f.wf._merge_recovery_basis == 'fallback'
         f.mark_done.assert_awaited_once_with(
-            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            f.wf.task_id, kind='found_on_main', sha='citationsha123',
             note='branch already on main at merge phase (pre-MERGE recovery)',
         )
-        f.is_ancestor.assert_awaited_once_with('branchhead123', 'mainsha123')
+        f.is_ancestor.assert_any_await('branchhead123', 'mainsha123')
 
     async def test_journal_miss_ancestor_with_no_prior_work_returns_none(
         self, tmp_path: Path,

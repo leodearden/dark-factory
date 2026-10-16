@@ -168,27 +168,32 @@ def status_via_update_task_error(task_id: str, status: object) -> dict[str, Any]
     }
 
 
+_DONE_PROVENANCE_HINT = (
+    'update_task cannot write metadata.done_provenance. Use '
+    'set_task_status(status="done", done_provenance={...}) instead — '
+    'it validates the kind/commit/note schema and runs an ancestor '
+    "backstop on the merge sha. Under metadata_mode='replace' the stored "
+    'done_provenance must be carried through verbatim: a whole-blob replace '
+    'may neither add, change nor drop it, so re-read the task and send the '
+    'stored value back unmodified.'
+)
+
+
 def done_provenance_via_update_task_error(task_id: str) -> dict[str, Any]:
-    """Canonical rejection shape for ``update_task`` calls writing ``metadata.done_provenance``.
+    """Canonical rejection shape for ``update_task`` calls that would add, change
+    or remove ``metadata.done_provenance``.
 
     ``set_task_status`` is the only sanctioned writer for ``done_provenance``
     — it validates the kind/commit/note schema and runs an ancestor backstop
-    on the merge sha. This dict is byte-identical to the historical
-    ``success: False`` variant produced by ``task_interceptor.py``'s
-    ``_reject_done_provenance_in_update_metadata``, so callers branching on
-    ``error == 'done_provenance_via_update_task'`` keep working across the
-    cutover.
+    on the merge sha. The stable promise across every surface is the ERROR
+    CODE: callers branch on ``error == 'done_provenance_via_update_task'``.
+    The ``hint`` is prose for the caller reading the failure and may grow.
     """
     return {
         'success': False,
         'error': 'done_provenance_via_update_task',
         'task_id': task_id,
-        'hint': (
-            'update_task cannot write metadata.done_provenance. Use '
-            'set_task_status(status="done", done_provenance={...}) instead — '
-            'it validates the kind/commit/note schema and runs an ancestor '
-            'backstop on the merge sha.'
-        ),
+        'hint': _DONE_PROVENANCE_HINT,
     }
 
 
@@ -219,25 +224,19 @@ class StatusWriteAuthorityError(TaskmasterError):
 
 
 class DoneProvenanceWriteAuthorityError(TaskmasterError):
-    """Raised when ``update_task`` is asked to write ``metadata.done_provenance``.
+    """Raised when ``update_task`` would add, change or remove ``metadata.done_provenance``.
 
     ``set_task_status`` is the sole sanctioned writer for ``done_provenance``
     — it validates the kind/commit/note schema and runs an ancestor backstop
     on the merge sha. Subclasses :class:`TaskmasterError` with the
-    ``TASKMASTER_TOOL_ERROR`` code and a ``set_task_status``-mentioning
-    message so existing ``TaskmasterError`` catchers/assertions keep working
-    unchanged; call :meth:`to_error_dict` for the canonical wire shape.
+    ``TASKMASTER_TOOL_ERROR`` code and the canonical hint as its message, so
+    existing ``TaskmasterError`` catchers/assertions keep working unchanged;
+    call :meth:`to_error_dict` for the canonical wire shape.
     """
 
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
-        super().__init__(
-            'TASKMASTER_TOOL_ERROR',
-            'update_task cannot write metadata.done_provenance. Use '
-            'set_task_status(status="done", done_provenance={...}) instead — '
-            'it validates the kind/commit/note schema and runs an ancestor '
-            'backstop on the merge sha.',
-        )
+        super().__init__('TASKMASTER_TOOL_ERROR', _DONE_PROVENANCE_HINT)
 
     def to_error_dict(self) -> dict[str, Any]:
         return done_provenance_via_update_task_error(self.task_id)

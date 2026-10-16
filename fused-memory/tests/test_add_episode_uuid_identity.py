@@ -20,10 +20,11 @@ Every graphiti mock in the suite is a permissive ``AsyncMock(return_value=None)`
 test_journaling_integration.py, test_e2e_durable_queue.py).  A mock that accepts
 any ``uuid=`` can never surface a load-or-raise contract.  The missing seam is
 ``_graphiti_fake.FakeGraphitiClient``, a STATEFUL fake with a real episodic
-store that raises on an unknown uuid, reached here through
-``_graphiti_fake.backend_with_fake_graphiti``.  It lives in its own module
-rather than here because ``test_graphiti_add_episode_uuid_param.py`` (task
-3568) needs the same seam to exercise the backend-side guard.
+store that raises on an unknown uuid, wired into a real backend here by the
+conftest factory fixture ``make_backend_over_fake_graphiti``.  The fake lives
+in its own module rather than here because
+``test_graphiti_add_episode_uuid_param.py`` (task 3568) needs the same seam to
+exercise the backend-side guard.
 
 The fake also encodes the two traps this fix must not fall into:
 
@@ -59,7 +60,7 @@ from _fm_helpers import (
     falkor_skipif,
     unique_graph_name,
 )
-from _graphiti_fake import backend_with_fake_graphiti
+from _graphiti_fake import FakeGraphitiClient
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.services.memory_service import MemoryService
@@ -71,11 +72,11 @@ from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistr
 
 
 @pytest.fixture
-def svc_and_fake(mock_config):
+def svc_and_fake(mock_config, make_backend_over_fake_graphiti):
     """MemoryService with a real GraphitiBackend over the stateful fake."""
     svc = MemoryService(mock_config)
-    backend, fake = backend_with_fake_graphiti(mock_config)
-    svc.graphiti = backend
+    fake = FakeGraphitiClient()
+    svc.graphiti = make_backend_over_fake_graphiti(mock_config, fake)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
@@ -860,14 +861,14 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
     backend = GraphitiBackend(config)
     # skip_maintenance=True is load-bearing, not an optimisation: the default
-    # path enumerates EVERY graph on the server and runs an index build plus a
-    # dup-uuid-edge REPAIR (a write) over each. A test must never sweep the
-    # real project graphs sharing this FalkorDB instance.
+    # path provisions every registered project graph and runs a dup-uuid-edge
+    # REPAIR (a write) over EVERY graph on the server. A test must never sweep
+    # the real project graphs sharing this FalkorDB instance.
     await backend.initialize(skip_maintenance=True)
     try:
         # The scratch graph is virgin, and graphiti's entity-dedup search needs
-        # its indices. _ensure_indices is a deliberate no-op (task 3707);
-        # ensure_indices is the real provisioning path.
+        # its indices. It is unregistered (PRD D5), so first-write provisioning
+        # skips it; this explicit ensure_indices call is what indexes it.
         await backend.ensure_indices(group_id=graph_name)
 
         svc = MemoryService(config)

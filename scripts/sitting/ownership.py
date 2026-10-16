@@ -4,7 +4,7 @@ Routing rule: a probe that answers ``owns`` routes the item to the brief's
 standing footer; ``mentions`` is evidence the agent must read before putting the
 item to Leo. The asymmetry is deliberate. Every ``owns`` source is a structured
 field (a session record and its ``result.md`` ``outcome:`` header,
-``x_coalesced_into``, the ruling keys, ``origin_escalation``); the one
+``x_coalesced_into``, the ruling keys, the follow-up keys); the one
 ``mentions``-only source, the handover file, is prose, and routing on its
 headings would be an ad-hoc parser.
 
@@ -39,7 +39,7 @@ PROBES: tuple[str, ...] = (
 )
 RULING_METADATA_KEYS: tuple[str, ...] = ('x_ruling', 'x_operator_ruling', 'x_ruled_by')
 COALESCE_KEY = 'x_coalesced_into'
-FOLLOWUP_KEYS: tuple[str, ...] = ('origin_escalation',)
+FOLLOWUP_KEYS: tuple[str, ...] = ('x_origin_escalation', 'origin_escalation')
 HANDOVER_CANDIDATES: tuple[str, ...] = ('data/escalations/l2-handover.md', 'plans/l2-watcher-handover-*.md')
 
 RESULT_OUTCOMES: tuple[str, ...] = ('done', 'blocked', 'abandoned', 'handed-off')

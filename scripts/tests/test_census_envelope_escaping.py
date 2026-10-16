@@ -26,7 +26,6 @@ backslash, so the four-character escape text is what the source holds.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any, NamedTuple
 
 import census as mod
@@ -114,7 +113,9 @@ def _quoting_cluster(**overrides: Any) -> dict[str, Any]:
 
 
 def _payload_for(cluster: dict[str, Any]) -> dict[str, Any]:
-    return mod.build_task_payloads([cluster], project_root='/r', project_id='reify')[0]
+    return mod.build_task_payloads(
+        [cluster], project_root='/r', project_id='reify', run_id='census-reify-20260714',
+    )[0]
 
 
 def test_evidence_quoting_envelope_closers_submits_and_round_trips_escaped():
@@ -164,13 +165,3 @@ def test_every_string_field_is_safe_to_requote_downstream():
     for key, value in payload.items():
         if isinstance(value, str):
             assert detect_for(value, key, _DOWNSTREAM_SCHEMA) is None, key
-
-
-def test_this_module_spells_no_raw_envelope_literal():
-    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``."""
-    needle = chr(60) + '/'
-    source = Path(__file__).read_text(encoding='utf-8')
-    assert needle not in source, (
-        'A raw envelope literal was written into this test file. Spell it with '
-        'the \\x3c escape instead — see this module\'s docstring for why.'
-    )

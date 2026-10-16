@@ -36,7 +36,7 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeConflictError
-from orchestrator.merge_queue import PlanFilesTouchedResult
+from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardInterrupted,
@@ -184,7 +184,7 @@ class TestSubmitToMergeQueuePlanTightening:
             PlanFilesTouchedResult(not_touched=[]),         # after narrowing
         ])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             check_seq,
         )
 
@@ -256,7 +256,7 @@ class TestSubmitToMergeQueuePlanTightening:
             PlanFilesTouchedResult(not_touched=['a.py']),  # unchanged after narrow
         ])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             check_seq,
         )
 
@@ -304,7 +304,7 @@ class TestSubmitToMergeQueuePlanTightening:
             PlanFilesTouchedResult(not_touched=['a.py']),
         ])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             check_seq,
         )
 
@@ -395,7 +395,7 @@ class TestSubmitToMergeQueueCrossRepo:
         async def fake_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult(not_touched=['__unreached__'])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check,
         )
 
@@ -483,7 +483,7 @@ class TestSubmitToMergeQueueStalePathMessage:
         """Stub the gate with *results*, record events and the block reason."""
         check_seq = _CheckSequence(results)
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             check_seq,
         )
 

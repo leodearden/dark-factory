@@ -1,4 +1,5 @@
-"""Tests for dashboard.config — canonical-vs-legacy escalation URL discovery.
+"""Tests for dashboard.config — canonical-vs-legacy escalation URL discovery,
+plus the curator ledger path (``TestCuratorEventsDbPath``).
 
 ``_discover_escalation_urls`` must prefer ``dark-factory-orchestrator.yaml``
 (the canonical top-level orchestrator config name) over the legacy spellings
@@ -430,3 +431,31 @@ class TestMultiRootDiscovery:
         assert records[0].levelno == logging.WARNING
         assert str(bad_root) in records[0].getMessage()
         assert str(good_root) not in records[0].getMessage()
+
+
+class TestCuratorEventsDbPath:
+    """``curator_events_db`` resolves where fused-memory writes the curator's
+    invocation ledger: ``<reconciliation.data_dir>/curator_events.db``.
+    """
+
+    def test_env_override_relocates_curator_ledger(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('RECONCILIATION_DATA_DIR', str(tmp_path / 'recon'))
+
+        cfg = DashboardConfig(project_root=tmp_path / 'proj')
+
+        assert cfg.curator_events_db == tmp_path / 'recon' / 'curator_events.db'
+
+    @pytest.mark.parametrize('env_value', [None, ''], ids=['unset', 'empty'])
+    def test_env_unset_or_empty_falls_back_to_project_root(
+        self, tmp_path, monkeypatch, env_value,
+    ):
+        if env_value is None:
+            monkeypatch.delenv('RECONCILIATION_DATA_DIR', raising=False)
+        else:
+            monkeypatch.setenv('RECONCILIATION_DATA_DIR', env_value)
+
+        cfg = DashboardConfig(project_root=tmp_path / 'proj')
+
+        assert cfg.curator_events_db == (
+            cfg.project_root / 'data' / 'reconciliation' / 'curator_events.db'
+        )

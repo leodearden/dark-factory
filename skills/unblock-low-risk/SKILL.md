@@ -46,7 +46,11 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
    human-rehearsal mandate. This precondition turns that external kill into a self-halt.
 
    **Mechanical backstop:** precondition 6's `b3_gate check` below now *also* scans the task
-   description and proposal/block-reason text for this same phrase family and returns
+   description, the proposal text and the block reason's prose for this same phrase family
+   (captured tool output — the fenced excerpt under each `## Test Failures`, `## Lint Issues`
+   or `## Type Errors` section of the verify failure report — is excluded, so
+   pytest/lint output that merely contains a phrase like
+   'do not run' no longer aborts; task 6933) and returns
    `verdict == 'abort'` with an `'explicit stop instruction present'` reason when found — so
    even if this precondition is somehow skipped, the existing "**ONLY** `verdict == 'fresh'`
    proceeds" rule at precondition 6 already routes this class to ABORT, with the gate's
@@ -224,7 +228,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
      # merge-state-vocab:end
          wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
-         sleep(wait)
+         sleep(wait)   # unattended: realise per skills/merge-queue/SKILL.md#waiting-between-polls, its FOREGROUND form only -- a bare sleep 60 is blocked by the harness
          result = mcp__escalation__merge_status(request_id)
      # merge-state-vocab:begin partition=LIVE_STATES
      #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES (second copy).
@@ -316,7 +320,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        request id:
        - **`coalesce-*`** → a **train** id, not a request id: this submission was absorbed into a
          coalesce train (`MergeOutcome('superseded', superseded_by=train_id)`,
-         `orchestrator/src/orchestrator/merge_queue.py`). Do **not** poll it by `request_id` —
+         `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`). Do **not** poll it by `request_id` —
          that returns an honest `unknown` which never resolves to anything else.
        - **`mr-*`** → a generation advance: this same branch re-enqueued at a newer generation
          (`MergeOutcome('superseded', superseded_by=gen_next.request_id, ...)`, same module).
@@ -440,7 +444,7 @@ eyeballed listing.
   outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
   `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
-  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  **neither arm licenses a write** — never self-stamp on either. Read rules 2 and 2v there for the
   argument rather than restating it; the disposition here is the **same on both arms**, and it
   turns on re-reading this task's scheduler status **fresh**:
   - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed

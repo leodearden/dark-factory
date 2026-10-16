@@ -48,7 +48,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import census_trigger, config, inventory, sampling  # noqa: E402
+from legibility import census_trigger, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
 from orchestrator import session_registry  # noqa: E402
 
@@ -188,26 +188,16 @@ def _usable_prompt_prefix(prompt: str | None) -> str | None:
 def _first_user_turn(path: Path) -> dict[str, Any] | None:
     """Return *path*'s first non-sidechain/non-meta user-turn record, or None.
 
-    A LIGHT alternative to ``sampling._score_and_find_first_turn`` for the
-    STRONG match: that helper must read the WHOLE file to also compute the
-    5-class confusion score (tool_error/not_found/self_correct/df_guard/
-    interrupt) — all of which the strong match discards. This loop instead
-    early-returns on the first matching user record, so matching a record
-    against a busy encoded-cwd dir full of large sibling transcripts costs
-    O(bytes-until-first-user-turn) per candidate rather than O(filesize)
-    (reviewer_comprehensive/efficiency, task 2893 amendment). The
-    first-turn selection predicate is identical to the scorer's, so
-    ``sampling._first_user_turn_text`` flattens the result the same way.
-    Degrades to ``None`` on an unreadable file, mirroring the scorer's
-    ``except OSError`` contract.
+    It early-returns on the first such record, so matching against a busy
+    encoded-cwd dir full of large sibling transcripts costs
+    O(bytes-until-first-user-turn) per candidate rather than a whole-file
+    scan (task 2893 amendment). The predicate is
+    :func:`detectors.is_primary_user_turn`, the one the sampler's first turn
+    uses. Degrades to ``None`` on an unreadable file.
     """
     try:
         for record in inventory.iter_json_lines(path):
-            if (
-                record.get('type') == 'user'
-                and not record.get('isSidechain')
-                and not record.get('isMeta')
-            ):
+            if detectors.is_primary_user_turn(record):
                 return record
     except OSError:
         return None
@@ -354,7 +344,8 @@ def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None
     # are whitespace-normalized so a reflowed transcript still matches.
     needle = _normalize_ws(prefix)
     for path in candidates:
-        text = sampling._first_user_turn_text(_first_user_turn(path))
+        turn = _first_user_turn(path)
+        text = (detectors.user_turn_text(turn) if turn is not None else None) or ''
         typed = _typed_slash_command(text)
         matched = needle in _normalize_ws(text) or (
             typed is not None and needle in _normalize_ws(typed)

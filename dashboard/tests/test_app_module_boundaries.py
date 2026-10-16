@@ -77,12 +77,10 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
     'dashboard.api.burndown': ('_BURNDOWN_WINDOWS', 'api_burndown'),
     'dashboard.api.merge_queue': ('api_merge_queue',),
     'dashboard.api.escalations': (
-        '_TASK_CARDS_TTL_SECONDS',
-        '_TASK_CARDS_BUDGET',
-        '_task_cards_cache',
-        '_task_cards_cache_clear',
-        '_load_task_cards',
+        '_analytics_memo',
+        '_analytics_memo_clear',
         'api_escalations',
+        'api_escalation_analytics',
     ),
     'dashboard.loops': (
         '_SAMPLE_INTERVAL_SECONDS',
@@ -100,6 +98,9 @@ MOVED_SYMBOLS: dict[str, tuple[str, ...]] = {
 MOVED_ROUTES: dict[str, tuple[str, str]] = {
     '/api/v2/dashboard/merge-queue': ('dashboard.api.merge_queue', 'api_merge_queue'),
     '/api/v2/dashboard/escalations': ('dashboard.api.escalations', 'api_escalations'),
+    '/api/v2/dashboard/escalation-analytics': (
+        'dashboard.api.escalations', 'api_escalation_analytics',
+    ),
     '/api/v2/dashboard/burndown': ('dashboard.api.burndown', 'api_burndown'),
     '/api/v2/dashboard/memory': ('dashboard.api.memory', 'api_memory'),
     '/api/v2/dashboard/orchestrators': ('dashboard.api.orchestrators', 'api_orchestrators'),

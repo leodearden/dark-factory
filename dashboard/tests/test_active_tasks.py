@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.task_statuses import ACTIVE, TaskStatus
 
@@ -17,7 +18,6 @@ from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
     _build_task_row,
     _minutes_since,
-    collect_active_tasks,
     collect_tasks_with_counts,
     shape_terminal_rows,
 )
@@ -124,7 +124,7 @@ def test_minutes_since_no_now_resolves_via_clock():
 
 
 # ---------------------------------------------------------------------------
-# collect_active_tasks against in-memory MCP-shaped fixture
+# collect_tasks_with_counts against in-memory MCP-shaped fixture
 # ---------------------------------------------------------------------------
 
 
@@ -219,13 +219,12 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
     may still return an offline marker dict, which is propagated unchanged.
     """
 
-    # ``timeout``/``cached`` are accepted-and-ignored: the unit threads
-    # task_snapshot.PER_CALL_TIMEOUT into both reads and asks the row read for
-    # an UNCACHED answer, so a stub missing either keyword raises TypeError
-    # instead of shaping rows.
+    # ``timeout`` is accepted-and-ignored: the unit threads
+    # task_snapshot.PER_CALL_TIMEOUT into both reads, so a stub missing the
+    # keyword raises TypeError instead of shaping rows.
     async def _narrowed(
         client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None, cached=True,
+        statuses=None, chunk_size=None, timeout=None,
     ):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
@@ -408,8 +407,8 @@ def two_project_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_filters_to_active_statuses(two_project_config, dummy_client):
-    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+async def test_collect_tasks_with_counts_filters_to_active_statuses(two_project_config, dummy_client):
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
     statuses = {t['status'] for t in active}
     assert statuses <= {'in-progress', 'blocked', 'pending'}
     # Done tasks (17, 15) should not appear.
@@ -419,8 +418,8 @@ async def test_collect_active_tasks_filters_to_active_statuses(two_project_confi
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_config, dummy_client):
-    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+async def test_collect_tasks_with_counts_resolves_deps_with_done_flags(two_project_config, dummy_client):
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
     by_id = {t['id']: t for t in active}
     t19 = by_id['dark-factory/T-19']
     assert {d['id']: d['done'] for d in t19['deps']} == {
@@ -433,8 +432,8 @@ async def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_co
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_pulls_metadata_and_loops(two_project_config, dummy_client):
-    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+async def test_collect_tasks_with_counts_pulls_metadata_and_loops(two_project_config, dummy_client):
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
     t19 = next(t for t in active if t['id'] == 'dark-factory/T-19')
     assert t19['agent'] == 'claude-task-19'
     assert t19['loops'] == 2
@@ -446,8 +445,8 @@ async def test_collect_active_tasks_pulls_metadata_and_loops(two_project_config,
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_started_uses_provided_now(tmp_path, monkeypatch, dummy_client):
-    """collect_active_tasks(now=fixed) computes every row's `started` against that one instant."""
+async def test_collect_tasks_with_counts_started_uses_provided_now(tmp_path, monkeypatch, dummy_client):
+    """collect_tasks_with_counts(now=fixed) computes every row's `started` against that one instant."""
     fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
     created_at = (fixed - timedelta(minutes=42)).isoformat()
     root, shaped = _make_project(
@@ -463,7 +462,7 @@ async def test_collect_active_tasks_started_uses_provided_now(tmp_path, monkeypa
     _register_runtime(monkeypatch, {'fixedclock': [_runtime_entry(1, started=created_at)]})
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg, now=fixed)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
     assert len(active) == 1
     assert active[0]['started'] == 42
 
@@ -527,9 +526,9 @@ async def test_collect_tasks_with_counts_stamps_every_snapshot_at_the_provided_n
     live clock BEFORE the request, which inverts production's ordering. That
     inversion is how 350 green dashboard tests sat over a handler that routed
     every project to ``unknown`` on every cache-miss render.
-    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` and
-    ``collect_active_tasks`` already forwarded ``now``; ``api_tasks`` was the
-    only call site that did not.
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state``
+    already forwarded ``now``; ``api_tasks`` was the only call site that did
+    not.
     """
     fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
     df_root = tmp_path / 'df'
@@ -556,7 +555,7 @@ async def test_collect_tasks_with_counts_stamps_every_snapshot_at_the_provided_n
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, monkeypatch, dummy_client):
+async def test_collect_tasks_with_counts_handles_missing_worktree_metadata(tmp_path, monkeypatch, dummy_client):
     """A pending task absent from an ONLINE runtime map still appears, with honest zeros."""
     root, shaped = _make_project(
         tmp_path, project_dir='solo',
@@ -572,7 +571,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
     # from an offline project (see the runtime-offline tests below).
     _register_runtime(monkeypatch, {'solo': []})
     cfg = DashboardConfig(project_root=root)
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'status': 'pending', 'agent': None,
@@ -634,7 +633,7 @@ async def test_no_task_row_carries_description_or_details(tmp_path, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypatch, dummy_client):
+async def test_collect_tasks_with_counts_surfaces_offline_projects(tmp_path, monkeypatch, dummy_client):
     """A project whose MCP fetch returns an offline marker is reported."""
     root = tmp_path / 'offline-project'
     root.mkdir()
@@ -644,9 +643,9 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
 
     _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, offline_projects = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert active == []
-    assert offline_projects == ['offline-project']
+    assert _offline(snapshots) == ['offline-project']
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +654,7 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state(
+async def test_collect_tasks_with_counts_runtime_join_populates_lane_phase_lane_state(
     tmp_path, monkeypatch, dummy_client,
 ):
     """An online runtime entry's loops/attempts/lane/phase/lane_state/agent all
@@ -680,7 +679,7 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg, now=fixed)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
     assert len(active) == 1
     row = active[0]
     assert row['loops'] == 3
@@ -694,7 +693,7 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
+async def test_collect_tasks_with_counts_runtime_unparseable_started_yields_none_row(
     tmp_path, monkeypatch, dummy_client,
 ):
     """An ONLINE entry whose ``started`` is present-but-unparseable renders as
@@ -719,7 +718,7 @@ async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     assert row['started'] is None
@@ -727,7 +726,7 @@ async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
+async def test_collect_tasks_with_counts_runtime_offline_snapshot_yields_all_none(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A project whose runtime snapshot reports offline=True gets honest None
@@ -748,7 +747,7 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', _offline_fetch_task_runtime)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
@@ -761,7 +760,7 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
+async def test_collect_tasks_with_counts_no_escalation_url_treated_as_offline(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A project absent from the runtime map entirely (no escalation URL
@@ -780,7 +779,7 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
     _register_runtime(monkeypatch, {})  # no label registered for 'nourl' at all
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
@@ -792,7 +791,7 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
+async def test_collect_tasks_with_counts_runtime_per_task_read_failure_stays_online(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A per-task artifact read failure (loops/attempts/started/phase=None,
@@ -816,7 +815,7 @@ async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     assert row['loops'] is None
@@ -861,7 +860,7 @@ async def _one_task_row_with_snapshot(
     monkeypatch.setattr(
         'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
     )
-    active, _ = await collect_active_tasks(
+    active, _ = await collect_tasks_with_counts(
         client=dummy_client, config=DashboardConfig(project_root=root),
     )
     assert len(active) == 1
@@ -870,7 +869,7 @@ async def _one_task_row_with_snapshot(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('reason', ['deadline_exceeded', 'unreachable'])
-async def test_collect_active_tasks_row_carries_probe_reason(
+async def test_collect_tasks_with_counts_row_carries_probe_reason(
     tmp_path, monkeypatch, dummy_client, reason,
 ):
     """The probe's fault-domain discriminator reaches the task row intact.
@@ -892,7 +891,7 @@ async def test_collect_active_tasks_row_carries_probe_reason(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_online_snapshot_with_entry_is_ok(
+async def test_collect_tasks_with_counts_online_snapshot_with_entry_is_ok(
     tmp_path, monkeypatch, dummy_client,
 ):
     row = await _one_task_row_with_snapshot(
@@ -905,7 +904,7 @@ async def test_collect_active_tasks_online_snapshot_with_entry_is_ok(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_includes_merge_deferred_and_train_field(
+async def test_collect_tasks_with_counts_includes_merge_deferred_and_train_field(
     tmp_path, monkeypatch, dummy_client
 ):
     """merge-deferred tasks survive the active filter and carry the `train` field.
@@ -943,7 +942,7 @@ async def test_collect_active_tasks_includes_merge_deferred_and_train_field(
 
     _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     ids = {t['id'] for t in active}
     assert 'trainyard/T-101' in ids, (
@@ -990,7 +989,7 @@ def _make_done_project(root, *, project_dir, active_tasks, done_tasks):
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_excludes_done_rows(tmp_path, monkeypatch, dummy_client):
+async def test_collect_tasks_with_counts_excludes_done_rows(tmp_path, monkeypatch, dummy_client):
     """The collector must return NO done row — for the scheduler or anyone else.
 
     This used to be the DEFAULT behaviour, switchable on by a cap. There is no
@@ -1016,12 +1015,11 @@ async def test_collect_active_tasks_excludes_done_rows(tmp_path, monkeypatch, du
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
-    # Call with NO max_done_per_project — default behaviour
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     done_rows = [t for t in active if t['status'] == 'done']
     assert done_rows == [], (
-        'Default collect_active_tasks must NOT return done rows — '
+        'collect_tasks_with_counts must NOT return done rows — '
         'scheduler.py must not receive done tasks'
     )
 
@@ -1216,7 +1214,7 @@ def test_build_task_row_prd_kwarg_overrides_metadata_coalescing():
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel(
+async def test_collect_tasks_with_counts_includes_external_deps_with_unknown_sentinel(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A task carrying metadata.external_deps surfaces external_deps with 'unknown' sentinels."""
@@ -1240,7 +1238,7 @@ async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel
     _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     assert row['external_deps'] == [
@@ -1250,7 +1248,7 @@ async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_external_deps_empty_when_absent(
+async def test_collect_tasks_with_counts_external_deps_empty_when_absent(
     tmp_path, monkeypatch, dummy_client,
 ):
     """Tasks without external_deps carry external_deps=[] (no KeyError)."""
@@ -1269,7 +1267,7 @@ async def test_collect_active_tasks_external_deps_empty_when_absent(
     _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     assert active[0]['external_deps'] == []
 
@@ -1499,7 +1497,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_completed_rows(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_excludes_cancelled(
+async def test_collect_tasks_with_counts_excludes_cancelled(
     tmp_path, monkeypatch, dummy_client,
 ):
     """The collector must return ZERO cancelled rows, for the same reason."""
@@ -1522,11 +1520,11 @@ async def test_collect_active_tasks_excludes_cancelled(
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     cancelled_rows = [t for t in active if t['status'] == 'cancelled']
     assert cancelled_rows == [], (
-        'collect_active_tasks must NOT return cancelled rows'
+        'collect_tasks_with_counts must NOT return cancelled rows'
     )
 
 
@@ -1536,7 +1534,7 @@ async def test_collect_active_tasks_excludes_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_includes_deferred_via_active_path(
+async def test_collect_tasks_with_counts_includes_deferred_via_active_path(
     tmp_path, monkeypatch, dummy_client,
 ):
     """deferred tasks must flow through the ACTIVE path (with resolved deps + started).
@@ -1578,7 +1576,7 @@ async def test_collect_active_tasks_includes_deferred_via_active_path(
     _register_fetch_tasks(monkeypatch, _fake_fetch)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     ids = {t['id'] for t in active}
     assert 'proj/T-30' in ids, (
@@ -1738,11 +1736,8 @@ class TestShapeOneProjectNarrowing:
 
     @pytest.fixture(autouse=True)
     def _isolate(self, monkeypatch):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_tasks_cache_clear()
         _register_runtime(monkeypatch, {})
         yield
-        tasks_mod._fetch_tasks_cache_clear()
 
     @staticmethod
     def _one_project_config(tmp_path):
@@ -2030,11 +2025,8 @@ class TestDepsOutsideTheFetchedRows:
 
     @pytest.fixture(autouse=True)
     def _isolate(self, monkeypatch):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_tasks_cache_clear()
         _register_runtime(monkeypatch, {})
         yield
-        tasks_mod._fetch_tasks_cache_clear()
 
     @staticmethod
     def _config(tmp_path):
@@ -2356,12 +2348,11 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         Both go through ``task_is_stranded`` at ``rows.as_of``, the instant the
         rows were measured. Judging the badge at the render instant instead
         would, once the substrate has been unreachable longer than
-        ``STRANDED_HEARTBEAT_TTL``, badge every claim as abandoned while the
+        ``DEFAULT_CLAIMANT_HEARTBEAT_TTL``, badge every claim as abandoned while the
         split (judged at ``as_of``) reports none — the same rows disagreeing
         with themselves on one wire payload.
         """
         import dashboard.data.task_snapshot as snapshot_mod
-        from dashboard.data.tasks import STRANDED_HEARTBEAT_TTL
 
         (root,) = self._roots(tmp_path, 'df')
         claimed = _raw_row(1, 'in-progress')
@@ -2382,7 +2373,7 @@ class TestTheReturnedUnitsCarryTheShapedRows:
 
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _rows_read_fails)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
-        much_later = _STUB_AS_OF + STRANDED_HEARTBEAT_TTL + timedelta(minutes=1)
+        much_later = _STUB_AS_OF + DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(minutes=1)
         active, snapshots = await collect_tasks_with_counts(dummy_client, config, now=much_later)
 
         unit = snapshots['df']
@@ -2848,32 +2839,6 @@ class TestCollectTasksBudget:
         assert _offline(snapshots) == []
         assert _done_counts(snapshots) == {'alpha': 11, 'beta': 22}
         assert [row['id'] for row in active] == ['alpha/T-1', 'beta/T-1']
-
-    async def test_collect_active_tasks_still_returns_two_elements(
-        self, monkeypatch, tmp_path, dummy_client
-    ):
-        """(g) the scheduler's caller keeps its two-element contract.
-
-        ``data/scheduler.py`` unpacks ``(active, offline)``; the snapshots are
-        absorbed by ``collect_active_tasks``, not leaked to it, and the offline
-        labels it does return are read off their kind rather than carried in a
-        parallel list.
-        """
-        _register_shaper(monkeypatch, {'beta': _BUDGET_SLOW}, done_counts={'alpha': 1})
-        self._tighten(monkeypatch, total=10.0, per_project=0.2)
-        config = _budget_config(tmp_path, ['alpha', 'beta'])
-
-        result = await collect_active_tasks(client=dummy_client, config=config)
-
-        assert len(result) == 2, (
-            f'collect_active_tasks must keep its (active, offline) shape, got '
-            f'{len(result)} elements'
-        )
-        active, offline = result
-        assert [row['project'] for row in active] == ['alpha']
-        # A degraded project is NOT offline here either — the marker is
-        # dropped by this narrower contract, not silently reclassified.
-        assert offline == []
 
 
 # ---------------------------------------------------------------------------
@@ -3491,38 +3456,10 @@ class TestCollectTasksWithCountsFairness:
             'operator can reason about across two consecutive renders'
         )
 
-    async def test_all_project_roots_stays_primary_first(
-        self, monkeypatch, tmp_path, dummy_client,
-    ):
-        """(c) The rotation must NOT leak into the shared root helper.
-
-        ``_all_project_roots`` has other callers that depend on primary-first
-        ordering (``app.py``, ``scheduler.py``, ``api/tasks.py``'s root count,
-        and ``test_app.py``'s patch
-        point). Rotating it in place would silently repoint every one of them
-        at a different project — a far larger blast radius than the Tasks tab.
-        """
-        import dashboard.data.active_tasks as at_mod
-
-        config = self._n_root_config(tmp_path, 5)
-        _register_runtime(monkeypatch, {})
-        self._admission_recorder(monkeypatch, dwell=0.0)
-        at_mod._reset_root_rotation()
-
-        for render in range(4):
-            await collect_tasks_with_counts(client=dummy_client, config=config)
-            roots = at_mod._all_project_roots(config)
-            assert roots[0] == config.project_root, (
-                f'after {render + 1} render(s) _all_project_roots returned '
-                f'{[r.name for r in roots]} — the primary root is no longer '
-                'first, so the rotation has leaked into the shared helper and '
-                'every other caller now reads a different project'
-            )
-
     async def test_output_order_is_unaffected_by_rotation(
         self, monkeypatch, tmp_path, dummy_client,
     ):
-        """(d) Rotation changes ADMISSION order only, never rendered order.
+        """(c) Rotation changes ADMISSION order only, never rendered order.
 
         If the rotated order reached the payload, the Tasks table would
         reshuffle on every 3 s poll — a fix for invisibility that trades it

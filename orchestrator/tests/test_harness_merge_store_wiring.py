@@ -123,8 +123,8 @@ class TestStartMergeWorkerInjectsMergeStore:
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker',
                    return_value=mock_worker) as mock_cls, \
-             patch('orchestrator.merge_queue.enforce_merge_liveness_margin'), \
-             patch('orchestrator.merge_queue.enforce_persistent_worktree_serial_lane'), \
+             patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin'), \
+             patch('orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane'), \
              patch('orchestrator.harness.StaleServiceRestartCoordinator'), \
              patch('orchestrator.harness.build_train_callback_factory',
                    return_value=MagicMock()):

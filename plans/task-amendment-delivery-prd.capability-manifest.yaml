@@ -176,9 +176,9 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "_descoped_steps"
-          paths: ["orchestrator/src/orchestrator/merge_gates.py"]
+          paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
           expect: present
-          # RED today: 0 hits.  Deliberately scoped to merge_gates.py and NOT
+          # RED today: 0 hits.  Deliberately scoped to merge_lane/gates.py and NOT
           # to orchestrator/src/: β lands the same key in workflow.py, which
           # would vacuously green γ under a wider scope.
       - name: "commit-ownership-gate-at-the-sibling-gate-site"
@@ -187,7 +187,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "unowned_commit|commit_ownership|owned_commits|branch_commits_owned|_check_branch_commits"
-          paths: ["orchestrator/src/orchestrator/merge_gates.py"]
+          paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
           expect: present
           # RED today: 0 hits.  Five-way disjunction over plausible gate
           # namings so γ's choice cannot false-RED it, scoped to the sibling

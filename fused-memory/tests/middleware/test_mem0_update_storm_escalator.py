@@ -16,6 +16,7 @@ import json
 import logging
 
 import pytest
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
@@ -68,6 +69,23 @@ class TestStormEscalationEnabled:
         assert '20' in payload['detail']
         assert '3600' in payload['detail']
         assert 'recon-stage-1' in payload['summary']
+
+    def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        esc = Mem0UpdateStormEscalator()
+        esc.set_known_projects({'dark_factory': str(tmp_path)})
+        esc_id = esc.report_storm(
+            project_id='dark_factory',
+            agent_id='recon-stage-1',
+            count=20,
+            threshold=20,
+            window_seconds=3600.0,
+        )
+
+        filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
+        assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_dedupe_fingerprint_is_over_category_and_agent_only(self, tmp_path):
         """The fingerprint must not vary with count/window — else folding is defeated.

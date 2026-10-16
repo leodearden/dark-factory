@@ -64,10 +64,10 @@ _BACKUP_GLOBS = ('*.tmp.*', '*.py.tmp.*', '*.orig', '*.rej', '*.bak', '*.swp', '
 # count is what makes that rebuild visible; it is expected to require a
 # deliberate bump for genuine new sites, not something to relax away.
 _EXPECTED_REAL_MERGE_ITEM_SITES = {
-    'orchestrator/src/orchestrator/merge_queue.py': 3,
+    'orchestrator/src/orchestrator/merge_lane/worker.py': 3,
 }
 _EXPECTED_DECIDED_ITEM_SITES = {
-    'orchestrator/src/orchestrator/merge_queue.py': 6,
+    'orchestrator/src/orchestrator/merge_lane/worker.py': 6,
 }
 
 

@@ -261,7 +261,7 @@ def test_artifact_measured_at_is_timezone_aware(report: HealthReport) -> None:
     stamp = datetime.fromisoformat(report.measured_at)
     assert stamp.tzinfo is not None, (
         f'measured_at={report.measured_at!r} is timezone-naive; '
-        'lms_healthcheck._now_iso emits aware UTC'
+        'lms_healthcheck._utc_now emits aware UTC and run_healthcheck enforces it'
     )
 
 

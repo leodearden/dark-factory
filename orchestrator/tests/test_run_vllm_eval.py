@@ -18,6 +18,8 @@ from uuid import uuid4
 import pytest
 import yaml
 
+from orchestrator.evals.results import CellName, ResultStore
+
 # Stub out runpod_toolkit BEFORE importing the launcher. The real package has
 # a transitive paramiko dependency that's not installed in the orchestrator
 # test venv, and we never need real RunPod calls in tests anyway — pod
@@ -229,7 +231,7 @@ def _write_result(
         "metrics": extra.pop("metrics", {"cost_usd": 1.23, "tests_pass": True}),
     }
     payload.update(extra)
-    p = results_dir / f"{task_id}__{config_name}__{run_id}.json"
+    p = results_dir / CellName(task_id, config_name, run_id).filename
     p.write_text(json.dumps(payload))
     return p
 
@@ -238,7 +240,7 @@ class TestFindNewResultFile:
     def test_returns_newest_after_watermark(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         old = _write_result(results, "df_task_12", "cfg", "old00000")
         watermark = old.stat().st_mtime
@@ -251,7 +253,7 @@ class TestFindNewResultFile:
     def test_ignores_files_at_or_before_watermark(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         only = _write_result(results, "df_task_12", "cfg", "only00000")
         watermark = only.stat().st_mtime + 1.0  # in the future
@@ -261,13 +263,13 @@ class TestFindNewResultFile:
     def test_returns_none_when_no_new_file(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         assert find_new_result_file("df_task_99", "cfg", 0.0) is None
 
     def test_isolates_by_task_id(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         _write_result(results, "df_task_13", "cfg", "abcd1234")
         assert find_new_result_file("df_task_12", "cfg", 0.0) is None
@@ -275,7 +277,7 @@ class TestFindNewResultFile:
     def test_isolates_by_config_name(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         _write_result(results, "df_task_12", "other-cfg", "abcd1234")
         assert find_new_result_file("df_task_12", "cfg", 0.0) is None
@@ -290,7 +292,7 @@ class TestFindNewResultFileExclude:
     def test_excludes_pre_files_paths(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         a = _write_result(results, "df_task_12", "cfg", "aaaa0000")
         watermark = a.stat().st_mtime - 1.0  # both files are above the watermark
@@ -317,7 +319,7 @@ class TestFindNewResultFileExclude:
         """Old 3-positional-arg call sites still work."""
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         only = _write_result(results, "df_task_12", "cfg", "only00000")
         # No exclude_paths arg at all — must still find the file.
@@ -330,7 +332,7 @@ class TestFindNewResultFileExclude:
 
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         # Write 5 files all with mtime = 1000.0
         files = {}
@@ -500,7 +502,7 @@ class TestPodLifecycle:
         self, monkeypatch, tmp_path, concurrency
     ):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         fake_tasks = tmp_path / "tasks"
@@ -540,7 +542,7 @@ class TestPodLifecycle:
 
     def test_pod_terminated_when_middle_task_crashes(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -594,7 +596,7 @@ class TestPodLifecycle:
 
     def test_pod_terminated_on_keyboard_interrupt(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -634,7 +636,7 @@ class TestPodLifecycle:
 
     def test_pod_bringup_failure_short_circuits(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -694,7 +696,7 @@ class TestPodLifecycle:
 
     def test_single_task_path_runs_subprocess_once(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -754,7 +756,7 @@ class TestPerTaskLogFiles:
 
     def _setup_one_task(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -1055,13 +1057,13 @@ def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
 def _setup_concurrent_fixture(
     monkeypatch, tmp_path: Path, task_ids: list[str]
 ) -> tuple[Path, _FakeClient]:
-    """Shared RESULTS_DIR / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
+    """Shared RESULT_STORE / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
     the ordering-sensitive TestConcurrentLoop tests below.
 
     Returns ``(results_dir, fake_client)``.
     """
     results = tmp_path / "results"
-    monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+    monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
     monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
     fake_tasks = tmp_path / "tasks"
@@ -1162,7 +1164,7 @@ class TestConcurrentLoop:
         deterministic on any CPU load.
         """
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = ["df_task_12", "df_task_13", "df_task_18"]
@@ -1212,7 +1214,7 @@ class TestConcurrentLoop:
         wave 1; later waves pass through the already-open event immediately.
         """
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = [f"df_task_{i}" for i in (12, 13, 14, 15, 18)]
@@ -1249,7 +1251,7 @@ class TestConcurrentLoop:
         import os
 
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = ["df_task_12", "df_task_13", "df_task_14", "df_task_15"]
@@ -1503,7 +1505,7 @@ class TestConcurrentLoop:
         signal injection from another thread.
         """
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = ["df_task_12", "df_task_13", "df_task_18"]
@@ -1687,7 +1689,7 @@ class TestPreflightBaseline:
         repo, sha = tmp_repo
 
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -1728,7 +1730,7 @@ class TestPreflightBaseline:
     def test_warn_policy_proceeds(self, monkeypatch, tmp_path, tmp_repo):
         repo, sha = tmp_repo
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -1777,7 +1779,7 @@ class TestPreflightBaseline:
 
     def test_skip_policy_does_not_run_lint(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()

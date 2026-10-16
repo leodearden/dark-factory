@@ -433,17 +433,18 @@ def test_healthz_data_plane_budget_is_structurally_deliverable(tmp_path):
         'diagnostic.'
     )
 
-    # (d) The grace that absorbs a routine ReadTimeout must be at least one
-    # cache TTL wide, or a single expired entry between two browser polls
-    # reads as a wedge.
+    # (d) A probe younger than the outstanding limit reports 'probing'; it
+    # must outlive one healthy whole-tree read, or a cold-but-healthy fetch
+    # is reported as a wedge.
     assert (
-        app_module._MCP_FANOUT_OK_GRACE_SECONDS >= tasks_module._FETCH_TASKS_TTL_SECONDS
+        app_module._MCP_PROBE_OUTSTANDING_LIMIT >= tasks_module.DEFAULT_WHOLE_OPERATION_BUDGET
     ), (
-        f'_MCP_FANOUT_OK_GRACE_SECONDS ({app_module._MCP_FANOUT_OK_GRACE_SECONDS}) '
-        f'is narrower than one _fetch_tasks_cache TTL '
-        f'({tasks_module._FETCH_TASKS_TTL_SECONDS}). The warm-cache signal goes '
-        'stale every TTL by construction, so a grace narrower than the TTL '
-        'would let an ordinary expiry between two polls report a wedge.'
+        f'_MCP_PROBE_OUTSTANDING_LIMIT ({app_module._MCP_PROBE_OUTSTANDING_LIMIT}) '
+        f'is below tasks.DEFAULT_WHOLE_OPERATION_BUDGET '
+        f'({tasks_module.DEFAULT_WHOLE_OPERATION_BUDGET}), the bound on one '
+        'healthy whole-tree fetch_tasks. The invariant is limit >= budget: a '
+        'probe still inside that budget has demonstrated nothing, so reporting '
+        "it as 'timeout' would call a cold but healthy read a wedge."
     )
 
 

@@ -2,15 +2,18 @@
 
 import asyncio
 import json
+import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import pytest_asyncio
 
-from fused_memory.services.memory_service import ReferentFinding
-from fused_memory.services.write_journal import WriteJournal
+from fused_memory.backends.llm_token_usage import LlmTokenUsage
+from fused_memory.services.write_journal import OPERATOR_TELEMETRY_QUERY, WriteJournal
 from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_verification import ReferentFinding
 
 
 @pytest_asyncio.fixture
@@ -69,6 +72,220 @@ async def test_log_backend_op_roundtrip(journal):
     assert len(ops) == 1
     assert ops[0]['backend'] == 'mem0'
     assert ops[0]['write_op_id'] == write_op_id
+
+
+async def _backend_ops_columns(db_path) -> set[str]:
+    import aiosqlite
+
+    async with aiosqlite.connect(str(db_path)) as db, db.execute(
+        'PRAGMA table_info(backend_ops)'
+    ) as cursor:
+        return {row[1] for row in await cursor.fetchall()}
+
+
+@pytest.mark.asyncio
+async def test_fresh_journal_backend_ops_has_duration_ms_column(journal):
+    columns = await _backend_ops_columns(journal.data_dir / 'write_journal.db')
+    assert 'duration_ms' in columns
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_duration_ms_roundtrips_as_real(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        duration_ms=1234.567,
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert row['duration_ms'] == pytest.approx(1234.567)
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_without_duration_ms_stores_null(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='mem0',
+        operation='add',
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert row['duration_ms'] is None
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_nests_the_result_beside_its_measured_llm_tokens(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        result_summary='episode-result',
+        llm_tokens=LlmTokenUsage(input_tokens=120, output_tokens=45, llm_calls=1),
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert json.loads(row['result_summary']) == {
+        'result': 'episode-result',
+        'tokens': {
+            'input_tokens': 120,
+            'output_tokens': 45,
+            'total_tokens': 165,
+            'llm_calls': 1,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_journals_measured_tokens_even_without_a_result(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        success=False,
+        error='RuntimeError: extraction failed',
+        llm_tokens=LlmTokenUsage(input_tokens=10, output_tokens=2, llm_calls=1),
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert json.loads(row['result_summary']) == {
+        'result': None,
+        'tokens': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12, 'llm_calls': 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_without_llm_tokens_keeps_the_plain_result_summary(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='mem0',
+        operation='add',
+        result_summary='plain-result',
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert row['result_summary'] == 'plain-result'
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_names_llm_tokens_that_are_not_an_llm_token_usage(
+    journal, caplog
+):
+    write_op_id = str(uuid.uuid4())
+    not_a_usage: Any = {'input_tokens': 1, 'output_tokens': 1, 'llm_calls': 1}
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.services.write_journal'):
+        await journal.log_backend_op(
+            write_op_id=write_op_id,
+            backend='graphiti',
+            operation='add_episode',
+            llm_tokens=not_a_usage,
+        )
+
+    assert await journal.get_backend_ops_for_write_op(write_op_id) == []
+    assert journal.journal_drop_stats()['by_operation'] == {'add_episode': 1}
+    assert 'llm_tokens must be an LlmTokenUsage or None, got dict' in caplog.text
+
+
+async def _seed_backend_op(
+    journal: WriteJournal,
+    *,
+    write_operation: str,
+    backend: str,
+    backend_operation: str,
+    duration_ms: float | None,
+    result_summary: dict | str | None,
+    llm_tokens: LlmTokenUsage | None = None,
+) -> None:
+    write_op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=write_op_id, operation=write_operation, project_id='telemetry'
+    )
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend=backend,
+        operation=backend_operation,
+        result_summary=result_summary,
+        duration_ms=duration_ms,
+        llm_tokens=llm_tokens,
+    )
+
+
+async def _run_operator_telemetry_query(journal: WriteJournal, since: str, limit: int):
+    import aiosqlite
+
+    async with aiosqlite.connect(str(journal.data_dir / 'write_journal.db')) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(OPERATOR_TELEMETRY_QUERY, (since, limit)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+@pytest.mark.asyncio
+async def test_operator_telemetry_query_reports_duration_and_tokens_per_write(journal):
+    await _seed_backend_op(
+        journal,
+        write_operation='add_episode',
+        backend='graphiti',
+        backend_operation='add_episode',
+        duration_ms=1.0,
+        result_summary=None,
+    )
+    since = datetime.now(UTC).isoformat()
+    await _seed_backend_op(
+        journal,
+        write_operation='delete_memory',
+        backend='mem0',
+        backend_operation='delete',
+        duration_ms=None,
+        result_summary=None,
+    )
+    await _seed_backend_op(
+        journal,
+        write_operation='add_memory',
+        backend='mem0',
+        backend_operation='add',
+        duration_ms=3.25,
+        result_summary=str({'results': [{'id': 'm1'}]}),
+    )
+    await _seed_backend_op(
+        journal,
+        write_operation='add_episode',
+        backend='graphiti',
+        backend_operation='add_episode',
+        duration_ms=812.5,
+        result_summary='x',
+        llm_tokens=LlmTokenUsage(input_tokens=120, output_tokens=45, llm_calls=1),
+    )
+
+    rows = await _run_operator_telemetry_query(journal, since, 100)
+
+    assert [(r['operation'], r['backend']) for r in rows] == [
+        ('add_episode', 'graphiti'),
+        ('add_memory', 'mem0'),
+        ('delete_memory', 'mem0'),
+    ]
+    graphiti, mem0, unmeasured = rows
+    assert graphiti['project_id'] == 'telemetry'
+    assert graphiti['success'] == 1
+    assert graphiti['duration_ms'] == 812.5
+    assert (
+        graphiti['input_tokens'],
+        graphiti['output_tokens'],
+        graphiti['total_tokens'],
+        graphiti['llm_calls'],
+    ) == (120, 45, 165, 1)
+    assert mem0['duration_ms'] == 3.25
+    assert (
+        mem0['input_tokens'],
+        mem0['output_tokens'],
+        mem0['total_tokens'],
+        mem0['llm_calls'],
+    ) == (None, None, None, None)
+    assert unmeasured['duration_ms'] is None
+    assert unmeasured['total_tokens'] is None
+
+    [most_recent] = await _run_operator_telemetry_query(journal, since, 1)
+    assert most_recent['duration_ms'] == 812.5
 
 
 @pytest.mark.asyncio
@@ -149,7 +366,6 @@ async def test_log_write_op_never_raises(journal):
     """Journaling failures should be swallowed, not propagated."""
     # Close the DB to force an error
     await journal.close()
-    journal._db = None
     # Should not raise
     await journal.log_write_op(
         write_op_id=str(uuid.uuid4()),
@@ -160,7 +376,6 @@ async def test_log_write_op_never_raises(journal):
 @pytest.mark.asyncio
 async def test_log_backend_op_never_raises(journal):
     await journal.close()
-    journal._db = None
     await journal.log_backend_op(
         backend='mem0',
         operation='add',
@@ -311,7 +526,7 @@ async def test_migration_adds_columns(tmp_path):
     await j.initialize()
 
     # Check columns exist
-    db = j._require_db()
+    db = j._require_access().connection
     async with db.execute('PRAGMA table_info(write_ops)') as cursor:
         cols = {row[1] for row in await cursor.fetchall()}
     assert 'session_id' in cols
@@ -326,6 +541,70 @@ async def test_migration_adds_columns(tmp_path):
         assert row[0] == 'read'
 
     await j.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_backend_ops_duration_ms_without_backfill(tmp_path):
+    import aiosqlite
+
+    db_dir = tmp_path / 'migrate_duration'
+    db_dir.mkdir()
+    db_path = db_dir / 'write_journal.db'
+    legacy_schema = """
+    CREATE TABLE write_ops (
+        id TEXT PRIMARY KEY,
+        causation_id TEXT,
+        source TEXT,
+        provenance TEXT DEFAULT 'original',
+        operation TEXT,
+        project_id TEXT,
+        agent_id TEXT,
+        params TEXT DEFAULT '{}',
+        result_summary TEXT,
+        success INTEGER DEFAULT 1,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE backend_ops (
+        id TEXT PRIMARY KEY,
+        write_op_id TEXT,
+        causation_id TEXT,
+        backend TEXT,
+        operation TEXT,
+        payload TEXT DEFAULT '{}',
+        result_summary TEXT,
+        success INTEGER DEFAULT 1,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript(legacy_schema)
+        await db.execute(
+            'INSERT INTO backend_ops (id, write_op_id, backend, operation, created_at)'
+            ' VALUES (?, ?, ?, ?, ?)',
+            ('legacy-bo', 'legacy-wo', 'graphiti', 'add_episode', '2025-01-01T00:00:00'),
+        )
+        await db.commit()
+
+    j = WriteJournal(db_dir)
+    await j.initialize()
+    try:
+        assert 'duration_ms' in await _backend_ops_columns(db_path)
+
+        [legacy_row] = await j.get_backend_ops_for_write_op('legacy-wo')
+        assert legacy_row['duration_ms'] is None
+
+        await j.log_backend_op(
+            write_op_id='fresh-wo',
+            backend='mem0',
+            operation='add',
+            duration_ms=12.5,
+        )
+        [fresh_row] = await j.get_backend_ops_for_write_op('fresh-wo')
+        assert fresh_row['duration_ms'] == 12.5
+    finally:
+        await j.close()
 
 
 # ------------------------------------------------------------------
@@ -573,11 +852,11 @@ async def test_prune_mem0_intents_ages_out_terminal_rows(journal):
             await journal.resolve_mem0_intent(iid, status)
             if resolved_at is not None:
                 # Backdate resolved_at to simulate an aged terminal row.
-                await journal._db.execute(
+                await journal._require_access().connection.execute(
                     'UPDATE mem0_intents SET resolved_at = ? WHERE id = ?',
                     (resolved_at, iid),
                 )
-                await journal._db.commit()
+                await journal._require_access().connection.commit()
         return iid
 
     old = '2000-01-01T00:00:00+00:00'
@@ -612,11 +891,11 @@ async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
         payload_digest='d',
     )
     await journal.resolve_mem0_intent(iid, 'dead', reason='unknown outcome')
-    await journal._db.execute(
+    await journal._require_access().connection.execute(
         'UPDATE mem0_intents SET resolved_at = ? WHERE id = ?',
         ('2000-01-01T00:00:00+00:00', iid),
     )
-    await journal._db.commit()
+    await journal._require_access().connection.commit()
 
     # Default statuses preserve dead...
     assert await journal.prune_mem0_intents(older_than_days=7) == 0
@@ -632,7 +911,6 @@ async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
 async def test_prune_mem0_intents_never_raises(journal):
     """A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
-    journal._db = None
     assert await journal.prune_mem0_intents() == 0
 
 
@@ -671,7 +949,6 @@ async def test_record_idempotent_result_first_write_wins(journal):
 async def test_get_idempotent_result_never_raises(journal):
     """A read hiccup fails open (None), never raises — journal never-block style."""
     await journal.close()
-    journal._db = None
     assert await journal.get_idempotent_result('op-x') is None
 
 
@@ -679,7 +956,6 @@ async def test_get_idempotent_result_never_raises(journal):
 async def test_record_idempotent_result_never_raises(journal):
     """A record hiccup is swallowed, not propagated."""
     await journal.close()
-    journal._db = None
     # Should not raise
     await journal.record_idempotent_result('op-y', 'update_task', {'ok': True})
 
@@ -690,11 +966,11 @@ async def test_prune_idempotent_ops_ages_out_old_rows(journal):
     # Recent row (created_at = now) stays; backdated row is aged out.
     await journal.record_idempotent_result('recent', 'update_task', {'ok': True})
     await journal.record_idempotent_result('old', 'update_task', {'ok': True})
-    await journal._db.execute(
+    await journal._require_access().connection.execute(
         'UPDATE idempotent_ops SET created_at = ? WHERE client_op_id = ?',
         ('2000-01-01T00:00:00+00:00', 'old'),
     )
-    await journal._db.commit()
+    await journal._require_access().connection.commit()
 
     deleted = await journal.prune_idempotent_ops(older_than_days=7)
     assert deleted == 1  # only the backdated row
@@ -707,7 +983,6 @@ async def test_prune_idempotent_ops_ages_out_old_rows(journal):
 async def test_prune_idempotent_ops_never_raises(journal):
     """A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
-    journal._db = None
     assert await journal.prune_idempotent_ops() == 0
 
 
@@ -793,7 +1068,7 @@ async def test_schema_creates_idx_wo_created(tmp_path):
     j = WriteJournal(tmp_path / 'idx_test')
     await j.initialize()
     try:
-        db = j._require_db()
+        db = j._require_access().connection
 
         # PRAGMA index_list -> (seq, name, unique, origin, partial)
         async with db.execute("PRAGMA index_list('write_ops')") as cursor:
@@ -839,7 +1114,7 @@ async def test_created_at_range_is_seekable_for_dashboard_queries(tmp_path):
     j = WriteJournal(tmp_path / 'plan_test')
     await j.initialize()
     try:
-        await _assert_created_at_seekable(j._require_db(), context='fresh schema')
+        await _assert_created_at_seekable(j._require_access().connection, context='fresh schema')
     finally:
         await j.close()
 
@@ -905,7 +1180,7 @@ async def test_existing_db_gains_idx_wo_created_on_initialize(tmp_path):
     j = WriteJournal(data_dir)
     await j.initialize()
     try:
-        db_inner = j._require_db()
+        db_inner = j._require_access().connection
 
         async with db_inner.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wo_created'"
@@ -936,7 +1211,7 @@ async def test_existing_db_gains_idx_wo_created_on_initialize(tmp_path):
 @pytest.mark.asyncio
 async def test_write_ops_has_terminal_columns(journal):
     """A fresh DB carries the terminal_* columns, NULL at Layer-1 log time."""
-    db = journal._require_db()
+    db = journal._require_access().connection
     async with db.execute('PRAGMA table_info(write_ops)') as cursor:
         cols = {row[1] for row in await cursor.fetchall()}
     assert 'terminal_status' in cols
@@ -1001,7 +1276,7 @@ async def test_existing_db_gains_terminal_columns_on_initialize(tmp_path):
     # a duplicate ALTER TABLE ADD COLUMN.
     await j.initialize()
     try:
-        db_inner = j._require_db()
+        db_inner = j._require_access().connection
         async with db_inner.execute('PRAGMA table_info(write_ops)') as cursor:
             cols = {row[1] for row in await cursor.fetchall()}
         assert 'terminal_status' in cols
@@ -1191,7 +1466,7 @@ async def test_late_producer_log_write_op_preserves_terminal_outcome(journal):
 
 @pytest.mark.asyncio
 async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
-    journal, monkeypatch, caplog
+    journal, caplog
 ):
     """The never-propagate guarantee the whole design rests on.
 
@@ -1206,10 +1481,7 @@ async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
     op_id = str(uuid.uuid4())
     await journal.log_write_op(write_op_id=op_id, operation='add_episode')
 
-    def _boom():
-        raise RuntimeError('db handle exploded')
-
-    monkeypatch.setattr(journal, '_txn', _boom)
+    await journal.close()
 
     with caplog.at_level(logging.ERROR, logger=wj.logger.name):
         result = await journal.record_terminal_outcome(
@@ -1254,15 +1526,15 @@ async def _seed_write_op(journal, *, operation, kind, created_at=None) -> str:
         result_summary={'count': 0},
     )
     if created_at is not None:
-        await journal._db.execute(
+        await journal._require_access().connection.execute(
             'UPDATE write_ops SET created_at = ? WHERE id = ?', (created_at, op_id)
         )
-        await journal._db.commit()
+        await journal._require_access().connection.commit()
     return op_id
 
 
 async def _surviving_ids(journal) -> set[str]:
-    async with journal._db.execute('SELECT id FROM write_ops') as cursor:
+    async with journal._require_access().connection.execute('SELECT id FROM write_ops') as cursor:
         return {row[0] for row in await cursor.fetchall()}
 
 
@@ -1422,7 +1694,6 @@ async def test_prune_write_ops_deadline_bounds_a_single_run(journal, caplog, mon
 async def test_prune_write_ops_never_raises(journal):
     """(g) A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
-    journal._db = None
     assert await _prune(journal) == 0
 
 
@@ -1477,7 +1748,6 @@ async def test_journal_drop_stats_starts_at_zero(journal):
 async def test_closed_db_write_counts_a_drop(journal):
     """(b) A closed DB still does not raise — and the lost row is COUNTED."""
     await journal.close()
-    journal._db = None
 
     await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
 
@@ -1511,7 +1781,6 @@ async def test_unserializable_params_counts_a_drop(journal):
 async def test_journal_drops_are_cumulative(journal):
     """(c) A fallback firing 100 times must read as 100, not as one log line."""
     await journal.close()
-    journal._db = None
 
     for _ in range(100):
         await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
@@ -1527,7 +1796,6 @@ async def test_journal_drops_are_cumulative(journal):
 async def test_backend_op_drops_share_the_same_counter(journal):
     """(d) Layer-2 losses feed ONE counter, not a second divergent one."""
     await journal.close()
-    journal._db = None
 
     await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
     await journal.log_backend_op(backend='mem0', operation='add')
@@ -1558,7 +1826,6 @@ async def test_successful_write_does_not_count_a_drop(journal):
 async def test_journal_drop_stats_returns_a_defensive_copy(journal):
     """A caller must not be able to mutate the journal's internal counter."""
     await journal.close()
-    journal._db = None
     await journal.log_write_op(write_op_id=str(uuid.uuid4()), operation='search')
 
     snapshot = journal.journal_drop_stats()
@@ -1756,7 +2023,7 @@ async def test_one_episode_is_one_commit_however_many_findings_it_carries(
     public surface distinguishes one transaction from N.
     """
     commits = 0
-    db = journal._require_db()
+    db = journal._require_access().connection
     real_commit = db.commit
 
     async def _counting_commit():

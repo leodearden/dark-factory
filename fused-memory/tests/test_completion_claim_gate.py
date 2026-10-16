@@ -15,6 +15,7 @@ exception is the make_commit_probe suite, which builds a throwaway repo).
 from __future__ import annotations
 
 import pytest
+from _distinct_git_repo import init_distinct_git_repo
 
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
@@ -23,6 +24,7 @@ from fused_memory.services.completion_claim_gate import (
     build_unverified_flag,
     extract_completion_claims,
     make_commit_probe,
+    make_registry_commit_probe,
     verify_claims,
 )
 
@@ -101,51 +103,40 @@ class TestAppliedWorkExtraction:
 
 
 class TestClauseBoundaryIsolation:
-    """The gate's clause boundary is INSULATED from task 3403's widening of
-    ``task_filter._CLAUSE_SPLIT_RE`` (the review finding on that task).
+    """The gate shares ``task_filter.WIDE_CLAUSE_BOUNDARY_RE``'s widened boundary
+    (task 3403: a dot followed by a word character, as in
+    ``orchestrator.yaml`` or ``CLAUDE.md:95``, no longer ends a clause).
 
-    Task 3403 narrowed that splitter's dot to ``\\.(?!\\w)`` so dotted technical
-    tokens (``dark-factory-orchestrator.yaml``, ``CLAUDE.md:95``) stop
-    shattering a sentence. That is the right trade for the two recon detectors
-    it was written for: they feed early-return SOFT-BLOCK write gates, so a
-    longer clause costs a rephrase-and-retry and nothing else. This gate is a
-    different animal — ``server/tools.py`` runs it on EVERY ``add_episode``
-    regardless of agent, a flagged claim rides into the Graphiti
-    ``source_description`` and every derived Mem0 fact's metadata, and it files
-    an operator escalation. A longer clause here durably mislabels a CORRECT
-    episode as contradicted and injects a false escalation into the human
-    queue.
+    Task 3403 refused that widening here at first. Then every ref in a clause
+    inherited the clause's completion phrasing, so a longer clause dragged a
+    still-pending task into a neighbour's completion claim, and the gate
+    writes what it finds: a durable tag on the episode and an operator
+    escalation. Precision now comes from per-marker proximity binding instead
+    of a short clause (task 4853): each completion marker binds to ONE nearest
+    ref and never across a barrier, so a longer clause adds candidate refs
+    without adding claims, and the widening is safe.
 
-    So the two have OPPOSITE fail-safe directions, and this module says so in
-    its own docstring: "requiring the ref is also the volume control — an
-    unanchored detector would tag a large fraction of ordinary agent narration,
-    and a tag that fires constantly stops being read." That is
-    precision-over-recall, the reverse of the recon detectors'
-    fail-open-on-under-firing default, and the reason the widening must not
-    propagate here.
-
-    The over-fire cases below were MEASURED on task 3403's branch: each yielded
-    ONE claim before the widening and TWO after it. The controls that follow
-    them pass in BOTH regimes on purpose — they exist so the fix cannot
-    over-correct into some third behaviour, and the ``task/3698`` case pins
-    that the SHARED ``TASK_REF_RE`` slash widening is deliberately RETAINED
-    for this consumer even though the clause widening is not.
+    The two over-fire cases below each yielded TWO claims under clause-wide
+    attribution with the widened boundary; binding keeps them to one. The
+    recall case is the claim the strict boundary used to lose. The controls
+    pin that nothing else moved, including the shared ``TASK_REF_RE`` slash
+    form.
     """
 
     @pytest.mark.parametrize(
         ('text', 'ref'),
         [
             # A dotted technical token inside a sentence that coordinates a
-            # LANDED task with a still-PENDING one. Under the widened splitter
-            # 'orchestrator.yaml' no longer breaks the sentence, so task 1986
-            # is dragged into task 1985's completion clause and tagged as an
-            # unverified claim it never made.
+            # LANDED task with a still-PENDING one. 'orchestrator.yaml' no
+            # longer breaks the sentence, and the 'and' barrier is what keeps
+            # task 1986 out of task 1985's completion claim.
             (
                 'df 1985 landed in orchestrator.yaml and task 1986 is still pending.',
                 '1985',
             ),
             # The missing-space sentence boundary: '.Task' is a real boundary
-            # that the widened splitter (right-side lookahead) stops honouring.
+            # that the widened splitter (right-side lookahead) stops honouring;
+            # 'has landed' binds back to Task 100, never forward across '.'.
             ('Task 100 has landed.Task 200 is still pending.', '100'),
         ],
     )
@@ -154,6 +145,11 @@ class TestClauseBoundaryIsolation:
 
         assert len(claims) == 1, f'{text!r} -> {claims!r}'
         assert claims[0].ref == ref, f'{text!r} -> {claims!r}'
+
+    def test_dotted_token_between_ref_and_marker_no_longer_hides_the_claim(self):
+        claims = _extract('Task 5252 (see CLAUDE.md:95) has landed and now enforces the gate.')
+
+        assert [c.ref for c in claims] == ['5252'], claims
 
     # ---- controls: unchanged by the widening, in either direction ---- #
 
@@ -168,17 +164,131 @@ class TestClauseBoundaryIsolation:
         assert _extract('Task 888 is still pending.') == []
 
     def test_slash_form_ref_is_still_recognised(self):
-        """The step-6 ``TASK_REF_RE`` widening IS retained for this consumer.
+        """Task 3403's shared ``TASK_REF_RE`` slash form is a ref here too.
 
-        Only the clause-boundary widening is refused; admitting 'task/3698'
-        into the shared ref grammar raises recall with no precision cost here
-        (a slash-form ref is still a ref, and it still has to co-occur with
-        completion phrasing in the same clause).
+        Admitting 'task/3698' into the shared ref grammar raises recall with no
+        precision cost (a slash-form ref is still a ref, and a completion
+        marker still has to bind to it).
         """
         claims = _extract('task/3698 has landed.')
 
         assert len(claims) == 1, claims
         assert claims[0].ref == '3698'
+
+
+_ESC_5869_1_CLAIMED = (
+    'Two sweeps (-18, -20) yielded real loose ends: a missing dependency (task 5869 '
+    'on 5460), a stale instruction naming a nonexistent symbol (_MIGRATED_MODULES '
+    'became _NOT_YET_MIGRATED), a time-sensitive missing dependency (task 3211 on '
+    "4855, otherwise E4's first grandfather snapshot uses the old semantics and the "
+    'tripwire alarms every run), overlapping tasks needing edges (5909 and 6102 on '
+    '6096), and a promised but never-filed de-flake task (filed as 6117)'
+)
+
+
+class TestProximityBinding:
+    """Each completion marker binds to ONE ref: a ticket/commit after it, or a
+    task that is its direct object or 'as'-complement, else the nearest ref
+    before it. No binding crosses a barrier (', ', ': ', a spaced dash, and,
+    but, while, because, rather than, ...)."""
+
+    @pytest.mark.parametrize(
+        ('text', 'expected'),
+        [
+            pytest.param(
+                "head_of_line was either 4792 ('queued', age ~110 h) or 5590's blocked "
+                "first request, still 'queued' after 5590 had landed (task 3860)",
+                [],
+                id='esc-unverified-claim-3860-3',
+            ),
+            pytest.param(
+                'task 4540 was CANCELLED as superseded by task 5053, task 5054 and task 5416',
+                [('disposition', 'task', '4540')],
+                id='esc-unverified-claim-5416-3',
+            ),
+            pytest.param(
+                "Description: Follow-up filed by task 4818's architect (escalation esc-4818-4)",
+                [],
+                id='esc-unverified-claim-4818-3',
+            ),
+            pytest.param(
+                "It is out of this task's scope and file set (task 3651 holds in-flight "
+                'changes there), so it is filed as a separate low-priority follow-up '
+                'rather than fixed here',
+                [],
+                id='esc-unverified-claim-3651-3',
+            ),
+            pytest.param(_ESC_5869_1_CLAIMED, [], id='esc-unverified-claim-5869-1'),
+            pytest.param(
+                "PDOCCOVER's DETECTOR landed as task #5478 (done) while its GATE, "
+                'task #5480, is STILL PENDING',
+                [('applied_work', 'task', '5478')],
+                id='sweep-class-b-pdoccover',
+            ),
+            pytest.param(
+                'the value 16 that task 5984 landed was chosen only to mirror dark_factory:3589',
+                [('applied_work', 'task', '5984')],
+                id='sweep-class-b-5984',
+            ),
+            pytest.param(
+                'because #6077 waits on #5467, the seven landed doc-sync rows stay rename-blind',
+                [],
+                id='sweep-class-b-6077-waits',
+            ),
+            pytest.param(
+                'select_infra_tests() was FOLDED INTO task #6077 rather than filed as its '
+                'own task',
+                [],
+                id='sweep-class-b-6077-folded',
+            ),
+        ],
+    )
+    def test_marker_binds_only_to_its_nearest_ref(self, text, expected):
+        claims = _extract(text)
+
+        assert [(c.kind, c.subject, c.ref) for c in claims] == expected, claims
+
+    @pytest.mark.parametrize(
+        ('text', 'expected'),
+        [
+            pytest.param(
+                'The user-observable signal was NOT dropped — it was refiled as task 4263',
+                [('filing_dispatch', 'task', '4263')],
+                id='as-complement',
+            ),
+            pytest.param(
+                'To close the hex/wedge Phase A wiring gap, filed task 4746 (x)',
+                [('filing_dispatch', 'task', '4746')],
+                id='direct-object',
+            ),
+            pytest.param(
+                'Fix for the Reify merge-verify fan-out storm, LANDED on dark-factory main '
+                '(commit 5353d209e4, merged as 1d3aaeb030',
+                [('applied_work', 'commit', '5353d209e4')],
+                id='forward-commit',
+            ),
+        ],
+    )
+    def test_forward_binding_still_binds(self, text, expected):
+        claims = _extract(text)
+
+        assert [(c.kind, c.subject, c.ref) for c in claims] == expected, claims
+
+    def test_forward_binding_through_a_registered_project_qualifier(self):
+        claims = _extract('prevention filed as dark_factory task 4213', default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '4213', 'dark_factory'),
+        ]
+
+    @pytest.mark.parametrize(
+        'text', ['task 1985 and task 1986 landed', 'task 1985, task 1986 landed'],
+    )
+    def test_coordinated_subject_claims_only_the_nearest_ref(self, text):
+        """An ACCEPTED recall residual, not a defect: one marker binds one ref,
+        so a false completion claim about 1985 goes untagged. Precision over
+        recall, the trade task_filter makes for 'PRs #1 and #2'."""
+        assert [(c.subject, c.ref) for c in _extract(text)] == [('task', '1986')]
 
 
 # The verbatim text from esc-3085-1 instance (2): a reify-authored claim that
@@ -200,8 +310,8 @@ class TestFilingDispatchExtraction:
         assert len(claims) == 1, claims
         claim = claims[0]
         assert claim.kind == 'filing_dispatch'
-        # Ticket beats task: the tkt_ id is the more specific authority, and it
-        # is the one that was actually false in the incident.
+        # 're-filed' binds forward to the ticket it names, the ref that was
+        # actually false in the incident, not back to task 5638.
         assert claim.subject == 'ticket'
         assert claim.ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
 
@@ -214,8 +324,6 @@ class TestFilingDispatchExtraction:
             'was submitted as',
             'was queued as',
             'was dispatched as',
-            'was cancelled as',
-            'was closed as duplicate of',
         ],
     )
     def test_filing_dispatch_family_each_yields_a_ticket_claim(self, phrasing):
@@ -227,6 +335,25 @@ class TestFilingDispatchExtraction:
         assert claims[0].subject == 'ticket'
         assert claims[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
 
+    @pytest.mark.parametrize(
+        'phrasing',
+        ['was cancelled as', 'was canceled as', 'was closed as duplicate of'],
+    )
+    def test_disposition_family_each_yields_a_disposition_claim(self, phrasing):
+        text = f'the follow-up {phrasing} ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+        claims = _extract(text)
+
+        assert [(c.kind, c.subject, c.ref) for c in claims] == [
+            ('disposition', 'ticket', 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'),
+        ], f'{text!r} -> {claims!r}'
+
+    def test_cancelled_task_is_a_disposition_claim(self):
+        claims = _extract('task 4540 was cancelled')
+
+        assert [(c.kind, c.subject, c.ref) for c in claims] == [
+            ('disposition', 'task', '4540'),
+        ]
+
     def test_commit_sha_claim_resolves_to_the_commit_subject(self):
         claims = _extract('the de-flake fix landed in commit 7bbcd5d815')
 
@@ -235,8 +362,8 @@ class TestFilingDispatchExtraction:
         assert claims[0].subject == 'commit'
         assert claims[0].ref == '7bbcd5d815'
 
-    def test_commit_beats_task_but_ticket_beats_commit(self):
-        """Subject precedence is ticket > commit > task, per clause."""
+    def test_marker_binds_forward_to_its_commit_complement(self):
+        """The marker binds FORWARD to its complement ('as commit X'), not back to the task."""
         task_and_commit = _extract('task 5422 was merged as commit 7bbcd5d815')
         assert [(c.subject, c.ref) for c in task_and_commit] == [('commit', '7bbcd5d815')]
 
@@ -322,6 +449,73 @@ class TestCrossProjectRefResolution:
         assert claims[0].project_id is None
 
 
+class TestForeignNumberRefs:
+    """A PR, issue or other-repository '#N' is not a task in the writer's project."""
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'Merged PR #4521 into main',
+            'The upstream issue #123 was closed as wontfix',
+        ],
+    )
+    def test_pull_request_and_issue_numbers_yield_nothing(self, text):
+        assert _extract(text) == []
+
+    def test_registered_project_hash_form_is_a_cross_project_task_ref(self):
+        claims = _extract('dark_factory#2748 was merged', default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '2748', 'dark_factory'),
+        ]
+
+
+class TestDenialAndCompoundForms:
+    """'<verb> nothing' denies the completion, and a hyphenated compound
+    ('merge-landed', 'auto-filed') is an adjective, not a completion verb."""
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                'task 5623 has landed nothing (still pending)', id='sweep-class-b-1554dafd',
+            ),
+            pytest.param('task 5623 merged nothing', id='merged-nothing'),
+            pytest.param("task 5422's fix has applied nothing", id='extension-vocabulary'),
+            pytest.param(
+                'Why task 6118 needed a manual fused-memory restart (2026-10-01): the '
+                'merge-landed restart coordinator (service_restart',
+                id='esc-unverified-claim-6118-3',
+            ),
+            pytest.param(
+                'Task 5850 owns rewording the auto-filed de-flake task text, which '
+                'wrongly tells the implementer to resolve its own debt row',
+                id='esc-unverified-claim-5850-1',
+            ),
+            pytest.param(
+                'the flake ledger opened debt owned by auto-filed task 6169',
+                id='esc-unverified-claim-6169-3',
+            ),
+            pytest.param('task 77 is a pre-merged stub', id='pre-merged'),
+        ],
+    )
+    def test_denial_or_compound_yields_nothing(self, text):
+        assert _extract(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                'task 5422 was re-filed as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376',
+                id='hyphen-inside-re-filed',
+            ),
+            pytest.param('task 5422 landed', id='bare-landed'),
+        ],
+    )
+    def test_controls_still_extract_one_claim(self, text):
+        assert len(_extract(text)) == 1, _extract(text)
+
+
 def _verify(claims, *, task=None, ticket=None, commit=None):
     """Run verify_claims with probes that fail loudly if an unexpected one is
     consulted — the short-circuit contract is part of what is under test."""
@@ -381,6 +575,48 @@ class TestVerifyClaims:
 
         _verify([self._task_claim(project_id='dark_factory')], task=probe)
         assert seen == [('5422', 'dark_factory')]
+
+    def _task_claim_of_kind(self, kind):
+        return CompletionClaim(
+            kind=kind, subject='task', ref='6169', project_id='reify', span=(0, 40),
+        )
+
+    @pytest.mark.parametrize(
+        'status',
+        ['pending', 'deferred', 'in-progress', 'blocked', 'merge-deferred', 'done',
+         'cancelled'],
+    )
+    def test_filing_claim_verifies_against_any_real_task_status(self, status):
+        """Existence is the truth condition of 'filed as task N' (sweep Class A;
+        esc-unverified-claim-6169-3)."""
+        verdicts = _verify(
+            [self._task_claim_of_kind('filing_dispatch')],
+            task=lambda ref, project: status,
+        )
+
+        assert verdicts[0].status == 'verified'
+        assert verdicts[0].observed == status
+
+    @pytest.mark.parametrize('probed', [None, 'unknown'])
+    def test_filing_claim_with_unresolvable_status_is_unverifiable(self, probed):
+        verdicts = _verify(
+            [self._task_claim_of_kind('filing_dispatch')],
+            task=lambda ref, project: probed,
+        )
+
+        assert verdicts[0].status == 'unverifiable'
+
+    @pytest.mark.parametrize(
+        ('status', 'expected'),
+        [('pending', 'mismatch'), ('cancelled', 'verified'), ('done', 'verified')],
+    )
+    def test_disposition_claim_requires_a_terminal_task_status(self, status, expected):
+        verdicts = _verify(
+            [self._task_claim_of_kind('disposition')],
+            task=lambda ref, project: status,
+        )
+
+        assert verdicts[0].status == expected
 
     def _ticket_claim(self):
         return CompletionClaim(
@@ -569,6 +805,58 @@ class TestMakeCommitProbe:
         probe = make_commit_probe(tmp_path / 'does-not-exist')
 
         assert probe('0' * 40) is None
+
+
+_ABSENT_SHA = '0' * 39 + '1'
+
+
+class TestMakeRegistryCommitProbe:
+    """A sha is near-globally unique, so a commit claim is checked against
+    every registered repository, and absence is asserted only when all of them
+    answered. Sweep Class C: 12 confirmed false accusations probed only the
+    writer's repo."""
+
+    @pytest.fixture
+    def repos(self, tmp_path):
+        reify_root = tmp_path / 'reify'
+        df_root = tmp_path / 'dark_factory'
+        reify_sha = init_distinct_git_repo(reify_root)
+        df_sha = init_distinct_git_repo(df_root)
+        assert reify_sha != df_sha
+        return {'reify': str(reify_root), 'dark_factory': str(df_root)}, reify_sha, df_sha
+
+    def test_sha_in_another_registered_repo_is_present(self, repos):
+        roots, _reify_sha, df_sha = repos
+        probe = make_registry_commit_probe(roots)
+
+        assert probe(df_sha, 'reify') is True
+        assert probe(df_sha, 'dark_factory') is True
+
+    def test_sha_absent_from_every_registered_repo_is_absent(self, repos):
+        roots, _reify_sha, _df_sha = repos
+
+        assert make_registry_commit_probe(roots)(_ABSENT_SHA, 'reify') is False
+
+    def test_unregistered_claimed_project_cannot_assert_absence(self, repos):
+        roots, _reify_sha, df_sha = repos
+        probe = make_registry_commit_probe(roots)
+
+        assert probe(df_sha, 'unregistered') is True
+        assert probe(_ABSENT_SHA, 'unregistered') is None
+
+    def test_one_unanswerable_repo_prevents_a_clean_absence(self, repos, tmp_path):
+        roots, _reify_sha, df_sha = repos
+        not_a_repo = tmp_path / 'not-a-repo'
+        not_a_repo.mkdir()
+        probe = make_registry_commit_probe(
+            {'reify': str(not_a_repo), 'dark_factory': roots['dark_factory']},
+        )
+
+        assert probe(_ABSENT_SHA, 'reify') is None
+        assert probe(df_sha, 'reify') is True
+
+    def test_empty_registry_is_unresolvable(self):
+        assert make_registry_commit_probe({})(_ABSENT_SHA, 'reify') is None
 
 
 class TestEmitUnverifiedClaimEscalation:

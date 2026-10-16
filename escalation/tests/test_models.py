@@ -20,6 +20,7 @@ from escalation.models import (
     LateResolution,
     TrainState,
     max_severity,
+    normalised_severity,
 )
 
 
@@ -41,6 +42,23 @@ class TestBornAtL2Severities:
     def test_constant_contains_exactly_critical_and_urgent(self):
         """BORN_AT_L2_SEVERITIES contains exactly {'critical', 'urgent'} — no extras."""
         assert frozenset({'critical', 'urgent'}) == BORN_AT_L2_SEVERITIES
+
+
+class TestNormalisedSeverity:
+    """The one severity normalisation every severity classifier compares against."""
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            ('info', 'info'),
+            (' Info ', 'info'),
+            ('BLOCKING', 'blocking'),
+            ('', ''),
+            (None, ''),
+        ],
+    )
+    def test_folds_case_whitespace_and_null(self, raw: str | None, expected: str):
+        assert normalised_severity(raw) == expected
 
 
 class TestEscalationLevelDefault:
@@ -602,7 +620,8 @@ class TestEscalationResolutionClass:
 
     def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
-        'moot-terminal-subject', 'stale-strand'} — no extras.
+        'moot-terminal-subject', 'stale-strand', 'addressed', 'observation-consumed',
+        'converted', 'status-info'} — no extras.
 
         'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
         revalidation sweep writes.
@@ -613,9 +632,15 @@ class TestEscalationResolutionClass:
         ``>= strand_age_secs`` when the orchestrator restarted.  It EXTENDS the
         task-2724 vocabulary rather than forking a second scheme, so a 20h
         strand and a 90s restart artifact stop reading identically.
+
+        'addressed', 'observation-consumed', 'converted' and 'status-info' are
+        the info-L0 disposition classes of plans/info-l0-disposition-router-prd.md D14.
         """
         assert (
-            frozenset({'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'})
+            frozenset({
+                'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
+                'addressed', 'observation-consumed', 'converted', 'status-info',
+            })
             == RESOLUTION_CLASSES
         )
         assert 'moot-terminal-subject' in RESOLUTION_CLASSES

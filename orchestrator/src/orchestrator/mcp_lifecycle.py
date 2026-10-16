@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import anyio
 import httpx
 from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.mcp_idempotency import maybe_inject_client_op_id
+from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body, mcp_endpoint_url
 from shared.proc_group import terminate_process_group
 
 from orchestrator.config import OrchestratorConfig
@@ -543,10 +545,39 @@ def is_timeout_failure(exc: BaseException) -> bool:
     return False
 
 
-MCP_HEADERS = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-}
+def tool_error_text(reply: Mapping[str, Any]) -> str | None:
+    """The error prose of a tool-level failure, or None if the tool succeeded.
+
+    An MCP tool reports its own failure in the response body, as a
+    well-formed envelope carrying ``isError``, not by breaking the transport.
+    Nothing about that envelope's shape says it failed, so a reader that
+    checks only the shape would take the error prose for a result.
+    """
+    if not reply.get('isError'):
+        return None
+    texts = tool_text_blocks(reply)
+    return texts[0] if texts else ''
+
+
+def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
+    """The text of each ``text`` content block of a tool result, in order.
+
+    An envelope whose ``content`` is missing, null or not a list carries no text.
+    """
+    content = reply.get('content')
+    if not isinstance(content, list):
+        return ()
+    return tuple(
+        str(block.get('text', ''))
+        for block in content
+        if isinstance(block, dict) and block.get('type') == 'text'
+    )
+
+
+# The orchestrator's one self-identification spelling. clientInfo reaches only
+# a stateful session; a stateless-HTTP server sees this identity only when a
+# tool call's arguments carry it (Scheduler.set_task_status does).
+ORCHESTRATOR_MCP_IDENTITY: str = 'orchestrator'
 
 # Mutating task tools that must carry a client-supplied idempotency key so a
 # transport-level retry (after an ambiguous timeout/reset) dedupes server-side
@@ -570,7 +601,7 @@ class McpSession:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip('/')
-        self.mcp_endpoint = f'{self.base_url}/mcp'
+        self.mcp_endpoint = mcp_endpoint_url(self.base_url)
         self._session_id: str | None = None
         self._initialized = False
         self._request_id = 0
@@ -608,7 +639,7 @@ class McpSession:
             {
                 'protocolVersion': '2025-03-26',
                 'capabilities': {},
-                'clientInfo': {'name': 'orchestrator', 'version': '0.1.0'},
+                'clientInfo': {'name': ORCHESTRATOR_MCP_IDENTITY, 'version': '0.1.0'},
             },
         )
         logger.debug(f'MCP initialize response: {json.dumps(result)[:200]}')
@@ -665,7 +696,7 @@ class McpSession:
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
-            headers = dict(MCP_HEADERS)
+            headers = dict(MCP_POST_HEADERS)
             if self._session_id:
                 headers['Mcp-Session-Id'] = self._session_id
 
@@ -698,7 +729,7 @@ class McpSession:
                     if resp_session_id:
                         self._session_id = resp_session_id
 
-                    return self._parse_response(resp)
+                    return decode_mcp_response_body(resp)
 
             except _RETRYABLE_EXCEPTIONS as exc:
                 logger.warning(
@@ -742,7 +773,7 @@ class McpSession:
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
-            headers = dict(MCP_HEADERS)
+            headers = dict(MCP_POST_HEADERS)
             if self._session_id:
                 headers['Mcp-Session-Id'] = self._session_id
 
@@ -779,34 +810,6 @@ class McpSession:
                 f'{type(last_exc).__name__}: {last_exc}'
             ) from last_exc
         raise RuntimeError('_raw_notify exhausted retries')
-
-    @staticmethod
-    def _parse_response(resp: httpx.Response) -> dict:
-        """Parse JSON or SSE response."""
-        content_type = resp.headers.get('content-type', '')
-
-        if 'text/event-stream' in content_type:
-            return _parse_sse_response(resp.text)
-        elif 'application/json' in content_type:
-            return resp.json()
-        else:
-            try:
-                return resp.json()
-            except (json.JSONDecodeError, ValueError):
-                return _parse_sse_response(resp.text)
-
-
-def _parse_sse_response(text: str) -> dict:
-    """Parse SSE text to extract the JSON-RPC result."""
-    last_data = None
-    for line in text.split('\n'):
-        if line.startswith('data: '):
-            last_data = line[6:]
-        elif line.startswith('data:'):
-            last_data = line[5:]
-    if last_data:
-        return json.loads(last_data)
-    raise ValueError(f'No data line found in SSE response: {text[:200]}')
 
 
 # Module-level session singleton (created by McpLifecycle after server starts)

@@ -57,6 +57,22 @@ inert (every holder reads as dead). `$PPID` is not stable across tool calls eith
 match what your own release presents. The long-lived `claude` process is `$CLAUDE_PID` — verify with
 `ps -o comm= -p "$CLAUDE_PID"`, which prints `claude`.
 
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still counts as
+held, and once its heartbeat is past the TTL the reaper reclaims it. Its heartbeat (the lease file's
+mtime) is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted `/unblock` session claimed *before* this
+change carries the bare `<--name>-$CLAUDE_PID` slug, so its re-derived release gets
+`result=refused` — nothing is damaged. Pass the original `--slug` on release (`lease-show` prints it
+as `holder_slug`), or let the lease become reclaimable once its heartbeat is past the 2h TTL.
+
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later release would fail to match; the CLI will not
 invent one, because a synthesized token would be identical for every degraded session and let each
@@ -71,7 +87,7 @@ leave the lease unreapable forever.
 `PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message,
 `holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>` — your own derived
 identity, a diagnostic to compare against `lease-show`'s `holder_slug`, never a value to carry into
-the release):
+the release — then `holder_record=<unlinked|absent|unreadable|active|exited>`):
 
 - **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
   user — this is exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) —
@@ -91,6 +107,12 @@ the release):
   way, and you never force-release someone else's lease to "clean up".
 - **`decision=acquired`**: no prior holder; continue normally. It prints `holder_liveness=none` —
   there is no contending holder to report, the lease is yours.
+
+The lease body also carries `record_slug`: the claimant's session-registry record key, which the CLI
+resolves from the claiming pid. `lease-claim` and `lease-show` print `holder_record=` from it: the
+state of the holder's record (yours, on an acquired claim), a second axis independent of
+`holder_liveness=`. `unlinked` means nothing was looked up (a lease claimed before the field existed,
+or an unresolvable record), not that the holder is alive. Like `orphaned`, it changes nothing here.
 
 To inspect a lease, use `lease-show --name "unblock-<project>#<TASK_ID>"` — never `cat`, which shows
 the holder's immutable `start_ts` but cannot show freshness (the heartbeat is the file's mtime).
@@ -168,6 +190,14 @@ In the worktree:
   list, means a plain `git rebase --abort` here is not safe — see
   [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge) before you run one.
 
+### 1e. Event history
+```bash
+python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py --project-root <PROJECT_ROOT> <TASK_ID>
+```
+Step 2's agent team and Step 3's findings count the task's failure events from this listing before
+joining any of them into one story — see
+[`skills/_shared/counting-failure-events.md`](../_shared/counting-failure-events.md).
+
 ---
 
 ## Step 2: Deep analysis
@@ -200,6 +230,8 @@ This is where you determine the nature and severity of each issue. The goal is t
 **Blocker or nice-for-later?**
 - Blocker: can't safely merge or continue without resolving this
 - Nice-for-later: real issue, but safe to defer to the backlog
+
+**Is the premise contested?** A check in this session, or in an Explore agent's session, that does not reproduce an issue's premise is a non-reproduction, not a refutation, unless it ran in the premise's execution context. Say which context each check ran in. Single normative statement of the rule: `orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
 
 ---
 
@@ -349,6 +381,8 @@ Enter plan mode. The plan covers two parts:
 The merge procedure is iterative — don't assume one pass will be enough:
 
 1. **Release the orchestrator's grip** on the task before merging — call `release_workflow(task_id="<TASK_ID>", timeout_secs=30)` on the escalation MCP. This soft-cancels any active workflow so the orchestrator stops processing the task while you finish it manually. Once no slot is live — whether one was registered or not — if the task is still `in-progress` the tool parks it as `blocked` (returned as `parked: "blocked"`) — this both stops the orchestrator from re-dispatching it AND protects the worktree from the stranded-in-progress reconciliation sweep (the reaper) while you work. **Always make this call — never skip it.** A `was_active: false` result does *not* mean there is nothing to do: that is the orphaned shape (the lane was already reaped while the task row stayed `in-progress`), and it is the case that most needs the hold, because nothing else is stopping the scheduler from re-dispatching the task out from under you mid-merge. The tool parks that case too. Confirm the park by reading the returned `parked` field rather than assuming it: `parked: null` means a slot was still active at the deadline (see below), or the task was not at `in-progress`, or the scheduler dispatched a fresh workflow while the tool was reading the status. In that last case `slot_cleared` comes back `false` too — the tool deliberately refuses to park under a live workflow rather than write `blocked` out from under a running agent. **Treat any `slot_cleared: false` as "the orchestrator still owns this task"** regardless of what `was_active` said, and re-run the call rather than proceeding into the merge.
+
+   **A `pending` task needs a hold of its own.** The tool parks only an `in-progress` task, so a `pending` one (for example, a lock-starved task whose earlier workflow already finished) comes back `parked: null` with nothing holding it. The scheduler dispatches only `pending` tasks, so it can start a fresh workflow in the worktree you are rebasing. Hold the task with `set_task_status(id="<TASK_ID>", status="deferred", project_root="<PROJECT_ROOT>")`. `deferred` is the operator-park status, and no sweep moves it back. **Never set `blocked` by hand as the hold.** A `blocked` task with no live claimant and no pinning escalation is flipped back to `pending` within minutes by the stranded-blocked sweep (`scheduler.py::_phase_redispatch_stranded_blocked`). That happened twice to solar_challenge_platform task 585 on 2026-10-05/06. Step 8's `set_task_status(done)` is then a deferred→done transition. If you abandon the merge instead, set the task back to `pending`.
 2. Rebase on main. Resolve any conflicts.
 3. Run the project's full verification suite (tests, lint, type-check).
 4. Fix any failures.
@@ -405,7 +439,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
    - `status: "superseded"` → **this submission was absorbed into a coalesced train, or replaced
      by a generation-advance resubmission, before the bounded wait returned.** Absorption
      resolves the waiting future directly (`MergeOutcome('superseded', superseded_by=train_id)`,
-     `orchestrator/src/orchestrator/merge_queue.py:12703`) and `merge_request` returns that status
+     `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`) and `merge_request` returns that status
      verbatim (`escalation/server.py:1733`), so with `wait_secs=100` this is the *ordinary*
      absorption outcome, not an exotic one. It is always submission-scoped here — it is your own
      call's response, so none of the unscoped-handle staleness guard applies — so go straight to
@@ -450,9 +484,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # merge-state-vocab:end
      # merge-state-vocab:begin partition=POLL_STOP_STATES
      #   Mirrors shared/src/shared/merge_state.py::POLL_STOP_STATES (TERMINAL_STATES
-     #   plus `unknown`). Pinned by the same guard.
+     #   plus every epistemic state). Pinned by the same guard.
      else:
-         terminal = ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
+         terminal = ("done", "conflict", "blocked", "abandoned", "unknown", "superseded",
+                     "no_record", "stale_record", "journaled")
      # merge-state-vocab:end
      # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
      # terminal `done` (see accept_terminal), and a durable tier re-serves the same stale
@@ -502,7 +537,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
                                    # not more polling).
 
      loop:
-         sleep(poll_interval)
+         sleep(poll_interval)  # realise per skills/merge-queue/SKILL.md#waiting-between-polls -- a bare sleep 60 is blocked by the harness
          poll = mcp__escalation__merge_status(**poll_kwargs)
          if poll["state"] in terminal and accept_terminal(poll):
              break
@@ -596,9 +631,9 @@ The merge procedure is iterative — don't assume one pass will be enough:
   `superseded` is permanent by construction, not merely stale: it will never itself turn
   `done`.** Nothing overwrites it — the absorbed member's own `merge_finalized` record is
   written under its own branch/task keys at absorption time
-  (`orchestrator/src/orchestrator/merge_queue.py:4353-4354, 4373-4377`), the train instead lands
+  (`orchestrator/src/orchestrator/merge_lane/worker.py::enqueue_merge_request`, its `_on_finalized` callback), the train instead lands
   under a brand-new `GroupMergeRequest` that bypasses `enqueue_merge_request` via direct queue
-  surgery (`orchestrator/src/orchestrator/merge_queue.py:12685-12696`), and
+  surgery (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`), and
   `orchestrator/src/orchestrator/harness.py::mark_member_done` flips scheduler status without
   writing a merge record. Because the durable tiers keep serving that stale hit, Tier 3.5's git-authority
   probe — gated behind a durable-tier *miss* (`escalation/server.py:2407-2420`) — never runs to
@@ -607,7 +642,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   resuming branch-handle polling for the derail/re-drive case below, where the orchestrator
   itself re-lands or re-dispatches the member. (A generation-advance `mr-*` successor is
   simpler: it is enqueued the normal way,
-  `orchestrator/src/orchestrator/merge_queue.py:4289`, so branch/task_id polling does eventually
+  `orchestrator/src/orchestrator/merge_lane/worker.py::_maybe_auto_chain_generation`, so branch/task_id polling does eventually
   reflect its outcome there — see its dispatch below.) Once you are following a successor,
   **never resubmit and never direct-merge, on any arm**, while it is still unresolved — it may
   already be in flight and either would race it. `superseded_by` names one of two shapes:
@@ -627,13 +662,13 @@ The merge procedure is iterative — don't assume one pass will be enough:
     - `conflict` or `blocked` → the successor has now failed on its own terms, and nothing
       auto-retries it — `_redrive_coalesce_members` is gated on
       `isinstance(req, GroupMergeRequest)` and the train id starting with `coalesce-`
-      (`orchestrator/src/orchestrator/merge_queue.py:12914, 12928`), neither of which holds for
+      (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._merger_loop`), neither of which holds for
       a generation-advance successor. Fix in the worktree, rebase on main, and resubmit — the
       standard *Polled terminal failures* remediation, loop back to step 7. (Both states are
       reachable here: this successor is an ordinary solo merge through `classify_and_merge`,
-      which returns `conflict` (`merge_queue.py:5746`) and which `_map_terminal_state` passes
+      which returns `conflict` (`merge_lane/worker.py::classify_and_merge`) and which `_map_terminal_state` passes
       through unchanged (`escalation/server.py:2194-2195`). The conflict→`blocked` collapse
-      (`merge_queue.py:6339, 6357`) is inside `_do_train_merge` — train path only.)
+      (`merge_lane/worker.py::_do_train_merge`) is inside `_do_train_merge` — train path only.)
     - `abandoned` → stop and report to the human. Do not resubmit; the resubmission may have
       been cancelled deliberately.
     - `superseded` → the successor was itself superseded (a further generation advance, or
@@ -689,7 +724,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   entirely** and go straight to **step 9** (cleanup). This is a **success** path, not an abort.
 
   **Signal (a) alone must never break the loop.** Signal (a)-landed next to a non-`done` signal (b)
-  is exactly rule 2b's veto: keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
+  is exactly rule 2v's veto (both arms): keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
   take the **landed-but-not-credited** exit stated there — citing the tip merge sha, the
   `git cherry` output and the current status; never "not landed", never resubmit, never self-stamp.
   Breaking out on signal (a) alone would fall through to step 8's
@@ -705,7 +740,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   **Neither an empty rc=128 marker search nor rc=1 means "not landed" here.** A coalesce train
   stacks its members linearly and merges only the **tip** branch into main (the `GroupMergeRequest`
   carries `tip_branch=tip_req.branch`, set in
-  `orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`),
+  `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`),
   so a non-tip absorbed member gets its commits onto main with **no `Merge task/<TASK_ID> into main`
   marker of its own**. And that tip is **rebased onto current main before the merge**, rewriting
   every stacked commit's sha, while this member's own `task/<TASK_ID>` ref is never advanced to the
@@ -755,18 +790,18 @@ The merge procedure is iterative — don't assume one pass will be enough:
     for every absorbed member once the train lands
     (`orchestrator/src/orchestrator/harness.py::mark_member_done`).
   - **Under rc=128-with-empty-marker** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
-    **rule 2a** governs; follow it there rather than from here.
+    **rule 2a** governs (with the shared **rule 2v** veto); follow it there rather than from here.
   - **Under rc=1 on the `coalesce-*` arm** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
-    **rule 2b** governs; follow it there rather than from here. The verdict, so you know which way
+    **rule 2b** governs (with the shared **rule 2v** veto); follow it there rather than from here. The verdict, so you know which way
     the arm points before you go: rc=1 is **not** a not-landed outcome here, signal (b) is a **veto,
-    not a corroborator**, and **there is no self-stamp on this arm**. Read rule 2b there for the
+    not a corroborator**, and **there is no self-stamp on this arm**. Read rule 2v there for the
     argument — which exit each scheduler status yields, its **landed-but-not-credited** report, and
-    the `git cherry main task/<TASK_ID>` content proof including why that proof cannot discharge the
-    veto — rather than restating it.
+    why a content proof cannot discharge the veto — and rule 2b for the
+    `git cherry main task/<TASK_ID>` content proof itself, rather than restating it.
   - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
     "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
     train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
-    (`orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._redrive_coalesce_members`),
+    (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._redrive_coalesce_members`),
     which also removes the train from the queue with nothing of yours on main. On queue-absence with
     neither (a) nor (b), the correct action is to **resume polling the `branch` handle** to the
     20-minute ceiling **under the [resumed-poll terminal set](#resumed-poll)** — the
@@ -826,10 +861,9 @@ Choose one of these based on the analysis:
 at session end.** Trigger (already computed, costs nothing): the block cause was a pending
 escalation — any category — that you read in Step 1b, and the session chose an option (with or
 without human ratification) rather than deferring the question. Immediately append the ruling to
-the escalation record: the chosen option, the ruling commit sha, and what remains (e.g. "closure
-deferred pending merge gate"). Use `amend_escalation` once it lands; until then, fold via
-`promote_to_l2` re-passing the record's exact `root_cause` and its existing member ids — the member
-union is a no-op and the fold appends an amendment. The amendment bumps `updated_at`, which is
+the escalation record with `amend_escalation(escalation_id=..., summary=..., detail=...)`: the
+chosen option, the ruling commit sha, and what remains (e.g. "closure deferred pending merge
+gate"). The amendment bumps `updated_at`, which is
 exactly what re-arms the watcher's re-verify on a parked record. This is an annotation, not a
 closure — L2 close rules are unchanged. Do NOT defer the record-write behind a merge gate or any
 tail plan: a deferred write is precisely what dies when a session ends early (esc-6107-7 sat
@@ -837,11 +871,12 @@ answered-but-unrecorded for 183h because its close was sequenced behind a merge 
 session stopped first). While you're there, check `get_pending_escalations(task_id="<TASK_ID>")`
 for OTHER pending records on the same task and disposition them in the same sitting — a ruling
 recorded on one twin while another record survives is the same failure class (esc-3875-12 kept a
-Leo-released task pinned 6.8 further days).
+Leo-released task pinned 6.8 further days). When you later resolve the record, the `resolve_issue`
+response's `related_pending` lists the twins still pending after that resolve; dispose of those too.
 
 ### 4.4: Execute the plan
 
-Exit plan mode and execute. **Keep the task in its current status during the work** — don't manually change it until you've successfully merged or resolved. This prevents the orchestrator from trying to start new agents on it. One deliberate exception: in the blocked-task merge procedure, `release_workflow` intentionally moves an escalated/in-progress task to `blocked` (the reaper-immune holding state) when it releases the slot — that's the safe status to work from, and the final `set_task_status(done)` after merge is then the normal blocked→done transition.
+Exit plan mode and execute. **Keep the task in its current status during the work** — don't manually change it until you've successfully merged or resolved. This prevents the orchestrator from trying to start new agents on it. One deliberate exception: in the blocked-task merge procedure, `release_workflow` intentionally moves an escalated/in-progress task to `blocked` (the reaper-immune holding state) when it releases the slot — that's the safe status to work from, and the final `set_task_status(done)` after merge is then the normal blocked→done transition. The second exception is a task you found `pending`, which you hold as `deferred` (step 1 of the blocked-task merge procedure), never as a hand-set `blocked`.
 
 ### 4.5: Final reflect
 

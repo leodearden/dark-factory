@@ -22,6 +22,7 @@ import types
 import httpx
 import pytest
 from _dashboard_helpers import drain, never_resolving_refresh, wedge_one_bypass
+from shared.testing_virtual_clock import virtual_clock_test
 
 from dashboard.data.mcp_fanout import TTLCache, first_success
 
@@ -603,7 +604,7 @@ class TestFanoutFailureThrottling:
         )
 
     async def test_log_failures_false_suppresses_the_fanout_report(self, caplog):
-        """The two app.py proxies log their own detailed WARNING at the call site."""
+        """app.py's MCP-write proxy logs its own detailed WARNING at the call site."""
         async def call(_url):
             raise httpx.ConnectError('refused')
 
@@ -784,9 +785,9 @@ class TestFanoutLabel:
     def test_label_is_composed_from_the_single_project_label_definition(self):
         """``fanout_label`` must delegate the basename rule, not re-derive it.
 
-        ``project_label`` is the one definition ``active_tasks._project_label``
-        and ``redux_api._project_label`` are meant to collapse onto; a future
-        edit that inlines the rule here again would silently re-fork it.
+        ``project_label`` is the one definition every dashboard module labels
+        projects with; a future edit that inlines the rule here again would
+        silently re-fork it.
         """
         from pathlib import Path
 
@@ -799,7 +800,7 @@ class TestFanoutLabel:
         """Discrimination is by basename, so same-named roots still collapse.
 
         Documented, inherited behaviour rather than an oversight: scheduler's
-        ``label_to_root`` and redux_api's per-project payload already key on the
+        per-label joins and redux_api's per-project payload already key on the
         same basename, so diverging to full paths here alone would make this one
         log label inconsistent with every other project label the UI renders.
         Pinned so the assumption is executable, not only prose in the docstring.
@@ -923,12 +924,12 @@ class TestTTLCacheFreshHit:
 
 class TestTTLCacheCallableTTLExpiry:
     async def test_callable_ttl_expiry_triggers_refetch(self):
-        """Proves the mechanism fetch_tasks relies on for its runtime monkeypatch.
+        """Proves the mechanism a runtime-monkeypatched TTL constant relies on.
 
-        _FETCH_TASKS_TTL_SECONDS is monkeypatched at runtime in
-        test_tasks.py::test_fetch_tasks_ttl_expiry_refetches; TTLCache must
-        resolve a callable ttl_seconds at each freshness check (not once at
-        construction) for that to keep working.
+        task_snapshot.SNAPSHOT_TTL_SECONDS is monkeypatched at runtime in
+        test_task_snapshot.py; TTLCache must resolve a callable ttl_seconds at
+        each freshness check (not once at construction) for that to keep
+        working.
         """
         ttl_box = {'v': 60.0}
         cache = TTLCache(ttl_seconds=lambda: ttl_box['v'])
@@ -2165,10 +2166,18 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
     a rate bound holds forever while the TOTAL still diverges. These tests
     assert the TOTAL, over many bound-windows.
 
-    Every method monkeypatches ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` to a small
-    value and uses the REAL clock. They deliberately create tasks that
-    never complete, so teardown cancels everything outstanding.
+    Every method monkeypatches ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` to
+    ``BOUND_SECONDS``, runs on
+    shared/src/shared/testing_virtual_clock.py::virtual_clock_test and
+    drives callers by count via ``_drive_callers``, so a host stall can only
+    speed up the re-arm chain, never stop it short. They deliberately
+    create tasks that never complete, so teardown cancels everything
+    outstanding.
     """
+
+    BOUND_SECONDS = 0.02
+    CALLER_INTERVAL_SECONDS = BOUND_SECONDS / 2
+    HOST_STALL_SECONDS = 0.35
 
     @staticmethod
     async def _cancel_all(*tasks):
@@ -2178,6 +2187,19 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         if live:
             await asyncio.gather(*live, return_exceptions=True)
 
+    @classmethod
+    async def _drive_callers(cls, cache, key, refresh, *, count):
+        """Start *count* callers of *key*, one every half bound-window of LOOP time.
+
+        The count, not a host clock, fixes how many arrive.
+        """
+        waiters = []
+        for _ in range(count):
+            waiters.append(asyncio.create_task(cache.get_or_refresh(key, refresh)))
+            await asyncio.sleep(cls.CALLER_INTERVAL_SECONDS)
+        return waiters
+
+    @virtual_clock_test
     async def test_total_live_refreshes_stay_under_the_cap_across_many_windows(
         self, monkeypatch
     ):
@@ -2190,7 +2212,9 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        monkeypatch.setattr(
+            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+        )
         # Pinned explicitly, and asserted against the LITERAL below rather
         # than against the constant: an assertion phrased as
         # `calls['n'] <= fanout_mod._MAX_LIVE_BYPASSES_PER_KEY` is vacuous
@@ -2217,18 +2241,16 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             # ~15 bound-windows, with fresh callers arriving throughout --
             # far more than enough for the pre-fix one-per-window growth to
             # blow past the cap.
-            start = time.monotonic()
-            while time.monotonic() - start < 0.30:
-                waiters.append(
-                    asyncio.create_task(cache.get_or_refresh('k', _refresh))
-                )
-                await asyncio.sleep(0.01)
-            elapsed = time.monotonic() - start
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            waiters = await self._drive_callers(cache, 'k', _refresh, count=30)
+            elapsed = loop.time() - start
             windows = elapsed / fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
 
             assert windows >= 5, (
-                f'precondition: the run must cover several bound-windows to '
-                f'distinguish a TOTAL bound from a RATE bound, got {windows:.1f}'
+                f'precondition: the driven callers must span several '
+                f'bound-windows of loop time to distinguish a TOTAL bound '
+                f'from a RATE bound -- raise count, got {windows:.1f}'
             )
             assert calls['n'] <= 3, (
                 'a wedged key must never start more than 3 live refreshes '
@@ -2244,6 +2266,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             lock.release()
             await self._cancel_all(*waiters, *cache._live_bypasses.get('k', []))
 
+    @virtual_clock_test
     async def test_the_cap_is_per_key_so_a_wedge_cannot_starve_other_keys(
         self, monkeypatch
     ):
@@ -2255,7 +2278,9 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        monkeypatch.setattr(
+            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+        )
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         wedged = asyncio.Event()  # never set
 
@@ -2271,14 +2296,9 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
 
         waiters = []
         try:
-            start = time.monotonic()
-            while time.monotonic() - start < 0.20:
-                waiters.append(
-                    asyncio.create_task(
-                        cache.get_or_refresh('wedged', _wedging_refresh)
-                    )
-                )
-                await asyncio.sleep(0.01)
+            waiters = await self._drive_callers(
+                cache, 'wedged', _wedging_refresh, count=20
+            )
 
             assert cache._live_bypasses.get('wedged'), (
                 'precondition: the wedged key must have live bypasses pinned'
@@ -2297,6 +2317,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             wedged_lock.release()
             await self._cancel_all(*waiters, *cache._live_bypasses.get('wedged', []))
 
+    @virtual_clock_test
     async def test_declining_to_re_arm_at_the_cap_is_logged(self, monkeypatch, caplog):
         """A silent cap would hide the next occurrence.
 
@@ -2305,14 +2326,24 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         the cap is a distinct, operator-relevant state -- the key is now
         deliberately NOT getting fresh attempts -- so it gets its own
         worded record, throttled through the same per-key streak counter.
+
+        The first refresh stalls the host for ``HOST_STALL_SECONDS``, so a
+        caller driver bounded by wall-clock time fails here on every run.
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        monkeypatch.setattr(
+            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+        )
+        monkeypatch.setattr(fanout_mod, '_MAX_LIVE_BYPASSES_PER_KEY', 3)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        calls = {'n': 0}
         wedged = asyncio.Event()  # never set
 
         async def _refresh():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                time.sleep(self.HOST_STALL_SECONDS)
             await wedged.wait()
             raise AssertionError('unreachable: the wedged event is never set')
 
@@ -2322,13 +2353,13 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         waiters = []
         try:
             with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
-                start = time.monotonic()
-                while time.monotonic() - start < 0.30:
-                    waiters.append(
-                        asyncio.create_task(cache.get_or_refresh('k', _refresh))
-                    )
-                    await asyncio.sleep(0.01)
+                waiters = await self._drive_callers(cache, 'k', _refresh, count=30)
 
+            assert calls['n'] == 3, (
+                'precondition: the key must reach the live-bypass cap (3 '
+                'started refreshes) before a decline can be logged, got '
+                f"{calls['n']}"
+            )
             records = [
                 r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout'
             ]
@@ -2350,6 +2381,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             lock.release()
             await self._cancel_all(*waiters, *cache._live_bypasses.get('k', []))
 
+    @virtual_clock_test
     async def test_a_finished_bypass_frees_a_cap_slot(self, monkeypatch):
         """The cap counts LIVE work, not lifetime attempts.
 
@@ -2361,7 +2393,9 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        monkeypatch.setattr(
+            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+        )
         monkeypatch.setattr(fanout_mod, '_MAX_LIVE_BYPASSES_PER_KEY', 3)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
         calls = {'n': 0}
@@ -2377,12 +2411,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
 
         waiters = []
         try:
-            start = time.monotonic()
-            while time.monotonic() - start < 0.20:
-                waiters.append(
-                    asyncio.create_task(cache.get_or_refresh('k', _refresh))
-                )
-                await asyncio.sleep(0.01)
+            waiters = await self._drive_callers(cache, 'k', _refresh, count=20)
 
             assert calls['n'] <= 3
 

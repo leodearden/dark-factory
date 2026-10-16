@@ -31,6 +31,7 @@ import pytest
 from orchestrator.delivered_checks import DeliveredCheckResult
 from orchestrator.git_ops import CommitEffectProbe
 from orchestrator.landing_evidence import (
+    LANDING_TALLY,
     LandingEvidenceVerdict,
     LandingMethod,
     LandingReason,
@@ -38,6 +39,7 @@ from orchestrator.landing_evidence import (
     file_unattributed_landing_escalation,
     format_unattributed_landing_detail,
     validate_landing_evidence,
+    validate_reported_landing,
 )
 
 
@@ -50,6 +52,8 @@ def _git_ops(
     main_branch='main',
     delivered_checks_enabled=True,
     fork_point=None,
+    reported_commit_files=None,
+    reported_commit_diff_error=None,
 ) -> MagicMock:
     """Build a bare MagicMock git_ops with the three sub-methods the helper calls.
 
@@ -71,6 +75,11 @@ def _git_ops(
     non-string.  ``fork_point`` stubs ``merge_base_with_main``; left UNSTUBBED
     when omitted so the ``^1`` fallback stays exercised on the shape the other
     gate-wiring files construct.
+
+    ``reported_commit_files`` / ``reported_commit_diff_error`` (task 4704)
+    stub ``get_merge_commit_diff_files`` — the reported commit's OWN diff,
+    which the reported-claim mode intersects with the task's declared files.
+    Stubbed only when either is given, so every earlier test keeps its shape.
     """
     git_ops = MagicMock()
     git_ops.config = SimpleNamespace(
@@ -93,6 +102,10 @@ def _git_ops(
     git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
     if effect_probe is not None:
         git_ops.describe_commit_effect_in_main = AsyncMock(return_value=effect_probe)
+    if reported_commit_files is not None or reported_commit_diff_error is not None:
+        git_ops.get_merge_commit_diff_files = AsyncMock(
+            return_value=(list(reported_commit_files or []), reported_commit_diff_error),
+        )
     return git_ops
 
 
@@ -2512,3 +2525,347 @@ class TestSuppressionFailsOpen:
         self._file(queue)
 
         queue.submit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The REPORTED-claim mode (task 4704)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestValidateReportedLanding:
+    """An agent REPORTS a commit as its work; the report is never attribution.
+
+    The architect's ``already_done`` claim names a commit and argues in prose
+    that it carries the task.  CANDIDATE mode assumes the caller already
+    attributed its sha, and DISCOVERY mode searches for a citation — neither
+    asks whether a REPORTED sha is corroborated.  This mode answers that from
+    the task's OWN declarations: ``metadata.files`` the commit's diff must
+    touch, else a ``metadata.delivered_checks`` entry the commit MADE TRUE
+    (the three-leg differential), else nothing to verify the claim against.
+    Only once attributed does it run the same effect-present guard CANDIDATE
+    mode does.
+    """
+
+    SHA = 'c' * 40
+
+    def _ops(self, **overrides: Any) -> MagicMock:
+        kwargs: dict[str, Any] = {
+            'citation': 'must-never-be-discovered',
+            'is_ancestor_map': {},
+            'effect_present': True,
+            'reported_commit_files': ['pkg/a.py'],
+        }
+        kwargs.update(overrides)
+        return _git_ops(**kwargs)
+
+    async def _validate(
+        self, git_ops: MagicMock, *, declared_files, delivered_checks,
+        delivered_checks_enabled: bool = True,
+    ) -> LandingVerdict:
+        return await validate_reported_landing(
+            git_ops, '42', 'task/42',
+            reported_sha=self.SHA,
+            declared_files=declared_files,
+            delivered_checks=delivered_checks,
+            delivered_checks_enabled=delivered_checks_enabled,
+        )
+
+    def _made_true_by_the_commit(self):
+        """A check runner that reads FALSE before the commit and TRUE at it and main."""
+        return _check_runner({
+            f'{self.SHA}^1': DeliveredCheckResult.FAILED,
+            self.SHA: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+    async def test_nothing_declared_rejects_before_asking_git(self) -> None:
+        """THE refusal: a task declaring neither files nor checks gives the
+        report nothing to be checked against, so it is never stamped.
+        """
+        git_ops = self._ops()
+
+        verdict = await self._validate(git_ops, declared_files=[], delivered_checks=[])
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.method is LandingMethod.reported_claim
+        assert verdict.evidence_sha is None
+        assert verdict.probe['citation'] == self.SHA, (
+            'the reported sha is the evidence identity a filed L1 stamps'
+        )
+        assert verdict.probe['attribution_basis'] == 'nothing_declared'
+        git_ops.get_merge_commit_diff_files.assert_not_awaited()
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+        git_ops.find_task_citation_commit.assert_not_awaited()
+
+    @pytest.mark.parametrize('delivered_checks', [[], [_grep_check()]])
+    async def test_declared_files_the_commit_never_touched_reject(
+        self, delivered_checks,
+    ) -> None:
+        """Declared files absent from the commit's own diff is COUNTER-evidence.
+
+        Rejected even when checks are declared: a check passing at main proves
+        the capability exists somewhere, not that THIS commit delivered it.
+        """
+        git_ops = self._ops(reported_commit_files=['other/b.py'])
+
+        verdict = await self._validate(
+            git_ops, declared_files=['pkg/a.py'], delivered_checks=delivered_checks,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.method is LandingMethod.reported_claim
+        assert verdict.probe['attribution_basis'] == 'declared_files_untouched'
+        assert verdict.probe['reported_commit_files'] == ['other/b.py']
+        assert verdict.probe['declared_files'] == ['pkg/a.py']
+        assert verdict.probe['declared_files_touched'] == []
+        git_ops.get_merge_commit_diff_files.assert_awaited_once_with(self.SHA)
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    async def test_declared_files_touched_and_effect_present_accepts(self) -> None:
+        """The positive control: the commit's diff carries the declared files."""
+        git_ops = self._ops(reported_commit_files=['pkg/a.py', 'pkg/b.py'])
+
+        verdict = await self._validate(
+            git_ops, declared_files=['pkg/a.py', 'docs/x.md'], delivered_checks=[],
+        )
+
+        assert verdict.accepted is True
+        assert verdict.reason is LandingReason.ok
+        assert verdict.method is LandingMethod.reported_claim
+        assert verdict.evidence_sha == self.SHA
+        assert verdict.probe['attribution_basis'] == 'declared_files'
+        assert verdict.probe['declared_files_touched'] == ['pkg/a.py']
+        assert verdict.probe['effect_check_sha'] == self.SHA
+        git_ops.commit_effect_present_in_main.assert_awaited_once_with(self.SHA)
+        git_ops.find_task_citation_commit.assert_not_awaited()
+
+    async def test_attributed_but_effect_absent_rejects_like_candidate_mode(self) -> None:
+        """Attribution is necessary, not sufficient: the same effect-present
+        guard CANDIDATE mode applies still decides, divergence facts included.
+        """
+        git_ops = self._ops(
+            effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False, diverged_paths=('pkg/a.py',), failure=None,
+                anchor_sha=self.SHA,
+            ),
+        )
+
+        verdict = await self._validate(
+            git_ops, declared_files=['pkg/a.py'], delivered_checks=[],
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.effect_absent
+        assert verdict.method is LandingMethod.reported_claim
+        assert verdict.evidence_sha is None
+        assert verdict.probe['diverged_paths'] == ['pkg/a.py']
+
+    async def test_a_declared_check_the_commit_made_true_attributes(self) -> None:
+        """No files declared: a declared check must flip AT the reported commit."""
+        git_ops = self._ops()
+        stub, calls = self._made_true_by_the_commit()
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=[], delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is True
+        assert verdict.evidence_sha == self.SHA
+        assert verdict.probe['attribution_basis'] == 'delivered_checks'
+        assert calls == [
+            ('cap-x', f'{self.SHA}^1'), ('cap-x', self.SHA), ('cap-x', 'main'),
+        ]
+        git_ops.get_merge_commit_diff_files.assert_not_awaited()
+        git_ops.commit_effect_present_in_main.assert_awaited_once_with(self.SHA)
+
+    async def test_a_declared_check_already_true_before_the_commit_rejects(
+        self,
+    ) -> None:
+        """A check passing at main proves the capability exists, not that THIS
+        commit delivered it — so it is no attribution for any surviving commit.
+        """
+        git_ops = self._ops()
+        stub, _calls = _check_runner(lambda _check, _ref: DeliveredCheckResult.DELIVERED)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=[], delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.probe['attribution_basis'] == 'delivered_checks_unconfirmed'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    async def test_disarmed_checks_never_attribute_and_never_run(self) -> None:
+        """``delivered_checks.enabled=False``: the checks-only report is refused,
+        not stamped on effect survival alone, and no declared check executes.
+        """
+        git_ops = self._ops()
+        stub, calls = self._made_true_by_the_commit()
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=[], delivered_checks=[_grep_check()],
+                delivered_checks_enabled=False,
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.probe['attribution_basis'] == 'delivered_checks_unconfirmed'
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        assert calls == []
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    async def test_disarmed_checks_never_rescue_a_files_attributed_claim(
+        self,
+    ) -> None:
+        """The switch governs the effect step's rescue too, not only attribution."""
+        git_ops = self._ops(effect_present=False)
+        stub, calls = self._made_true_by_the_commit()
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=['pkg/a.py'],
+                delivered_checks=[_grep_check()], delivered_checks_enabled=False,
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.effect_absent
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        assert calls == []
+
+    async def test_an_unreadable_diff_is_a_git_error_never_a_negative(self) -> None:
+        """git failing to answer says nothing about the task (LandingReason.git_error)."""
+        git_ops = self._ops(
+            reported_commit_files=[],
+            reported_commit_diff_error=RuntimeError('bad object'),
+        )
+
+        verdict = await self._validate(
+            git_ops, declared_files=['pkg/a.py'], delivered_checks=[],
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.git_error
+        assert verdict.reason != LandingReason.no_attribution
+        assert verdict.probe['git_error_stage'] == 'reported_commit_diff'
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ('delivered_checks', 'expected'),
+        [([], 'none_declared'), ([_grep_check()], 'evaluated')],
+    )
+    async def test_delivered_checks_state_is_seeded_like_validate_landing_evidence(
+        self, delivered_checks, expected,
+    ) -> None:
+        verdict = await self._validate(
+            self._ops(), declared_files=['pkg/a.py'], delivered_checks=delivered_checks,
+        )
+
+        assert verdict.probe['delivered_checks_state'] == expected
+
+    async def test_every_verdict_is_charged_to_the_tally(self) -> None:
+        """Through the family's single exit: a hand-built verdict would bypass it."""
+        before = LANDING_TALLY.snapshot()[LandingReason.no_attribution]
+
+        await self._validate(self._ops(), declared_files=[], delivered_checks=[])
+
+        assert LANDING_TALLY.snapshot()[LandingReason.no_attribution] == before + 1
+
+
+@pytest.mark.asyncio
+class TestReportedClaimEscalation:
+    """What a human reads, and what is filed, for a reported-claim reject (task 4704).
+
+    The verdict comes from CALLING the producer, never from a hand-built
+    dataclass: a hand-built one carries ``method=unspecified`` and would test
+    a shape production never files.  The formatter assertions are about WHICH
+    disposition branch is selected — a reported-claim reject holds the task
+    blocked, so the redispatch paragraph the other modes need would be false.
+    """
+
+    SHA = 'c' * 40
+
+    async def _reported_reject(self) -> LandingVerdict:
+        return await validate_reported_landing(
+            _git_ops(
+                citation=None, is_ancestor_map={}, effect_present=True,
+                reported_commit_files=['pkg/a.py'],
+            ),
+            '42', 'task/42',
+            reported_sha=self.SHA, declared_files=[], delivered_checks=[],
+            delivered_checks_enabled=True,
+        )
+
+    def _queue(self, tmp_path):
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        return EscalationQueue(tmp_path / 'queue')
+
+    async def test_detail_says_the_task_is_held_blocked_not_redispatched(self) -> None:
+        summary, detail = format_unattributed_landing_detail(
+            '42', 'task/42', await self._reported_reject(),
+        )
+
+        assert 'no_attribution' in summary
+        assert 'no_attribution' in detail
+        assert 'reported_claim' in detail
+        assert 'nothing_declared' in detail
+        assert 'BLOCKED' in detail
+        assert 'DISPATCHED TO AN AGENT' not in detail, (
+            'a held task is not redispatched; the pending/redispatch '
+            'disposition is false for this verdict'
+        )
+        assert not detail.startswith('validate_landing_evidence'), (
+            'validate_landing_evidence did not produce this verdict'
+        )
+
+    async def test_other_modes_keep_the_redispatch_disposition(self) -> None:
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=False),
+            '42', 'task/42', branch_tip_sha=None, candidate_sha='b' * 40,
+        )
+
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert 'DISPATCHED TO AN AGENT' in detail
+
+    async def test_filing_stamps_the_reported_sha_and_the_claimant_run(
+        self, tmp_path,
+    ) -> None:
+        queue = self._queue(tmp_path)
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', await self._reported_reject(),
+            agent_role='orchestrator-workflow', filing_claimant_run_id='run-x',
+        )
+
+        pending = queue.get_by_task('42', status='pending')
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.category == 'provenance_unattributed'
+        assert esc.citation_sha == self.SHA
+        assert esc.filing_claimant_run_id == 'run-x'
+        assert esc.agent_role == 'orchestrator-workflow'
+
+    async def test_callers_that_pass_no_claimant_run_file_unchanged(
+        self, tmp_path,
+    ) -> None:
+        """The harness and merge-worker callers pass no run id and stay byte-identical."""
+        queue = self._queue(tmp_path)
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', await self._reported_reject(),
+            agent_role='harness-reconcile',
+        )
+
+        (esc,) = queue.get_by_task('42', status='pending')
+        assert esc.filing_claimant_run_id is None

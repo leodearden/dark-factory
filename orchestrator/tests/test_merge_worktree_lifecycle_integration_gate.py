@@ -303,13 +303,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT
 from _merge_lane_fakes import (
     FakeVerifier,
     RecordingEscalations,
     hangs_until,
     make_lane,
 )
-from _orch_helpers import make_placeholder_future
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -318,6 +319,7 @@ from orchestrator.merge_lane import (
     coalesce_or_enqueue_merge_request,
     retire_cancelled_merge_request,
 )
+from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
 from orchestrator.merge_queue import PRODUCTION_CLOCK
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_types import (
@@ -845,6 +847,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -900,6 +904,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -927,6 +933,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -992,7 +1000,7 @@ class _TreeLivenessVerifier(FakeVerifier):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # heavy class: real git + real merge worker end-to-end
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # heavy class: real git + real merge worker end-to-end
 class TestFiveThreeTwoSixReplayGate:
     """The headline done-gate: replays the 2026-07-22 task/5326 restart
     incident end-to-end, driving the ACTUAL startup substrate (real
@@ -1315,7 +1323,11 @@ class TestFiveThreeTwoSixReplayGate:
 
             # (4) Release the gated verify; await the recovered merge.
             release.set()
-            outcome = await asyncio.wait_for(winner.result, timeout=60)
+            outcome = await wait_responsive(
+                winner.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='5326 replay gate: recovered merge outcome after the gated verify is released',
+            )
 
             assert outcome.status == 'done', f'Expected done, got: {outcome}'
             full_branch = f'{harness.config.git.branch_prefix}5326'

@@ -4,7 +4,12 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from fused_memory.models.enums import MemoryCategory, QueryType, SourceStore
+from fused_memory.models.enums import (
+    ClassificationFallback,
+    MemoryCategory,
+    QueryType,
+    SourceStore,
+)
 
 
 class EpisodeStatus(StrEnum):
@@ -22,6 +27,8 @@ class ClassificationResult(BaseModel):
     secondary: MemoryCategory | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ''
+    # None: primary is a real classification. A member names why primary is a default.
+    fallback: ClassificationFallback | None = None
 
 
 class MemoryResult(BaseModel):
@@ -36,10 +43,10 @@ class MemoryResult(BaseModel):
     temporal: dict | None = None  # {valid_at, invalid_at}
     entities: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
-    # Mem0 server-stamped write time, passed through verbatim from the Mem0 search result.
-    # Typically an offset-aware ISO-8601 string (e.g. "2026-05-15T10:00:00+00:00"), but the
-    # UTC offset is not guaranteed — Mem0 may stamp in any offset or return a non-UTC value.
-    # None when the key is absent in the Mem0 response or for Graphiti-sourced results.
+    # When the record entered its store. Mem0 hits: the server-stamped write time, passed
+    # through verbatim — typically offset-aware ISO-8601 (e.g. "2026-05-15T10:00:00+00:00"),
+    # but the UTC offset is not guaranteed. Graphiti hits: EntityEdge.created_at, the edge's
+    # BIRTH, not its last edit. None when the store supplies no stamp.
     created_at: str | None = None
     # COMPUTED RETRIEVAL STATE, not stored metadata: never round-trips to a store, and is
     # never read back off a payload. True means this result was PROMOTED into the returned
@@ -99,6 +106,9 @@ class AddMemoryResponse(BaseModel):
     stores_written: list[SourceStore] = Field(default_factory=list)
     category: MemoryCategory | None = None
     message: str = ''
+    # Set when category was not supplied and the classifier returned a default
+    # rather than a classification.
+    classification_fallback: ClassificationFallback | None = None
 
 
 class ReadRouteResult(BaseModel):

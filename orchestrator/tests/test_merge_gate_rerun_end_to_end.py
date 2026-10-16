@@ -122,6 +122,7 @@ def _failing_result() -> VerifyResult:
         summary='fail',
         category='test_failure',
         cause_hint=f'FAILED {PROBE_NODE_ID}',
+        failing_leg_categories=['test_failure'],
     )
 
 

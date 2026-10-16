@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,8 @@ from shared.cli_invoke import (  # noqa: F401
 
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
+
+from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 
 # MCP startup-timeout injection (bounded drop-on-fail for all projects)
 from orchestrator.mcp_lifecycle import apply_mcp_startup_env
@@ -198,9 +200,43 @@ async def invoke_agent(
         raise ValueError(f'Unknown backend: {backend!r}')
 
 
+def _sandbox_spawn(
+    cmd: list[str],
+    env: Mapping[str, str],
+    cwd: Path,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+) -> tuple[list[str], dict[str, str]]:
+    """The argv and env every backend spawns: a requested sandbox wraps *cmd* and turns rerere off."""
+    if sandbox_modules is None:
+        return cmd, dict(env)
+    from orchestrator.agents.sandbox_dispatch import wrap_command
+    return (
+        wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras),
+        {**env, **sandbox_git_config_env(env)},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Claude backend — thin wrapper adding sandbox support over shared.cli_invoke
 # ---------------------------------------------------------------------------
+
+# The Claude CLI reads this as a request to return the Bash shell, silently,
+# to the session's launch directory after every Bash call, so a `cd` does not
+# outlive its command and relative Grep/Glob paths stay anchored to the
+# dispatch root.  Only an explicit '0' in env_overrides (e.g. via
+# config.role_env_overrides) opts out: env_overrides are layered over the
+# orchestrator's own os.environ, so an ambient value there is overwritten.
+# Pinned by orchestrator/tests/test_invoke_bash_cwd_reset.py.
+BASH_CWD_RESET_ENV_VAR = 'CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR'
+
+
+def apply_bash_cwd_reset_env(env_overrides: dict[str, str] | None) -> dict[str, str]:
+    """Return a copy of *env_overrides* with the Bash cwd reset on by default."""
+    merged: dict[str, str] = dict(env_overrides or {})
+    merged.setdefault(BASH_CWD_RESET_ENV_VAR, '1')
+    return merged
+
 
 async def _invoke_claude_with_sandbox(
     prompt: str,
@@ -236,18 +272,19 @@ async def _invoke_claude_with_sandbox(
     to ``build_claude_argv`` (both the sandboxed and non-sandbox sub-paths),
     emitting ``--strict-mcp-config`` alongside ``--mcp-config`` (task 2796).
     """
-    # Inject MCP_TIMEOUT into every claude agent's subprocess env so a slow,
-    # hung, or incompatible stdio MCP is dropped within a bounded time and the
-    # agent still reaches turn 1 (bounded drop-on-fail; reify esc-4415-232).
-    # Both sub-paths below consume env_overrides, so this single transform is
-    # project-agnostic and cannot miss a dispatch site.  setdefault lets
-    # explicit caller values win.
-    env_overrides = apply_mcp_startup_env(env_overrides)
+    # Inject per-session CLI env defaults into every claude agent's subprocess
+    # env.  MCP_TIMEOUT: a slow, hung, or incompatible stdio MCP is dropped
+    # within a bounded time and the agent still reaches turn 1 (bounded
+    # drop-on-fail; reify esc-4415-232).  BASH_CWD_RESET_ENV_VAR: the Bash cwd
+    # reset described at its definition above.  Both sub-paths below consume
+    # env_overrides, so this single transform is project-agnostic and cannot
+    # miss a dispatch site.  setdefault lets explicit caller values win.
+    env_overrides = apply_bash_cwd_reset_env(apply_mcp_startup_env(env_overrides))
 
     # For sandboxed invocations we need to build the command ourselves
     # and use the lower-level shared primitives
     if sandbox_modules is not None:
-        from orchestrator.agents.sandbox_dispatch import resolve_active_backend, wrap_command
+        from orchestrator.agents.sandbox_dispatch import resolve_active_backend
         active = resolve_active_backend()
         if active != 'none':
             # Same lockstep obligation as the argv build below, applied to the
@@ -262,7 +299,7 @@ async def _invoke_claude_with_sandbox(
             # Build command via the shared single source of truth (task 2465
             # dedup) so this sandboxed path stays in lockstep with the
             # non-sandbox path in shared.cli_invoke._invoke_claude — including
-            # the CLI-2.1.168 StructuredOutput deny-list expansion.
+            # the schema + '*' deny → `--tools ''` registry-filter substitution.
             cmd, temp_files = build_claude_argv(
                 model=model,
                 max_budget_usd=max_budget_usd,
@@ -282,8 +319,6 @@ async def _invoke_claude_with_sandbox(
             # User prompt piped via stdin to avoid ARG_MAX
             stdin_data = prompt.encode()
 
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
             env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
             if env_overrides:
                 env.update(env_overrides)
@@ -296,6 +331,8 @@ async def _invoke_claude_with_sandbox(
             # for the full rationale on the CLAUDE_SPAWN_SESSION_ID/
             # LAUNCHER_PID scrub.
             apply_spawn_env(env, spawn_env)
+
+            cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
 
             try:
                 result = await _run_subprocess(
@@ -311,6 +348,10 @@ async def _invoke_claude_with_sandbox(
             finally:
                 for path in temp_files:
                     Path(path).unlink(missing_ok=True)
+
+        env_overrides = {
+            **env_overrides, **sandbox_git_config_env({**os.environ, **env_overrides}),
+        }
 
     # No sandbox or bwrap unavailable — use shared invocation
     return await invoke_claude_agent(
@@ -400,12 +441,7 @@ async def _invoke_codex(
         cmd.append('-')
         codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
-        if sandbox_modules is not None:
-            from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
-        # Strip OPENAI_API_KEY if using OAuth
-        env = dict(os.environ)
+        cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
 
         result = await _run_subprocess_local(
             cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
@@ -580,11 +616,7 @@ async def _invoke_gemini(
 
         cmd = ['gemini', '-p', prompt, '-m', model, '-o', 'json', '--yolo']
 
-        if sandbox_modules is not None:
-            from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
-        env = dict(os.environ)
+        cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
         return _parse_gemini_output(result, model, prices)
@@ -1034,12 +1066,6 @@ async def _invoke_pi(
 
         cmd.append(prompt)
 
-        if sandbox_modules is not None:
-            from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
-        _warn_if_argv_near_arg_max(cmd)
-
         env = dict(os.environ)
         if oauth_token:
             # Strip a lingering ANTHROPIC_API_KEY so it can't shadow the
@@ -1054,6 +1080,9 @@ async def _invoke_pi(
             env['ANTHROPIC_OAUTH_TOKEN'] = oauth_token
         if env_overrides:
             env.update(env_overrides)
+
+        cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
+        _warn_if_argv_near_arg_max(cmd)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'pi', model, max_budget_usd, timeout_seconds)
         return _parse_pi_output(result, model, prices)

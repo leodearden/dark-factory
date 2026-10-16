@@ -639,22 +639,25 @@ class EventBuffer:
         ]
 
     async def drain_by_ids(
-        self, project_id: str, ids: list[str],
+        self, project_id: str, ids: list[str], run_id: str,
     ) -> int:
-        """Mark specific event IDs as drained.
+        """Mark specific event IDs as drained by run *run_id*.
 
         Used after the ContextAssembler determines which events fit the
-        token budget.  Returns the number of rows updated.
+        token budget.  Returns the number of rows updated.  *run_id* is
+        stamped as ``drained_by_run_id`` so a later run-scoped
+        ``restore_drained`` can target exactly this chunk; it is required so
+        this path can never leave an unattributed row (task 6453).
         """
         if not ids:
             return 0
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             cursor = await db.execute(
-                f"""UPDATE event_buffer SET status = 'drained'
+                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?
                     WHERE project_id = ? AND id IN ({placeholders})
                       AND status = 'buffered'""",
-                [project_id, *ids],
+                [run_id, project_id, *ids],
             )
             rowcount = cursor.rowcount
         return rowcount
@@ -662,42 +665,35 @@ class EventBuffer:
     async def restore_drained(
         self,
         project_id: str,
-        run_id: str | None = None,
+        run_id: str,
         *,
         include_unattributed: bool = False,
     ) -> int:
-        """Restore drained events to 'buffered' after a failed run.
+        """Restore one run's drained events to 'buffered' after it failed.
 
-        When ``run_id`` is provided, only rows stamped with
-        ``drained_by_run_id = run_id`` are restored — this protects a
-        concurrent live run's drained events from being clobbered when the
-        reaper recovers a *different* orphaned run on the same project (task
-        2711 / E7). When omitted (the default), behaviour is unchanged: every
-        drained row for the project is restored, project-wide.
+        Only rows stamped with ``drained_by_run_id = run_id`` are restored —
+        this protects a concurrent live run's drained events from being
+        clobbered when the reaper recovers a *different* orphaned run on the
+        same project (task 2711 / E7), and an earlier completed run's consumed
+        events from being re-processed (task 6453). There is deliberately no
+        project-wide mode.
 
         ``include_unattributed`` additionally restores rows with
-        ``drained_by_run_id IS NULL`` when ``run_id`` is set (ignored
-        otherwise — the project-wide path already covers them). This closes
-        the upgrade-boundary gap where events drained by a pre-task-2711
-        process carry no run attribution: since every current code path now
-        always stamps ``drained_by_run_id`` on drain, a NULL row can only be
-        left over from a process that no longer exists by the time a recovery
-        pass runs, so it is provably safe to fold into a *specific* run's
-        recovery without reintroducing the concurrent-run clobber the run
-        scoping was added to prevent (task 2711 amendment, reviewer finding).
+        ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
+        where events drained by a pre-task-2711 process carry no run
+        attribution: since every production drain path stamps
+        ``drained_by_run_id`` as it drains (``drain_by_ids`` requires a
+        ``run_id``, and ``run_full_cycle``, ``drain``'s only production
+        caller, always passes one; task 6453), a NULL row can only be left
+        over from a process that no longer exists by the time a recovery pass
+        runs, so it is provably safe to fold into a *specific* run's recovery
+        without reintroducing the concurrent-run clobber the run scoping was
+        added to prevent (task 2711 amendment, reviewer finding).
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
         """
-        if run_id is None:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained'",
-                    (project_id,),
-                )
-                count = cursor.rowcount
-        elif include_unattributed:
+        if include_unattributed:
             async with self._require_access().write() as db:
                 cursor = await db.execute(
                     "UPDATE event_buffer SET status = 'buffered' "
@@ -723,12 +719,11 @@ class EventBuffer:
     ) -> int:
         """Attribute already-drained rows to the run about to process them.
 
-        Used by the BacklogIterator path: ``drain_by_ids`` drains a chunk's
-        events *before* ``run_full_cycle`` mints that chunk's run_id, so those
-        rows would otherwise carry no ``drained_by_run_id`` attribution. This
-        lets the harness stamp them retroactively so a later run-scoped
-        ``restore_drained`` can restore exactly that chunk's events (task 2711
-        / E7).
+        ``run_full_cycle``'s attribution for caller-supplied ``events``, so a
+        later run-scoped ``restore_drained`` can restore exactly that run's
+        events (task 2711 / E7). BacklogIterator already stamps each chunk's
+        run_id at ``drain_by_ids`` (task 6453), which makes this an idempotent
+        re-stamp on that path.
 
         Only rows currently ``status = 'drained'`` are touched; ids that don't
         exist, aren't currently drained, or are empty are silently ignored (no
@@ -1265,16 +1260,4 @@ class EventBuffer:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-
-        Still ``(-1, -1, -1)`` — never a raise — for a buffer that was never
-        initialized OR one already closed: server/main.py's checkpoint cycle
-        unpacks the result and logs exceptions separately.
-
-        This is the contract THIS store's callers already had; the journal and
-        ReconLedgerStore raise 'not initialized' in both those cases instead.
-        See ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
-        """
-        if self._access is None:
-            return CheckpointResult(-1, -1, -1)
-        return await self._access.checkpoint()
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)

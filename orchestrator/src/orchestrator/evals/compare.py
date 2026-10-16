@@ -13,7 +13,7 @@ from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
 
 from .judge import _strip_metadata
-from .runner import EvalResult
+from .results import EvalResult
 from .scoring import quality_from_review_artifact
 from .snapshots import get_diff
 

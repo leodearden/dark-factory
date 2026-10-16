@@ -47,8 +47,10 @@ EXPECTED_REASONS = {
     'effect_absent',
 }
 
-#: The three production attribution paths, plus the hand-constructed default.
-EXPECTED_METHODS = {'patch_id', 'merge_marker', 'citation', 'unspecified'}
+#: The four production attribution paths, plus the hand-constructed default.
+EXPECTED_METHODS = {
+    'patch_id', 'merge_marker', 'citation', 'reported_claim', 'unspecified',
+}
 
 
 class TestLandingReasonVocabulary:
@@ -83,7 +85,7 @@ class TestLandingMethodVocabulary:
     def test_is_a_str_enum(self) -> None:
         assert issubclass(LandingMethod, enum.StrEnum)
 
-    def test_members_are_exactly_the_three_paths_plus_unspecified(self) -> None:
+    def test_members_are_exactly_the_four_paths_plus_unspecified(self) -> None:
         assert {m.name for m in LandingMethod} == EXPECTED_METHODS
 
     def test_every_member_value_equals_its_name(self) -> None:

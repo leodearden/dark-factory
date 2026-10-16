@@ -37,19 +37,22 @@ dependencies = [
     "anyio>=4.0",
     "escalation>=0.1",
     "dark-factory-shared",
+    "dark-factory-load-sampler",
 ]
 
 [tool.uv.sources]
 escalation = { workspace = true }
 dark-factory-shared = { workspace = true }
+dark-factory-load-sampler = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "../shared/src", "../escalation/src", ".."]
+extraPaths = ["src", "../shared/src", "../escalation/src", "../sampler/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+reportUnnecessaryTypeIgnoreComment = "error"
 venvPath = ".."
 venv = ".venv"
 
@@ -102,15 +105,14 @@ addopts = "-n auto --dist loadgroup"
 # local/agent invocations (`cd dashboard && uv run pytest tests/`, the form
 # CONTRIBUTING.md and the 3216 incident used) — and since task 5442 raised the
 # ini past 300, those two budgets now DIFFER rather than coincide.
-# Raised 60→300 on 2026-09-12 and 300→540 on 2026-09-17; see
-# shared/pyproject.toml for the full rationale (the cap is WALL-CLOCK, so a
+# See shared/pyproject.toml for the full rationale (the cap is WALL-CLOCK, so a
 # healthy test starved of CPU on a loaded 32-core host trips it, and in the
 # xdist packages that reds a SHIFTING VICTIM rather than the starved test).
-# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
-# clock under real fleet load x the 8x headroom factor — and no longer
-# judgement-picked; see
+# 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock under
+# real fleet load x the 8x headroom factor — and no longer judgement-picked;
+# the measurement and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-timeout = 540
+timeout = 420
 # signal is KEPT under xdist (task 5408), and the premise this comment used to
 # give for it — "dashboard runs no pytest-xdist, so signal is safe" — is
 # corrected rather than softened, because it is false twice over. It was
@@ -122,15 +124,10 @@ timeout = 540
 # records this suite green under those exact flags, signal unchanged. signal
 # remains the only method that interrupts a blocking main-thread wait (thread
 # mode can't — mirrors escalation/pyproject.toml).
-# NOT flipped to `thread`, deliberately, and the argument for why that flip is a
-# real trade rather than a free upgrade is NOT restated here — it lives once in
-# fused-memory/pyproject.toml's own `timeout_method` block, which records the
-# opposite experience ("signal proved unreliable under pytest-xdist workers in
-# practice") together with the mechanism (pytest-timeout's thread handler ends in
-# `os._exit(1)`, killing the whole xdist worker; near end-of-suite the controller
-# can deadlock waiting for a completion signal that never arrives). Changing it
-# on no measurement, inside a config-only task, would be unmeasured scope creep;
-# the open question is filed as residue 2 of task 5470.
+# DECIDED ON MEASUREMENT (task 5470): signal is KEPT. Under the pinned
+# pytest-xdist, worker tests run on the worker's main thread, so a signal
+# timeout fails the one test and the worker survives. The signal-vs-thread
+# trade and that evidence live once, in tests/scripts/test_timeout_method_policy.py.
 # Residual risk: signal only raises in the main
 # thread, and aiosqlite's connection worker is a non-daemon thread
 # (aiosqlite/core.py: `Thread(target=_connection_worker_thread, ...)`), so a

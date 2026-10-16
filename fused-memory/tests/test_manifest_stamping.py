@@ -8,15 +8,22 @@ a mocked task_interceptor — no DB/backend involved (that's covered by the
 commit_planning integration tests in test_task_tools.py).
 """
 
+import asyncio
 import json
 import logging
+import os
 import subprocess
+import threading
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 import yaml
 
-from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.manifest_stamping import (
+    stamp_capability_manifests,
+    stamping_action_required,
+)
 
 # Hand-written rather than built from _mechanical_sidecar_yaml below: this
 # fixture mixes grep + script + manual capabilities on a single label, and
@@ -70,8 +77,8 @@ tasks:
 # binding, not a measured absence — see ManifestCapability's docstring) plus
 # one ordinary mechanical grep capability. Exercises the claim
 # ManifestTask's own docstring makes about this module's step-4 write-back:
-# a DECLARED field (note) survives yaml.safe_dump(raw, ...) where a YAML
-# comment would not. See test_round_trip_preserves_task_level_note_and_open_verdict.
+# a DECLARED field (note) survives it. See
+# test_round_trip_preserves_task_level_note_and_open_verdict.
 _NOTE_AND_OPEN_VERDICT_SIDECAR_YAML = """\
 prd: plans/note-prd.md
 schema_version: 1
@@ -273,9 +280,8 @@ async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
     the round-trip counterpart to shared's LOAD-only
     TestLoader::test_load_sidecar_with_task_level_note. ManifestTask's
     docstring claims a DECLARED `note` field survives this module's step-4
-    ``yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)`` write-back
-    where a YAML comment would not — that claim can only be asserted here,
-    on the stamping side, since shared/ has no write path of its own. Stamp
+    write-back — that claim can only be asserted here, on the stamping
+    side, since shared/ has no write path of its own. Stamp
     a sidecar carrying a task-level `note:` and a `verdict: OPEN` capability
     row through the real helper and confirm both survive byte-for-byte
     (as decoded values) in the rewritten file, unstamped fields included.
@@ -326,7 +332,7 @@ async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
     assert reloaded == expected
 
     # Named check for the specific claim this test exists to verify: the
-    # task-level `note:` survives the safe_dump write-back verbatim.
+    # task-level `note:` survives the write-back verbatim.
     # Subsumed by the whole-document equality above; kept as documentation
     # of intent, derived from the parsed fixture rather than retyped so it
     # can't silently desync from it.
@@ -344,6 +350,99 @@ async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
     assert len(checks) == 1
     assert checks[0]['name'] == 'grep_check'
     assert checks[0]['kind'] == 'grep'
+
+
+@pytest.mark.asyncio
+async def test_stamp_preserves_sidecar_header_comment(tmp_path):
+    """A stamp rewrites only the bound label's task_id value: the header
+    comment block, inline comments and every other byte survive on disk."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'eval-framework-revival-prd.capability-manifest.yaml'
+    original = '# Machine-readable sidecar; task_id stamped by commit_planning.\n' + (
+        _mechanical_sidecar_yaml('eval-framework-revival', ['π', 'ρ'])
+        .replace('  - label: π\n', '  - label: π  # the paired-edit task\n')
+        .replace('    title: Mechanical task ρ\n', '    title: Mechanical task ρ  # not yet decomposed\n')
+    )
+    sidecar_path.write_bytes(original.encode('utf-8'))
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=['2861'],
+        tasks_data=[
+            {
+                'id': '2861',
+                'metadata': {
+                    'prd_path': 'plans/eval-framework-revival-prd.md',
+                    'prd_task_label': 'π',
+                },
+            },
+        ],
+        task_interceptor=task_interceptor,
+    )
+
+    assert report == {
+        'path': 'plans/eval-framework-revival-prd.capability-manifest.yaml',
+        'stamped': ['π'],
+        'missing_labels': [],
+        'errors': [],
+    }
+    expected = original.replace(
+        '  - label: π  # the paired-edit task\n    task_id: null\n',
+        '  - label: π  # the paired-edit task\n    task_id: 2861\n',
+    )
+    assert sidecar_path.read_bytes() == expected.encode('utf-8')
+
+
+def _externally_produced(sidecar_yaml, label, external_task_id='reify:5613'):
+    """*sidecar_yaml* with *label*'s block bound to a producer in another project."""
+    unbound = f'  - label: {label}\n    task_id: null\n'
+    assert unbound in sidecar_yaml
+    return sidecar_yaml.replace(
+        unbound, f'  - label: {label}\n    external_task_id: {external_task_id}\n'
+    )
+
+
+@pytest.mark.asyncio
+async def test_external_producer_label_is_reported_and_its_siblings_still_stamp(tmp_path):
+    """A batch label naming a block another project produces is never stamped
+    (a block cannot bind both task_id and external_task_id); it is reported in
+    its own bucket, and the batch's other labels still stamp and copy checks."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'ext-prd.capability-manifest.yaml'
+    original = _externally_produced(_mechanical_sidecar_yaml('ext', ['far', 'near']), 'far')
+    sidecar_path.write_bytes(original.encode('utf-8'))
+
+    report, task_interceptor = await _stamp_batch(
+        tmp_path,
+        [
+            ('601', {'prd_path': 'plans/ext-prd.md', 'prd_task_label': 'far'}),
+            ('602', {'prd_path': 'plans/ext-prd.md', 'prd_task_label': 'near'}),
+        ],
+    )
+
+    assert report == {
+        'path': 'plans/ext-prd.capability-manifest.yaml',
+        'stamped': ['near'],
+        'missing_labels': [],
+        'errors': [],
+        'external_labels': [
+            {'task_id': '601', 'label': 'far', 'external_task_id': 'reify:5613'},
+        ],
+    }
+    expected = original.replace(
+        '  - label: near\n    task_id: null\n', '  - label: near\n    task_id: 602\n'
+    )
+    assert sidecar_path.read_bytes() == expected.encode('utf-8')
+    task_interceptor.update_task.assert_called_once()
+    call = task_interceptor.update_task.call_args
+    assert call.args[0] == '602'
+    copied = json.loads(call.kwargs['metadata'])['delivered_checks']
+    assert [check['name'] for check in copied] == ['grep_check_near']
 
 
 @pytest.mark.asyncio
@@ -461,24 +560,19 @@ async def test_missing_label_and_manual_only(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, monkeypatch):
-    """A write/replace *exception* between temp-write and os.replace (e.g. a
-    disk error — the path where the ``finally`` unlink runs, unlike a hard
-    process kill) must never corrupt the tracked sidecar: os.replace is
-    atomic, so the original file is left byte-identical and parseable, and
-    no stray .tmp file lingers on disk for this exception path."""
+@pytest.mark.skipif(os.geteuid() == 0, reason='root ignores directory write permission')
+async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path):
+    """A real write failure must never corrupt the tracked sidecar.
+
+    The sidecar's directory is made read+execute only, so the read still
+    succeeds but the atomic write-back cannot create its temp sibling. The
+    original file is left byte-identical and parseable, nothing else appears
+    in the directory, and no delivered_checks are copied for a stamp that
+    never landed."""
     plans_dir = tmp_path / 'plans'
     plans_dir.mkdir()
     sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
     sidecar_path.write_text(_HAPPY_PATH_SIDECAR_YAML, encoding='utf-8')
-
-    def _boom(*args, **kwargs):
-        raise OSError('simulated crash between temp-write and replace')
-
-    monkeypatch.setattr(
-        'fused_memory.server.manifest_stamping.os.replace',
-        _boom,
-    )
 
     task_interceptor = AsyncMock()
     ids = ['101']
@@ -493,12 +587,17 @@ async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, 
         },
     ]
 
-    report = await stamp_capability_manifests(
-        project_root=str(tmp_path),
-        ids=ids,
-        tasks_data=tasks_data,
-        task_interceptor=task_interceptor,
-    )
+    plans_dir.chmod(0o555)
+    try:
+        report = await stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=ids,
+            tasks_data=tasks_data,
+            task_interceptor=task_interceptor,
+        )
+        leftovers = sorted(p.name for p in plans_dir.iterdir())
+    finally:
+        plans_dir.chmod(0o755)
 
     assert report is not None
     assert report['stamped'] == []
@@ -509,11 +608,84 @@ async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, 
     assert sidecar_path.read_text(encoding='utf-8') == _HAPPY_PATH_SIDECAR_YAML
     yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
 
-    # No stray temp file left behind in the sidecar's directory.
-    leftovers = [p for p in plans_dir.iterdir() if p.name.endswith('.tmp')]
-    assert leftovers == []
+    # No stray .tmp sibling (nor anything else) left beside the sidecar.
+    assert leftovers == [sidecar_path.name]
 
     task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stamps_of_one_sidecar_both_land(tmp_path, monkeypatch):
+    """Two commit_planning batches stamping DIFFERENT labels of the SAME
+    sidecar concurrently must both land: neither read-modify-write may
+    overwrite the other's stamp with a stale copy of the file.
+
+    The race is forced, not hoped for: the first read of the sidecar holds
+    its thread until a second read has completed, or until a grace period
+    shows no second read can start. Unserialized, both batches then stamp
+    the original text and the second write discards the first stamp."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'race-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_mechanical_sidecar_yaml('race', ['alpha', 'beta']), encoding='utf-8')
+
+    real_read_bytes = Path.read_bytes
+    sidecar_reads = 0
+    sidecar_reads_lock = threading.Lock()
+    second_read_done = threading.Event()
+
+    def read_bytes_holding_the_first_reader(path):
+        nonlocal sidecar_reads
+        if path.name != sidecar_path.name:
+            return real_read_bytes(path)
+        with sidecar_reads_lock:
+            sidecar_reads += 1
+            is_first_read = sidecar_reads == 1
+        data = real_read_bytes(path)
+        if is_first_read:
+            second_read_done.wait(timeout=1.0)
+        else:
+            second_read_done.set()
+        return data
+
+    monkeypatch.setattr(Path, 'read_bytes', read_bytes_holding_the_first_reader)
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+
+    def _batch(task_id: str, label: str) -> list[dict]:
+        return [
+            {
+                'id': task_id,
+                'metadata': {'prd_path': 'plans/race-prd.md', 'prd_task_label': label},
+            },
+        ]
+
+    report_alpha, report_beta = await asyncio.gather(
+        stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=['501'],
+            tasks_data=_batch('501', 'alpha'),
+            task_interceptor=task_interceptor,
+        ),
+        stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=['502'],
+            tasks_data=_batch('502', 'beta'),
+            task_interceptor=task_interceptor,
+        ),
+    )
+
+    assert sidecar_reads == 2
+    assert report_alpha is not None
+    assert report_alpha['stamped'] == ['alpha']
+    assert report_alpha['errors'] == []
+    assert report_beta is not None
+    assert report_beta['stamped'] == ['beta']
+    assert report_beta['errors'] == []
+
+    reloaded = yaml.safe_load(real_read_bytes(sidecar_path))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'alpha': 501, 'beta': 502}
 
 
 @pytest.mark.asyncio
@@ -1111,3 +1283,263 @@ async def test_stamper_non_git_root_copies_everything_and_logs(tmp_path, caplog)
         'an unevaluable check must be loudly recorded, not silently passed; '
         f'got {[r.getMessage() for r in caplog.records]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Every PRD-bound batch task lands in exactly one report bucket, and a report
+# that needs action says so (task 5276). The stamper never blocks the flip,
+# so these buckets and the action lines are the whole signal.
+# ---------------------------------------------------------------------------
+
+
+def _write_sidecar(root, prd_stem, labels):
+    plans_dir = root / 'plans'
+    plans_dir.mkdir(exist_ok=True)
+    sidecar_path = plans_dir / f'{prd_stem}-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_mechanical_sidecar_yaml(prd_stem, labels), encoding='utf-8')
+    return sidecar_path
+
+
+async def _stamp_batch(root, batch):
+    """Stamp a batch given as ``[(task_id, metadata), ...]``; return (report, interceptor)."""
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    report = await stamp_capability_manifests(
+        project_root=str(root),
+        ids=[tid for tid, _meta in batch],
+        tasks_data=[{'id': tid, 'metadata': meta} for tid, meta in batch],
+        task_interceptor=task_interceptor,
+    )
+    return report, task_interceptor
+
+
+@pytest.mark.asyncio
+async def test_unlabeled_task_is_reported_not_silently_skipped(tmp_path):
+    sidecar_path = _write_sidecar(tmp_path, 'gx', ['γ'])
+    original = sidecar_path.read_bytes()
+
+    report, task_interceptor = await _stamp_batch(
+        tmp_path, [('6700', {'prd_path': 'plans/gx-prd.md'})],
+    )
+
+    assert report == {
+        'path': 'plans/gx-prd.capability-manifest.yaml',
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'unlabeled_tasks': ['6700'],
+    }
+    assert sidecar_path.read_bytes() == original
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', ['prd_label', 'label', 'PRD-Task-Label'])
+async def test_near_miss_key_is_reported(tmp_path, key):
+    _write_sidecar(tmp_path, 'gx', ['γ'])
+
+    report, task_interceptor = await _stamp_batch(
+        tmp_path, [('6708', {'prd_path': 'plans/gx-prd.md', key: 'gamma'})],
+    )
+
+    assert report == {
+        'path': 'plans/gx-prd.capability-manifest.yaml',
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'near_miss_keys': [
+            {'task_id': '6708', 'key': key, 'value': 'gamma', 'sidecar_label': 'γ'},
+        ],
+    }
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_near_miss_key_whose_value_matches_no_label_names_none(tmp_path):
+    _write_sidecar(tmp_path, 'gx', ['γ'])
+
+    report, _ = await _stamp_batch(
+        tmp_path, [('6708', {'prd_path': 'plans/gx-prd.md', 'prd_label': 'omega-prime'})],
+    )
+
+    assert report is not None
+    assert report['near_miss_keys'] == [
+        {'task_id': '6708', 'key': 'prd_label', 'value': 'omega-prime', 'sidecar_label': None},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('label', ['gamma', ' γ ', 'Γ', 'GAMMA'])
+async def test_near_miss_label_is_reported_not_missing(tmp_path, label):
+    sidecar_path = _write_sidecar(tmp_path, 'gx', ['γ'])
+    original = sidecar_path.read_bytes()
+
+    report, task_interceptor = await _stamp_batch(
+        tmp_path, [('6709', {'prd_path': 'plans/gx-prd.md', 'prd_task_label': label})],
+    )
+
+    assert report == {
+        'path': 'plans/gx-prd.capability-manifest.yaml',
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'near_miss_labels': [{'task_id': '6709', 'label': label, 'sidecar_label': 'γ'}],
+    }
+    assert sidecar_path.read_bytes() == original
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_every_prd_bound_task_lands_in_exactly_one_bucket(tmp_path):
+    sidecar_path = _write_sidecar(tmp_path, 'mix', ['α', 'β', 'γ', 'δ'])
+    sidecar_path.write_text(
+        _externally_produced(sidecar_path.read_text(encoding='utf-8'), 'δ'), encoding='utf-8',
+    )
+    prd = 'plans/mix-prd.md'
+
+    report, _ = await _stamp_batch(
+        tmp_path,
+        [
+            ('7001', {'prd_path': prd, 'prd_task_label': 'α'}),
+            ('7002', {'prd_path': prd, 'prd_task_label': 'ζ'}),
+            ('7003', {'prd_path': prd, 'prd_task_label': 'beta'}),
+            ('7004', {'prd_path': prd, 'prd_label': 'gamma'}),
+            ('7005', {'prd_path': prd}),
+            ('7006', {'files': ['src/unrelated.py']}),
+            ('7007', {'prd_path': prd, 'prd_task_label': 'δ'}),
+        ],
+    )
+
+    assert report == {
+        'path': 'plans/mix-prd.capability-manifest.yaml',
+        'stamped': ['α'],
+        'missing_labels': ['ζ'],
+        'errors': [],
+        'external_labels': [
+            {'task_id': '7007', 'label': 'δ', 'external_task_id': 'reify:5613'},
+        ],
+        'near_miss_labels': [{'task_id': '7003', 'label': 'beta', 'sidecar_label': 'β'}],
+        'near_miss_keys': [
+            {'task_id': '7004', 'key': 'prd_label', 'value': 'gamma', 'sidecar_label': 'γ'},
+        ],
+        'unlabeled_tasks': ['7005'],
+    }
+    assert '7006' not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_labeled_sidecar_is_preferred_over_unlabeled_only_sidecar(tmp_path):
+    _write_sidecar(tmp_path, 'zz', ['alpha'])
+    _write_sidecar(tmp_path, 'aa', ['beta'])
+
+    report, _ = await _stamp_batch(
+        tmp_path,
+        [
+            ('7101', {'prd_path': 'plans/zz-prd.md', 'prd_task_label': 'alpha'}),
+            ('7102', {'prd_path': 'plans/aa-prd.md'}),
+        ],
+    )
+
+    assert report == {
+        'path': 'plans/zz-prd.capability-manifest.yaml',
+        'stamped': ['alpha'],
+        'missing_labels': [],
+        'errors': [
+            "multiple capability-manifest sidecars matched this batch; processing "
+            "'plans/zz-prd.capability-manifest.yaml', ignoring: "
+            'plans/aa-prd.capability-manifest.yaml'
+        ],
+    }
+
+
+_CLEAN_REPORT = {
+    'path': 'plans/x-prd.capability-manifest.yaml',
+    'stamped': ['α'],
+    'missing_labels': [],
+    'errors': [],
+}
+
+
+@pytest.mark.parametrize(
+    'report',
+    [
+        pytest.param(_CLEAN_REPORT, id='clean'),
+        pytest.param(
+            {
+                **_CLEAN_REPORT,
+                'polarity_warnings': [
+                    {
+                        'task_id': '1', 'label': 'α', 'name': 'n', 'code': 'absent_overbroad',
+                        'severity': 'warn', 'message': 'advisory',
+                    },
+                ],
+            },
+            id='polarity-warnings-only',
+        ),
+    ],
+)
+def test_clean_report_needs_no_action(report):
+    assert stamping_action_required(report) == []
+
+
+def test_action_required_has_one_line_per_non_clean_entry():
+    report = {
+        **_CLEAN_REPORT,
+        'missing_labels': ['ζ', 'η'],
+        'errors': ['plans/x-prd.capability-manifest.yaml: something broke'],
+        'near_miss_labels': [{'task_id': '7003', 'label': 'beta', 'sidecar_label': 'β'}],
+        'near_miss_keys': [
+            {'task_id': '7004', 'key': 'prd_label', 'value': 'gamma', 'sidecar_label': 'γ'},
+        ],
+        'unlabeled_tasks': ['7005'],
+        'external_labels': [{'task_id': '7007', 'label': 'δ', 'external_task_id': 'reify:5613'}],
+    }
+
+    lines = stamping_action_required(report)
+
+    def naming(needle):
+        return [line for line in lines if needle in line]
+
+    assert len(lines) == 7
+    assert len(naming('ζ')) == 1
+    assert len(naming('η')) == 1
+    assert len(naming('something broke')) == 1
+    for task_id in ('7003', '7004', '7005', '7007'):
+        (line,) = naming(task_id)
+        assert 'prd_task_label' in line
+
+
+@pytest.mark.asyncio
+async def test_report_needing_action_logs_one_warning_naming_the_sidecar(tmp_path, caplog):
+    _write_sidecar(tmp_path, 'gx', ['γ'])
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        await _stamp_batch(tmp_path, [('6700', {'prd_path': 'plans/gx-prd.md'})])
+
+    warnings = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.server.manifest_stamping' and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert 'plans/gx-prd.capability-manifest.yaml' in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_clean_stamp_logs_no_warning(tmp_path, caplog):
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    (plans_dir / 'cl-prd.capability-manifest.yaml').write_text(
+        _mechanical_sidecar_yaml('cl', [], manual_labels=['alpha']), encoding='utf-8',
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        report, _ = await _stamp_batch(
+            tmp_path, [('6800', {'prd_path': 'plans/cl-prd.md', 'prd_task_label': 'alpha'})],
+        )
+
+    assert report is not None
+    assert report['stamped'] == ['alpha']
+    assert [
+        r for r in caplog.records
+        if r.name == 'fused_memory.server.manifest_stamping' and r.levelno == logging.WARNING
+    ] == []

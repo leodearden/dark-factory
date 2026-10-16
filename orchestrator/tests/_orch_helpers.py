@@ -17,12 +17,13 @@ import logging
 import os
 import threading
 import time
+import types
 import weakref
 from collections import deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 from unittest.mock import AsyncMock, AsyncMockMixin, MagicMock
 
 import pytest
@@ -30,6 +31,8 @@ from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.psi import PsiSample
 from shared.usage_gate import AccountState, UsageGate
+
+from orchestrator.config import ModuleConfig
 
 if TYPE_CHECKING:
     from shared.prompt_artifact import PromptArtifactStore
@@ -41,6 +44,43 @@ _log = logging.getLogger(__name__)
 
 # task 3980: return-type variable for `wait_responsive` below.
 _WaitT = TypeVar('_WaitT')
+
+
+ADMISSION_TEST_CMD = 'pytest tests/'
+ADMISSION_LINT_CMD = 'ruff'
+ADMISSION_TYPE_CMD = 'pyright'
+
+
+def admission_leg_for_cmd(cmd: str) -> str:
+    """Label which verify leg (test/lint/type) *cmd* belongs to.
+
+    Matches by substring because an active admission gate nice-wraps the test
+    leg, so its cmd contains ``ADMISSION_TEST_CMD`` without equalling it.
+    ``'pytest'`` and ``'tests/'`` are checked separately because a ``-n`` cap
+    splices flags between them.
+    """
+    if 'pytest' in cmd and 'tests/' in cmd:
+        return 'test'
+    if ADMISSION_LINT_CMD in cmd:
+        return 'lint'
+    if ADMISSION_TYPE_CMD in cmd:
+        return 'type'
+    return cmd
+
+
+def admission_module_config(**overrides: Any) -> ModuleConfig:
+    kwargs: dict[str, Any] = dict(
+        prefix='pkg',
+        test_command=ADMISSION_TEST_CMD,
+        lint_command=ADMISSION_LINT_CMD,
+        type_check_command=ADMISSION_TYPE_CMD,
+        # Sequential so the three legs run strictly test -> lint -> type,
+        # making ordering/labelling assertions deterministic (no gather
+        # interleaving between legs themselves).
+        concurrent_verify=False,
+    )
+    kwargs.update(overrides)
+    return ModuleConfig(**kwargs)
 
 
 def mock_lock_table(held: dict[str, set[str]] | None = None) -> MagicMock:
@@ -74,7 +114,13 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     state, so tests may still freely reassign ``scheduler_mock._dispatched``
     (a plain set) or ``scheduler_mock.lock_table`` (use :func:`mock_lock_table`)
     and have the accessors reflect it.
+
+    It also pins ``is_paused=False`` / ``pause_reason=None`` (task 5311): a
+    bare MagicMock attribute is truthy, so every re-pend would otherwise read
+    as landing in a paused scheduler.
     """
+    scheduler_mock.is_paused = False
+    scheduler_mock.pause_reason = None
     scheduler_mock._dispatched = set()
     scheduler_mock.lock_table = mock_lock_table()
     scheduler_mock._workflow_cancel_at = {}
@@ -102,13 +148,31 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     )
 
 
+def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
+    """Bind the REAL ``Scheduler.clear_claim_then_set_status`` onto a MagicMock Scheduler.
+
+    On a bare ``MagicMock()`` the method auto-mocks to a non-awaitable. Binding
+    the real one (rather than a forwarding fake) keeps one definition of the
+    clear-then-flip order, and routes both writes to the mock's own
+    ``set_task_claimant`` / ``set_task_status``, so existing assertions on
+    those still hold. The import is function-local to keep importing this
+    module free of ``orchestrator.scheduler`` (collection cost, not a cycle).
+    """
+    from orchestrator.scheduler import Scheduler
+
+    if not isinstance(scheduler_mock.set_task_claimant, AsyncMock):
+        scheduler_mock.set_task_claimant = AsyncMock()
+    scheduler_mock.clear_claim_then_set_status = types.MethodType(
+        Scheduler.clear_claim_then_set_status, scheduler_mock,
+    )
+
+
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
-# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
-# (currently 540, raised from 60 on 2026-09-12 and from 300 on 2026-09-17 --
-# see that setting's comment, shared/pyproject.toml for the canonical
-# rationale, and plans/pytest-per-test-timeout-measurement-2026-09-17.md for
-# the measurement the current value is derived from).  It was a bare
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- see
+# that setting's comment, shared/pyproject.toml for the canonical rationale,
+# and plans/pytest-per-test-timeout-measurement-2026-09-17.md for the
+# measurement the value is derived from and its history.  It was a bare
 # literal in
 # test_merge_queue_concurrent_verify.py, whose own comment admitted the
 # defect -- "it is still a literal and CAN drift if that setting changes
@@ -117,7 +181,7 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
 # pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
 # add a second copy -- import this one.
-PYPROJECT_DEFAULT_TIMEOUT = 540
+PYPROJECT_DEFAULT_TIMEOUT = 420
 
 # task 4215: per-test ceiling for the family of guard tests that sweep the
 # WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
@@ -147,24 +211,26 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 #     guard that merely shared the dead worker.
 #   So one slow tree-scan costs a whole verify run AND misattributes the blame.
 #
-# MEASURED basis for 300 rather than a tuned literal:
+# MEASURED history of the family:
 #   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
 #     (test_merge_queue_reachback_patch_guard), 6.70s
 #     (test_event_loop_antipattern_guard), 6.46s
-#     (test_serial_merge_worker_import_guard);
-#   * the SAME serial_merge_worker guard measured 17.85 / 21.32 / 30.75s per
+#     (the serial-worker import guard, deleted with its fixture by task 5034);
+#   * the SAME serial-worker guard measured 17.85 / 21.32 / 30.75s per
 #     call at loadavg 120-176 under `-n auto` -- ~4.8x load inflation;
 #   * xdist worker deaths were then observed at loadavg 250-423, one further
 #     inflation step past the 60s default THEN IN FORCE (esc-3980-1 on branch
 #     task/3980, esc-3787-1 on branch task/3787).
 #   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
-#   test_merge_queue_reachback_patch_guard.py and
-#   test_serial_merge_worker_import_guard.py -- which is what makes this a
+#   test_merge_queue_reachback_patch_guard.py and the serial-worker import
+#   guard -- which is what makes this a
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
 #   unmarked-and-slow one costs a whole session.
-# 300s is ~36x the unloaded worst case and ~10x the measured-under-load worst
-# case, and that MEASUREMENT is what the value is anchored to.
+# The current anchor is
+# test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE, which
+# floors the family at test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
+# Derivation: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # WAS `5 * PYPROJECT_DEFAULT_TIMEOUT` until 2026-09-12, when that ini default
 # was raised 60 -> 300 to stop CPU starvation on a loaded host false-redding a
@@ -177,69 +243,38 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 # measurement asks for, and one that would silently let a genuinely hung tree
 # scan burn 25 minutes.  So the two knobs are now what they always were
 # SEMANTICALLY -- orthogonal, one sized by host contention and one by the cost
-# of an AST sweep -- and this one is pinned at the figure its own measurements
+# of an AST sweep -- and this one is floored at the figure its own measurements
 # justify.  test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
-# already encoded exactly that independence and is unchanged.
+# encodes that independence; it has since been re-anchored, but its role is
+# unchanged.
 #
-# 300 -> 540 on 2026-09-17 (task 5442), and NOT because this family was
-# re-measured: the never-narrow rule below forces it, since the ini default it
-# must not fall below moved to 540.  Two things follow and are recorded rather
-# than left to be rediscovered.  (a) The raise incidentally CLEARS this
-# family's own freshly measured requirement -- that task measured a marked
-# member of it (test_merge_lane_ratchet.py) at 51.87s setup under load,
-# 51.87 x 8 = 414.96, which 540 covers and the former 300 did not.  (b) The
-# ANCHOR is nonetheless stale: `_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` dates
-# from task 4215 and this family has since been measured at 1.7x that, so the
-# arithmetic that justifies _ABSOLUTE_FLOOR_SECONDS now rests on an
-# out-of-date figure even though its conclusion is no longer binding.
-# Re-anchoring it is deliberately NOT done here -- it would change a constant
-# whose whole point is independence from the ini default, on a task that
-# measured the ini default -- and is filed as follow-up.
+# It must clear BOTH the floor and PYPROJECT_DEFAULT_TIMEOUT (pinned by
+# test_whole_tree_scan_timeout_guard.py); which of the two binds is value
+# history, recorded in plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
-# Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT, which happens to
-# equal 300 but is merge-wait arithmetic (`5 * MERGE_RESULT_TIMEOUT + 75`); an
-# AST sweep performs zero merge waits, so borrowing it would let a future
-# merge-timing retune silently move this ceiling.  Never-narrow: it must also
+# Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
+# different hazard, sized by merge-barrier waits, and an AST sweep performs
+# zero merge waits, so borrowing it would let a future merge-timing retune
+# silently move this ceiling.  Never-narrow: it must also
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # test_whole_tree_scan_timeout_guard.py).
-#
-# THAT NEVER-NARROW RULE WAS APPLIED HERE AND NOT TO ITS NEIGHBOUR, which is
-# recorded rather than left to be noticed later.  HEAVY_BARRIER_TEST_TIMEOUT
-# (test_merge_queue_concurrent_verify.py) stayed at 300 while this moved to 540,
-# so it now sits BELOW the ini default it used to equal: under a bare
-# local/agent run the heaviest merge-barrier classes become the one heavy family
-# whose module marks TIGHTEN below the ambient budget -- exactly the inversion
-# the rule above exists to prevent, on the tests most exposed to the CPU
-# starvation the 540 raise answers.  A LATENT GAP, not a regression: verify
-# passes `--timeout=300` on its CLI either way (see VERIFY_CLI_PER_TEST_TIMEOUT
-# below), so on the merge gate those tests see 300 whatever this file says.
-# Unfixed here because that constant lives outside the file scope of the task
-# that moved this one, and because the fix is a genuine choice rather than a
-# mechanical one -- either exempt a DERIVED merge-wait bound from the rule
-# explicitly, or raise it to `max(5 * MERGE_RESULT_TIMEOUT + 75,
-# PYPROJECT_DEFAULT_TIMEOUT)`.  Filed as follow-up.
-WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
+
+# Headroom a per-test ceiling must keep over its family's measured-under-load
+# worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist
+# to prevent were observed at loadavg 250-423, one inflation step past the load
+# at which any measurement has been taken.  Rationale and corpus:
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+UNDER_LOAD_HEADROOM_FACTOR = 8
 
 # task 5147: the per-test budget VERIFY actually passes -- the `--timeout=300`
 # token in `orchestrator/orchestrator.yaml`'s `test_command`, mirrored by every
-# pytest segment of the fleet chain in dark-factory-orchestrator.yaml.  This
-# comment is the SINGLE home of the INVERSION rationale; test modules and the
-# pyproject comment point HERE rather than restating it.
-#
-# WHY A MARKER IS AN OVERRIDE AND NEVER A FLOOR -- read verbatim from
-# `pytest_timeout.py::_get_item_settings` in the installed package:
-#
-#     if marker is not None:
-#         timeout = _validate_timeout(settings.timeout, "marker")
-#     if timeout is None:
-#         timeout = item.config._env_timeout
-#
-# The marker wins UNCONDITIONALLY.  `config._env_timeout` -- fed by CLI
-# `--timeout`, then `PYTEST_TIMEOUT`, then the ini `timeout` -- is consulted
-# ONLY when the marker yielded None.  So `@pytest.mark.timeout(N)` is a TWO-WAY
-# override: whatever budget is in force it REPLACES, raising it wherever the
-# ambient budget is smaller and LOWERING it under verify's `--timeout=300`.
+# pytest segment of the fleet chain in dark-factory-orchestrator.yaml.  It is
+# the upper edge of the inversion band, whose rationale lives in
+# shared/src/shared/testing_timeout_markers.py, and a slow test here loosens
+# safely by spelling it: `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`.
+# ENFORCED by tests/test_timeout_marker_inversion_guard.py.
 #
 # THE CLI BUDGET AND THE INI DEFAULT NO LONGER COINCIDE.  Both were 300 until
 # 2026-09-17, when task 5442's measurement raised the ini default to 540 and
@@ -251,24 +286,6 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 # from PYPROJECT_DEFAULT_TIMEOUT: a mirror would have followed the ini default
 # up to 540 and silently widened the band past what verify actually passes.
 #
-# THE INVERSION BAND.  A marker at N falls in one of three regimes:
-#   * N <= DELIBERATE_TIGHT_BOUND_CEILING -- small enough that it reads as a
-#     deliberate tight bound rather than a slow test's opt-out
-#     (test_verify_clock_stop.py's 15s watchdog marks exist precisely to
-#     assert something fires FAST);
-#   * DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT --
-#     INVERTS.  Too large to read as a deliberate fast bound, and below the
-#     budget verify passes, so the author's intended LOOSENING for a slow test
-#     silently becomes a TIGHTENING of the run that gates their merge: 300
-#     becomes N;
-#   * N >= VERIFY_CLI_PER_TEST_TIMEOUT -- loosens under both.  Safe.
-# Only the middle band contradicts its author's evident intent, and a breach
-# there is not a red test: `timeout_method = "thread"` makes pytest-timeout
-# `os._exit()` the xdist worker, and `--max-worker-restart=0` then truncates
-# the session and blames an innocent test that merely shared it (the same
-# mechanism spelled out for WHOLE_TREE_SCAN_TEST_TIMEOUT above).
-# ENFORCED by tests/test_timeout_marker_inversion_guard.py.
-#
 # A LITERAL, NOT AN EXPRESSION, and deliberately NOT `5 *
 # PYPROJECT_DEFAULT_TIMEOUT` despite equalling it today.  What is being named
 # here is the VERIFY CLI BUDGET, whose only real-world source is that
@@ -278,40 +295,11 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 # to 100 while a ratio assertion stayed green as an identity -- collapsing the
 # band toward nothing without a single test going red.  Same hazard, and same
 # resolution, as WHOLE_TREE_SCAN_TEST_TIMEOUT deliberately not borrowing
-# HEAVY_BARRIER_TEST_TIMEOUT's 300.  The literal is instead kept honest by an
+# HEAVY_BARRIER_TEST_TIMEOUT.  The literal is instead kept honest by an
 # EXECUTABLE link: test_timeout_marker_inversion_guard.py::
 # TestVerifyCliBudgetConstant re-reads orchestrator/orchestrator.yaml at
 # runtime and fails if the two disagree.  Never-narrow.
 VERIFY_CLI_PER_TEST_TIMEOUT = 300
-
-
-# task 5147: the band's LOWER edge -- the largest N that still reads as a
-# DELIBERATE tight bound rather than a slow test's opt-out.
-#
-# A LITERAL, and deliberately NOT `PYPROJECT_DEFAULT_TIMEOUT`, which it merely
-# EQUALLED until 2026-09-12.  It was first written as that mirror, while the
-# ini default was 60 and a marker above it read to its author as a loosening.
-# Commit 64e24b547f then raised the ini default 60 -> 300 in every package, and
-# a mirror would have followed it: (300, 300) is EMPTY, so every sweep built on
-# this band would pass VACUOUSLY -- green because nothing can offend -- while
-# the 61 in-band markers it was built to ratchet stayed untouched in the tree.
-# Task 5442 then moved the ini default again, to 540, which is a second reason
-# the same mirror would have been wrong: it would now put the lower edge ABOVE
-# the upper one and make the band not merely empty but inverted.
-#
-# The raise did not remove the hazard, only one framing of it.  A marker at 120
-# still REPLACES verify's 300, still `os._exit()`s the xdist worker when a
-# loaded host starves it, and is still what blamed tasks 4176, 4384 and 4405.
-# What the raise removed is the SIGN-FLIP: an author reading `timeout = 300`
-# who writes 120 is now knowingly tightening rather than reaching for what
-# looks like a loosening. The edge therefore stays at the value the design
-# always used -- pinned by test_timeout_marker_inversion_guard.py::
-# test_the_band_edges_are_exactly_where_the_design_puts_them -- and stops
-# borrowing a number that can move underneath it. The ini default DID move
-# again -- 300 -> 540 on 2026-09-17, task 5442, which is the measured value the
-# follow-up this comment anticipated was owed -- and this edge did not move
-# with it, which is the whole point of it having stopped being a mirror.
-DELIBERATE_TIGHT_BOUND_CEILING = 60
 
 
 # task 3451's measured worst-case happy-path subprocess spawn latency (n=3:
@@ -621,7 +609,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # claim about what this class costs", so borrowing it would let a Row 7
 # re-measurement silently move this module's ceiling -- the identical hazard
 # WHOLE_TREE_SCAN_TEST_TIMEOUT cites when it declines to borrow
-# HEAVY_BARRIER_TEST_TIMEOUT's 300 despite the numbers matching.  The two
+# HEAVY_BARRIER_TEST_TIMEOUT.  The two
 # scenes are sized by different arithmetic anyway: Row 7 is 234 spawns with
 # zero bounded waits, this is 169 spawns plus a 180s bounded-wait path.
 #
@@ -629,7 +617,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # TestDeepLandingSceneBudget:
 #   * `>= VERIFY_CLI_PER_TEST_TIMEOUT` (300) -- 1080 is far above it, so the
 #     marker loosens under the budget verify's CLI passes and cannot invert;
-#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (540) -- the never-narrow rule this file
+#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (420) -- the never-narrow rule this file
 #     states a few constants above, at WHOLE_TREE_SCAN_TEST_TIMEOUT: a mark
 #     meant as a FLOOR must never fall below the ambient ini default, or it
 #     starts narrowing its own module.  Until 2026-09-17 these first two were
@@ -637,8 +625,9 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 #     default 300 -> 540 on measurement and deliberately left verify's CLI at
 #     300, so a value can now clear the verify edge while narrowing the
 #     ambient one.  That is not hypothetical -- the same commit recorded its
-#     own casualty, HEAVY_BARRIER_TEST_TIMEOUT, left at 300 and now below the
-#     default it used to equal.  1080 clears 540 today, so this pin changes
+#     own casualty, HEAVY_BARRIER_TEST_TIMEOUT, left at 300 below the default
+#     it used to equal until task 5572 re-derived it to 540.  1080 clears 420
+#     today, so this pin changes
 #     nothing now; it exists so a future re-derivation landing somewhere like
 #     360 cannot satisfy the verify edge and reproduce that gap in silence;
 #   * `<= verify_command_timeout_secs` (7200, orchestrator/orchestrator.yaml)
@@ -853,13 +842,12 @@ RESPONSIVE_WAIT_STRETCH = 2.0
 # task 3980: ABSOLUTE hard wall-clock backstop for `wait_responsive` below,
 # DERIVED from MERGE_RESULT_TIMEOUT rather than written as a literal so a
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
-# the scaled per-call cap above whatever nominal a call site passes.  Sizing
-# check: the worst per-method budget the auditor computes for
-# test_merge_speculation.py is 240s (TestLateArrivalCleanCAS /
-# TestLateArrivalFailCascade / TestLateArrivalSubmissionOrderCAS: 2 gate
-# barriers x 30 + 2 result waits x 90), under HEAVY_BARRIER_TEST_TIMEOUT
-# (300s, itself `5 * MERGE_RESULT_TIMEOUT + 75` in
-# test_merge_queue_concurrent_verify.py).  Never-narrow.
+# the scaled per-call cap above whatever nominal a call site passes.  Whether
+# the waits a test stacks on it fit that test's timeout mark is checked, not
+# restated here: each guarded module's TestTimeoutMarkCoverage recomputes
+# every class's budget from source
+# (test_merge_queue_concurrent_verify.py::_worst_per_method_wait_budget).
+# Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
 
 # task 3980: nominal budget for the merge-pipeline `asyncio.Event` GATE
@@ -873,18 +861,12 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 # because the amendment pass asked the question directly: in the regime where
 # THIS process is scheduled normally but its child `git`/verify subprocesses
 # are starved, the stretch buys a gate barrier nothing at all (see the helper's
-# "Limitation" section), so is 15 still right?  Yes, on three grounds:
+# "Limitation" section), so is 15 still right?  Yes, on two grounds:
 #   1. No gate-barrier failure has ever been MEASURED.  All three archived
 #      failures were result-future waits (45s, 45s, 25s).  Raising a nominal
 #      that has not been observed to fail is a plain widening, which this repo
 #      forbids as a flake fix (plans/flake-ledger-prd.md:216-223).
-#   2. It would be actively harmful.  Gates at a 45s nominal are billed 90s
-#      each, taking the worst per-method budget from 240s to 360s and blowing
-#      the paired @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (300s) —
-#      under `timeout_method = "thread"` plus `--max-worker-restart=0` that is
-#      an os._exit() of the xdist worker, i.e. a worker death instead of a
-#      clean failure.
-#   3. It is not tight.  Every barrier in the LateArrival suite resolves inside
+#   2. It is not tight.  Every barrier in the LateArrival suite resolves inside
 #      a test that completes in ~5s end to end, against a 15s nominal and a 30s
 #      ceiling.
 # If a gate-barrier flake is ever measured, the fix is to make child-process
@@ -904,9 +886,10 @@ MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
 # for this exact shape (task 2350's `wait_for(<event>.wait(), timeout=45.0)`
 # in test_merge_queue_concurrent_verify.py, and MERGE_RESULT_TIMEOUT above).
 # Never-narrow: only replaces literals <=15 in test_workflow_cancellation.py.
-# Any class using it MUST also carry @pytest.mark.timeout(180) — two of
-# these barriers exceed the 60s pyproject default, which pytest-timeout's
-# thread method answers by os._exit()ing the xdist worker.
+# Any class using it MUST also carry
+# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT): two of these barriers sum
+# to 2 x 45s, and pytest-timeout's thread method answers a breach by
+# os._exit()ing the xdist worker.
 CANCEL_SCOPE_BARRIER_TIMEOUT = 45
 
 # task 3307 (reviewer follow-up): small ceiling for the two PURE in-memory
@@ -915,8 +898,8 @@ CANCEL_SCOPE_BARRIER_TIMEOUT = 45
 # artifact writes, no agent round-trip.  Pairing those with the much larger
 # CANCEL_SCOPE_BARRIER_TIMEOUT above bought no green-path benefit (they
 # resolve in microseconds) while making a genuine CancellationScope
-# regression there take 45s — or up to 180s under a paired
-# @pytest.mark.timeout — to report red instead of pytest's 60s default.
+# regression there take 45s — or up to VERIFY_CLI_PER_TEST_TIMEOUT under a
+# paired marker — to report red.
 # Kept above the retired 5.0s literal (never-narrow) for headroom against
 # scheduler jitter under host oversubscription, without borrowing the
 # I/O-sized budget above.  Do NOT use this for a test that drives a real
@@ -1022,31 +1005,28 @@ async def wait_responsive(
     COUPLED OBLIGATION
     ------------------
     Any class using this MUST carry an adequate ``@pytest.mark.timeout`` —
-    exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.
-    orchestrator/pyproject.toml sets ``timeout = 300`` with
-    ``timeout_method = "thread"`` and ``--max-worker-restart=0``: exceeding
-    the per-test timeout does not fail the test, it ``os._exit()``s the xdist
-    worker, degrading a clean per-test failure into a worker death.  A
+    exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.  An
+    unmarked test runs under ``PYPROJECT_DEFAULT_TIMEOUT`` locally and under
+    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, with ``timeout_method =
+    "thread"`` and ``--max-worker-restart=0``: exceeding the per-test timeout
+    does not fail the test, it ``os._exit()``s the xdist worker, degrading a
+    clean per-test failure into a worker death.  A
     stretched wait without a paired mark is therefore strictly worse than the
     flake it fixes.
 
     The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
     the 90s ceiling, and that is what makes the paired marks checkable:
-    ``_call_wait_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
+    ``_wait_responsive_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
     not an under-count.  With a flat default a ``timeout=15`` site the auditor
     billed at 30s could consume 90s, and TestLateArrivalCleanCAS's true worst
-    case would be 360s against a 300s mark.
+    case would overrun its ``HEAVY_BARRIER_TEST_TIMEOUT`` mark.
 
-    That exactness carries ONE qualifier, load-bearing and currently a
-    CONVENTION rather than a structural guarantee: an explicit ``max_wall_s``
-    wins over the scaled default and the auditor does not scan for it, so a
-    hypothetical ``wait_responsive(f, timeout=1.0, max_wall_s=1000.0)`` would
-    be billed 2.0s while being allowed 1000s.  No scanned site passes
-    ``max_wall_s`` — only the hermetic unit tests in
-    test_orch_helpers_wait_responsive.py do, and they carry no mark obligation
-    — so the marks hold today.  Teaching the auditor to resolve ``max_wall_s``
-    (or to reject any scanned site passing it) is tracked as follow-up.
+    The bound is structural, not a convention: an explicit ``max_wall_s``
+    wins over the scaled default, so the auditor
+    (``_wait_responsive_budget``) bills it verbatim, and one it cannot
+    resolve bills as unbounded — which no mark clears, so the timeout-mark
+    guard rejects the site rather than under-billing it.
 
     The kwarg is named literally ``timeout`` so task 3492's AST wait-budget
     scanner (``_call_wait_budget`` in test_merge_queue_concurrent_verify.py)
@@ -2414,6 +2394,26 @@ def mcp_tool_envelope(payload: object) -> dict:
             'isError': False,
         },
     }
+
+
+class CannedMcpSession:
+    """The duck-typed ``call_tool`` seam ``Scheduler.dispatch_tool`` routes an injected
+    session through (the eval runner's ``_StubMcpSession`` pattern): answers every call
+    with one canned JSON-RPC body, or raises ``error``; ``calls`` records each
+    ``(name, arguments)``."""
+
+    def __init__(self, body: dict | None = None, error: Exception | None = None) -> None:
+        self.body = body or {}
+        self.error = error
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        self.calls.append((name, arguments))
+        if self.error is not None:
+            raise self.error
+        return self.body
+
+
 def make_prompt_resolution_workflow(
     *, tmp_path: Path, prompt_store: PromptArtifactStore | None = None,
 ) -> TaskWorkflow:
@@ -2475,3 +2475,28 @@ class ExitContractViolationCollector(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(record, self._verdict_attribute, None) == self._violation:
             self.violations.append(record)
+
+    @classmethod
+    @contextlib.contextmanager
+    def listening(cls) -> Iterator[ExitContractViolationCollector]:
+        """Attach a collector to the recorder's logger, pinned so that neither
+        a raised ancestor level nor a disabled logger can blind it.
+
+        A test that itself raises 'orchestrator.exit_contract' above WARNING
+        after setup still blinds it.
+        """
+        from orchestrator.exit_contract import record_exit_verdict
+
+        contract_logger = logging.getLogger(record_exit_verdict.__module__)
+        saved_level, saved_disabled = contract_logger.level, contract_logger.disabled
+        if saved_level == logging.NOTSET or saved_level > logging.WARNING:
+            contract_logger.setLevel(logging.WARNING)
+        contract_logger.disabled = False
+        collector = cls()
+        contract_logger.addHandler(collector)
+        try:
+            yield collector
+        finally:
+            contract_logger.removeHandler(collector)
+            contract_logger.setLevel(saved_level)
+            contract_logger.disabled = saved_disabled

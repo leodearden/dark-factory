@@ -23,6 +23,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
+from shared.task_deferral import DeferralRecord
+
 __all__ = [
     'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
     'HUMAN_CURATOR_GATE_KEY',
@@ -41,6 +44,7 @@ __all__ = [
     'SubmodelCardinality',
     'TaskMetadata',
     'apply_migrations',
+    'is_known_metadata_key',
     'parse_metadata',
     'register_metadata_submodel',
     'validate_model_overrides',
@@ -824,6 +828,12 @@ register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality
 # write+enforce instead of silently validating element-wise.
 register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 
+# deferral: plans/deferral-flip-condition-prd.md §5.1.
+register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
+
+# strand_converted: shared/src/shared/strand_conversion.py.
+register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
+
 
 def _normalize_legacy_memory_hints(value: object) -> object:
     """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
@@ -1003,6 +1013,7 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
     {
         'source',
+        # retired 2026-08; stays blessed for historical carriers (docs/task-authoring.md §8).
         'modules',
         'spawn_context',
         'complexity',
@@ -1314,8 +1325,25 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # stays countable instead of invisible.
         'pending_since',
         'pending_since_backfilled',
+        # Ledger entry for a terminal write that honoured an explicit
+        # claimant (task 4866). Writer `fused-memory/src/fused_memory/
+        # middleware/task_interceptor.py::_claimant_exception_entry` via
+        # `_apply_status_transition`; consumer the detection gauge's ledger
+        # classification (docs/prds/claimant-invariant-detection.md D-5, E-2).
+        # A permanent machine stamp: unblessed, every carrier would emit
+        # unknown_key census noise.
+        'claimant_exception',
+        # The harness's audit-trail rotation rollup (task 5771, docs/task-authoring.md
+        # §10): written and read back only by
+        # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
+        'audit_trail_rotation',
     }
 )
+
+
+def is_known_metadata_key(key: str) -> bool:
+    """A typed field, a registered submodel slice or a Tier-A blessed key; never ``x_``."""
+    return key in TaskMetadata.model_fields or key in _SUBMODEL_REGISTRY or key in _BLESSED_METADATA_KEYS
 
 
 def _cardinality_mismatch_message(
@@ -1529,9 +1557,8 @@ def parse_metadata(
                 )
             )
 
-    known_fields = set(TaskMetadata.model_fields) | set(_SUBMODEL_REGISTRY)
     for key in parsed:
-        if key in known_fields or key.startswith('x_') or key in _BLESSED_METADATA_KEYS:
+        if is_known_metadata_key(key) or key.startswith('x_'):
             continue
         warnings.append(
             SchemaWarning(

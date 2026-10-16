@@ -7,7 +7,8 @@ in the durable archive under `data/verify-logs/<task_id>/`. Together those ARE
 the duration distribution a per-module `verify_command_timeout_secs` should be
 derived from, which is why this task does not run a measurement suite: the
 production corpus already is the measurement, and (since deliverable 1) each
-record carries the host load its command ran under.
+record carries the host load its command ran under. While the worktree lives,
+its copy and the archive copy are ONE record, and `load_records` counts it once.
 
 STRICTLY READ-ONLY. This script opens every file `mode='r'`; it writes nothing,
 files nothing, and emits no events. It is safe to run against a live tree while
@@ -22,9 +23,11 @@ a fixed date; `--window <iso>..<iso>` is the mechanism for that. The GATE that
 holds a budget up lives in tests/scripts/test_module_verify_budgets.py; do not
 read this report as that gate.
 
-THREE FACTS COME ONLY FROM THE PATH. A summary.json carries no task id, no
-module prefix and no role, so `parse_record_path` recovers them from where the
-file sits. The two corpora spell the filename differently and the difference is
+TWO FACTS COME ONLY FROM THE PATH. A summary.json carries no task id and no
+module prefix, so `parse_record_path` recovers them from where the file sits.
+The role comes from the record itself (stamped since task 5671); only a record
+written before that falls back to the role its path implies (`Record.role`).
+The two corpora spell the filename differently and the difference is
 easy to get wrong: the worktree side ends `.summary.json`, while the ARCHIVE
 side carries its stamp AFTER that word — `.summary-20260914T123016_283575Z.json`
 — so a `*.summary.json` glob selects zero archive records. D17's own text globs
@@ -110,12 +113,14 @@ class RecordPath:
     attempt one. Selection sanitises the REQUESTED prefix through the same rule
     and compares forward, which is unambiguous; see ``sanitise_prefix``.
 
-    ``role`` is ``None`` when it is not knowable, which is every archive record
-    (the archive carries both task-path and merge-path legs, and the path does
-    not say which) and any unrecognised worktree lane name. ``None`` is the
-    honest reading: defaulting it to ``'task'`` would fold merge legs, which
-    run a different breadth on a different budget, into a task distribution and
-    call the result measured.
+    ``role`` is the role the path implies, which is only the FALLBACK for a
+    record written before task 5671 stamped the role into the summary itself;
+    read ``Record.role``, not this. It is ``None`` when it is not knowable,
+    which is every archive record (the archive carries both task-path and
+    merge-path legs, and the path does not say which) and any unrecognised
+    worktree lane name. ``None`` is the honest reading: defaulting it to
+    ``'task'`` would fold merge legs, which run a different breadth on a
+    different budget, into a task distribution and call the result measured.
     """
 
     path: Path
@@ -207,10 +212,24 @@ class Record:
     where: RecordPath
     payload: dict
 
+    @property
+    def role(self) -> str | None:
+        """The verify role that wrote this record: its own stamp, else its path's.
+
+        The ONE place role is resolved. A non-string stamp is treated as no
+        stamp, so a malformed record keeps the path inference rather than
+        inventing a role.
+        """
+        stamped = self.payload.get('role')
+        return stamped if isinstance(stamped, str) else self.where.role
+
 
 @dataclass(frozen=True)
 class Skip:
-    """A file the globs selected and the walker could not use, with the reason.
+    """A file the globs selected and the walker did not count, with the reason.
+
+    Either it could not be used, or the same record is already counted under
+    another path (``duplicate_of_worktree_record``; see ``load_records``).
 
     Carrying the reason BY VALUE is what makes the corpus reconcilable: the
     report prints these counts beside ``n``, so a reader can see that
@@ -282,6 +301,13 @@ def load_records(roots: Iterable[Path]) -> Corpus:
     A root that does not exist contributes nothing and is not an error: the
     archive lives only in a project's main checkout, so a census run from a
     task worktree legitimately finds one corpus and not the other.
+
+    While a task's worktree lives, each attempt sits in both corpora as twins
+    (``_twin_key``). The WORKTREE copy is kept, because its lane names the role
+    (``RecordPath.role``): ``--role task`` keeps seeing live attempts, and a
+    live task looks as it did before task 5199 archived summaries. The archive
+    copy enters the corpus only once its worktree is torn down. The dropped copy
+    is a counted skip, so ``len(records) + len(skipped)`` still reconciles.
     """
     records: list[Record] = []
     skipped: list[Skip] = []
@@ -297,7 +323,46 @@ def load_records(roots: Iterable[Path]) -> Corpus:
                     skipped.append(Skip(path, reason or 'unreadable'))
                     continue
                 records.append(Record(where=where, payload=payload))
-    return Corpus(records=tuple(records), skipped=tuple(skipped))
+    kept, twins = _split_archived_twins(records)
+    return Corpus(records=tuple(kept), skipped=tuple(skipped + twins))
+
+
+def _twin_key(record: Record) -> tuple[str, int, str | None, str]:
+    """Identify "the same attempt record" across the two corpora.
+
+    Twins share task, attempt and module scope and carry identical content,
+    because ``orchestrator/src/orchestrator/verify.py::run_verification`` builds
+    one ``_build_summary_payload`` record and hands that same dict to both
+    writers.
+    Content is part of the key, not just the name: an infra retry reuses the
+    attempt number and overwrites the worktree copy, so only the archived run
+    whose content matches is its twin.
+    """
+    where = record.where
+    return (
+        where.task_id,
+        where.attempt,
+        where.module_prefix,
+        json.dumps(record.payload, sort_keys=True),
+    )
+
+
+def _split_archived_twins(records: Sequence[Record]) -> tuple[list[Record], list[Skip]]:
+    """Drop each ARCHIVE record whose worktree twin is loaded, as a counted skip.
+
+    Only an archive record is ever dropped, and only against a worktree record:
+    two archive records are distinct runs by construction (each carries its own
+    microsecond stamp), so they never de-duplicate against each other.
+    """
+    live = {_twin_key(r) for r in records if r.where.corpus == 'worktree'}
+    kept: list[Record] = []
+    twins: list[Skip] = []
+    for record in records:
+        if record.where.corpus == 'archive' and _twin_key(record) in live:
+            twins.append(Skip(record.where.path, 'duplicate_of_worktree_record'))
+        else:
+            kept.append(record)
+    return kept, twins
 
 
 @dataclass(frozen=True)
@@ -426,9 +491,10 @@ def select_full_suite_legs(
     report renders ``<none declared>`` beside it, so a reader can tell "nothing
     to compare against" from "compared and found nothing".
 
-    ``role=None`` means "do not filter by role", which is the only usable
-    default for the archive corpus, where the role is not knowable from the
-    path at all (see ``RecordPath.role``).
+    ``role=None`` means "do not filter by role". A role filter compares
+    ``Record.role``, so it selects archive records stamped since task 5671 and
+    rejects the unstamped ones, whose role is not knowable from the path at all
+    (see ``RecordPath.role``).
 
     Every entry read is either selected or counted under a reason, and every
     record not read is counted under one — in ``Selection``'s two separate
@@ -444,7 +510,7 @@ def select_full_suite_legs(
         if record.where.module_prefix != wanted_infix:
             rejected_records['prefix_mismatch'] += 1
             continue
-        if role is not None and record.where.role != role:
+        if role is not None and record.role != role:
             rejected_records['role_mismatch'] += 1
             continue
         entries = record.payload.get('commands')

@@ -3,12 +3,14 @@
 import asyncio
 import contextlib
 import logging
-from dataclasses import asdict, replace
+import shlex
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
     XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
@@ -816,41 +818,49 @@ class TestRunVerificationColdFirstUse:
         )
 
 
-def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):
-    """_apply_cargo_scope propagates verify_cold_command_timeout_secs to the rebuilt ModuleConfig.
-
-    Constructs a ModuleConfig with both warm and cold timeout values, forces the
-    cargo-scope rewrite path via mocked workspace discovery, and asserts the
-    returned ModuleConfig carries both timeout fields unchanged.
-    """
-    from unittest.mock import patch
-
-    from orchestrator.config import ModuleConfig
-    from orchestrator.verify import _apply_cargo_scope
+def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
+    """Cargo scoping rewrites only the three commands; every other ModuleConfig field survives."""
+    (tmp_path / 'Cargo.toml').write_text('[workspace]\nmembers = ["crates/*"]\n')
+    crate_dir = tmp_path / 'crates' / 'foo'
+    crate_dir.mkdir(parents=True)
+    (crate_dir / 'Cargo.toml').write_text('[package]\nname = "foo"\nversion = "0.1.0"\n')
 
     mc = ModuleConfig(
         prefix='crates',
         test_command='cargo test --workspace',
         lint_command='cargo clippy --workspace',
-        type_check_command=None,
+        type_check_command='cargo check --workspace',
+        lock_depth=3,
+        max_per_module=2,
+        module_overrides={'crates/foo': 1},
         verify_command_timeout_secs=2000.0,
         verify_cold_command_timeout_secs=6000.0,
+        concurrent_verify=False,
+        sequential_lint_first=True,
+        verify_env={'K': 'V'},
+        scope_cargo=True,
+    )
+    left_default = [f.name for f in fields(ModuleConfig) if getattr(mc, f.name) == f.default]
+    assert left_default == [], (
+        f'Every ModuleConfig field must be set to a non-default value here so a dropped '
+        f'field is observable; still at default: {left_default}'
     )
 
-    # Force the rewrite path: workspace has one crate, and the .rs file maps to it.
-    with (
-        patch('orchestrator.verify.discover_workspace_crates', return_value={'crates/foo': 'foo'}),
-        patch('orchestrator.verify.files_to_crates', return_value=['foo']),
-    ):
-        result = _apply_cargo_scope(
-            mc,
-            task_files=['crates/foo/src/lib.rs'],
-            project_root=tmp_path,
-            scope_cargo_enabled=True,
-        )
+    result = _apply_cargo_scope(
+        mc,
+        task_files=['crates/foo/src/lib.rs'],
+        project_root=tmp_path,
+        scope_cargo_enabled=True,
+    )
 
-    assert result.verify_command_timeout_secs == 2000.0
-    assert result.verify_cold_command_timeout_secs == 6000.0
+    assert result is not mc
+    assert result.test_command == 'cargo test -p foo'
+    command_fields = {'test_command', 'lint_command', 'type_check_command'}
+    differing = [
+        f.name for f in fields(ModuleConfig)
+        if f.name not in command_fields and getattr(result, f.name) != getattr(mc, f.name)
+    ]
+    assert differing == [], f'Non-command fields changed by cargo scoping: {differing}'
 
 
 class TestIsTestFile:
@@ -1845,6 +1855,253 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestParsePytestFailures:
+    """``parse_pytest_failures`` types each failing test by kind and first failure line."""
+
+    FAILED = verify.FailureKind.FAILED
+    ERROR = verify.FailureKind.ERROR
+
+    def _parse(self, output: str) -> list[tuple[str, str, str]]:
+        return [
+            (f.node_id, f.kind.value, f.first_line) for f in verify.parse_pytest_failures(output)
+        ]
+
+    def test_failed_line_is_kind_failed(self):
+        assert self._parse('FAILED tests/a.py::test_x - assert 1 == 2') == [
+            ('tests/a.py::test_x', 'failed', 'assert 1 == 2'),
+        ]
+
+    def test_error_node_line_is_kind_error(self):
+        assert self._parse('ERROR tests/a.py::test_x - RuntimeError: setup') == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: setup'),
+        ]
+
+    def test_bare_error_file_line_is_kind_error(self):
+        assert self._parse('ERROR tests/a.py - ImportError: nope') == [
+            ('tests/a.py', 'error', 'ImportError: nope'),
+        ]
+
+    def test_xdist_crash_notice_is_kind_failed(self):
+        output = "worker 'gw1' crashed while running 'tests/a.py::test_x'"
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_node_down_preceding_line_is_kind_failed(self):
+        output = 'tests/a.py::test_x\n[gw0] node down: Not properly terminated\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_summary_reason_is_stripped_of_line_ending_and_trailing_spaces(self):
+        output = 'FAILED tests/a.py::test_x - AssertionError: boom  \r\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'AssertionError: boom')]
+
+    def test_first_line_keeps_everything_after_first_separator(self):
+        output = 'FAILED tests/a.py::test_x - ValueError: a - b\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'ValueError: a - b')]
+
+    def test_error_without_reason_takes_e_line_of_its_own_section(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at setup of test_other ___\n'
+            'E   KeyError: other\n'
+            '___ ERROR at setup of test_x ___\n'
+            'x = 1\n'
+            'E   RuntimeError: fixture exploded\n'
+            'E   second line\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: fixture exploded'),
+        ]
+
+    def test_section_of_parametrised_id_is_matched_by_full_id(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at setup of test_x[1] ___\n'
+            'E   KeyError: one\n'
+            '___ ERROR at setup of test_x[2] ___\n'
+            'E   KeyError: two\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py::test_x[2]\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x[2]', 'error', 'KeyError: two')]
+
+    def test_section_of_class_qualified_id_uses_dotted_header(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ TestBox.test_x ___\n'
+            'E   AssertionError: boxed\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::TestBox::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::TestBox::test_x', 'failed', 'AssertionError: boxed'),
+        ]
+
+    def test_collection_error_takes_e_line_of_collecting_section(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR collecting tests/a.py ___\n'
+            'E   ModuleNotFoundError: no module named zz\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py', 'error', 'ModuleNotFoundError: no module named zz'),
+        ]
+
+    def test_failed_and_error_sections_of_one_node_are_kept_apart(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at teardown of test_x ___\n'
+            'E   OSError: teardown\n'
+            '=== FAILURES ===\n'
+            '___ test_x ___\n'
+            'E   AssertionError: body\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x\n'
+            'ERROR tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', 'AssertionError: body'),
+            ('tests/a.py::test_x', 'error', 'OSError: teardown'),
+        ]
+
+    def test_first_line_is_empty_without_reason_or_section(self):
+        assert self._parse('ERROR tests/a.py::test_x\n') == [('tests/a.py::test_x', 'error', '')]
+
+    def test_section_without_e_line_leaves_first_line_empty(self):
+        output = (
+            '___ test_x ___\n'
+            'plain output\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_e_line_after_the_section_ends_is_not_taken(self):
+        output = (
+            '___ test_x ___\n'
+            'plain output\n'
+            '___ test_y ___\n'
+            'E   KeyError: belongs to y\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_same_named_tests_in_two_files_each_take_their_own_section(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ test_x ___\n'
+            'tests/a.py:3: in test_x\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'tests/b.py:9: in test_x\n'
+            'E   ValueError: from b\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/b.py::test_x\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/b.py::test_x', 'failed', 'ValueError: from b'),
+            ('tests/a.py::test_x', 'failed', 'KeyError: from a'),
+        ]
+
+    def test_same_named_tests_whose_sections_name_no_path_leave_first_line_empty(self):
+        output = (
+            '___ test_x ___\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'E   ValueError: from b\n'
+            'FAILED tests/a.py::test_x\n'
+            'FAILED tests/b.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', ''),
+            ('tests/b.py::test_x', 'failed', ''),
+        ]
+
+    def test_extract_failing_test_ids_returns_every_reasonless_failure(self):
+        count = 500
+        output = (
+            ''.join(f'___ test_{i} ___\nE   Boom: {i}\n' for i in range(count))
+            + ''.join(f'FAILED tests/a.py::test_{i}\n' for i in range(count))
+        )
+        assert verify._extract_failing_test_ids(output) == [
+            f'tests/a.py::test_{i}' for i in range(count)
+        ]
+
+    def test_xdist_crash_has_no_section_first_line(self):
+        output = (
+            '___ test_x ___\n'
+            'E   KeyError: unrelated\n'
+            "worker 'gw1' crashed while running 'tests/a.py::test_x'\n"
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_crash_takes_reason_of_failed_line_for_same_node(self):
+        output = (
+            "worker 'gw1' crashed while running 'tests/a.py::test_x'\n"
+            'FAILED tests/a.py::test_x - worker crashed\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'worker crashed')]
+
+    def test_order_follows_position_across_interleaved_surfaces(self):
+        output = (
+            'FAILED tests/z.py::test_1 - a\n'
+            'ERROR tests/y.py::test_2 - b\n'
+            'FAILED tests/x.py::test_3 - c\n'
+            'ERROR tests/w.py - d\n'
+        )
+        assert [node for node, _, _ in self._parse(output)] == [
+            'tests/z.py::test_1',
+            'tests/y.py::test_2',
+            'tests/x.py::test_3',
+            'tests/w.py',
+        ]
+
+    def test_repeated_node_and_kind_is_one_entry_keeping_first_position(self):
+        output = (
+            'FAILED tests/a.py::test_x - first\n'
+            'FAILED tests/a.py::test_y - y\n'
+            'FAILED tests/a.py::test_x - second\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', 'first'),
+            ('tests/a.py::test_y', 'failed', 'y'),
+        ]
+
+    def test_node_both_failed_and_error_is_two_entries_but_one_node_id(self):
+        output = 'FAILED tests/a.py::test_x - f\nERROR tests/a.py::test_x - e\n'
+        failures = verify.parse_pytest_failures(output)
+        assert [(f.kind, f.first_line) for f in failures] == [
+            (self.FAILED, 'f'),
+            (self.ERROR, 'e'),
+        ]
+        assert verify.node_ids_of(failures) == ['tests/a.py::test_x']
+
+    def test_empty_input_parses_to_empty_tuple(self):
+        assert verify.parse_pytest_failures('') == ()
+
+    def test_extract_failing_test_ids_is_the_node_ids_of_the_parse(self):
+        output = (
+            'FAILED tests/b.py::test_1 - x\n'
+            'ERROR tests/a.py::test_2\n'
+            'ERROR tests/c.py\n'
+            'FAILED tests/a.py::test_2 - y\n'
+            "worker 'gw1' crashed while running 'tests/d.py::test_4'\n"
+            'FAILED tests/b.py::test_1 - again\n'
+        )
+        assert verify._extract_failing_test_ids(output) == verify.node_ids_of(
+            verify.parse_pytest_failures(output),
+        )
+        assert verify._extract_failing_test_ids(output) == [
+            'tests/b.py::test_1',
+            'tests/a.py::test_2',
+            'tests/c.py',
+            'tests/d.py::test_4',
+        ]
+
+
 class TestExtractFailingTestIdsFromJunit:
     """``_extract_failing_test_ids_from_junit(path)`` parses a pytest junitxml
     report into a sorted, de-duplicated list of stable ``classname::name`` ids
@@ -1936,6 +2193,160 @@ class TestExtractFailingTestIdsFromJunit:
         ]
 
 
+class TestExtractTestIdsFromJunit:
+    """``_extract_test_ids_from_junit(path)`` — ONE parse, failing and skipped vectors.
+
+    Task 3226.  The failing vector alone leaves ``main_baseline_failing_ids``
+    unable to tell "main RAN this test and it passed" from "main never ran it";
+    only the first supports the task-fault conclusion the id-diff fast path in
+    ``verify_failure_is_preexisting_on_main`` draws.  The skipped vector is the
+    never-executed population, so it must hold exactly the tests the run did
+    not execute — an xfail ran.
+    """
+
+    # DELIBERATELY the failing parser's fixture, verbatim: the partition
+    # assertion below is that ONE report yields two disjoint vectors.
+    _JUNIT_XML = TestExtractFailingTestIdsFromJunit._JUNIT_XML
+
+    @staticmethod
+    def _parse(tmp_path: Path, xml: str) -> verify._JunitTestIds | None:
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(xml)
+        return verify._extract_test_ids_from_junit(junit_path)
+
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
+        )
+
+    def test_one_report_partitions_into_failing_and_skipped(self, tmp_path: Path):
+        """Failing and skipped are DISJOINT, a pass is in neither, and the
+        failing projection agrees with the pair."""
+        ids = self._parse(tmp_path, self._JUNIT_XML)
+
+        assert ids == (
+            ['tests.test_sample::test_error', 'tests.test_sample::test_fail'],
+            ['tests.test_sample::test_skip'],
+        ), ids
+        assert ids is not None
+        assert verify._extract_failing_test_ids_from_junit(tmp_path / 'junit.xml') == ids.failing
+
+    def test_nothing_skipped_is_an_empty_vector_not_none(self, tmp_path: Path):
+        """``[]`` ("junit collected, zero skipped") licenses "main ran
+        everything"; ``None`` (no report) licenses nothing."""
+        ids = self._parse(
+            tmp_path,
+            self._suite('<testcase classname="tests.test_sample" name="test_pass" />'),
+        )
+
+        assert ids == ([], [])
+
+    def test_xfail_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """pytest writes an xfail as ``<skipped type="pytest.xfail">``
+        (``_pytest/junitxml.py::_NodeReporter.append_skipped``), but the test
+        RAN.  Counting it as skipped would let the merge-queue reason say
+        "main never ran" about a test main did run."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_skip">'
+                '<skipped type="pytest.skip" message="no reify checkout">x</skipped>'
+                '</testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_skip']), ids
+
+    def test_strict_xpass_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """A strict XPASS is written as an UNTYPED ``<skipped>`` with a fixed
+        message (``_pytest/junitxml.py::_NodeReporter.append_failure``); it ran
+        too.  An untyped collection skip did not, and stays skipped."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xpass_strict">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+                '<testcase classname="t" name="test_module">'
+                '<skipped message="collection skipped">reason</skipped></testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_module']), ids
+
+    def test_a_testcase_with_a_failure_is_failing_whatever_else_it_records(
+        self, tmp_path: Path,
+    ):
+        """A skip in the call phase plus a teardown error lands in ``failing``
+        only, so the two vectors stay disjoint by construction."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_both">'
+                '<skipped type="pytest.skip" message="s" />'
+                '<error message="failed on teardown">boom</error></testcase>',
+            ),
+        )
+
+        assert ids == (['t::test_both'], []), ids
+
+    def test_bare_testsuite_root_is_handled(self, tmp_path: Path):
+        """A writer that omits the ``<testsuites>`` wrapper must not yield an
+        empty vector, which would read as "nothing skipped"."""
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="no reify checkout" type="pytest.skip" />'
+            '</testcase></testsuite>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'])
+
+    def test_both_vectors_share_the_classname_file_name_id_fallback(self, tmp_path: Path):
+        """The vectors are set-differenced against each other downstream, so
+        they must spell an id identically: classname, then file, then name."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase file="tests/test_x.py" name="test_by_file">'
+                '<skipped message="s" /></testcase>',
+                '<testcase name="test_bare"><failure message="f" /></testcase>',
+            ),
+        )
+
+        assert ids == (['test_bare'], ['tests/test_x.py::test_by_file']), ids
+
+    def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites>'
+            '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '</testsuites>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'])
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path):
+        """No junit collected — the B3 degrade signal, and NOT ``([], [])``,
+        which would license "main ran everything" from a report never written."""
+        assert verify._extract_test_ids_from_junit(tmp_path / 'missing.xml') is None
+
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_unparseable_report_returns_none(self, tmp_path: Path, content: str):
+        assert self._parse(tmp_path, content) is None
+
+
 # ---------------------------------------------------------------------------
 # Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
 # — a plain JSON-native `list[str] | None` (mirrors the `contention` (task
@@ -1985,6 +2396,208 @@ class TestVerifyResultFailingTestIds:
 
         assert restored.failing_test_ids == []
         assert restored.failing_test_ids is not None
+
+
+class TestVerifyResultSkippedTestIds:
+    """VerifyResult carries `skipped_test_ids` beside `failing_test_ids` (task 3226).
+
+    Same three seams as the failing field — dataclass default, generic
+    asdict/**d codec, and `_aggregate_results` — because the two vectors are
+    consumed TOGETHER: a caller asks "did main run this test?" by checking one
+    against the other, and a field that survived only two of the three seams
+    would answer that question with stale or absent data at the third.
+
+    JSON-native `list[str] | None` like `contention`/`plan`/`failing_test_ids`,
+    so no serialization allowlist needs editing.
+    """
+
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_skipped_test_ids_is_none(self):
+        """None is the fail-OPAQUE default: no junit collected, nothing may be concluded."""
+        assert self._make_result().skipped_test_ids is None
+
+    def test_skipped_test_ids_round_trips_via_asdict_codec(self):
+        vr = self._make_result(skipped_test_ids=['a::b'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == ['a::b']
+        assert restored == vr
+
+    def test_empty_skipped_test_ids_is_preserved_not_coerced_to_none(self):
+        """`[]` ("junit collected, zero skipped") must survive the codec distinctly.
+
+        Coercing it to None across the wire would erase the only positive
+        evidence that main ran its whole suite — turning a genuine "main ran
+        everything" into "we do not know", which fails the wrong way for the
+        caller this field exists to serve.
+        """
+        vr = self._make_result(skipped_test_ids=[])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == []
+        assert restored.skipped_test_ids is not None
+
+    @pytest.mark.asyncio
+    async def test_run_verification_parses_both_vectors_from_one_report(
+        self, tmp_path: Path,
+    ):
+        """Both vectors reach the result from ONE parse of the report.
+
+        Drives the real ``run_verification`` seam (nothing executes —
+        ``_run_cmd`` is a spy).  ``role='merge'`` plus
+        ``merge_verify_breadth='full'`` is exactly what makes ``junit_path``
+        non-None, so the seam is reached.  A single parse is what guarantees
+        the two vectors describe the same run.
+        """
+        worktree = tmp_path / 'merge-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        failing_sentinel = ['sentinel::failing']
+        skipped_sentinel = ['sentinel::skipped']
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(failing=failing_sentinel, skipped=skipped_sentinel),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='merge',
+                attempt_id=None,
+            )
+
+        # (a) both vectors reach the result on the correct fields — neither
+        #     dropped, aliased, nor swapped.
+        assert result.failing_test_ids == failing_sentinel, (
+            f'the failing vector must reach the result; got {result.failing_test_ids!r}'
+        )
+        assert result.skipped_test_ids == skipped_sentinel, (
+            f'the skipped vector must reach the result; got {result.skipped_test_ids!r}'
+        )
+
+        # (b) the report was parsed exactly once.
+        assert parser.call_count == 1, parser.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_neither_vector_is_parsed_when_the_seam_is_not_reached(
+        self, tmp_path: Path,
+    ):
+        """(c) role='task' leaves junit_path None: the report is not parsed and
+        BOTH fields come back None."""
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(
+                failing=['sentinel::failing'], skipped=['sentinel::skipped'],
+            ),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='task',
+                attempt_id=None,
+            )
+
+        parser.assert_not_called()
+        assert result.failing_test_ids is None, result.failing_test_ids
+        assert result.skipped_test_ids is None, result.skipped_test_ids
+
+    def test_both_id_vectors_coexist_on_one_result(self):
+        """The two fields are independent — neither aliases nor overwrites the other."""
+        vr = self._make_result(failing_test_ids=['f::1'], skipped_test_ids=['s::1'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == ['f::1']
+        assert restored.skipped_test_ids == ['s::1']
+
+
+class TestAggregateResultsSkippedTestIds:
+    """`_aggregate_results` unions skipped_test_ids by the SAME rule as the failing side."""
+
+    def _r(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok'
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_all_none_stays_none(self):
+        agg = _aggregate_results([self._r(), self._r()])
+        assert agg.skipped_test_ids is None
+
+    def test_one_none_child_does_not_erase_another_childs_skip_evidence(self):
+        """The mixed case, and the reason the rule is None-iff-EVERY-child-is-None.
+
+        A module that collected no junit at all (None — OPAQUE command, or
+        breadth != full) knows nothing about skips; letting it POISON the
+        aggregate to None would discard a sibling module's real, collected skip
+        evidence and silently return the whole run to the can't-tell state this
+        task closes. None contributes nothing; it does not suppress.
+        """
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=['a::b'])])
+
+        assert agg.skipped_test_ids == ['a::b'], (
+            f'an OPAQUE module must not erase a sibling\'s collected skips; got '
+            f'{agg.skipped_test_ids!r}'
+        )
+
+    def test_unions_sorts_and_dedupes_across_children(self):
+        agg = _aggregate_results(
+            [
+                self._r(skipped_test_ids=['y::2', 'shared::s']),
+                self._r(skipped_test_ids=['x::1', 'shared::s']),
+            ]
+        )
+
+        assert agg.skipped_test_ids == ['shared::s', 'x::1', 'y::2']
+
+    def test_empty_child_makes_the_aggregate_non_none(self):
+        """A child that collected junit and found zero skips is EVIDENCE, not silence."""
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=[])])
+
+        assert agg.skipped_test_ids == []
+        assert agg.skipped_test_ids is not None
+
+    def test_failing_and_skipped_aggregate_independently(self):
+        """Wiring the new field must not perturb the failing side's aggregation."""
+        agg = _aggregate_results(
+            [
+                self._r(failing_test_ids=['f::1']),
+                self._r(skipped_test_ids=['s::1']),
+            ]
+        )
+
+        assert agg.failing_test_ids == ['f::1']
+        assert agg.skipped_test_ids == ['s::1']
+
 
 
 # ---------------------------------------------------------------------------
@@ -2183,6 +2796,264 @@ class TestRunVerificationJunitxmlInjection:
             f'non-pytest command must never receive --junitxml; got {captured}'
         )
         assert result.failing_test_ids is None
+
+
+# ---------------------------------------------------------------------------
+# Task 5627: run_verification records WHICH module produced its junit ids —
+# VerifyResult.failing_test_ids_by_module, {module_prefix: failing_test_ids}.
+# It is set where a junit id and its module_prefix meet, so a consumer never
+# has to parse node-id strings to learn which module a red id belongs to.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunVerificationAttributesFailingIdsToModule:
+    """failing_test_ids_by_module: codec round-trip and run_verification wiring."""
+
+    _junit = TestRunVerificationJunitxmlInjection()
+
+    _PASSING_JUNIT_XML = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '<testsuite name="pytest" errors="0" failures="0" tests="1">\n'
+        '<testcase classname="tests.test_sample" name="test_ok" time="0.001">\n'
+        '</testcase>\n'
+        '</testsuite>\n'
+        '</testsuites>\n'
+    )
+
+    def _fake_run_cmd_writing_passing_junit(self):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                junit_path = Path(parts[parts.index('--junitxml') + 1])
+                junit_path.parent.mkdir(parents=True, exist_ok=True)
+                junit_path.write_text(self._PASSING_JUNIT_XML)
+            return 0, 'ok', False
+
+        return fake_run_cmd
+
+    async def test_field_defaults_to_none_and_round_trips_both_codecs(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        assert VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='x',
+        ).failing_test_ids_by_module is None
+
+        by_module = {'pkg': ['a::b'], 'other': []}
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x',
+            failing_test_ids=['a::b'], failing_test_ids_by_module=by_module,
+        )
+
+        via_asdict = VerifyResult(**asdict(vr))
+        via_wire = result_from_dict(result_to_dict(vr))
+
+        assert via_asdict.failing_test_ids_by_module == by_module
+        assert via_wire.failing_test_ids_by_module == by_module
+        assert via_asdict == vr
+        assert via_wire == vr
+
+    async def test_module_run_attributes_its_ids_to_its_prefix(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+        assert result.failing_test_ids_by_module == {'pkg': ['tests.test_sample::test_fail']}
+
+    async def test_global_command_run_has_no_module_to_attribute_to(self, tmp_path: Path):
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full', test_command='pytest tests/',
+        )
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, None, max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+        assert result.failing_test_ids_by_module is None
+
+    async def test_run_that_collected_no_junit_has_no_attribution(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+        fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='task',
+            )
+
+        assert result.failing_test_ids is None
+        assert result.failing_test_ids_by_module is None
+
+    async def test_clean_module_run_is_attributed_as_covered_and_clean(self, tmp_path: Path):
+        config = self._junit._make_config(tmp_path, breadth='full')
+
+        with patch(
+            'orchestrator.verify._run_cmd',
+            side_effect=self._fake_run_cmd_writing_passing_junit(),
+        ):
+            result = await run_verification(
+                tmp_path, config, self._junit._module_config(), max_retries=0, role='merge',
+            )
+
+        assert result.failing_test_ids == []
+        assert result.failing_test_ids_by_module == {'pkg': []}
+
+
+@pytest.mark.asyncio
+class TestScopedVerificationAggregatesModuleAttribution:
+    """Task 5627: a multi-module merge verify keeps each red id's module.
+
+    ``run_verification`` is faked per module exactly as the real one now
+    answers: ``failing_test_ids_by_module={prefix: failing_test_ids}``.
+    """
+
+    _PREFIXES = ('A', 'B', 'C')
+
+    def _module_configs(self, prefixes=_PREFIXES) -> list[ModuleConfig]:
+        return [
+            ModuleConfig(
+                prefix=p, test_command=f'pytest {p}/tests',
+                lint_command=None, type_check_command=None,
+            )
+            for p in prefixes
+        ]
+
+    def _per_module_fake(
+        self,
+        ids_by_prefix: dict[str, list[str] | None],
+        *,
+        unattributed: frozenset[str] = frozenset(),
+    ):
+        async def fake(worktree, config, module_config=None, **kwargs):
+            assert module_config is not None
+            ids = ids_by_prefix[module_config.prefix]
+            by_module = (
+                {module_config.prefix: ids}
+                if ids is not None and module_config.prefix not in unattributed
+                else None
+            )
+            return VerifyResult(
+                passed=not ids, test_output='', lint_output='', type_output='',
+                summary='All checks passed' if not ids else 'Failures: tests failed',
+                failing_test_ids=ids,
+                failing_test_ids_by_module=by_module,
+            )
+
+        return fake
+
+    async def _run(
+        self, tmp_path: Path, fake, prefixes=_PREFIXES,
+    ) -> VerifyResult:
+        config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='full')
+        with patch.object(verify, 'run_verification', side_effect=fake):
+            return await run_scoped_verification(
+                tmp_path, config, self._module_configs(prefixes),
+                task_files=None, role='merge',
+            )
+
+    async def test_each_red_id_stays_with_its_module(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1'], 'B': [], 'C': ['c1', 'c2']}),
+        )
+
+        assert result.failing_test_ids == ['a1', 'c1', 'c2']
+        assert result.failing_test_ids_by_module == {
+            'A': ['a1'], 'B': [], 'C': ['c1', 'c2'],
+        }
+
+    async def test_an_unattributed_collecting_child_poisons_the_map(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path,
+            self._per_module_fake(
+                {'A': ['a1'], 'B': ['x'], 'C': []}, unattributed=frozenset({'B'}),
+            ),
+        )
+
+        assert result.failing_test_ids == ['a1', 'x']
+        assert result.failing_test_ids_by_module is None
+
+    async def test_a_child_that_collected_nothing_does_not_poison(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1'], 'B': None}), prefixes=('A', 'B'),
+        )
+
+        assert result.failing_test_ids == ['a1']
+        assert result.failing_test_ids_by_module == {'A': ['a1']}
+
+    async def test_nothing_collected_anywhere_leaves_both_none(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': None, 'B': None, 'C': None}),
+        )
+
+        assert result.failing_test_ids is None
+        assert result.failing_test_ids_by_module is None
+
+    async def test_single_module_run_keeps_its_map(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1']}), prefixes=('A',),
+        )
+
+        assert result.failing_test_ids_by_module == {'A': ['a1']}
+
+
+class TestModuleAttributionInvariantIsNamedWhereResultsAreBuilt:
+    """A failing_test_ids_by_module that does not cover exactly failing_test_ids
+    is reported when the VerifyResult is built, naming the ids that disagree."""
+
+    @staticmethod
+    def _result(**fields: Any) -> VerifyResult:
+        return VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x', **fields,
+        )
+
+    @staticmethod
+    def _invariant_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'failing_test_ids_by_module' in r.getMessage()
+        ]
+
+    def test_an_exact_map_reports_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=['a1'], failing_test_ids_by_module={'A': ['a1'], 'B': []})
+            self._result(failing_test_ids=['a1'])
+
+        assert self._invariant_warnings(caplog) == []
+
+    def test_an_id_no_module_owns_is_named(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=['a1', 'zz'], failing_test_ids_by_module={'A': ['a1']})
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'zz'" in message and "'a1'" not in message, message
+
+    def test_a_map_without_collected_ids_is_named(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=None, failing_test_ids_by_module={'B': ['b1']})
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'b1'" in message, message
+
+    def test_filtering_ids_through_replace_alone_is_named(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        attributed = self._result(
+            failing_test_ids=['a1', 'b1'], failing_test_ids_by_module={'A': ['a1'], 'B': ['b1']},
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            replace(attributed, failing_test_ids=['a1'])
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'b1'" in message, message
 
 
 class TestExtractCauseHint:
@@ -3941,19 +4812,16 @@ class TestVerifyResultCategoryAndPaths:
 
 
 class TestPersistAttemptLogs:
-    """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)``.
+    """Tests for ``_persist_attempt_logs(worktree, attempt_id, runs, summary_record)``.
 
     Tests fail until step 8 implements the helper.
     """
 
     def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
-        import asyncio  # noqa: PLC0415
-
         from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
-        return asyncio.run(
-            _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint)
-        ) if asyncio.iscoroutinefunction(_persist_attempt_logs) else _persist_attempt_logs(
-            worktree, attempt_id, runs, category, cause_hint
+        return _persist_attempt_logs(
+            worktree, attempt_id, runs,
+            _build_summary_payload(runs, category, cause_hint, role='task'),
         )
 
     def _make_runs(self):
@@ -4112,14 +4980,17 @@ class TestPersistAttemptLogs:
 
 
 class TestArchiveAttemptLog:
-    """Tests for ``_archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)``.
+    """Tests for ``_archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category, *, stamp)``.
 
     Tests fail until step 10 implements the helper.
     """
 
     def _archive(self, worktree_log_paths, archive_root, task_id, attempt_id, category):
-        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
-        return _archive_attempt_log(worktree_log_paths, archive_root, task_id, attempt_id, category)
+        from orchestrator.verify import _archive_attempt_log, _archive_stamp  # noqa: PLC0415
+        return _archive_attempt_log(
+            worktree_log_paths, archive_root, task_id, attempt_id, category,
+            stamp=_archive_stamp(),
+        )
 
     def _make_source_logs(self, tmp_path: Path) -> list[Path]:
         """Create two fake worktree log files and return their paths."""
@@ -5027,6 +5898,188 @@ class TestRunVerificationMergeArchival:
         )
 
 
+@pytest.mark.asyncio
+class TestTaskPathSummaryArchival:
+    """Every task-path attempt leaves its summary JSON in the durable archive.
+
+    The task-path counterpart of ``TestRunVerificationMergeArchival``.  The
+    worktree copy under ``.task/verify/`` dies with the worktree, so the
+    record of why an attempt passed or failed must also land under
+    ``<archive_root>/<task_id>/``.  Asserted on the files written, not on
+    the writer.
+    """
+
+    _TASK_ID = '5199'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / '.task').mkdir()
+        return tmp_path
+
+    def _make_config(self, worktree: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=worktree,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+    async def _verify(self, worktree: Path, archive_root: 'Path | None', attempt_id: int, fake_run_cmd):
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_verification(
+                worktree, self._make_config(worktree),
+                max_retries=0,
+                attempt_id=attempt_id,
+                task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+    @staticmethod
+    async def _all_green(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+        return 0, 'ok', False
+
+    def _archived_summaries(self, archive_root: Path, stem: str) -> list[Path]:
+        return sorted((archive_root / self._TASK_ID).glob(f'{stem}.summary-*.json'))
+
+    @staticmethod
+    def _load(path: Path) -> dict:
+        import json  # noqa: PLC0415
+        return json.loads(path.read_text())
+
+    async def test_green_attempt_summary_survives_worktree_teardown(self, tmp_path: Path):
+        import shutil  # noqa: PLC0415
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        result = await self._verify(worktree, archive_root, 3, self._all_green)
+
+        assert result.passed
+        archived = self._archived_summaries(archive_root, 'attempt-3')
+        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
+        worktree_copy = worktree / '.task' / 'verify' / 'attempt-3.summary.json'
+        assert self._load(archived[0]) == self._load(worktree_copy), (
+            'the archived summary must be the same record as the worktree copy'
+        )
+        assert self._load(archived[0])['category'] == 'passed'
+
+        shutil.rmtree(worktree / '.task')
+        assert archived[0].is_file(), 'the archived summary must outlive the worktree'
+        assert self._load(archived[0])['category'] == 'passed'
+
+    async def test_summary_archived_even_when_the_logs_are_not(self, tmp_path: Path):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def failing_tests(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'cargo test' in cmd:
+                return 1, 'running 3 tests\ntest my::mod::it FAILED\n', False
+            return 0, 'ok', False
+
+        result = await self._verify(worktree, archive_root, 1, failing_tests)
+
+        assert result.category == 'test_failure', (
+            f'precondition: fixture must classify into the log deny-list; got {result.category!r}'
+        )
+        archived = self._archived_summaries(archive_root, 'attempt-1')
+        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
+        assert self._load(archived[0])['category'] == 'test_failure'
+        assert list((archive_root / self._TASK_ID).glob('*.log')) == [], (
+            'the per-log category deny-list must be unchanged'
+        )
+        assert result.archive_log_paths == [], (
+            'the summary must not travel through the log-archival path'
+        )
+
+    async def test_attempts_and_module_prefixes_never_overwrite(self, tmp_path: Path):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        prefixes = ('cratea', 'crateb')
+        module_configs = [
+            ModuleConfig(
+                prefix=prefix,
+                test_command=f'cargo test -p {prefix}',
+                lint_command=None,
+                type_check_command=None,
+            )
+            for prefix in prefixes
+        ]
+
+        async def module_specific_failures(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            for prefix in prefixes:
+                if prefix in cmd:
+                    return 1, f'{prefix} ERR\nfoo\n', False
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=module_specific_failures):
+            for attempt_id in (1, 2):
+                await run_scoped_verification(
+                    worktree, self._make_config(worktree), module_configs,
+                    attempt_id=attempt_id,
+                    task_id=self._TASK_ID,
+                    archive_root=archive_root,
+                )
+
+        for attempt_id in (1, 2):
+            for prefix in prefixes:
+                archived = self._archived_summaries(archive_root, f'attempt-{attempt_id}.{prefix}')
+                assert len(archived) == 1, (
+                    f'expected one archived summary for attempt {attempt_id} / {prefix}; got {archived}'
+                )
+                cmds = [c['cmd'] for c in self._load(archived[0])['commands']]
+                assert cmds, f'archived summary for {prefix} records no commands'
+                assert all(prefix in cmd for cmd in cmds), (
+                    f'archived summary for {prefix} names another module: {cmds}'
+                )
+
+    async def test_rerun_of_the_same_attempt_keeps_both_records(self, tmp_path: Path):
+        """``workflow.py::_run_scoped_verification_with_infra_retry`` reuses the attempt id."""
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        for _ in range(2):
+            await self._verify(worktree, archive_root, 1, self._all_green)
+
+        archived = self._archived_summaries(archive_root, 'attempt-1')
+        assert len(set(archived)) == 2, (
+            f'a re-run of the same attempt must not overwrite the earlier record; got {archived}'
+        )
+
+    async def test_no_archive_tree_without_an_archiving_caller(self, tmp_path: Path):
+        """``archive_root=None`` is how cold-shadow and drift probes opt out."""
+        worktree = self._worktree(tmp_path)
+        before = set(tmp_path.rglob('*'))
+
+        await self._verify(worktree, None, 1, self._all_green)
+
+        assert (worktree / '.task' / 'verify' / 'attempt-1.summary.json').is_file()
+        created = sorted(p.relative_to(tmp_path) for p in set(tmp_path.rglob('*')) - before)
+        assert all(p.parts[0] == '.task' for p in created), (
+            f'a non-archiving caller may write only inside its worktree .task/; created {created}'
+        )
+
+    async def test_summary_and_logs_of_one_attempt_share_one_stamp(self, tmp_path: Path):
+        """A reader joins a task-path attempt's archived logs to its summary by stamp."""
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def cargo_cli_error(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'cargo test' in cmd:
+                return 1, 'error: --exclude can only be used together with --workspace\n', False
+            return 0, 'ok', False
+
+        result = await self._verify(worktree, archive_root, 2, cargo_cli_error)
+
+        assert result.archive_log_paths, (
+            f'precondition: fixture must classify into an archived category; got {result.category!r}'
+        )
+        summaries = self._archived_summaries(archive_root, 'attempt-2')
+        assert len(summaries) == 1, f'expected exactly one archived summary; got {summaries}'
+        stamp = summaries[0].name.split('summary-', 1)[1].removesuffix('.json')
+        for log in result.archive_log_paths:
+            assert Path(log).name.endswith(f'-{stamp}.log'), (
+                f'log {Path(log).name!r} does not carry the summary stamp {stamp!r}'
+            )
+
+
 class TestPersistAttemptLogsModulePrefix:
     """Tests for the ``module_prefix`` parameter added to ``_persist_attempt_logs``.
 
@@ -5048,7 +6101,8 @@ class TestPersistAttemptLogsModulePrefix:
         kwargs = {}
         if module_prefix is not None:
             kwargs['module_prefix'] = module_prefix
-        return _persist_attempt_logs(worktree, attempt_id, runs, category, cause_hint, **kwargs)
+        summary = _build_summary_payload(runs, category, cause_hint, role='task')
+        return _persist_attempt_logs(worktree, attempt_id, runs, summary, **kwargs)
 
     def _make_runs(self):
         return [
@@ -6800,6 +7854,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
                 task_id='42',
                 attempt_id=1,
                 category='cargo_cli_error',
+                stamp=verify._archive_stamp(),
             )
             assert spy.call_count == 0, (
                 f'_archive_attempt_log must not call _prune_archive; '
@@ -7593,6 +8648,68 @@ class TestRunFullVerificationRole:
         )
 
 
+class TestRunFullVerificationMaxRetries:
+    """run_full_verification threads `max_retries` to every run_verification call.
+
+    Task 5812: the main-tip sweep passes max_retries=0 so a timeout reaches its
+    verdict without re-running; omitting it keeps config.verify_timeout_retries
+    in force for every other caller (e.g. review-checkpoint).
+    """
+
+    _PASSING = VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    )
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_each_subproject(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(
+                tmp_path, config, role='background', max_retries=0,
+            )
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs['max_retries'] == 0, one_call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_the_global_fallback(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {}  # discovered-empty → global fallback branch
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, max_retries=0)
+
+        assert mock_run_verification.call_count == 1
+        assert mock_run_verification.call_args_list[0].kwargs['max_retries'] == 0
+
+    @pytest.mark.asyncio
+    async def test_omitted_max_retries_leaves_config_default_in_force(
+        self, tmp_path: Path,
+    ):
+        """None reaches run_verification, which then uses config.verify_timeout_retries."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs.get('max_retries') is None, one_call.kwargs
+
+
 class TestRunScopedVerificationForceWorkspace:
     """run_scoped_verification: force_workspace=True bypasses all scoping.
 
@@ -7945,7 +9062,7 @@ class TestBuildSummaryPayload:
 
     def _build(self, runs, category='test_failure', cause_hint=''):
         from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
-        return _build_summary_payload(runs, category, cause_hint)
+        return _build_summary_payload(runs, category, cause_hint, role='task')
 
     def test_top_level_keys_present(self):
         """Returned dict has category, cause_hint, rc, timed_out, cmd, started_at,
@@ -8145,6 +9262,23 @@ class TestArchiveMergeVerifyLogs:
                 f'Expected attempt-5 in filename, got: {Path(p).name!r}'
             )
 
+    def test_summary_and_logs_of_one_run_share_one_stamp(self, tmp_path: Path):
+        """A reader joins a merge run's logs to its summary by the shared stamp."""
+        runs = _make_runs(test_rc=1, include_lint=True)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        self._archive(runs, archive_root, '1768', 1, 'test_failure', module_prefix='pkg')
+
+        task_dir = archive_root / '1768'
+        summaries = list(task_dir.glob('attempt-1.pkg.summary-*.json'))
+        assert len(summaries) == 1, f'Expected exactly one summary, got {summaries}'
+        stamp = summaries[0].name.split('summary-', 1)[1].removesuffix('.json')
+        logs = list(task_dir.glob('*.log'))
+        assert logs, f'Expected archived logs in {task_dir}'
+        for log in logs:
+            assert log.name.endswith(f'-{stamp}.log'), (
+                f'log {log.name!r} does not carry the summary stamp {stamp!r}'
+            )
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers for TestVerifyPipelineGuard / TestMergeGuard* test classes
@@ -8287,6 +9421,7 @@ class TestMergeConfigOnlyDiffForcesFullGate:
             git=GitConfig(merge_config_only_full_gate_globs=globs),
         )
 
+    @pytest.mark.usefixtures('code_default_config')
     def test_empty_globs_default_config_returns_false(self):
         """Default OrchestratorConfig (empty globs) → False regardless of files."""
         from orchestrator.verify import _merge_config_only_diff_forces_full_gate
@@ -9075,13 +10210,9 @@ class TestRunVerificationGovernRouting:
         scope contains the cpu-governed-exec.sh invocation, which on its
         governed path itself tries to create an inner systemd-run --user --scope.
 
-        In the real environment reify currently sets verify_use_cgroup_scope=False,
-        so this combination does not occur on the live path.  cpu-governed-exec.sh
-        has a runtime probe + fail-open that handles systemd-run absence or
-        failures; the outer scope's cgroup kill still reaps the whole subtree.
-        This test confirms the code paths compose without crashing and that
-        governance wrapping still fires (the nested scope interaction is a
-        runtime-environment concern, not a code-correctness bug).
+        What the nested scope does and does not govern is stated at
+        verify.py::_govern_cpu_str.  This test confirms the two wrappings
+        compose and that governance wrapping still fires.
         """
         import shlex
 
@@ -10179,7 +11310,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _serial_pytest_str(self._REFUSED)
+            result = _serial_pytest_str(self._REFUSED, invocation_dir=None)
 
         assert result is self._REFUSED, "the no-op must return the caller's own string"
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
@@ -10213,7 +11344,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         cmd = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            assert _serial_pytest_str(cmd) is cmd
+            assert _serial_pytest_str(cmd, invocation_dir=None) is cmd
 
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
         assert len(records) == 1
@@ -10285,7 +11416,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _serial_pytest_str(cmd)
+            _serial_pytest_str(cmd, invocation_dir=None)
 
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
@@ -10301,10 +11432,88 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         from orchestrator.verify import _serial_pytest_str
 
-        result = _serial_pytest_str(ROOT_TEST_COMMAND)
+        result = _serial_pytest_str(ROOT_TEST_COMMAND, invocation_dir=None)
         assert result is not None
         assert result is not ROOT_TEST_COMMAND
         assert 'no:xdist' in result
+
+
+def _write_serial_recovery_tree(root: Path) -> Path:
+    """A real tree: a root-shaped root config and an orchestrator-shaped ``sub``."""
+    (root / 'pyproject.toml').write_text(ROOT_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests').mkdir(parents=True)
+    (root / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests' / 'test_x.py').write_text('def test_t():\n    pass\n', encoding='utf-8')
+    return root
+
+
+class TestSerialPytestStrReSuppliesGoverningAddopts:
+    """``_serial_pytest_str(cmd, invocation_dir)`` re-supplies the governing addopts.
+
+    The config is resolved by pytest's own walk from the directory the command
+    runs in, so scoped and unscoped shapes of one module agree; every xdist
+    option is removed. ``invocation_dir=None`` is the historical blank.
+    """
+
+    def test_a_module_directory_command_carries_its_own_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+        assert not any(
+            token in rendered for token in ('-n auto', '--dist', '--max-worker-restart')
+        ), rendered
+
+    def test_the_scoped_cwd_stripped_shape_carries_the_same_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str(
+            'uv run --project sub pytest sub/tests/test_x.py::T::t', invocation_dir=tree,
+        )
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+
+    def test_a_root_targeted_command_carries_the_root_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == [
+            "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'",
+        ]
+
+    def test_no_invocation_dir_is_the_historical_blank(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        assert _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=None) == (
+            'cd sub && uv run pytest -p no:xdist -o addopts= tests/'
+        )
+
+    def test_none_and_non_pytest_commands_pass_through(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        assert _serial_pytest_str(None, invocation_dir=tree) is None
+        cmd = 'cargo test --workspace'
+        assert _serial_pytest_str(cmd, invocation_dir=tree) is cmd
+
+    def test_a_refused_rewrite_still_logs_once_with_an_invocation_dir(
+        self, tmp_path, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        refused = "pytest -k 'a && b' tests/ && true"
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            assert _serial_pytest_str(refused, invocation_dir=tree) is refused
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1
+        assert refused in records[0].getMessage()
+        assert "pytest -k 'a " in records[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
@@ -10416,7 +11625,7 @@ class TestSummaryPayloadNamesTheKilledRun:
         ]
 
     def test_killed_run_outranks_a_passing_run(self):
-        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '', role='task')
         assert payload['rc'] == -9
         assert payload['cmd'] == _KILLED_LINT_CMD
         assert payload['duration_secs'] == 0.31
@@ -10425,12 +11634,12 @@ class TestSummaryPayloadNamesTheKilledRun:
     def test_killed_run_outranks_a_genuine_nonzero_failure(self):
         runs = self._runs()
         runs[0]['rc'] = 1
-        payload = _build_summary_payload(runs, 'infra_kill', '')
+        payload = _build_summary_payload(runs, 'infra_kill', '', role='task')
         assert payload['rc'] == -9
         assert payload['cmd'] == _KILLED_LINT_CMD
 
     def test_all_commands_are_still_listed(self):
-        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '', role='task')
         assert [c['label'] for c in payload['commands']] == ['test', 'lint']
         assert [c['rc'] for c in payload['commands']] == [0, -9]
 
@@ -10443,7 +11652,7 @@ class TestSummaryPayloadNamesTheKilledRun:
             {'label': 'lint', 'cmd': 'ruff check .', 'rc': 0, 'timed_out': False,
              'started_at': 't1', 'duration_secs': 3.0},
         ]
-        payload = _build_summary_payload(runs, 'test_failure', '')
+        payload = _build_summary_payload(runs, 'test_failure', '', role='task')
         assert payload['rc'] == 1
         assert payload['cmd'] == 'pytest'
         assert payload['duration_secs'] == 12.0
@@ -10455,7 +11664,7 @@ class TestSummaryPayloadNamesTheKilledRun:
             {'label': 'lint', 'cmd': 'ruff check .', 'rc': 1, 'timed_out': False,
              'started_at': 't1', 'duration_secs': 3.0},
         ]
-        payload = _build_summary_payload(runs, 'infra_timeout', '')
+        payload = _build_summary_payload(runs, 'infra_timeout', '', role='task')
         assert payload['cmd'] == 'pytest'
         assert payload['timed_out'] is True
 

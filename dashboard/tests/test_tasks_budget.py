@@ -30,7 +30,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from dashboard.data import active_tasks, task_snapshot, tasks
+import pytest
+
+from dashboard.data import active_tasks, mcp_fanout, task_lookup, task_snapshot, tasks
 
 # The tightest real caller of /api/v2/dashboard/tasks is the dashboard's own
 # poll loop, whose fetch wrapper aborts at DEFAULT_TIMEOUT_MS. Parsed out of
@@ -147,9 +149,9 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
         'OFFLINE on a cold render and shipped 208 of 3045 active rows). It '
         'must NOT buy that by raising this shared constant: '
         'DEFAULT_PER_CALL_TIMEOUT feeds DEFAULT_WHOLE_OPERATION_BUDGET, which '
-        'merge_queue._TASK_TITLES_BUDGET and escalations._TASK_CARDS_BUDGET '
-        'both bind BY REFERENCE — so a bump here silently widens route '
-        'budgets this work must not touch (task 4788 territory). Widen '
+        'task_lookup.LOOKUP_BUDGET_SECONDS binds BY REFERENCE — so a bump '
+        'here silently widens the /merge-queue and /escalations lookup budget '
+        'this work must not touch (task 4788 territory). Widen '
         'task_snapshot.PER_CALL_TIMEOUT instead.'
     )
     assert per_call > shared_per_call, (
@@ -186,4 +188,36 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
         f'whole-handler budget {total}s is smaller than one project\'s '
         f'{per_project}s — no root could ever complete, so every render '
         'would be all-degraded regardless of concurrency or rotation'
+    )
+
+
+@pytest.mark.parametrize(
+    'enclosing_deadline',
+    [
+        pytest.param(
+            active_tasks._TASKS_PER_PROJECT_BUDGET,
+            id='active_tasks._TASKS_PER_PROJECT_BUDGET',
+        ),
+        pytest.param(
+            task_lookup.LOOKUP_BUDGET_SECONDS,
+            id='task_lookup.LOOKUP_BUDGET_SECONDS',
+        ),
+    ],
+)
+def test_lock_acquire_bound_is_unreachable_under_each_bounded_caller(
+    enclosing_deadline: float,
+) -> None:
+    """Each caller the reachability paragraph names must time out before the lock bound.
+
+    One param per enclosing deadline that the paragraph above
+    ``mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS`` calls unreachable; the
+    derivation lives there, not here.
+    """
+    lock_bound = mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS
+
+    assert lock_bound > enclosing_deadline, (
+        f'lock bound {lock_bound}s <= enclosing deadline {enclosing_deadline}s; '
+        'see the reachability paragraph above '
+        'mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS and update it deliberately '
+        'rather than retuning a constant just to pass'
     )

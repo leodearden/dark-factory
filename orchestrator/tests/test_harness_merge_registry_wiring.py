@@ -188,7 +188,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator') as mock_build_coord, \
              patch('asyncio.create_task') as mock_create_task, \
-             patch('orchestrator.merge_queue.enforce_merge_liveness_margin') as mock_guard:
+             patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin') as mock_guard:
 
             # SpeculativeMergeWorker.run() must be awaitable to satisfy create_task
             mock_smw = MagicMock()

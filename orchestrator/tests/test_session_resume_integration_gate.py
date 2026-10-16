@@ -47,7 +47,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 from shared.cli_invoke import transcript_exists
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 
@@ -747,7 +747,7 @@ async def _drive_resumed_invoke(
         'orchestrator.workflow.invoke_with_cap_retry',
         new_callable=AsyncMock, side_effect=_side_effect,
     ) as mock_iwcr:
-        await workflow._invoke(role, 'p', cwd)
+        await workflow._invoke(role, fixed_prompt('p'), cwd)
 
     return _InvokeCapture(
         kwargs=mock_iwcr.call_args.kwargs,
@@ -2405,8 +2405,9 @@ async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
 
         Each drive builds its OWN tmp repo and mints its OWN fresh session
         id, so a handful of values differ by construction: the two paths, the
-        config-dir handle (an object with no value equality) and everything
-        derived from the session id, the spawn parent slug included.
+        config-dir handle and the prompt builder (objects with no value
+        equality) and everything derived from the session id, the spawn
+        parent slug included.
         Neutralised rather than dropped, so every key stays in the comparison
         and a real drift in any of them still shows up.
         """
@@ -2423,6 +2424,7 @@ async def test_epsilon_no_sink_leaves_the_dispatch_byte_identical(
         spawn['CLAUDE_SPAWN_PARENT_ID'] = f'{parent.rsplit("-", 1)[0]}-<slug>'
         out['spawn_env'] = spawn
         out['session_id'] = '<sid>'
+        out['rebuild_prompt'] = callable(out['rebuild_prompt'])
         return out
 
     stable, emits = [], []

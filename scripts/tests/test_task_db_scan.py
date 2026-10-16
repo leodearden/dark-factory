@@ -2,7 +2,7 @@
 the four READ-ONLY tasks.db sweep scripts (tasks 3336 and 3616, following task
 3286's "~134 identical lines" finding).
 
-Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path / decode_metadata /
+Tier 1 (discovery: tasks_db_path / runs_db_path / decode_metadata /
 resolve_project_roots / discover_project_roots / discover_db_paths) is adopted
 by ALL FOUR sweep scripts — except decode_metadata, which is Tier 1 by SHAPE
 (pure, no per-script semantics) rather than by adoption count, and is used only
@@ -64,7 +64,6 @@ from typing import NamedTuple
 
 import pytest
 from _task_db_scan import (
-    _DEFAULT_PROJECT_ROOTS,
     _SQLITE_NOTADB_ERRORCODE,
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
@@ -86,10 +85,17 @@ from _task_db_scan import (
     resolve_project_roots,
     run_audit_cli,
     run_scan_cli,
+    runs_db_path,
     sweep_databases,
     sweep_project_roots,
     tasks_db_path,
     truncate,
+)
+from shared.project_layout import (
+    default_project_root,
+    known_project_roots,
+    runs_db,
+    tasks_db,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,6 +112,23 @@ def test_tasks_db_path_returns_a_path_not_a_str(tmp_path):
     """audit_wiped_metadata_files.py's public spelling returns Path, and its
     internal call sites (e.g. audit_project) depend on Path methods."""
     assert isinstance(tasks_db_path(str(tmp_path)), Path)
+
+
+@pytest.mark.parametrize("as_type", [str, Path], ids=["str-root", "path-root"])
+def test_tasks_db_path_is_the_shared_layouts_tasks_db(tmp_path, as_type):
+    assert tasks_db_path(as_type(tmp_path)) == tasks_db(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# runs_db_path(project_root) -> Path  (task 6091's move, delivered by 6713)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("as_type", [str, Path], ids=["str-root", "path-root"])
+def test_runs_db_path_is_the_shared_layouts_runs_db(tmp_path, as_type):
+    result = runs_db_path(as_type(tmp_path))
+
+    assert result == runs_db(tmp_path)
+    assert isinstance(result, Path)
 
 
 # ---------------------------------------------------------------------------
@@ -477,14 +500,20 @@ def test_resolve_project_roots_splits_env_on_comma_strips_and_drops_empties():
     assert resolve_project_roots(env=env) == ["/a", "/b"]
 
 
+def test_resolve_project_roots_parses_env_exactly_as_the_shared_layout_does():
+    env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": " /a , /b ,, "}
+
+    assert resolve_project_roots(env=env) == [str(p) for p in known_project_roots(env)]
+
+
 def test_resolve_project_roots_whitespace_only_env_falls_back_to_default():
-    assert resolve_project_roots(env={"DASHBOARD_KNOWN_PROJECT_ROOTS": "   "}) == list(
-        _DEFAULT_PROJECT_ROOTS
-    )
+    assert resolve_project_roots(env={"DASHBOARD_KNOWN_PROJECT_ROOTS": "   "}) == [
+        str(default_project_root())
+    ]
 
 
 def test_resolve_project_roots_absent_env_key_falls_back_to_default():
-    assert resolve_project_roots(env={}) == list(_DEFAULT_PROJECT_ROOTS)
+    assert resolve_project_roots(env={}) == [str(default_project_root())]
 
 
 def test_resolve_project_roots_does_not_filter_for_on_disk_existence(tmp_path):
@@ -496,17 +525,17 @@ def test_resolve_project_roots_does_not_filter_for_on_disk_existence(tmp_path):
     assert resolve_project_roots(project_roots=[str(missing)]) == [str(missing)]
 
 
-def test_resolve_project_roots_default_is_the_dark_factory_root(monkeypatch):
+def test_resolve_project_roots_default_is_the_main_checkout(monkeypatch):
     """The default-fallback contract, pinned pre-existence-filter so it holds
-    on a machine where the real dark-factory checkout is absent."""
+    on a machine whose main checkout has no task store. The default follows
+    the checkout this code was imported from (worktree-aware); the probe in
+    test_scripts_default_root.py pins that from a linked worktree."""
     monkeypatch.delenv("DASHBOARD_KNOWN_PROJECT_ROOTS", raising=False)
 
     roots = resolve_project_roots()
 
-    assert roots == ["/home/leo/src/dark-factory"]
-    assert str(tasks_db_path(roots[0])) == (
-        "/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db"
-    )
+    assert roots == [str(default_project_root())]
+    assert tasks_db_path(roots[0]) == tasks_db(roots[0])
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +837,24 @@ def test_sweep_databases_skips_unreadable_db_and_warns_on_stderr(capsys):
     assert "results below are incomplete" in err
 
 
+def test_sweep_databases_skips_a_store_connect_ro_refused_and_warns_on_stderr(capsys):
+    refusal = TaskDbUnreadable(Path("/db/stub.db"), TaskDbProblem.EMPTY_STUB)
+
+    def scan(db_path):
+        if db_path == "/db/stub.db":
+            raise refusal
+        return [_match(db_path=db_path)]
+
+    matches, unreadable = sweep_databases(["/db/stub.db", "/db/good.db"], scan)
+
+    assert [m.db_path for m in matches] == ["/db/good.db"]
+    assert unreadable == ["/db/stub.db"]
+
+    err = capsys.readouterr().err
+    assert f"warning: skipping unreadable database /db/stub.db: {refusal}" in err
+    assert "results below are incomplete" in err
+
+
 def test_sweep_databases_omits_the_aggregate_warning_when_all_readable(capsys):
     matches, unreadable = sweep_databases(["/db/a.db"], lambda db_path: [])
 
@@ -883,6 +930,25 @@ def test_run_scan_cli_exits_3_when_every_db_is_unreadable(tmp_path, capsys):
     assert captured.out.strip() == "rendered:0"
     assert "results below are incomplete" in captured.err
     assert "NOTHING was scanned" in captured.err
+
+
+def _scan_through_connect_ro(db_path):
+    connect_ro(db_path).close()
+    return []
+
+
+def test_run_scan_cli_exits_3_when_connect_ro_refuses_every_real_stub(tmp_path, capsys):
+    stub_a = tmp_path / "a.db"
+    stub_b = tmp_path / "b.db"
+    stub_a.write_bytes(b"")
+    stub_b.write_bytes(b"")
+
+    exit_code = _cli(["--db", str(stub_a), "--db", str(stub_b)], _scan_through_connect_ro)
+
+    assert exit_code == 3
+    err = capsys.readouterr().err
+    assert str(TaskDbUnreadable(stub_a.resolve(), TaskDbProblem.EMPTY_STUB)) in err
+    assert "NOTHING was scanned" in err
 
 
 def test_run_scan_cli_exits_0_when_some_dbs_unreadable_and_rest_clean(tmp_path, capsys):
@@ -1007,6 +1073,24 @@ def test_sweep_project_roots_skips_unreadable_root_and_warns_on_stderr(capsys):
     assert (
         "warning: skipping unreadable project /proj/bad: file is not a database" in err
     )
+
+
+def test_sweep_project_roots_skips_a_store_connect_ro_refused_and_warns_on_stderr(capsys):
+    refusal = TaskDbUnreadable(Path("/proj/stub"), TaskDbProblem.EMPTY_STUB)
+
+    def audit(root):
+        if root == "/proj/stub":
+            raise refusal
+        return f"audit:{root}"
+
+    audits, unreadable = sweep_project_roots(["/proj/stub", "/proj/good"], audit)
+
+    assert audits == ["audit:/proj/good"]
+    assert unreadable == ["/proj/stub"]
+
+    err = capsys.readouterr().err
+    assert f"warning: skipping unreadable project /proj/stub: {refusal}" in err
+    assert "results below are incomplete" in err
 
 
 def test_sweep_project_roots_warns_once_in_aggregate_that_results_are_incomplete(capsys):
@@ -1142,6 +1226,27 @@ def test_run_audit_cli_exits_3_when_every_root_is_unreadable(
     assert captured.out.strip() == "rendered:0"
     assert "results below are incomplete" in captured.err
     assert "NOTHING was audited (this is not a clean result)" in captured.err
+
+
+def test_run_audit_cli_exits_3_when_connect_ro_refuses_every_real_stub(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    root_a = tmp_path / "proj_a"
+    root_b = tmp_path / "proj_b"
+    stub_a = project_root_with_tasks_db(root_a)
+    project_root_with_tasks_db(root_b)
+
+    def audit(root, args):
+        connect_ro(tasks_db_path(root)).close()
+        return "audit"
+
+    exit_code = _audit_cli(
+        ["--project-root", str(root_a), "--project-root", str(root_b)], audit
+    )
+
+    assert exit_code == AUDIT_EXIT_NOTHING_AUDITED
+    err = capsys.readouterr().err
+    assert str(TaskDbUnreadable(stub_a.resolve(), TaskDbProblem.EMPTY_STUB)) in err
 
 
 def test_run_audit_cli_exits_0_when_some_roots_unreadable_and_rest_clean(

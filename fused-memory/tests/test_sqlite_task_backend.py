@@ -13,7 +13,9 @@ from typing import Any, cast
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _fm_helpers import make_db_without_claimant_columns
 from pydantic import ValidationError
+from shared.project_layout import tasks_db
 from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
@@ -57,6 +59,11 @@ async def backend(tmp_path):
 @pytest_asyncio.fixture
 async def project_root(tmp_path):
     return str(tmp_path / 'proj')
+
+
+async def _raw_write_conn(backend: SqliteTaskBackend, project_root: str) -> aiosqlite.Connection:
+    """The backend's cached write connection, for seeding and inspecting state."""
+    return (await backend._get_write_access(project_root)).connection
 
 
 @pytest.fixture(autouse=True)
@@ -563,7 +570,7 @@ async def test_get_task_backend_unavailable_is_not_task_not_found_error(
     async def _boom(self, root):
         raise TaskmasterError('TASKMASTER_UNAVAILABLE', 'backend not reachable')
 
-    monkeypatch.setattr(SqliteTaskBackend, '_get_connection', _boom)
+    monkeypatch.setattr(SqliteTaskBackend, '_get_write_access', _boom)
 
     with pytest.raises(TaskmasterError) as exc:
         await backend.get_task('1', project_root=project_root)
@@ -852,66 +859,12 @@ async def test_set_task_status_without_claimant_kwargs_leaves_claimant_intact(ba
     assert one['heartbeat_at'] == '2026-07-07T00:00:00+00:00'
 
 
-def _make_v2_stamped_db_without_claimant_columns(db_path: Path, *, status: str = 'pending') -> None:
-    """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
-
-    Simulates a connection whose claimant columns never got ALTERed in —
-    e.g. a routine orchestrator restart racing ahead of the fused-memory
-    deploy that ships this migration. Opening it runs only the v2->v3
-    candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
-    and is skipped for an already-v2 DB), so the claimant columns stay
-    absent, exercising set_task_status's fail-safe (WARNING, no error) path.
-
-    ``status`` seeds the single row's status column (default ``'pending'``,
-    matching every pre-existing caller); pass e.g. ``'done'`` to exercise
-    the fail-safe path on an already-terminal row.
-    """
-    import sqlite3
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            tag           TEXT NOT NULL DEFAULT 'master',
-            id            INTEGER NOT NULL,
-            title         TEXT NOT NULL,
-            description   TEXT,
-            details       TEXT,
-            test_strategy TEXT,
-            status        TEXT NOT NULL,
-            priority      TEXT,
-            metadata      TEXT,
-            updated_at    TEXT NOT NULL,
-            PRIMARY KEY (tag, id)
-        );
-        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-        CREATE TABLE IF NOT EXISTS dependencies (
-            tag        TEXT NOT NULL DEFAULT 'master',
-            task_id    INTEGER NOT NULL,
-            depends_on INTEGER NOT NULL,
-            PRIMARY KEY (tag, task_id, depends_on)
-        );
-        CREATE TABLE IF NOT EXISTS id_counters (
-            tag    TEXT NOT NULL DEFAULT 'master',
-            max_id INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (tag)
-        );
-    """)
-    conn.execute(
-        "INSERT INTO tasks (tag, id, title, status, updated_at) "
-        "VALUES ('master', 1, 'stranded-shape task', ?, '2026-01-01T00:00:00.000Z')",
-        (status,),
-    )
-    conn.execute("PRAGMA user_version = 2")
-    conn.commit()
-    conn.close()
-
-
 @pytest.mark.asyncio
 async def test_set_task_status_claimant_fails_safe_when_columns_absent(tmp_path, caplog):
     """A connection whose columns never got ALTERed must not error on a claimant write."""
     project_root = str(tmp_path / 'proj')
     db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-    _make_v2_stamped_db_without_claimant_columns(db_path)
+    make_db_without_claimant_columns(db_path)
 
     cfg = TaskmasterConfig(project_root=str(tmp_path))
     b = SqliteTaskBackend(cfg)
@@ -941,7 +894,7 @@ async def test_set_task_claimant_fails_safe_when_columns_absent(tmp_path, caplog
     """set_task_claimant on a not-yet-migrated connection must not error either."""
     project_root = str(tmp_path / 'proj')
     db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-    _make_v2_stamped_db_without_claimant_columns(db_path)
+    make_db_without_claimant_columns(db_path)
 
     cfg = TaskmasterConfig(project_root=str(tmp_path))
     b = SqliteTaskBackend(cfg)
@@ -977,7 +930,7 @@ async def test_set_task_claimant_columns_absent_on_terminal_row_emits_no_tripwir
     """
     project_root = str(tmp_path / 'proj')
     db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-    _make_v2_stamped_db_without_claimant_columns(db_path, status='done')
+    make_db_without_claimant_columns(db_path, status='done')
 
     cfg = TaskmasterConfig(project_root=str(tmp_path))
     b = SqliteTaskBackend(cfg)
@@ -1201,6 +1154,188 @@ async def test_update_task_done_provenance_floor_skips_unparseable_metadata(
     await backend.add_task(project_root=project_root, title='x')
     # Must not raise DoneProvenanceWriteAuthorityError.
     await backend.update_task('1', project_root=project_root, metadata=bad_metadata)
+
+
+_STORED_DONE_PROVENANCE = {'kind': 'merged', 'commit': 'a' * 40}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'passed_through',
+    [
+        {'kind': 'merged', 'commit': 'a' * 40},
+        {'commit': 'a' * 40, 'kind': 'merged'},
+    ],
+    ids=['same-key-order', 'reversed-key-order'],
+)
+async def test_update_task_replace_admits_identical_done_provenance_passthrough(
+    backend, project_root, passed_through,
+):
+    """A whole-blob replace that carries the STORED done_provenance through
+    unchanged is admitted, and it RETIRES every key the payload omits — the
+    one thing merge mode can never do. Identity is on JSON VALUE, not bytes:
+    a get_task -> json.dumps round trip does not preserve inner key order."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE,
+            'stale_key': 1,
+            'files': ['src'],
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'done_provenance': passed_through, 'files': ['src']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert 'stale_key' not in task['metadata']
+    assert task['metadata']['files'] == ['src']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('stored', 'payload_done_provenance'),
+    [
+        ({'files': ['src']}, _STORED_DONE_PROVENANCE),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {'kind': 'merged', 'commit': 'b' * 40},
+        ),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {'kind': 'operational-verified', 'commit': 'a' * 40},
+        ),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {**_STORED_DONE_PROVENANCE, 'note': 'drift'},
+        ),
+    ],
+    ids=['add', 'change-commit', 'change-kind', 'change-nested-shape'],
+)
+async def test_update_task_replace_still_rejects_added_and_changed_done_provenance(
+    backend, project_root, stored, payload_done_provenance,
+):
+    """Only the identical passthrough is admitted under replace: a payload
+    that ADDS done_provenance to a row without one, or CHANGES the stored
+    value in any way (deep equality, not a subset check), is refused and the
+    transaction rolls back with the stored blob untouched."""
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps(stored),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': payload_done_provenance}),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_rejects_dropping_stored_done_provenance(
+    backend, project_root,
+):
+    """Under a whole-blob replace, omission is deletion: a payload that drops
+    the stored done_provenance is refused rather than silently destroying the
+    audit record of a done task."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src'],
+        }),
+    )
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'files': ['src']}),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == _STORED_DONE_PROVENANCE
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_allows_omitting_absent_done_provenance(
+    backend, project_root,
+):
+    """The deletion arm is scoped to rows that HAVE done_provenance: an
+    ordinary replace on a row without one still lands and still retires the
+    keys it omits."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'stale_key': 1, 'files': ['src']}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['lib']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {'files': ['lib']}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('metadata_mode', [None, 'merge', 'additive'])
+async def test_update_task_non_replace_modes_reject_done_provenance_unconditionally(
+    backend, project_root, metadata_mode,
+):
+    """The carve-out is keyed on metadata_mode='replace' and nothing else:
+    every other mode still refuses the very identical-value payload that
+    replace admits, before touching the row."""
+    stored = {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']}
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps(stored),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode=metadata_mode,
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_mode_done_provenance_rejection_precedes_existence_check(
+    backend, project_root,
+):
+    """Explicit merge mode keeps the pre-connect ordering: the
+    write-authority rejection beats 'No tasks found'."""
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode='merge',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('999')
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_done_provenance_on_missing_task_reports_not_found(
+    backend, project_root,
+):
+    """The one deliberate ordering difference, confined to replace mode: the
+    passthrough check needs the stored value, so it runs after the SELECT and
+    a missing row reports 'No tasks found'. Both answers are refusals — there
+    is no stored value to pass through on a row that does not exist."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode='replace',
+        )
+    assert not isinstance(exc.value, DoneProvenanceWriteAuthorityError)
+    assert 'No tasks found' in exc.value.message
 
 
 @pytest.mark.asyncio
@@ -2011,7 +2146,7 @@ async def test_row_to_task_returns_empty_dict_for_malformed_metadata(backend, pr
     await backend.add_task(project_root=project_root, title='parent')
 
     # Directly corrupt the row's metadata column with a non-JSON string.
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         "UPDATE tasks SET metadata = 'NOT_JSON' WHERE id = 1"
     )
@@ -2034,7 +2169,7 @@ async def test_row_to_task_warns_on_malformed_metadata(backend, project_root, ca
     await backend.add_task(project_root=project_root, title='parent')
 
     # Directly corrupt the row's metadata column with a non-JSON string.
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         "UPDATE tasks SET metadata = 'NOT_JSON_GARBAGE_xyz' WHERE id = 1"
     )
@@ -2082,7 +2217,7 @@ async def test_row_to_task_warning_deduplicated_per_id_per_process(
     lifetime of the process.
     """
     await backend.add_task(project_root=project_root, title='parent')
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         "UPDATE tasks SET metadata = 'NOT_JSON_DEDUP' WHERE id = 1"
     )
@@ -2122,7 +2257,7 @@ async def test_row_to_task_warning_dedup_key_distinguishes_distinct_ids(
     """
     await backend.add_task(project_root=project_root, title='task_one')
     await backend.add_task(project_root=project_root, title='task_two')
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         "UPDATE tasks SET metadata = 'NOT_JSON_KEYS' WHERE id = 1"
     )
@@ -2169,13 +2304,13 @@ async def test_row_to_task_warning_dedup_distinguishes_project_roots(
     await backend.add_task(project_root=proj_b, title='parent_b')
 
     # Corrupt both DBs' metadata column with a non-JSON string.
-    conn_a = await backend._get_connection(proj_a)
+    conn_a = await _raw_write_conn(backend, proj_a)
     await conn_a.execute(
         "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE id = 1"
     )
     await conn_a.commit()
 
-    conn_b = await backend._get_connection(proj_b)
+    conn_b = await _raw_write_conn(backend, proj_b)
     await conn_b.execute(
         "UPDATE tasks SET metadata = 'NOT_JSON_PROJ' WHERE id = 1"
     )
@@ -4175,7 +4310,7 @@ async def test_v3_to_v4_midloop_heal_failure_leaves_no_partial_heal_on_cached_co
     corrupt, so `_merge_metadata` raises `TaskmasterError` while cancelling
     it) must not leave id=2's already-executed cancel UPDATE sitting
     uncommitted on the cached write connection. Without a rollback on the
-    failure path, the very next unrelated successful write -- `_txn` commits
+    failure path, the very next unrelated successful write -- `_write_unit` commits
     with no BEGIN/rollback preamble -- silently flushes that partial heal to
     disk. This reproduces the reported bug end-to-end through the real
     backend rather than by calling `_migrate_v3_to_v4` directly.
@@ -4750,7 +4885,7 @@ async def test_add_task_duplicate_candidate_key_raises_and_no_orphan(backend, pr
     """A second add_task whose normalized (title, files) collides with an
     existing non-cancelled row raises DuplicateCandidateKeyError naming the
     survivor, and creates NO orphan row — the partial UNIQUE index rejects
-    the INSERT, ``_txn`` rolls it back, and get_tasks still shows exactly
+    the INSERT, the write unit rolls it back, and get_tasks still shows exactly
     one non-cancelled row.
     """
     from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
@@ -5000,7 +5135,7 @@ async def test_id_counter_self_heals_when_empty_but_tasks_present(backend, proje
     await backend.add_task(project_root=project_root, title='b')  # 2
 
     # Wipe the counter to mimic a pre-Fix-A DB.
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute('DELETE FROM id_counters')
     await conn.commit()
 
@@ -5021,10 +5156,10 @@ async def test_set_status_cancellation_leaves_connection_clean(
     backend, project_root,
 ):
     """A cancellation arriving while ``set_task_status`` is queued behind
-    the write_lock must not leave the connection mid-transaction.
+    another write unit must not leave the connection mid-transaction.
 
-    Reproduces the soak-cancel signature: hold the per-project write lock,
-    queue a ``set_task_status`` against it, cancel the awaiter via
+    Reproduces the soak-cancel signature: hold a write unit open on the
+    project's write connection, queue a ``set_task_status`` behind it, cancel the awaiter via
     ``wait_for(timeout=0.001)``, then assert the next ``set_task_status``
     applies cleanly. Pre-fix (Exception-only suppress + unshielded
     rollback) the connection could end up holding an open BEGIN, which
@@ -5035,9 +5170,18 @@ async def test_set_status_cancellation_leaves_connection_clean(
     await backend.add_task(project_root=project_root, title='t0')
     assert (await backend.get_task('1', project_root))['status'] == 'pending'
 
-    # Acquire the per-project write lock so the next set_task_status blocks.
-    lock = backend._write_lock(project_root)
-    await lock.acquire()
+    # Hold a write unit open so the next set_task_status blocks.
+    access = await backend._get_write_access(project_root)
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold_a_write_unit() -> None:
+        async with access.write():
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.create_task(_hold_a_write_unit())
+    await holding.wait()
     try:
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
@@ -5045,7 +5189,8 @@ async def test_set_status_cancellation_leaves_connection_clean(
                 timeout=0.001,
             )
     finally:
-        lock.release()
+        release.set()
+        await holder
 
     # Connection state must be clean: the next mutation succeeds.
     res = await backend.set_task_status('1', 'done', project_root)
@@ -5148,7 +5293,7 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
 
     # --- Set up spy on conn.execute ---
     # get_tasks reads via the cached read connection (_get_read_connection,
-    # task 2651), not the write connection (_get_connection) — spy on the
+    # task 2651), not the write connection (_get_write_access) — spy on the
     # former so this still captures the SQL get_tasks actually issues.
     conn = await backend._get_read_connection(project_root)
     recorded_sql: list[str] = []
@@ -5266,14 +5411,14 @@ async def _pin_write_connection_then_commit_out_of_band(backend, project_root) -
 
     # Pin the cached WRITE connection's WAL read-snapshot by leaving a read
     # transaction open on it (materialize the snapshot via fetchall()).
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute('BEGIN')
     cur = await conn.execute('SELECT id, status FROM tasks')
     await cur.fetchall()
 
     # Simulate a separate process committing a status change out-of-band,
     # via a fresh autocommit connection to the same DB file on disk.
-    db_path = SqliteTaskBackend._db_path(project_root)
+    db_path = tasks_db(project_root)
     writer = await connect_daemon(str(db_path), isolation_level=None)
     try:
         await apply_wal_pragmas(writer, busy_timeout_ms=5000)
@@ -5292,7 +5437,7 @@ async def test_get_statuses_fresh_sees_committed_write_despite_pinned_cached_sna
     """get_statuses_fresh reads a live WAL snapshot even when the cached
     WRITE connection has a read transaction pinned open.
 
-    Reproduces the task 2388 root cause: ``_get_connection`` opens its
+    Reproduces the task 2388 root cause: ``_get_write_access`` opens its
     cached WRITE connection in legacy deferred-transaction mode, so a read
     transaction left open on it pins a stale WAL snapshot. This test is
     scoped to the census read itself — ``get_statuses_fresh`` remains the
@@ -5325,7 +5470,7 @@ async def test_get_statuses_fresh_returns_empty_when_db_file_missing(backend, pr
     ``if not db_path.exists(): return {}`` fast path documented on
     get_statuses_fresh ("{} if the DB file does not exist yet...").
     """
-    assert not SqliteTaskBackend._db_path(project_root).exists()
+    assert not tasks_db(project_root).exists()
 
     result = await backend.get_statuses_fresh(project_root)
 
@@ -5367,7 +5512,7 @@ async def test_get_statuses_hot_path_fresh_despite_pinned_write_connection(
 ):
     """get_statuses (and get_statuses_raw, bulk and scoped) must observe the
     latest committed WAL state even when the cached WRITE connection
-    (``_get_connection``) has a read transaction pinned open.
+    (``_get_write_access``) has a read transaction pinned open.
 
     Reproduces the task 2388 pinned-snapshot harness (see
     ``test_get_statuses_fresh_sees_committed_write_despite_pinned_cached_snapshot``,
@@ -5438,7 +5583,7 @@ async def test_get_statuses_hot_path_fresh_on_reused_warm_connection(
     # Commit a status change out-of-band via a separate autocommit
     # connection — simulating a second process writing to the same DB file
     # while the cached read connection sits idle in between calls.
-    db_path = SqliteTaskBackend._db_path(project_root)
+    db_path = tasks_db(project_root)
     writer = await connect_daemon(str(db_path), isolation_level=None)
     try:
         await apply_wal_pragmas(writer, busy_timeout_ms=5000)
@@ -5585,7 +5730,7 @@ async def _pin_cached_read_connection_then_commit_out_of_band(backend, project_r
 
     # Simulate a separate process committing a status change out-of-band,
     # via a fresh autocommit connection to the same DB file on disk.
-    db_path = SqliteTaskBackend._db_path(project_root)
+    db_path = tasks_db(project_root)
     writer = await connect_daemon(str(db_path), isolation_level=None)
     try:
         await apply_wal_pragmas(writer, busy_timeout_ms=5000)
@@ -5727,7 +5872,7 @@ async def test_get_statuses_fresh_when_cached_read_connection_pinned(
 async def test_close_drains_cached_read_connections(backend, project_root):
     """close() must drain the cached read connections opened by
     :meth:`~SqliteTaskBackend._get_read_connection` (task 2455), not just
-    the write connections in ``self._connections`` — otherwise the
+    the write connections in ``self._write_accesses`` — otherwise the
     autocommit read connection is leaked open (a stray file handle / WAL
     reader) past shutdown.
     """
@@ -5763,25 +5908,25 @@ async def test_get_read_connection_does_not_leak_when_closed_during_bring_up(
     review: the re-check-after-acquiring-the-lock only tested
     ``self._read_connections.get(project_root)``, not ``self._closed`` — so
     a ``close()`` that ran (and drained the then-empty map) during the
-    ``await self._get_connection(...)`` bring-up call, before
+    ``await self._get_write_access(...)`` bring-up call, before
     ``_get_read_connection`` reached the lock, would let it go on to open
     and cache a brand-new connection that ``close()`` would never revisit —
     a leaked file handle / WAL reader past shutdown.
     """
     await backend.add_task(project_root=project_root, title='T1')
 
-    real_get_connection = SqliteTaskBackend._get_connection
+    real_get_write_access = SqliteTaskBackend._get_write_access
 
-    async def _get_connection_then_close(self, root):
-        conn = await real_get_connection(self, root)
+    async def _get_write_access_then_close(self, root):
+        access = await real_get_write_access(self, root)
         # Simulate close() winning the race here: it runs to completion
         # (setting self._closed and draining the — at this point still
         # empty — _read_connections map) before _get_read_connection
         # reaches its lock acquisition below.
         await self.close()
-        return conn
+        return access
 
-    monkeypatch.setattr(SqliteTaskBackend, '_get_connection', _get_connection_then_close)
+    monkeypatch.setattr(SqliteTaskBackend, '_get_write_access', _get_write_access_then_close)
 
     with pytest.raises(RuntimeError, match='closed'):
         await backend._get_read_connection(project_root)
@@ -5864,7 +6009,7 @@ async def test_get_statuses_concurrent_cold_open_opens_single_read_connection(
     The WRITE connection is warmed first (via ``add_task``) so the only
     cold cache in play when the race starts is the READ connection —
     isolating this test to :meth:`_get_read_connection`'s own lock, rather
-    than :meth:`_get_connection`'s (already covered by the
+    than :meth:`_get_write_access`'s (already covered by the
     close()-during-bring-up/open regression tests above).
     """
     from fused_memory.backends import sqlite_task_backend as _sb
@@ -6013,7 +6158,7 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
     await backend.add_task(project_root=project_root, title='t')
 
     # Directly inject a corrupt blob WITHOUT reading the row first.
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
     )
@@ -6041,17 +6186,58 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
     # The original corrupt blob must be byte-for-byte unchanged (no overwrite).
     # Use raw SQL — NOT get_task — so _row_to_task does not pollute the
     # WARNING count or hide the raw bytes via its own coercion path.
-    raw_conn = await backend._get_connection(project_root)
+    raw_conn = await _raw_write_conn(backend, project_root)
     cursor = await raw_conn.execute(
         'SELECT metadata FROM tasks WHERE id = 1',
     )
     row = await cursor.fetchone()
+    assert row is not None
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'Expected metadata unchanged (corrupt blob preserved); got: {row["metadata"]!r}'
     )
     assert 'dark_factory:42' in row['metadata'], (
         f'Expected external_deps substring in preserved metadata; got: {row["metadata"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_on_corrupt_stored_blob_done_provenance_arms(
+    backend, project_root,
+):
+    """On a row whose stored blob does not parse, done_provenance identity
+    cannot be established: (a) a replace payload CARRYING done_provenance is
+    refused, so a corrupted row cannot launder a done_provenance write, while
+    (b) a replace payload OMITTING it is still the sanctioned corrupt-row
+    repair and lands verbatim."""
+    await backend.add_task(project_root=project_root, title='carries')
+    await backend.add_task(project_root=project_root, title='omits')
+    conn = await _raw_write_conn(backend, project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id IN (1, 2)', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({
+                'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
+            }),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    cursor = await conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row['metadata'] == _CORRUPT_BLOB
+
+    await backend.update_task(
+        '2', project_root=project_root,
+        metadata=json.dumps({'files': ['src']}),
+        metadata_mode='replace',
+    )
+    repaired = await backend.get_task('2', project_root=project_root)
+    assert repaired['metadata'] == {'files': ['src']}
 
 
 @pytest.mark.asyncio
@@ -6071,7 +6257,7 @@ async def test_stamp_audit_metadata_refuses_to_clobber_corrupt_metadata(
     await backend.add_task(project_root=project_root, title='t')
 
     # Directly inject a corrupt blob WITHOUT reading the row first.
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
     )
@@ -6099,11 +6285,12 @@ async def test_stamp_audit_metadata_refuses_to_clobber_corrupt_metadata(
 
     # The original corrupt blob must be byte-for-byte unchanged — the audit
     # stamp did NOT silently succeed nor clobber the row.
-    raw_conn = await backend._get_connection(project_root)
+    raw_conn = await _raw_write_conn(backend, project_root)
     cursor = await raw_conn.execute(
         'SELECT metadata FROM tasks WHERE id = 1',
     )
     row = await cursor.fetchone()
+    assert row is not None
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'Expected metadata unchanged (corrupt blob preserved); got: {row["metadata"]!r}'
     )
@@ -6126,7 +6313,7 @@ async def test_add_dependency_qualified_refuses_corrupt_metadata(
     """
     await backend.add_task(project_root=project_root, title='t')
 
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
     )
@@ -6149,9 +6336,10 @@ async def test_add_dependency_qualified_refuses_corrupt_metadata(
     )
 
     # The new external dep must NOT have been added; original blob unchanged.
-    raw_conn = await backend._get_connection(project_root)
+    raw_conn = await _raw_write_conn(backend, project_root)
     cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
     row = await cursor.fetchone()
+    assert row is not None
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'Expected metadata unchanged; got: {row["metadata"]!r}'
     )
@@ -6172,7 +6360,7 @@ async def test_remove_dependency_qualified_warns_and_does_not_falsely_claim_remo
     """
     await backend.add_task(project_root=project_root, title='t')
 
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
     )
@@ -6206,9 +6394,10 @@ async def test_remove_dependency_qualified_warns_and_does_not_falsely_claim_remo
     )
 
     # Blob is byte-for-byte unchanged.
-    raw_conn = await backend._get_connection(project_root)
+    raw_conn = await _raw_write_conn(backend, project_root)
     cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
     row = await cursor.fetchone()
+    assert row is not None
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'Expected metadata unchanged; got: {row["metadata"]!r}'
     )
@@ -6231,7 +6420,7 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
     """
     await backend.add_task(project_root=project_root, title='t')
 
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
     )
@@ -7037,11 +7226,12 @@ _DF3857_INCOMING_HINTS = {
 
 async def _raw_metadata_bytes(backend, project_root, task_id: int = 1) -> str:
     """Read the stored metadata blob verbatim, bypassing get_task's parsing."""
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     cursor = await conn.execute(
         'SELECT metadata FROM tasks WHERE id = ?', (task_id,),
     )
     row = await cursor.fetchone()
+    assert row is not None
     return row['metadata']
 
 
@@ -7053,7 +7243,7 @@ async def test_update_task_merge_plus_append_true_rejected_and_blob_untouched(
     and the stored blob is left byte-for-byte intact (task 3581).
 
     The load-bearing assertion is the second one: _resolve_metadata_mode is
-    called before ensure_connected() and before the write _txn, so a rejection
+    called before ensure_connected() and before the write unit, so a rejection
     can never leave a half-applied write. Rejecting is therefore strictly safer
     than the old silent 'merge', which clobbered memory_hints wholesale."""
     await backend.add_task(
@@ -7196,12 +7386,186 @@ async def test_update_task_details_only_merge_plus_append_true_ok(backend, proje
 
 
 @pytest.mark.asyncio
+async def test_update_task_details_and_metadata_append_true_concatenates_details(
+    backend, project_root,
+):
+    """CHARACTERIZATION PIN (task 4216): ``append`` is NOT scoped to metadata.
+
+    A single ``update_task`` carrying BOTH a ``details`` rewrite and a
+    ``memory_hints`` metadata attach under ``append=True`` splits in two:
+
+    * the METADATA half behaves exactly as advertised — ``append=True`` with
+      metadata present resolves to 'additive' (``_resolve_metadata_mode``),
+      so hints union and sibling keys survive;
+    * the DETAILS half silently CONCATENATES ``existing + '\\n\\n' + new``
+      (``update_task``'s details branch), because the very same flag also
+      drives the ``details``/``prompt`` TEXT columns.
+
+    The metadata success makes the response read as a clean write while the
+    details body is duplicated — the silent-duplication hazard the Stage-2
+    prompt now warns about. This test pins CURRENT behaviour and is GREEN on
+    first run by design: task 4216 is a prompt/payload text correction and
+    changes no merge semantics. Do NOT "fix" the backend to make it fail.
+
+    Scope: the ``details=`` spelling of the combined call only. Its two
+    siblings pin the rest of the same contract independently, so a
+    regression in one cannot mask the others:
+    ``test_update_task_prompt_and_metadata_append_true_concatenates_details``
+    (the ``prompt=`` spelling of this same hazard) and
+    ``test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints``
+    (the split-call remedy the corrected Stage-2 prompt prescribes).
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='combined-row',
+        details='ORIGINAL BODY',
+        metadata=json.dumps({
+            'files': ['src/a.py'],
+            'spawned_from': 'task-100',
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='REWRITTEN BODY',
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+
+    # (a) append is NOT scoped to metadata — the details TEXT column is
+    #     concatenated, not replaced. The intended rewrite is duplicated.
+    assert task['details'] == 'ORIGINAL BODY\n\nREWRITTEN BODY', (
+        'append=True must concatenate the details column even when the call '
+        f'also carries metadata; got: {task["details"]!r}'
+    )
+
+    # (b) the metadata half behaves exactly as advertised — union + siblings.
+    assert task['metadata'] == {
+        'files': ['src/a.py'],
+        'spawned_from': 'task-100',
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
+    }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_prompt_and_metadata_append_true_concatenates_details(
+    backend, project_root,
+):
+    """The ``prompt=`` spelling of the same hazard (task 4216).
+
+    ``update_task``'s body branch is ``details`` first, ``prompt`` as the
+    fallback — and BOTH write the same ``details`` TEXT column under the
+    same ``append`` flag. A caller that reaches for the legacy ``prompt=``
+    parameter alongside a ``memory_hints`` attach therefore duplicates the
+    body exactly as the ``details=`` sibling above does.
+
+    This exists because the backend comment and the Stage-2 prompt both
+    state the hazard covers ``details`` AND ``prompt``; without this case
+    the ``prompt`` half of that claim would be asserted in two places and
+    pinned in none. GREEN on first run by design — characterization, not a
+    behaviour change.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='prompt-row',
+        details='ORIGINAL BODY',
+        metadata=json.dumps({
+            'files': ['src/c.py'],
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
+    await backend.update_task(
+        '1', project_root=project_root,
+        prompt='REWRITTEN BODY',
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+
+    assert task['details'] == 'ORIGINAL BODY\n\nREWRITTEN BODY', (
+        'append=True must concatenate the details column via the prompt '
+        f'branch too; got: {task["details"]!r}'
+    )
+    assert task['metadata'] == {
+        'files': ['src/c.py'],
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
+    }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints(
+    backend, project_root,
+):
+    """The SPLIT-CALL REMEDY prescribed by the corrected Stage-2 prompt (task 4216).
+
+    A metadata-only ``append=True`` attach followed by a details-only call
+    with ``append`` OMITTED leaves exactly ONE copy of the details body
+    while the hints still union and sibling keys survive.
+
+    Split out from
+    ``test_update_task_details_and_metadata_append_true_concatenates_details``
+    deliberately: the remedy is the shape Stage 2 is now told to emit, so a
+    regression here must surface on its own rather than be masked behind a
+    failure of the combined-call hazard characterization.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='split-row',
+        details='ORIGINAL BODY',
+        metadata=json.dumps({
+            'files': ['src/b.py'],
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
+    # call 1 — metadata only, append=True (the hints attach)
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    # call 2 — details only, append OMITTED (the clean rewrite)
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='REWRITTEN BODY',
+    )
+    split = await backend.get_task('1', project_root=project_root)
+
+    assert split['details'] == 'REWRITTEN BODY', (
+        'the split-call remedy must leave exactly ONE copy of the details '
+        f'body; got: {split["details"]!r}'
+    )
+    assert split['metadata'] == {
+        'files': ['src/b.py'],
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
+    }, f'the hints attach must still union under the split: {split["metadata"]}'
+
+
+@pytest.mark.asyncio
 async def test_update_task_default_corrupt_blob_refused(backend, project_root, caplog):
     """Default (no-arg) merge refuses a corrupt existing blob — raises TaskmasterError
     and leaves stored bytes unchanged."""
     await backend.add_task(project_root=project_root, title='t')
 
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute('UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,))
     await conn.commit()
 
@@ -7213,9 +7577,10 @@ async def test_update_task_default_corrupt_blob_refused(backend, project_root, c
             metadata=json.dumps({'note': 'x'}),
         )
 
-    raw_conn = await backend._get_connection(project_root)
+    raw_conn = await _raw_write_conn(backend, project_root)
     cursor = await raw_conn.execute('SELECT metadata FROM tasks WHERE id = 1')
     row = await cursor.fetchone()
+    assert row is not None
     assert row['metadata'] == _CORRUPT_BLOB, (
         f'corrupt blob must be byte-for-byte unchanged; got: {row["metadata"]!r}'
     )
@@ -7539,6 +7904,64 @@ async def test_update_task_unknown_key_patch_tolerates_untouched_invalid_done_pr
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_passthrough_tolerates_legacy_invalid_done_provenance(
+    tmp_path, project_root,
+):
+    """Under enforce mode, a whole-blob replace that passes a LEGACY (schema-
+    invalid) done_provenance through verbatim is not blamed for it.
+
+    The replace caller is REQUIRED to send the stored done_provenance back, so
+    the field is not this write's responsibility (task 2401's scoping rule).
+    The tolerance is scoped to that one verified key: a CHANGED invalid value
+    still gets the write-authority answer first, and any other invalid field
+    the payload adds is still a ValidationError.
+    """
+    legacy = {'commit': 'abc123'}
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        backend._task_metadata_enforce = False
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({
+                'done_provenance': legacy, 'stale_key': 1, 'files': ['src'],
+            }),
+        )
+        backend._task_metadata_enforce = True
+
+        await backend.update_task(
+            dto['id'], project_root=project_root,
+            metadata=json.dumps({'done_provenance': legacy, 'files': ['src']}),
+            metadata_mode='replace',
+        )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata']['done_provenance'] == legacy
+        assert 'stale_key' not in task['metadata']
+        assert task['metadata']['files'] == ['src']
+
+        with pytest.raises(DoneProvenanceWriteAuthorityError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({'done_provenance': {'commit': 'zzz'}}),
+                metadata_mode='replace',
+            )
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({
+                    'done_provenance': legacy, 'task_kind': 'bogus_kind',
+                }),
+                metadata_mode='replace',
+            )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == {'done_provenance': legacy, 'files': ['src']}
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
     tmp_path, project_root,
 ):
@@ -7605,7 +8028,7 @@ async def test_row_to_task_coerces_valid_non_object_json_to_empty_dict(backend, 
     both get_task and get_tasks.
     """
     await backend.add_task(project_root=project_root, title='t')
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute('UPDATE tasks SET metadata = ? WHERE id = 1', ('[1,2,3]',))
     await conn.commit()
 
@@ -7629,7 +8052,7 @@ async def test_get_tasks_coerces_corrupt_json_to_empty_dict_with_one_warning(
     read path).
     """
     await backend.add_task(project_root=project_root, title='t')
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute('UPDATE tasks SET metadata = ? WHERE id = 1', ('{not json',))
     await conn.commit()
 
@@ -7657,7 +8080,7 @@ async def test_row_to_task_preserves_unknown_key_without_typed_defaults(backend,
     never a parse_metadata(...).model_dump().
     """
     await backend.add_task(project_root=project_root, title='t')
-    conn = await backend._get_connection(project_root)
+    conn = await _raw_write_conn(backend, project_root)
     await conn.execute(
         'UPDATE tasks SET metadata = ? WHERE id = 1',
         ('{"prd": "x", "unknown_key": 1}',),

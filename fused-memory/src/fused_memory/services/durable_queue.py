@@ -16,11 +16,15 @@ import time
 from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,21 +68,16 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # empirical half rather than restoring the names by reflex. The removal is a
 # judgement about the CURRENT deployment, not a fact settled for all time.
 #
-# REINSTATEMENT NOW TAKES TWO EDITS, NOT ONE (task 3586). Re-adding names here
-# is no longer sufficient, because _classify_failure checks its payload-derived
-# permanent rule BEFORE the transient one: a self-referential not-found dies at
-# attempt 1 whatever this set says. That rule could itself mis-fire under the
-# very topology that would justify reinstatement — attempt 1 creates the
-# episodic node and then fails downstream; attempt 2's by-uuid lookup
-# (routing_='r') lands on a lagging follower and raises NodeNotFoundError naming
-# the item's OWN uuid, which is genuinely transient but reads as the permanent
-# proof. Disabling it means passing identity_payload_keys={} to
-# DurableWriteQueue, and that is a CODE CHANGE today, not a config edit: the
-# kwarg is deliberately not a QueueConfig field (see
-# DEFAULT_IDENTITY_PAYLOAD_KEYS below) and MemoryService's construction site
-# (memory_service.py:1190) does not pass it. Whoever reinstates the budget must
-# wire that kwarg through in the same change, or the reinstatement is a no-op
-# for exactly the failures it was meant to cover.
+# REINSTATEMENT IS ONE EDIT (task 5474). The payload-identity rule ships with
+# no operation mapped (DurableWriteQueue's identity_payload_keys defaults to
+# empty), so today it cannot pre-empt a reinstated name: re-adding names here is
+# sufficient. If a caller ever injects identity_payload_keys=, _classify_failure's
+# permanent-before-transient precedence applies again — a self-referential
+# not-found then dies at attempt 1 whatever this set says — and the clustered
+# caveat returns with it: attempt 1 creates the node and then fails downstream;
+# attempt 2's by-uuid lookup (routing_='r') lands on a lagging follower and
+# raises a not-found naming the item's OWN uuid, which is genuinely transient
+# but reads as the permanent proof.
 #
 # ABSENT HERE MEANS "NOT EXTENDED", NOT "FAIL FAST" — and the empirical half
 # above argues the stronger claim. Dropping these names only returns them to
@@ -92,10 +91,10 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # blunter "terminal error names" counterpart 3585 offered as a fallback. It
 # does NOT act on this set or on any name list — it fires only when the
 # not-found names the very uuid the operation exists to create, a proof derived
-# from the item's own payload. So the two mechanisms stay independent: editing
-# the names here cannot switch the permanent rule on or off, and 3586's rule is
-# checked FIRST precisely so re-adding a name here cannot hand a
-# provably-doomed write the extended budget back.
+# from the item's own payload, and only for an operation a caller has mapped
+# through identity_payload_keys= (none by default; see REINSTATEMENT IS ONE
+# EDIT above). So the two mechanisms stay independent: editing the names here cannot switch the
+# permanent rule on or off.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'TimeoutError',
     'ConnectionError',
@@ -143,43 +142,6 @@ def _parse_not_found_uuid(message: str) -> str | None:
     match = _NOT_FOUND_MESSAGE_RE.match(message)
     return match.group(1) if match else None
 
-
-# operation -> the payload key holding THE UUID THAT OPERATION CREATES.
-#
-# Deliberately NOT "any uuid appearing in the payload". A payload may
-# legitimately REFERENCE other nodes' uuids, and a not-found naming one of those
-# is genuinely retryable: the node may live in a different graph (for FalkorDB
-# the group_id IS the database, and graphiti's by-uuid lookup Cypher carries no
-# group_id predicate), or a concurrent write creating it may still be in flight.
-# Those keep their full retry budget. Only the uuid this operation exists to
-# CREATE licenses the conclusion that retrying cannot possibly help.
-#
-# Verified vocabulary (the queue has exactly four operation strings, dispatched
-# by MemoryService._execute_durable_write at memory_service.py:1402-1410):
-#   add_episode           — 'uuid' is minted by the producer as its OWN fresh
-#                           identity (memory_service.py:2516), stamped onto the
-#                           payload (:2534) and forwarded to the backend
-#                           (:2248). The self-referential case.
-#   add_memory_graphiti   — no 'uuid' key at all.
-#   mem0_classify_and_add — no uuid key.
-#   mem0_add              — legacy, no live producer.
-# ('_write_op_id' / '_causation_id' are write-journal ids, not graph uuids.)
-#
-# COUPLING TO TASK 3561, which is in flight and changes exactly this key: its
-# fix stops handing graphiti a caller-minted uuid (passing None so the library
-# takes its CREATE branch rather than its LOAD branch). If it lands and the key
-# disappears, this rule simply falls open and every add_episode failure returns
-# to the ordinary policy — which is correct. This classifier is the generic
-# safety net for the NEXT operation that references its own not-yet-created
-# uuid, not a fix for that one instance.
-#
-# Not a QueueConfig field: the config surface exists for operator tuning,
-# whereas this is a fact about the payload vocabulary that an operator has no
-# basis to retune. It is overridable via the constructor only — the test seam,
-# and the property that keeps this a generic component.
-DEFAULT_IDENTITY_PAYLOAD_KEYS: Mapping[str, str] = MappingProxyType({
-    'add_episode': 'uuid',
-})
 
 # -- Schema ------------------------------------------------------------------
 
@@ -336,15 +298,11 @@ class DurableWriteQueue:
             frozenset(transient_error_names) if transient_error_names is not None
             else DEFAULT_TRANSIENT_ERROR_NAMES
         )
-        # An explicit map REPLACES the default rather than extending it, so a
-        # caller can express "no operation has a self-identity" as {}.
-        self._identity_payload_keys: Mapping[str, str] = (
-            dict(identity_payload_keys) if identity_payload_keys is not None
-            else DEFAULT_IDENTITY_PAYLOAD_KEYS
-        )
+        # operation -> payload key of the graph uuid it CREATES; empty = rule off.
+        self._identity_payload_keys: Mapping[str, str] = dict(identity_payload_keys or {})
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
-        self._db: aiosqlite.Connection | None = None
+        self._access: AtomicConnection | None = None
         self._callbacks: dict[str, CallbackFn] = {}
         self._group_events: dict[str, asyncio.Event] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
@@ -356,16 +314,18 @@ class DurableWriteQueue:
     async def initialize(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / 'write_queue.db'
-        self._db = await connect_daemon(str(db_path))
-        self._db.row_factory = aiosqlite.Row
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
+        conn = await connect_daemon(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
         # Table, then in-place migrate, then indexes — matching ticket_store's
         # ordering, so a migration-added column is present before any index
         # that might reference it.
-        await self._db.execute(_CREATE_TABLE)
+        async with self._access.write() as db:
+            await db.execute(_CREATE_TABLE)
         await self._migrate()
-        await self._db.execute(_CREATE_INDEX)
-        await self._db.commit()
+        async with self._access.write() as db:
+            await db.execute(_CREATE_INDEX)
         # Recover any items left in_flight from a previous crash
         await self._recover_in_flight()
         # Spin up workers for groups that have pending work
@@ -383,14 +343,12 @@ class DurableWriteQueue:
         orchestrator/run_store.py) is that purely additive changes use this
         light feature-detect idiom.
         """
-        assert self._db is not None
-        cursor = await self._db.execute('PRAGMA table_info(write_queue)')
-        cols = {row[1] for row in await cursor.fetchall()}
+        access = self._require_access()
+        cols = {row[1] for row in await access.read_all('PRAGMA table_info(write_queue)')}
         if 'executed' not in cols:
             try:
-                await self._db.execute(
-                    'ALTER TABLE write_queue ADD COLUMN executed INTEGER'
-                )
+                async with access.write() as db:
+                    await db.execute('ALTER TABLE write_queue ADD COLUMN executed INTEGER')
                 logger.info(
                     'DurableWriteQueue: migrated write_queue — added executed column'
                 )
@@ -415,24 +373,21 @@ class DurableWriteQueue:
         if all_tasks:
             await asyncio.gather(*all_tasks, return_exceptions=True)
         self._worker_tasks.clear()
-        if self._db:
-            # Final TRUNCATE checkpoint so the next open sees an empty WAL.
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
-            self._db = None
+        # Workers first: one cancelled inside a write unit rolls that unit
+        # back, so a half-claimed item stays pending, and one cancelled
+        # mid-execute leaves its item in_flight for _recover_in_flight.
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
         logger.info('DurableWriteQueue closed')
 
-    async def checkpoint(self) -> tuple[int, int, int]:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-        Called by the periodic loop in ``server/main.py``."""
-        if self._db is None:
-            return (-1, -1, -1)
-        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
+            raise RuntimeError('DurableWriteQueue not initialized — call initialize() first')
+        return self._access
+
+    async def checkpoint(self) -> CheckpointResult:
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)
 
     # -- callbacks ------------------------------------------------------------
 
@@ -449,20 +404,19 @@ class DurableWriteQueue:
         callback_type: str | None = None,
     ) -> int:
         """Persist a write item and signal workers. Returns item id."""
-        assert self._db is not None
         now = time.time()
-        cursor = await self._db.execute(
-            # `executed` = 0 is a RECORDED negative, distinct from a legacy
-            # row's NULL (unknown); see get_dead_items.
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, callback_type, status, attempts, '
-            ' max_attempts, next_retry_at, created_at, executed) '
-            'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
-            (group_id, operation, json.dumps(payload), callback_type,
-             'pending', self._max_attempts, now),
-        )
-        await self._db.commit()
-        item_id = cursor.lastrowid
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                # `executed` = 0 is a RECORDED negative, distinct from a legacy
+                # row's NULL (unknown); see get_dead_items.
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, callback_type, status, attempts, '
+                ' max_attempts, next_retry_at, created_at, executed) '
+                'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
+                (group_id, operation, json.dumps(payload), callback_type,
+                 'pending', self._max_attempts, now),
+            )
+            item_id = cursor.lastrowid
         self._ensure_workers(group_id)
         self._signal_group(group_id)
         return item_id  # type: ignore[return-value]
@@ -470,16 +424,17 @@ class DurableWriteQueue:
     async def enqueue_batch(
         self, items: list[dict[str, Any]]
     ) -> list[int]:
-        """Bulk insert in a single transaction. Each dict needs group_id,
-        operation, payload, and optionally callback_type."""
-        assert self._db is not None
+        """Bulk insert in ONE write unit: a failure anywhere persists no row.
+
+        Each dict needs group_id, operation, payload, and optionally
+        callback_type.
+        """
         now = time.time()
         ids: list[int] = []
         groups_seen: set[str] = set()
-        await self._db.execute('BEGIN')
-        try:
+        async with self._require_access().write() as db:
             for item in items:
-                cursor = await self._db.execute(
+                cursor = await db.execute(
                     # Explicit `executed = 0` for the same reason as enqueue().
                     'INSERT INTO write_queue '
                     '(group_id, operation, payload, callback_type, status, attempts, '
@@ -492,10 +447,6 @@ class DurableWriteQueue:
                 )
                 ids.append(cursor.lastrowid)  # type: ignore[arg-type]
                 groups_seen.add(item['group_id'])
-            await self._db.commit()
-        except Exception:
-            await self._db.rollback()
-            raise
         for g in groups_seen:
             self._ensure_workers(g)
             self._signal_group(g)
@@ -544,26 +495,24 @@ class DurableWriteQueue:
 
         Uses a per-group asyncio.Lock so only one worker claims at a time.
         """
-        assert self._db is not None
         lock = self._group_locks[group_id]
         async with lock:
             now = time.time()
-            cursor = await self._db.execute(
-                "SELECT * FROM write_queue "
-                "WHERE group_id = ? AND status IN ('pending', 'retry') "
-                "  AND next_retry_at <= ? "
-                "ORDER BY id ASC LIMIT 1",
-                (group_id, now),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            item = QueueItem(tuple(row))
-            await self._db.execute(
-                "UPDATE write_queue SET status = 'in_flight' WHERE id = ?",
-                (item.id,),
-            )
-            await self._db.commit()
+            async with self._require_access().write() as db:
+                rows = list(await db.execute_fetchall(
+                    "SELECT * FROM write_queue "
+                    "WHERE group_id = ? AND status IN ('pending', 'retry') "
+                    "  AND next_retry_at <= ? "
+                    "ORDER BY id ASC LIMIT 1",
+                    (group_id, now),
+                ))
+                if not rows:
+                    return None
+                item = QueueItem(tuple(rows[0]))
+                await db.execute(
+                    "UPDATE write_queue SET status = 'in_flight' WHERE id = ?",
+                    (item.id,),
+                )
             return item
 
     async def _process_item(self, item: QueueItem) -> None:
@@ -673,13 +622,12 @@ class DurableWriteQueue:
         """
         if item.executed:
             return
-        assert self._db is not None
         try:
-            await self._db.execute(
-                'UPDATE write_queue SET executed = 1 WHERE id = ?',
-                (item.id,),
-            )
-            await self._db.commit()
+            async with self._require_access().write() as db:
+                await db.execute(
+                    'UPDATE write_queue SET executed = 1 WHERE id = ?',
+                    (item.id,),
+                )
         except Exception:
             logger.warning(
                 'Item %d (%s, group_id=%s): backend write landed but the '
@@ -747,13 +695,12 @@ class DurableWriteQueue:
             )
 
     async def _mark_completed(self, item: QueueItem) -> None:
-        assert self._db is not None
-        await self._db.execute(
-            "UPDATE write_queue SET status = 'completed', completed_at = ?, "
-            "attempts = attempts + 1 WHERE id = ?",
-            (time.time(), item.id),
-        )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            await db.execute(
+                "UPDATE write_queue SET status = 'completed', completed_at = ?, "
+                "attempts = attempts + 1 WHERE id = ?",
+                (time.time(), item.id),
+            )
 
     def _is_transient(self, exc: BaseException) -> bool:
         """Whether *exc* (or any class in its MRO) is a known-transient error
@@ -838,72 +785,68 @@ class DurableWriteQueue:
         only ever sets the flag: an attempt that did not land leaves the
         column as it was, so a legacy NULL stays unknown.
         """
-        assert self._db is not None
         new_attempts = item.attempts + 1
         error_msg = f'{type(exc).__name__}: {exc}'
         classification, limit = self._classify_failure(item, exc)
         died = new_attempts >= limit
-        if died:
-            await self._db.execute(
-                "UPDATE write_queue SET status = 'dead', attempts = ?, error = ?, "
-                "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
-                (new_attempts, error_msg, executed, item.id),
-            )
-            # operation / group_id / classification are what a triager needs
-            # first, and the log line is all that survives once the queue row is
-            # deleted — after that, get_dead_items can no longer supply them.
-            # The classification separates "doomed from attempt 1" from
-            # "exhausted its budget", which the attempt count alone cannot when
-            # max_attempts is 1.
-            logger.warning(
-                'Item %d (%s, group_id=%s) dead-lettered after %d attempts [%s]: %s',
-                item.id, item.operation, item.group_id, new_attempts,
-                classification, error_msg,
-            )
-        else:
-            delay = min(
-                self._retry_base_seconds * (2 ** (new_attempts - 1))
-                + random.uniform(0, self._retry_base_seconds),
-                self._retry_max_delay_seconds,
-            )
-            next_retry = time.time() + delay
-            await self._db.execute(
-                "UPDATE write_queue SET status = 'retry', attempts = ?, "
-                "next_retry_at = ?, error = ?, "
-                "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
-                (new_attempts, next_retry, error_msg, executed, item.id),
-            )
-            # Kept symmetrical with the dead-letter line above so a retry storm
-            # is attributable to an operation and a project without a second
-            # lookup.
-            logger.info(
-                'Item %d (%s, group_id=%s) retry %d/%d in %.1fs [%s]: %s',
-                item.id, item.operation, item.group_id, new_attempts, limit,
-                delay, classification, error_msg,
-            )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            if died:
+                await db.execute(
+                    "UPDATE write_queue SET status = 'dead', attempts = ?, error = ?, "
+                    "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                    (new_attempts, error_msg, executed, item.id),
+                )
+                # operation / group_id / classification are what a triager needs
+                # first, and the log line is all that survives once the queue row is
+                # deleted — after that, get_dead_items can no longer supply them.
+                # The classification separates "doomed from attempt 1" from
+                # "exhausted its budget", which the attempt count alone cannot when
+                # max_attempts is 1.
+                logger.warning(
+                    'Item %d (%s, group_id=%s) dead-lettered after %d attempts [%s]: %s',
+                    item.id, item.operation, item.group_id, new_attempts,
+                    classification, error_msg,
+                )
+            else:
+                delay = min(
+                    self._retry_base_seconds * (2 ** (new_attempts - 1))
+                    + random.uniform(0, self._retry_base_seconds),
+                    self._retry_max_delay_seconds,
+                )
+                next_retry = time.time() + delay
+                await db.execute(
+                    "UPDATE write_queue SET status = 'retry', attempts = ?, "
+                    "next_retry_at = ?, error = ?, "
+                    "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                    (new_attempts, next_retry, error_msg, executed, item.id),
+                )
+                # Kept symmetrical with the dead-letter line above so a retry storm
+                # is attributable to an operation and a project without a second
+                # lookup.
+                logger.info(
+                    'Item %d (%s, group_id=%s) retry %d/%d in %.1fs [%s]: %s',
+                    item.id, item.operation, item.group_id, new_attempts, limit,
+                    delay, classification, error_msg,
+                )
         return ('dead', error_msg) if died else None
 
     # -- recovery -------------------------------------------------------------
 
     async def _recover_in_flight(self) -> None:
         """Reset items left in_flight (crashed mid-write) back to pending."""
-        assert self._db is not None
-        cursor = await self._db.execute(
-            "UPDATE write_queue SET status = 'pending' WHERE status = 'in_flight'"
-        )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                "UPDATE write_queue SET status = 'pending' WHERE status = 'in_flight'"
+            )
         if cursor.rowcount:
             logger.info('Recovered %d in-flight items to pending', cursor.rowcount)
 
     async def _start_workers_for_pending_groups(self) -> None:
         """Start workers for any groups that have pending/retry items."""
-        assert self._db is not None
-        cursor = await self._db.execute(
+        rows = await self._require_access().read_all(
             "SELECT DISTINCT group_id FROM write_queue "
             "WHERE status IN ('pending', 'retry')"
         )
-        rows = await cursor.fetchall()
         for row in rows:
             group_id = row[0] if isinstance(row, tuple) else row['group_id']
             self._ensure_workers(group_id)
@@ -921,21 +864,20 @@ class DurableWriteQueue:
         and it is exactly the fact that makes a SECOND blind replay dangerous.
         Read it before replaying; the rule per value is on get_dead_items.
         """
-        assert self._db is not None
-        if group_id:
-            cursor = await self._db.execute(
-                "UPDATE write_queue SET status = 'pending', attempts = 0, "
-                "next_retry_at = 0, error = NULL "
-                "WHERE status = 'dead' AND group_id = ?",
-                (group_id,),
-            )
-        else:
-            cursor = await self._db.execute(
-                "UPDATE write_queue SET status = 'pending', attempts = 0, "
-                "next_retry_at = 0, error = NULL "
-                "WHERE status = 'dead'",
-            )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            if group_id:
+                cursor = await db.execute(
+                    "UPDATE write_queue SET status = 'pending', attempts = 0, "
+                    "next_retry_at = 0, error = NULL "
+                    "WHERE status = 'dead' AND group_id = ?",
+                    (group_id,),
+                )
+            else:
+                cursor = await db.execute(
+                    "UPDATE write_queue SET status = 'pending', attempts = 0, "
+                    "next_retry_at = 0, error = NULL "
+                    "WHERE status = 'dead'",
+                )
         count = cursor.rowcount or 0
         if count:
             if group_id:
@@ -970,19 +912,18 @@ class DurableWriteQueue:
                 statistics — preserving the behaviour required by
                 :mcp-tool:`get_queue_stats` and the dashboard.
         """
-        assert self._db is not None
+        access = self._require_access()
 
         if group_id is not None:
-            cursor = await self._db.execute(
+            rows = await access.read_all(
                 'SELECT status, COUNT(*) as cnt FROM write_queue '
                 'WHERE group_id = ? GROUP BY status',
                 (group_id,),
             )
         else:
-            cursor = await self._db.execute(
+            rows = await access.read_all(
                 'SELECT status, COUNT(*) as cnt FROM write_queue GROUP BY status'
             )
-        rows = await cursor.fetchall()
         counts = {
             row[0] if isinstance(row, tuple) else row['status']:
             row[1] if isinstance(row, tuple) else row['cnt']
@@ -991,17 +932,16 @@ class DurableWriteQueue:
 
         oldest_pending_age = None
         if group_id is not None:
-            cursor = await self._db.execute(
+            row = await access.read_one(
                 "SELECT MIN(created_at) FROM write_queue "
                 "WHERE status IN ('pending', 'retry') AND group_id = ?",
                 (group_id,),
             )
         else:
-            cursor = await self._db.execute(
+            row = await access.read_one(
                 "SELECT MIN(created_at) FROM write_queue "
                 "WHERE status IN ('pending', 'retry')"
             )
-        row = await cursor.fetchone()
         if row:
             min_created = row[0] if isinstance(row, tuple) else row[0]
             if min_created is not None:
@@ -1013,17 +953,16 @@ class DurableWriteQueue:
         # not free on a live DB; see write_journal.py's idx_wo_created note,
         # where adding one measured ~47 s of one-time startup DDL.
         if group_id is not None:
-            cursor = await self._db.execute(
+            rows = await access.read_all(
                 'SELECT operation, COUNT(*) as cnt FROM write_queue '
                 "WHERE status = 'dead' AND group_id = ? GROUP BY operation",
                 (group_id,),
             )
         else:
-            cursor = await self._db.execute(
+            rows = await access.read_all(
                 'SELECT operation, COUNT(*) as cnt FROM write_queue '
                 "WHERE status = 'dead' GROUP BY operation"
             )
-        rows = await cursor.fetchall()
         dead_by_operation = {
             row[0] if isinstance(row, tuple) else row['operation']:
             row[1] if isinstance(row, tuple) else row['cnt']
@@ -1071,9 +1010,10 @@ class DurableWriteQueue:
         excludes ineligible ids already classified in prior chunks.  Retrying
         with ``ids=remaining`` is therefore safe and non-redundant.
 
-        If the recovery ``COMMIT`` after the error also fails (e.g. disk still
-        full), ``deleted`` and ``not_found`` are set to ``[]`` and ``remaining``
-        covers all input ids, so a full retry is safe.
+        Every chunk runs in ONE write unit, which commits the chunks before the
+        failing one when it exits.  If that commit also fails (e.g. disk still
+        full), the unit rolls back, so ``deleted`` and ``not_found`` are set to
+        ``[]`` and ``remaining`` covers all input ids, and a full retry is safe.
 
         Programmer-bug exceptions (``ProgrammingError``, ``IntegrityError``)
         are NOT caught and propagate to the caller.
@@ -1088,62 +1028,56 @@ class DurableWriteQueue:
         if not ids:
             return {'deleted': [], 'not_found': []}
 
-        assert self._db is not None
         deleted: set[int] = set()
         not_found_completed: set[int] = set()
+        failure: dict[str, Any] | None = None
 
-        for i in range(0, len(ids), _DELETE_DEAD_BATCH_SIZE):
-            chunk = ids[i : i + _DELETE_DEAD_BATCH_SIZE]
-            placeholders = ','.join('?' * len(chunk))
-            # Single atomic statement — SELECT + DELETE in one round-trip (SQLite >=3.35).
-            # The WHERE guards (status='dead', group_id=?) are enforced atomically so
-            # a concurrent replay or worker cannot slip a row past the eligibility check
-            # between a separate SELECT and DELETE.
-            try:
-                cursor = await self._db.execute(
-                    f"DELETE FROM write_queue "
-                    f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
-                    f"RETURNING id",
-                    (*chunk, group_id),
-                )
-                rows = await cursor.fetchall()
-            except aiosqlite.OperationalError as exc:
-                # Commit prior-chunk deletions durably before returning.
-                # The commit itself can fail (e.g. disk still full), in which case
-                # we cannot guarantee prior deletions landed — return a conservative
-                # envelope covering all inputs so a full retry is safe.
-                try:
-                    await self._db.commit()
-                except aiosqlite.OperationalError:
-                    logger.exception(
-                        'delete_dead: recovery commit failed after OperationalError;'
-                        ' reporting full input as remaining',
-                    )
-                    return {
-                        'error': str(exc),
-                        'error_type': 'TransientSqliteError',
-                        'retriable': True,
-                        'deleted': [],
-                        'not_found': [],
-                        'remaining': sorted(ids),
+        try:
+            async with self._require_access().write() as db:
+                for i in range(0, len(ids), _DELETE_DEAD_BATCH_SIZE):
+                    chunk = ids[i : i + _DELETE_DEAD_BATCH_SIZE]
+                    placeholders = ','.join('?' * len(chunk))
+                    # Single atomic statement — SELECT + DELETE in one round-trip
+                    # (SQLite >=3.35).  The WHERE guards (status='dead', group_id=?)
+                    # are enforced atomically so a concurrent replay or worker cannot
+                    # slip a row past the eligibility check between a separate SELECT
+                    # and DELETE.
+                    try:
+                        cursor = await db.execute(
+                            f"DELETE FROM write_queue "
+                            f"WHERE id IN ({placeholders}) AND status='dead' AND group_id=? "
+                            f"RETURNING id",
+                            (*chunk, group_id),
+                        )
+                        rows = await cursor.fetchall()
+                    except aiosqlite.OperationalError as exc:
+                        # Leaving the unit cleanly commits the prior chunks.
+                        failure = {
+                            'error': str(exc),
+                            'error_type': 'TransientSqliteError',
+                            'retriable': True,
+                            'deleted': sorted(deleted),
+                            'not_found': sorted(not_found_completed),
+                            'remaining': sorted(ids[i:]),
+                        }
+                        break
+                    chunk_deleted = {
+                        (row[0] if isinstance(row, tuple) else row['id']) for row in rows
                     }
-                return {
-                    'error': str(exc),
-                    'error_type': 'TransientSqliteError',
-                    'retriable': True,
-                    'deleted': sorted(deleted),
-                    'not_found': sorted(not_found_completed),
-                    'remaining': sorted(ids[i:]),
-                }
-            chunk_deleted = {
-                (row[0] if isinstance(row, tuple) else row['id']) for row in rows
-            }
-            deleted |= chunk_deleted
-            # Subtract `deleted` at point-of-update so the invariant holds
-            # throughout the loop — any future early-return path is safe.
-            not_found_completed |= (set(chunk) - chunk_deleted) - deleted
-
-        await self._db.commit()
+                    deleted |= chunk_deleted
+                    # Subtract `deleted` at point-of-update so the invariant holds
+                    # throughout the loop — any future early-return path is safe.
+                    not_found_completed |= (set(chunk) - chunk_deleted) - deleted
+        except aiosqlite.OperationalError:
+            if failure is None:
+                raise
+            logger.exception(
+                'delete_dead: recovery commit failed after OperationalError;'
+                ' reporting full input as remaining',
+            )
+            return {**failure, 'deleted': [], 'not_found': [], 'remaining': sorted(ids)}
+        if failure is not None:
+            return failure
 
         return {
             'deleted': sorted(deleted),
@@ -1181,7 +1115,6 @@ class DurableWriteQueue:
             limit: Optional maximum number of items to return.  When *None*
                 all dead items are returned (backward-compatible default).
         """
-        assert self._db is not None
         if group_id:
             sql = (
                 "SELECT * FROM write_queue WHERE status = 'dead' AND group_id = ?"
@@ -1196,8 +1129,7 @@ class DurableWriteQueue:
             sql += ' LIMIT ?'
             params = (*params, limit)
 
-        cursor = await self._db.execute(sql, params)
-        rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(sql, params)
         results = []
         for row in rows:
             item = QueueItem(tuple(row))

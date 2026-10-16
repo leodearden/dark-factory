@@ -74,6 +74,10 @@ dev = [
 markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
+filterwarnings = [
+    # Sync def under an @pytest.mark.asyncio mark: mark mismatch (same entry as orchestrator/pyproject.toml).
+    "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
+]
 # Default per-test timeout. THE CANONICAL RATIONALE for this setting across
 # the workspace — orchestrator/, fused-memory/, escalation/ and dashboard/
 # pyproject.toml cite this block rather than restating it.
@@ -83,6 +87,9 @@ asyncio_mode = "auto"
 # invoke_with_cap_retry through 19 real exponential-backoff sleeps), and
 # deadlocked lock implementations. Slow tests can opt out with
 # @pytest.mark.timeout(N).
+# In-band markers (60 < N < verify --timeout) are rejected by
+# tests/test_timeout_marker_inversion_guard.py; see
+# shared/src/shared/testing_timeout_markers.py.
 #
 # WHY A LARGE VALUE AND NOT THE ORIGINAL 60 (2026-09-12). The cap is
 # WALL-CLOCK, not CPU time. On this 32-core host under sustained load (~180 at
@@ -99,26 +106,26 @@ asyncio_mode = "auto"
 # mechanisms intact: timeout_method and --max-worker-restart=0 are UNCHANGED,
 # each having been chosen against a measured worse failure (task 1907).
 #
-# 540 IS DERIVED FROM MEASUREMENT (task 5442, 2026-09-17), which is what this
-# paragraph used to say nobody had done. The worst per-test wall clock of an
-# UNMARKED test, across every suite and both inifile-resolution modes under real
-# fleet load, measured 61.52s; times the 8x headroom factor whose rationale is
-# orchestrator/tests/test_whole_tree_scan_timeout_guard.py
-# ::_REQUIRED_HEADROOM_FACTOR, rounded up to a whole minute, floored at the
-# independently-measured 300. The full corpus, the run-to-run spread and the
-# arithmetic are in
+# 420 IS DERIVED FROM MEASUREMENT. The worst per-test wall clock of an UNMARKED
+# test, across every suite and both inifile-resolution modes under real fleet
+# load, measured 45.48s (orchestrator/tests/test_hard_v2_fixture_pool.py,
+# root-bound); times the 8x headroom factor whose rationale is
+# orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
+# rounded up to a whole minute = 420. Marked tests are excluded by design,
+# including the slower repo-wide scans in
+# fused-memory/tests/test_check_bare_magicmock_config.py, which carry their own
+# mark. The full corpus, the run-to-run spread, the
+# arithmetic and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md — read that before
 # moving this number, and re-measure rather than re-judging it.
 #
-# THE MEASUREMENT RAISED THE VALUE RATHER THAN CONFIRMING IT: 300 was only 4.9x
-# the measured worst case, against the 8x this repo's own worker-death evidence
-# demands. The cost is unchanged in kind and stated plainly — a genuinely hung
-# test now takes 9 minutes to surface, not 5. @pytest.mark.timeout(N) remains
-# the escape hatch for any test that wants to surface faster.
+# The cost is stated plainly — a genuinely hung unmarked test takes 7 minutes
+# to surface. @pytest.mark.timeout(N) remains the escape hatch for any test
+# that wants to surface faster.
 #
 # signal method is load-bearing HERE: thread method prints a stack trace but
 # can't actually interrupt a blocking asyncio.sleep in the main thread.
-timeout = 540
+timeout = 420
 timeout_method = "signal"
 
 [tool.pyright]

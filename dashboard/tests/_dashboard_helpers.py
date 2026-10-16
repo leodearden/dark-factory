@@ -13,17 +13,21 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
+from unittest.mock import patch
 
 import aiosqlite
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from dashboard.config import DashboardConfig
+from dashboard.data.db import DbPool
+from dashboard.loops import _metrics_loop, _MetricsStore
 
 
 def live_aiosqlite_worker_threads() -> list[threading.Thread]:
@@ -235,6 +239,93 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Background-loop driving harness (task 5095)
+#
+# ONE definition of "run a real dashboard loop until the caller has seen
+# enough, then cancel it": drive_loop_until for any loop, drive_metrics_loop
+# for _metrics_loop against a recorded collect_metrics_snapshot.  Their
+# contract is pinned by test_metrics_loop_harness.py.
+# ---------------------------------------------------------------------------
+
+
+async def yielding_noop_sleep(*_args: object, **_kwargs: object) -> None:
+    """Stand-in for ``dashboard.loops._sleep_to_aligned_tick`` that suspends.
+
+    It MUST actually suspend.  A plain ``AsyncMock`` never yields, so the loop
+    spins synchronously and starves the event loop: an ``Event.set()`` waiter
+    (scheduled via ``call_soon``) never runs and ``asyncio.wait_for`` cannot
+    even time out.
+    """
+    await asyncio.sleep(0)
+
+
+async def drive_loop_until(
+    loop: Coroutine[Any, Any, None], until: asyncio.Event, *, timeout: float = 2.0
+) -> None:
+    """Run the never-returning *loop* as a task until *until* is set, then cancel it.
+
+    *timeout* is a backstop that is SUPPRESSED, so a regression fails on the
+    caller's named assertions rather than a bare ``TimeoutError``; assert a
+    positive witness (``until.is_set()``) before any upper-bound or absence
+    assertion.  Only ``CancelledError`` is swallowed on the way out, so a loop
+    that died of a real exception still surfaces it.  The task never outlives
+    this call.
+    """
+    task = asyncio.create_task(loop)
+    try:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(until.wait(), timeout=timeout)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def drive_metrics_loop(
+    store: _MetricsStore,
+    app: FastAPI,
+    *,
+    pool: DbPool,
+    http_client: httpx.AsyncClient,
+    until: asyncio.Event | None = None,
+    on_collect: Callable[[dict[str, Any]], None] | None = None,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Run ``_metrics_loop`` until *until* is set; return each collect call's kwargs.
+
+    *pool* and *http_client* are passed to the loop explicitly, and
+    ``app.state`` is never read or written here -- the binding tests depend on
+    the caller's ``app.state`` staying exactly as it built it.
+
+    With no *until* the driver stops after the first collect.  Otherwise the
+    caller sets *until* from wherever its observable lives: an *on_collect*
+    hook, a checkpoint mock.  *timeout* is ``drive_loop_until``'s suppressed
+    backstop.  *on_collect* runs INSIDE the loop's ``_run_once``, whose
+    ``except Exception`` swallows whatever it raises, so a hook should record
+    and signal, never assert.
+    """
+    calls: list[dict[str, Any]] = []
+    first_collect = asyncio.Event()
+
+    async def _record(*_args: object, **kwargs: Any) -> None:
+        calls.append(kwargs)
+        first_collect.set()
+        if on_collect is not None:
+            on_collect(kwargs)
+
+    with (
+        patch('dashboard.loops.collect_metrics_snapshot', new=_record),
+        patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
+    ):
+        await drive_loop_until(
+            _metrics_loop(store, app, pool=pool, http_client=http_client),
+            first_collect if until is None else until,
+            timeout=timeout,
+        )
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +917,25 @@ class _JsSpan(NamedTuple):
     closed: bool
 
 
+def _string_literal_end(source: str, quote_at: int) -> tuple[int, bool]:
+    """Return ``(end, closed)`` for the literal whose opening quote is at *quote_at*.
+
+    ``end`` is exclusive and clamped to ``len(source)``; ``closed`` is False
+    when the source ran out first.  A backslash skips the next character, so
+    an escaped quote cannot close the literal.
+    """
+    quote = source[quote_at]
+    i, n = quote_at + 1, len(source)
+    while i < n:
+        if source[i] == '\\':
+            i += 2
+            continue
+        if source[i] == quote:
+            return i + 1, True
+        i += 1
+    return n, False
+
+
 def _scan_js(source: str) -> list[_JsSpan]:
     """Return the string-literal and comment spans of *source*, in order.
 
@@ -842,19 +952,9 @@ def _scan_js(source: str) -> list[_JsSpan]:
         ch = source[i]
 
         if ch in '\'"`':
-            start = i
-            i += 1
-            closed = False
-            while i < n:
-                if source[i] == '\\':  # an escaped char cannot close the literal
-                    i += 2
-                    continue
-                if source[i] == ch:
-                    i += 1
-                    closed = True
-                    break
-                i += 1
-            spans.append(_JsSpan(start, min(i, n), 'string', ch, closed))
+            end, closed = _string_literal_end(source, i)
+            spans.append(_JsSpan(i, end, 'string', ch, closed))
+            i = end
             continue
 
         if source[i : i + 2] == '//':
@@ -1280,6 +1380,57 @@ def extract_df_data_block(src: str, key: str) -> str:
     if m is None:
         return ''
     return walk_balanced(src, m.end() - 1)  # m.end() - 1 is the opening `{`
+
+
+# ---------------------------------------------------------------------------
+# JSX opening-tag walk.
+#
+# Spans one opening tag, attributes included, so a probe can confine itself to
+# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# ---------------------------------------------------------------------------
+
+
+def jsx_open_tag_end(src: str, start: int) -> int | None:
+    """Return the index JUST PAST the ``>`` closing the opening tag at *start*.
+
+    *start* must index the tag's ``<``, else ``ValueError``.  ``src[start:end]``
+    is the whole tag; ``src[end - 2:end] == '/>'`` tells a self-closing one.  A
+    ``<`` or ``>`` inside a ``{...}`` attribute expression or a string/template
+    literal does not end the tag.
+
+    ``None``, never a raise, when *start* begins no closed opening tag: it is
+    never closed, a literal is never terminated, a bare ``<`` opens at depth 0
+    first, or a ``}`` drives brace depth negative.
+
+    Not comment-aware (pass `strip_js_comments` output), and it shares
+    `_scan_js`'s lexer blind spots.
+    """
+    if src[start : start + 1] != '<':
+        raise ValueError(
+            f"jsx_open_tag_end: start={start} must index the tag's `<`, "
+            f'found {src[start : start + 1]!r}'
+        )
+    depth = 0
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if c in '\'"`':
+            i, closed = _string_literal_end(src, i)
+            if not closed:
+                return None
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and c == '>':
+            return i + 1
+        elif depth == 0 and c == '<':
+            return None
+        i += 1
+    return None
 
 
 # ---------------------------------------------------------------------------

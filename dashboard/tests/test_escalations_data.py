@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
+from shared.testing_virtual_clock import virtual_clock_test
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -28,6 +30,11 @@ def _esc(esc_id: str, task_id: str = '1', level: int = 0, status: str = 'pending
     if worktree is not None:
         d['worktree'] = worktree
     return d
+
+
+def _named(roots: list[tuple[Path, list[dict]]]) -> list[tuple[str, Path, list[dict]]]:
+    """Each ``(root, task_rows)`` as a ``resolve_owning_project`` candidate owned by its basename."""
+    return [(root.name, root, rows) for root, rows in roots]
 
 
 def _write_esc(directory: Path, filename: str, data: dict) -> Path:
@@ -156,6 +163,32 @@ class TestLoadQueueEscalations:
         assert loaded['worktree'] == '/home/leo/src/proj/.worktrees/3'
         assert loaded['extra_field'] == 'should-survive'
 
+    def test_non_escalation_json_resident_is_not_read(self, tmp_path):
+        """A well-formed non-``esc-*`` JSON file in the queue root is not an escalation.
+
+        The queue directory has a second writer:
+        ``orchestrator/src/orchestrator/b3_gate.py::STATE_REL_PATH`` keeps
+        ``b3-state.json`` there.  Read as an escalation it becomes a row with
+        no ``id``.  It is a permanent resident, not a read failure, so it is
+        not reported in *skipped* either.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        good = _esc('esc-good-1', task_id='1', level=1, status='pending')
+        _write_esc(esc_dir, 'esc-good-1.json', good)
+        _write_esc(esc_dir, 'b3-state.json', {
+            'launches': [],
+            'charges': [{'task_id': '1615', 'charged_at': '2026-09-20T00:00:00+00:00'}],
+        })
+
+        skipped: list = []
+        result = load_queue_escalations(esc_dir, skipped=skipped)
+
+        assert result == [good]
+        assert skipped == []
+
     # -- the opt-in ``skipped`` out-parameter -------------------------------
     #
     # Skipping an unparseable file is correct — one corrupt escalation must not
@@ -188,8 +221,8 @@ class TestLoadQueueEscalations:
     def test_skipped_records_os_errors_not_just_decode_errors(self, tmp_path):
         """BOTH arms of ``except (JSONDecodeError, OSError)`` report, not just JSON.
 
-        ``Path.glob('*.json')`` yields directories too, so a directory named
-        ``weird.json`` makes ``read_text()`` raise ``IsADirectoryError`` — a
+        ``Path.glob('esc-*.json')`` yields directories too, so a directory named
+        ``esc-weird.json`` makes ``read_text()`` raise ``IsADirectoryError`` — a
         deterministic OSError needing no permission games or monkeypatching.
         A reader that only reported the decode arm would still lose every
         unreadable/permission-denied file silently, which is the more likely
@@ -200,7 +233,7 @@ class TestLoadQueueEscalations:
         esc_dir = tmp_path / 'escalations'
         esc_dir.mkdir()
         _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
-        weird = esc_dir / 'weird.json'
+        weird = esc_dir / 'esc-weird.json'
         weird.mkdir()
 
         skipped: list = []
@@ -278,7 +311,7 @@ class TestResolveOwningProjectWorktreeArm:
 
         esc = _esc('esc-1', task_id='42',
                    worktree=str(proj_a / '.worktrees' / '42'))
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
 
     def test_worktree_directly_under_root_resolves(self, tmp_path):
@@ -290,7 +323,7 @@ class TestResolveOwningProjectWorktreeArm:
 
         esc = _esc('esc-2', task_id='55',
                    worktree=str(proj_b / 'some-subdir'))
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projB'
 
     def test_dot_worktrees_prefix_form_also_matches(self, tmp_path):
@@ -303,7 +336,7 @@ class TestResolveOwningProjectWorktreeArm:
         # Worktree string exactly starts with str(proj_c / '.worktrees')
         wt = str(proj_c / '.worktrees' / '99')
         esc = _esc('esc-3', task_id='99', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projC'
 
     def test_first_root_wins_when_multiple_could_match(self, tmp_path):
@@ -321,7 +354,7 @@ class TestResolveOwningProjectWorktreeArm:
         esc = _esc('esc-4', task_id='10', worktree=wt)
 
         roots = [(proj_first, []), (proj_second, [])]
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         # first root wins
         assert result == 'workspace'
 
@@ -334,7 +367,7 @@ class TestResolveOwningProjectWorktreeArm:
 
         esc = _esc('esc-5', task_id='7',
                    worktree='/completely/different/path')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None
 
     def test_missing_worktree_returns_none(self, tmp_path):
@@ -345,7 +378,7 @@ class TestResolveOwningProjectWorktreeArm:
         roots = [(proj_a, [])]
 
         esc = _esc('esc-6', task_id='8')  # no worktree field
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None
 
 
@@ -367,7 +400,7 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, []), (proj_b, task_map_b)]
 
         esc = _esc('esc-1', task_id='42', worktree='/no-match/path')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projB'
 
     def test_first_root_wins_when_multiple_task_maps_contain_same_task_id(self, tmp_path):
@@ -382,7 +415,7 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, task_map_a), (proj_b, task_map_b)]
 
         esc = _esc('esc-1', task_id='42')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
 
     def test_no_match_in_any_task_map_returns_none(self, tmp_path):
@@ -393,7 +426,7 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, [{'id': 99, 'title': 'other task'}])]
 
         esc = _esc('esc-1', task_id='55')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None
 
     def test_task_id_string_vs_int_coercion(self, tmp_path):
@@ -407,8 +440,25 @@ class TestResolveOwningProjectTaskMapArm:
 
         # esc.task_id is a string
         esc = _esc('esc-1', task_id='42')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
+
+    def test_the_owner_is_returned_as_passed_so_shared_basenames_stay_distinct(self, tmp_path):
+        """Two roots named ``proj`` are two owners: the match is the candidate, never its name."""
+        from dashboard.data.escalations import resolve_owning_project
+
+        first = object()
+        second = object()
+        candidates = [
+            (first, tmp_path / 'a' / 'proj', [{'id': 8}]),
+            (second, tmp_path / 'b' / 'proj', [{'id': 7}]),
+        ]
+
+        assert resolve_owning_project(_esc('esc-1', task_id='7'), candidates) is second
+        worktree = str(tmp_path / 'b' / 'proj' / '.worktrees' / '9')
+        assert resolve_owning_project(
+            _esc('esc-2', task_id='9', worktree=worktree), candidates,
+        ) is second
 
     def test_no_worktree_falls_back_to_task_map(self, tmp_path):
         """Escalation without worktree field falls back to task map probe."""
@@ -419,585 +469,496 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, task_map_a)]
 
         esc = _esc('esc-1', task_id='7')  # no worktree key
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
 
 
 # ---------------------------------------------------------------------------
-# Tests for build_escalation_queues — subsection enumeration (step 7)
+# Tests for build_escalation_queues — subsections from the escalation corpus
 # ---------------------------------------------------------------------------
 
+NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
+"""The instant every corpus datum here is measured at."""
+
+
+def _record(esc_id: str, task_id: str = '1', level: int = 0, status: str = 'pending',
+            worktree: str | None = None) -> dict:
+    """One escalation as the server writes it — parseable by the corpus walk."""
+    from escalation.models import Escalation
+
+    return Escalation(
+        id=esc_id, task_id=task_id, agent_role='implementer', severity='blocking',
+        category='design_concern', summary=f'summary of {esc_id}',
+        timestamp='2026-09-01T00:00:00+00:00', status=status, level=level,
+        worktree=worktree,
+    ).to_dict()
+
+
+def _put(directory: Path, record: dict, *, archived: bool = False) -> Path:
+    target = directory / 'archive' / '2026-09-01' if archived else directory
+    target.mkdir(parents=True, exist_ok=True)
+    return _write_esc(target, f"{record['id']}.json", record)
+
+
+def _config(primary: Path, extra: list[Path] | None = None):
+    from dashboard.config import DashboardConfig
+
+    primary.mkdir(parents=True, exist_ok=True)
+    for root in extra or []:
+        root.mkdir(parents=True, exist_ok=True)
+    return DashboardConfig(project_root=primary, known_project_roots=extra or [])
+
+
+def _queues_dir(root: Path) -> Path:
+    return root / 'data' / 'escalations'
+
+
+def _recon_dir(config) -> Path:
+    return config.reconciliation_escalations_dir
+
+
+def _build(config, active_rows: dict | None = None) -> dict:
+    """``build_escalation_queues`` over a fresh walk of *config*'s corpus at NOW."""
+    from dashboard.data.escalation_corpus import corpus_queues, measure_corpus
+    from dashboard.data.escalations import build_escalation_queues
+
+    corpus = measure_corpus(corpus_queues(config), now=NOW)
+    return build_escalation_queues(corpus, active_rows=active_rows or {})
+
+
+def _sub(result: dict, sub_id: str) -> dict:
+    return next(s for s in result['subsections'] if s['id'] == sub_id)
+
+
 class TestBuildEscalationQueuesSubsections:
-    """Tests for build_escalation_queues(config) subsection shape and de-duplication."""
+    """Subsections built from the corpus: same shape, corpus_queues order, root rows only."""
 
-    def _make_config(self, tmp_path, primary: Path, extra: list[Path] | None = None):
-        """Build a DashboardConfig with given project roots."""
-        from dashboard.config import DashboardConfig
-
-        return DashboardConfig(
-            project_root=primary,
-            known_project_roots=extra or [],
-        )
-
-    def test_orchestrator_subsections_created_per_root(self, tmp_path):
-        """One orchestrator subsection per root, plus one reconciliation subsection."""
-        from dashboard.data.escalations import build_escalation_queues
-
+    def test_one_subsection_per_queue_in_corpus_order(self, tmp_path):
         primary = tmp_path / 'primary'
         reify = tmp_path / 'reify'
-        primary.mkdir()
-        reify.mkdir()
+        config = _config(primary, [primary, reify])
+        _put(_queues_dir(primary), _record('esc-1-1'))
+        _put(_queues_dir(reify), _record('esc-2-1'))
+        _put(_recon_dir(config), _record('esc-3-1'))
 
-        # Primary escalations
-        primary_esc_dir = primary / 'data' / 'escalations'
-        primary_esc_dir.mkdir(parents=True)
-        _write_esc(primary_esc_dir, 'esc-p1.json', _esc('esc-p1', task_id='1'))
+        result = _build(config)
 
-        # Reify escalations
-        reify_esc_dir = reify / 'data' / 'escalations'
-        reify_esc_dir.mkdir(parents=True)
-        _write_esc(reify_esc_dir, 'esc-r1.json', _esc('esc-r1', task_id='2'))
-
-        # Reconciliation escalations
-        recon_esc_dir = primary / 'data' / 'reconciliation' / 'escalations'
-        recon_esc_dir.mkdir(parents=True)
-        _write_esc(recon_esc_dir, 'esc-rc1.json', _esc('esc-rc1', task_id='3'))
-
-        config = self._make_config(tmp_path, primary, [reify])
-        result = build_escalation_queues(config)
-
-        assert 'subsections' in result
-        subsections = result['subsections']
-        assert len(subsections) == 3
-
-    def test_subsection_order_primary_first(self, tmp_path):
-        """Primary root is first, then known_project_roots, then reconciliation."""
-        from dashboard.data.escalations import build_escalation_queues
-
-        primary = tmp_path / 'primary'
-        reify = tmp_path / 'reify'
-        primary.mkdir()
-        reify.mkdir()
-        (primary / 'data' / 'escalations').mkdir(parents=True)
-        (reify / 'data' / 'escalations').mkdir(parents=True)
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
-
-        config = self._make_config(tmp_path, primary, [reify])
-        result = build_escalation_queues(config)
-        subsections = result['subsections']
-
-        # Use .resolve() to match what DashboardConfig.__post_init__ stores;
-        # on macOS /tmp is a symlink to /private/tmp so str(primary) may differ
-        # from the stored resolved path.
-        assert subsections[0]['id'] == str(primary.resolve())
-        assert subsections[0]['label'] == 'primary'
-        assert subsections[0]['kind'] == 'orchestrator'
-
-        assert subsections[1]['id'] == str(reify.resolve())
-        assert subsections[1]['label'] == 'reify'
-        assert subsections[1]['kind'] == 'orchestrator'
-
-        assert subsections[2]['id'] == 'reconciliation'
-        assert subsections[2]['label'] == 'fused-memory'
-        assert subsections[2]['kind'] == 'reconciliation'
-
-    def test_archive_excluded_from_orchestrator_subsection(self, tmp_path):
-        """Files in archive/ subdir are not included in orchestrator subsection escalations."""
-        from dashboard.data.escalations import build_escalation_queues
-
-        primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-
-        # Root-level — should appear
-        _write_esc(esc_dir, 'esc-root.json', _esc('esc-root', task_id='1'))
-
-        # Archive — should NOT appear
-        archive_dir = esc_dir / 'archive' / '2026-05-27'
-        archive_dir.mkdir(parents=True)
-        _write_esc(archive_dir, 'esc-old.json', _esc('esc-old', task_id='99'))
-
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
-
-        orch = result['subsections'][0]
-        ids = {e['id'] for e in orch['escalations']}
-        assert 'esc-root' in ids
-        assert 'esc-old' not in ids
-
-    def test_dedup_primary_not_repeated_in_known_roots(self, tmp_path):
-        """If config.project_root also appears in known_project_roots, it appears once."""
-        from dashboard.data.escalations import build_escalation_queues
-
-        primary = tmp_path / 'primary'
-        primary.mkdir()
-        (primary / 'data' / 'escalations').mkdir(parents=True)
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
-
-        # known_project_roots includes the primary root — should be de-duped
-        config = self._make_config(tmp_path, primary, [primary])
-        result = build_escalation_queues(config)
-
-        orchestrator_subsections = [s for s in result['subsections'] if s['kind'] == 'orchestrator']
-        ids = [s['id'] for s in orchestrator_subsections]
-        # Use .resolve() to match the stored resolved path (DashboardConfig resolves roots).
-        assert ids.count(str(primary.resolve())) == 1, 'Primary root should appear exactly once'
-
-    def test_each_subsection_has_escalations_list(self, tmp_path):
-        """Each subsection carries an 'escalations' list."""
-        from dashboard.data.escalations import build_escalation_queues
-
-        primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-1.json', _esc('esc-1'))
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
-
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
-
+        assert [(s['id'], s['label'], s['kind']) for s in result['subsections']] == [
+            (str(primary.resolve()), 'primary', 'orchestrator'),
+            (str(reify.resolve()), 'reify', 'orchestrator'),
+            ('reconciliation', 'fused-memory', 'reconciliation'),
+        ]
         for sub in result['subsections']:
-            assert 'escalations' in sub
-            assert isinstance(sub['escalations'], list)
+            assert set(sub) >= {'id', 'label', 'kind', 'escalations', 'skipped', 'summary'}
+            assert set(sub['summary']) == {'by_level', 'by_status', 'skipped_count'}
+
+    def test_rows_are_the_escalation_fields_plus_project(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        record = _record('esc-1-1', task_id='7', level=1)
+        _put(_queues_dir(primary), record)
+
+        (row,) = _sub(_build(config), str(primary.resolve()))['escalations']
+
+        assert row['project'] == 'primary'
+        assert {k: v for k, v in row.items() if k not in ('project', 'project_root')} == record
+
+    def test_archived_records_are_not_rows_but_count_in_open_in_history(self, tmp_path):
+        from dashboard.data.escalation_corpus import EscalationView
+
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        _put(_queues_dir(primary), _record('esc-1-1'))
+        _put(_queues_dir(primary), _record('esc-1-2'), archived=True)
+
+        sub = _sub(_build(config), str(primary.resolve()))
+
+        assert [row['id'] for row in sub['escalations']] == ['esc-1-1']
+        assert sub['views'][EscalationView.QUEUE_PENDING].value == 1
+        assert sub['views'][EscalationView.OPEN_IN_HISTORY].value == 2
+
+    def test_top_level_views_cover_every_queue_at_the_corpus_instant(self, tmp_path):
+        from dashboard.data.datum import validate_datum
+        from dashboard.data.escalation_corpus import EscalationView
+
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        config = _config(primary, [reify])
+        for n in (1, 2):
+            _put(_queues_dir(primary), _record(f'esc-1-{n}'))
+        for n in (3, 4, 5):
+            _put(_queues_dir(primary), _record(f'esc-1-{n}'), archived=True)
+        _put(_queues_dir(primary), _record('esc-1-6', status='resolved'))
+        _put(_queues_dir(reify), _record('esc-2-1'))
+        _put(_recon_dir(config), _record('esc-3-1'))
+
+        views = _build(config)['views']
+
+        assert views[EscalationView.QUEUE_PENDING].value == 4
+        assert views[EscalationView.OPEN_IN_HISTORY].value == 7
+        for datum in views.values():
+            assert datum.as_of == NOW
+            validate_datum(datum, NOW)
 
     def test_orchestrator_subsection_reports_skipped_files(self, tmp_path):
-        """A corrupt queue file is reported in the subsection's ``skipped`` list.
-
-        INV-2 (``structured-facts-at-failure``): a queue that reports fewer
-        escalations than it holds must say so in the payload, not only in a
-        WARNING line a human tailing stderr may never see.
-        """
-        from dashboard.data.escalations import build_escalation_queues
-
+        """INV-2: a queue that reads fewer escalations than it holds says so in the payload."""
         primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
-        (esc_dir / 'esc-bad.json').write_text('{not json')
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+        config = _config(primary)
+        esc_dir = _queues_dir(primary)
+        _put(esc_dir, _record('esc-good-1'))
+        (esc_dir / 'esc-bad-1.json').write_text('{not json')
 
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
+        sub = _sub(_build(config), str(primary.resolve()))
 
-        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
+        assert [e['id'] for e in sub['escalations']] == ['esc-good-1']
+        (entry,) = sub['skipped']
+        assert set(entry) == {'path', 'error', 'location'}
+        assert isinstance(entry['path'], str) and entry['path'].endswith('esc-bad-1.json')
+        assert isinstance(entry['error'], str) and entry['error']
+        assert entry['location'] == 'root'
+        assert sub['summary']['skipped_count'] == 1
 
-        assert 'skipped' in primary_sub, (
-            'each subsection must carry a `skipped` list — pass a fresh accumulator '
-            'to load_queue_escalations and stringify its records into the subsection'
-        )
-        assert isinstance(primary_sub['skipped'], list)
-        assert len(primary_sub['skipped']) == 1, (
-            f"expected exactly one skip record, got {primary_sub['skipped']!r}"
-        )
+    def test_an_unreadable_archive_file_is_skipped_with_its_location(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        archive = _queues_dir(primary) / 'archive' / '2026-09-01'
+        archive.mkdir(parents=True)
+        (archive / 'esc-bad-1.json').write_text('{not json')
 
-        entry = primary_sub['skipped'][0]
-        assert set(entry.keys()) == {'path', 'error'}, (
-            "skip records keep the reader's own {'path', 'error'} shape — no "
-            'renamed or extra fields'
-        )
-        assert isinstance(entry['path'], str), (
-            '`path` must be stringified at this payload boundary — a Path reaching '
-            'JSONResponse would 500 the endpoint'
-        )
-        assert entry['path'].endswith('esc-bad.json'), (
-            'the record must name the FILE that was dropped, not its directory'
-        )
-        assert isinstance(entry['error'], str) and entry['error'], (
-            '`error` must be a non-empty str naming why the file could not be read'
-        )
+        sub = _sub(_build(config), str(primary.resolve()))
 
-        # A skip must not drop readable records.
-        assert [e['id'] for e in primary_sub['escalations']] == ['esc-good'], (
-            'the good escalation must still be returned alongside the skip report'
-        )
+        assert [e['location'] for e in sub['skipped']] == ['archive']
+        assert sub['summary']['skipped_count'] == 1
 
     def test_skipped_is_per_subsection_not_shared(self, tmp_path):
-        """Each subsection gets its OWN skipped list — no shared accumulator.
-
-        ``load_queue_escalations`` **appends** to the accumulator it is handed,
-        so one list shared across every call site would attribute every queue's
-        skips to every subsection: a single corrupt file in one orchestrator's
-        queue would render as N badges across N unrelated projects.  That is a
-        worse lie than the current silence.
-        """
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
         reify = tmp_path / 'reify'
-        primary.mkdir()
-        reify.mkdir()
+        config = _config(primary, [reify])
+        _put(_queues_dir(primary), _record('esc-1-1'))
+        (_queues_dir(primary) / 'esc-bad-1.json').write_text('{not json')
+        _put(_queues_dir(reify), _record('esc-2-1'))
+        _put(_recon_dir(config), _record('esc-3-1'))
 
-        primary_esc = primary / 'data' / 'escalations'
-        primary_esc.mkdir(parents=True)
-        _write_esc(primary_esc, 'esc-p1.json', _esc('esc-p1'))
-        (primary_esc / 'esc-bad.json').write_text('{not json')
-
-        reify_esc = reify / 'data' / 'escalations'
-        reify_esc.mkdir(parents=True)
-        _write_esc(reify_esc, 'esc-r1.json', _esc('esc-r1'))
-
-        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
-        recon_dir.mkdir(parents=True)
-        _write_esc(recon_dir, 'esc-rc1.json', _esc('esc-rc1'))
-
-        config = self._make_config(tmp_path, primary, [reify])
-        result = build_escalation_queues(config)
+        result = _build(config)
 
         primary_id = str(primary.resolve())
-        primary_sub = next(s for s in result['subsections'] if s['id'] == primary_id)
-        others = [s for s in result['subsections'] if s['id'] != primary_id]
-
-        assert len(others) == 2, 'expected the reify + reconciliation subsections'
-        assert len(primary_sub['skipped']) == 1
-        assert primary_sub['skipped'][0]['path'].endswith('esc-bad.json')
-        for sub in others:
-            assert sub['skipped'] == [], (
-                f"subsection {sub['id']!r} must not inherit another queue's skips — "
-                'pass a FRESH list per load_queue_escalations call site'
-            )
+        assert len(_sub(result, primary_id)['skipped']) == 1
+        for sub in result['subsections']:
+            if sub['id'] != primary_id:
+                assert sub['skipped'] == []
 
     def test_reconciliation_subsection_reports_skipped_files(self, tmp_path):
-        """The reconciliation queue reports its own skips, one entry per file."""
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-p1.json', _esc('esc-p1'))
+        config = _config(primary)
+        _put(_queues_dir(primary), _record('esc-1-1'))
+        recon = _recon_dir(config)
+        recon.mkdir(parents=True)
+        (recon / 'esc-bad-1.json').write_text('{not json')
+        (recon / 'esc-bad-2.json').write_text('also not json')
 
-        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
-        recon_dir.mkdir(parents=True)
-        (recon_dir / 'esc-bad-1.json').write_text('{not json')
-        (recon_dir / 'esc-bad-2.json').write_text('also not json')
+        result = _build(config)
 
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
-
-        recon_sub = next(s for s in result['subsections'] if s['id'] == 'reconciliation')
-        orch_subs = [s for s in result['subsections'] if s['kind'] == 'orchestrator']
-
-        assert len(recon_sub['skipped']) == 2, (
-            'one skip record per unreadable file, not one per queue'
-        )
-        assert {Path(e['path']).name for e in recon_sub['skipped']} == {
+        assert {Path(e['path']).name for e in _sub(result, 'reconciliation')['skipped']} == {
             'esc-bad-1.json', 'esc-bad-2.json',
         }
-        for sub in orch_subs:
-            assert sub['skipped'] == [], (
-                "an orchestrator subsection must not inherit the reconciliation queue's skips"
-            )
+        assert _sub(result, str(primary.resolve()))['skipped'] == []
 
     def test_skipped_reports_os_errors_end_to_end(self, tmp_path):
-        """The ``OSError`` arm reaches the payload too, not just ``JSONDecodeError``.
+        """The OSError arm reaches the payload too, not just a decode failure.
 
-        Every other test here corrupts a file's *content*, exercising only the
-        decode arm of the reader's ``except (JSONDecodeError, OSError)``.  The
-        OSError arm is the one likelier to hit a whole directory at once
-        (permission fault, a file vanishing mid-scan, a truncated mount), so if
-        only the decode arm reached the payload the worst real failure would
-        still be silent.
-
-        A directory named ``weird.json`` makes ``read_text()`` raise
-        ``IsADirectoryError`` — a deterministic OSError needing no chmod games
-        (which no-op under root) or monkeypatching.  Same device as
-        ``TestLoadQueueEscalations::test_skipped_records_os_errors_not_just_decode_errors``,
-        here driven end-to-end through ``build_escalation_queues``.
+        A directory named like a queue file makes ``read_text()`` raise
+        ``IsADirectoryError``. It is named ``esc-*.json`` because the corpus
+        walks ``iter_all_escalation_paths``' ``esc-*.json`` glob — the
+        documented population change from ``load_queue_escalations``' ``*.json``.
         """
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-p1.json', _esc('esc-p1'))
-        (esc_dir / 'weird.json').mkdir()
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+        config = _config(primary)
+        esc_dir = _queues_dir(primary)
+        _put(esc_dir, _record('esc-1-1'))
+        (esc_dir / 'esc-weird-1.json').mkdir()
 
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
+        sub = _sub(_build(config), str(primary.resolve()))
 
-        primary_sub = result['subsections'][0]
-        assert [e['id'] for e in primary_sub['escalations']] == ['esc-p1'], (
-            'an unreadable entry must not drop the readable records beside it'
-        )
-        assert len(primary_sub['skipped']) == 1
-        entry = primary_sub['skipped'][0]
-        assert Path(entry['path']).name == 'weird.json'
-        assert isinstance(entry['error'], str) and entry['error'], (
-            'an OSError skip must carry a non-empty cause, same as a decode skip'
-        )
-        assert primary_sub['summary']['skipped_count'] == 1
+        assert [e['id'] for e in sub['escalations']] == ['esc-1-1']
+        (entry,) = sub['skipped']
+        assert Path(entry['path']).name == 'esc-weird-1.json'
+        assert entry['error']
+        assert sub['summary']['skipped_count'] == 1
 
     def test_payload_with_skips_is_json_serializable(self, tmp_path):
-        """The built payload survives ``json.dumps`` — the stringify claim, pinned.
-
-        Three docstrings justify stringifying ``path`` at this boundary with "a
-        ``Path`` reaching ``JSONResponse`` would 500 the endpoint".  That claim
-        was asserted only indirectly (``isinstance(path, str)``); this pins it
-        directly, through the shaper the API layer actually calls, so a future
-        refactor that lets a ``Path`` back into the payload fails here rather
-        than at runtime on the one poll where a queue file is corrupt.
-        """
-        import json as _json
-
-        from dashboard.data.escalations import build_escalation_queues
+        """What the API layer hands ``JSONResponse`` survives ``json.dumps``."""
+        from dashboard.data.escalations import card_datums
         from dashboard.data.redux_api import shape_escalations
 
         primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-p1.json', _esc('esc-p1'))
+        config = _config(primary)
+        esc_dir = _queues_dir(primary)
+        _put(esc_dir, _record('esc-1-1'))
         (esc_dir / 'esc-bad-1.json').write_text('{not json')
-        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
-        recon_dir.mkdir(parents=True)
-        (recon_dir / 'esc-bad-2.json').write_text('also not json')
+        recon = _recon_dir(config)
+        recon.mkdir(parents=True)
+        (recon / 'esc-bad-2.json').write_text('also not json')
 
-        config = self._make_config(tmp_path, primary)
-        queues = build_escalation_queues(config)
+        queues = _build(config)
+        shaped = shape_escalations(queues, card_datums(queues, {}), served_at=NOW)
+        encoded = json.dumps(shaped)
 
-        # Raw builder output serializes...
-        _json.dumps(queues)
-        # ...and so does what the API layer actually hands JSONResponse.
-        shaped = shape_escalations(queues, {})
-        encoded = _json.dumps(shaped)
-
-        assert 'esc-bad-1.json' in encoded and 'esc-bad-2.json' in encoded, (
-            'the serialized payload must still name the unreadable files'
-        )
+        assert 'esc-bad-1.json' in encoded and 'esc-bad-2.json' in encoded
         assert shaped['ESCALATIONS']['summary']['skipped_count'] == 2
 
 
+class TestOwnerAttribution:
+    """Each row's owning root: its queue's, or — for reconciliation — worktree, then active rows."""
+
+    def test_an_orchestrator_row_is_owned_by_its_queue_root(self, tmp_path):
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        config = _config(primary, [reify])
+        _put(_queues_dir(reify), _record('esc-2-1', task_id='9'))
+
+        (row,) = _sub(_build(config), str(reify.resolve()))['escalations']
+
+        assert row['project'] == 'reify'
+        assert row['project_root'] == str(reify.resolve())
+
+    def test_a_reconciliation_row_with_a_worktree_is_owned_by_that_root(self, tmp_path):
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        config = _config(primary, [reify])
+        worktree = str(reify / '.worktrees' / '9')
+        _put(_recon_dir(config), _record('esc-9-1', task_id='9', worktree=worktree))
+
+        (row,) = _sub(_build(config), 'reconciliation')['escalations']
+
+        assert row['project'] == 'reify'
+        assert row['project_root'] == str(reify.resolve())
+
+    def test_a_reconciliation_row_without_worktree_is_owned_by_the_root_it_is_active_in(
+        self, tmp_path,
+    ):
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        config = _config(primary, [reify])
+        _put(_recon_dir(config), _record('esc-7-1', task_id='7'))
+        active = {
+            str(primary.resolve()): [{'id': 8}],
+            str(reify.resolve()): [{'id': 7}],
+        }
+
+        (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
+
+        assert row['project'] == 'reify'
+        assert row['project_root'] == str(reify.resolve())
+
+    def test_the_first_root_wins_when_the_task_is_active_in_several(self, tmp_path):
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        config = _config(primary, [reify])
+        _put(_recon_dir(config), _record('esc-7-1', task_id='7'))
+        active = {
+            str(primary.resolve()): [{'id': 7}],
+            str(reify.resolve()): [{'id': 7}],
+        }
+
+        (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
+
+        assert row['project_root'] == str(primary.resolve())
+
+    def test_roots_sharing_a_basename_attribute_to_the_root_the_task_is_active_in(
+        self, tmp_path,
+    ):
+        primary = tmp_path / 'a' / 'proj'
+        other = tmp_path / 'b' / 'proj'
+        config = _config(primary, [other])
+        _put(_recon_dir(config), _record('esc-7-1', task_id='7'))
+        active = {
+            str(primary.resolve()): [{'id': 8}],
+            str(other.resolve()): [{'id': 7}],
+        }
+
+        (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
+
+        assert row['project'] == 'proj'
+        assert row['project_root'] == str(other.resolve())
+
+    def test_a_reconciliation_row_active_nowhere_has_no_owner(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        _put(_recon_dir(config), _record('esc-7-1', task_id='7'))
+
+        (row,) = _sub(_build(config, {str(primary.resolve()): [{'id': 8}]}),
+                      'reconciliation')['escalations']
+
+        assert row['project'] is None
+        assert row['project_root'] is None
+
+
+class TestCardTaskRefs:
+    """The task ids a request must look up: every attributable row with a numeric id."""
+
+    def test_refs_name_the_owning_root_and_the_numeric_id(self, tmp_path):
+        from dashboard.data.escalations import card_task_refs
+        from dashboard.data.task_lookup import TaskRef
+
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        config = _config(primary, [reify])
+        _put(_queues_dir(primary), _record('esc-1-1', task_id='1'))
+        _put(_queues_dir(primary), _record('esc-x-1', task_id='not-a-number'))
+        _put(_queues_dir(reify), _record('esc-2-1', task_id='2'))
+        _put(_recon_dir(config), _record('esc-3-1', task_id='3'))
+        _put(_recon_dir(config), _record('esc-4-1', task_id='4'))
+
+        refs = card_task_refs(_build(config, {str(reify.resolve()): [{'id': 3}]}))
+
+        assert refs == {
+            TaskRef(str(primary.resolve()), 1),
+            TaskRef(str(reify.resolve()), 2),
+            TaskRef(str(reify.resolve()), 3),
+        }
+
+
+class TestCardDatums:
+    """Every row gets a task Datum: the lookup's answer, or an unknown that says why."""
+
+    def _fixture(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        _put(_queues_dir(primary), _record('esc-1-1', task_id='1'))
+        _put(_queues_dir(primary), _record('esc-2-1', task_id='2'))
+        _put(_queues_dir(primary), _record('esc-none-1', task_id=''))
+        _put(_queues_dir(primary), _record('esc-x-1', task_id='abc'))
+        _put(_recon_dir(config), _record('esc-7-1', task_id='7'))
+        return primary, _build(config)
+
+    def test_every_row_is_keyed_and_reasons_say_which_case(self, tmp_path):
+        from dashboard.data.datum import Datum, DatumState
+        from dashboard.data.escalations import card_datums
+        from dashboard.data.task_lookup import TaskRef
+
+        primary, queues = self._fixture(tmp_path)
+        root = str(primary.resolve())
+        found = Datum({'id': 1, 'title': 'one'}, NOW, DatumState.FRESH, None, 1200)
+
+        cards = card_datums(queues, {TaskRef(root, 1): found})
+
+        assert set(cards) == {
+            (root, 'esc-1-1'), (root, 'esc-2-1'), (root, 'esc-none-1'),
+            (root, 'esc-x-1'), ('reconciliation', 'esc-7-1'),
+        }
+        assert cards[(root, 'esc-1-1')] is found
+        reasons = {key: cards[key].reason or '' for key in cards if key != (root, 'esc-1-1')}
+        assert 'not looked up' in reasons[(root, 'esc-2-1')]
+        assert 'no task id' in reasons[(root, 'esc-none-1')]
+        assert 'task id is not a number' in reasons[(root, 'esc-x-1')]
+        assert 'no owning project' in reasons[('reconciliation', 'esc-7-1')]
+        for key, datum in cards.items():
+            if key != (root, 'esc-1-1'):
+                assert datum.state is DatumState.UNKNOWN
+                assert datum.value is None
+
+    def test_one_esc_id_in_two_queues_keeps_two_entries(self, tmp_path):
+        from dashboard.data.escalations import card_datums
+
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        _put(_queues_dir(primary), _record('esc-101-1', task_id='101'))
+        _put(_recon_dir(config), _record('esc-101-1', task_id='101'))
+
+        cards = card_datums(_build(config), {})
+
+        assert set(cards) == {
+            (str(primary.resolve()), 'esc-101-1'), ('reconciliation', 'esc-101-1'),
+        }
+
+
 # ---------------------------------------------------------------------------
-# Tests for build_escalation_queues — summary counts (step 9)
+# Tests for build_escalation_queues — summary counts
 # ---------------------------------------------------------------------------
 
 class TestBuildEscalationQueuesSummary:
-    """Tests for per-subsection and top-level summary bucketing."""
-
-    def _make_config(self, tmp_path, primary: Path, extra: list[Path] | None = None):
-        from dashboard.config import DashboardConfig
-
-        return DashboardConfig(
-            project_root=primary,
-            known_project_roots=extra or [],
-        )
+    """Per-subsection and top-level summary bucketing over the live-queue rows."""
 
     def test_per_subsection_summary_shape(self, tmp_path):
-        """Each subsection has a summary dict with by_level and by_status keys."""
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-1.json', _esc('esc-1', level=0, status='pending'))
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+        config = _config(primary)
+        _put(_queues_dir(primary), _record('esc-1-1'))
 
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
-
-        for sub in result['subsections']:
-            assert 'summary' in sub
-            s = sub['summary']
-            assert 'by_level' in s
-            assert 'by_status' in s
-            assert set(s['by_level'].keys()) == {0, 1, 2}
-            assert set(s['by_status'].keys()) == {'pending', 'resolved', 'dismissed'}
+        for sub in _build(config)['subsections']:
+            assert set(sub['summary']['by_level']) == {0, 1, 2}
+            assert set(sub['summary']['by_status']) == {'pending', 'resolved', 'dismissed'}
 
     def test_per_subsection_counts_correct(self, tmp_path):
-        """Subsection summary counts only its own escalations."""
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
         reify = tmp_path / 'reify'
-        primary.mkdir()
-        reify.mkdir()
+        config = _config(primary, [reify])
+        _put(_queues_dir(primary), _record('esc-1-1', level=0, status='pending'))
+        _put(_queues_dir(primary), _record('esc-1-2', level=1, status='resolved'))
+        _put(_queues_dir(primary), _record('esc-1-3', level=2, status='dismissed'))
+        _put(_queues_dir(primary), _record('esc-1-4', level=2), archived=True)
+        _put(_queues_dir(reify), _record('esc-2-1', level=1, status='pending'))
 
-        primary_esc = primary / 'data' / 'escalations'
-        primary_esc.mkdir(parents=True)
-        _write_esc(primary_esc, 'esc-p1.json', _esc('esc-p1', level=0, status='pending'))
-        _write_esc(primary_esc, 'esc-p2.json', _esc('esc-p2', level=1, status='resolved'))
-        _write_esc(primary_esc, 'esc-p3.json', _esc('esc-p3', level=2, status='dismissed'))
+        result = _build(config)
+        primary_sub = _sub(result, str(primary.resolve()))
+        reify_sub = _sub(result, str(reify.resolve()))
 
-        reify_esc = reify / 'data' / 'escalations'
-        reify_esc.mkdir(parents=True)
-        _write_esc(reify_esc, 'esc-r1.json', _esc('esc-r1', level=1, status='pending'))
-
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
-
-        config = self._make_config(tmp_path, primary, [reify])
-        result = build_escalation_queues(config)
-
-        # Use .resolve() to match the stored resolved path (DashboardConfig resolves roots).
-        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
-        reify_sub = next(s for s in result['subsections'] if s['id'] == str(reify.resolve()))
-
-        # primary: 1 at level 0, 1 at level 1, 1 at level 2
-        assert primary_sub['summary']['by_level'][0] == 1
-        assert primary_sub['summary']['by_level'][1] == 1
-        assert primary_sub['summary']['by_level'][2] == 1
-
-        # primary: 1 pending, 1 resolved, 1 dismissed
-        assert primary_sub['summary']['by_status']['pending'] == 1
-        assert primary_sub['summary']['by_status']['resolved'] == 1
-        assert primary_sub['summary']['by_status']['dismissed'] == 1
-
-        # reify: 1 at level 1 only
-        assert reify_sub['summary']['by_level'][0] == 0
-        assert reify_sub['summary']['by_level'][1] == 1
+        assert primary_sub['summary']['by_level'] == {0: 1, 1: 1, 2: 1}
+        assert primary_sub['summary']['by_status'] == {
+            'pending': 1, 'resolved': 1, 'dismissed': 1,
+        }
+        assert reify_sub['summary']['by_level'] == {0: 0, 1: 1, 2: 0}
 
     def test_top_level_summary_aggregates_all_subsections(self, tmp_path):
-        """Top-level summary aggregates counts from ALL subsections."""
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-1.json', _esc('esc-1', level=0, status='pending'))
-        _write_esc(esc_dir, 'esc-2.json', _esc('esc-2', level=1, status='resolved'))
+        config = _config(primary)
+        _put(_queues_dir(primary), _record('esc-1-1', level=0, status='pending'))
+        _put(_queues_dir(primary), _record('esc-1-2', level=1, status='resolved'))
+        _put(_recon_dir(config), _record('esc-3-1', level=2, status='dismissed'))
 
-        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
-        recon_dir.mkdir(parents=True)
-        _write_esc(recon_dir, 'esc-rc1.json', _esc('esc-rc1', level=2, status='dismissed'))
+        top = _build(config)['summary']
 
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
-
-        assert 'summary' in result
-        top = result['summary']
-        assert top['by_level'][0] == 1
-        assert top['by_level'][1] == 1
-        assert top['by_level'][2] == 1
-        assert top['by_status']['pending'] == 1
-        assert top['by_status']['resolved'] == 1
-        assert top['by_status']['dismissed'] == 1
+        assert top['by_level'] == {0: 1, 1: 1, 2: 1}
+        assert top['by_status'] == {'pending': 1, 'resolved': 1, 'dismissed': 1}
 
     def test_unknown_level_and_status_excluded_from_buckets_but_in_list(self, tmp_path):
-        """Escalations with unknown level/status are excluded from counts but stay in escalations list."""
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
+        config = _config(primary)
+        _put(_queues_dir(primary), _record('esc-1-1', level=0, status='pending'))
+        _put(_queues_dir(primary), _record('esc-1-2', level=3, status='weird'))
 
-        esc_valid = _esc('esc-valid', level=0, status='pending')
-        esc_unknown = {'id': 'esc-unknown', 'task_id': '99', 'level': 3, 'status': 'weird'}
-        _write_esc(esc_dir, 'esc-valid.json', esc_valid)
-        _write_esc(esc_dir, 'esc-unknown.json', esc_unknown)
+        sub = _sub(_build(config), str(primary.resolve()))
 
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+        assert {e['id'] for e in sub['escalations']} == {'esc-1-1', 'esc-1-2'}
+        assert sum(sub['summary']['by_level'].values()) == 1
+        assert sum(sub['summary']['by_status'].values()) == 1
 
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
+    def test_skipped_count_sits_beside_the_counts_without_inflating_them(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        esc_dir = _queues_dir(primary)
+        _put(esc_dir, _record('esc-1-1', level=1))
+        (esc_dir / 'esc-bad-1.json').write_text('{not json')
+        recon = _recon_dir(config)
+        recon.mkdir(parents=True)
+        (recon / 'esc-bad-2.json').write_text('also not json')
 
-        primary_sub = result['subsections'][0]
+        result = _build(config)
+        primary_sub = _sub(result, str(primary.resolve()))
 
-        # Both escalations still in the list
-        ids = {e['id'] for e in primary_sub['escalations']}
-        assert 'esc-valid' in ids
-        assert 'esc-unknown' in ids
-
-        # Only the valid one counted
-        assert primary_sub['summary']['by_level'][0] == 1
+        assert primary_sub['summary']['skipped_count'] == 1
         assert sum(primary_sub['summary']['by_level'].values()) == 1
-        assert primary_sub['summary']['by_status']['pending'] == 1
-        assert sum(primary_sub['summary']['by_status'].values()) == 1
-
-    def test_per_subsection_summary_carries_skipped_count(self, tmp_path):
-        """``skipped_count`` sits beside the counts it explains, and does not inflate them.
-
-        The summary dict is precisely "the per-level/per-status counts that may
-        be quietly low"; the skip count is the honest annotation on those counts,
-        read by the same consumers at the same nesting.
-        """
-        from dashboard.data.escalations import build_escalation_queues
-
-        primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good', level=1, status='pending'))
-        (esc_dir / 'esc-bad.json').write_text('{not json')
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
-
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
-
-        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
-        recon_sub = next(s for s in result['subsections'] if s['id'] == 'reconciliation')
-
-        assert primary_sub['summary']['skipped_count'] == 1, (
-            'the summary must report how many files this queue could not read'
-        )
-        assert recon_sub['summary']['skipped_count'] == 0, (
-            "a clean queue's skipped_count is 0, not another queue's count"
-        )
-
-        # The skip must NOT inflate the level/status counts it qualifies.
-        assert sum(primary_sub['summary']['by_level'].values()) == 1
-        assert primary_sub['summary']['by_level'][1] == 1
-        assert sum(primary_sub['summary']['by_status'].values()) == 1
-        assert primary_sub['summary']['by_status']['pending'] == 1
-
-    def test_top_level_summary_aggregates_skipped_count(self, tmp_path):
-        """The top-level rollup sums every subsection's skips."""
-        from dashboard.data.escalations import build_escalation_queues
-
-        primary = tmp_path / 'primary'
-        primary.mkdir()
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
-        (esc_dir / 'esc-bad.json').write_text('{not json')
-
-        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
-        recon_dir.mkdir(parents=True)
-        (recon_dir / 'esc-bad-rc.json').write_text('also not json')
-
-        config = self._make_config(tmp_path, primary)
-        result = build_escalation_queues(config)
-
-        assert result['summary']['skipped_count'] == 2, (
-            'the top-level summary must aggregate skipped_count across every '
-            'subsection, through the same _merge_summaries path the level/status '
-            'counts already take'
-        )
+        assert result['summary']['skipped_count'] == 2
 
     def test_skipped_count_zero_when_all_files_readable(self, tmp_path):
-        """``skipped_count`` is always present — never conditionally absent.
-
-        A missing key reads as "unknown" and forces every consumer into a
-        ``.get(..., 0)`` guess; an explicit 0 states the fact.
-        """
-        from dashboard.data.escalations import build_escalation_queues
-
         primary = tmp_path / 'primary'
         reify = tmp_path / 'reify'
-        primary.mkdir()
-        reify.mkdir()
+        config = _config(primary, [reify])
+        _put(_queues_dir(primary), _record('esc-1-1'))
 
-        esc_dir = primary / 'data' / 'escalations'
-        esc_dir.mkdir(parents=True)
-        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
-        (reify / 'data' / 'escalations').mkdir(parents=True)
-        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
-
-        config = self._make_config(tmp_path, primary, [reify])
-        result = build_escalation_queues(config)
+        result = _build(config)
 
         for sub in result['subsections']:
-            assert sub['summary']['skipped_count'] == 0, (
-                f"subsection {sub['id']!r} has no unreadable files — skipped_count "
-                'must be present and 0'
-            )
+            assert sub['summary']['skipped_count'] == 0
         assert result['summary']['skipped_count'] == 0
 
 
@@ -1038,7 +999,7 @@ class TestResolveOwningProjectPrefixRegression:
 
         wt = str(ws2 / '.worktrees' / '42')
         esc = _esc('esc-reg-1', task_id='42', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'workspace-2', (
             f"Expected 'workspace-2' but got {result!r} — "
             "sibling-prefix false positive not fixed"
@@ -1058,7 +1019,7 @@ class TestResolveOwningProjectPrefixRegression:
 
         wt = str(ws_extra / '.worktrees' / '42')
         esc = _esc('esc-reg-2', task_id='42', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None, (
             f"Expected None but got {result!r} — "
             "sibling-prefix false positive not fixed"
@@ -1089,7 +1050,7 @@ class TestResolveOwningProjectPrefixRegression:
         # Its name string-starts-with ".worktrees" but it is NOT under worktrees_root.
         wt = str(proj_a / '.worktrees-archive' / '42')
         esc = _esc('esc-reg-3', task_id='42', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None, (
             f"Expected None but got {result!r} — "
             ".worktrees-archive false-matched .worktrees root via string prefix"
@@ -1402,8 +1363,15 @@ class TestFetchPinsRecovery:
         assert 'proj8102' in result
         assert result['proj8102'] is None
 
+    @virtual_clock_test
     async def test_timeout_maps_to_none(self):
-        """A project that does not answer inside per_call_timeout is UNKNOWN."""
+        """A project that does not answer inside per_call_timeout is UNKNOWN,
+        while a sibling that did answer keeps its read.
+
+        The answering project must beat the same deadline the slow one misses;
+        on the host clock a stalled worker made it miss that deadline too, so
+        this is a shared.testing_virtual_clock.virtual_clock_test.
+        """
         from dashboard.data.escalations import fetch_pins_recovery
 
         handler = _PinsHandler(

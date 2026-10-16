@@ -93,7 +93,7 @@ class TestAssertStoreMutationAllowed:
     def test_returns_normally_when_creation_is_permitted(self, tmp_path, monkeypatch):
         monkeypatch.setenv('MEM0_DIR', str(tmp_path))
 
-        assert_store_mutation_allowed(operation='unit-test') is None  # noqa: B015
+        assert assert_store_mutation_allowed(operation='unit-test') is None
 
     def test_leaves_no_probe_file_behind(self, tmp_path, monkeypatch):
         """The probe is scratch, not residue: a guard that littered the mem0

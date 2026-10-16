@@ -161,7 +161,8 @@ to wake itself on new escalation files — don't conflate the two.
 The **restart coordinator** (`service_restart.py`,
 `StaleServiceRestartCoordinator`) also lives inside the harness, not as a
 separate process — it arms on merge-landed events and fires detached
-restart scripts for fused-memory and the dashboard (see
+restart scripts for fused-memory, the dashboard and the orchestrator fleet
+itself (the last passes `--drain`; see
 [OPERATIONS.md](OPERATIONS.md)).
 
 ### 2.2 fused-memory (shared, one process, three ports)
@@ -192,9 +193,13 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
 - **`scripts/orchestrator-watchdog.py`** — a systemd-timer oneshot
   (`OnBootSec=30`, `OnUnitActiveSec=60`). Its liveness pass TCP-probes each
   orchestrator's escalation port and revives a wedged unit immediately; its
-  separate staleness pass allows at most one fleet-wide redeploy per 8
-  hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`),
-  delegating to `scripts/restart-all-orchestrators.sh --drain`. Full
+  separate staleness pass *intends* at most one fleet-wide redeploy per 8
+  hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`,
+  plus an in-flight lease), delegating to
+  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that
+  halts merge admission and holds each unit's restart while a merge verify is
+  in flight, until it ends or passes its own deadline (a sweep-wide cap bounds
+  the wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 
@@ -234,12 +239,14 @@ default `.worktrees`), alongside ephemeral merge/probe/sweep worktrees
 (pre-created, reused worktrees) exist in code (`warm_lane_pool.py`) but
 default off and are not enabled for this project.
 
-An OS-level sandbox (bubblewrap/Landlock) for implementer/debugger agents is
-built and wired (`SandboxConfig`, `agents/sandbox_dispatch.py`) but is
-**disabled by default** across the fleet today — see §9. This is separate
-from fused-memory's reconciliation confinement
-(`reconciliation/sandbox_guard.py`), which *is* enabled and fail-closed in
-production.
+An OS-level write sandbox for the implementer, debugger and simple_task
+agents is **enabled on this fleet** (`SandboxConfig`,
+`agents/sandbox_dispatch.py`), with `backend: landlock` pinned in each
+project's config. The shipped default stays off, so enablement is explicit
+per-project config. Status and census: `docs/sandbox-fleet-status.md`; what
+it does not cover: §9. This is separate from fused-memory's reconciliation
+confinement (`reconciliation/sandbox_guard.py`), which is likewise enabled
+and fail-closed in production.
 
 ---
 
@@ -635,8 +642,12 @@ and are not restated here.
   `CONVERT_TO_BLOCKED` in all four branch states, landed-but-pinned rows
   included; the normative rule is spec §7.2. The applier,
   `Harness._reconcile_one_stranded` (`harness.py`), writes `blocked`, files
-  nothing and writes no `done_provenance`. Conversion is a legibility action,
-  not a recovery: the row keeps its pin and does not self-heal. Its exit is
+  nothing and writes no `done_provenance`. It stamps `metadata.strand_converted`
+  (`shared/src/shared/strand_conversion.py::StrandConverted`: `at`, `shape`,
+  `pinning_escalation_ids`) and emits one `strand_converted` event naming the
+  same records (`orchestrator/src/orchestrator/strand_conversion.py`).
+  Conversion is a legibility action, not a recovery: the row keeps its pin
+  and does not self-heal. Its exit is
   its record's resolution — by a human, or, for a dead-filer L0, by the
   supervised consumer that takes it once the orphan-L0 reaper has promoted it
   to L1 ("Orphaned L0 records" below) — where a `resume` re-pends it (§6).
@@ -702,10 +713,10 @@ matter most for reasoning about safety:
   `done`/`blocked`/etc. indirectly, through the workflow's own choke points
   (`_mark_blocked`, `_finalise_merged_done`, `DeterministicRunner`) — no
   other agent can unilaterally declare a task's fate.
-- **`sandboxed=True`** is set on `implementer` and `debugger` only — the two
-  roles that write code. See §9: this sandbox is currently disabled
-  fleet-wide, so today this is a scope *declaration* enforced by convention
-  and file-locking, not an OS-enforced boundary.
+- **`sandboxed=True`** is set on `implementer`, `debugger` and
+  `simple_task`. For those roles it is an OS-enforced write boundary on this
+  fleet (Landlock; `docs/sandbox-fleet-status.md`), not just a scope
+  declaration. §9 lists what it does not cover.
 
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
@@ -717,7 +728,7 @@ matter most for reasoning about safety:
 | `merger` | Merge-conflict resolution | Conservative conflict resolution with a drop-aware protocol | opus / max / $5 / 50 |
 | `steward` | ESCALATED (persistent, per task) | L0 escalation handling; the only role that may set task status | opus / high / $5 / 100 |
 | `deep_reviewer` | ReviewCheckpoint (every ~40 merges) | Cross-task integration review; can file its own tasks/escalations | opus / max / $15 / 100 |
-| `simple_task` | Fast path (`complexity='simple'`) | Single-agent explore → plan → implement → commit | sonnet / high / $2.50 / 50 |
+| `simple_task` | Fast path (`complexity='simple'`) | Single-agent explore → plan → implement → commit; sandboxed | sonnet / high / $2.50 / 50 |
 | `triage` (defined in `agents/triage.py`, outside `ROLES`) | Steward pre-triage of large suggestion batches | ACCEPT/SKIP classification of review suggestions | sonnet / medium / $2 / 25 |
 | `module_tagger` (no `AgentRole`) | Pre-dispatch batch | Predicts `metadata.files` for module-lock prediction | haiku / medium / $2 / 30 |
 | `unblock_auto` (skill-level) | `/unblock-low-risk`, watcher dry-run | Read-only, risk-labelled fix proposal | sonnet / high / $5 / 50 / 1200s |
@@ -740,7 +751,7 @@ resolver and rule vocabulary.
 ## 5. The merge lane
 
 Code lands on `main` through a **two-layer speculative merge queue**
-(`orchestrator/src/orchestrator/merge_queue.py`, class
+(`orchestrator/src/orchestrator/merge_lane/worker.py`, class
 `SpeculativeMergeWorker`, run inside the `merge-worker` lifecycle entry —
 there is no separate merge process).
 
@@ -967,7 +978,7 @@ design is in [RECONCILIATION_PLAN.md](RECONCILIATION_PLAN.md).
 |---|---|---|
 | Event store | `data/orchestrator/runs.db`, table `events` | Append-only structured events: invocation start/end, routing decisions, phase enter/exit, escalation created/resolved, merge events, train events, scheduler paused/resumed, worktree quarantined/reaped, retry-cap-exhausted, external-dep-gate-held, config-reload, and more |
 | Run/task results | same DB, tables `runs`/`task_results`/`scheduler_state` | Per-run rollups, per-task outcome/cost/duration, persisted scheduler pause state |
-| Cost ledger | same DB, tables `invocations`/`account_events` | Per-LLM-call cost, tokens, model, role, account; enforces daily cost ceilings |
+| Cost ledger | same DB, tables `invocations`/`account_events` | Per-LLM-call cost, tokens, role, account; `model` is the routing lineage alias (`opus`), `model_id` the exact CLI-served version (`claude-opus-5`, NULL when unknown); `capped`/`capped_reason` record which ceiling ended a run (`shared/src/shared/cost_store.py::CapReason`). Enforces daily cost ceilings |
 | Merge queue (live) | `mcp__escalation__get_merge_queue` | In-flight/queued requests, conflict graph, frozen prefix, metrics — the blind spot the event store alone misses |
 | Task runtime snapshot | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection |
 | Escalations | `data/escalations/` + `get_pending_escalations`/`get_escalation` | Open L0/L1/L2 escalations, categories, resolution history |
@@ -988,15 +999,17 @@ capture (crashes, startup, stack traces).
 Being direct about what's built but not (yet) turned on, so you don't assume
 a defense is active when it isn't:
 
-- **OS-level sandboxing is built but disabled everywhere today.**
-  `SandboxConfig.enabled` defaults to `True` in code, but the shipped
-  defaults (`orchestrator/src/orchestrator/defaults.yaml`) override it to
-  `false`, and no project config re-enables it. Dispatch resolution
-  (`auto → landlock → bwrap → none`) fails open to `none` in practice, so
-  `implementer`/`debugger`'s `sandboxed=True` flag is a scope declaration
-  today, not an enforced OS boundary. (Separately, fused-memory's
-  reconciliation confinement *is* enabled and fail-closed — a different
-  subsystem, not covered by this caveat.)
+- **The OS sandbox confines writes only, and only for three roles.**
+  `implementer`, `debugger` and `simple_task` run under Landlock on this
+  fleet, with the whole worktree as their write scope. Reads and network are
+  unscoped, and `merger`, `steward` and `architect` Bash are not confined
+  (`plans/os-sandbox-worktree-containment-prd.md` §"Out of scope
+  (explicit)"). A landlock backend that fails its probe refuses
+  sandboxed-role dispatches rather than running them unconfined;
+  `backend: none` is the escape hatch. Landlock enforcement is validated on
+  x86_64 only. Status and census: `docs/sandbox-fleet-status.md`. (Separately,
+  fused-memory's reconciliation confinement is enabled and fail-closed — a
+  different subsystem, not covered by this caveat.)
 - **An agent's shell in a worktree can import first-party code from main,
   not the worktree.** Each worktree gets its own independent root `.venv`,
   never a shared one, once cold-verified. A project can set
@@ -1027,7 +1040,7 @@ a defense is active when it isn't:
   these; this repo currently doesn't.
 
 None of these are secret — they're deliberate, documented trade-offs (see
-`plans/os-sandbox-worktree-containment-research-2026-07-22.md` for the
-sandbox rollout status specifically) rather than bugs. If you're adopting
-dark-factory for a project with stronger isolation requirements, treat
-sandbox enablement as a prerequisite to evaluate, not an assumption.
+`docs/sandbox-fleet-status.md` for the sandbox rollout status specifically)
+rather than bugs. If you're adopting dark-factory for a project with
+stronger isolation requirements, treat sandbox enablement as a prerequisite
+to evaluate, not an assumption.

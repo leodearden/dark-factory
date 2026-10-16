@@ -4,7 +4,9 @@
 //
 //   1. the stranded badge (strandBadgeState), at three sites;
 //   2. the agent cell it sits beside (agentCellState), at two of them;
-//   3. the Locks cell of that same row (locksCellState), at one.
+//   3. the Locks cell of that same row, at one: whether anything is known
+//      about the project's locks (schedulerLocksDatum) and what the cell draws
+//      for that answer (locksCellState).
 //
 // THE THIRD ONE ARRIVED LAST AND FOR THE SAME REASON THE FIRST TWO DID. The
 // Locks column is a cell of the identical task row, and its decision was a
@@ -56,8 +58,12 @@
 const {
   assertDatum: requireDatum,
   datumView: viewOfDatum,
+  plainDatum: plainRowDatum,
+  unknownDatum: unknownRowDatum,
   EM_DASH: DATUM_PLACEHOLDER,
 } = window.DF_DATUM;
+
+const SCHEDULER_ENDPOINT = '/api/v2/dashboard/scheduler';
 
 // ── The one true strand tooltip ──
 // Exported once because all three render sites (tab_tasks.jsx renderNode,
@@ -235,12 +241,31 @@ function locksCellState(datum, lockInfo) {
   };
 }
 
+// ── Is anything KNOWN about this project's locks? ──
+// The Datum locksCellState reads, decided per PROJECT. DF.SCHEDULER is the only
+// source of lock state, and a snapshot listing the project in offline_projects
+// carries no lock rows for it: drawing that empty set as chips is the "nothing
+// is held" lie locksCellState exists to refuse, so that project's cells are a
+// hole naming it.
+//
+// ONLY THAT PROJECT. The snapshot's top-level `offline` flag is raised when ANY
+// project's scheduler is offline; keyed on it, one quiet scheduler blanked every
+// project's Locks column although the snapshot still measured all the others.
+function schedulerLocksDatum(scheduler, project, receipts) {
+  if (scheduler.offline_projects.includes(project)) {
+    return unknownRowDatum(`the scheduler reports ${project} offline, so its locks were not read`);
+  }
+  return plainRowDatum(scheduler, SCHEDULER_ENDPOINT, receipts);
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced at
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision
 // here would leave window.DF_TASK_ROW_CELLS undefined and break the
 // top-level destructures in tab_tasks.jsx and tabs.jsx.
-const TASK_ROW_CELLS_API = { strandBadgeState, agentCellState, locksCellState, STRAND_TITLE, MUTED_COLOR };
+const TASK_ROW_CELLS_API = {
+  strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, STRAND_TITLE, MUTED_COLOR,
+};
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = TASK_ROW_CELLS_API;

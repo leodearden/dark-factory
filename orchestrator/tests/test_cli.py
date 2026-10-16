@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, pydantic_spec
 from click.testing import CliRunner, Result
 
 import orchestrator.cli as cli_module
@@ -2289,13 +2289,8 @@ def _wait_pgid_gone(pgid: int, *, timeout: float = 20.0, interval: float = 0.1) 
         time.sleep(interval)
 
 
-# NOTE (task 2350): widened from 30s -- fixed real-time deadlines starve
-# under heavy shared-host xdist contention even though the underlying
-# subprocess-cancel behavior is correct (timing flake, not a bug).
-# NOTE (task 2770): widened 90s -> 120s -- _wait_pgid_gone's poll-for-drain
-# (up to 20s, landed via task 2733) can still push total wall time past 90s
-# under extreme load even though the underlying cancel behavior is correct.
-@pytest.mark.timeout(120)
+# Slow: _wait_pgid_gone's poll-for-drain alone can take up to 20s (task 2733).
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     """End-to-end: real subprocess 'verify-merge --request-id X' is killed by cancel-verify.
 

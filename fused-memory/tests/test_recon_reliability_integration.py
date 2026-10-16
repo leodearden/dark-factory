@@ -911,9 +911,7 @@ class TestDeterministicCycleSummary:
     (test_summary_pool.py::TestWriteCycleSummaryMirrorAndTrim) and is out of
     scope here. Per Rule 5 (and plan.json's design decision), this class
     deliberately has NO grep-source / import-introspection assertion that
-    the retired nonce/verify/repair/reconstruct machinery is gone — a
-    repo-wide ``retry_nonce`` grep would falsely hit residual prompt prose
-    in ``prompts/stage2.py`` owned by a downstream task.
+    the retired nonce/verify/repair/reconstruct machinery is gone.
     """
 
     _PROJECT = 'proj-d1-cycle-summary'

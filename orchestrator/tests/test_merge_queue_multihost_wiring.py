@@ -25,6 +25,7 @@ from _merge_lane_fakes import FakeVerifier, raises
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RemoteRunner
@@ -1078,7 +1079,7 @@ class TestColdShadowVerifyLocalOnly:
 
         with patch('orchestrator.merge_queue.run_scoped_verification',
                    new=AsyncMock(return_value=_make_pass_result())):
-            await _run_cold_shadow_verify(git_ops, req, 'abc123', es)
+            await _run_cold_shadow_verify(git_ops, req, 'abc123', es, verifier=PRODUCTION_VERIFIER)
 
         dispatched_on = es.field('runner')
         assert dispatched_on, 'cold shadow emitted no verify dispatch event'
@@ -1126,7 +1127,7 @@ class TestRunDriftCheck:
 
     async def test_agree_emits_verdict_parity_ok(self, tmp_path):
         """When local and remote agree, a verdict_parity_ok event is emitted."""
-        from orchestrator.merge_queue import _run_drift_check
+        from orchestrator.merge_lane.drift import _run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -1139,6 +1140,7 @@ class TestRunDriftCheck:
         await _run_drift_check(
             git_ops, req, 'abc123', eq, es, quarantine_set,
             allocator=allocator,
+            verifier=PRODUCTION_VERIFIER,
         )
 
         assert es.types().count('verdict_parity_ok') >= 1
@@ -1159,7 +1161,7 @@ class TestRunDriftCheck:
         its injected scoped-verify callable, so nothing reaches into the
         runner it built.
         """
-        from orchestrator.merge_queue import _run_drift_check
+        from orchestrator.merge_lane.drift import _run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -1171,6 +1173,7 @@ class TestRunDriftCheck:
             await _run_drift_check(
                 git_ops, req, 'abc123', None, None, set(),
                 allocator=allocator,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         git_ops.create_throwaway_verify_worktree.assert_called_once_with('abc123')
@@ -1192,7 +1195,7 @@ class TestRunDriftCheck:
 
     async def test_diverge_submits_escalation_and_quarantines(self, tmp_path):
         """When local passes but remote fails (divergence), escalation submitted + remote quarantined."""
-        from orchestrator.merge_queue import _run_drift_check
+        from orchestrator.merge_lane.drift import _run_drift_check
 
         config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
         req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
@@ -1211,6 +1214,7 @@ class TestRunDriftCheck:
         await _run_drift_check(
             git_ops, req, 'abc123', eq, es, quarantine_set,
             allocator=allocator,
+            verifier=PRODUCTION_VERIFIER,
         )
 
         # Remote must be quarantined in the shared set
@@ -1246,7 +1250,7 @@ class TestMaybeRunDriftCheck:
         worker = self._make_worker(config)
 
         with patch('asyncio.create_task') as mock_create_task:
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha1')
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
 
         mock_create_task.assert_not_called()
 
@@ -1264,21 +1268,21 @@ class TestMaybeRunDriftCheck:
 
         with patch('asyncio.create_task') as mock_create_task:
             # First land (count=1): no trigger
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha1')
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
             assert worker._drift_land_count == 1
             assert mock_create_task.call_count == 0
 
             # Second land (count=2): trigger
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha2')
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha2', verifier=PRODUCTION_VERIFIER)
             assert worker._drift_land_count == 2
             assert mock_create_task.call_count == 1
 
             # Third land (count=3): no trigger
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha3')
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha3', verifier=PRODUCTION_VERIFIER)
             assert mock_create_task.call_count == 1
 
             # Fourth land (count=4): trigger again
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha4')
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha4', verifier=PRODUCTION_VERIFIER)
             assert mock_create_task.call_count == 2
 
     async def test_increments_drift_land_count(self, tmp_path):
@@ -1291,9 +1295,9 @@ class TestMaybeRunDriftCheck:
         worker = self._make_worker(config)
 
         with patch('asyncio.create_task'):
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha1')
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha2')
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha3')
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha2', verifier=PRODUCTION_VERIFIER)
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha3', verifier=PRODUCTION_VERIFIER)
 
         assert worker._drift_land_count == 3
 
@@ -1369,7 +1373,7 @@ class TestDriftCheckTaskGCSafety:
         )
 
         try:
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha1')
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
 
             # Yield so the scheduler starts the task and it reaches gate.wait()
             await asyncio.sleep(0)
@@ -1749,8 +1753,8 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         The warm swap is driven through the REAL ``_acquire_warm_verify_worktree``
         (spec-lane-pool knob on + speculative item + valve disabled, the three
         preconditions of its ``_spec-`` branch) with only ``git_ops`` stubbed —
-        never by monkeypatching the helper onto ``orchestrator.merge_queue``,
-        which ``test_merge_queue_reachback_patch_guard`` freezes.  So the True
+        never by monkeypatching the helper onto ``orchestrator.merge_queue``.
+        So the True
         asserted below is the value production would compute, not one injected.
         """
         from orchestrator.config import GitConfig, OrchestratorConfig
@@ -2897,7 +2901,7 @@ class TestClearVerifyHostUnreachable:
 
     def test_resolves_open_pending_l1(self):
         """Pending L1 for the host sentinel is resolved (resolve() called with its id)."""
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         sentinel = _verify_host_unreachable_sentinel('host1')
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(sentinel, 'esc-1001')
@@ -2907,7 +2911,7 @@ class TestClearVerifyHostUnreachable:
 
     def test_pending_l1_no_longer_pending_after_call(self):
         """After the call the seeded L1 is no longer returned by get_by_task(..., status='pending')."""
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         sentinel = _verify_host_unreachable_sentinel('myhost')
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(sentinel, 'esc-2002')
@@ -2918,7 +2922,7 @@ class TestClearVerifyHostUnreachable:
     def test_emits_verify_host_recovered_event(self):
         """When event_store is provided and an alarm was open, a recovered event is emitted."""
         from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('recover-host'))
         es = _FakeEventStore()
@@ -2929,7 +2933,7 @@ class TestClearVerifyHostUnreachable:
     def test_recovery_event_names_the_host(self):
         """The emitted verify_host_recovered event data includes the host name."""
         from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('my-box'))
         es = _FakeEventStore()
@@ -2940,7 +2944,7 @@ class TestClearVerifyHostUnreachable:
 
     def test_submits_info_severity_recovery_escalation(self):
         """An info-severity recovery escalation is submitted when an alarm was open."""
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
         self._call(eq, None, 'recovered-host', downtime_s=60.0)
@@ -2950,7 +2954,7 @@ class TestClearVerifyHostUnreachable:
 
     def test_recovery_escalation_has_level_0(self):
         """The recovery escalation is level=0 (informational, not L1 blocking)."""
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('recovered-host'))
         self._call(eq, None, 'recovered-host', downtime_s=60.0)
@@ -2960,7 +2964,7 @@ class TestClearVerifyHostUnreachable:
 
     def test_recovery_escalation_names_the_host(self):
         """Recovery escalation summary, detail, or task_id includes the host name."""
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('worker-node'))
         self._call(eq, None, 'worker-node', downtime_s=90.0)
@@ -2984,7 +2988,7 @@ class TestClearVerifyHostUnreachable:
 
     def test_no_event_when_event_store_none(self):
         """No event store → no event emitted; info escalation still submitted when alarm was open."""
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         eq = _FakeEscalationQueueWithResolution()
         eq.seed_pending_l1(_verify_host_unreachable_sentinel('host1'))
         self._call(eq, None, 'host1', downtime_s=60.0)
@@ -3189,7 +3193,7 @@ class TestReprobeQuarantinedHosts:
 
     async def test_healthy_host_recovery_escalation_submitted(self):
         """health()=True with an open alarm → _clear_verify_host_unreachable submits info escalation."""
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
         worker, eq = make_reprobe_worker()
 
         fake_runner = MagicMock()
@@ -3393,7 +3397,7 @@ class TestReprobeIsTrackerDriven:
     async def test_tracked_but_unquarantined_host_recovers_fully(self):
         """Strand host + green health() → readmitted, tracker popped, L1 resolved, event emitted."""
         from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+        from orchestrator.merge_lane.liveness import _verify_host_unreachable_sentinel
 
         worker, eq = make_reprobe_worker()
         es = _FakeEventStore()

@@ -1,98 +1,80 @@
-"""SQLite persistence for load sampler metrics.
+"""SQLite persistence for the load sampler's per-tick samples.
 
 Schema
 ------
-samples(ts INTEGER, metric TEXT, value REAL, window_mean REAL, window_max REAL)
-    idx_samples_metric_ts ON samples(metric, ts)
+``SCHEMA`` is its one spelling.
 
-meta(key TEXT PRIMARY KEY, value TEXT)
-    Tracks last_vacuum_ts for the daily VACUUM gate and last_cleanup_ts for
-    the daily retention gate. The two are independent clocks.
+samples(ts, metric, value, window_mean, window_max, leaf)
+    One row per metric per tick. ``leaf`` is the cgroup leaf a per-leaf metric
+    was read at, NULL for a host-level metric, and is the last column.
+    idx_samples_metric_ts_leaf ON samples(metric, ts, leaf) serves every read
+    by metric. idx_samples_metric_leaf_ts ON samples(metric, leaf, ts), partial
+    on ``leaf IS NOT NULL``, serves the per-leaf trailing window.
 
-Design
-------
-Mirrors orchestrator.run_store.RunStore:
-- connect-per-call (no persistent connection)
-- apply_full_durability_pragmas_sync on every connection
-- IF NOT EXISTS schema (idempotent _ensure_schema)
+meta(key, value)
+    Two independent clocks: last_cleanup_ts for the retention gate and
+    last_vacuum_ts for the VACUUM gate.
 
-The unit of writing is the TICK, not the row: write_tick(ts, unwindowed=,
-windowed=) reads every trailing window and inserts every row on one connection
-inside one transaction, so a tick's cost is flat in its metric count and a
-tick reaches the corpus whole or not at all (see its docstring for both
-measurements). insert_sample remains the single-row primitive, with no
-production caller of its own -- see its docstring.
+Migration
+---------
+A file written before the ``leaf`` column existed is migrated when the store
+is built: additive and feature-detected, the column is added and every legacy
+``metric:leaf`` row is split into its two columns, and the indexes are swapped,
+in one transaction (``_migrate``).
 
-Retention policy
-----------------
-- cleanup_old(now): DELETE rows outside ±30 days of now — the future half
-  prunes clock-skew rows a past-only cutoff can never reach. Called every
-  tick, gated by meta.last_cleanup_ts to at most once per 24h because the
-  DELETE is a full table SCAN and cannot be index-backed.
-- maybe_vacuum(now): VACUUM at most once per 24h, gated by meta.last_vacuum_ts
-  AND by a floor on the free-page fraction, because at the 30-day size a
-  steady-state VACUUM stalls a tick for seconds to reclaim almost nothing.
-  VACUUM runs outside a transaction to satisfy SQLite constraints.
-- Both gates read _is_due, which treats a stamp in the FUTURE as due — a
-  forward clock step must not be able to disable either sweep.
+Connections
+-----------
+Every connection comes from the injected ``connect``, ``connect_durably`` by
+default, and lives for one call.
 
-Every number behind those two policies lives on the method that implements it
-(``cleanup_old``, ``maybe_vacuum``): the scan cost and the rejected ts index,
-the VACUUM's cost and what a steady-state day actually reclaims. They are not
-restated here, so there is one copy to keep true.
+Writing
+-------
+The unit of writing is the TICK: ``write_tick`` lands a whole tick in one
+transaction, or none of it.
 
-The 30-day window is what the threshold calibration in PRD
-``plans/load-throttle-harmonisation-prd.md`` D11 needs: a fortnight of
-production load with enough margin either side to see a weekly cycle.
-
-Sizing, measured on this host rather than estimated, so the next reader
-inherits the numbers instead of re-deriving them:
-
-    metrics/tick   25  (6 PSI + 3 process + 2 runqueue + 2 x 7 cgroup leaves)
-    ticks/day      17,280  (the paired .timer's OnUnitActiveSec=5s)
-    rows/day       432,000
-    rows at 30 d   12,960,000
-    bytes/row      125.3  including the index, which is 43% of the file
-    file at 30 d   ~1.62 GB
-
-against ~19 MB for the 9-metric, 24-hour steady state this replaces — about
-85x, NOT the ~30x the originating task estimated. That estimate counted the
-retention widening (24 h -> 30 d) but not the metric-count widening (9 -> 25)
-that lands in the same change.
+Retention
+---------
+``cleanup_old`` keeps the rows within ±30 days of now and runs at most once a
+day. ``maybe_vacuum`` runs at most once a day, and only when the reclaimable
+fraction of the file is worth a whole-file rewrite. Both gates treat a stamp in
+the future as due.
 
 Trailing window
 ---------------
-trailing_window(metric, current_value, window=60):
-  Reads the last `window-1` rows from the DB for the metric, combines with
-  current_value, returns (fmean, max).  Under the oneshot model the in-process
-  ring-buffer approach is impossible; DB-backed windows are the only option.
+A windowed metric's ``window_mean``/``window_max`` cover its current value and
+the most recent stored rows of the same (metric, leaf). The window is read
+from the DB because every tick is a process of its own. A read seeks its own
+(metric, leaf), so a leaf with little history costs no more than a busy one.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import statistics
-from collections.abc import Mapping
 from pathlib import Path
+from typing import Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
-__all__ = ['LoadSampleStore']
+from sampler.metrics import SampleKey, Samples
+
+__all__ = ['SCHEMA', 'Connect', 'LoadSampleStore', 'connect_durably']
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA = """\
+# ``leaf`` is last because ALTER TABLE ADD COLUMN appends, so a migrated file
+# and a fresh one have the same shape.
+_TABLES_DDL = """\
 CREATE TABLE IF NOT EXISTS samples (
     ts          INTEGER NOT NULL,
     metric      TEXT    NOT NULL,
     value       REAL    NOT NULL,
     window_mean REAL,
-    window_max  REAL
+    window_max  REAL,
+    leaf        TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
-    ON samples (metric, ts);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -100,23 +82,105 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+_INDEXES_DDL = (
+    'CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf)',
+    'CREATE INDEX IF NOT EXISTS idx_samples_metric_leaf_ts ON samples (metric, leaf, ts)'
+    ' WHERE leaf IS NOT NULL',
+)
+
+SCHEMA: str = '\n'.join([_TABLES_DDL, *(f'{ddl};' for ddl in _INDEXES_DDL)]) + '\n'
+
+# The right-hand sides read the row's OLD metric, so one statement splits it.
+_SPLIT_LEGACY_KEYS_SQL = (
+    "UPDATE samples SET metric = substr(metric, 1, instr(metric, ':') - 1),"
+    " leaf = substr(metric, instr(metric, ':') + 1)"
+    " WHERE instr(metric, ':') > 0"
+)
+
 
 # A VACUUM is worth its whole-file rewrite only past this share of free pages.
-# Measured on the 30-day probe: a steady-state daily prune leaves ~3.3% free,
-# which the next day's inserts fully reclaim, so 10% sits clear of the normal
-# transient while still firing on a retention change or a post-outage prune.
 _VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 
 # Samples a trailing window spans, current value included. One home for it, so
 # ``write_tick`` and ``trailing_window`` cannot disagree about the span.
 _TRAILING_WINDOW_SAMPLES = 60
 
+_SET_META_SQL = 'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'
+
+_INSERT_SQL = (
+    'INSERT INTO samples (ts, metric, leaf, value, window_mean, window_max)'
+    ' VALUES (?, ?, ?, ?, ?, ?)'
+)
+
+_HOST_WINDOW_SQL = (
+    'SELECT value FROM samples WHERE metric = ? AND leaf IS NULL ORDER BY ts DESC LIMIT ?'
+)
+
+# ``leaf = ?``, never ``leaf IS ?``: only ``=`` proves the partial index's
+# ``leaf IS NOT NULL``, and without that index the read walks every newer row of
+# every other leaf of the metric.
+_LEAF_WINDOW_SQL = (
+    'SELECT value FROM samples WHERE metric = ? AND leaf = ? ORDER BY ts DESC LIMIT ?'
+)
+
+
+class Connect(Protocol):
+    def __call__(self, db_path: Path, *, autocommit: bool = False) -> sqlite3.Connection: ...
+
+
+def connect_durably(db_path: Path, *, autocommit: bool = False) -> sqlite3.Connection:
+    """Open *db_path* under the full durability pragmas; ``autocommit`` is for VACUUM.
+
+    SQLite refuses some statements inside a transaction, VACUUM among them, so
+    an autocommit connection opens with ``isolation_level=None`` from the
+    start and no pragma can begin an implicit transaction on it.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None if autocommit else 'DEFERRED')
+    apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
+    return conn
+
+
+def _create_indexes(conn: sqlite3.Connection) -> None:
+    for ddl in _INDEXES_DDL:
+        conn.execute(ddl)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Give a pre-leaf ``samples`` its ``leaf`` column, in ONE transaction.
+
+    The ADD COLUMN, the split of every legacy ``metric:leaf`` row, and the
+    swap to the leaf indexes commit together or roll back together, so a
+    failure leaves the file exactly as it was and the next construction
+    retries. The feature-detect runs under the write lock, so a concurrent
+    construction waits, then reads ``leaf`` present and does nothing.
+    Statements are ``execute()``d one by one: ``executescript`` would commit
+    first. The additive idiom is the one
+    ``orchestrator/src/orchestrator/run_store.py::RunStore._migrate_task_results_block_context``
+    follows; unlike it, a failure here raises, and the store is not built.
+    """
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(samples)')}
+        if 'leaf' in columns:
+            conn.rollback()
+            return
+        conn.execute('ALTER TABLE samples ADD COLUMN leaf TEXT')
+        split = conn.execute(_SPLIT_LEGACY_KEYS_SQL).rowcount
+        _create_indexes(conn)
+        conn.execute('DROP INDEX IF EXISTS idx_samples_metric_ts')
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info('migrated samples to the leaf column: %d metric:leaf rows split', split)
+
 
 class LoadSampleStore:
     """Synchronous SQLite writer for per-tick load samples."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, connect: Connect = connect_durably):
         self.db_path = db_path
+        self._open = connect
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
@@ -124,20 +188,21 @@ class LoadSampleStore:
     # Connection helpers
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a connection and apply the full durability pragma triad."""
-        conn = sqlite3.connect(str(self.db_path))
-        apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
-        return conn
+    def _connect(self, *, autocommit: bool = False) -> sqlite3.Connection:
+        return self._open(self.db_path, autocommit=autocommit)
 
     def _ensure_schema(self) -> None:
-        """Create the samples + meta tables and index idempotently."""
-        conn = self._connect()
-        try:
-            conn.executescript(_SCHEMA)
+        """Bring a fresh, pre-leaf or current file to ``SCHEMA``'s shape.
+
+        Tables, then the migration, then the indexes: running ``SCHEMA`` whole on
+        a pre-leaf file would fail, because its indexes name the ``leaf`` column
+        the migration has not added yet.
+        """
+        with contextlib.closing(self._connect()) as conn:
+            conn.executescript(_TABLES_DDL)
+            _migrate(conn)
+            _create_indexes(conn)
             conn.commit()
-        finally:
-            conn.close()
 
     # ------------------------------------------------------------------
     # Write
@@ -146,30 +211,17 @@ class LoadSampleStore:
     def insert_sample(
         self,
         ts: int,
-        metric: str,
+        key: SampleKey,
         value: float,
         *,
         window_mean: float | None = None,
         window_max: float | None = None,
     ) -> None:
-        """Insert a single sample row and commit.
-
-        NO PRODUCTION CALLER, deliberately, and said here so nobody has to grep
-        to find out: every tick goes through ``write_tick``, and the ~30
-        remaining call sites are all in this store's own tests, seeding rows.
-
-        Kept rather than deleted because it is the store's one-row primitive —
-        the smallest honest unit of this interface — and because deleting it
-        would rewrite those call sites into ``write_tick(ts, unwindowed=...,
-        windowed={})``, which is a wordier way to say the same thing and drags
-        the windowing machinery into tests that are not about windows.
-        """
+        """The single-row primitive; production writes go through ``write_tick``."""
         conn = self._connect()
         try:
             conn.execute(
-                'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
-                ' VALUES (?, ?, ?, ?, ?)',
-                (ts, metric, value, window_mean, window_max),
+                _INSERT_SQL, (ts, key.metric, key.leaf, value, window_mean, window_max)
             )
             conn.commit()
         finally:
@@ -179,61 +231,25 @@ class LoadSampleStore:
         self,
         ts: int,
         *,
-        unwindowed: Mapping[str, float],
-        windowed: Mapping[str, float],
+        unwindowed: Samples,
+        windowed: Samples,
         window: int = _TRAILING_WINDOW_SAMPLES,
     ) -> None:
         """Write one whole tick on ONE connection inside ONE transaction.
 
-        *unwindowed* metrics are stored with NULL window columns because their
+        *unwindowed* rows are stored with NULL window columns because their
         source already carries its own window — a PSI ``avg10`` is kernel-
-        windowed, and re-windowing it here would report a window of windows.
-        *windowed* metrics get ``window_mean``/``window_max`` computed from
-        their own trailing history.
+        windowed, and re-windowing it would report a window of windows.
+        *windowed* rows get ``window_mean``/``window_max`` from their own
+        (metric, leaf)'s trailing history. The window mode is the only axis on
+        which the store treats a metric differently; which collection group a
+        metric came from is the caller's business.
 
-        The two are separate parameters rather than one pre-shaped row list
-        because the window MODE is the only axis on which the store treats a
-        metric differently; which collection group a metric came from is the
-        caller's business and is deliberately not visible here.
-
-        COST is why this exists. Every row used to take its own connection, its
-        own five durability pragmas and its own ``synchronous=FULL`` commit,
-        and every windowed metric took a second connection for its trailing
-        window — about 44 connections and 25 fsyncs for the 25-metric tick this
-        change's vocabulary produces. Measured on this host against warmed
-        stores on ext4, the two paths INTERLEAVED in one process so host noise
-        hits both, 40 ticks each:
-
-            per-row .... 309.6 ms median (mean 330.9, max 592.8)
-            batched ....  13.2 ms median (mean  15.1, max  34.6)
-
-        23x, or 6.2% of the paired timer's 5 s cadence down to 0.26%, on a host
-        that also runs seven orchestrators.
-
-        What is FLAT in the metric count is the CONNECTION and fsync cost — one
-        of each per tick, whatever the vocabulary. The tick as a whole is not:
-        the trailing-window loop below still issues one indexed
-        ``ORDER BY ts DESC LIMIT`` per WINDOWED metric, and the load group is
-        routed there whole (``sampler.py::run_tick``), so even a 0/1
-        ``*_read_ok`` flag buys a window read. That is worth stating because the
-        cgroup leaf count is DISCOVERED per tick and nothing here bounds it — so
-        it was measured, same host and method, 40 timed ticks after 80 warm-up:
-
-            1 leaf ......   9 windowed metrics ....  4.5 ms median
-            100 leaves .. 207 windowed metrics .... 23.4 ms median
-
-        23x the metrics for 5.2x the time — the per-metric SELECT is real but
-        each one is an index seek, so 100 leaves is 0.47% of the cadence. Leaf
-        growth is affordable, not free; collapsing the N window reads into one
-        grouped query is the move if a host ever carries leaves in the thousands.
-
-        ATOMICITY comes with it and is not incidental. Every read happens
-        before any insert, and the single commit lands the whole tick or none
-        of it, so the corpus ε1/ε2 calibrate against can no longer contain a
-        tick that was cut in half by a crash — which would have read as "those
-        metrics were unreadable on that tick", a fact that never happened.
-        Reading first is also what keeps the windows identical to the per-row
-        path: no row of this tick is visible to any window of this tick.
+        Every window is read before any row is inserted, so no row of this tick
+        is visible to any window of this tick, and the single commit lands the
+        whole tick or none of it: the corpus never holds half a tick. The
+        connection and commit cost is one per tick, whatever the metric count;
+        each windowed metric still costs one indexed window read.
         """
         if not unwindowed and not windowed:
             return
@@ -242,19 +258,16 @@ class LoadSampleStore:
             # Annotated because the unwindowed comprehension alone would fix the
             # element type at ``None`` for both window columns, which the
             # windowed append below then contradicts.
-            rows: list[tuple[int, str, float, float | None, float | None]] = [
-                (ts, metric, value, None, None) for metric, value in unwindowed.items()
+            rows: list[tuple[int, str, str | None, float, float | None, float | None]] = [
+                (ts, key.metric, key.leaf, value, None, None)
+                for key, value in unwindowed.items()
             ]
-            for metric, value in windowed.items():
+            for key, value in windowed.items():
                 window_mean, window_max = self._trailing_window(
-                    conn, metric, value, window=window
+                    conn, key, value, window=window
                 )
-                rows.append((ts, metric, value, window_mean, window_max))
-            conn.executemany(
-                'INSERT INTO samples (ts, metric, value, window_mean, window_max)'
-                ' VALUES (?, ?, ?, ?, ?)',
-                rows,
-            )
+                rows.append((ts, key.metric, key.leaf, value, window_mean, window_max))
+            conn.executemany(_INSERT_SQL, rows)
             conn.commit()
         finally:
             conn.close()
@@ -266,53 +279,41 @@ class LoadSampleStore:
     @staticmethod
     def _trailing_window(
         conn: sqlite3.Connection,
-        metric: str,
+        key: SampleKey,
         current_value: float,
         *,
         window: int,
     ) -> tuple[float, float]:
-        """The window arithmetic, on a caller-supplied connection.
+        """(mean, max) over *current_value* and *key*'s ``window - 1`` latest rows.
 
-        One home for it (heuristic 11): ``write_tick`` needs it on the
-        connection it already holds, ``trailing_window`` needs it on one of its
-        own, and a second copy would be free to drift.
-
-        The span is bounded by ROW COUNT and not by time, so a "60-sample
-        window" spans whatever wall-clock those 60 rows cover: 300 s at the
-        5 s cadence, and the outage plus 300 s for a metric whose unit was
-        stopped for hours. No ``ts >=`` floor is imposed, because these
-        columns are a convenience over rows that are all kept anyway — a floor
-        would silently narrow the window instead, and a consumer that needs
-        wall-clock windows can compute them from the raw ``ts``/``value``
-        rows, which is what ``scripts/load-threshold-calibration.py`` already
-        does.
+        On the caller's connection, so ``write_tick`` reads windows inside its
+        own transaction. The span is a ROW COUNT, not a time: it covers
+        whatever wall-clock those rows do, outages included. It is scoped to
+        one (metric, leaf), so no two leaves ever share a window.
         """
-        rows = conn.execute(
-            'SELECT value FROM samples'
-            ' WHERE metric = ?'
-            ' ORDER BY ts DESC'
-            ' LIMIT ?',
-            (metric, window - 1),
-        ).fetchall()
+        if key.leaf is None:
+            rows = conn.execute(_HOST_WINDOW_SQL, (key.metric, window - 1)).fetchall()
+        else:
+            rows = conn.execute(_LEAF_WINDOW_SQL, (key.metric, key.leaf, window - 1)).fetchall()
         values = [current_value] + [r[0] for r in rows]
         return statistics.fmean(values), max(values)
 
     def trailing_window(
         self,
-        metric: str,
+        key: SampleKey,
         current_value: float,
         *,
         window: int = _TRAILING_WINDOW_SAMPLES,
     ) -> tuple[float, float]:
-        """Return (window_mean, window_max) over the last `window` samples.
+        """Return (window_mean, window_max) over *key*'s last `window` samples.
 
-        Reads the `window-1` most-recent prior DB rows for *metric*, prepends
-        *current_value*, and computes mean and max over the combined list.
-        If there are no prior rows, returns (current_value, current_value).
+        The `window - 1` most recent stored rows of the same (metric, leaf),
+        plus *current_value*; a row count, not a time span. With no prior rows
+        it is (current_value, current_value).
         """
         conn = self._connect()
         try:
-            return self._trailing_window(conn, metric, current_value, window=window)
+            return self._trailing_window(conn, key, current_value, window=window)
         finally:
             conn.close()
 
@@ -323,25 +324,9 @@ class LoadSampleStore:
     def _is_due(self, key: str, now: int, interval_seconds: int) -> bool:
         """Return True when the interval clock at *key* has run out.
 
-        One home for both gates (heuristic 11): ``should_cleanup`` and
-        ``should_vacuum`` differ only in which meta key they read, and a second
-        copy of this arithmetic was free to drift from the first.
-
-        An ABSENT record means due, so a fresh store prunes and compacts on its
-        first tick.
-
-        A record in the FUTURE also means due, and that is the non-obvious
-        half. ``now`` is ``int(time.time())`` with no monotonicity guard
-        (``sampler/src/sampler/__main__.py``), and the stamp is whatever
-        ``now`` the stamping tick carried — so one tick during a forward clock
-        step writes a stamp no later tick can reach with a plain
-        ``elapsed >= interval``. That reading would suppress BOTH the retention
-        sweep and the VACUUM for the entire skew, and the rows it would
-        preserve are exactly the future-dated ones ``cleanup_old``'s symmetric
-        cutoff exists to prune: the corpus could not heal itself from the very
-        condition that disabled the healing. Elapsed time outside
-        ``[0, interval)`` is therefore due, which reads "the clock is either
-        spent or nonsense, and running the sweep is cheap either way".
+        An absent record is due, so a fresh store prunes and compacts on its
+        first tick. A record in the FUTURE is due too, so a stamp written during
+        a forward clock step cannot disable either sweep.
         """
         last_str = self._get_meta(key)
         if last_str is None:
@@ -359,58 +344,16 @@ class LoadSampleStore:
         retain_seconds: int = 30 * 24 * 60 * 60,
         interval_seconds: int = 86400,
     ) -> None:
-        """Delete samples older than ``retain_seconds``, at most once per interval.
+        """Delete rows more than ``retain_seconds`` from ``now``, once per interval.
 
-        The default window is 30 days (see "Retention policy" above), and it
-        is SYMMETRIC about ``now``: rows more than ``retain_seconds`` in the
-        FUTURE are deleted too. Both cutoffs are exclusive — a row at exactly
+        The cutoff is SYMMETRIC about ``now``: rows that far in the future go
+        too, because a forward clock step stamps rows that no past-only cutoff
+        would ever reach. Both bounds are exclusive — a row at exactly
         ``now ± retain_seconds`` survives.
 
-        The future half is not symmetry for its own sake. ``ts`` is stamped
-        ``int(time.time())`` with no monotonicity guard
-        (``sampler/__main__.py``), so an NTP step forward, a VM
-        suspend/resume, or a hand-seeded probe row can land a sample beyond
-        any real tick. Such a row is unreachable by the past-only cutoff — it
-        outlives the whole corpus — and it is not inert: every consumer that
-        anchors on ``MAX(ts)`` (``dashboard/src/dashboard/data/load.py``'s
-        recency bound, ``trailing_window``'s ordering) is pulled forward with
-        it. Pruning it is the only path back to a healthy corpus.
-
-        The future cutoff is ``retain_seconds`` and not something tighter
-        BECAUSE THE CLOCK CUTS BOTH WAYS: a host whose clock reads
-        ``now`` too EARLY (unsynced NTP at boot) sees a healthy corpus as
-        future-dated, and a tight tolerance would delete all of it. At 30 days
-        only a clock wrong by more than a month destroys data, and a host that
-        wrong has no usable corpus either way. Consumers that need to be
-        robust to a skewed row WITHIN the window clamp their own anchor rather
-        than rely on this sweep — see load.py's ``_ANCHOR_SQL``.
-
-        The interval GATE is what makes a per-tick call affordable.
-        ``DELETE FROM samples WHERE ts < ?`` plans as ``SCAN samples``:
-        ``idx_samples_metric_ts(metric, ts)`` cannot serve a bare-ts
-        predicate, because a leading-column index does not. Measured at 2.5M
-        rows, a NO-OP cleanup — nothing old enough to delete — costs 106.7 ms;
-        extrapolated to the 12.96M-row 30-day steady state that is ~550 ms of
-        full-table scan every 5 s, forever, to delete nothing (~11% duty).
-
-        The alternative measured was ``CREATE INDEX idx_samples_ts``, which
-        turns the plan into ``SEARCH samples USING INDEX idx_samples_ts
-        (ts<?)`` at ~0 ms but grew the probe file 33% (98 -> 130 MB, i.e.
-        1.62 -> ~2.15 GB at 30 d). The gate amortises the same scan to once
-        per interval, where 550 ms is irrelevant, and costs zero extra bytes —
-        winning on 530 MB of disk and on reusing the ``should_vacuum`` /
-        ``last_vacuum_ts`` pattern that already lives in this class. Its only
-        cost, up to one interval of over-retention past 30 days, is meaningless
-        for a calibration corpus. Doing both would make the index dead weight,
-        so exactly one is taken.
-
-        ``trailing_window`` is deliberately untouched: its SELECT already
-        plans as ``SEARCH samples USING INDEX idx_samples_metric_ts
-        (metric=?)`` and measured ~0 ms at 2.5M rows.
-
-        The timestamp is stamped only AFTER the DELETE commits — maybe_vacuum's
-        ordering — so a transient failure does not suppress retries for a whole
-        interval and leave the next window double-length.
+        The DELETE is a full table scan, since no index leads with ``ts``,
+        which is why it runs at most once per interval. The interval is stamped
+        only after the DELETE commits, so a failure is retried on the next tick.
         """
         if not self.should_cleanup(now, interval_seconds=interval_seconds):
             return
@@ -440,10 +383,7 @@ class LoadSampleStore:
     def _set_meta(self, key: str, value: str) -> None:
         conn = self._connect()
         try:
-            conn.execute(
-                'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
-                (key, value),
-            )
+            conn.execute(_SET_META_SQL, (key, value))
             conn.commit()
         finally:
             conn.close()
@@ -455,9 +395,7 @@ class LoadSampleStore:
     def reclaimable_fraction(self) -> float:
         """Free pages as a fraction of the file — what a VACUUM would reclaim.
 
-        Both pragmas are header reads, not scans: measured 0.49 ms for
-        connect-plus-both against the 1.16 GB 30-day probe, so this is
-        affordable inside ``maybe_vacuum``'s own interval gate.
+        Both pragmas read the file header; neither scans the table.
         """
         conn = self._connect()
         try:
@@ -468,59 +406,26 @@ class LoadSampleStore:
         return free / total if total else 0.0
 
     def maybe_vacuum(self, now: int) -> None:
-        """VACUUM once per interval, and only when there are pages to reclaim.
+        """VACUUM at most once per interval, and only when it would reclaim enough.
 
-        The interval gate alone was sized for the 24-hour retention this class
-        shipped with. At the 30-day window (see "Retention policy" above) the
-        file is ~85x larger and VACUUM rewrites ALL of it. Measured against a
-        probe carrying this schema and the real 25-metrics-per-tick vocabulary
-        at the 30-day steady state (12,960,000 rows, 1.16 GB): VACUUM takes
-        15.5 s and reclaims 2 MB — 0.17%.
+        A VACUUM rewrites the whole file, and in the steady state the next
+        day's inserts reuse the pages a prune frees. So it runs only when
+        ``reclaimable_fraction`` reaches ``_VACUUM_MIN_RECLAIMABLE_FRACTION``,
+        as after a retention change or a bulk prune.
 
-        It reclaims so little because free pages are REUSED. One steady-state
-        day, measured on the same probe: the daily prune left
-        ``freelist_count`` at 9232, and the day's inserts took it back to 0
-        with ``page_count`` up 0.25%. So the file does not bloat at steady
-        state, and an unconditional daily VACUUM buys ~0.17% for ~15 s.
-
-        Fifteen seconds is not free: the systemd unit is Type=oneshot, so the
-        rewrite is one whole tick and the corpus ε1/ε2 calibrate against would
-        carry a ~15 s hole every day. A VACUUM also needs roughly the file size
-        again in temp space, so on a tight filesystem it raises, is swallowed
-        by the ``except`` below, and the file is then never compacted at all.
-
-        Gating on ``reclaimable_fraction`` keeps the compaction where it earns
-        its cost — after a retention change, or a post-outage bulk prune — and
-        skips it in the steady state, where ``cleanup_old`` runs first in the
-        same tick and leaves only ~3.3% free for the next day's inserts to
-        consume.
-
-        A skip STAMPS the clock: deciding there is nothing to reclaim is a
-        successful evaluation, not the transient failure the retry rule below
-        exists for, and stamping keeps the pragma read to once per interval
-        instead of once per 5 s tick.
+        A skip stamps the clock: finding nothing to reclaim is a successful
+        evaluation. A VACUUM stamps it only on success, and a failure, opening
+        the connection included, is logged and retried on the next eligible
+        tick.
         """
         if not self.should_vacuum(now):
             return
         if self.reclaimable_fraction() < _VACUUM_MIN_RECLAIMABLE_FRACTION:
             self._set_meta('last_vacuum_ts', str(now))
             return
-        # VACUUM must run outside a transaction.  Connect with isolation_level=None
-        # (autocommit) from the start so that pragma application inside
-        # apply_full_durability_pragmas_sync cannot begin an implicit transaction
-        # that would cause VACUUM to error with
-        # "cannot VACUUM from within a transaction".
-        conn = sqlite3.connect(str(self.db_path), isolation_level=None)
         try:
-            apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
-            conn.execute('VACUUM')
-            # Record the timestamp only after a successful VACUUM so that a
-            # transient VACUUM failure doesn't suppress retries for 24h.
-            conn.execute(
-                'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
-                ('last_vacuum_ts', str(now)),
-            )
+            with contextlib.closing(self._connect(autocommit=True)) as conn:
+                conn.execute('VACUUM')
+                conn.execute(_SET_META_SQL, ('last_vacuum_ts', str(now)))
         except Exception:
             logger.exception('VACUUM failed; will retry on next eligible tick')
-        finally:
-            conn.close()

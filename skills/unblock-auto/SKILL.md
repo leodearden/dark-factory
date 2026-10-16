@@ -41,6 +41,11 @@ If the orchestrator could not fetch the task record, you get an explicit
 silently missing block. When you see it you are investigating with neither the task
 text nor its declared scope — label scope conservatively.
 
+If the fetch succeeded but the record carries no title, description, details or
+declared files, you get `**Task record:** fetched but empty` instead. Treat it the
+same way: there is no task text and no declared scope to judge against, so label
+scope conservatively.
+
 ---
 
 ## Step 1: Gather context (read-only)
@@ -100,7 +105,7 @@ landing on the current `main` tip (e.g. "post-merge verify failed", a
 rebase conflict, a pyright/lint break against the new main tip) — this
 investigation is running on the **merge-stage completion mode** path
 (orchestrator `block_class == MERGE_VERIFY_RED`; see
-`orchestrator/src/orchestrator/merge_completion.py`). This is narrower than
+`orchestrator/src/orchestrator/merge_lane/completion.py`). This is narrower than
 the general risk assessment above: only label `risk_label: "low"` for
 **MECHANICAL** completion classes:
 

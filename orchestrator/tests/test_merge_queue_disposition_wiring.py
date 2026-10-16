@@ -973,7 +973,7 @@ class TestEmitMergeAttemptSkewEvidence:
         truncated row, exactly as "guards parse zero test ids" was inferred from
         a row that never carried evidence. ``<key>_total`` makes the truncation
         self-describing."""
-        from orchestrator.merge_queue import _MAX_EVENT_EVIDENCE_ITEMS
+        from orchestrator.merge_lane.gates import _MAX_EVENT_EVIDENCE_ITEMS
 
         shas = tuple(f'{i:040x}' for i in range(22))
         files = tuple(f'src/f{i}.py' for i in range(22))

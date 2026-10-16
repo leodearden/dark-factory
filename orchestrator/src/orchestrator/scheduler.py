@@ -11,9 +11,10 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, MutableSet, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
@@ -29,8 +30,11 @@ from shared.mcp_envelope import parse_tool_result, resolver_failed
 from shared.psi import PsiSample, read_psi_sample
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import parse_metadata
+from shared.task_metadata_wire import coerce_task_metadata
+from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
+from orchestrator.anchor_coverage_gate import AnchorCoverageGate
 from orchestrator.config import (
     DEFAULT_TIER,
     PRIORITY_RANK,
@@ -43,12 +47,26 @@ from orchestrator.config import (
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
-from orchestrator.guard_state import PersistentSet, guard_path
+from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
-from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.pending_age import AnchorReading, read_pending_age
+from orchestrator.pin_reservation import (
+    Blocker,
+    BlockerKind,
+    ParkPriority,
+    PinBlockedLimiter,
+    PinOrder,
+    ReservationSource,
+    is_pin_rank,
+    park_rank,
+    pin_release_reason,
+    priority_payload,
+    rank_payload,
+)
 from orchestrator.recovery_emission import (
     LeaveReason,
     RecoverySite,
@@ -63,14 +81,15 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
+from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
-# How long a task is remembered as having been non-pending (task 5352).  An
-# upper bound on the subject, not a tuning dial: thirty days is the horizon
-# over which a resurrected task could still be pending and still be claiming
-# an age bonus it did not earn.  The longest of the four guard TTLs because
-# its subject is the longest-lived.
+# How long a task's age-anchor record outlives the last write that recorded
+# it (task 5352).  Every age-guard write re-records every anchor in the active
+# fetch, so only a departed task's record expires, or a live one through a
+# whole TTL with no write; a restart then re-anchors that task to its own id.
+# The longest of the four guard TTLs because its subject is the longest-lived.
 _RESURRECTION_GUARD_TTL = timedelta(days=30)
 
 if TYPE_CHECKING:
@@ -80,11 +99,12 @@ if TYPE_CHECKING:
     # scheduler<->escalation module-load coupling.
     from escalation.queue import EscalationQueue
 
-# task_skipped events for "effectively infinite" skip thresholds (>= this
-# value) are rate-limited to a geometric schedule so the event store is not
-# flooded with diagnostics for tasks that will perpetually lose the race.
+# Geometric emission schedule for per-task diagnostics that can repeat every
+# tick: task_skipped under an "effectively infinite" skip threshold (>= the
+# value below) and reservation_install_blocked.  Emitting only at these counts
+# keeps the event store from flooding for tasks that perpetually lose a race.
 _INF_SKIP_THRESHOLD: int = 1000
-_GEOMETRIC_SKIP_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000})
+_GEOMETRIC_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000})
 
 # set_task_status transient-failure retry attempt count and backoff schedule
 # come from the shared orchestrator.fm_retry.fm_retry_backoffs() (task 2706)
@@ -863,7 +883,7 @@ class SchedulerFacade(Protocol):
         /,
         *,
         persist_files: list[str] | None = ...,
-    ) -> bool: ...
+    ) -> BlastRadiusResult: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
     async def get_task(self, task_id: str, /) -> dict | None: ...
     async def update_task(
@@ -880,6 +900,7 @@ class SchedulerFacade(Protocol):
     def clear_requeue_count(self, task_id: str, /) -> None: ...
     def note_merge_phase_entered(self, tid: str, /) -> None: ...
     def clear_merge_phase(self, tid: str, /) -> None: ...
+    def blocked_writes_suppressed(self, task_id: str, /) -> bool: ...
 
 
 @dataclass
@@ -889,6 +910,30 @@ class TaskAssignment:
     task_id: str
     task: dict
     modules: list[str]
+
+
+@dataclass(frozen=True)
+class BlastRadiusResult:
+    """Outcome of ``Scheduler.handle_blast_radius_expansion``.
+
+    Three legal shapes:
+
+    - ``applied``: the locks now cover the refined scope;
+    - not ``applied``, no ``repend_error``: metadata.files persisted, the row
+      re-pended, and the locks released;
+    - not ``applied``, with ``repend_error``: the pending write died, and the
+      locks are deliberately still held.
+    """
+
+    applied: bool
+    repend_error: Exception | None = None
+
+    def __post_init__(self) -> None:
+        if self.applied and self.repend_error is not None:
+            raise ValueError(
+                'an applied refinement writes no pending row, so it cannot '
+                f'carry a re-pend error: {self.repend_error!r}'
+            )
 
 
 @dataclass
@@ -968,6 +1013,21 @@ class TickOutcome:
 
 
 @dataclass(frozen=True)
+class _PinCandidate:
+    """One pinned task that passed the pin queue's static filters this tick.
+
+    ``tier`` is its effective priority, ``signal`` the dispatch-cooldown
+    signal :meth:`Scheduler._eligible_for_dispatch` returned with it.
+    """
+
+    task_id: str
+    task: dict
+    pin_order: int
+    tier: str
+    signal: str | None
+
+
+@dataclass(frozen=True)
 class _BackfillGrant:
     """The facts behind one EASY-backfill admission (task 3823 / PRD C7).
 
@@ -1016,6 +1076,53 @@ class _BackfillScanCache:
 
     parks: dict[str, dict] | None = None
     delays: dict[str, float] = field(default_factory=dict)
+
+
+def _numeric_id(task_id: str) -> float:
+    """The dispatch tie-break rank of *task_id*: older numeric ids first, any non-numeric id last (PRD I-4)."""
+    return float(int(task_id)) if task_id.isdecimal() else math.inf
+
+
+def _as_stamp(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _pending_since(task: dict) -> str | None:
+    """The task's D3 ``metadata.pending_since`` stamp; None when absent or
+    malformed, never raising, because every tick reads it."""
+    metadata = task.get('metadata')
+    return _as_stamp(metadata.get('pending_since')) if isinstance(metadata, dict) else None
+
+
+@dataclass(frozen=True)
+class _AgeAnchor:
+    """A task's age anchor and the ``pending_since`` stamp it was taken at.
+
+    A later stamp that differs is D3's cancelled -> pending, which resets the
+    anchor (``Scheduler._update_age_anchors``).
+    """
+
+    anchor: int
+    pending_since: str | None
+
+    def is_reset_by(self, stamp: str | None) -> bool:
+        """Whether *stamp* differs from a known stamp.  A first stamp, where
+        none was known, is not a reset, and neither is a missing one."""
+        return bool(self.pending_since and stamp and stamp != self.pending_since)
+
+    def to_record(self) -> dict:
+        return {'anchor': self.anchor, 'pending_since': self.pending_since}
+
+    @classmethod
+    def from_record(cls, raw: object) -> _AgeAnchor | None:
+        """Parse a guard-file record; a malformed one reads as absent, keeping
+        guard_state's fail-open contract."""
+        if not isinstance(raw, dict):
+            return None
+        anchor = raw.get('anchor')
+        if not isinstance(anchor, int) or isinstance(anchor, bool):
+            return None
+        return cls(anchor, _as_stamp(raw.get('pending_since')))
 
 
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
@@ -1067,7 +1174,10 @@ class ModuleLockTable:
         # higher-priority owner PUSHES (shadows) the lower entry instead of
         # destroying it.  Restoration happens when the top entry is removed.
         # INV-3: every stack is strictly rank-decreasing top-ward (top has the
-        # lowest rank / highest priority), so depth ≤ 5 (number of priority tiers).
+        # lowest rank / highest priority), so depth is bounded by the 5 priority
+        # tiers plus the bounded number of pin reservations (task 6040).  An
+        # owner holds at most one entry per stack in each band (tier, pin), and
+        # its pin entry sits above its own tier entry.
         self._parked: dict[str, list[tuple[str, int]]] = {}
         # task_id -> ISO8601 timestamp of first install_parks call for that owner
         self._park_install_at: dict[str, str] = {}
@@ -1256,6 +1366,30 @@ class ModuleLockTable:
                 result[module] = holders
         return result
 
+    def blockers(self, task_id: str, modules: list[str]) -> list[Blocker]:
+        """Every holder and active park that would make ``try_acquire`` refuse.
+
+        Composed from :meth:`blocking_holders` and
+        :meth:`_iter_blocking_park_owners` over the same normalized keys the
+        gate tests, so it names exactly what the gate honours (INV-5): never
+        a buried park, never the requester's own.  Sorted and de-duplicated;
+        empty means the acquire would succeed.  A READ.
+        """
+        depth = self._config.lock_depth
+        found: set[Blocker] = {
+            Blocker(module, holder, BlockerKind.HELD)
+            for module, holders in self.blocking_holders(
+                modules, exclude_task=task_id
+            ).items()
+            for holder in holders
+        }
+        for module in {normalize_lock(m, depth) for m in modules}:
+            found.update(
+                Blocker(module, owner, BlockerKind.PARKED)
+                for owner in self._iter_blocking_park_owners(module, task_id)
+            )
+        return sorted(found)
+
     def _is_parked_blocks(
         self,
         module: str,
@@ -1276,28 +1410,112 @@ class ModuleLockTable:
             module, task_id, ignore_owners=ignore_owners
         ) is not None
 
+    def _owned_ranks(self, task_id: str) -> dict[str, int]:
+        """``{key: rank}`` for every stack holding *task_id* at ANY level, top or buried.
+
+        THE single definition of "the owner already parks this key": the
+        install idempotency skip, the completion remainder and ``has_parks``
+        all read it, so they cannot disagree about a buried entry.  The rank
+        is the owner's best (lowest) one on that key.
+        """
+        owned: dict[str, int] = {}
+        for module, stack in self._parked.items():
+            ranks = [rank for owner, rank in stack if owner == task_id]
+            if ranks:
+                owned[module] = min(ranks)
+        return owned
+
+    @staticmethod
+    def _covers(held_rank: int | None, rank: int | None) -> bool:
+        """True iff an owner entry at *held_rank* already covers a request at *rank*.
+
+        *held_rank* None means the owner has no entry on the key.  *rank* None
+        means "at any rank".  An entry covers a request at its own rank or any
+        weaker one; it never covers a stronger one, which is a re-rank.
+        """
+        return held_rank is not None and (rank is None or held_rank <= rank)
+
     def has_parks(self, task_id: str) -> bool:
         """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
 
-        Returns True for both active-top AND buried (shadowed) reservations so
-        that ``_bump_skip_and_maybe_park`` does not re-arm a duplicate park for a
-        shadowed owner.
+        A pure query over :meth:`_owned_ranks`, so an owner buried beneath a
+        higher-priority shadow still counts as parked.
         """
-        for stack in self._parked.values():
-            for owner, _ in stack:
-                if owner == task_id:
-                    return True
-        return False
+        return bool(self._owned_ranks(task_id))
+
+    def reservation_source(
+        self, owner: str, modules: Iterable[str] | None = None
+    ) -> ReservationSource:
+        """Why *owner*'s parks exist, derived from their ranks (task 6040).
+
+        PIN if any of the owner's entries, top or buried, sits in the pin band;
+        otherwise FAIRNESS.  *modules* (normalized keys) narrows the question
+        to the owner's best entry on each of those keys — a restore exposes
+        one specific entry, and an owner holding a pin reservation elsewhere
+        can have a fairness entry exposed here.  An owner with no matching
+        parks reads FAIRNESS, so callers that ask after a removal get the
+        automatic default rather than an error.
+        """
+        owned = self._owned_ranks(owner)
+        keys = owned.keys() if modules is None else owned.keys() & set(modules)
+        if any(is_pin_rank(owned[key]) for key in keys):
+            return ReservationSource.PIN
+        return ReservationSource.FAIRNESS
+
+    def unparked_modules(
+        self,
+        task_id: str,
+        modules: list[str],
+        priority: ParkPriority | None = None,
+    ) -> list[str]:
+        """The completion rule's remainder (task 5308): keys *task_id* has not parked.
+
+        Normalizes *modules* exactly as :meth:`install_parks` does, drops empty
+        keys, de-duplicates, and subtracts every key the owner already parks
+        at ANY stack level.  Sorted.
+
+        For a tier *priority*, or none, an entry at ANY rank counts as owned —
+        a buried entry and a pin entry included — because fairness completion
+        fills coverage gaps and never re-ranks.  For a :class:`PinOrder`, a
+        key counts as owned only at that pin rank or better (task 6040): the
+        owner's own fairness entry does not cover its pin reservation, which
+        :meth:`install_parks` then stacks above it.
+        """
+        depth = self._config.lock_depth
+        owned = self._owned_ranks(task_id)
+        floor = park_rank(priority) if isinstance(priority, PinOrder) else None
+        requested = {normalize_lock(m, depth) for m in modules}
+        return sorted(
+            m for m in requested if m and not self._covers(owned.get(m), floor)
+        )
 
     def install_parks(
-        self, task_id: str, modules: list[str], priority: str
+        self, task_id: str, modules: list[str], priority: ParkPriority
     ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Install reservations on the normalized form of *modules* for *task_id*.
 
         Returns ``(installed, shadowed)`` where *installed* is the list of
-        normalized modules actually parked (as the active top) and *shadowed* is
-        a list of ``(owner_id, modules_shadowed)`` for any lower-priority parks
-        that were PUSHED beneath the new reservation (retained, not destroyed).
+        normalized modules NEWLY parked, or re-ranked upward, as the active
+        top by this call and *shadowed* is a list of
+        ``(owner_id, modules_shadowed)`` for any lower-priority parks that
+        were PUSHED beneath the new reservation (retained, not destroyed).
+
+        *priority* is a tier name or a :class:`PinOrder`; :func:`park_rank`
+        resolves either to the stack rank (task 6040).
+
+        Idempotent per owner (task 5308): a key *task_id* already parks at
+        *priority* or better, at any stack level (:meth:`_owned_ranks`), is
+        skipped, and so is a second input normalizing to a key this call
+        already handled.  A key it parks at a LOWER priority is a rank
+        upgrade: it runs the same conflict scan at the new rank and, unless
+        blocked, a new entry goes on top at the new rank and the key is
+        reported in *installed*; a blocked upgrade keeps the old entry.  The
+        upgrade replaces the owner's old entry in the SAME band
+        (:func:`is_pin_rank`).  A pin reservation leaves the owner's tier
+        entry in place beneath it (task 6040), so releasing the pin restores
+        that fairness park as it was.  Either way the owner holds at most one
+        entry per band per stack, never reports shadowing itself, and is
+        never downgraded.
 
         Cross-tier preemption (INV-1): if the active TOP of a conflicting stack
         has ``existing_rank > new_rank`` (strictly lower priority), the new entry
@@ -1312,15 +1530,16 @@ class ModuleLockTable:
         restorable after the preemptor clears (step-12 fix).
         """
         depth = self._config.lock_depth
-        rank = PRIORITY_RANK[coerce_tier(priority)]
+        rank = park_rank(priority)
         installed: list[str] = []
         # Accumulate shadows: victim_owner -> list of original module keys shadowed.
         shadow_acc: dict[str, list[str]] = {}
         # Track insertion order of shadowed owners for stable output.
         shadow_order: list[str] = []
+        owned = self._owned_ranks(task_id)
         for m in modules:
             normalized = normalize_lock(m, depth)
-            if not normalized:
+            if not normalized or self._covers(owned.get(normalized), rank):
                 continue
             # Scan only the ACTIVE TOP of each conflicting stack (INV-2).
             to_shadow: list[tuple[str, str]] = []  # (parked_m_key, victim_owner)
@@ -1356,10 +1575,16 @@ class ModuleLockTable:
                     shadow_order.append(victim_owner)
                 shadow_acc[victim_owner].append(parked_m)
 
-            # Push task_id onto the top of the (possibly freshly created) stack.
-            if normalized not in self._parked:
-                self._parked[normalized] = []
-            self._parked[normalized].append((task_id, rank))
+            # Push task_id onto the top of the (possibly freshly created)
+            # stack, dropping the same-band entry a rank upgrade replaces.
+            stack = [
+                (owner, entry_rank)
+                for owner, entry_rank in self._parked.get(normalized, [])
+                if owner != task_id or is_pin_rank(entry_rank) != is_pin_rank(rank)
+            ]
+            stack.append((task_id, rank))
+            self._parked[normalized] = stack
+            owned[normalized] = rank
             installed.append(normalized)
 
         # Build shadowed list in first-seen victim order, original module keys sorted.
@@ -1377,12 +1602,19 @@ class ModuleLockTable:
             )
         return installed, shadowed
 
-    def _remove_owner(self, task_id: str) -> list[tuple[str, list[str]]]:
+    def _remove_owner(
+        self, task_id: str, *, source: ReservationSource | None = None
+    ) -> list[tuple[str, list[str]]]:
         """Remove *task_id* from every stack at any level and return restored pairs.
 
-        For each module stack where *task_id* was the ACTIVE TOP: after removal
+        With *source*, only the owner's entries of that source go (task 6040):
+        releasing a pin reservation leaves the owner's fairness parks where
+        they are.
+
+        For each module stack whose ACTIVE TOP was removed: after removal
         the new last element (if any) becomes the active top and is reported as a
-        ``(owner, sorted_modules)`` restored pair.  Removing a buried (non-top)
+        ``(owner, sorted_modules)`` restored pair — with *source*, possibly
+        the owner's own remaining entry.  Removing a buried (non-top)
         entry leaves the top unchanged and is NOT reported as a restore (INV-4).
 
         Drops ``_park_install_at[task_id]`` only when task_id has no remaining
@@ -1404,16 +1636,19 @@ class ModuleLockTable:
         newly-unblocked entries on every removal.  Exact-match shadows (same
         key) always produce a restore pair; hierarchical shadows do not.
         """
-        # Track which modules had task_id as their ACTIVE TOP before removal.
-        was_top: set[str] = set()
-        for m, stack in self._parked.items():
-            if stack and stack[-1][0] == task_id:
-                was_top.add(m)
+        def removed(entry: tuple[str, int]) -> bool:
+            owner, rank = entry
+            return owner == task_id and (
+                source is None or ReservationSource.source_of_rank(rank) is source
+            )
 
-        # Rebuild stacks without task_id.
+        # Track which modules had a removed entry as their ACTIVE TOP.
+        was_top = {m for m, stack in self._parked.items() if stack and removed(stack[-1])}
+
+        # Rebuild stacks without the removed entries.
         new_parked: dict[str, list[tuple[str, int]]] = {}
         for m, stack in self._parked.items():
-            new_stack = [(o, r) for o, r in stack if o != task_id]
+            new_stack = [entry for entry in stack if not removed(entry)]
             if new_stack:
                 new_parked[m] = new_stack
         self._parked = new_parked
@@ -1454,25 +1689,32 @@ class ModuleLockTable:
         return self._remove_owner(task_id)
 
     def prune_owners(
-        self, predicate: Callable[[str], bool]
+        self,
+        predicate: Callable[[str], bool],
+        *,
+        source: ReservationSource | None = None,
     ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Evict every park whose owner satisfies *predicate* at ANY stack level.
 
         Iterates unique owners across all levels of all stacks (deduped,
         first-seen order), calls ``predicate(owner_id)`` at most once per
         owner, and removes all entries for matching owners via ``_remove_owner``.
+        With *source*, only owners holding an entry of that source are asked,
+        and only those entries are removed (task 6040).
 
         Returns ``(evicted_owners, restored_pairs)`` where *evicted_owners* is
         the list of removed owner IDs in first-seen order and *restored_pairs*
-        is a flattened list of ``(owner, sorted_modules)`` for all stacks whose
-        newly-exposed tops belong to non-evicted owners.  The Scheduler's
-        ``_park_gc`` sweep loop uses restored_pairs to emit
-        ``reservation_restored`` events (step-8).
+        is a flattened list of ``(owner, sorted_modules)`` for every stack
+        whose newly-exposed top is still the top once the whole sweep is
+        done.  The Scheduler's ``_park_gc`` sweep loop uses restored_pairs to
+        emit ``reservation_restored`` events (step-8).
         """
         # Collect unique owners in first-seen order across all stack levels.
         seen: dict[str, bool] = {}
         for stack in self._parked.values():
-            for owner, _rank in stack:
+            for owner, rank in stack:
+                if source is not None and ReservationSource.source_of_rank(rank) is not source:
+                    continue
                 if owner not in seen:
                     seen[owner] = predicate(owner)
         # Build evicted list.
@@ -1481,7 +1723,7 @@ class ModuleLockTable:
         all_restored_acc: dict[str, list[str]] = {}  # deduplicate across calls
         all_restored_order: list[str] = []
         for owner in evicted:
-            for restored_owner, mods in self._remove_owner(owner):
+            for restored_owner, mods in self._remove_owner(owner, source=source):
                 if restored_owner not in all_restored_acc:
                     all_restored_acc[restored_owner] = list(mods)
                     all_restored_order.append(restored_owner)
@@ -1489,20 +1731,23 @@ class ModuleLockTable:
                     # Merge modules for the same restored owner across multiple calls.
                     merged = sorted(set(all_restored_acc[restored_owner]) | set(mods))
                     all_restored_acc[restored_owner] = merged
-        # Filter out any owner that is itself being evicted in this same sweep.
-        # When removing top Z exposes lower Y (recorded in all_restored), but Y
-        # also matches the predicate and is later evicted, the caller would
-        # otherwise emit a spurious reservation_restored for a task whose parks
-        # are all gone.  Filtering against the evicted set removes that noise
-        # without any state-correctness impact (the removal itself already
-        # happened via _remove_owner).
-        evicted_set = set(evicted)
+        # Keep only restores that survived the rest of the sweep.  When
+        # removing top Z exposes lower Y, but a later removal in this sweep
+        # takes Y's entry too, the caller would otherwise emit a spurious
+        # reservation_restored for an entry that is gone.  Asking the stacks
+        # rather than the evicted set keeps a source-scoped sweep right: there
+        # an evicted owner's other-source entry can be the surviving top.
         all_restored = [
-            (owner, all_restored_acc[owner])
+            (owner, survivors)
             for owner in all_restored_order
-            if owner not in evicted_set
+            if (survivors := [m for m in all_restored_acc[owner] if self._top_owner(m) == owner])
         ]
         return evicted, all_restored
+
+    def _top_owner(self, module: str) -> str | None:
+        """The owner of *module*'s active top entry, or None for no stack."""
+        stack = self._parked.get(module)
+        return stack[-1][0] if stack else None
 
     def force_clear(
         self, owner: str
@@ -1615,10 +1860,15 @@ class ModuleLockTable:
 
         Each entry dict contains:
         - ``owner``: str — task id
-        - ``rank``: int — PRIORITY_RANK value (lower = higher priority, INV-3)
+        - ``rank``: int — :func:`park_rank` value: a PRIORITY_RANK tier, or a
+          negative pin rank (task 6040); lower = higher priority, INV-3
         - ``shadowed``: bool — True for every entry except the active top
         - ``installed_at``: str — ISO8601 timestamp from ``_park_install_at``,
           or ``''`` if the owner has no recorded install timestamp
+        - ``source``: ``'pin'`` | ``'fairness'`` — derived from ``rank`` by
+          :func:`~orchestrator.pin_reservation.rank_payload`
+        - ``pin_order``: int (pin entries only) / ``tier``: str (fairness
+          entries only) — the priority behind ``rank``
 
         INV-3: ranks are strictly decreasing top-ward (``entry[i].rank > entry[i+1].rank``).
 
@@ -1637,8 +1887,31 @@ class ModuleLockTable:
                     'rank': rank,
                     'shadowed': idx != last_index,
                     'installed_at': self._park_install_at.get(owner, ''),
+                    **rank_payload(rank),
                 })
             result[module] = entries
+        return result
+
+    def snapshot_pin_reservations(self) -> dict[str, dict]:
+        """``{owner: {modules, installed_at}}`` for every pin-ranked park entry.
+
+        Unlike :meth:`snapshot_parks`, a buried pin entry is listed too: this
+        is "which modules does each pin hold a reservation on" (task 6040),
+        not "who tops each stack".  Tier-ranked owners never appear.  Fresh
+        dicts, sorted modules.
+        """
+        result: dict[str, dict] = {}
+        for module, stack in self._parked.items():
+            for owner, rank in stack:
+                if not is_pin_rank(rank):
+                    continue
+                entry = result.setdefault(owner, {
+                    'modules': [],
+                    'installed_at': self._park_install_at.get(owner, ''),
+                })
+                entry['modules'].append(module)
+        for entry in result.values():
+            entry['modules'].sort()
         return result
 
     def snapshot_holders(self) -> dict[str, str]:
@@ -1821,6 +2094,20 @@ def _task_external_deps(task: dict) -> list[str]:
     return metadata.external_deps
 
 
+def train_order_key(task: Mapping[str, Any]) -> tuple[int, int]:
+    """A declared-train member's place in its train, root to tip: ascending
+    ``metadata.train.order``, with a missing or non-integer order last.  A
+    train's tip is the last member in this order."""
+    train = (task.get('metadata') or {}).get('train') or {}
+    order = train.get('order') if isinstance(train, dict) else None
+    if order is None:
+        return (1, 0)
+    try:
+        return (0, int(order))
+    except (TypeError, ValueError):
+        return (1, 0)
+
+
 def _reject_contradictory_metadata_mode(
     metadata_mode: str | None, append: bool
 ) -> None:
@@ -1906,9 +2193,9 @@ class Scheduler:
         'delivered_check_gate',
         'stamp_milestone',
         'override_snapshot_gc',
+        'compute_priorities',
         'reserve_now',
         'override_diff',
-        'compute_priorities',
         'build_candidates',
         'landed_outbox_gate',
         'starvation',
@@ -2143,29 +2430,23 @@ class Scheduler:
         self._pending_transient_cooldown: dict[str, int] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
+        # Per-pin pin_blocked cadence (task 6040): a pin's blocked episode
+        # ends when it dispatches or leaves the pin queue.
+        self._pin_blocked = PinBlockedLimiter()
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
         self._dispatched_priority: dict[str, str] = {}
-        # Age-anchor bookkeeping for score(): first time we see a task as
-        # pending, we record its age baseline.  Cleared on transition to any
-        # non-pending status so a cancelled->pending resurrection starts
-        # fresh (no accumulated age).
+        # Age-anchor bookkeeping for score(): one anchor per task in the
+        # active fetch, taken with its pending_since stamp and read and
+        # written through _held_age_anchor / _hold_age_anchor /
+        # _release_age_anchor.  Each is recorded durably (task 5352) whenever
+        # it changes, and only a changed pending_since resets it: D3 in
+        # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md is the rule.
         self._pending_anchor: dict[str, int] = {}
-        # The mark that makes that resurrection reset stick.  Restart-durable
-        # since task 5352: held in memory, it was cleared by the ~8-15h fleet
-        # redeploy, so a resurrected task re-anchored to its own (low) numeric
-        # id and collected its full accumulated age bonus again — once per
-        # redeploy, at the expense of the genuinely-old pending tasks the
-        # starvation watchdog is there to protect.  It decays after
-        # _RESURRECTION_GUARD_TTL, so the mark cannot outlive its subject.
-        #
-        # NOT the state-snapshot path: scheduler_state.json is a throttled,
-        # content-deduped, write-only OBSERVABILITY artifact that is never read
-        # back as authoritative state, and overloading it would make a
-        # dashboard file load-bearing for dispatch fairness.
-        self._was_non_pending: MutableSet[str] = PersistentSet(
-            guard_path(self._project_root, 'scheduler_was_non_pending.json'),
+        self._anchor_pending_since: dict[str, str | None] = {}
+        self._age_anchors: PersistentMap = PersistentMap(
+            guard_path(self._project_root, 'scheduler_age_anchors.json'),
             ttl=_RESURRECTION_GUARD_TTL,
         )
         # Effective-priority cache: populated at the end of each acquire_next tick
@@ -2194,6 +2475,8 @@ class Scheduler:
         # reset-on-success cannot leak. Bumped by _note_fm_read_failure,
         # zeroed by _reset_fm_read_failure_streak on any successful read.
         self._fm_read_failure_streak: int = 0
+        # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
+        self._anchor_gate = AnchorCoverageGate()
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -2334,6 +2617,12 @@ class Scheduler:
         # per-tick _streak_registry sweep like every other streak counter.
         self._streak_milestone_malformed = StreakCounter()
         self._streak_registry.register('milestone_malformed', self._streak_milestone_malformed)
+        # Consecutive park-install attempts that left a module blocked
+        # (task 5308); rate-limits reservation_install_blocked.
+        self._streak_park_install_blocked = StreakCounter()
+        self._streak_registry.register(
+            'park_install_blocked', self._streak_park_install_blocked
+        )
 
         # Per-(task_id, dep_string) count of consecutive ticks where the dep
         # resolved to a sentinel (unknown_project/unknown_task/malformed).
@@ -2686,12 +2975,14 @@ class Scheduler:
         The fused-memory wire format may surface metadata as a JSON string,
         a dict, or absent. Normalize once at this boundary so every consumer
         can assume ``isinstance(task['metadata'], dict)`` without re-parsing.
+        The absent-vs-unreadable rule itself lives in
+        ``shared.task_metadata_wire.coerce_task_metadata``.
 
-        A non-JSON or non-dict-shaped value collapses to ``{}`` — every
-        consumer reads dict-keyed sub-fields, so a non-dict carries no
-        information they can use.
+        Absent metadata (``None``, a missing key, or ``''``) is the NORMAL
+        shape (most tasks carry none) and stays silent — warning there would be
+        pure noise, every tick.
 
-        The collapse is LOUD: a discarded value emits a WARNING naming the task
+        An UNREADABLE value collapses to ``{}`` LOUDLY: a WARNING names the task
         id, the discarded type and a truncated repr.  It warns rather than
         raises because this runs per task inside the scheduler's task-list
         normalisation, so one malformed task must not take down a whole tick.
@@ -2700,37 +2991,18 @@ class Scheduler:
         distinguish "no markers" from "markers unreadable" — without it a task
         whose metadata arrived as an unparseable string is waved through
         looking marker-free, with no trace that anything was dropped.
-
-        Absent / ``None`` metadata is the NORMAL shape (most tasks carry none)
-        and stays silent — warning there would be pure noise, every tick.
         """
         raw = task.get('metadata')
-        if isinstance(raw, dict):
-            return
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                parsed = None
-            if not isinstance(parsed, dict):
-                logger.warning(
-                    'Task %s metadata discarded: str did not decode to a dict '
-                    '(type=str, repr=%.200r) — collapsing to {}; any markers it '
-                    'carried are NOT visible to downstream gates',
-                    task.get('id'), raw,
-                )
-                task['metadata'] = {}
-                return
-            task['metadata'] = parsed
-            return
-        if raw is not None:
+        meta = coerce_task_metadata(raw)
+        if meta is None:
             logger.warning(
-                'Task %s metadata discarded: not a dict or JSON string '
+                'Task %s metadata discarded: not a dict or a JSON-object string '
                 '(type=%s, repr=%.200r) — collapsing to {}; any markers it '
                 'carried are NOT visible to downstream gates',
                 task.get('id'), type(raw).__name__, raw,
             )
-        task['metadata'] = {}
+            meta = {}
+        task['metadata'] = meta
 
     @staticmethod
     def is_deterministic(task: dict) -> bool:
@@ -2792,21 +3064,13 @@ class Scheduler:
 
         tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES)
 
-        def _order_key(t: dict) -> tuple[int, int]:
-            train = (t.get('metadata') or {}).get('train') or {}
-            order = train.get('order') if isinstance(train, dict) else None
-            try:
-                return (0, int(order))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return (1, 0)  # missing/non-int → sort last
-
         return sorted(
             [
                 t for t in tasks
                 if isinstance((t.get('metadata') or {}).get('train'), dict)
                 and (t.get('metadata') or {}).get('train', {}).get('id') == train_id
             ],
-            key=_order_key,
+            key=train_order_key,
         )
 
     @overload
@@ -2869,6 +3133,15 @@ class Scheduler:
             )
         return None if distinguish_failure else []
 
+    def blocked_writes_suppressed(self, task_id: str, /) -> bool:
+        """True while a Table-B action teardown
+        (harness.py::Harness._action_teardown_and_set_status) owns the row and
+        this task's 'blocked' writes are absorbed."""
+        return (
+            self._callbacks.suppress_blocked_write is not None
+            and self._callbacks.suppress_blocked_write(task_id)
+        )
+
     async def set_task_status(
         self,
         task_id: str,
@@ -2909,11 +3182,25 @@ class Scheduler:
         so every existing caller's wire payload is unaffected. Injected into
         ``arguments`` before the retry loop so a transient retry resends the
         same claimant stamp rather than silently dropping it.
+
+        **Caller identity.** Every write sends ``agent_id`` =
+        ``ORCHESTRATOR_MCP_IDENTITY``, placed before the retry loop for the
+        same reason as ``claimant_run_id``. fused-memory serves stateless
+        HTTP, where clientInfo never reaches a tools/call, so the identity
+        must travel in the arguments. Without it, fused-memory's
+        ``deterministic-*`` caller bar
+        (``fused-memory/src/fused_memory/middleware/done_provenance_authz.py``)
+        refuses the write as unidentified. The done-write journal row records
+        this value. These writes now classify as ORCHESTRATOR rather than
+        HUMAN in ``shared/src/shared/task_transitions.py::derive_actor_class``.
+        Both classes map to the same ``_UNION``, so no legality verdict
+        changes.
         """
         arguments: dict = {
             'id': task_id,
             'status': status,
             'project_root': self._project_root,
+            'agent_id': ORCHESTRATOR_MCP_IDENTITY,
         }
         if done_provenance is not None:
             arguments['done_provenance'] = done_provenance
@@ -2931,11 +3218,7 @@ class Scheduler:
         # and _maybe_fire_park_stop_trip are then necessarily skipped for free.
         # (A guard placed at the post-write success branch :1190 would still let the
         # write reach fused-memory, defeating C3.2.)
-        if (
-            status == 'blocked'
-            and self._callbacks.suppress_blocked_write is not None
-            and self._callbacks.suppress_blocked_write(task_id)
-        ):
+        if status == 'blocked' and self.blocked_writes_suppressed(task_id):
             logger.info(
                 'set_task_status(%s, blocked): suppressed by action-teardown — skipping write',
                 task_id,
@@ -3114,6 +3397,19 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
 
+    async def clear_claim_then_set_status(self, task_id: str, status: str) -> None:
+        """Clear a DEAD claimant, then write ``status``.
+
+        Precondition: the caller has established that the claimant is not
+        live; on a live claim this un-claims a running workflow (task 2588).
+        The clear is best-effort and never blocks the write, which raises on
+        rejection exactly as :meth:`set_task_status` does. Why the clear comes
+        first: docs/prds/claimant-invariant-enforcement.md, D2 and the G7
+        walk's ``status-matches-liveness`` entry.
+        """
+        await self.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None)
+        await self.set_task_status(task_id, status)
+
     async def mark_done(
         self,
         task_id: str,
@@ -3209,6 +3505,22 @@ class Scheduler:
                     return None
                 return None
         return None
+
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        """Submit one task to fused-memory and return its typed outcome.
+
+        ``project_root`` defaults to this scheduler's root.  A dispatch
+        exception is returned as ``SubmitFailed``, never raised.  The outcome
+        taxonomy lives in ``shared/src/shared/task_submit.py::SubmitOutcome``.
+        """
+        call_arguments = dict(arguments)
+        call_arguments.setdefault('project_root', self._project_root)
+        try:
+            result = await self.dispatch_tool('submit_task', call_arguments, timeout=timeout)
+        except Exception as e:
+            logger.exception('Failed to submit task: %s: %s', type(e).__name__, e)
+            return SubmitFailed(f'submit_task dispatch raised {type(e).__name__}: {e}')
+        return parse_submit_task_result(result)
 
     async def get_statuses(
         self, ids: list[str] | None = None
@@ -4530,12 +4842,7 @@ class Scheduler:
             )
             # MCP tool errors return in the response body, not as exceptions
             content = result.get('result', result) if isinstance(result, dict) else result
-            if isinstance(content, dict) and content.get('isError'):
-                text = ''
-                for block in content.get('content', []):
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        text = block.get('text', '')
-                        break
+            if isinstance(content, dict) and (text := tool_error_text(content)) is not None:
                 logger.error(f'Failed to update task {task_id}: {text}')
                 return False
             # Structured rejections (e.g. LockCharterViolation, ValidationError)
@@ -5230,8 +5537,9 @@ class Scheduler:
         modules: list[str],
         tier: str = DEFAULT_TIER,
     ) -> None:
-        """Increment *task_id*'s skip counter; install a reservation if it
-        has just crossed ``skip_threshold`` and does not already hold parks.
+        """Increment *task_id*'s skip counter; once it is at or past
+        ``skip_threshold``, complete its reservation (:meth:`_complete_parks`)
+        over every module it has not parked yet.
 
         *tier* is the task's effective priority — it selects a per-tier
         threshold and lease multiplier.  When the per-tier threshold is
@@ -5248,7 +5556,7 @@ class Scheduler:
         # at {1, 10, 100, 1000, 10000, ...} so the event store is not flooded.
         should_emit = (
             threshold < _INF_SKIP_THRESHOLD
-            or count in _GEOMETRIC_SKIP_EMIT_COUNTS
+            or count in _GEOMETRIC_EMIT_COUNTS
         )
         if self.event_store and should_emit:
             self.event_store.emit(
@@ -5261,40 +5569,175 @@ class Scheduler:
                     'threshold': threshold,
                 },
             )
-        if (
-            count >= threshold
-            and not self.lock_table.has_parks(task_id)
-        ):
-            installed, shadowed_pairs = self.lock_table.install_parks(task_id, modules, tier)
-            logger.info(
-                'Task %s reserved modules %s (skip_count=%d, tier=%s)',
-                task_id, installed, count, tier,
+        if count >= threshold:
+            self._complete_parks(task_id, modules, tier, skip_count=count)
+
+    def _settle_fairness_on_dispatch(
+        self, task_id: str, modules: list[str], priority: str
+    ) -> None:
+        """End *task_id*'s fairness episode because it just dispatched (task 5308).
+
+        THE single place a dispatch settles fairness state, called for EVERY
+        dispatch — pin loop and scored loop, top or not: the skip count,
+        blocked-install streak and ``pin_blocked`` episode (task 6040) are
+        dropped, and the task's own parks are
+        consumed (``reservation_used``, plus ``reservation_restored`` for each
+        shadow the clear exposes).  A running task's park would otherwise
+        block same-tier installs (INV-3) until release, which is where
+        partial installs came from.  ``Scheduler.release`` keeps its
+        defensive clear only for parks installed AFTER dispatch, e.g. a
+        reserve_now armed on a running task.
+        """
+        self._skip_count.pop(task_id, None)
+        self._streak_park_install_blocked.clear(task_id)
+        self._pin_blocked.forget(task_id)
+        if not self.lock_table.has_parks(task_id):
+            return
+        source = self.lock_table.reservation_source(task_id)
+        restored_pairs = self.lock_table.clear_parks_for(task_id)
+        self._emit_reservation(
+            EventType.reservation_used,
+            task_id,
+            {'modules': modules, 'priority': priority},
+            source=source,
+        )
+        self._emit_reservations_restored(restored_pairs)
+
+    def _emit_reservation(
+        self,
+        event_type: EventType,
+        task_id: str,
+        data: dict[str, Any],
+        *,
+        source: ReservationSource,
+    ) -> None:
+        """Emit one ``reservation_*`` event, stamped with its ``source`` (task 6040).
+
+        Every reservation event goes through here, so ``data.source`` is
+        present on all of them and its absence never has to mean anything.
+        """
+        if self.event_store:
+            self.event_store.emit(
+                event_type, task_id=task_id, data=data | {'source': source.value}
             )
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.reservation_installed,
-                    task_id=task_id,
-                    data={
-                        'modules': installed,
-                        'skip_count': count,
-                        'priority': tier,
+
+    def _emit_reservations_restored(
+        self, restored_pairs: list[tuple[str, list[str]]]
+    ) -> None:
+        """``reservation_restored`` for each owner a park removal re-exposed.
+
+        Called AFTER the removal: the source is that of the restored entries
+        themselves, read from the table as it now stands.
+        """
+        for restored_owner, restored_modules in restored_pairs:
+            self._emit_reservation(
+                EventType.reservation_restored,
+                restored_owner,
+                {'restored_owner': restored_owner, 'modules': restored_modules},
+                source=self.lock_table.reservation_source(restored_owner, restored_modules),
+            )
+
+    def _complete_parks(
+        self,
+        task_id: str,
+        modules: list[str],
+        priority: ParkPriority,
+        *,
+        skip_count: int,
+    ) -> None:
+        """The park completion rule (task 5308): park whatever is still unparked.
+
+        *priority* is the park's priority: the owner's tier for a fairness
+        park, or a :class:`PinOrder` for the head pin's reservation (task
+        6040).  It alone decides the install rank, the remainder rule
+        (:meth:`ModuleLockTable.unparked_modules`), each event's ``source``
+        and how the events name the priority (:func:`priority_payload`).
+
+        The remainder is every key of *modules* that *task_id* does not
+        already park, at any stack level, in a way that covers *priority*.
+        An empty remainder is a fully parked owner: no attempt, no event.
+        Otherwise the remainder is installed and exactly one emission decision
+        follows:
+
+        - ``reservation_installed`` only when something was NEWLY parked,
+          carrying just that increment (plus ``reservation_shadowed`` per
+          lower-priority owner pushed beneath it);
+        - ``reservation_install_blocked`` whenever fewer modules were parked
+          than requested — empty and partial installs are one signal.
+
+        The ATTEMPT runs on every qualifying skip, deliberately unthrottled:
+        a module whose foreign park clears must be parked on the very next
+        skip, or a lower-tier task takes it in between.  Only the blocked
+        EVENT is rate-limited, geometrically on the owner's consecutive
+        blocked-attempt streak, which any attempt that leaves nothing
+        blocked resets, as does the owner's dispatch
+        (:meth:`_settle_fairness_on_dispatch`).
+        """
+        streak = self._streak_park_install_blocked
+        source = ReservationSource.source_of_rank(park_rank(priority))
+        remainder = self.lock_table.unparked_modules(task_id, modules, priority)
+        if not remainder:
+            streak.clear(task_id)
+            return
+        installed, shadowed_pairs = self.lock_table.install_parks(
+            task_id, remainder, priority
+        )
+        blocked = [m for m in remainder if m not in installed]
+        if installed:
+            logger.info(
+                'Task %s reserved modules %s (skip_count=%d, priority=%s)',
+                task_id, installed, skip_count, priority,
+            )
+            self._emit_reservation(
+                EventType.reservation_installed,
+                task_id,
+                {
+                    'modules': installed,
+                    'skip_count': skip_count,
+                    **priority_payload(priority),
+                },
+                source=source,
+            )
+            # Emit reservation_shadowed (non-destructive shadow) for each
+            # lower-priority owner whose park was pushed beneath task_id.
+            # reservation_evicted is RETAINED as an enum member for historical
+            # event-log back-compat but is no longer emitted on preemption.
+            for victim, victim_modules in shadowed_pairs:
+                self._emit_reservation(
+                    EventType.reservation_shadowed,
+                    task_id,
+                    {
+                        'modules': victim_modules,
+                        'preempted_by': task_id,
+                        'victim': victim,
+                        **priority_payload(priority, tier_key='preempted_by_priority'),
                     },
+                    source=source,
                 )
-                # Emit reservation_shadowed (non-destructive shadow) for each
-                # lower-priority owner whose park was pushed beneath task_id.
-                # reservation_evicted is RETAINED as an enum member for historical
-                # event-log back-compat but is no longer emitted on preemption.
-                for victim, victim_modules in shadowed_pairs:
-                    self.event_store.emit(
-                        EventType.reservation_shadowed,
-                        task_id=task_id,
-                        data={
-                            'modules': victim_modules,
-                            'preempted_by': task_id,
-                            'preempted_by_priority': tier,
-                            'victim': victim,
-                        },
-                    )
+        if not blocked:
+            streak.clear(task_id)
+            return
+        attempts = streak.bump(task_id)
+        if attempts not in _GEOMETRIC_EMIT_COUNTS:
+            return
+        logger.info(
+            'Task %s could not reserve modules %s: a same-or-higher-priority '
+            'park holds them (attempt %d, skip_count=%d, priority=%s)',
+            task_id, blocked, attempts, skip_count, priority,
+        )
+        self._emit_reservation(
+            EventType.reservation_install_blocked,
+            task_id,
+            {
+                'requested': remainder,
+                'installed': installed,
+                'blocked': blocked,
+                'attempts': attempts,
+                'skip_count': skip_count,
+                **priority_payload(priority),
+            },
+            source=source,
+        )
 
     # --- Value/h scoring helpers (P1/P2/P3) -----------------------------
 
@@ -5416,9 +5859,10 @@ class Scheduler:
     def _compute_age(self, task_id: str, max_id: int) -> int:
         """Return this task's age, in "newer-task-count" units.
 
-        Anchors are lazily initialized in :meth:`_update_age_anchors`; they
-        reset to the *current* max_id on resurrection so a cancelled→pending
-        task does not inherit accumulated age.
+        Anchors are lazily initialized in :meth:`_update_age_anchors`; one
+        is reset to the *current* max_id only when the task's
+        ``pending_since`` changed (D3), so a resurrected task does not inherit
+        accumulated age.
         """
         anchor = self._pending_anchor.get(task_id)
         if anchor is None:
@@ -5426,61 +5870,108 @@ class Scheduler:
         return max(0, max_id - anchor)
 
     def _update_age_anchors(self, tasks: list[dict], max_id: int) -> None:
-        """Maintain per-task age anchors across ticks.
+        """Maintain one age anchor per task in the active fetch.
 
-        - First time we see a task as pending with no prior non-pending
-          history, anchor to its own numeric id (so genuinely-old pending
-          tasks carry accumulated age from the start).
-        - First time we see a task as pending after having seen it
-          non-pending, anchor to *current max_id* (resurrection resets age).
-        - On any non-pending observation, drop the anchor and mark the task
-          as ever-non-pending so the next pending appearance is a fresh start.
+        The rule is D3 in
+        ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``: only a
+        cancelled -> pending return resets a task's wait, and fused-memory
+        marks exactly that return by overwriting ``metadata.pending_since``.
 
-        That last mark survives a restart (task 5352), so a resurrection resets
-        age ONCE rather than once per fleet redeploy.  The marks are collected
-        here and recorded in a single batch after the loop: this method
-        re-observes every non-pending task on every ~15s tick, and a cold start
-        seeing N of them would otherwise perform N writes of an N-entry file.
-        Batching is safe by construction — a task has exactly one status, so
-        the branch that WRITES a mark (non-pending) and the branch that READS
-        one (pending) are mutually exclusive within a single call, and no id can
-        be both.
+        - A task with an empty or terminal status is skipped: it is not an
+          observation of the active population, and recording its departure
+          is :meth:`_phase_stale_sweep`'s job alone.
+        - Any other task keeps its known anchor: the held one, else the
+          recorded one, else its own numeric id (so a genuinely-old task
+          carries its accumulated age), else *max_id*.  So a requeue, an
+          unblock, an undefer, an infra-hold resume, a done reopen and a
+          restart all keep the wait.
+        - If the task's stamp resets the known anchor
+          (:meth:`_AgeAnchor.is_reset_by`), the anchor moves to *max_id*.
+
+        An anchor is recorded as soon as it differs from its record, so the
+        stamp it was taken at survives a restart.  A cancel and reopen while
+        no process runs is therefore still reset at the next start, and a
+        reset is applied ONCE, because its record carries the new stamp.  A
+        tick that changes no anchor writes nothing.
         """
-        newly_non_pending: set[str] = set()
+        changed: dict[str, _AgeAnchor] = {}
+        resets: dict[str, _AgeAnchor] = {}
         for t in tasks:
             tid = str(t.get('id', ''))
-            if not tid:
-                continue
             status = t.get('status', '')
-            if status != 'pending':
-                self._pending_anchor.pop(tid, None)
-                if status:
-                    newly_non_pending.add(tid)
+            if not tid or not status or status in TERMINAL_STATUSES:
                 continue
-            if tid in self._pending_anchor:
-                continue
-            # First-seen pending for this tid.
-            if tid in self._was_non_pending:
-                # Resurrection — start fresh from now.
-                self._pending_anchor[tid] = max_id
-            elif tid.isdigit():
-                self._pending_anchor[tid] = int(tid)
+            stamp = _pending_since(t)
+            stored = self._held_age_anchor(tid) or _AgeAnchor.from_record(self._age_anchors.get(tid))
+            known = stored or _AgeAnchor(int(tid) if tid.isdecimal() else max_id, stamp)
+            if known.is_reset_by(stamp):
+                current = _AgeAnchor(max_id, stamp)
+                resets[tid] = current
             else:
-                self._pending_anchor[tid] = max_id
-        self._was_non_pending |= newly_non_pending
+                current = _AgeAnchor(known.anchor, stamp or known.pending_since)
+            if current != stored:
+                changed[tid] = current
+            self._hold_age_anchor(tid, current)
+        self._record_age_anchors(changed)
+        self._journal_age_resets(resets)
 
-    def _compute_score(
+    def _held_age_anchor(self, tid: str) -> _AgeAnchor | None:
+        if tid not in self._pending_anchor:
+            return None
+        return _AgeAnchor(self._pending_anchor[tid], self._anchor_pending_since.get(tid))
+
+    def _hold_age_anchor(self, tid: str, anchor: _AgeAnchor) -> None:
+        self._pending_anchor[tid] = anchor.anchor
+        self._anchor_pending_since[tid] = anchor.pending_since
+
+    def _release_age_anchor(self, tid: str) -> _AgeAnchor | None:
+        held = self._held_age_anchor(tid)
+        self._pending_anchor.pop(tid, None)
+        self._anchor_pending_since.pop(tid, None)
+        return held
+
+    def _record_age_anchors(self, records: dict[str, _AgeAnchor]) -> None:
+        """Write *records*, and every held anchor with them, in ONE write.
+
+        One write, because each write rewrites the whole file: a cold start
+        or a mass departure of N tasks would otherwise perform N writes of an
+        N-entry file.  Re-recording the held anchors adds no write and
+        refreshes their TTL, so a task that stays in the fetch keeps its
+        record while any write lands within ``_RESURRECTION_GUARD_TTL``.  No
+        records, no write.
+        """
+        if not records:
+            return
+        held = {
+            tid: _AgeAnchor(anchor, self._anchor_pending_since.get(tid))
+            for tid, anchor in self._pending_anchor.items()
+        }
+        self._age_anchors.put_many({tid: a.to_record() for tid, a in {**held, **records}.items()})
+
+    def _journal_age_resets(self, resets: dict[str, _AgeAnchor]) -> None:
+        """Journal each applied reset (INV-11)."""
+        if not self.event_store:
+            return
+        for tid, a in resets.items():
+            self.event_store.emit(
+                EventType.age_anchor_reset,
+                task_id=tid,
+                data={'anchor': a.anchor, 'pending_since': a.pending_since},
+            )
+
+    def _compute_score_legacy(
         self,
         tier: str,
         age: int,
         transitive_count: int,
     ) -> float:
-        """Compute the total dispatch score for a task.
+        """The pre-C2 dispatch score, still live as the I-6 fallback.
 
-        ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``
-
-        The combined age+CPM bonus is capped below ``TIER_WIDTH`` so bonuses
-        can never bump a task across a tier boundary — priority always wins.
+        ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``,
+        where *age* is a newer-task count (:meth:`_compute_age`), not seconds.
+        A tick whose anchor coverage is below
+        ``scoring.new_scoring_min_anchor_coverage`` scores every candidate
+        with this formula.
         """
         tier = coerce_tier(tier)
         base = TIER_BASE[tier]
@@ -5488,6 +5979,37 @@ class Scheduler:
         cpm_bonus = self.config.cpm_beta * math.log1p(max(0, transitive_count))
         bonus = min(age_bonus + cpm_bonus, float(TIER_WIDTH - 1))
         return float(base) + bonus
+
+    def _compute_score(
+        self,
+        tier: str,
+        *,
+        age_secs: float,
+        transitive_count: int,
+        has_work_product: bool,
+    ) -> float:
+        """The C2 dispatch score: tier base plus three independently budgeted terms.
+
+        No term is clipped against another, and ScoringConfig's validators keep
+        the budgets' sum inside one tier (plans/scheduler-dispatch-scoring-and-
+        lock-layer-prd.md C2, I-1, I-2).  Keyword-only so a caller can never
+        hand a newer-task count where seconds are meant.
+        """
+        cfg = self.config.scoring
+        cpm = cfg.cpm_budget * math.log1p(min(max(0, transitive_count), cfg.cpm_d_cap)) / math.log1p(cfg.cpm_d_cap)
+        a = max(0.0, age_secs)
+        age = cfg.age_budget * a / (a + cfg.age_half_secs)
+        continuity = cfg.continuity_credit if has_work_product else 0.0
+        return float(TIER_BASE[coerce_tier(tier)]) + cpm + age + continuity
+
+    def _has_work_product(self, task: dict) -> bool:
+        """Whether *task* already carries work worth resuming (PRD C3).
+
+        Task γ owns the real predicate.  Until it lands this is False for every
+        task, the fail-safe: no live score gains ``continuity_credit`` before
+        γ's zero-progress gating exists.
+        """
+        return False
 
     def _emit_override_diff_events(
         self,
@@ -5669,13 +6191,14 @@ class Scheduler:
             return
         for task_id in self._park_eviction_store.drain(self._project_root):
             # D4 guard: refuse eviction of a live, dispatchable owner.
+            source = self.lock_table.reservation_source(task_id)
             if self._owner_is_live_dispatchable(task_id, status_map, tasks_by_id):
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.reservation_force_evict_refused,
-                        task_id=task_id,
-                        data={'reason': 'live_owner'},
-                    )
+                self._emit_reservation(
+                    EventType.reservation_force_evict_refused,
+                    task_id,
+                    {'reason': 'live_owner'},
+                    source=source,
+                )
                 continue
             modules, restored = self.lock_table.force_clear(task_id)
             self._skip_count.pop(task_id, None)
@@ -5689,22 +6212,14 @@ class Scheduler:
             # was actually cleared.  Operators who see no event after enqueueing
             # can infer the park was already gone.  See design decision
             # §"Emit reservation_force_evicted only when … modules non-empty".
-            if modules and self.event_store:
-                self.event_store.emit(
+            if modules:
+                self._emit_reservation(
                     EventType.reservation_force_evicted,
-                    task_id=task_id,
-                    data={'owner': task_id, 'modules': modules},
+                    task_id,
+                    {'owner': task_id, 'modules': modules},
+                    source=source,
                 )
-            if self.event_store:
-                for restored_owner, restored_mods in restored:
-                    self.event_store.emit(
-                        EventType.reservation_restored,
-                        task_id=restored_owner,
-                        data={
-                            'restored_owner': restored_owner,
-                            'modules': restored_mods,
-                        },
-                    )
+            self._emit_reservations_restored(restored)
 
     def _note_fm_read_failure(self) -> None:
         """Record one more consecutive fm-read-failure tick (survey C3).
@@ -6206,41 +6721,62 @@ class Scheduler:
         missing / deps-unsatisfied has no reason to keep blocking other
         tasks, so it's evicted now. Always continues.
         """
-        def _park_gc(tid: str) -> bool:
-            status = ctx.status_map.get(tid)
-            if status in TERMINAL_STATUSES:
-                return True
-            if tid not in ctx.tasks_by_id:
-                return True
-            return not self._deps_satisfied(ctx.tasks_by_id[tid], ctx.status_map, ctx.tasks_by_id)
-
-        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
-        for owner in gc_evicted:
+        for owner in self._expire_parks(partial(self._park_gc_reason, ctx)):
             self._skip_count.pop(owner, None)
-            if self.event_store:
-                owner_status = ctx.status_map.get(owner)
-                if owner_status in TERMINAL_STATUSES:
-                    reason = f'terminal:{owner_status}'
-                elif owner not in ctx.tasks_by_id:
-                    reason = 'missing'
-                else:
-                    reason = 'deps_unsatisfied'
-                self.event_store.emit(
-                    EventType.reservation_expired,
-                    task_id=owner,
-                    data={'reason': reason},
-                )
-        if self.event_store:
-            for restored_owner, restored_modules in gc_restored:
-                self.event_store.emit(
-                    EventType.reservation_restored,
-                    task_id=restored_owner,
-                    data={
-                        'restored_owner': restored_owner,
-                        'modules': restored_modules,
-                    },
-                )
         return _CONTINUE
+
+    def _park_gc_reason(self, ctx: TickContext, owner: str) -> str | None:
+        """Why park GC expires *owner*'s parks, or None to keep them.
+
+        ``'terminal:<status>'``, ``'missing'`` (absent from the task read) or
+        ``'deps_unsatisfied'`` — an owner in any of these has no reason to keep
+        blocking other tasks.
+        """
+        status = ctx.status_map.get(owner)
+        if status in TERMINAL_STATUSES:
+            return f'terminal:{status}'
+        if owner not in ctx.tasks_by_id:
+            return 'missing'
+        if not self._deps_satisfied(ctx.tasks_by_id[owner], ctx.status_map, ctx.tasks_by_id):
+            return 'deps_unsatisfied'
+        return None
+
+    def _expire_parks(
+        self,
+        reason_of: Callable[[str], str | None],
+        *,
+        source: ReservationSource | None = None,
+    ) -> list[str]:
+        """Remove the parks of every owner *reason_of* names a reason for; return them.
+
+        THE one place ``reservation_expired`` is built.  Without *source*,
+        every entry of each named owner goes, and the event carries the
+        owner's own source as it stood before the removal.  With *source*,
+        only the owner's entries of that source go (task 6040: a released pin
+        reservation leaves its owner's fairness parks in place), and the
+        event names that source.  Reasons and sources are captured while
+        ``prune_owners`` evaluates the predicate, i.e. before any owner is
+        removed; then ``reservation_expired`` is emitted per evicted owner,
+        followed by ``reservation_restored`` for every shadow the removals
+        exposed.
+        """
+        expiring: dict[str, tuple[str, ReservationSource]] = {}
+
+        def _expires(owner: str) -> bool:
+            reason = reason_of(owner)
+            if reason is None:
+                return False
+            expiring[owner] = (reason, source or self.lock_table.reservation_source(owner))
+            return True
+
+        evicted, restored = self.lock_table.prune_owners(_expires, source=source)
+        for owner in evicted:
+            reason, owner_source = expiring[owner]
+            self._emit_reservation(
+                EventType.reservation_expired, owner, {'reason': reason}, source=owner_source
+            )
+        self._emit_reservations_restored(restored)
+        return evicted
 
     async def _phase_stale_sweep(self, ctx: TickContext) -> object:
         """Hygiene: sweep stale per-task bookkeeping + streak counters.
@@ -6250,7 +6786,8 @@ class Scheduler:
         ``_module_cache`` / ``_pending_anchor`` entries for tasks that are
         (a) in a terminal status, or (b) absent from tasks_by_id
         (active-only filter dropped them), recording each dropped id in
-        ``_was_non_pending`` and ``ctx.stale_ids``. Then sweeps every
+        ``ctx.stale_ids`` and its age anchor in ``_age_anchors``, which a
+        return restores. Then sweeps every
         registered ``StreakRegistry`` counter (task 2124) via
         ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
         into a hand loop — unioning in tasks that left the candidate pool
@@ -6274,7 +6811,7 @@ class Scheduler:
         """
         stale_ids: set[str] = set()
         terminal_ids: set[str] = set()
-        newly_non_pending: set[str] = set()
+        departed_anchors: dict[str, _AgeAnchor] = {}
         all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
@@ -6289,12 +6826,11 @@ class Scheduler:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
-                self._pending_anchor.pop(tid_str, None)
-                newly_non_pending.add(tid_str)
+                departed = self._release_age_anchor(tid_str)
+                if departed is not None:
+                    departed_anchors[tid_str] = departed
                 stale_ids.add(tid_str)
-        # Recorded in one batch, for the same reason as _update_age_anchors:
-        # this sweep re-observes the same terminal ids on every tick.
-        self._was_non_pending |= newly_non_pending
+        self._record_age_anchors(departed_anchors)
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
@@ -6577,12 +7113,9 @@ class Scheduler:
         Writes: none on ctx — a task flipped this tick is picked up on the
         NEXT tick (the server row flips via ``set_task_status``, but this
         tick's in-memory ``ctx.tasks`` still reads 'blocked'), avoiding a
-        current-tick candidate-set race. Also clears the stale
-        ``claimant_run_id``/``heartbeat_at`` via ``set_task_claimant``
-        (best-effort) immediately before the status flip, mirroring the
-        slot-release NULL-claimant convention at harness.py:5693-5696, so a
-        redispatched task is never left carrying a claimant that no longer
-        owns it. Always continues.
+        current-tick candidate-set race. The flip goes through
+        :meth:`clear_claim_then_set_status`, so a redispatched task never
+        carries a claimant that no longer owns it. Always continues.
         """
         if not self.config.stranded_blocked_redispatch_enabled:
             return _CONTINUE
@@ -6721,17 +7254,7 @@ class Scheduler:
                     'pending (no live claimant, deps satisfied, no open escalation)',
                     tid,
                 )
-                # Clear the stale claimant BEFORE the status flip — mirrors the
-                # slot-release ordering at harness.py:5693-5696. The task is
-                # still 'blocked' here (not yet dispatch-contestable), so
-                # nothing should be racing in a fresh claimant stamp; clearing
-                # first means a concurrent orchestrator that dispatches into
-                # this task right after it goes 'pending' below can never have
-                # its fresh stamp clobbered by a late-landing clear.
-                # Best-effort — set_task_claimant already swallows its own
-                # errors, so this can never block the flip.
-                await self.set_task_claimant(tid, claimant_run_id=None, heartbeat_at=None)
-                await self.set_task_status(tid, 'pending')
+                await self.clear_claim_then_set_status(tid, 'pending')
             except Exception:
                 # Isolation guard (task 2849): a single task's predicate/write
                 # failure must never abort the batch — that previously
@@ -6923,7 +7446,9 @@ class Scheduler:
     async def _phase_reserve_now(self, ctx: TickContext) -> object:
         """Snapshot pre-short-circuit overrides, then reserve-now.
 
-        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``.
+        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
+        ``ctx.effective_priorities`` (parks install at, or an owner's
+        lower-tier park is raised to, the effective tier).
         Writes: ``ctx.overrides_for_diff`` (snapshot BEFORE the
         short-circuit below), then mutates ``ctx.overrides`` in place via
         the reserve-now short-circuit: for any task with reserve_now=1,
@@ -6944,13 +7469,14 @@ class Scheduler:
                     continue
                 r_task = ctx.tasks_by_id[rid]
                 r_modules = self._get_modules(r_task)
-                r_tier = coerce_tier(r_task.get('priority'))
-                # Clear the flag BEFORE installing parks.  install_parks is
-                # naturally idempotent (duplicate parks are a no-op), so if the
-                # process crashes between clear and install, the next tick re-runs
-                # install harmlessly.  The opposite order risks a duplicate
-                # reservation_installed event if the clear fails after a
-                # successful install.
+                r_tier = ctx.effective_priorities.get(
+                    rid, coerce_tier(r_task.get('priority'))
+                )
+                # Clear the flag BEFORE installing parks.  The opposite order
+                # risks a duplicate reserve_now_consumed event if the clear
+                # fails after a successful install, whereas a re-run install
+                # is harmless: ModuleLockTable.install_parks is idempotent per
+                # owner.
                 #
                 # In-process exceptions from install_parks are handled separately:
                 # the flag is restored via set_override so the next tick retries.
@@ -7255,84 +7781,282 @@ class Scheduler:
         ``ctx.effective_priorities``.
         Writes: none on ctx (dispatch bookkeeping lives on ``self``).
         Pinned candidates bypass scoring entirely but still respect lock
-        availability and eligibility checks (status, deps, cooldown). On
-        lock conflict, falls through to the next pinned candidate without
-        touching skip counters or arming parks (pins bypass fairness).
+        availability and eligibility checks (status, deps, cooldown).  A pin
+        never ACCRUES a skip count from this loop, but a pin dispatch settles
+        whatever it earned as a scored candidate
+        (``_settle_fairness_on_dispatch``).
+
+        On a lock conflict the loop falls through to the next pin.  The first
+        ``pin_reservation_max_active`` lock-blocked, non-deterministic pins
+        are HEADS: each reserves its modules at its pin rank through
+        :meth:`_complete_parks` (task 6040), inline, so a later pin or scored
+        candidate this tick cannot take a module the head is waiting for.
+        This is the bounded exception described in
+        ``orchestrator/pin_reservation.py``'s module docstring.
+        :meth:`_bound_pin_reservations` enforces that bound at phase start
+        (so a PSI-held tick still applies it) and after each head reserves.
+        Every lock-blocked pin also reports ``pin_blocked``
+        (:meth:`_note_pin_blocked`).  With ``pin_reservations_enabled`` off, a
+        blocked pin neither reserves nor reports, as before task 6040.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
         """
-        if self._override_store:
-            pin_queue: list[tuple[str, OverrideRow]] = sorted(
-                ((tid, row) for tid, row in ctx.overrides.items() if row.pinned),
-                key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
+        if not self._override_store:
+            return _CONTINUE
+        queue = self._pin_queue(ctx)
+        reservable = tuple(
+            pin.task_id for pin in queue if not self.is_deterministic(pin.task)
+        )
+        self._pin_blocked.retain(pin.task_id for pin in queue)
+        self._bound_pin_reservations(ctx, reservable)
+        heads = 0
+        for pin in queue:
+            if ctx.psi_hold and not self.is_deterministic(pin.task):
+                # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
+                # doesn't reduce host load, so a pinned HEAVY candidate is
+                # deferred exactly like a scored one — deterministic pins
+                # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
+                # the SAME once-per-tick decision/helper the scored loop
+                # uses below, so both loops share one hold and one event.
+                self._note_heavy_deferral(ctx, pin.task_id)
+                continue
+            modules = self._get_modules(pin.task)
+            if self.lock_table.try_acquire(pin.task_id, modules):
+                return await self._dispatch_pin(pin, modules)
+            if not self.config.pin_reservations_enabled:
+                continue
+            is_head = (
+                pin.task_id in reservable
+                and heads < self.config.pin_reservation_max_active
             )
-            for pin_tid, _pin_row in pin_queue:
-                if pin_tid not in ctx.tasks_by_id:
-                    continue
-                pin_task = ctx.tasks_by_id[pin_tid]
-                # Re-use the same eligibility helper as the scored-candidate
-                # loop to keep both paths in sync.  A future gate addition only
-                # needs to be added to _eligible_for_dispatch.
-                eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, ctx.status_map, ctx.tasks_by_id,
-                    external_status_cache=ctx.external_cache,
-                    external_resolver_failed=ctx.external_resolver_failed,
-                    delivered_check_cache=ctx.delivered_check_cache,
-                    terminal_dep_records=ctx.terminal_dep_records,
+            self._note_pin_blocked(pin, modules, head=is_head)
+            if is_head:
+                heads += 1
+                self._complete_parks(
+                    pin.task_id,
+                    modules,
+                    PinOrder(pin.pin_order),
+                    skip_count=self._skip_count.get(pin.task_id, 0),
                 )
-                if not eligible:
-                    continue
-                if pin_tid in ctx.gated_ids:
-                    # Landed-outbox gate (task 2156, SD-1/B5): this pinned
-                    # task's merge already landed on main and is being driven
-                    # to done inline — skip it here too so the pin loop and
-                    # the scored loop share the one gated_ids source of truth.
-                    continue
-                if ctx.psi_hold and not self.is_deterministic(pin_task):
-                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
-                    # doesn't reduce host load, so a pinned HEAVY candidate is
-                    # deferred exactly like a scored one — deterministic pins
-                    # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
-                    # the SAME once-per-tick decision/helper the scored loop
-                    # uses below, so both loops share one hold and one event.
-                    self._note_heavy_deferral(ctx, pin_tid)
-                    continue
-                # Eligible pinned candidate — try to acquire its modules.
-                pin_modules = self._get_modules(pin_task)
-                if self.lock_table.try_acquire(pin_tid, pin_modules):
-                    self._dispatched.add(pin_tid)
-                    # Starvation-watchdog resolve (task 1880): if a pinned task
-                    # had an open INFO escalation, self-resolve it now.
-                    # Wrapped in try/except so a resolve failure can NEVER abort
-                    # a successful dispatch (PROPERTY 1).
-                    try:
-                        await self._resolve_starvation_escalation(pin_tid)
-                    except Exception:
-                        logger.warning(
-                            'Starvation watchdog resolve for pin_tid=%s raised — '
-                            'dispatch continues normally',
-                            pin_tid,
-                            exc_info=True,
-                        )
-                    if pin_signal is not None:
-                        self._last_dispatch_at[pin_tid] = self._time_source()
-                    pin_pri = ctx.effective_priorities.get(
-                        pin_tid, coerce_tier(pin_task.get('priority'))
-                    )
-                    self._dispatched_priority[pin_tid] = pin_pri
-                    self._emit_lock_event(
-                        EventType.lock_acquired,
-                        task_id=pin_tid,
-                        modules=pin_modules,
-                        priority=pin_pri,
-                    )
-                    await self._write_snapshot_best_effort()
-                    return TickOutcome(TaskAssignment(
-                        task_id=pin_tid, task=pin_task, modules=pin_modules
-                    ))
-                # Lock conflict — fall through to next pinned candidate.
-                # No skip-bookkeeping for pinned tasks (pins bypass fairness).
+                self._bound_pin_reservations(ctx, reservable)
         return _CONTINUE
+
+    def _note_pin_blocked(
+        self, pin: _PinCandidate, modules: list[str], *, head: bool
+    ) -> None:
+        """Emit ``pin_blocked`` for a lock-blocked *pin* when its cadence is due.
+
+        Called before a head reserves, so ``blockers`` names exactly what
+        refused this acquire (:meth:`ModuleLockTable.blockers`), never the
+        pin's own new reservation.  Due on the transition into blocked, then
+        once per ``pin_blocked_emit_interval_secs``, read at tick time.
+        """
+        if not self._pin_blocked.due(
+            pin.task_id,
+            now=self._time_source(),
+            interval=self.config.pin_blocked_emit_interval_secs,
+        ):
+            return
+        blockers = self.lock_table.blockers(pin.task_id, modules)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.pin_blocked,
+                task_id=pin.task_id,
+                data={
+                    'task_id': pin.task_id,
+                    'pin_order': pin.pin_order,
+                    'head': head,
+                    'blockers': [blocker.as_payload() for blocker in blockers],
+                },
+            )
+
+    def _bound_pin_reservations(
+        self, ctx: TickContext, reservable: Sequence[str]
+    ) -> None:
+        """Release every pin reservation the pin phase no longer keeps.
+
+        *reservable* lists the non-deterministic pin-queue entries in queue
+        order.  The kept owners are the first ``pin_reservation_max_active``
+        reservation owners in that order — none when the kill switch is off.
+        Every other pin owner loses its pin reservation through
+        :meth:`_expire_parks`, with its :func:`pin_release_reason`.  Only the
+        pin entries go: the owner's fairness parks stay where they were, and
+        an owner whose skips have earned fairness parks completes them at once
+        (:meth:`_complete_earned_fairness_parks`).
+
+        Order inside the loop is safe: when a head reserves, every reservable
+        pin ahead of it in the queue has already been tried this tick, so the
+        cap keeps this tick's heads first, and a displaced pin is outranked by
+        the head's pin rank on every key they share.  (Pins with no stored
+        pin_order tie at one rank, so there the shared key waits for the
+        head's next completion.)  Terminal, missing and deps-unsatisfied
+        owners are park GC's, earlier in the tick.
+        """
+        owners = self.lock_table.snapshot_pin_reservations()
+        if not owners:
+            return
+        enabled = self.config.pin_reservations_enabled
+        cap = self.config.pin_reservation_max_active if enabled else 0
+        kept = [owner for owner in reservable if owner in owners][:cap]
+        released = sorted(owners.keys() - set(kept))
+        if not released:
+            return
+
+        def _release_reason(owner: str) -> str | None:
+            if owner not in released:
+                return None
+            row = ctx.overrides.get(owner)
+            task = ctx.tasks_by_id.get(owner)
+            return pin_release_reason(
+                enabled=enabled,
+                reservable=owner in reservable,
+                pinned=row is not None and row.pinned,
+                gated=owner in ctx.gated_ids,
+                deterministic=task is not None and self.is_deterministic(task),
+            )
+
+        self._expire_parks(_release_reason, source=ReservationSource.PIN)
+        for owner in released:
+            self._complete_earned_fairness_parks(ctx, owner)
+
+    def _complete_earned_fairness_parks(self, ctx: TickContext, task_id: str) -> None:
+        """Apply the fairness completion rule to a just-released pin owner.
+
+        While a pin reservation covered a module, the owner's top-skips parked
+        nothing more there: the pin entry already covered it
+        (:meth:`ModuleLockTable.unparked_modules`).  Once the pin reservation
+        is gone, an owner whose skip count has reached its tier's threshold
+        completes those fairness parks now, through the ordinary rule, rather
+        than leaving the modules open until it is next top-skipped.  An owner
+        below the threshold, or absent from this tick's tasks, is left alone.
+        """
+        task = ctx.tasks_by_id.get(task_id)
+        if task is None:
+            return
+        tier = ctx.effective_priorities.get(task_id, coerce_tier(task.get('priority')))
+        skip_count = self._skip_count.get(task_id, 0)
+        if skip_count < self.config.fairness.skip_threshold_for(tier):
+            return
+        self._complete_parks(task_id, self._get_modules(task), tier, skip_count=skip_count)
+
+    def _pin_queue(self, ctx: TickContext) -> list[_PinCandidate]:
+        """Pinned tasks that may dispatch this tick, in pin_order ASC.
+
+        A pin is queued when its override row is pinned, its task is in
+        ``ctx.tasks_by_id``, it passes :meth:`_eligible_for_dispatch` (the
+        same helper as the scored loop, so a new gate reaches both paths)
+        and it is not landed-outbox gated.  A row with no stored pin_order
+        counts as 0; ties keep the override store's row order, as they did
+        before task 6040.  This order is the only one the pin phase uses:
+        it picks the heads and the reservations the cap keeps.
+        """
+        queue: list[_PinCandidate] = []
+        for tid, row in ctx.overrides.items():
+            if not row.pinned or tid not in ctx.tasks_by_id:
+                continue
+            task = ctx.tasks_by_id[tid]
+            eligible, signal = self._eligible_for_dispatch(
+                task, tid, ctx.status_map, ctx.tasks_by_id,
+                external_status_cache=ctx.external_cache,
+                external_resolver_failed=ctx.external_resolver_failed,
+                delivered_check_cache=ctx.delivered_check_cache,
+                terminal_dep_records=ctx.terminal_dep_records,
+            )
+            if not eligible:
+                continue
+            if tid in ctx.gated_ids:
+                # Landed-outbox gate (task 2156, SD-1/B5): this pinned
+                # task's merge already landed on main and is being driven
+                # to done inline — skip it here too so the pin loop and
+                # the scored loop share the one gated_ids source of truth.
+                continue
+            queue.append(_PinCandidate(
+                task_id=tid,
+                task=task,
+                pin_order=row.pin_order if row.pin_order is not None else 0,
+                tier=ctx.effective_priorities.get(tid, coerce_tier(task.get('priority'))),
+                signal=signal,
+            ))
+        return sorted(queue, key=lambda pin: pin.pin_order)
+
+    async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
+        """Book a pin whose ``try_acquire`` just succeeded, and end the tick."""
+        self._dispatched.add(pin.task_id)
+        # Starvation-watchdog resolve (task 1880): if a pinned task
+        # had an open INFO escalation, self-resolve it now.
+        # Wrapped in try/except so a resolve failure can NEVER abort
+        # a successful dispatch (PROPERTY 1).
+        try:
+            await self._resolve_starvation_escalation(pin.task_id)
+        except Exception:
+            logger.warning(
+                'Starvation watchdog resolve for pin_tid=%s raised — '
+                'dispatch continues normally',
+                pin.task_id,
+                exc_info=True,
+            )
+        if pin.signal is not None:
+            self._last_dispatch_at[pin.task_id] = self._time_source()
+        self._dispatched_priority[pin.task_id] = pin.tier
+        self._settle_fairness_on_dispatch(pin.task_id, modules, pin.tier)
+        self._emit_lock_event(
+            EventType.lock_acquired,
+            task_id=pin.task_id,
+            modules=modules,
+            priority=pin.tier,
+        )
+        await self._write_snapshot_best_effort()
+        return TickOutcome(TaskAssignment(
+            task_id=pin.task_id, task=pin.task, modules=modules
+        ))
+
+    def _note_anchor_coverage(self, task_ids: list[str], readings: list[AnchorReading]) -> bool:
+        """Run the tick's arming gate and deliver its verdict: the event, then any L1."""
+        verdict = self._anchor_gate.observe(
+            task_ids, readings, threshold=self.config.scoring.new_scoring_min_anchor_coverage,
+        )
+        if verdict.coverage_low is not None and self.event_store:
+            self.event_store.emit(
+                EventType.scoring_anchor_coverage_low, task_id=None, data=asdict(verdict.coverage_low),
+            )
+        if verdict.escalation is not None:
+            file_sentinel_l1(self.escalation_queue, verdict.escalation)
+        return verdict.armed
+
+    def _score_candidates(self, ctx: TickContext) -> list[tuple[float, str, dict, str]]:
+        """Score every candidate of the tick, best first, as ``(score, task_id, task, tier)``.
+
+        Precondition: ``ctx.candidates`` is non-empty — an empty tick ends in
+        an earlier phase.
+
+        The I-6 arming gate decides the formula for the WHOLE tick: when the
+        share of candidates with a usable ``pending_since`` anchor reaches
+        ``scoring.new_scoring_min_anchor_coverage``, every candidate scores on
+        C2; otherwise every candidate scores on the legacy formula, so one
+        tick's ordering always comes from one comparable scale.
+        """
+        now = self._wall_now()
+        task_ids = [str(t.get('id', '')) for t in ctx.candidates]
+        readings = [read_pending_age(t, now) for t in ctx.candidates]
+        armed = self._note_anchor_coverage(task_ids, readings)
+
+        scored: list[tuple[float, str, dict, str]] = []
+        for tid, t, reading in zip(task_ids, ctx.candidates, readings, strict=True):
+            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
+            transitive = ctx.transitive_counts.get(tid, 0)
+            if armed:
+                score = self._compute_score(
+                    pri,
+                    age_secs=reading.age_secs,
+                    transitive_count=transitive,
+                    has_work_product=self._has_work_product(t),
+                )
+            else:
+                score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
+            scored.append((score, tid, t, pri))
+
+        scored.sort(key=lambda entry: (-entry[0], _numeric_id(entry[1]), entry[1]))
+        return scored
 
     async def _phase_select_scored(self, ctx: TickContext) -> object:
         """Score each candidate and dispatch the best available.
@@ -7344,19 +8068,11 @@ class Scheduler:
         ``TickOutcome(TaskAssignment)`` on a successful dispatch, or
         ``TickOutcome(None)`` once the loop is exhausted with no acquire
         (the top candidate's skip counter is bumped either way it is
-        passed over). Higher score wins; ties broken by task_id string
-        order (stable, FIFO-ish for numeric ids).
+        passed over). Higher score wins; equal scores dispatch the
+        numerically smaller (older) id first, and non-numeric ids after every
+        numeric one, in string order.
         """
-        scored: list[tuple[float, str, dict, str]] = []
-        for t in ctx.candidates:
-            tid = str(t.get('id', ''))
-            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
-            age = self._compute_age(tid, ctx.max_id)
-            transitive = ctx.transitive_counts.get(tid, 0)
-            score = self._compute_score(pri, age, transitive)
-            scored.append((score, tid, t, pri))
-
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
         if logger.isEnabledFor(logging.DEBUG):
@@ -7377,7 +8093,6 @@ class Scheduler:
         # for fairness bookkeeping (skip counter / park installation).
         top_score, top_id, top_task, top_pri = scored[0]
         top_modules = self._get_modules(top_task)
-        top_had_parks = self.lock_table.has_parks(top_id)
 
         # One scan, one memo for admission's read-only inputs (task 3823 /
         # PRD C7).  Park and hold state does not move inside this loop, so
@@ -7441,27 +8156,10 @@ class Scheduler:
                     if ctx.candidate_signals.get(task_id) is not None:
                         self._last_dispatch_at[task_id] = self._time_source()
                     self._dispatched_priority[task_id] = pri
-                    if task_id == top_id:
-                        self._skip_count.pop(task_id, None)
-                        if top_had_parks:
-                            restored_pairs = self.lock_table.clear_parks_for(task_id)
-                            if self.event_store:
-                                self.event_store.emit(
-                                    EventType.reservation_used,
-                                    task_id=task_id,
-                                    data={'modules': modules, 'priority': pri},
-                                )
-                                for restored_owner, restored_modules in restored_pairs:
-                                    self.event_store.emit(
-                                        EventType.reservation_restored,
-                                        task_id=restored_owner,
-                                        data={
-                                            'restored_owner': restored_owner,
-                                            'modules': restored_modules,
-                                        },
-                                    )
-                    else:
-                        # A lower-ranked task won — top was passed over this tick.
+                    # Settle the winner BEFORE bumping a passed-over top: the
+                    # winner's own park would otherwise block the top's install.
+                    self._settle_fairness_on_dispatch(task_id, modules, pri)
+                    if task_id != top_id:
                         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
                     if grant is not None:
                         self._record_backfill_grant(grant)
@@ -7484,9 +8182,9 @@ class Scheduler:
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
-        Dispatch order is determined by ``_compute_score()``: tier base is
-        dominant, age + CPM bonuses order tasks within a tier, and
-        per-tier slot caps reserve headroom for higher-value work.
+        Dispatch order is determined by ``_score_candidates()``: tier base is
+        dominant, age + CPM (+ continuity) bonuses order tasks within a tier,
+        and per-tier slot caps reserve headroom for higher-value work.
 
         Returns ``None`` immediately when the scheduler is paused (park-stop).
         No MCP round-trips, no GC, no override snapshots are performed while
@@ -7561,7 +8259,7 @@ class Scheduler:
                 continue
             status_map[tid] = t.get('status', 'unknown')
             tasks_by_id[tid] = t
-            if tid.isdigit():
+            if tid.isdecimal():
                 max_id = max(max_id, int(tid))
 
         # Maintain age anchors (resurrected tasks reset their anchor).
@@ -7664,12 +8362,17 @@ class Scheduler:
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains twelve top-level keys:
+        Contains thirteen top-level keys:
         - skip_counts: {task_id: int}
-        - parks: {task_id: {modules: [...], installed_at: str}}
-        - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
-          full LIFO stack bottom→top per module (active top + shadowed owners);
-          additive sibling to the INV-7 top-only ``parks`` key
+        - parks: {task_id: {modules: [...], installed_at: str}} — every active
+          top, pin reservations included
+        - park_stacks: {module: [entry, ...]} — full LIFO stack bottom→top
+          per module (active top + shadowed owners); additive sibling to the
+          INV-7 top-only ``parks`` key.  Entry fields:
+          :meth:`ModuleLockTable.snapshot_park_stacks`
+        - pin_reservations: {task_id: {modules: [...], installed_at: str}} —
+          the park entries held at a pin rank (task 6040), top or buried,
+          shown apart from fairness parks
         - effective_priorities: {task_id: str}
         - pin_queue: [{task_id: str, order: int}, ...]
         - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
@@ -7764,6 +8467,7 @@ class Scheduler:
             'skip_counts': skip_counts,
             'parks': parks,
             'park_stacks': park_stacks,
+            'pin_reservations': self.lock_table.snapshot_pin_reservations(),
             'effective_priorities': effective_priorities,
             'pin_queue': pin_queue,
             'overrides': overrides,
@@ -8048,14 +8752,16 @@ class Scheduler:
         needed: list[str],
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
         """Handle plan refining blast radius (widening, narrowing, or shift).
 
         1. Try acquire any additional locks (needed − current)
         2. On success, release any stale locks (current − needed) so other
            tasks can acquire modules the refined plan no longer touches
         3. On acquire failure: update task with new modules, reset to pending,
-           release current locks
+           release current locks.  Returns ``BlastRadiusResult(applied=False)``,
+           carrying ``repend_error`` when the pending write died (locks then
+           stay held); steps 1-2 and the no-op return ``applied=True``.
 
         ``persist_files`` — optional list of raw file-level paths to store in
         ``metadata.files`` when the persist branch fires.  If supplied, these
@@ -8077,7 +8783,7 @@ class Scheduler:
         additional = sorted(needed_set - current_set)
         stale = sorted(current_set - needed_set)
         if not additional and not stale:
-            return True
+            return BlastRadiusResult(applied=True)
 
         # Determine what to write to metadata.files.  When the caller supplies
         # raw file-level paths via persist_files, use those; otherwise fall back
@@ -8172,7 +8878,7 @@ class Scheduler:
             # diverge.
             self._write_module_cache(task_id, sorted(needed_set))
             logger.info(f'Task {task_id} expanded to modules: {needed}')
-            return True
+            return BlastRadiusResult(applied=True)
 
         # Can't acquire — reset task
         logger.warning(
@@ -8196,12 +8902,15 @@ class Scheduler:
             # sweep or startup) will revert the in-progress status when the
             # backend recovers.  Releasing locks here would let another task
             # claim the modules while this one is still nominally in-progress.
+            # The error is returned so the workflow's run()-exit contract
+            # records the exit as store-unavailable
+            # (orchestrator/src/orchestrator/exit_contract.py).
             logger.warning(
                 'Task %s: set_task_status(pending) failed during '
                 'blast-radius requeue (%s) — keeping locks held for '
                 'reconcile to recover.', task_id, e,
             )
-            return False
+            return BlastRadiusResult(applied=False, repend_error=e)
         # Route through Scheduler.release (requeued=True — status was just set
         # to 'pending'): the single writer that emits lock_released, clears the
         # dispatch guard and arms the anti-hot-loop cooldown.  Stays AFTER that
@@ -8209,7 +8918,7 @@ class Scheduler:
         # stuck-lock hazard: contract C5 / task 3818, written up in
         # orchestrator/tests/test_lock_release_single_writer_guard.py.
         self.release(task_id, requeued=True)
-        return False
+        return BlastRadiusResult(applied=False)
 
     def _arm_requeue_cooldown(self, task_id: str, armed_n: int | None) -> None:
         """Write *task_id*'s re-dispatch cooldown deadline and snapshot meta.
@@ -8343,7 +9052,9 @@ class Scheduler:
             self._arm_requeue_cooldown(task_id, armed_n)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
-        # Defensive: clear any reservations still owned by this task.
+        # Defensive: dispatch already settled this task's parks, so this only
+        # clears parks installed after dispatch (e.g. a reserve_now armed on
+        # a running task).
         restored_pairs = self.lock_table.clear_parks_for(task_id)
         if modules:
             self._emit_lock_event(
@@ -8366,16 +9077,7 @@ class Scheduler:
         # has been recorded above, so the hold this judges is the one the
         # predictor just closed.
         self._settle_backfill_grant(task_id)
-        if self.event_store:
-            for restored_owner, restored_modules in restored_pairs:
-                self.event_store.emit(
-                    EventType.reservation_restored,
-                    task_id=restored_owner,
-                    data={
-                        'restored_owner': restored_owner,
-                        'modules': restored_modules,
-                    },
-                )
+        self._emit_reservations_restored(restored_pairs)
 
     # --- Public liveness accessors (task 2235, W10-α) ---
     # Replace the Harness's direct reach-ins into Scheduler-private liveness

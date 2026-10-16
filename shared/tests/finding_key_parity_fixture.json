@@ -1,0 +1,80 @@
+[
+  {
+    "area": "orchestrator",
+    "anchor": "orchestrator/src/orchestrator/harness.py::run",
+    "primary_tag": "h13",
+    "key": "fk-16b191ab5756"
+  },
+  {
+    "area": "orchestrator",
+    "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::MergeGate.check",
+    "primary_tag": "h10",
+    "key": "fk-d2e29aabb939"
+  },
+  {
+    "area": "shared",
+    "anchor": "shared/src/shared/finding_key.py",
+    "primary_tag": "h11",
+    "key": "fk-9567e2ecf4cc"
+  },
+  {
+    "area": "repo",
+    "anchor": "slug:merge-lane-practice",
+    "primary_tag": "kind:confusion",
+    "key": "fk-4985473b646c"
+  },
+  {
+    "area": "fused-memory",
+    "anchor": "fused-memory/src/fused_memory/server/tools.py::add_memory:120",
+    "primary_tag": "h4",
+    "key": "fk-87b98036b29e"
+  },
+  {
+    "area": "fused-memory",
+    "anchor": "fused-memory/src/fused_memory/server/tools.py::add_memory:120-140",
+    "primary_tag": "h4",
+    "key": "fk-87b98036b29e"
+  },
+  {
+    "area": "fused-memory",
+    "anchor": "fused-memory/src/fused_memory/server/tools.py::add_memory:1,5-7,9",
+    "primary_tag": "h4",
+    "key": "fk-87b98036b29e"
+  },
+  {
+    "area": "dashboard",
+    "anchor": "dashboard\\src\\dashboard\\app.py::index",
+    "primary_tag": "comments",
+    "key": "fk-3db3fbd8604f"
+  },
+  {
+    "area": "escalation",
+    "anchor": "  escalation/src/escalation/server.py::serve  ",
+    "primary_tag": "tests",
+    "key": "fk-c7ac0f3f2bad"
+  },
+  {
+    "area": "Orchestrator",
+    "anchor": "orchestrator/src/orchestrator/harness.py::run",
+    "primary_tag": "H13",
+    "key": "fk-16b191ab5756"
+  },
+  {
+    "area": "shared",
+    "anchor": "scripts/legibility/census.py::run_census",
+    "primary_tag": "inv-11",
+    "key": "fk-c3e3d59fb074"
+  },
+  {
+    "area": "repo",
+    "anchor": "scripts/legibility/coder.py::code_digest",
+    "primary_tag": "kind:confusion",
+    "key": "fk-7e110c1ba2ae"
+  },
+  {
+    "area": "sampler",
+    "anchor": "sampler/src/sampler/main.py",
+    "primary_tag": "TESTS",
+    "key": "fk-dcdb817d5699"
+  }
+]

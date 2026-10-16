@@ -34,7 +34,12 @@ from pathlib import Path
 import pytest
 import silent_fallthrough_scan as sfs
 import test_config_dir_archival_gate as archival_gate
-from silent_fallthrough_scan import ParsedFile, iter_first_party_files
+from silent_fallthrough_scan import (
+    SCOPE_ROOTS,
+    ParsedFile,
+    ScopeRootsMissingError,
+    iter_first_party_files,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,15 +51,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _make_fake_repo(tmp_path: Path, files: dict[str, str | bytes]) -> Path:
-    """Build a minimal repo root that satisfies iter_first_party_files' sentinels.
+    """Build a minimal repo root carrying every ``SCOPE_ROOTS`` directory.
 
-    ``iter_first_party_files`` validates ``shared/src`` and ``orchestrator/src``
-    and RAISES if they are absent, so both are created even when no file is
-    placed in them.
+    Every scope root is required: ``iter_first_party_files`` RAISES if any one
+    is absent, so all of them are created even when no file is placed in them.
     """
     root = tmp_path / 'repo'
-    (root / 'shared' / 'src').mkdir(parents=True)
-    (root / 'orchestrator' / 'src').mkdir(parents=True)
+    for scope_root in SCOPE_ROOTS:
+        (root / scope_root).mkdir(parents=True)
     for rel, content in files.items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +250,41 @@ class TestParseFirstPartyTreeIsMemoized:
         assert second is not first
         assert len(counter.parses) == 1
         assert len(counter.reads) == 1
+
+
+class TestEveryScopeRootIsRequired:
+    """An absent scope root RAISES; it is never skipped.
+
+    A skipped root is a green gate over less code — the silent fallthrough the
+    flagship gate exists to catch — so every ``SCOPE_ROOTS`` entry is required,
+    not just the two the enumerator once treated as sentinels.
+    """
+
+    @pytest.mark.parametrize('removed_root', SCOPE_ROOTS)
+    def test_each_absent_root_raises_naming_it(self, tmp_path, removed_root):
+        root = _make_fake_repo(tmp_path, {})
+        (root / removed_root).rmdir()
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            list(iter_first_party_files(root))
+        assert excinfo.value.missing == (removed_root,)
+        assert excinfo.value.repo_root == root
+        assert isinstance(excinfo.value, RuntimeError)
+
+    def test_every_absent_root_is_named_in_one_error(self, tmp_path):
+        """Report them all at once, in declaration order — not first-hit-only."""
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            list(iter_first_party_files(tmp_path))
+        assert excinfo.value.missing == SCOPE_ROOTS
+
+    def test_provider_propagates_and_memoizes_nothing(self, tmp_path,
+                                                      isolated_parse_cache):
+        """The raise reaches conftest's prebuild through the provider, uncached."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        (root / 'scripts').rmdir()
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            sfs.parse_first_party_tree(root)
+        assert excinfo.value.missing == ('scripts',)
+        assert isolated_parse_cache == {}
 
 
 class TestSessionFixtureSharesTheProvider:
@@ -696,10 +735,10 @@ class TestArchivalGateUsesTheSharedTree:
 # The anti-regrowth ratchet
 # ---------------------------------------------------------------------------
 
-#: Modules allowed to name ``iter_first_party_files`` AND call ``ast.parse``:
+#: Modules exempt from the ratchet below:
 #:
-#:   silent_fallthrough_scan.py  — IS the provider. It owns the enumeration and
-#:       the one parse; that is the whole point.
+#:   silent_fallthrough_scan.py  — IS the provider. It owns the enumeration (an
+#:       rglob over each scope root) and the one parse; that is the whole point.
 #:   test_tree_scan_sharing.py   — this file, which pins the provider's
 #:       contract. It must name the enumerator and must parse synthetic sources
 #:       to assert what the provider does with them.
@@ -752,21 +791,125 @@ def _calls_ast_parse(tree: ast.Module) -> bool:
     return False
 
 
-def _grows_a_private_tree_parse(tree: ast.Module) -> bool:
-    """The offence: enumerate the first-party tree AND parse it yourself."""
-    return 'iter_first_party_files' in _names_referenced(tree) and _calls_ast_parse(tree)
+def _os_module_names(tree: ast.Module) -> set[str]:
+    """``os`` plus every alias an ``import os as <x>`` binds."""
+    return {'os'} | {
+        alias.asname
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == 'os' and alias.asname
+    }
+
+
+def _bare_os_walk_names(tree: ast.Module) -> set[str]:
+    """Every name a ``from os import walk [as <x>]`` binds."""
+    return {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == 'os'
+        for alias in node.names
+        if alias.name == 'walk'
+    }
+
+
+_GLOB_NAMES = frozenset({'glob', 'iglob'})
+
+
+def _is_recursive_glob(call: ast.Call) -> bool:
+    """A glob that descends: a literal ``**`` pattern, or ``recursive=True``."""
+    pattern = call.args[0] if call.args else None
+    if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str) and '**' in pattern.value:
+        return True
+    return any(
+        keyword.arg == 'recursive'
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in call.keywords
+    )
+
+
+def _is_walk_call(call: ast.Call, os_names: set[str], bare_walks: set[str]) -> bool:
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        receiver = func.value.id if isinstance(func.value, ast.Name) else None
+        return (
+            func.attr == 'rglob'
+            or (func.attr == 'walk' and receiver in os_names)
+            or (func.attr in _GLOB_NAMES and _is_recursive_glob(call))
+        )
+    if isinstance(func, ast.Name):
+        return func.id in bare_walks or (func.id in _GLOB_NAMES and _is_recursive_glob(call))
+    return False
+
+
+def _walks_a_directory_tree(tree: ast.Module) -> bool:
+    """True if the module calls a recursive directory walk.
+
+    The walks are ``<x>.rglob(...)``, ``os.walk(...)`` under any import
+    spelling or alias, and a ``glob``/``iglob`` call that recurses (a ``**``
+    pattern on ``Path.glob``, or ``glob.glob(..., recursive=True)``). A flat
+    ``<dir>.glob('*.py')`` lists one directory and is not a walk. Only
+    ``ast.Call`` nodes count, so a string constant naming ``'os.walk'``
+    (test_loop_blocking_gate's primitive table) is not a walk.
+    """
+    os_names = _os_module_names(tree)
+    bare_walks = _bare_os_walk_names(tree)
+    return any(
+        isinstance(node, ast.Call) and _is_walk_call(node, os_names, bare_walks)
+        for node in ast.walk(tree)
+    )
+
+
+def _names_the_enumerator(tree: ast.Module) -> bool:
+    """Rule 1: enumerating the first-party tree is the provider's job alone.
+
+    Keyed on the NAME, not on a parse in the same module: a module that
+    enumerates and hands sources to a scanner that parses elsewhere is still a
+    second whole-tree parse.
+    """
+    return 'iter_first_party_files' in _names_referenced(tree)
+
+
+def _rolls_its_own_root_parse(tree: ast.Module) -> bool:
+    """Rule 2: walk a directory tree yourself AND parse."""
+    return _walks_a_directory_tree(tree) and _calls_ast_parse(tree)
+
+
+def _is_private_tree_parse_offender(tree: ast.Module) -> bool:
+    return _names_the_enumerator(tree) or _rolls_its_own_root_parse(tree)
+
+
+def _could_offend(source: str) -> bool:
+    """Exact source-text prefilter for :func:`_is_private_tree_parse_offender`.
+
+    Every identifier the detectors match must appear literally in the source,
+    so a module failing this test cannot offend and need not be parsed.
+    """
+    return 'iter_first_party_files' in source or (
+        'parse' in source and ('glob' in source or 'walk' in source)
+    )
+
+
+def _offends(source: str, filename: str = '<synthetic>') -> bool:
+    """The ratchet's whole verdict on one module: the prefilter, then the detectors."""
+    return _could_offend(source) and _is_private_tree_parse_offender(
+        ast.parse(source, filename=filename)
+    )
 
 
 class TestNoRegrownWholeTreeParse:
     """No shared/tests module may grow a SECOND private whole-tree parse.
 
-    Written in this directory's established ratchet idiom
-    (``test_safe_io.TestNoRegrownAtomicWriters``, the silent-fallthrough gate,
-    the archival gate): AST scan, name the offender, carry an anti-vacuity
-    floor. Keyed on ``iter_first_party_files`` rather than on "parses anything"
-    so it stays scoped to the shared enumerator — ``test_safe_io`` and
-    ``test_auth_failed`` roll their own roots and are a separate, filed
-    follow-up.
+    Written in this directory's established ratchet idiom (the
+    silent-fallthrough gate, the archival gate): AST scan, name the offender,
+    carry an anti-vacuity floor. Two shapes offend: naming
+    ``iter_first_party_files`` at all (rule 1), and walking a directory tree
+    yourself (``rglob``, ``os.walk``, a recursive glob) and parsing (rule 2).
+    ``test_safe_io``'s
+    cross-tree sweep left shared/tests in task 3388 (now
+    ``tests/scripts/test_atomic_write_regrowth.py``), and ``test_auth_failed``
+    now walks the shared tree.
     """
 
     def test_no_module_enumerates_and_parses_the_tree_itself(self):
@@ -776,55 +919,133 @@ class TestNoRegrownWholeTreeParse:
             if module_path.name in _PRIVATE_PARSE_EXEMPT:
                 continue
             scanned += 1
-            if _grows_a_private_tree_parse(
-                ast.parse(module_path.read_text(encoding='utf-8'),
-                          filename=str(module_path))
-            ):
+            source = module_path.read_text(encoding='utf-8')
+            if _offends(source, filename=str(module_path)):
                 offenders.append(module_path.name)
         assert scanned >= 50, (
             f'only {scanned} modules scanned — is the tests dir correct? '
             f'({_TESTS_DIR})'
         )
         assert not offenders, (
-            'These shared/tests modules enumerate the first-party tree with '
-            'iter_first_party_files AND parse it themselves:\n'
+            'These shared/tests modules name iter_first_party_files, or walk '
+            'a directory tree (rglob, os.walk, a recursive glob) AND call '
+            'ast.parse:\n'
             + '\n'.join(f'  {name}' for name in offenders)
-            + '\n\nThat is a SECOND whole-tree parse. Two of them already '
+            + '\n\nEither is a SECOND whole-tree parse. Two of them already '
               'collided with the 60s pytest-timeout budget under load (task '
-              '4520): pytest-timeout arms its timer over the whole runtest '
-              'protocol, so the duplicated work lands on one arbitrary test '
-              'item as an ERROR-at-setup. Take the session-scoped '
-              '`first_party_tree` fixture (conftest.py) and walk the ASTs '
-              'silent_fallthrough_scan.parse_first_party_tree already built.'
+              '4520). Take the session-scoped `first_party_tree` fixture '
+              '(conftest.py) instead: its records carry each file\'s relpath, '
+              'source and parsed tree, built once at collection, outside every '
+              'item\'s pytest-timeout timer.'
         )
 
     def test_the_detector_actually_fires(self):
         """Anti-vacuity: a synthetic offender must be caught."""
-        offender = ast.parse(
+        assert _offends(
             'import ast\n'
             'from silent_fallthrough_scan import iter_first_party_files\n'
             'def scan(root):\n'
             '    return [ast.parse(p.read_text()) for p in iter_first_party_files(root)]\n'
         )
-        assert _grows_a_private_tree_parse(offender)
 
-    def test_the_detector_catches_the_from_import_spelling(self):
-        """`from ast import parse` must not evade the ratchet."""
-        offender = ast.parse(
-            'from ast import parse\n'
-            'from silent_fallthrough_scan import iter_first_party_files\n'
-            'def scan(root):\n'
-            '    return [parse(p.read_text()) for p in iter_first_party_files(root)]\n'
-        )
-        assert _grows_a_private_tree_parse(offender)
-
-    def test_the_detector_does_not_fire_on_either_half_alone(self):
-        """Parsing a synthetic source, or naming the enumerator, is fine alone."""
-        parses_only = ast.parse('import ast\nast.parse("x = 1")\n')
-        enumerates_only = ast.parse(
+    def test_naming_the_enumerator_alone_fires(self):
+        """Rule 1: a consumer never needs the enumerator; paths are on the records."""
+        assert _offends(
             'from silent_fallthrough_scan import iter_first_party_files\n'
             'def files(root):\n'
             '    return list(iter_first_party_files(root))\n'
         )
-        assert not _grows_a_private_tree_parse(parses_only)
-        assert not _grows_a_private_tree_parse(enumerates_only)
+
+    def test_the_split_enumerate_here_parse_elsewhere_shape_fires(self):
+        """The loop-blocking gate's old shape: enumerate, then a scanner parses."""
+        assert _offends(
+            'from loop_blocking_scan import find_loop_blocking_sites\n'
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def scan(root):\n'
+            '    sources = {str(p): p.read_text() for p in iter_first_party_files(root)}\n'
+            '    return find_loop_blocking_sites(sources)\n'
+        )
+
+    def test_the_detector_catches_the_from_import_spelling(self):
+        """`from ast import parse` must not evade rule 2."""
+        assert _offends(
+            'from ast import parse\n'
+            'def scan(root):\n'
+            "    return [parse(p.read_text()) for p in root.rglob('*.py')]\n"
+        )
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                'import ast\n'
+                'def scan(root):\n'
+                "    return [ast.parse(p.read_text()) for p in root.rglob('*.py')]\n",
+                id='rglob',
+            ),
+            pytest.param(
+                'import ast, os\n'
+                'def scan(root):\n'
+                '    for dirpath, _dirs, names in os.walk(root):\n'
+                '        for name in names:\n'
+                '            ast.parse(open(os.path.join(dirpath, name)).read())\n',
+                id='os-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'import os as o\n'
+                'def scan(root):\n'
+                '    for dirpath, _dirs, names in o.walk(root):\n'
+                '        for name in names:\n'
+                '            ast.parse(open(o.path.join(dirpath, name)).read())\n',
+                id='aliased-os-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'from os import walk as w\n'
+                'def scan(root):\n'
+                '    return [ast.parse(name) for _d, _s, names in w(root) for name in names]\n',
+                id='aliased-from-os-import-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'def scan(root):\n'
+                "    return [ast.parse(p.read_text()) for p in root.glob('**/*.py')]\n",
+                id='double-star-path-glob',
+            ),
+            pytest.param(
+                'import ast, glob, os\n'
+                'def scan(root):\n'
+                "    paths = glob.glob(os.path.join(root, '**', '*.py'), recursive=True)\n"
+                '    return [ast.parse(open(p).read()) for p in paths]\n',
+                id='recursive-glob-module',
+            ),
+        ],
+    )
+    def test_the_detector_catches_every_directory_walk_spelling(self, source):
+        """Rule 2 keys on the walk, whichever spelling rolls it."""
+        assert _offends(source)
+
+    def test_a_flat_glob_is_not_a_walk(self):
+        """One directory level is not a tree: this ratchet itself globs '*.py' and parses."""
+        flat = ast.parse(
+            'import ast\n'
+            'def scan(directory):\n'
+            "    return [ast.parse(p.read_text()) for p in directory.glob('*.py')]\n"
+        )
+        assert not _is_private_tree_parse_offender(flat)
+
+    def test_a_walk_or_a_parse_alone_does_not_fire(self):
+        walks_only = ast.parse(
+            "def files(root):\n    return sorted(root.rglob('*.py'))\n"
+        )
+        parses_only = ast.parse('import ast\nast.parse("x = 1")\n')
+        assert not _is_private_tree_parse_offender(walks_only)
+        assert not _is_private_tree_parse_offender(parses_only)
+
+    def test_a_string_naming_os_walk_is_not_a_walk(self):
+        """Only calls count: test_loop_blocking_gate's primitive table names 'os.walk'."""
+        names_it = ast.parse(
+            "import ast\nPRIMITIVES = ('os.walk',)\nast.parse('x = 1')\n"
+        )
+        assert not _is_private_tree_parse_offender(names_it)

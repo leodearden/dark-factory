@@ -18,15 +18,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
+from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
+from shared.proc_group import process_group_members, read_stat_fields
 
 
 @pytest.fixture
@@ -343,3 +350,195 @@ async def test_bounded_calls_do_not_queue_behind_unbounded_ones() -> None:
                 asyncio.gather(*unbounded, *probes, return_exceptions=True),
                 timeout=5,
             )
+
+
+# ---------------------------------------------------------------------------
+# (j) an interrupted call reaches the child's whole process group (task 4155)
+# ---------------------------------------------------------------------------
+
+
+def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until *pid* is gone or a zombie; False if still running at *timeout*.
+
+    A zombie counts as exited: an orphaned grandchild of a killed group awaits
+    systemd --user's reap, which is not run_git's to perform (task 6029).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        fields = read_stat_fields(Path('/proc') / str(pid))
+        if fields is None or fields.state in ('Z', 'X'):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _leaker_argv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """argv of a script that backgrounds a grandchild and records its pid in ``leaked.pid``."""
+    leaker = tmp_path / 'leaker.sh'
+    leaker.write_text(PIPE_CLOSING_LEAKER_SRC)
+    monkeypatch.setenv('LEAK_PIDFILE', str(tmp_path / 'leaked.pid'))
+    return ['sh', str(leaker)]
+
+
+def _abandon(task: asyncio.Future, leaked_pid: int | None) -> None:
+    """Test cleanup: stop an unfinished call and SIGKILL the grandchild it leaked."""
+    task.cancel()
+    if leaked_pid is not None:
+        with contextlib.suppress(OSError):
+            os.kill(leaked_pid, signal.SIGKILL)
+
+
+def _spawned_child(marker: str) -> int | None:
+    """The pid of this process's child whose cmdline contains *marker*, if any."""
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        fields = read_stat_fields(entry)
+        if fields is None or fields.ppid != os.getpid():
+            continue
+        with contextlib.suppress(OSError):
+            if marker in (entry / 'cmdline').read_bytes().decode('utf-8', 'replace'):
+                return int(entry.name)
+    return None
+
+
+# Each test below judges the grandchild while the call is still in flight and
+# only then awaits it: a surviving group member holds the call's pipes open, so
+# awaiting first would hang rather than fail.
+
+
+async def test_cancellation_kills_a_backgrounded_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = asyncio.ensure_future(run_git(_leaker_argv(tmp_path, monkeypatch)))
+    leaked_pid = None
+    try:
+        leaked_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leaked.pid')
+        task.cancel()
+
+        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid), (
+            f'pid {leaked_pid}, a backgrounded grandchild, survived a cancelled run_git'
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        _abandon(task, leaked_pid)
+
+
+async def test_cancellation_mid_spawn_kills_a_backgrounded_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel landing after the fork but before create_subprocess_exec returns
+    must still reach the child's whole group."""
+    real_spawn = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+
+    async def _recording_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        spawned.append(await real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', _recording_spawn)
+    leaker = _leaker_argv(tmp_path, monkeypatch)
+    task = asyncio.ensure_future(run_git(leaker))
+    leader_pid = leaked_pid = None
+    try:
+        deadline = time.monotonic() + 10.0
+        while (leader_pid := _spawned_child(leaker[1])) is None:
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    'the leaker never forked within 10.0s; the harness is broken, '
+                    'which says nothing either way about process-group containment.',
+                    pytrace=False,
+                )
+            await asyncio.sleep(0)
+        # Held on the loop thread, not to_thread: this freezes run_git inside
+        # create_subprocess_exec's post-fork pipe connect, as load does.
+        leaked_pid = read_leaked_pid(tmp_path / 'leaked.pid')
+        assert not spawned, (
+            'create_subprocess_exec returned before the cancel: asyncio connected '
+            "the child's pipes ahead of this poll, so the test no longer reaches "
+            'the mid-spawn window'
+        )
+        task.cancel()
+
+        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid), (
+            f'pid {leaked_pid}, a backgrounded grandchild, survived a run_git '
+            'cancelled mid-spawn'
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        _abandon(task, leaked_pid)
+        if leader_pid is not None:
+            for member in process_group_members(leader_pid):
+                if not member.terminated:
+                    with contextlib.suppress(OSError):
+                        os.kill(member.pid, signal.SIGKILL)
+
+
+async def test_cancellation_mid_spawn_wins_over_a_spawn_that_then_fails() -> None:
+    """A cancel that waits out a spawn which then fails still raises CancelledError."""
+    entered: list[str] = []
+    released = asyncio.Event()
+
+    async def _fake_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        entered.append('spawn')
+        await released.wait()
+        raise FileNotFoundError(args[0])
+
+    with mock.patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+        task = asyncio.ensure_future(run_git(['git', 'status']))
+        await _settle_until(lambda: entered)
+        assert entered, 'run_git never reached the spawn, so there was nothing to cancel'
+
+        task.cancel()
+        released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+
+async def test_own_timeout_kills_a_backgrounded_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_timeout = 2.0
+    task = asyncio.ensure_future(
+        run_git(_leaker_argv(tmp_path, monkeypatch), timeout=run_timeout)
+    )
+    leaked_pid = None
+    try:
+        leaked_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leaked.pid')
+
+        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid, run_timeout + 5.0), (
+            f'pid {leaked_pid}, a backgrounded grandchild, survived a timed-out run_git'
+        )
+        result = await task
+        assert result.timed_out
+    finally:
+        _abandon(task, leaked_pid)
+
+
+# ---------------------------------------------------------------------------
+# (k) every child leads its own session, so it has no controlling terminal
+# ---------------------------------------------------------------------------
+
+_SESSION_PROBE = '''\
+import errno, json, os
+try:
+    os.close(os.open('/dev/tty', os.O_RDWR))
+    tty = 'opened'
+except OSError as exc:
+    tty = errno.errorcode[exc.errno]
+print(json.dumps({'pid': os.getpid(), 'pgid': os.getpgid(0), 'sid': os.getsid(0), 'tty': tty}))
+'''
+
+
+async def test_child_leads_its_own_session_with_no_controlling_terminal() -> None:
+    """The group kill signals the child's pid as its pgid, and a git credential
+    prompt must fail rather than block on a tty; both rest on a new session."""
+    result = await run_git([sys.executable, '-c', _SESSION_PROBE])
+
+    assert result.ok, result.stderr
+    child = json.loads(result.stdout)
+    assert child['pid'] == child['pgid'] == child['sid'], child
+    assert child['tty'] == 'ENXIO', child

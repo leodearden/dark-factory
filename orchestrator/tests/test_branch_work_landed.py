@@ -1873,6 +1873,28 @@ class TestLandingTally:
                 subject.record(reason)
         assert subject.git_error_count_in_window() == 0
 
+    def test_the_git_error_window_is_half_open(self) -> None:
+        now = [0.0]
+        subject = LandingTally(clock=lambda: now[0])
+        subject.record(LandingReason.git_error)
+
+        now[0] = subject.window_secs - 1.0
+        assert subject.git_error_count_in_window() == 1
+        now[0] = subject.window_secs
+        assert subject.git_error_count_in_window() == 0, (
+            'a stamp aged exactly the window is out'
+        )
+
+    def test_the_windowed_count_is_exact_however_large_the_storm(self) -> None:
+        """The count is the number the storm alarm reports, so it must be exact.
+
+        The window, not a cap, bounds it.
+        """
+        subject = LandingTally(clock=lambda: 0.0)
+        for _ in range(5000):
+            subject.record(LandingReason.git_error)
+        assert subject.git_error_count_in_window() == 5000
+
 
 @pytest.mark.asyncio
 class TestTallyIsChargedByEveryVerdict:
@@ -2128,6 +2150,44 @@ class TestGitErrorStormEscape:
         )
         assert all(v.reason is LandingReason.git_error for v in verdicts)
         assert queue.submitted == []
+
+    async def test_a_failed_submit_is_retried_on_the_next_git_error(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """The alarm's only dedup is the open L1 (``has_open_l1``), never a time
+        rate-limit or latch — which is why ``LandingTally`` uses
+        ``StormCounter.observe()`` and NOT ``record()``: routing the fire through
+        ``record()`` would consume a fire on a failed submit and stop re-filing a
+        resolved alarm mid-storm.
+        """
+        build_unlanded_branch(repo)
+        broken = _FakeEscalationQueue(submit_raises=True)
+        await _drive_git_errors(
+            git_ops, 4, queue=broken, recovery_emission=_storm_config(rate=3),
+        )
+        assert broken.submitted == []
+
+        healthy = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 1, queue=healthy, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(healthy.submitted) == 1
+
+    async def test_a_resolved_alarm_is_refiled_while_the_storm_persists(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        build_unlanded_branch(repo)
+        first = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=first, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(first.submitted) == 1
+
+        resolved = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 1, queue=resolved, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(resolved.submitted) == 1
 
     async def test_the_filer_is_directly_callable_and_reports_what_it_did(
         self, tally: LandingTally,

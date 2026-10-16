@@ -64,9 +64,9 @@ function loadTaskRowCells() {
 
 const cells = loadTaskRowCells().cells;
 
-const { strandBadgeState, agentCellState, locksCellState, STRAND_TITLE, MUTED_COLOR } = cells;
+const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, STRAND_TITLE, MUTED_COLOR } = cells;
 
-const EXPECTED_FUNCTION_NAMES = ['strandBadgeState', 'agentCellState', 'locksCellState'];
+const EXPECTED_FUNCTION_NAMES = ['strandBadgeState', 'agentCellState', 'locksCellState', 'schedulerLocksDatum'];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'STRAND_TITLE', 'MUTED_COLOR'];
 
 test('default-imported module exposes the task-row render decisions', () => {
@@ -398,4 +398,56 @@ test('locksCellState: a non-Datum argument throws via assertDatum', () => {
       `locksCellState accepted ${JSON.stringify(bad)}`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// schedulerLocksDatum — is anything KNOWN about one project's locks?
+// (PRD decision 15 / precondition sketch #12, first half)
+//
+// The Datum locksCellState reads. A project the scheduler snapshot lists in
+// offline_projects carries no lock rows, so its Locks cells are holes naming
+// it; every other project's cells are measured by that same snapshot, however
+// many OTHER projects are offline.
+// ---------------------------------------------------------------------------
+
+const SCHEDULER_ENDPOINT = '/api/v2/dashboard/scheduler';
+const SCHEDULER_RECEIPTS = Object.freeze({
+  [SCHEDULER_ENDPOINT]: Object.freeze({ servedAt: '2026-10-03T12:00:30+00:00', receivedAt: 1_800_000_000_000 }),
+});
+
+function schedulerSnapshot(offlineProjects) {
+  return {
+    rows: [],
+    modules: [],
+    offline: offlineProjects.length > 0,
+    offline_projects: offlineProjects,
+  };
+}
+
+test('schedulerLocksDatum: a project the snapshot lists offline is a hole naming it', () => {
+  const datum = schedulerLocksDatum(schedulerSnapshot(['reify']), 'reify', SCHEDULER_RECEIPTS);
+  assert.equal(datum.state, 'unknown');
+  assert.equal(datum.value, null);
+  assert.match(datum.reason, /reify/, `the reason does not name the project: ${datum.reason}`);
+  assert.match(datum.reason, /locks were not read/, `the reason does not say its locks were not read: ${datum.reason}`);
+  // ...and the Locks cell draws that hole even with lock paths in hand.
+  assert.deepEqual(
+    locksCellState(datum, lockInfoWith('crates/reify-eval/src/lib.rs')),
+    { placeholder: LOCKS_EM_DASH, title: datum.reason },
+  );
+});
+
+test('schedulerLocksDatum: one offline project does not blank another project\'s Locks', () => {
+  const snapshot = schedulerSnapshot(['reify']);
+  assert.equal(snapshot.offline, true, 'fixture: the any-project offline flag is raised');
+  const datum = schedulerLocksDatum(snapshot, 'dark_factory', SCHEDULER_RECEIPTS);
+  assert.notEqual(datum.state, 'unknown', `a covered project's locks read as unknown: ${datum.reason}`);
+  assert.equal(datum.value, snapshot);
+  assert.equal(locksCellState(datum, lockInfoWith('a/b.py')).placeholder, null);
+});
+
+test('schedulerLocksDatum: before the first /scheduler receipt nothing is known', () => {
+  const datum = schedulerLocksDatum(schedulerSnapshot([]), 'dark_factory', {});
+  assert.equal(datum.state, 'unknown');
+  assert.equal(datum.reason, 'not yet fetched');
 });

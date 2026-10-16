@@ -52,6 +52,26 @@ def relocating_read_text(doomed: Path, dest_dir: Path) -> Callable[..., str]:
     return flaky
 
 
+def deleting_read_text(doomed: Path) -> Callable[..., str]:
+    """Interpose ``Path.read_text`` to really delete *doomed* mid-read.
+
+    The deletion counterpart to :func:`relocating_read_text`: the record is
+    genuinely gone rather than moved, so the re-locate/retry in
+    ``queue.py::EscalationQueue.get`` and ``queue.py::EscalationQueue.get_by_task``
+    has nothing to find and must give up cleanly.  The ``doomed.exists()``
+    guard makes it fire exactly once, so the retry's re-read reaches the real
+    ``FileNotFoundError`` rather than a second unlink.
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed and doomed.exists():
+            doomed.unlink()
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
 def unreadable_read_text(doomed: Path) -> Callable[..., str]:
     """Interpose ``Path.read_text`` to fail *doomed* with ``PermissionError``.
 

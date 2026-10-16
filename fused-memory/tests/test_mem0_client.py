@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _qdrant_responses import missing_collection_404
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
@@ -699,6 +700,35 @@ class TestMem0BackendScrollCollectionPages:
         assert kwargs['with_vectors'] is True
         assert isinstance(kwargs['scroll_filter'], qmodels.Filter)
         assert kwargs['scroll_filter'] == given_filter
+
+    @pytest.mark.asyncio
+    async def test_payload_is_read_by_default(self, backend):
+        """Every existing caller reads payloads; the default must keep that."""
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert client.scroll.await_args_list[0].kwargs['with_payload'] is True
+
+    @pytest.mark.asyncio
+    async def test_ids_only_walk_skips_payload_on_every_page(self, backend):
+        """with_payload=False reaches EVERY page request, and points still stream in order.
+
+        The uuid-prefix resolver enumerates ids only; a payload read on any
+        page would widen its data access for nothing.
+        """
+        p1, p2, p3 = (self._make_mock_point(f'id-{i}') for i in range(1, 4))
+        client = _paging_client([([p1, p2], 'off-1'), ([p3], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('fused_reify', with_payload=False, page_size=2)
+            )
+
+        assert got == [p1, p2, p3]
+        assert client.scroll.await_count == 2
+        assert [c.kwargs['with_payload'] for c in client.scroll.await_args_list] == [False, False]
 
     @pytest.mark.asyncio
     async def test_empty_collection_yields_nothing(self, backend):
@@ -1512,6 +1542,65 @@ class TestMem0BackendGetPointById:
         ), f'expected a >1-point WARNING, got {[r.getMessage() for r in caplog.records]!r}'
 
 
+class TestMem0BackendGetPointsByIds:
+    """get_points_by_ids reads several points' raw payloads in ONE retrieve (task 5323)."""
+
+    @staticmethod
+    def _point(point_id: str, payload: dict | None):
+        point = MagicMock()
+        point.id = point_id
+        point.payload = payload
+        return point
+
+    @pytest.mark.asyncio
+    async def test_one_retrieve_maps_each_present_id_to_its_raw_payload(self, backend):
+        first, second, absent = (
+            '77a3f6bc-0000-4000-8000-000000000001',
+            '77a3f6bc-0000-4000-8000-000000000002',
+            '77a3f6bc-0000-4000-8000-000000000003',
+        )
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[
+            self._point(first, {'data': 'one', 'agent_id': 'a'}),
+            self._point(second, None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.get_points_by_ids(
+                [first, second, absent], Scope(project_id='dark_factory'),
+            )
+
+        assert result == {first: {'data': 'one', 'agent_id': 'a'}, second: {}}
+        assert mock_client.retrieve.await_count == 1
+        call_kwargs = mock_client.retrieve.call_args.kwargs
+        assert call_kwargs['collection_name'] == f'{backend.config.mem0.collection_prefix}_dark_factory'
+        assert call_kwargs['ids'] == [first, second, absent]
+        assert call_kwargs['with_payload'] is True
+        assert call_kwargs['with_vectors'] is False
+
+    @pytest.mark.asyncio
+    async def test_no_ids_is_no_read(self, backend):
+        get_client = AsyncMock()
+
+        with patch.object(backend, '_get_async_qdrant', get_client):
+            assert await backend.get_points_by_ids([], Scope(project_id='dark_factory')) == {}
+
+        get_client.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.get_points_by_ids(
+                ['00000000-0000-4000-8000-000000000000'], Scope(project_id='dark_factory'),
+            )
+
+
 class TestMem0BackendAddSystemRecord:
     """Unit tests for the dedup-exempt system-write path (task 2222 / W5-δ).
 
@@ -1863,6 +1952,139 @@ class TestIsMissingCollectionError:
     def test_timeout_error_is_false(self):
         """A timeout must keep propagating — it is not evidence of 'no data'."""
         assert is_missing_collection_error(TimeoutError()) is False
+
+
+_ABSENT_SCOPE = Scope(project_id='solar_challenge')
+_ABSENT_FILTERS = {'kind': 'project_status_correction'}
+
+_SCOPED_METADATA_READS = ['scroll_by_metadata', 'count_by_metadata']
+
+_EMPTY_READ_RESULTS = [
+    pytest.param('scroll_by_metadata', [], id='scroll'),
+    pytest.param('count_by_metadata', 0, id='count'),
+]
+
+_PROPAGATING_FAILURES = [
+    pytest.param(
+        lambda: UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers()),
+        UnexpectedResponse,
+        id='500',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404,
+            'Not Found',
+            b'{"status":{"error":"Not found: Point 42 does not exist"}}',
+            httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='point-404',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404, 'Not Found', b"Snapshot `daily` doesn't exist!", httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='snapshot-404',
+    ),
+    pytest.param(lambda: TimeoutError('too slow'), TimeoutError, id='timeout'),
+    pytest.param(lambda: RuntimeError('qdrant down'), RuntimeError, id='generic'),
+]
+
+
+class TestMem0BackendMetadataReadsOnAbsentCollection:
+    """A never-provisioned collection holds zero memories, so both Scope-addressed
+    metadata reads answer it as empty and say so at INFO, while every other
+    failure keeps propagating (task 4858).
+    """
+
+    @staticmethod
+    async def _read_raising(backend, op: str, exc: BaseException):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=exc)
+        mock_client.count = AsyncMock(side_effect=exc)
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            return await getattr(backend, op)(scope=_ABSENT_SCOPE, filters=_ABSENT_FILTERS)
+
+    @staticmethod
+    def _collection(backend) -> str:
+        return _ABSENT_SCOPE.mem0_collection_name(backend.config.mem0.collection_prefix)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('op', 'empty'), _EMPTY_READ_RESULTS)
+    async def test_missing_collection_reads_as_empty(self, backend, op, empty):
+        exc = missing_collection_404(self._collection(backend))
+
+        result = await self._read_raising(backend, op, exc)
+
+        assert result == empty
+        assert type(result) is type(empty)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
+    async def test_missing_collection_is_disclosed_at_info(self, backend, caplog, op):
+        collection = self._collection(backend)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.backends.mem0_client'):
+            await self._read_raising(backend, op, missing_collection_404(collection))
+
+        disclosures = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and op in r.getMessage()
+            and collection in r.getMessage()
+        ]
+        assert len(disclosures) == 1, [r.getMessage() for r in caplog.records]
+        assert getattr(disclosures[0], 'collection', None) == collection
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
+    @pytest.mark.parametrize(('make_failure', 'raised'), _PROPAGATING_FAILURES)
+    async def test_other_failures_still_propagate(self, backend, op, make_failure, raised):
+        with pytest.raises(raised):
+            await self._read_raising(backend, op, make_failure())
+
+
+@pytest.fixture
+def _absent_scope(worker_id) -> Scope:
+    return Scope(project_id=f'_test_absent_collection_{worker_id}')
+
+
+@pytest.fixture
+def _absent_collection(_absent_scope, mock_config):
+    """Guarantee the scope's Qdrant collection is absent before AND after the test."""
+    collection = _absent_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
+        client.delete_collection(collection)
+    yield collection
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    client.close()
+
+
+class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
+    """The live client's absent-collection 404 matches the predicate for BOTH reads.
+
+    No mem0 instance is built: ``_get_instance`` would provision the very
+    collection this test needs absent.
+    """
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
+
+    @pytest.mark.asyncio
+    async def test_live_absent_collection_reads_as_empty(
+        self, mock_config, _absent_scope, _absent_collection,
+    ):
+        config = mock_config.model_copy(deep=True)
+        config.mem0.qdrant_url = QDRANT_URL
+        backend = Mem0Backend(config)
+        try:
+            assert await backend.scroll_by_metadata(_absent_scope, {'kind': 'x'}) == []
+            assert await backend.count_by_metadata(_absent_scope, {'kind': 'x'}) == 0
+        finally:
+            await backend.close()
 
 
 # ---------------------------------------------------------------------------

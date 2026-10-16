@@ -15,6 +15,7 @@ import re
 
 import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments
+from _lock_chip_matrix import chip_classes_over_the_matrix
 
 
 @pytest.fixture(scope='module')
@@ -531,6 +532,47 @@ def test_cell_state_delegates_membership_to_the_shared_predicate(scheduler_heatm
     )
 
 
+@pytest.mark.parametrize('token', ['parked_by', 'park_state', 'held-by-other', 'parked-by'])
+def test_cell_state_classifies_through_the_one_lock_classifier(scheduler_heatmap_jsx_body, token):
+    """cellStateFor asks lockChipStateFor and keeps no precedence of its own.
+
+    The heatmap once ranked parked-by-me above held-by-other while the task-row
+    chip ranks the holder first, so one lock read differently in two views.
+    test_lock_chip_state.py executes both and pins that they agree; this pins
+    that no private precedence, and no reading of the park fields, survives
+    beside the call — the module entry is handed over whole.
+    """
+    body = strip_js_comments(extract_function_body(scheduler_heatmap_jsx_body, 'cellStateFor'))
+    assert re.search(r'lockChipStateFor\s*\(', body), 'cellStateFor does not call lockChipStateFor'
+    assert token not in body, f'cellStateFor still reads or returns `{token}`'
+
+
+def test_scheduler_heatmap_derives_no_park_map(scheduler_heatmap_jsx_body):
+    """The server's modules[].parked_by is the park answer; no client re-derivation."""
+    assert 'parkedByModule' not in _heatmap_body(scheduler_heatmap_jsx_body), (
+        'SchedulerHeatmap still rebuilds a parked-by map over the rows, overriding '
+        "the server's modules[].parked_by that the task-row chip reads."
+    )
+
+
+class TestHeatmapCellClassesAreStyled:
+    """Every class a heatmap cell can carry has a `.sched-cell.<cls>` rule.
+
+    test_lock_chip_state.py pins what lockChipStateFor returns; what a node
+    process cannot see is whether styles.css colours it. An unstyled class
+    renders as a bare cell, and a taken lock would read like a free one.
+    """
+
+    def test_every_cell_class_has_a_rule(self, styles_css_body):
+        classes = chip_classes_over_the_matrix() | {'not-in-set'}
+        unstyled = sorted(c for c in classes if not _extract_css_rule_block(styles_css_body, f'.sched-cell.{c}'))
+        assert unstyled == [], f'styles.css has no `.sched-cell.<cls>` rule for {unstyled}'
+
+    def test_the_retired_cell_vocabulary_is_unstyled(self, styles_css_body):
+        retired = re.findall(r'\.sched-cell\.(held-by-other|parked-by-me|parked-by-other|free)\b', styles_css_body)
+        assert retired == [], f'styles.css still styles the retired cell classes {sorted(set(retired))}'
+
+
 # ---------------------------------------------------------------------------
 # task 5705: memoisation — what turns a one-off expensive render into a
 # skipped one
@@ -607,4 +649,50 @@ def test_memoising_the_module_filter_preserved_its_predicate(tab_scheduler_jsx_b
     ), (
         'the strict per-project predicate must survive the memo wrap verbatim, '
         'inside the visibleModules stUseMemo callback'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-4889 #4425: the Scheduler tab reads the new degraded_projects key
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_tab_renders_degraded_projects_distinctly(tab_scheduler_jsx_body):
+    """SchedulerTab must both destructure AND use ``degraded_projects``.
+
+    This layer has no render test by construction — the dashboard has no
+    JS/DOM runner (React/Babel are CDN-only, no build step), which
+    test_chip_label_disambiguation.py's module docstring already records for
+    the six other JSX render sites. A source-structure assertion is therefore
+    the only executable guard against a payload key that reaches the browser
+    and is never read, which is precisely the silent drop this workstream
+    closes one seam earlier.
+
+    Comment-stripped, per this file's convention: that is what keeps this a
+    WIRING assertion rather than a prose pin — a mention in the banner's own
+    explanatory comment cannot satisfy it.
+    """
+    from _dashboard_helpers import destructure_bindings
+
+    body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'SchedulerTab'))
+
+    match = re.search(r'const\s*\{(.*?)\}\s*=\s*sched\s*;', body, re.S)
+    assert match, 'SchedulerTab must destructure its fields from `sched`'
+    # Every binding here carries a destructuring DEFAULT (`offline = false`),
+    # which the shared helper keeps attached because it splits aliases on ':',
+    # not defaults on '='.  Dropping the default is this test's own projection
+    # over the shared parse, not a second dialect of it.
+    bound = {
+        canonical.split('=')[0].strip()
+        for canonical, _local in destructure_bindings(match.group(1))
+    }
+    assert 'degraded_projects' in bound, (
+        'SchedulerTab must destructure degraded_projects from sched; bound '
+        f'names were {sorted(bound)}'
+    )
+
+    outside_destructure = body.replace(match.group(0), '')
+    assert outside_destructure.count('degraded_projects') >= 2, (
+        'degraded_projects must be both gated on and rendered, not '
+        'destructured and dropped'
     )

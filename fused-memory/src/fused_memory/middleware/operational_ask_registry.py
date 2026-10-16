@@ -71,12 +71,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import yaml
+from fused_memory.utils.safe_yaml import load_yaml_list_file
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
+_LOG_LABEL = "operational_ask_registry"
 
 
 @dataclass(frozen=True)
@@ -96,56 +97,24 @@ class OperationalAskEntry:
 
 
 def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
-    """Load the operational-ask registry from a YAML file.
+    """Load the operational-ask registry from a YAML file; never raises.
 
-    Returns an empty list (without warning) when *path* is ``None``.
-    Returns an empty list and emits one WARNING when the file is missing,
-    unreadable, not valid YAML, or its top-level document is not a list.
-    Skips malformed individual entries with one WARNING each while returning
-    the well-formed entries from the same file.
-
-    The function never raises — all failures degrade gracefully to [].
+    File-level failures (unset path, missing / unreadable / undecodable file,
+    invalid YAML, non-list document) degrade to [] as specified by
+    fused_memory/utils/safe_yaml.py::load_yaml_list_file. Malformed individual
+    entries are skipped with one WARNING each.
     """
-    if path is None:
-        return []
-
-    # Missing-file / unreadable
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        logger.warning(
-            "operational_ask_registry: file not found: %s — registry disabled", path
-        )
-        return []
-    except OSError as exc:
-        logger.warning(
-            "operational_ask_registry: cannot read %s: %s — registry disabled",
-            path, exc,
-        )
-        return []
-
-    # Parse
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        logger.warning(
-            "operational_ask_registry: YAML parse error in %s: %s — registry disabled",
-            path, exc,
-        )
-        return []
-
-    if not isinstance(data, list):
-        logger.warning(
-            "operational_ask_registry: expected a YAML list in %s, got %s — registry disabled",
-            path, type(data).__name__,
-        )
-        return []
-
     entries: list[OperationalAskEntry] = []
-    for item in data:
+    for item in load_yaml_list_file(
+        path,
+        logger=logger,
+        label=_LOG_LABEL,
+        consequence="registry disabled",
+    ):
         if not isinstance(item, dict):
             logger.warning(
-                "operational_ask_registry: skipping non-dict entry in %s: %r", path, item
+                "%s: skipping non-dict entry in %s: %r",
+                _LOG_LABEL, path, item
             )
             continue
 
@@ -156,8 +125,8 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
         ]
         if missing:
             logger.warning(
-                "operational_ask_registry: skipping entry missing fields %s in %s: %r",
-                missing, path, item.get("name", "<unnamed>"),
+                "%s: skipping entry missing fields %s in %s: %r",
+                _LOG_LABEL, missing, path, item.get("name", "<unnamed>"),
             )
             continue
 
@@ -165,18 +134,20 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
         desc_subs = item["description_substrings"]
         if not isinstance(title_subs, list) or not isinstance(desc_subs, list):
             logger.warning(
-                "operational_ask_registry: skipping entry %r — title_substrings and "
+                "%s: skipping entry %r — title_substrings and "
                 "description_substrings must be lists",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue
 
         if not title_subs or not desc_subs:
             logger.warning(
-                "operational_ask_registry: skipping entry %r — title_substrings and "
+                "%s: skipping entry %r — title_substrings and "
                 "description_substrings must be non-empty (an empty title_substrings "
                 "would match every candidate title via all([]) == True, degrading the "
                 "gate to a description-only match)",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue

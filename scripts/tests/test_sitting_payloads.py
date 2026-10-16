@@ -11,6 +11,8 @@ from orchestrator.session_registry import decision_path_for_id
 from sitting import payloads as mod
 from sitting.inventory import OpenItem, decision_key, escalation_key, queue_tag
 
+from orchestrator import session_registry
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ESCALATION_SERVER = REPO_ROOT / 'escalation' / 'src' / 'escalation' / 'server.py'
 FUSED_MEMORY_TOOLS = REPO_ROOT / 'fused-memory' / 'src' / 'fused_memory' / 'server' / 'tools.py'
@@ -224,19 +226,35 @@ class TestCloseDecisionArgv:
         assert _flag(argv, '--project') == 'know_live'
         assert _flag(argv, '--escalations-dir') == DF_RECON_QUEUE
 
-    def test_an_unlinked_item_is_filed_and_closed_under_the_derived_id(self):
-        item = _l2()
+    @pytest.mark.parametrize(
+        ('queue_dir', 'local_id'), [(DF_QUEUE, 'esc-4803-2'), (DF_RECON_QUEUE, 'recon-esc-4803-2')]
+    )
+    def test_an_unlinked_item_is_filed_and_closed_under_the_derived_id(self, queue_dir, local_id):
+        item = _l2(queue_dir)
 
         write, close = _argvs(mod.close_decision_argv(item, 'dropped', 'Leo: drop it'))
 
         assert (write[2], close[2]) == ('write-decision', 'close-decision')
-        derived = mod.sitting_decision_id(item)
-        assert derived != 'esc-4803-2'
+        assert _flag(write, '--id') == local_id
+        assert _flag(close, '--id') == mod.sitting_decision_id(item)
+        assert _flag(close, '--id') == session_registry.qualify_decision_id(item.project, local_id)
         for argv in (write, close):
-            assert _flag(argv, '--id') == derived
             assert _flag(argv, '--project') == item.project
             assert _flag(argv, '--escalations-dir') == item.queue_dir
         assert _flag(write, '--escalation-id') == 'esc-4803-2'
+
+    @pytest.mark.parametrize('queue_dir', [DF_QUEUE, DF_RECON_QUEUE])
+    def test_the_filed_record_is_the_one_the_close_names(self, tmp_path, monkeypatch, queue_dir):
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        item = _l2(queue_dir)
+        write, close = _argvs(mod.close_decision_argv(item, 'answered', 'gate evidence'))
+
+        assert session_registry.main(write[2:]) == 0
+        assert session_registry.main(close[2:]) == 0
+
+        path = decision_path_for_id(_flag(close, '--id'), root=tmp_path)
+        record = session_registry.DecisionRecord.from_json(path.read_text())
+        assert (record.state, record.closing_evidence) == ('answered', 'gate evidence')
 
     @pytest.mark.parametrize('evidence', ['', '   '])
     def test_empty_evidence_is_refused(self, evidence):

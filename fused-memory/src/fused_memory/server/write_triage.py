@@ -75,12 +75,18 @@ from fused_memory.server.grouped_read import (
 # from a genuinely novel corpus. If that module is ever deleted rather than
 # left dormant, this import fails LOUDLY at import time, which is the right
 # way to be told to hoist the helper. (Hoisting it into a shared home is the
-# better end state and is deliberately NOT done here: near_duplicate_guard.py
-# is outside this task's lock set.)
-from fused_memory.server.near_duplicate_guard import _cosine_of
+# better end state and is still NOT done. Task 3127, which added this import,
+# did not hold near_duplicate_guard.py in its lock set; task 4734 did, and
+# took the cheaper move instead — renaming ``_cosine_of`` to the public
+# ``cosine_of`` in place, so this cross-module import no longer reaches into
+# another module's private surface — because that module is dormant rather
+# than deleted, and one home for the reader beats a third file to keep in
+# sync.)
+from fused_memory.server.near_duplicate_guard import cosine_of
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Sequence
 
     from fused_memory.models.memory import MemoryResult
     from fused_memory.services.memory_service import SearchResults
@@ -168,6 +174,18 @@ TRIAGE_OUTCOMES: frozenset[str] = frozenset({
 })
 
 
+class JudgeUsage(NamedTuple):
+    """What the provider reported for ONE judge call.
+
+    Output includes reasoning, as both OpenAI APIs bill it.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    #: ``None`` when the provider does not report reasoning separately.
+    reasoning_tokens: int | None = None
+
+
 class TriageJudgeVerdict(NamedTuple):
     """The middle-band judge's answer: a verdict and the candidate it is about.
 
@@ -180,6 +198,12 @@ class TriageJudgeVerdict(NamedTuple):
     outcome: str
     #: The id of the RETRIEVED record the verdict is about; ``None`` names none.
     candidate_id: str | None = None
+    #: What the provider reported for the call that produced the verdict;
+    #: ``None`` when no call was made or none was reported. Triage ignores it;
+    #: the eval prices a write from it.
+    usage: JudgeUsage | None = None
+    #: Comparable candidates the judge was not shown; ``()`` when it saw them all.
+    truncation_facts: tuple[TruncationFact, ...] = ()
 
 
 def attach_write_landed(result: Any) -> bool:
@@ -341,6 +365,8 @@ class BandDecision:
     #: The slate id the judge named, before hoisting; ``None`` on every
     #: non-judged path and for a bare-word verdict.
     judged_candidate_id: str | None = None
+    #: Where the evidence behind this decision was clipped; ``()`` when nowhere.
+    truncation_facts: tuple[TruncationFact, ...] = ()
 
 
 def declares_attach_keys(metadata: Any) -> bool:
@@ -492,7 +518,7 @@ def decide_band(
     scored = [
         (cosine, r)
         for r in results
-        if (cosine := _cosine_of(r)) is not None
+        if (cosine := cosine_of(r)) is not None
     ]
     if not scored:
         return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
@@ -859,7 +885,10 @@ async def triage_write(
                 stage='retrieve',
             )
             return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
-        decision = decide_band(results, t_high=t_high, t_low=t_low)
+        decision = replace(
+            decide_band(results, t_high=t_high, t_low=t_low),
+            truncation_facts=_retrieval_cap_facts(results, k, t_low),
+        )
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='retrieve')
         return BandDecision(OUTCOME_STORED, None, None, None, None)
@@ -891,6 +920,20 @@ async def triage_write(
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
 
 
+def _retrieval_cap_facts(
+    results: Sequence[MemoryResult], k: int, t_low: float | None,
+) -> tuple[TruncationFact, ...]:
+    """A full top-*k* whose weakest comparable candidate still reached ``t_low`` may have cut in-band ones.
+
+    Nothing past rank *k* scores above the weakest kept candidate, so when that one
+    is below the band the cut hid nothing comparable. How many were cut is unknowable.
+    """
+    scores = [score for score in map(cosine_of, results) if score is not None]
+    if len(results) < k or t_low is None or not scores or min(scores) < t_low:
+        return ()
+    return (TruncationFact(field='triage_candidates', cap=k, elided=None),)
+
+
 def _apply_judge_verdict(
     decision: BandDecision,
     answer: object,
@@ -898,9 +941,9 @@ def _apply_judge_verdict(
 ) -> BandDecision:
     """The judged band's attach rule: file the write against the candidate named.
 
-    *answer* is what the judge returned — a :class:`TriageJudgeVerdict`, any
-    ``(outcome, candidate_id)`` pair, or a bare outcome word naming no
-    candidate. A verdict naming a candidate attaches to that retrieved record,
+    *answer* is what the judge returned — a :class:`TriageJudgeVerdict` (its
+    ``usage`` is ignored here), any ``(outcome, candidate_id)`` pair, or a bare
+    outcome word naming no candidate. A verdict naming a candidate attaches to that retrieved record,
     hoisted by :func:`_canonical_id_of` exactly as the band's winner is; one
     naming none attaches to the band's winner. ``stored`` attaches nothing, so
     it carries no canonical a caller could mistake for an endorsement.
@@ -910,6 +953,7 @@ def _apply_judge_verdict(
     closed (D3): an unrecognised verdict is a bug, not an extension point.
     """
     verdict = _judge_verdict_of(answer)
+    decision = replace(decision, truncation_facts=decision.truncation_facts + verdict.truncation_facts)
     if verdict.outcome not in TRIAGE_OUTCOMES:
         raise ValueError(f'judge returned {verdict.outcome!r}, not in TRIAGE_OUTCOMES')
     if verdict.outcome == OUTCOME_STORED:
@@ -939,10 +983,12 @@ def _apply_judge_verdict(
 
 def _judge_verdict_of(answer: object) -> TriageJudgeVerdict:
     """Read a judge's *answer* as a verdict: a bare word names no candidate."""
+    if isinstance(answer, TriageJudgeVerdict):
+        return answer
     if isinstance(answer, str):
         return TriageJudgeVerdict(answer)
     if isinstance(answer, tuple) and len(answer) == 2:
-        return TriageJudgeVerdict._make(answer)
+        return TriageJudgeVerdict(*answer)
     raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
 
 

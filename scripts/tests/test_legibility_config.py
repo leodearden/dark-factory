@@ -99,6 +99,8 @@ class TestNestedDefaults:
         assert cfg.census.tasks_landed_min_days == 7
         assert cfg.census.novelty_spike.count == 4
         assert cfg.census.novelty_spike.window_hours == 72
+        assert cfg.census.novelty_spike.multiple == 2
+        assert cfg.census.novelty_spike.baseline_days == 30
         assert cfg.census.floor_days == 5
         assert cfg.census.saturation.dup_rate == 0.9
         assert cfg.census.saturation.consecutive_batches == 2
@@ -212,6 +214,64 @@ class TestTrickleCensusCaps:
         with pytest.raises(ValidationError):
             caps.max_batches = None
         assert caps.max_batches == 50
+
+
+class TestLedgerRetentionDays:
+    """``census.ledger_retention_days`` — the census mining window's length,
+    which is also how long a coded session stays in the ledger."""
+
+    def test_default_is_thirty_days(self):
+        assert mod.Census().ledger_retention_days == 30
+
+    def test_yaml_without_the_key_keeps_the_default(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {floor_days: 5}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.ledger_retention_days == 30
+
+    def test_yaml_value_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {ledger_retention_days: 14}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.ledger_retention_days == 14
+
+    @pytest.mark.parametrize('bad_value', ['0', '-1', "'30'"])
+    def test_non_positive_or_quoted_value_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{ledger_retention_days: {bad_value}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
+class TestNoveltySpikeBaseline:
+    """``census.novelty_spike`` — the relative (b) condition of
+    plans/census-incremental-prd.md §4.7, every field an unquoted
+    non-negative int."""
+
+    def test_yaml_values_round_trip(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {novelty_spike: {multiple: 3, baseline_days: 14}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.novelty_spike.multiple == 3
+        assert cfg.census.novelty_spike.baseline_days == 14
+        assert cfg.census.novelty_spike.count == 4
+        assert cfg.census.novelty_spike.window_hours == 72
+
+    def test_partial_block_keeps_the_new_defaults(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {novelty_spike: {count: 5}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.novelty_spike.count == 5
+        assert cfg.census.novelty_spike.multiple == 2
+        assert cfg.census.novelty_spike.baseline_days == 30
+
+    @pytest.mark.parametrize('field', ['count', 'window_hours', 'multiple', 'baseline_days'])
+    def test_zero_is_legal(self, tmp_path, field):
+        text = MINIMAL_YAML + f'census: {{novelty_spike: {{{field}: 0}}}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert getattr(cfg.census.novelty_spike, field) == 0
+
+    @pytest.mark.parametrize('field', ['count', 'window_hours', 'multiple', 'baseline_days'])
+    @pytest.mark.parametrize('bad_value', ["'2'", '-1', 'true', '2.5'])
+    def test_non_int_or_negative_value_raises(self, tmp_path, field, bad_value):
+        text = MINIMAL_YAML + f'census: {{novelty_spike: {{{field}: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
 
 
 class TestFullConfigOverridesDefaults:
@@ -470,6 +530,21 @@ class TestShippedDarkFactoryConfig:
         cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
         assert cfg.census.trickle_caps.max_batches == 50
         assert cfg.census.trickle_caps.max_verify_clusters == 150
+
+    def test_shipped_config_novelty_spike_pinned_explicitly(self):
+        raw = yaml.safe_load(self.SHIPPED_CONFIG_PATH.read_text(encoding='utf-8'))
+        assert raw['census']['novelty_spike'] == {
+            'count': 4,
+            'window_hours': 72,
+            'multiple': 2,
+            'baseline_days': 30,
+        }
+
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.census.novelty_spike.count == 4
+        assert cfg.census.novelty_spike.window_hours == 72
+        assert cfg.census.novelty_spike.multiple == 2
+        assert cfg.census.novelty_spike.baseline_days == 30
 
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):

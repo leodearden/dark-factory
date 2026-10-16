@@ -938,8 +938,7 @@ info "Installing dashboard systemd units"
 # open since April".
 #
 # Deliberately no --fix in the checker (see its module docstring): re-running
-# this installer is the propagation path, and re-ARMING the watchdog timer
-# belongs to task 3289.
+# this installer is the propagation path.
 #
 # The gate distinguishes "ran and found drift" from "did not run at all", and
 # the install proceeds either way. Exit code alone is NOT trusted, because 2 is
@@ -1152,13 +1151,13 @@ for name in "${!SKILLS[@]}"; do
   fi
 done
 
-# Directory-form skills (the newer Claude Code Skill mechanism): these three
+# Directory-form skills (the newer Claude Code Skill mechanism): these four
 # are wired as whole-directory symlinks under ~/.claude/skills/<name> so their
 # references/ and scripts/ travel with them (convention documented in
 # skills/prd/references/project-overlay.md).
 SKILLS_DIR="$HOME/.claude/skills"
 mkdir -p "$SKILLS_DIR"
-for name in factory-init prd hotspot-survey; do
+for name in factory-init prd hotspot-survey review-all; do
   target="$REPO_ROOT/skills/$name"
   link="$SKILLS_DIR/$name"
   if [ -d "$target" ]; then

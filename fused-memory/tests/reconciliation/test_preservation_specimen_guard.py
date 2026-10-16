@@ -45,6 +45,7 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     filter_preservation_specimen_flags,
     flag_asserts_stranded,
     maybe_escalate_preservation_suppression_storm,
+    preservation_mem0_filters,
 )
 
 # ── Live corroboration strings, copied verbatim from the base branch ─────────
@@ -487,6 +488,19 @@ class TestFilterPreservationSpecimenFlagsMem0Channel:
                 'actionable': False,
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_the_query_is_the_filter_the_stage1_prompt_renders(self):
+        """The code path and Stage 1's directive ask for one filter, from one source."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert memory_service.get_memories_by_metadata.await_args.kwargs[
+            'filters'
+        ] == preservation_mem0_filters('3105')
 
     @pytest.mark.asyncio
     async def test_row_without_preservation_prose_does_not_suppress(self):
@@ -949,7 +963,8 @@ class TestBoundedScopeAndReadEconomy:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'task_id', [None, '', 0, -5, '0', '-5', [], {'nested': 'dict'}],
+        'task_id',
+        [None, '', 0, -5, '0', '-5', [], {'nested': 'dict'}, True, False, 3105.0],
     )
     async def test_unusable_task_id_is_kept_without_reads(self, task_id):
         """(f) A flag with no resolvable task is kept, never a junk backend query.
@@ -1585,9 +1600,7 @@ class TestMaybeEscalatePreservationSuppressionStorm:
     @pytest.mark.asyncio
     async def test_escalation_package_unavailable_returns_empty(self, queue, monkeypatch):
         """The reconciliation package must import where escalation is not installed."""
-        monkeypatch.setattr(
-            preservation_specimen_guard, 'Escalation', None, raising=False,
-        )
+        monkeypatch.setattr(preservation_specimen_guard, 'file_or_fold_l1', None)
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN, _suppression_result(),
         )
@@ -1612,6 +1625,67 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         assert escalated == []
         assert any('3105' in message for message in records)
 
+    @staticmethod
+    def _seed_legacy_parent(queue, subject, finding_category):
+        """Submit a pending parent built exactly as the pre-5466 filer built it.
+
+        *finding_category* is the persisted LITERAL, never the module's private
+        constant: the string on disk is the fold contract, so renaming the
+        constant must break this test rather than un-fold every live parent.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+        from escalation.models import Escalation
+
+        return queue.submit(Escalation(
+            id=queue.make_id(subject),
+            task_id=subject,
+            agent_role='reconciliation-stage1',
+            severity='blocking',
+            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+            summary='legacy parent',
+            detail='legacy parent',
+            level=1,
+            dedupe_fingerprint=compute_content_fingerprint(
+                CATEGORY_PRESERVATION_SPECIMEN_STORM,
+                finding_category,
+                [f'{PROJECT}:{subject}'],
+            ),
+        ))
+
+    @pytest.mark.asyncio
+    async def test_storm_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending storm parent filed before the helper moved still receives the fold."""
+        parent_id = self._seed_legacy_parent(
+            queue, '3105', 'preservation_specimen_suppression_storm',
+        )
+
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(),
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_unresolved_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending unresolved-corroboration parent filed before the move still folds."""
+        parent_id = self._seed_legacy_parent(
+            queue,
+            UNRESOLVED_CORROBORATION_SUBJECT,
+            'preservation_specimen_corroboration_unreadable',
+        )
+
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(1, unresolved=('3105',)),
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
+
 
 class TestCompositeFlagTaskIds:
     """A flag's OWN task_id is routinely comma-joined, and must be decomposed.
@@ -1625,8 +1699,8 @@ class TestCompositeFlagTaskIds:
 
     ``filter_suppressed._keep`` has precisely this gap — it looks the flag
     task_id up verbatim while only the suppression ROW side is decomposed. This
-    guard must not inherit it. ``_flag_candidate_task_ids`` (task
-    3476) is the existing flag-side splitter and the precedent followed here.
+    guard must not inherit it. ``flag_task_ids.task_id_components`` is the
+    shared flag-side splitter it decomposes through.
     """
 
     @pytest.mark.asyncio
@@ -1827,3 +1901,26 @@ class TestCompositeFlagTaskIds:
 
         assert result.kept_flags == [flag]
         assert result.unresolved_task_ids == ('4102', '4103')
+
+    @pytest.mark.asyncio
+    async def test_a_cited_task_is_not_the_task_the_flag_claims_is_stranded(self):
+        """Only the flag's OWN task_id is corroborated, never its cited_tasks.
+
+        A cited task is evidence the flag mentions; corroborating it would drop
+        a genuine stranded finding about a different task — the over-suppression
+        this guard is biased against.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flag = _stranded_flag(task_id='4102', cited_tasks=[{'task_id': '3105'}])
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        queried = [
+            call.kwargs['filters']['task_id']
+            for call in memory_service.get_memories_by_metadata.await_args_list
+        ]
+        assert queried == ['4102']

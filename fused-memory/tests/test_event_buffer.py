@@ -542,10 +542,10 @@ async def test_restore_drained_moves_events_back_to_buffered(buf):
     for _ in range(3):
         await buf.push(_make_event())
 
-    await buf.drain('test-project')
+    await buf.drain('test-project', run_id='R1')
     assert (await buf.get_buffer_stats('test-project'))['size'] == 0
 
-    restored = await buf.restore_drained('test-project')
+    restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 3
 
@@ -553,7 +553,7 @@ async def test_restore_drained_moves_events_back_to_buffered(buf):
 @pytest.mark.asyncio
 async def test_restore_drained_returns_zero_when_empty(buf):
     """Restore on empty buffer returns 0."""
-    restored = await buf.restore_drained('test-project')
+    restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 0
 
 
@@ -566,10 +566,10 @@ async def test_restore_drained_only_affects_target_project(tmp_path):
         await buf.push(_make_event(project_id='project-a'))
         await buf.push(_make_event(project_id='project-b'))
 
-        await buf.drain('project-a')
-        await buf.drain('project-b')
+        await buf.drain('project-a', run_id='R1')
+        await buf.drain('project-b', run_id='R1')
 
-        restored = await buf.restore_drained('project-a')
+        restored = await buf.restore_drained('project-a', run_id='R1')
         assert restored == 1
         assert (await buf.get_buffer_stats('project-a'))['size'] == 1
         assert (await buf.get_buffer_stats('project-b'))['size'] == 0
@@ -1509,7 +1509,7 @@ async def test_drain_by_ids_marks_specific_events(buf):
     await buf.push(e2)
     await buf.push(e3)
 
-    count = await buf.drain_by_ids('test-project', [e1.id, e3.id])
+    count = await buf.drain_by_ids('test-project', [e1.id, e3.id], run_id='R1')
     assert count == 2
 
     # e2 should still be buffered
@@ -1526,7 +1526,7 @@ async def test_drain_by_ids_marks_specific_events(buf):
 async def test_drain_by_ids_empty_list(buf):
     """drain_by_ids with empty list is a no-op."""
     await buf.push(_make_event())
-    count = await buf.drain_by_ids('test-project', [])
+    count = await buf.drain_by_ids('test-project', [], run_id='R1')
     assert count == 0
     assert (await buf.get_buffer_stats('test-project'))['size'] == 1
 
@@ -1539,7 +1539,7 @@ async def test_drain_by_ids_ignores_wrong_project(buf):
     await buf.push(e1)
     await buf.push(e2)
 
-    count = await buf.drain_by_ids('project-a', [e1.id, e2.id])
+    count = await buf.drain_by_ids('project-a', [e1.id, e2.id], run_id='R1')
     # e2 belongs to project-b, so only e1 should be drained
     assert count == 1
     assert (await buf.get_buffer_stats('project-a'))['size'] == 0
@@ -1557,9 +1557,25 @@ async def test_peek_then_drain_by_ids_workflow(buf):
 
     # "Assemble" selects first 3
     selected_ids = [e.id for e in peeked[:3]]
-    count = await buf.drain_by_ids('test-project', selected_ids)
+    count = await buf.drain_by_ids('test-project', selected_ids, run_id='R1')
     assert count == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_by_ids_stamps_run_id_for_run_scoped_restore(buf):
+    """drain_by_ids(run_id=) attributes the chunk so a run-scoped restore targets exactly it."""
+    e1, e2, e3 = _make_event(), _make_event(), _make_event()
+    for event in (e1, e2, e3):
+        await buf.push(event)
+
+    assert await buf.drain_by_ids('test-project', [e1.id, e2.id], run_id='R1') == 2
+    assert [e.id for e in await buf.drain('test-project', run_id='R2')] == [e3.id]
+
+    assert {e.id for e in await buf.get_drained_events('test-project', 'R1')} == {e1.id, e2.id}
+    assert await buf.restore_drained('test-project', run_id='R1') == 2
+    assert await buf.count_buffered('test-project') == 2
+    assert [e.id for e in await buf.get_drained_events('test-project', 'R2')] == [e3.id]
 
 
 # ── _debug_get_deferred_row tests ─────────────────────────────────────
@@ -1880,15 +1896,13 @@ async def test_get_drained_events_reads_run_scoped_without_restoring(buf):
 @pytest.mark.asyncio
 async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
     """mark_drained_run_id lets an already-drained (NULL-attributed) row be
-    retroactively attributed to the run about to process it — used by the
-    BacklogIterator path, which drains events via drain_by_ids() before
-    run_full_cycle mints a run_id."""
+    retroactively attributed to the run about to process it — run_full_cycle's
+    attribution of caller-supplied events."""
     events = [_make_event() for _ in range(4)]
     for e in events:
         await buf.push(e)
 
-    # drain() with no run_id — rows land 'drained' with NULL drained_by_run_id,
-    # mirroring drain_by_ids()'s pre-existing (unattributed) behaviour.
+    # drain() with no run_id — rows land 'drained' with NULL drained_by_run_id.
     drained = await buf.drain('test-project')
     assert len(drained) == 4
     id1, id2, id3, id4 = (e.id for e in events)
@@ -1950,26 +1964,6 @@ async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
     restored_ry = await buf.restore_drained('test-project', run_id='RY')
     assert restored_ry == 1
     assert await _status(id4) == 'drained'
-
-
-@pytest.mark.asyncio
-async def test_restore_drained_without_run_id_restores_all_project_wide(buf):
-    """(c) Legacy backward-compat: restore_drained(project) with no run_id still
-    restores ALL remaining drained rows project-wide (guards existing callers)."""
-    events_r1 = [_make_event() for _ in range(2)]
-    events_r2 = [_make_event() for _ in range(3)]
-    for e in events_r1:
-        await buf.push(e)
-    await buf.drain('test-project', run_id='R1')
-    for e in events_r2:
-        await buf.push(e)
-    await buf.drain('test-project', run_id='R2')
-
-    assert (await buf.get_buffer_stats('test-project'))['size'] == 0
-
-    restored = await buf.restore_drained('test-project')
-    assert restored == 5
-    assert (await buf.get_buffer_stats('test-project'))['size'] == 5
 
 
 @pytest.mark.asyncio

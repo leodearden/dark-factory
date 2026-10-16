@@ -55,13 +55,13 @@ orchestrator = { workspace = true }
 # See shared/pyproject.toml for the full rationale, including why this is large
 # rather than the original 60: the cap is WALL-CLOCK, so a healthy test starved
 # of CPU on a loaded 32-core host trips it, and in the xdist packages that
-# reds a SHIFTING VICTIM rather than the starved test. 540 is DERIVED FROM
-# MEASUREMENT (task 5442) — worst unmarked per-test wall clock under real fleet
-# load x the 8x headroom factor — and no longer judgement-picked; the corpus and
-# the arithmetic are in
+# reds a SHIFTING VICTIM rather than the starved test. 420 is DERIVED FROM
+# MEASUREMENT — worst unmarked per-test wall clock under real fleet load x the
+# 8x headroom factor — and no longer judgement-picked; the corpus, the
+# arithmetic and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # signal method is load-bearing: thread method can't interrupt a blocking
-# syscall in the main thread. UNCHANGED by the 60→300 and 300→540 raises,
+# syscall in the main thread. UNCHANGED by every change of the value,
 # deliberately, and UNCHANGED by task 5408's addopts below.
 # THE PREMISE THIS USED TO GIVE IS CORRECTED, not softened. It read "escalation
 # runs no pytest-xdist so signal is always safe here", and that was false twice
@@ -71,16 +71,11 @@ orchestrator = { workspace = true }
 # 5408's `-n auto --dist loadgroup` then made it false on its face.
 # WHAT SURVIVES IS A MEASUREMENT: the addopts block below records this suite
 # green under those exact flags, signal unchanged.
-# NOT flipped to `thread`, deliberately, and the argument for why that flip is a
-# real trade rather than a free upgrade is NOT restated here — it lives once in
-# fused-memory/pyproject.toml's own `timeout_method` block, which records the
-# opposite experience ("signal proved unreliable under pytest-xdist workers in
-# practice") together with the mechanism (pytest-timeout's thread handler ends in
-# `os._exit(1)`, killing the whole xdist worker; near end-of-suite the controller
-# can deadlock waiting for a completion signal that never arrives). Changing it
-# on no measurement, inside a config-only task, would be unmeasured scope creep;
-# the open question is filed as residue 2 of task 5470.
-timeout = 540
+# DECIDED ON MEASUREMENT (task 5470): signal is KEPT. Under the pinned
+# pytest-xdist, worker tests run on the worker's main thread, so a signal
+# timeout fails the one test and the worker survives. The signal-vs-thread
+# trade and that evidence live once, in tests/scripts/test_timeout_method_policy.py.
+timeout = 420
 timeout_method = "signal"
 
 # PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy

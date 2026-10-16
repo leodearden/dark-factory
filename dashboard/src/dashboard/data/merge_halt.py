@@ -31,11 +31,18 @@ from typing import Any
 
 import httpx
 
+from dashboard.data.mcp_fanout import FANOUT_FAILURE_EXCEPTIONS
 from dashboard.data.memory import mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PER_CALL_TIMEOUT = 2.0
+
+# OSError is this probe's own addition on top of the shared fan-out failure
+# set: anything escaping _probe_one 500s /merge-queue.
+_PROBE_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    *FANOUT_FAILURE_EXCEPTIONS, OSError,
+)
 
 
 async def _probe_one(
@@ -50,7 +57,7 @@ async def _probe_one(
             ),
             timeout=timeout,
         )
-    except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:
+    except _PROBE_FAILURE_EXCEPTIONS as exc:
         logger.debug('get_merge_halt_status failed for %s: %s', base_url, exc)
         return {'wired': False, 'halted': False, 'offline': True, 'error': str(exc)}
     return {

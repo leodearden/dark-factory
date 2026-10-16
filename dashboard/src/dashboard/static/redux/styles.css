@@ -742,11 +742,11 @@ table { border-collapse: collapse; width: 100%; }
   transition: opacity .1s, transform .1s;
 }
 .sched-cell:hover { transform: scale(1.15); }
-/* Cell color states — reuse --ok/--warn/--bad/--accent tokens */
-.sched-cell.free           { background: oklch(0.74 0.14 155 / 0.25); border: 1px solid var(--ok); }
-.sched-cell.held-by-other  { background: oklch(0.68 0.18 25 / 0.35); border: 1px solid var(--bad); }
-.sched-cell.parked-by-me   { background: oklch(0.80 0.14 80 / 0.35); border: 1px solid var(--warn); }
-.sched-cell.parked-by-other { background: oklch(0.80 0.14 80 / 0.18); border: 1px dashed var(--warn); }
+/* Cell states — lockChipState's vocabulary, the same classes the lock chips carry */
+.sched-cell.lock-free      { background: oklch(0.74 0.14 155 / 0.25); border: 1px solid var(--ok); }
+.sched-cell.lock-mine      { background: var(--ok); border: 1px solid var(--ok); }
+.sched-cell.lock-taken     { background: oklch(0.68 0.18 25 / 0.35); border: 1px solid var(--bad); }
+.sched-cell.lock-parked    { background: oklch(0.80 0.14 80 / 0.35); border: 1px solid var(--warn); }
 .sched-cell.not-in-set     { background: var(--bg-2); border: 1px solid transparent; opacity: 0.4; }
 
 .sched-empty {

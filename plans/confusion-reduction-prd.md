@@ -63,12 +63,14 @@ Haiku for trickle coding; Sonnet for census mining/verification; **Fable ONLY fo
 5. **Headroom check = cheap preflight probe**, not a usage API (none exists as substrate): one tiny Haiku call; a usage-limit/auth banner defers the census to the next trigger evaluation with a loud log + info escalation.
 6. **Phase stamps are per-sighting and may be `unknown`.** Enum: `prd | decompose | architect | implement | verify | review | merge | recon | ops | unknown`. The trickle coder stamps best-effort; census synthesis refines; the matrix reports unknowns explicitly rather than guessing (lesson: `guards-assert-unverified-diagnoses`).
 7. **Trickle commits are docs-only `git commit --only`** with ref-lock retry; nothing is committed on a no-change night. Liveness is therefore probed from systemd unit state, not commit presence.
-   - *Clarification (task 3340), not a reversal.* What this bans is inferring pipeline health from the **repo's contents** — git history, codebook mtime. Such a probe false-alarms on a legitimately quiet night, because an external observer cannot tell "nothing to do" from "broken". It does **not** ban the pipeline from **recording why a night produced nothing**: `nightly.py` writes a host-local run-state file (`${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/<project_id>/trickle-state.json`) classifying each run `productive` / `quiet` / `barren` from `SampleResult`'s conservation invariant, and `check_trickle_progress.py` reads it. A quiet night is recorded **as** quiet and never alarms, so decision 7's stated rationale is satisfied rather than circumvented — the missing information was never missing from the world, only from the observer.
+   - *Clarification (task 3340), not a reversal.* What this bans is inferring pipeline health from the **repo's contents** — git history, codebook mtime. Such a probe false-alarms on a legitimately quiet night, because an external observer cannot tell "nothing to do" from "broken". It does **not** ban the pipeline from **recording why a night produced nothing**: `nightly.py` writes a host-local run-state file (`<passwd home>/.local/state/dark-factory/legibility/<project_id>/trickle-state.json`, relocatable only through `DARK_FACTORY_LEGIBILITY_STATE_ROOT`; `OPERATIONS.md` §12 "Legibility trickle health probe (04:30)" is the home for why it is anchored on the passwd entry rather than on the process environment) classifying each run `productive` / `quiet` / `barren` / `failed` (`failed` whenever the run exited non-zero, the other three from `SampleResult`'s conservation invariant), and `check_trickle_progress.py` reads it. A quiet night is recorded **as** quiet and never alarms, so decision 7's stated rationale is satisfied rather than circumvented — the missing information was never missing from the world, only from the observer.
    - **Division of labour.** `check_trickle_liveness.sh` answers *did the unit run* (systemd unit state; semantics deliberately unchanged, since tasks κ/κ′ are already `done` against them). `check_trickle_progress.py` answers *did signal flow*. Neither subsumes the other: the 2026-07-16..29 incident passed the liveness probe every night while digesting literally nothing.
    - The state file is deliberately **not** git-tracked, and lives outside every checkout — precisely so "the repo has a commit today" never becomes a liveness signal, and so a nightly rewrite never dirties the machine-operated `project_root` checkout.
 8. **Fail-loud contract:** extractor crash, >50% coder parse failures, or git-commit failure files an info escalation to the project's escalation server (port from config) and exits non-zero — degradation never silent (standing directive).
 9. **Census files tasks through the curator** (normal `submit_task`), never `planning_mode` — dedup against already-filed remediation is the point. Filed tasks follow the routing rules (`task_kind`, no prose-routing intent — lesson: `prose-routing-intent`).
 10. **Deploy/liveness via the deterministic task kind** (install script as `before_done` deploy; liveness as delayed-milestone predicate) — no LLM pipeline for host operations. Stub scripts are committed with this PRD (executable, fail-loud) because `submit_task` validates `before_done.script` existence at filing; task ε replaces them with the real implementations before any deploy task can run (deps gate it).
+
+**Superseded for trigger semantics (2026-10-05):** the census trigger in these decisions is now owned by `plans/census-incremental-prd.md` L8a/L8b (its C7).
 
 ## 7. Contracts
 
@@ -103,6 +105,8 @@ candidates:
     sightings: [...]                         # same shape as above
 ```
 
+**The sighting `note` field is human-readable provenance only — it is not machine-read signal, and no census feedback loop runs through it.** `note` is written by `scripts/legibility/codebook.py::_build_sighting` (and requested from the coder by `scripts/legibility/coder.py::build_prompt`), but no code path reads a sighting's `note` back; its readers are humans and agents skimming the raw YAML (`skills/census/SKILL.md` directs that skim). The coder's matching prompt takes codebook content from one seam alone, `scripts/legibility/coder.py::build_codebook_index`, which emits `{id}: {title} — {one-line cause}` per entry and never includes sightings; the census miner reaches the LLM through that same seam. The claim is about `note` alone, not about sightings: other sighting fields do have automated readers (`scripts/legibility/census.py::_entry_cluster`, for one, copies `evidence_quote` into a filed task's evidence). Consequence: a stale present-tense `note` cannot make a census pass re-derive an already-fixed defect as live — unlike an entry's `cause`, which `build_codebook_index` renders to the matcher. Wiring `note` into matching would be new work to file separately, not something this PRD assumes exists.
+
 Phase enum everywhere: `prd | decompose | architect | implement | verify | review | merge | recon | ops | unknown`.
 
 ### 7.2 Digest (extractor output)
@@ -136,14 +140,38 @@ Motivation: `plans/confusion-census-2026-07-31.md:97` (cluster 1.3) found sessio
 
 - **1** — the implicit pre-3610 baseline, **never emitted**. An **absent** `instrument_version` key is the normative "this digest predates task 3610's filter change" marker. There is no sentinel value and no backfill: digests are rendered on demand and cached only in-process, so there is no persisted corpus to migrate.
 - **2** — the relaxed anchor+corroborator briefing filter plus the genuine/designed error split.
-- **3** — the re-ingested-content classifier (`scripts/legibility/digest.py::is_reingested_content`, task 5685), consulted by every text-pattern detector and the gold-turn filter. It bumps under the same-transcript test above: session `b203a05c` now renders `self_correct` 1 → 0, and `6a527d51` renders `self_correct` 1 → 0 and `df_guard` 1 → 0.
-- **4** — the non-human-origin record rule (`scripts/legibility/digest.py::has_non_human_origin`, task 5956): a user record whose Claude Code `origin.kind` is anything but `human` (`task-notification`, `auto-continuation`, `coordinator`, `peer`) is dropped from the gold-turn filter and from every dialogue carrier. It bumps under the same-transcript test above: reify session `50e12d17` renders `n_user_turns` 1 → 0, because its only gold turn, record 196, is a `<task-notification>` for a sub-agent's weekly-limit failure. There is deliberately no text fallback. On 2026-09-27 no non-sidechain user record opening with `<task-notification>` lacked `origin` in either local corpus (`~/.claude/projects` and the archived agent transcripts), and the usage-limit-reset auto-continuation literal only ever appeared with `isMeta=True`. A text rule would therefore guard nothing, while risking the loss of a human turn that opens with a pasted notification.
+- **3** — the re-ingested-content classifier (`scripts/legibility/reingestion.py::is_reingested_content`, task 5685), consulted by every text-pattern detector and the gold-turn filter. It bumps under the same-transcript test above: session `b203a05c` now renders `self_correct` 1 → 0, and `6a527d51` renders `self_correct` 1 → 0 and `df_guard` 1 → 0.
+- **4** — the non-human-origin record rule (`scripts/legibility/reingestion.py::has_non_human_origin`, task 5956): a user record whose Claude Code `origin.kind` is anything but `human` (`task-notification`, `auto-continuation`, `coordinator`, `peer`) is dropped from the gold-turn filter and from every dialogue carrier. It bumps under the same-transcript test above: reify session `50e12d17` renders `n_user_turns` 1 → 0, because its only gold turn, record 196, is a `<task-notification>` for a sub-agent's weekly-limit failure. There is deliberately no text fallback. On 2026-09-27 no non-sidechain user record opening with `<task-notification>` lacked `origin` in either local corpus (`~/.claude/projects` and the archived agent transcripts), and the usage-limit-reset auto-continuation literal only ever appeared with `isMeta=True`. A text rule would therefore guard nothing, while risking the loss of a human turn that opens with a pasted notification.
 
 This is the pre-fix-trace vs live-regression discriminator that `plans/confusion-census-2026-07-31.md:151` (§6) asked the next census for.
 
 **Task 4751's decision, made deliberately rather than defaulted** (census R1 asks the implementer to apply this section's test explicitly, not assume): the retry-loop designed-outcome annotation **does not bump** `instrument_version`, which stays **2**. Applying the same-transcript test above — the annotation adds no `signal_counts` key and no detector hit, leaves the gold section untouched, and leaves the section partition untouched (the same groups appear in the same section at the same counts; only their rendered line text grows) — places it squarely in the "renderer cosmetics" case that does not bump. Bumping would falsely tell a future census that signal semantics moved, corrupting the very discriminator this key exists to provide. The decision's *premises* are pinned by runtime assertions over a rendered digest (`scripts/tests/test_legibility_digest.py::TestRetryLoopAnnotationEndToEnd`) rather than left as a docstring claim: `signal_counts` is asserted equal to `signal_counts(records)` key-for-key, and the retry groups, their counts, their section and that section's priority are asserted unchanged — so a later edit that *does* move signal semantics cannot quietly keep claiming this case. The **conclusion** — that the constant still reads 2 — is a diff-level fact, not a test: no test freezes `DIGEST_INSTRUMENT_VERSION` at 2, deliberately, so that a legitimate future bump is governed by the policy above and not by a test named for the 4751 decision.
 
 **07-31 census R1–R3 (`plans/confusion-census-2026-07-31.md:129-135`)**: R3 (exit-code / designed-outcome awareness) was discharged by task 3610, together with the R6 gold-turn filter relaxation. **R1** (pasted-report-content and mid-field truncation marking) and **R2** (`n_user_turns` frontmatter itemization) were named in task 3610's title but absent from its FIX list, so they were deliberately not folded in there; both are discharged by **task 3614** — R2 as the `n_user_turns` key above, R1 as `truncated_items` plus the gold-turn filter's pasted-report coverage.
+
+#### 7.2.3 Sampler carrier classification (task 5693)
+
+*Superseded by §7.2.4 (task 6740).*
+
+The β pre-scorer (`scripts/legibility/sampling.py`) asks the digest's one carrier predicate, `scripts/legibility/digest.py::is_non_dialogue_carrier`, of every carrier its text classes scan (`not_found`, the `df_guard` text patterns, `interrupt`, `self_correct`). A carrier the predicate rejects scores nothing: a non-human-origin record, a prior coder judgment, or a harness-injected briefing or prompt. Of its carrier logic the sampler shares only that classifier; its pattern tables and its carrier extraction stay its own. The extraction cuts carriers where the digest does, so the predicate judges the same strings in both: a user record's text blocks join into one turn, as `digest.py::_user_turn_text` joins them, so a briefing split across blocks is rejected by both. `TestSamplerReingestedContentParity` (`scripts/tests/test_legibility_sampling.py`) holds the two in step. The structural classes are **not** filtered: `tool_error`/`designed_outcome` (an `is_error` flag) and the guard `tool_use` half of `df_guard`. Quoted text cannot fake a structural flag, and the digest's error neighborhoods are unfiltered too.
+
+That predicate is one of three things `sampling.py` takes from `digest.py`. The other two came earlier. `digest.py::classify_error_content` splits genuine errors from designed outcomes for `tool_error` (task 3610), so the two layers cannot disagree on what an error is. The renderer, `digest.py::build_digest`, prices a record against `budgets.max_daily_digest_bytes` (`sampling.py::digest_byte_cost_fn`). That is a digest-output budget, and only the renderer knows how big a record's digest will be. The dependency runs one way: `digest.py` imports only `legibility.inventory`.
+
+There is **no `instrument_version` bump**: under §7.2.2's same-transcript test no digest changes. Only the set of sessions the sampler selects changes.
+
+Measured 2026-10-09, read-only, over all 29,902 dark-factory transcripts. 14,985 sessions scored non-zero at the sampler, and 4,488 of them were **phantom-only**: every signal came from a carrier the predicate rejects, so they reached the sample on re-ingested content alone. Sessions affected per class: `not_found` 4,448, `df_guard` 1,102, `interrupt` 327, `self_correct` 41. The dominant cause is the harness-injected turn (the orchestrator briefing and the trickle-coder prompt), not the coder answer. The figures are the same whether each user text block is judged on its own or the blocks are joined into one turn, so the boundary rule above changes none of them.
+
+#### 7.2.4 One detector layer (task 6740)
+
+Both scorers reduce one per-record function, `scripts/legibility/detectors.py::record_hits`. The digest's `signal_counts` sums each class's hits over the records; the sampler's `scripts/legibility/sampling.py::scan_transcript` counts each record holding a class at most once. The carrier cut, the non-dialogue-carrier predicate, the pattern tables and `classify_error_content` all live in `detectors.py`, over the provenance predicates in `scripts/legibility/reingestion.py`; neither module imports `digest.py` or `sampling.py`.
+
+**The digest's tables are the reference.** Every sampler-only pattern was dropped and none was promoted: its looser text literals (among them `not found`, `wait,`, bare `scope_violation` and `phantom-done`, and `interrupted by user`), and the four plan-tools guard tool names its `df_guard` matched on `tool_use.name`. No digest changes under §7.2.2's same-transcript test, so `instrument_version` stays **5**; only the sampler's counts move.
+
+**Class-presence invariant.** For every transcript and all six `SignalClass` members, `bool(scan_transcript(path).counts[c]) == bool(signal_counts(load_transcript(path))[c])`. Counts may differ (per-record versus per-hit); presence may not. `TestSamplerAndDigestAgreeOnTheCorpus` (`scripts/tests/test_legibility_detectors.py`) holds it over the committed corpus `scripts/tests/fixtures/legibility_detectors/`.
+
+**One agent-class classifier.** `detectors.py::classify_agent_class(path, records)` serves both: the digest's `agent_class` (unless the caller overrides it) and the sampler's stratum. Precedence: an empty transcript is `unknown`; a worktree encoded directory (`path.parent`) is `orchestrated-task`; then one marker table (lowercase substrings; `orchestrated-task`, `recon`, `watcher`, `curator-classifier` in that order) over the raw first non-sidechain, non-meta user turn, then over every raw carrier; otherwise `interactive`. The carriers are read unfiltered, because the class is decided by the injected markers the dialogue filter exists to drop.
+
+Measured 2026-10-11 over the census-finding population (the 400 most recently modified dark-factory transcripts under 3 MB): 40 of 63 sessions with signal disagreed on class presence before this change and 0 of 63 after; 48 of the 400 change stratum, 38 of them to the class the digest already gave them.
 
 ### 7.3 Coding record (coder output → merger input)
 
@@ -176,9 +204,13 @@ census:
 models: {trickle: haiku, census_miner: sonnet, census_verify: sonnet, census_synthesis: fable}
 ```
 
+**Superseded for trigger semantics (2026-10-05):** the `census:` trigger keys are now owned by `plans/census-incremental-prd.md` L8a/L8b (its C7).
+
 ### 7.5 Census state (`<root>/docs/legibility/census-state.json`)
 
 `{"last_census_at": <iso>, "last_census_report": "plans/confusion-census-<date>.md"}` — committed by the census; the trigger reads it plus fused-memory done-counts plus candidate `first_seen` dates.
+
+**Superseded for trigger semantics (2026-10-05):** the state shape and how the trigger reads it are now owned by `plans/census-incremental-prd.md` (its C2, and L8a/L8b for C7).
 
 ## 8. Boundary-test sketch
 
@@ -192,6 +224,8 @@ models: {trickle: haiku, census_miner: sonnet, census_verify: sonnet, census_syn
 | 6 | Coder failure storm | >50% of a night's codings fail schema validation | Info escalation filed, non-zero exit, codebook untouched by failed records |
 | 7 | Census saturation stop | Fixture digest stream reaching 90% duplicates two consecutive batches | Mining stops; matrix + report emitted; state advanced |
 | 8 | Deploy verify | Install script run for dark_factory | `systemctl --user list-timers` lists the trickle timer; deterministic runner stamps `deployed-and-verified` |
+
+**Superseded for trigger semantics (2026-10-05):** row 5's trigger conditions are now owned by `plans/census-incremental-prd.md` L8a/L8b (its C7 and §4.8 row 13).
 
 ## 9. Pre-conditions for activating
 
@@ -210,6 +244,7 @@ All verified on main 2026-07-13:
 |---|---|---|---|---|
 | Tasks 2549/2558 (emission-time reason codes / structured evidence, from the survey batch) | consumes | Better-structured failure facts eventually make digests richer; no interface change needed here | **2549/2558** | wired (independent; trickle reads transcripts either way) |
 | Design-invariants gate PRD (sibling session, authoring 2026-07-13) | produces | Optional `invariant_violated` field on sightings/candidates (§7.1/§7.3) | **this PRD** owns the schema field; the sibling owns its gate/consumption | queued (field ships in γ) |
+| `plans/census-incremental-prd.md` | supersedes | Population of `invariant_violated` and its slug check | **`plans/census-incremental-prd.md` L9** (as of 2026-10-05) | queued |
 | `/hotspot-survey` skill | none | Disjoint: hotspot-survey mines *bug history* (git/fix-tasks/postmortems); this mines *agent confusion* (transcripts). Neither replaces the other | — | n/a |
 | Adaptive-model-routing PRD (tasks 2531-2546) | none | Model choice here is static ratified policy (§5), not `resolve_route`; no shared code | — | n/a |
 | verify-plan-prd (W7) | none | Census may *observe* verify-manifested confusion; it files tasks, never edits verify code | — | n/a |

@@ -791,7 +791,7 @@ class TestCapRetryTranscriptReachability:
         )
         # The fresh path must rebuild the prompt — CAP_HIT_RESUME_PROMPT is
         # meaningless to a brand-new session with no history to continue.
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         assert second.kwargs.get('prompt') == 'FRESH REBUILT PROMPT'
 
     async def test_unreachable_transcript_without_rebuild_uses_original_prompt(self, tmp_path):
@@ -834,7 +834,7 @@ class TestCapRetryTranscriptReachability:
 
         capped = make_result(session_id='sess-42')
         ok = make_result()
-        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
@@ -847,7 +847,7 @@ class TestCapRetryTranscriptReachability:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-42'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
 
     async def test_log_states_reason_resumed_transcript_present(self, tmp_path, caplog):
         """The cap-hit line must say WHY it resumed, not just 'resuming'."""
@@ -1034,7 +1034,7 @@ class TestCapRetryResumableProgress:
         )
         # A fresh retry replays the REAL task prompt, which is strictly better
         # than an instruction to continue nothing.
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         assert second.kwargs.get('prompt') == 'FRESH REBUILT PROMPT'
 
     async def test_text_only_transcript_without_rebuild_uses_original_prompt(self, tmp_path):
@@ -1081,7 +1081,7 @@ class TestCapRetryResumableProgress:
 
         capped = make_result(session_id='sess-42')
         ok = make_result()
-        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
@@ -1094,7 +1094,7 @@ class TestCapRetryResumableProgress:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-42'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
 
     async def test_no_config_dir_resumes_without_checking_progress(self):
         """Regression pin: config_dir=None -> resume as today, unchecked.
@@ -1111,7 +1111,7 @@ class TestCapRetryResumableProgress:
             detect_cap_hit=MagicMock(side_effect=[True, False]),
             active_account_name='acct-b',
         )
-        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        rebuild = AsyncMock(return_value='DISCARDED BY THE RESUME')
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock,
                   side_effect=[make_result(session_id='sess-42'), make_result()]) as mock_inv,
@@ -1124,7 +1124,7 @@ class TestCapRetryResumableProgress:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-42'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
 
     async def test_log_states_reason_fresh_no_resumable_progress(self, tmp_path, caplog):
         """The cap-hit line must name this reason distinctly.
@@ -1530,7 +1530,7 @@ class TestCapRetryBudget:
 
 @pytest.mark.asyncio
 class TestCapRetryCostStore:
-    """CostStore integration: invocations and events."""
+    """CostStore integration: invocations."""
 
     async def test_save_invocation_correct_params(self):
         """save_invocation called with all correct parameters on success."""
@@ -1557,33 +1557,6 @@ class TestCapRetryCostStore:
         assert kw['capped'] is False
         assert kw['account_name'] == 'acct-a'
 
-    async def test_save_account_event_on_cap_hit(self):
-        """save_account_event called with cap_hit on cap detection."""
-        gate = _mock_gate(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock()
-        result = make_result()
-        with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
-            patch(_SLEEP_PATCH, new_callable=AsyncMock),
-        ):
-            await invoke_with_cap_retry(
-                gate, 'my-label',
-                cost_store=cost_store, run_id='r1', project_id='p1',
-                prompt='hi',
-            )
-        cost_store.save_account_event.assert_awaited_once()
-        kw = cost_store.save_account_event.call_args.kwargs
-        assert kw['event_type'] == 'cap_hit'
-        assert kw['details'] == 'my-label'
-        assert 'created_at' in kw
-
     async def test_save_invocation_exception_swallowed(self, caplog):
         """save_invocation exception is swallowed (logged as warning)."""
         gate = _mock_gate()
@@ -1599,31 +1572,6 @@ class TestCapRetryCostStore:
             )
         assert got.success is True
         assert 'Failed to save invocation cost' in caplog.text
-
-    async def test_save_account_event_exception_swallowed(self, caplog):
-        """save_account_event exception is swallowed; retry still happens."""
-        gate = _mock_gate(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock(side_effect=RuntimeError('db error'))
-        result = make_result()
-        with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
-            patch(_SLEEP_PATCH, new_callable=AsyncMock),
-            caplog.at_level(logging.WARNING),
-        ):
-            got = await invoke_with_cap_retry(
-                gate, 'lbl', cost_store=cost_store, prompt='hi',
-            )
-        assert got.success is True
-        assert 'Failed to save cap_hit event' in caplog.text
-        # save_invocation still called on the success path
-        cost_store.save_invocation.assert_awaited_once()
 
     async def test_no_error_when_cost_store_none(self):
         """No crash when cost_store is None (default)."""
@@ -1866,7 +1814,7 @@ class TestCapRetryEdgeCases:
 
 @pytest.mark.asyncio
 class TestCapRetryTimingAndSequence:
-    """Verify exact ordering: invoke -> detect -> cost_event -> sleep -> invoke."""
+    """Verify exact ordering: invoke -> detect -> sleep -> invoke."""
 
     async def test_invoke_detect_sleep_invoke_sequence(self):
         """Verify invoke -> detect_cap_hit -> sleep -> invoke on cap-hit retry."""
@@ -1909,50 +1857,6 @@ class TestCapRetryTimingAndSequence:
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
         mock_sleep.assert_not_awaited()
-
-    async def test_sleep_after_cost_event_before_next_invoke(self):
-        """Sleep happens AFTER save_account_event, BEFORE next invoke."""
-        call_order = []
-
-        gate = _mock_gate(
-            account_count=1,
-            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct',
-        )
-
-        cost_store = MagicMock()
-
-        async def save_event(**kwargs):
-            call_order.append('save_event')
-
-        cost_store.save_account_event = AsyncMock(side_effect=save_event)
-        cost_store.save_invocation = AsyncMock()
-
-        r1 = make_result()
-        r2 = make_result()
-        invoke_count = 0
-
-        async def invoke_side_effect(**kwargs):
-            nonlocal invoke_count
-            invoke_count += 1
-            call_order.append(f'invoke_{invoke_count}')
-            return [r1, r2][invoke_count - 1]
-
-        async def sleep_side_effect(duration):
-            call_order.append('sleep')
-
-        with (
-            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=invoke_side_effect),
-            patch(_SLEEP_PATCH, new_callable=AsyncMock, side_effect=sleep_side_effect),
-        ):
-            await invoke_with_cap_retry(
-                gate, 'lbl', cost_store=cost_store, prompt='hi',
-            )
-
-        # Order: invoke_1 -> save_event -> sleep -> invoke_2
-        assert call_order.index('save_event') < call_order.index('sleep')
-        assert call_order.index('sleep') < call_order.index('invoke_2')
 
 
 # ===================================================================
@@ -2513,9 +2417,10 @@ class TestCancelledErrorReleaseProbeSlot:
 class TestCapRetryUnattributedCapHit:
     """Heuristic cap fires but _handle_cap_detected returns False (token unresolvable).
 
-    In this scenario, unattributed_cap is set True (skip_confirm was renamed to
-    unattributed_cap to better reflect its broader semantics). on_agent_complete
-    must NOT be called and cost_store.save_invocation must record capped=True.
+    In this scenario, report() settles the slot with the synthetic CapHit, so the
+    slot's one-verdict rule turns the completion confirm into a no-op.
+    on_agent_complete must NOT be called and cost_store.save_invocation must
+    record capped=True for this returned attempt.
     """
 
     def _make_heuristic_result(self) -> AgentResult:
@@ -2618,6 +2523,38 @@ class TestCapRetryUnattributedCapHit:
         assert kw['capped'] is True, (
             f'Expected capped=True for unattributed cap hit, got capped={kw["capped"]!r}'
         )
+        assert kw['capped_reason'] == 'account', (
+            'Widening capped to ceiling kills must preserve its original meaning: an '
+            f'unattributed account cap records capped_reason=account, got {kw["capped_reason"]!r}'
+        )
+
+    async def test_account_reason_outranks_a_ceiling_reason(self):
+        """An unattributed usage cap ends the run before any ceiling could be
+        reached, so 'account' wins even when the numeric turn fallback would
+        also fire (turns=1 >= max_turns=1 on a failed result)."""
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+        )
+        gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.lease_is_current = MagicMock(return_value=False)
+        heuristic_result = self._make_heuristic_result()
+
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=heuristic_result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'unattributed-capped-at-turns',
+                cost_store=cost_store, prompt='hi', max_turns=1, max_budget_usd=5.0,
+            )
+
+        kw = cost_store.save_invocation.call_args.kwargs
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'account'
 
     async def test_save_invocation_capped_false_for_normal_success(self):
         """cost_store.save_invocation uses capped=False for a normal successful result.
@@ -2648,6 +2585,110 @@ class TestCapRetryUnattributedCapHit:
         assert kw['capped'] is False, (
             f'Expected capped=False for normal success, got capped={kw["capped"]!r}'
         )
+        assert kw['capped_reason'] is None, (
+            f'Expected capped_reason=None for normal success, got {kw["capped_reason"]!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestSaveInvocationCeilingAndModelId:
+    """``invoke_with_cap_retry``'s ``save_invocation`` records which configured
+    ceiling ended the run and the exact CLI-served model id (task 4826).
+
+    Results here are long, costly runs — never the zero-cost instant exit the
+    heuristic cap net converts into a synthetic cap hit — so each reaches
+    ``save_invocation`` exactly once with the ceiling attribution under test.
+    """
+
+    async def _save_kwargs(self, result: AgentResult, **invoke_kwargs) -> dict:
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+        )
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'ceiling-task', cost_store=cost_store, prompt='hi', **invoke_kwargs,
+            )
+
+        cost_store.save_invocation.assert_awaited_once()
+        return cost_store.save_invocation.call_args.kwargs
+
+    async def test_budget_subtype_records_budget_cap(self):
+        result = make_result(
+            success=False, subtype='error_max_budget_usd',
+            cost_usd=5.02, turns=31, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'budget'
+
+    async def test_turns_subtype_records_turns_cap(self):
+        result = make_result(
+            success=False, subtype='error_max_turns',
+            cost_usd=1.4, turns=100, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'turns'
+
+    async def test_ceilings_are_read_from_the_invoke_kwargs(self):
+        """The numeric fallback compares against the max_budget_usd that
+        reached invoke_with_cap_retry via **invoke_kwargs."""
+        result = make_result(
+            success=False, subtype='error_during_execution',
+            cost_usd=5.0, turns=12, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'budget'
+
+    async def test_successful_run_at_its_budget_is_not_capped(self):
+        result = make_result(
+            success=True, subtype='success',
+            cost_usd=5.0, turns=100, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is False
+        assert kw['capped_reason'] is None
+
+    async def test_non_claude_backend_past_its_budget_is_not_capped(self):
+        """The dispatched backend reaches the classifier: codex enforces no
+        budget ceiling, so a failed run past its estimated budget was not ended
+        by one."""
+        result = make_result(
+            success=False, subtype='',
+            cost_usd=7.5, turns=12, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(
+            result, invoke_fn=AsyncMock(return_value=result), backend='codex',
+            model='gpt-5', max_budget_usd=5.0, max_turns=100,
+        )
+        assert kw['capped'] is False
+        assert kw['capped_reason'] is None
+
+    async def test_exact_model_id_is_recorded_beside_the_alias(self):
+        """The crux of task 4826: ``model`` keeps the lineage alias the caller
+        routed on, while ``model_id`` carries the exact version that served the
+        run — asserted to differ in the SAME call."""
+        result = make_result(cost_usd=0.5, duration_ms=60_000, model_id='claude-opus-5')
+        kw = await self._save_kwargs(result, model='opus')
+        assert kw['model'] == 'opus'
+        assert kw['model_id'] == 'claude-opus-5'
+        assert kw['model'] != kw['model_id']
+
+    async def test_model_id_none_passes_through_as_none(self):
+        """No transcript → NULL, the honest unknown; never the alias."""
+        result = make_result(cost_usd=0.5, duration_ms=60_000)
+        kw = await self._save_kwargs(result, model='sonnet')
+        assert 'model_id' in kw
+        assert kw['model_id'] is None
+        assert kw['model'] == 'sonnet'
 
 
 # ===================================================================
@@ -3325,17 +3366,17 @@ class TestCapRetryMaxCapRetries:
 
 @pytest.mark.asyncio
 class TestCapRetryRebuildPrompt:
-    """rebuild_prompt: optional hook invoked on an unresumable cap retry.
+    """rebuild_prompt: optional no-arg builder consulted before every retry.
 
-    Fires only on the two FRESH (unresumable) cap-retry paths, with
-    session_lost=True, so the caller can rebuild its prompt (e.g. with fresh
-    pending escalations) instead of reusing the stale original_prompt. The
-    resumable path (session_id present) is untouched — it keeps
-    CAP_HIT_RESUME_PROMPT and resumes, never calling rebuild_prompt.
+    A FRESH cap retry sends what it builds, so the caller can rebuild its
+    prompt (e.g. with fresh pending escalations) instead of reusing the stale
+    original_prompt. The resumable path (session_id present) still consults
+    it but keeps CAP_HIT_RESUME_PROMPT. The full contract is pinned in
+    test_cap_retry_prompt_builder.py.
     """
 
     async def test_rebuild_prompt_invoked_on_unresumable_cap(self):
-        """On a cap hit with no session_id, rebuild_prompt(True) replaces the prompt."""
+        """On a cap hit with no session_id, rebuild_prompt() replaces the prompt."""
         gate = _mock_gate(
             account_count=1,
             before_invoke=AsyncMock(side_effect=['tok', 'tok']),
@@ -3352,13 +3393,13 @@ class TestCapRetryRebuildPrompt:
             await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'FRESH ESCALATIONS PROMPT'
         assert 'resume_session_id' not in second.kwargs
 
-    async def test_rebuild_prompt_not_called_on_resumable_cap(self):
-        """On a cap hit WITH a session_id, the resume path is untouched — no rebuild."""
+    async def test_rebuild_prompt_consulted_but_discarded_on_resumable_cap(self):
+        """On a cap hit WITH a session_id, the builder is consulted but the resume keeps its prompt."""
         gate = _mock_gate(
             account_count=1,
             before_invoke=AsyncMock(side_effect=['tok', 'tok']),
@@ -3375,14 +3416,14 @@ class TestCapRetryRebuildPrompt:
             await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_not_awaited()
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-1'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_rebuild_prompt_invoked_on_heuristic_cap(self):
         """On the heuristic (zero-cost instant-exit) unresumable cap path,
-        rebuild_prompt(True) also replaces the prompt.
+        rebuild_prompt() also replaces the prompt.
 
         Covers the second FRESH cap-retry site — the exact-detect branch
         (test_rebuild_prompt_invoked_on_unresumable_cap) and this heuristic
@@ -3412,7 +3453,7 @@ class TestCapRetryRebuildPrompt:
             await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'HEUR REBUILD'
 
@@ -3441,7 +3482,7 @@ class TestCapRetryRebuildPrompt:
             got = await invoke_with_cap_retry(
                 gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         assert got.success is True
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'original'
@@ -3534,11 +3575,6 @@ class TestCapRetryResumeFailureRebuildsPrompt:
     unchanged to a brand-new session is context-less. This mirrors the two
     existing fresh-fallback rebuild call sites (TestCapRetryRebuildPrompt)
     for the third, non-cap-hit resume-failure site.
-
-    FAILS RED: the non-cap resume-failure branch (cli_invoke.py ~1087-1094)
-    calls _reset_for_fresh_retry(invoke_kwargs, original_prompt) and never
-    awaits _rebuild_fresh_prompt(), so the second call's prompt is still
-    'continuation'.
     """
 
     async def test_non_cap_resume_failure_rebuilds_prompt(self):
@@ -3565,7 +3601,7 @@ class TestCapRetryResumeFailureRebuildsPrompt:
                 resume_delivers_prompt=True,
                 rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
         assert 'resume_session_id' not in second.kwargs
@@ -3587,11 +3623,6 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
     the per-escalation continuation prompt — valid only inside the resumed
     session. A live-continuation resume that wedges or auth-fails must not
     hand that context-less prompt to the fresh retry.
-
-    FAILS RED: neither branch calls ``_rebuild_fresh_prompt()`` today — both
-    call ``_reset_for_fresh_retry(invoke_kwargs, original_prompt)`` and
-    ``continue`` directly, so the second call's prompt is still 'continuation'
-    and ``rebuild`` is never awaited.
     """
 
     async def test_wedge_branch_rebuilds_prompt(self):
@@ -3619,7 +3650,7 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
                 resume_delivers_prompt=True,
                 rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
         assert 'resume_session_id' not in second.kwargs
@@ -3647,7 +3678,7 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
                 resume_delivers_prompt=True,
                 rebuild_prompt=rebuild,
             )
-        rebuild.assert_awaited_once_with(True)
+        rebuild.assert_awaited_once_with()
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
         assert 'resume_session_id' not in second.kwargs

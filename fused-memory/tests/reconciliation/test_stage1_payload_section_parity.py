@@ -15,8 +15,9 @@ tells the model to draw an inference from that section's ABSENCE**. Today that
 set has exactly one member, ``### Live-Workflow Signals``, because
 ``prompts/stage1.py`` says:
 
-    "If `### Live-Workflow Signals` is absent from the payload, all three
-     signals are False for every task; no live-workflow suppression applies …"
+    "If `### Live-Workflow Signals` is absent from the payload, no task is live
+     this cycle — neither through a per-task signal nor through the project-wide
+     lock — and none has landing evidence; no live-workflow suppression applies …"
 
 That sentence makes absence load-bearing: a builder that omits the section is
 not merely terser, it makes the model conclude something FALSE. That — not
@@ -62,8 +63,10 @@ someone remembered. Here:
 * the SECTION set is DECLARED ONCE in ``MemoryConsolidator.REQUIRED_SECTIONS``
   and consumed by all builders through one aggregator — adding a section is a
   single edit, not one edit per builder;
-* the BUILDER set is DERIVED by AST introspection over the class body, so a
-  fourth builder is in scope the day it is added with no edit here — and
+* the BUILDER set is DERIVED by AST introspection over the class body
+  (``reconciliation/payload_section_parity.py``, shared with the Stage-2
+  guard), so a fourth builder is in scope the day it is added with no edit
+  here — and
   EVERY payload-returning branch of each discovered builder is checked, not
   just the first one found, so a second return added to an existing builder
   is in scope the same way.
@@ -75,206 +78,36 @@ too small fails loudly.
 
 from __future__ import annotations
 
-import ast
 import pathlib
 
 import pytest
-from _ast_guard import calls_named, parse_python_module
+from _ast_guard import calls_named
 
 import fused_memory.reconciliation.stages.memory_consolidator as consolidator_module
-from fused_memory.reconciliation.stages.memory_consolidator import (
-    MemoryConsolidator,
-    RequiredSection,
-)
+from fused_memory.reconciliation.stages.base import RequiredSection
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from reconciliation.consolidator_fixtures import make_consolidator
+from reconciliation.payload_section_parity import (
+    AGGREGATOR,
+    PAYLOAD_HEADER_PREFIX,
+    branches_missing_the_aggregator,
+    discover_payload_builders,
+    registry_shape_violations,
+)
 
 CONSOLIDATOR_SRC = pathlib.Path(consolidator_module.__file__)
-AGGREGATOR = '_render_required_sections'
 CONSOLIDATOR_CLASS = 'MemoryConsolidator'
 
-# A payload builder returns a WHOLE payload, which in this module always means an
-# f-string opening with the top-level markdown header. See
-# _discover_stage1_payload_builders for the verified discrimination.
-_PAYLOAD_HEADER_PREFIX = '## '
-
-
-def _is_a_whole_payload(node: ast.Return) -> bool:
-    """True when *node* returns a whole Stage-1 payload.
-
-    A whole payload is an f-string whose LEADING literal chunk opens with
-    ``'## '`` — the top-level markdown header that makes a string an entire
-    payload rather than one section of one.
-    """
-    if not isinstance(node.value, ast.JoinedStr):
-        return False
-    values = node.value.values
-    lead = values[0] if values else None
-    return (
-        isinstance(lead, ast.Constant)
-        and isinstance(lead.value, str)
-        and lead.value.startswith(_PAYLOAD_HEADER_PREFIX)
-    )
-
-
-def _payload_returns(node: ast.AST) -> list[ast.Return]:
-    """EVERY ``Return`` under *node* that returns a whole Stage-1 payload.
-
-    ALL of them, not the first one found. A builder may grow a second
-    payload-returning branch — an early-return short payload ahead of the full
-    one is the obvious shape — and checking only one branch would leave the
-    other free to omit the required sections silently, which is precisely the
-    drift this guard exists to prevent. Checking the whole set also removes a
-    trap for the next reader: ``ast.walk`` is BREADTH-first, so "the first
-    payload return" is not source order and which branch got checked would not
-    be obvious from reading the file. Sorted by position so failure messages
-    name the offending branches in source order.
-
-    Returns the nodes themselves (not a count or a bool) so callers can assert
-    over each f-string's interpolations and report its ``lineno``.
-    """
-    returns = [
-        descendant
-        for descendant in ast.walk(node)
-        if isinstance(descendant, ast.Return) and _is_a_whole_payload(descendant)
-    ]
-    returns.sort(key=lambda ret: (ret.lineno, ret.col_offset))
-    return returns
-
-
-def _discover_stage1_payload_builders() -> dict[str, tuple[ast.AST, list[ast.Return]]]:
-    """Every Stage-1 payload builder on ``MemoryConsolidator``, by introspection.
-
-    DERIVED, not hand-listed — that is the whole point. A fourth payload builder
-    is pulled into scope the day it is added, with no edit to this file. A
-    hand-maintained list of three names would pin regression in the builders
-    tasks 2150/2552/3839 already fixed and stay blind to the next one, which is
-    precisely the defect task 4708 closes.
-
-    Predicate: a method directly in the ``MemoryConsolidator`` class body that
-    returns an f-string opening with ``'## '``. Its discrimination was verified
-    against this module:
-
-    * SELECTS ``assemble_payload`` ('## Reconciliation Run — Stage 1: …'),
-      ``_format_assembled_payload`` (same header) and
-      ``_assemble_remediation_payload`` ('## Remediation Run — Stage 1: …').
-    * REJECTS the section builders. ``_build_task_count_census_section``
-      ('\\n### Task Count Census …') and ``_build_project_root_directive``
-      ('\\nUse project_root="…') do return f-strings, but neither opens with
-      ``'## '``; ``_build_task_tree_section`` and
-      ``_build_live_workflow_section`` return ``BinOp`` and cannot match at all;
-      the aggregator returns a ``Call``.
-
-    The class body is iterated DIRECTLY rather than via ``ast.walk``: a helper
-    function nested inside a builder is not itself a builder.
-    """
-    tree = parse_python_module(CONSOLIDATOR_SRC)
-    class_def = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == CONSOLIDATOR_CLASS
-        ),
-        None,
-    )
-    assert class_def is not None, (
-        f'{CONSOLIDATOR_SRC.name} no longer defines a top-level class '
-        f'{CONSOLIDATOR_CLASS!r}. Builder discovery cannot run; fix the class name '
-        f'here rather than letting this guard check nothing.'
-    )
-    builders: dict[str, tuple[ast.AST, list[ast.Return]]] = {}
-    for node in class_def.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        payload_returns = _payload_returns(node)
-        if payload_returns:
-            builders[node.name] = (node, payload_returns)
-    return builders
-
-
-STAGE1_PAYLOAD_BUILDERS = _discover_stage1_payload_builders()
-
-
-def _aggregator_call(node: ast.AST) -> bool:
-    """True when *node* is a call to ``self._render_required_sections()``.
-
-    The aggregator is a coroutine method (task 3778), so the call arrives
-    wrapped in ``await``; the wrapper is unwrapped before the check.
-    """
-    if isinstance(node, ast.Await):
-        node = node.value
-    return bool(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == AGGREGATOR
-    )
-
-
-def _names_bound_to_the_aggregator(builder: ast.AST) -> set[str]:
-    """Locals in *builder* assigned the aggregator's output.
-
-    Lets the parity check accept the indirect spelling
-    ``x = self._render_required_sections()`` … ``f"…{x}…"`` as well as direct
-    interpolation, so the guard proves the rendered text reaches the returned
-    payload without pinning one brittle spelling.
-    """
-    bound: set[str] = set()
-    for descendant in ast.walk(builder):
-        if isinstance(descendant, ast.Assign) and _aggregator_call(descendant.value):
-            bound.update(
-                target.id for target in descendant.targets if isinstance(target, ast.Name)
-            )
-        elif (
-            isinstance(descendant, ast.AnnAssign)
-            and isinstance(descendant.target, ast.Name)
-            # A bare annotation (``x: str``) has ``value=None`` and binds nothing.
-            and descendant.value is not None
-            and _aggregator_call(descendant.value)
-        ):
-            bound.add(descendant.target.id)
-    return bound
-
-
-def _payload_interpolates_the_aggregator(builder: ast.AST, payload_return: ast.Return) -> bool:
-    """True when the returned payload f-string carries the aggregator's output."""
-    bound = _names_bound_to_the_aggregator(builder)
-    assert isinstance(payload_return.value, ast.JoinedStr)
-    for value in payload_return.value.values:
-        if not isinstance(value, ast.FormattedValue):
-            continue
-        if _aggregator_call(value.value):
-            return True
-        if isinstance(value.value, ast.Name) and value.value.id in bound:
-            return True
-    return False
+STAGE1_PAYLOAD_BUILDERS = discover_payload_builders(CONSOLIDATOR_SRC, CONSOLIDATOR_CLASS)
 
 
 class TestRequiredSectionsRegistry:
     """``MemoryConsolidator.REQUIRED_SECTIONS`` is the single declared section set."""
 
-    def test_registry_is_a_non_empty_tuple_of_required_sections(self):
-        registry = MemoryConsolidator.REQUIRED_SECTIONS
-        assert isinstance(registry, tuple), (
-            f'REQUIRED_SECTIONS must be a tuple (immutable — it is a class-level '
-            f'declaration read by every payload builder), got {type(registry).__name__}.'
-        )
-        assert registry, (
-            'REQUIRED_SECTIONS is empty. An empty registry makes the aggregator a '
-            'no-op and every parity assertion in this file vacuous; at least '
-            "'### Live-Workflow Signals' is required by prompts/stage1.py."
-        )
-        for section in registry:
-            assert isinstance(section.header, str) and section.header.startswith('### '), (
-                f'REQUIRED_SECTIONS member {section!r} has header {section.header!r}; '
-                f"it must be the exact markdown header the shipped prompt names, "
-                f"which is a level-3 heading ('### …')."
-            )
-            assert isinstance(section.renderer, str), (
-                f'REQUIRED_SECTIONS member {section!r} has renderer '
-                f'{section.renderer!r}; it must be the NAME of a MemoryConsolidator '
-                f'method (a str resolved via getattr), not the method object — the '
-                f'aggregator dispatches by name.'
-            )
+    def test_registry_is_well_formed(self):
+        violations = registry_shape_violations(MemoryConsolidator)
+        assert not violations, '\n'.join(violations)
 
     def test_registry_contains_the_live_workflow_section(self):
         registry = MemoryConsolidator.REQUIRED_SECTIONS
@@ -287,18 +120,8 @@ class TestRequiredSectionsRegistry:
             f"RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'); "
             f'got {[(s.header, s.renderer) for s in registry]!r}. This is the one '
             f'section prompts/stage1.py draws an absence-inference from, so a builder '
-            f'omitting it makes the model conclude all three liveness signals are False.'
+            f'omitting it makes the model conclude no task is live or landed.'
         )
-
-    def test_every_registry_renderer_resolves_to_a_method(self):
-        for section in MemoryConsolidator.REQUIRED_SECTIONS:
-            renderer = getattr(MemoryConsolidator, section.renderer, None)
-            assert callable(renderer), (
-                f'REQUIRED_SECTIONS member {section.header!r} names renderer '
-                f'{section.renderer!r}, which is not a callable attribute of '
-                f'MemoryConsolidator. A typo in the renderer string must fail HERE, '
-                f'not as an AttributeError at payload-assembly time in production.'
-            )
 
 
 class TestRenderRequiredSections:
@@ -308,7 +131,7 @@ class TestRenderRequiredSections:
     contracts:
 
     * WHAT IT DISPATCHES TO — driven with a real live-workflow fixture (the
-      detector monkeypatched at its home namespace in ``task_knowledge_sync``,
+      detector monkeypatched at its home namespace in ``live_workflow_section``,
       the established spelling) so the assertion runs against real renderer
       output rather than the empty strings every renderer returns when its
       guard fails.
@@ -332,7 +155,7 @@ class TestRenderRequiredSections:
 
     def _make_live_stage(self, monkeypatch) -> MemoryConsolidator:
         """A consolidator whose every registry section actually renders."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -347,7 +170,7 @@ class TestRenderRequiredSections:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(
@@ -448,6 +271,20 @@ class TestDiscoveryItself:
     into a loud one. Mirrors ``tests/test_falkor_index_barrier_guard.py``'s
     ``TestDiscoveryItself`` / ``VERIFIED_LIVE_INDEX_MODULES`` so the two guards
     agree on anti-vacuity semantics by shared precedent.
+
+    The shared predicate (``reconciliation/payload_section_parity.py``) — a
+    method directly in the class body returning an f-string that opens with
+    ``'## '`` — was verified against ``memory_consolidator.py``:
+
+    * SELECTS ``assemble_payload`` ('## Reconciliation Run — Stage 1: …'),
+      ``_format_assembled_payload`` (same header) and
+      ``_assemble_remediation_payload`` ('## Remediation Run — Stage 1: …').
+    * REJECTS the section builders. ``_build_task_count_census_section``
+      ('\\n### Task Count Census …') and ``_build_project_root_directive``
+      ('\\nUse project_root="…') do return f-strings, but neither opens with
+      ``'## '``; ``_build_task_tree_section`` and
+      ``_build_live_workflow_section`` return ``BinOp`` and cannot match at all;
+      the aggregator returns a ``Call``.
     """
 
     # A LOWER bound, never an equality: a fourth builder must be pulled INTO
@@ -464,9 +301,9 @@ class TestDiscoveryItself:
         assert not missing, (
             f'Stage-1 payload-builder discovery no longer finds {sorted(missing)} '
             f'(found {sorted(discovered) or "nothing"}). The predicate in '
-            f'_discover_stage1_payload_builders has gone stale — most likely a '
+            f'payload_section_parity.discover_payload_builders has gone stale — most likely a '
             f'payload f-string was hoisted to a module constant or built by '
-            f'concatenation, or the top-level {_PAYLOAD_HEADER_PREFIX!r} header was '
+            f'concatenation, or the top-level {PAYLOAD_HEADER_PREFIX!r} header was '
             f'reworded. Fix the PREDICATE; do NOT shrink this floor, and do NOT '
             f'turn it into an equality: an introspective guard that discovers '
             f'nothing passes having checked nothing, which is the failure this '
@@ -495,19 +332,15 @@ class TestEveryPayloadBuilderRendersTheRequiredSections:
         an early-return short payload, say — must have that branch checked too,
         or it becomes a fresh place for a required section to go missing.
         """
-        builder, payload_returns = STAGE1_PAYLOAD_BUILDERS[builder_name]
+        builder = STAGE1_PAYLOAD_BUILDERS[builder_name]
 
-        offending_lines = [
-            payload_return.lineno
-            for payload_return in payload_returns
-            if not _payload_interpolates_the_aggregator(builder, payload_return)
-        ]
+        offending_lines = branches_missing_the_aggregator(builder)
 
         assert not offending_lines, (
             f'{CONSOLIDATOR_CLASS}.{builder_name} returns a Stage-1 payload that '
             f'never interpolates self.{AGGREGATOR}() at '
             f'{CONSOLIDATOR_SRC.name}:{",".join(str(n) for n in offending_lines)} '
-            f'(of {len(payload_returns)} payload-returning branch(es) in this '
+            f'(of {len(builder.payload_returns)} payload-returning branch(es) in this '
             f'builder), so that branch can omit '
             f'{sorted(s.header for s in MemoryConsolidator.REQUIRED_SECTIONS)} — '
             f"and the prompt's absence-inference then makes the model conclude "
@@ -528,10 +361,10 @@ class TestEveryPayloadBuilderRendersTheRequiredSections:
         via ``getattr(self, section.renderer)()``, which is not a named call and
         so is unaffected; it is also not a discovered builder.
         """
-        builder, _ = STAGE1_PAYLOAD_BUILDERS[builder_name]
+        builder = STAGE1_PAYLOAD_BUILDERS[builder_name]
 
         for section in MemoryConsolidator.REQUIRED_SECTIONS:
-            assert not calls_named(builder, section.renderer), (
+            assert not calls_named(builder.node, section.renderer), (
                 f'{CONSOLIDATOR_CLASS}.{builder_name} calls '
                 f'self.{section.renderer}() directly. Registered sections must be '
                 f'reached ONLY through self.{AGGREGATOR}(), or adding the next '

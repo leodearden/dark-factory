@@ -617,17 +617,62 @@ def is_interpreter_missing_workspace_packages(output: str) -> bool:
     rather than raising — a classifier must never be the thing that fails.
     """
     unresolved = unresolved_top_level_modules(output)
-    return (
-        len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
-        and bool(unresolved & _BASELINE_WORKSPACE_MODULES)
+    return _has_broad_unresolved_imports(unresolved) and bool(
+        unresolved & _BASELINE_WORKSPACE_MODULES
     )
+
+
+def is_partially_provisioned_venv_type_failure(
+    type_output: str, *, test_tool: ToolKind, test_leg_passed: bool,
+) -> bool:
+    """True when a type-check failure shows pyright reading a cold ``.venv``
+    that was still being populated, corroborated by the same run's passing
+    PYTEST leg — an environment fault, not a branch defect.
+
+    Task 6127 / esc-6021-3. Measured signature: 164 reportMissingImports over
+    seven DISTINCT top-level third-party modules on a docs-only merge, while
+    every test leg passed. pytest resolved, because shared's ``uv run``
+    installed it first, so the task-3367 sentinel misses this shape; the
+    member-specific packages had not landed yet.
+
+    DISCRIMINATOR CONTRACT — all three conditions must hold:
+
+      1. *test_leg_passed*: the same venv imported those packages at runtime,
+         so pyright's view was stale rather than the dependency set wrong.
+         This corroboration replaces the 3367 sentinel;
+      2. *test_tool* is ``ToolKind.PYTEST``: only a Python test run imports
+         anything, so a passing ``true``, JS-only or wrapped test command
+         corroborates nothing. A skipped leg resolves ``ToolKind.OPAQUE``;
+      3. at least ``_MIN_DISTINCT_UNRESOLVED_IMPORTS`` DISTINCT top-level
+         modules are unresolved — the floor shared with 3367, so a branch
+         adding one or two undeclared imports still blames the branch.
+
+    Purity of reportMissingImports is deliberately NOT required: the measured
+    log carried consequential reportAttributeAccessIssue and
+    reportOptionalMemberAccess errors alongside the imports.
+
+    Residual gap: a passing pytest leg vouches only for the modules it
+    imported, so a type command covering code no test imports (a whole
+    subproject, or a new untested module) gets no real corroboration.
+
+    Pure and total: any input returns a bool rather than raising.
+    """
+    return (
+        test_leg_passed
+        and test_tool is ToolKind.PYTEST
+        and _has_broad_unresolved_imports(unresolved_top_level_modules(type_output))
+    )
+
+
+def _has_broad_unresolved_imports(unresolved: frozenset[str]) -> bool:
+    return len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
 
 
 def unresolved_top_level_modules(output: str) -> frozenset[str]:
     """Distinct TOP-LEVEL module names reported unresolved in *output*.
 
-    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both the predicate
-    above and verify.py's loud log (which reports the count) read the signature
+    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both predicates above
+    and verify.py's loud logs (which report the count) read the signature
     through this helper, so there is never a second copy of the regex.
     """
     return frozenset(

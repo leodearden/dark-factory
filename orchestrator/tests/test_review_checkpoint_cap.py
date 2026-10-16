@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from _recording_event_store import _RecordingEventStore
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
@@ -220,61 +220,118 @@ class TestReviewCheckpointParseFailure:
         )
 
 
-@pytest.mark.asyncio
-class TestReviewCheckpointVerifyRole:
-    """Regression guard (task 2391 / T3): review-checkpoint acquires as task-role.
+_REVIEW_PAYLOAD = {'findings': [], 'summary': 'all good'}
 
-    T3 stamps role='background' on the main-tip sweep's run_full_verification
-    calls only (verify.run_main_tip_sweep — see test_verify_main_tip_sweep.py).
-    review_checkpoint.py is intentionally untouched by that change: its Phase 1
-    call omits the role kwarg entirely, so run_full_verification's 'task'
-    default applies. This pins that behavior so a future edit can't silently
-    start stamping 'background' (or any other non-default role) onto the
-    review-checkpoint fan-out.
+
+@pytest.mark.asyncio
+class TestReviewCheckpointInvocationRecord:
+    """The deep_reviewer ``save_invocation`` row records the exact served
+    ``model_id`` and which configured ceiling, if any, ended the run (task 4826).
+
+    This path emits no ``invocation_end`` event, so its ``invocations`` row is
+    the ONLY durable record of a reviewer cap kill.
     """
 
-    async def test_run_focused_verify_call_omits_role_kwarg(self, monkeypatch):
-        """run_focused()'s run_full_verification call must verify at 'task' priority.
-
-        Asserts the *effective* role (kwarg present-and-'task', or absent so
-        run_full_verification's 'task' default applies) rather than the
-        kwarg's mere absence — a behavior-preserving refactor that starts
-        passing the equivalent ``role='task'`` explicitly should still pass
-        this test, while a real regression to ``role='background'`` (or any
-        other non-task role) must still fail it.
-
-        Reuses the AllAccountsCappedException short-circuit (see
-        test_run_review_handles_all_accounts_capped above) to reach the Phase 1
-        verify call with minimal mocking — the cap exception fires immediately
-        after Phase 1 completes, so this doesn't need to touch _save_report or
-        the agent-output parse path.
-        """
+    async def _drive(
+        self, monkeypatch, result: AgentResult, *, backend: str = 'claude',
+    ) -> tuple[dict, dict]:
+        """Run one focused review on *backend* returning *result*; give back
+        ``(save_invocation kwargs, invoke_with_cap_retry kwargs)``."""
         checkpoint = _make_checkpoint()
+        checkpoint.config.backends.deep_reviewer = backend
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+        cost_store.model_cost_in_window = AsyncMock(return_value=0.0)
+        checkpoint.cost_store = cost_store
+        mock_invoke = AsyncMock(return_value=result)
 
-        cap_exc = AllAccountsCappedException(
-            retries=4, elapsed_secs=300.0, label='Review checkpoint [x]'
-        )
-
-        mock_run_full_verification = AsyncMock(return_value=_PHASE1_RESULT)
-
-        monkeypatch.setattr(
-            'orchestrator.review_checkpoint.invoke_with_cap_retry',
-            AsyncMock(side_effect=cap_exc),
-        )
+        monkeypatch.setattr('orchestrator.review_checkpoint.invoke_with_cap_retry', mock_invoke)
         monkeypatch.setattr(
             'orchestrator.review_checkpoint.run_full_verification',
-            mock_run_full_verification,
+            AsyncMock(return_value=_PHASE1_RESULT),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.ReviewCheckpoint._save_report',
+            lambda *a, **kw: None,
         )
 
-        report = await checkpoint.run_focused()
+        await checkpoint.run_focused()
 
-        assert isinstance(report, ReviewReport)
-        mock_run_full_verification.assert_awaited_once()
-        assert mock_run_full_verification.await_args is not None
-        call_kwargs = mock_run_full_verification.await_args.kwargs
-        assert call_kwargs.get('role', 'task') == 'task', (
-            'review-checkpoint must verify at task priority — expected the '
-            "effective role to be 'task' (whether via an absent kwarg, relying "
-            "on run_full_verification's default, or an explicit role='task'); "
-            f"got kwargs={call_kwargs!r}"
+        cost_store.save_invocation.assert_awaited_once()
+        return cost_store.save_invocation.call_args.kwargs, dict(mock_invoke.call_args.kwargs)
+
+    async def test_exact_model_id_is_recorded_beside_the_resolved_alias(self, monkeypatch):
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=True, output='', subtype='success',
+                structured_output=_REVIEW_PAYLOAD, model_id='claude-opus-5',
+            ),
         )
+        assert save_kw['model'] == invoke_kw['model'], (
+            'model must stay the routing-resolved alias the reviewer was invoked with'
+        )
+        assert save_kw['model_id'] == 'claude-opus-5'
+        assert save_kw['model'] != save_kw['model_id']
+
+    async def test_budget_cap_kill_is_recorded(self, monkeypatch):
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='error_max_budget_usd',
+                cost_usd=10.04, turns=22,
+            ),
+        )
+        assert invoke_kw['max_budget_usd'] == 10.0
+        assert save_kw['capped'] is True
+        assert save_kw['capped_reason'] == 'budget'
+
+    async def test_turn_cap_kill_is_recorded(self, monkeypatch):
+        save_kw, _ = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='error_max_turns', cost_usd=2.1, turns=50,
+            ),
+        )
+        assert save_kw['capped'] is True
+        assert save_kw['capped_reason'] == 'turns'
+
+    async def test_resolved_budget_reaches_the_numeric_fallback(self, monkeypatch):
+        """A failed reviewer run AT the resolved budget with an inconclusive
+        subtype is attributed to the budget ceiling."""
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='error_during_execution',
+                cost_usd=10.0, turns=3,
+            ),
+        )
+        assert invoke_kw['max_budget_usd'] == 10.0
+        assert save_kw['capped_reason'] == 'budget'
+
+    async def test_normal_review_is_not_capped(self, monkeypatch):
+        save_kw, _ = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=True, output='', subtype='success',
+                structured_output=_REVIEW_PAYLOAD, cost_usd=3.2, turns=18,
+            ),
+        )
+        assert save_kw['capped'] is False
+        assert save_kw['capped_reason'] is None
+        assert 'model_id' in save_kw
+        assert save_kw['model_id'] is None
+
+    async def test_non_claude_failed_review_past_the_budget_is_not_capped(self, monkeypatch):
+        """The deep_reviewer backend reaches the classifier as well as the
+        invoke: a backend that enforces no budget ceiling is never budget-capped."""
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='', cost_usd=12.0, turns=3,
+            ),
+            backend='codex',
+        )
+        assert invoke_kw['backend'] == 'codex'
+        assert save_kw['capped'] is False
+        assert save_kw['capped_reason'] is None

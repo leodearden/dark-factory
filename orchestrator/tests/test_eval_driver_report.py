@@ -349,7 +349,7 @@ class TestSelectSurvivors:
 # ---------------------------------------------------------------------------
 
 def _res(task_id: str, config: str, role: str, composite_score: float):
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     return EvalResult(
         task_id, config, 'done',

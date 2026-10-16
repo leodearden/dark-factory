@@ -309,8 +309,10 @@ class ManifestTask(BaseModel):
       spelling, so the stored value is always JOIN-SAFE against an
       ``external_deps`` entry (see the validator below).
       ``commit_planning`` never stamps such a block: its step-4 write-back
-      only touches labels present in the batch being committed, and a
-      foreign producer is by construction not in a dark-factory batch.
+      only touches labels present in the batch being committed, a foreign
+      producer is by construction not in a dark-factory batch, and a batch
+      label that does name one is left unstamped and reported in the
+      stamping report's ``external_labels`` bucket.
     - both ``None`` — authoring time; the block binds nothing yet.
 
     The two id fields are MUTUALLY EXCLUSIVE (enforced below): a block that
@@ -319,18 +321,14 @@ class ManifestTask(BaseModel):
     prevent. ``title`` is a human aid, not load-bearing.
 
     ``note`` is durable task-level provenance — why a label was split,
-    renamed or re-homed. It is a DECLARED field rather than a YAML comment
-    because ``manifest_stamping``'s write-back is
-    ``yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)``
-    (``fused-memory/src/fused_memory/server/manifest_stamping.py``, step 4),
-    which discards every comment in the sidecar on the next stamp. A
-    declared field survives that rewrite; a comment does not. Surviving is
-    a property of the field being DECLARED, not of step 4 happening to dump
-    the raw decoded dict — it would hold equally under a ``model_dump()``.
-    That survival is asserted end-to-end on the stamping side, not here:
-    see ticket ``tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD`` (follow-up from task
-    4471) for the ``test_manifest_stamping`` fixture that stamps a sidecar
-    carrying this field and re-reads it.
+    renamed or re-homed. Comments in a sidecar now survive a stamp too
+    (``fused-memory/src/fused_memory/server/manifest_stamping.py`` step 4
+    rewrites only ``task_id`` values), but ``note`` remains the preferred
+    home: it is declared, validated, and machine-readable, where a comment
+    is none of those. Its survival is asserted end-to-end on the stamping
+    side, not here: see ticket ``tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD`` (follow-up
+    from task 4471) for the ``test_manifest_stamping`` fixture that stamps a
+    sidecar carrying this field and re-reads it.
     """
 
     model_config = ConfigDict(extra='forbid')

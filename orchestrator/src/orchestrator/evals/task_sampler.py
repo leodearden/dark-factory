@@ -707,6 +707,9 @@ def enrich_candidates_from_task_db(
     with those fields filled (``complexity`` read from the row's ``metadata``
     JSON blob). Opened ``mode=ro`` (mirroring
     ``curator_corpus.read_curator_decisions``) so it never locks the live db.
+    Not ``scripts/_task_db_scan.py::connect_ro``, deliberately: package code
+    cannot import a ``scripts/`` sibling, and this pass degrades to stubs
+    rather than refusing.
 
     Degrades to the UNCHANGED stub — never raises — for a non-numeric id
     (legacy fixtures), an id absent from the db, or a missing/unreadable db: a

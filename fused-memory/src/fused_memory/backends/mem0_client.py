@@ -28,7 +28,7 @@ _MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
 _EXCERPT_LEN = 240
 
 
-def _extract_payload_text(payload: dict[str, Any]) -> str | None:
+def extract_payload_text(payload: dict[str, Any]) -> str | None:
     """Return a Qdrant payload's memory text, in canonical key order."""
     for key in _MEM0_TEXT_KEYS:
         value = payload.get(key)
@@ -104,9 +104,9 @@ def is_missing_collection_error(exc: BaseException) -> bool:
     construction (404 AND the message), so a 404 raised about some other
     Qdrant resource can never be read as an empty collection.
 
-    Callers that degrade on this predicate should still say so out loud (log
-    the missing collection), so an operator can tell "collection absent" from
-    "collection genuinely empty".
+    :meth:`Mem0Backend._timed_collection_read` is the degrade-and-disclose
+    home for the Scope-addressed metadata reads; any other caller that
+    degrades on this predicate should likewise log the missing collection.
     """
     from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
 
@@ -389,6 +389,28 @@ class Mem0Backend:
     async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
         """:meth:`_timed` under this backend's WRITE budget."""
         return await self._timed(awaitable, op, self._write_timeout)
+
+    async def _timed_collection_read(
+        self, awaitable: Awaitable[_T], op: str, collection_name: str, *, if_absent: _T,
+    ) -> _T:
+        """:meth:`_timed_read`, reading a provably-absent collection as *if_absent*.
+
+        Only :func:`is_missing_collection_error` degrades: it returns
+        *if_absent* and logs the collection at INFO.  A timeout and every other
+        failure propagate per the class TIMEOUT POSTURE.
+        """
+        try:
+            return await self._timed_read(awaitable, op)
+        except Exception as exc:
+            if not is_missing_collection_error(exc):
+                raise
+            logger.info(
+                'Mem0 %s: collection %s does not exist; reading it as empty',
+                op,
+                collection_name,
+                extra={'collection': collection_name},
+            )
+            return if_absent
 
     async def add(
         self,
@@ -848,10 +870,13 @@ class Mem0Backend:
         Qdrant payload, so ``filters={'source': 'X', 'flag_id': 'Y'}`` matches
         against ``payload.source == 'X' AND payload.flag_id == 'Y'``.
 
-        Returns the exact match count.  Empty ``filters`` is rejected (would
-        otherwise count every memory in the collection — almost certainly a
-        bug at the caller).
+        Returns the exact match count; an unprovisioned collection reads as 0
+        (see :meth:`_timed_collection_read`).  Empty ``filters`` is rejected
+        (would otherwise count every memory in the collection — almost
+        certainly a bug at the caller).
         """
+        from qdrant_client.http import models as qmodels
+
         if not filters:
             raise ValueError(
                 'count_by_metadata requires at least one filter; '
@@ -860,13 +885,15 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
         qdrant_filter = self._build_payload_filter(filters)
-        result = await self._timed_read(
+        result = await self._timed_collection_read(
             client.count(
                 collection_name=collection_name,
                 count_filter=qdrant_filter,
                 exact=True,
             ),
             'count_by_metadata',
+            collection_name,
+            if_absent=qmodels.CountResult(count=0),
         )
         return result.count
 
@@ -918,7 +945,8 @@ class Mem0Backend:
             returned that point without one.  A vector-less point is still
             returned (degraded, not dropped) so the caller can count and
             report it rather than losing it silently; the ``'vector'`` key is
-            absent entirely when *with_vectors* is False.
+            absent entirely when *with_vectors* is False.  An unprovisioned
+            collection reads as ``[]`` (see :meth:`_timed_collection_read`).
 
         Raises:
             ValueError: If *filters* is empty.
@@ -935,7 +963,7 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
         qdrant_filter = self._build_payload_filter(filters)
-        points, _next_offset = await self._timed_read(
+        points, _next_offset = await self._timed_collection_read(
             client.scroll(
                 collection_name=collection_name,
                 scroll_filter=qdrant_filter,
@@ -944,6 +972,8 @@ class Mem0Backend:
                 limit=limit,
             ),
             'scroll_by_metadata',
+            collection_name,
+            if_absent=([], None),
         )
 
         result = [self._normalise_point(point, with_vectors=with_vectors) for point in points]
@@ -1175,10 +1205,10 @@ class Mem0Backend:
                 async for point in pages:
                     scanned += 1
                     payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                    hits = find_toolcall_xml_leak(_extract_payload_text(payload))
+                    hits = find_toolcall_xml_leak(extract_payload_text(payload))
                     if not hits:
                         continue
-                    text = _extract_payload_text(payload) or ''
+                    text = extract_payload_text(payload) or ''
                     matches.append({
                         'id': point.id,
                         'created_at': payload.get('created_at'),
@@ -1223,6 +1253,7 @@ class Mem0Backend:
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
         max_points: int | None = None,
         with_vectors: bool = False,
+        with_payload: bool = True,
     ) -> AsyncGenerator[Any, None]:
         """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
 
@@ -1288,6 +1319,10 @@ class Mem0Backend:
                 only by pulling a point past the cap.
             with_vectors: Fetch each point's stored vector.  Costs bandwidth,
                 so it is opt-in.
+            with_payload: Fetch each point's payload.  ``False`` is an
+                ids-only walk, how id enumeration keeps its data access
+                minimal; it exists for ``services/id_resolver.py`` (PRD C2's
+                single substrate extension).
 
         Yields:
             Raw Qdrant point objects, in page order.  Annotated
@@ -1372,7 +1407,7 @@ class Mem0Backend:
                 client.scroll(
                     collection_name=collection_name,
                     scroll_filter=scroll_filter,
-                    with_payload=True,
+                    with_payload=with_payload,
                     with_vectors=with_vectors,
                     limit=page_limit,
                     offset=offset,
@@ -1558,6 +1593,29 @@ class Mem0Backend:
                 memory_id,
             )
         return dict(records[0].payload or {})
+
+    async def get_points_by_ids(
+        self, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, dict[str, Any]]:
+        """Several points' raw payloads in ONE ``retrieve``: ``{id: payload}``, absent ids omitted.
+
+        The batched sibling of :meth:`get_point_by_id`, with the same payload
+        shape and timeout posture; no ids is no read.
+        """
+        if not memory_ids:
+            return {}
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        records = await self._timed_read(
+            client.retrieve(
+                collection_name=collection_name,
+                ids=list(memory_ids),
+                with_payload=True,
+                with_vectors=False,
+            ),
+            'get_points_by_ids',
+        )
+        return {str(record.id): dict(record.payload or {}) for record in records}
 
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""

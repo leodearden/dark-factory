@@ -255,10 +255,11 @@ async def _run_script_check(
     propagates to :func:`run_delivered_check`'s catch-all, which maps it to
     :attr:`DeliveredCheckResult.ERRORED`.
 
-    On timeout, ``asyncio.wait_for`` cancels the ``runner`` coroutine;
-    ``orchestrator.git_ops._run`` kills and reaps its spawned subprocess in
-    that case (task 2608), so a script that hangs past ``timeout_secs`` no
-    longer leaks an orphaned child process.
+    On timeout, ``asyncio.wait_for`` cancels the ``runner`` coroutine, and
+    ``orchestrator.git_ops._run`` then kills the script's whole process group
+    (any helpers it forked included) and reaps the script (tasks 2608/4155).
+    The residual: a script that already exited, leaving a helper behind, gets
+    no signal (``shared/src/shared/git_async.py`` module docstring).
     """
     assert meta.script is not None  # enforced by the script cross-field validator
     assert meta.timeout_secs is not None  # enforced by the script cross-field validator

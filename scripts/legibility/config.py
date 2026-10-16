@@ -46,12 +46,17 @@ class Sampling(BaseModel):
 
 
 class NoveltySpike(BaseModel):
-    """``census.novelty_spike`` — the (c) census-trigger condition (PRD §5.2 point 6)."""
+    """``census.novelty_spike`` — the relative novelty-spike trigger condition
+    (plans/census-incremental-prd.md §4.7 (b)): ``count`` is the absolute
+    minimum, and ``multiple`` x the median of the daily window counts over
+    the trailing ``baseline_days`` is the relative bar."""
 
     model_config = ConfigDict(extra='allow')
 
-    count: int = 4
-    window_hours: int = 72
+    count: int = Field(default=4, ge=0, strict=True)
+    window_hours: int = Field(default=72, ge=0, strict=True)
+    multiple: int = Field(default=2, ge=0, strict=True)
+    baseline_days: int = Field(default=30, ge=0, strict=True)
 
 
 class Saturation(BaseModel):
@@ -84,10 +89,12 @@ class TrickleCensusCaps(BaseModel):
 
 class Census(BaseModel):
     """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
-    points 6-7) and the nightly trickle's census launch caps."""
+    points 6-7), the nightly trickle's census launch caps, and the length of
+    the census mining window (which is also the session ledger's retention)."""
 
     model_config = ConfigDict(extra='allow')
 
+    ledger_retention_days: int = Field(default=30, ge=1, strict=True)
     max_interval_days: int = 10
     tasks_landed_threshold: int = 120
     tasks_landed_min_days: int = 7
@@ -113,8 +120,8 @@ class Timeouts(BaseModel):
     budgets (seconds).
 
     The census runs three claude-CLI-backed stages with very different
-    shapes, but originally handed every stage ``coder._invoke_cli``'s single
-    module default of 120s (sized for one Haiku trickle-coding call). That
+    shapes, but originally handed every stage the trickle coder's single
+    default of 120s (sized for one Haiku trickle-coding call). That
     default demonstrably killed the first dark_factory census: every Sonnet
     verify-vs-``main`` call (one per novel cluster, exploring current
     ``main`` via targeted reads) and the final large Fable synthesis call
@@ -126,6 +133,7 @@ class Timeouts(BaseModel):
     cluster exploring current ``main``), ``census_synthesis_secs`` (1800 —
     one large Fable call over all verified clusters). An omitted block loads
     with all three defaults, so a pre-existing legibility.yaml keeps working.
+    ``census.census_stage_specs`` binds each to its stage.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -184,7 +192,7 @@ class LegibilityConfig(BaseModel):
     def _project_root_must_be_absolute(cls, value: str) -> str:
         """Reject a relative ``project_root`` at config-load time.
 
-        Every consumer (sampling.py, census.py's ``default_batch_source``,
+        Every consumer (sampling.py, census_window.py's ``WindowBatchSource``,
         digest.py, ...) resolves ``cfg.project_root`` against its OWN
         process cwd. ``scripts/legibility-trickle@.service`` pins
         ``WorkingDirectory=/home/leo/src/dark-factory`` for every ``%i``
@@ -292,8 +300,8 @@ def configure_logging(default_level: str = 'INFO') -> None:
     tinguishable from genuine no-change nights.
 
     ``LEGIBILITY_LOG_LEVEL`` overrides *default_level* (matching the
-    ``LEGIBILITY_SEARCH_ROOTS`` / ``LEGIBILITY_CLAUDE_BIN`` env convention
-    already used across these modules). Either spelling operators reach for
+    ``LEGIBILITY_SEARCH_ROOTS`` env convention already used across these
+    modules). Either spelling operators reach for
     is accepted — a level NAME (``DEBUG``, case-insensitive) or a numeric
     level (``10``, which is what ``logging``'s own API takes). An
     unparseable value degrades to *default_level* and logs one warning — it

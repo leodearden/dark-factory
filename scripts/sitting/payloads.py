@@ -185,23 +185,22 @@ def route_finding_to_owner(owner_task_id: str, owner_status: str, finding: Findi
 
 
 def sitting_decision_id(item: OpenItem) -> str:
-    """The decision id an unrecorded L2 is filed under: ``<project>[-<queue tag>]-<escalation id>``."""
-    if not item.escalation_id:
-        raise ValueError(f'{item.key}: only an escalation item has a sitting decision id')
-    return '-'.join(part for part in (item.project, queue_tag(item.queue_dir), item.escalation_id) if part)
+    """The id write-decision stores an unrecorded L2 under: ``<project>[-<queue tag>]-<escalation id>``."""
+    return session_registry.qualify_decision_id(item.project, _sitting_local_decision_id(item))
 
 
 def close_decision_argv(item: OpenItem, state: str, evidence: str) -> ApplyPayload:
     """``close-decision`` for *item*'s record, preceded by a ``write-decision`` when *item* has none.
 
-    Decision ids are fleet-global while escalation numbering restarts per
-    project, so two defences keep a close off another project's record. The
-    derived id (``sitting_decision_id``) makes a cross-project or cross-queue
-    collision improbable. The close's compare-and-swap, ``--project`` and
-    ``--escalations-dir`` naming the record as read, makes any residual
-    collision a loud non-zero exit rather than a silent close of another
-    project's gate; it is needed because ``write-decision`` refuses a collision
-    fail-soft with exit 0, so the close that follows it still runs.
+    The filing passes the project-LOCAL id and ``write-decision`` qualifies it
+    by project, so the close names ``sitting_decision_id``, the id actually
+    stored, and a derived id cannot collide across projects. The close's
+    compare-and-swap, ``--project`` and ``--escalations-dir`` naming the record
+    as read, still guards a linked or legacy record, and the residual case
+    where ``write-decision`` refuses a qualified id held by another project's
+    legacy record fail-soft with exit 0, so the close that follows still runs:
+    there it is a loud non-zero exit rather than a silent close of another
+    project's gate.
     """
     if state not in CLOSING_STATES:
         raise ValueError(f'close-decision closes to one of {sorted(CLOSING_STATES)}, not {state!r}')
@@ -212,7 +211,7 @@ def close_decision_argv(item: OpenItem, state: str, evidence: str) -> ApplyPaylo
         decision_id, expected_project, filing = item.decision_id, item.decision_project, []
     else:
         decision_id, expected_project = sitting_decision_id(item), item.project
-        filing = [[*registry, *_write_decision_args(decision_id, item)]]
+        filing = [[*registry, *_write_decision_args(_sitting_local_decision_id(item), item)]]
     close = [*registry, 'close-decision', '--id', decision_id, '--state', str(state), '--evidence', evidence,
              '--project', expected_project, '--escalations-dir', item.queue_dir]
     return ApplyPayload(SESSION_REGISTRY_TOOL, [*filing, close])
@@ -265,10 +264,16 @@ def _parse_last_marker(note: str, token: str, build: Callable[..., _Marker]) -> 
         return RejectedMarker(marker=token, line=line, reason=str(exc))
 
 
-def _write_decision_args(decision_id: str, item: OpenItem) -> list[str]:
+def _sitting_local_decision_id(item: OpenItem) -> str:
+    if not item.escalation_id:
+        raise ValueError(f'{item.key}: only an escalation item has a sitting decision id')
+    return '-'.join(part for part in (queue_tag(item.queue_dir), item.escalation_id) if part)
+
+
+def _write_decision_args(local_id: str, item: OpenItem) -> list[str]:
     if item.queue_dir in ('', UNKNOWN_QUEUE):
         raise ValueError(f'write-decision needs the item\'s real queue, not {item.queue_dir!r}')
-    args = ['write-decision', '--id', decision_id, '--project', item.project, '--text', item.text,
+    args = ['write-decision', '--id', local_id, '--project', item.project, '--text', item.text,
             '--escalations-dir', item.queue_dir]
     if item.task_id:
         args += ['--task-id', item.task_id]

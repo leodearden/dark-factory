@@ -1672,7 +1672,7 @@ class TestPostMergeRedMainAbort:
         with the canonical merge_queue.POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
         """
         from orchestrator.b3_gate import POST_MERGE_RED_MAIN_REASON_PREFIX
-        from orchestrator.merge_queue import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         assert POST_MERGE_RED_MAIN_REASON_PREFIX == POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX, (
             f'b3_gate prefix {POST_MERGE_RED_MAIN_REASON_PREFIX!r} '
             f'!= merge_queue prefix {POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX!r}'
@@ -1781,6 +1781,155 @@ class TestStopInstructionAbort:
             _LOW_RISK_ENTRY, worktree='/tmp', category=None,
             run_git=_fake_git_fresh, now=self._NOW,
             extra_texts=['deploy the service'],
+        )
+        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
+
+
+class TestStopScanExcludesCapturedOutput:
+    """check_proposal's step-1c scan skips the fenced captured output of each
+    verify failure-report section in block_reason, and still scans every
+    authored text: proposal_text, extra_texts, and the rest of block_reason
+    (task 6933).
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    _RATCHET_RED_BLOCK_REASON = (
+        'Post-merge verification failed: 1 new failing test(s) not present on main: '
+        'tests.test_merge_lane_ratchet::test_baseline_matches_a_fresh_measurement'
+        '@merge_lane_ratchet'
+        '\n\n## Failure Cause\n\nFAILED tests/test_merge_lane_ratchet.py::'
+        'test_baseline_matches_a_fresh_measurement@merge_lane_ratchet'
+        '\n\n## Test Failures\n\n```\n'
+        'E     RESIDUAL, so you do not trust more than is true: `git rebase` and a '
+        'CLEAN merge do not run pre-commit at all, and the merge worker advances '
+        'main with `git update-ref`, which runs no hooks.\n'
+        '1 failed, 25096 passed'
+        '\n```'
+        '\n\nintegration_skew: port landed commit(s) 071b84b48f touching '
+        'scripts/merge_lane_metrics.py — do not hunt your own diff'
+    )
+
+    def _merge_verify_red_entry(self, block_reason):
+        return {
+            **_LOW_RISK_ENTRY,
+            'block_class': 'merge_verify_red',
+            'block_reason': block_reason,
+        }
+
+    def test_ratchet_readme_in_fenced_pytest_output_does_not_trip_the_stop_scan(self):
+        from orchestrator.b3_gate import FRESH, check_proposal
+        from orchestrator.stop_instruction import detect_stop_instruction
+
+        assert detect_stop_instruction(self._RATCHET_RED_BLOCK_REASON) == 'do not run'
+
+        result = check_proposal(
+            self._merge_verify_red_entry(self._RATCHET_RED_BLOCK_REASON),
+            worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
+        assert 'stop instruction' not in result['reason']
+
+    def test_do_not_merge_in_proposal_text_still_aborts_beside_captured_output(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+
+        entry = {
+            **self._merge_verify_red_entry(self._RATCHET_RED_BLOCK_REASON),
+            'proposal_text': 'Regenerate the baseline, but do not merge until a human has looked.',
+        }
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'stop instruction' in result['reason']
+        assert "'do not merge'" in result['reason']
+
+    @pytest.mark.parametrize('block_reason', [
+        'Blocked: hold for human sign-off.\n\n## Test Failures\n\n```\nbenign output\n```',
+        '## Test Failures\n\n```\nbenign output\n```\n\nhold for human sign-off',
+    ], ids=['prose-before-fence', 'prose-after-fence'])
+    def test_stop_phrase_in_block_reason_prose_outside_a_fence_still_aborts(self, block_reason):
+        from orchestrator.b3_gate import ABORT, check_proposal
+
+        result = check_proposal(
+            self._merge_verify_red_entry(block_reason),
+            worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'hold for human' in result['reason']
+
+    def test_unterminated_fence_excludes_nothing(self):
+        from orchestrator.b3_gate import ABORT, check_proposal
+
+        truncated = (
+            'Post-merge verification failed\n\n## Test Failures\n\n```\n'
+            'E     a CLEAN merge do not run pre-commit at all'
+        )
+        result = check_proposal(
+            self._merge_verify_red_entry(truncated),
+            worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'do not run' in result['reason']
+
+    @pytest.mark.parametrize('block_reason', [
+        pytest.param(
+            'Blocked.\n\n```\nhold for human sign-off\n```',
+            id='fence-without-a-failure-report-heading',
+        ),
+        pytest.param(
+            'Post-merge verification failed\n\n```\nE  expected:\n```\nE  got\n```'
+            '\n\nhold for human sign-off'
+            '\n\n## Lint Issues\n\n```\nx.py:1:1: E501 line too long\n```',
+            id='unheaded-fences-around-prose',
+        ),
+        pytest.param(
+            'Post-merge verification failed\n\n## Test Failures\n\n```\nE  expected:\n```\nE  got\n```'
+            '\n\nhold for human sign-off'
+            '\n\n## Lint Issues\n\n```\nx.py:1:1: E501 line too long\n```',
+            id='stray-fence-inside-captured-output',
+        ),
+    ])
+    def test_stray_or_unheaded_fences_never_hide_authored_prose(self, block_reason):
+        from orchestrator.b3_gate import ABORT, check_proposal
+
+        result = check_proposal(
+            self._merge_verify_red_entry(block_reason),
+            worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'hold for human' in result['reason']
+
+    @pytest.mark.parametrize('stream', [
+        {'test_output': (
+            'E     a CLEAN merge do not run pre-commit at all\n'
+            'FAILED tests/test_merge_lane_ratchet.py::test_baseline_matches_a_fresh_measurement\n'
+            '1 failed'
+        )},
+        {'lint_output': 'x.py:1:1: E501 do not run this by hand'},
+        {'type_output': 'x.py:1: error: do not run this by hand'},
+    ], ids=['test_output', 'lint_output', 'type_output'])
+    def test_verify_failure_report_streams_are_fenced_and_skipped(self, stream):
+        from orchestrator.b3_gate import FRESH, check_proposal
+        from orchestrator.stop_instruction import detect_stop_instruction
+        from orchestrator.verify import VerifyResult
+
+        streams = {'test_output': '', 'lint_output': '', 'type_output': '', **stream}
+        report = VerifyResult(passed=False, summary='Failures: tests failed', **streams)
+        block_reason = 'Post-merge verification failed: tests failed\n\n' + report.failure_report()
+
+        assert '```' in block_reason
+        assert detect_stop_instruction(block_reason) == 'do not run'
+
+        result = check_proposal(
+            self._merge_verify_red_entry(block_reason),
+            worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
 

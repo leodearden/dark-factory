@@ -55,6 +55,7 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
     NEGATIVE_SET_VERDICT,
 )
 from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND,
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
     STAGE2_CYCLE_SUMMARY_RECON_POOL,
@@ -188,13 +189,9 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # {'flag_for_stage2': True} rather than a {'source': ...} filter,
         # since these markers carry no source metadata field.
         #
-        # That collector is NO LONGER age-based (task 4375). Retirement is now
-        # COMPOSITE: a marker is deleted only when it is past the
-        # _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS age cutoff AND is not a protected
-        # cycle_summary mirror AND its kind is not in
-        # mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is confirmed
-        # terminal. The age-only rule destroyed 40 kind='cadence_check' audit
-        # records in autopilot_video, all citing a merely-'deferred' task.
+        # That collector is NO LONGER age-based: retirement is composite and
+        # gated on terminal-task closure (tasks 4375, 4995); that sweep's
+        # docstring owns the rule.
         #
         # Second firing site (task 4376), a latency layer applying the same
         # rule to the one task that just closed:
@@ -234,8 +231,8 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
     ),
     'stage1_flag_suppression': MarkerLifecycle(
         writer=(
-            'Operators / remediation hooks, via '
-            'flag_dedup.write_suppression_record'
+            'Operators only, via flag_dedup.write_suppression_record (scripted); '
+            'recon stages are refused at add_memory/add_system_record'
         ),
         deleter=DELETER_TTL,
     ),
@@ -389,6 +386,7 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
         'get_cycle_summary_presence(project_id, run_id, stage) -> '
         "{'present': bool, 'ledger_available': bool, 'project_id': ..., "
         "'run_id': ..., 'stage': ..., 'remediation': bool|None, "
+        "'agent_outcome': str|None, "
         "'reason': 'present'|'missing'|'stage_not_run'|'expired'|"
         "'run_unknown'|'ledger_unavailable', 'expected': bool|None, "
         "'run_lookup_available': bool, 'run_status': str|None}"
@@ -424,37 +422,44 @@ def render_marker_lifecycle_section() -> str:
         '(not Stage 3 remediation, not the LLM) deletes them early.\n\n'
         'Every marker write MUST include `metadata.run_id=<current_run_id>`. '
         '`run_id` is minted fresh per run and is never persisted across cycles: '
-        'the Mem0 marker channel is intentionally single-cycle. Any marker whose '
-        'run_id does not match the current cycle — including one left over from '
-        'a prior cycle whose consumer crashed before processing it — is '
-        'unconditionally swept by Python and never reaches the LLM; it is not '
-        'retried. The `flagged_items` structured-output field is the durable '
-        'delivery channel that survives this sweep — the marker is only a '
-        'same-cycle relay.'
+        'the Mem0 marker channel is intentionally single-cycle. One exception '
+        'concerns delivery, not run_id: a `flag_for_stage2` marker relayed by a '
+        'run whose Stage 2 agent did not complete is carried forward to the next '
+        'Stage 2 until a Stage 2 agent completes. Any other marker whose run_id '
+        'does not match the current cycle is swept by Python and never reaches '
+        'the LLM. The `flagged_items` structured-output field is the durable '
+        'delivery channel that survives this sweep; apart from that '
+        'carry-forward, the marker is only a same-cycle relay.'
     )
 
 
 def render_suppression_schema_section() -> str:
-    """Render the canonical suppression-record schema section, faithful to
-    reconciliation/prompts/stage1.py:498-560."""
+    """Render the suppression-record section spliced into the Stage-1 system
+    prompt (reconciliation/prompts/stage1.py::STAGE1_SYSTEM_PROMPT): suppressions
+    are operator-only recon_ledger rows (task 4863)."""
     return (
-        '## Suppression Schema\n'
-        'Canonical suppression record schema (Mem0, observations_and_summaries '
-        "category) — the producer's contract read by the Stage 1 post-processor:\n"
-        '  - `metadata.kind = "stage1_flag_suppression"`\n'
-        '  - `metadata.task_id = <N>` (str)\n'
-        '  - `metadata.flag_types = [<str>, ...]` (OPTIONAL scoping allowlist)\n'
-        '  - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`\n\n'
-        'Scoped vs. legacy/blanket suppression: a record WITH a non-empty '
-        '`metadata.flag_types` is a scoped record that suppresses ONLY those '
-        '(task_id, flag_type) pairs, leaving other flag_types for the same '
-        'task_id free to surface. A record WITHOUT `flag_types` (absent, None, '
-        'or empty — the legacy shape) is a blanket record that suppresses ALL '
-        'flag_types for that task_id. When both a scoped and a legacy/blanket '
-        'record exist for the same task_id, the blanket record wins (union '
-        'semantics) — a blanket suppression cannot be narrowed by a more '
-        'specific scoped record.'
+        '## Suppression Records\n'
+        'A suppression is a `recon_ledger` row with '
+        '`record_kind = "stage1_flag_suppression"`, keyed by `(task_id, flag_type)`; '
+        'a row with `flag_type = ""` is blanket. Operators write these rows '
+        'out-of-band. No reconciliation stage can create one: `add_memory` and '
+        '`add_system_record` refuse that kind from recon-stage agents. A Mem0 record '
+        'of that kind (an operator audit mirror or a legacy record) has no gate '
+        'effect and is not evidence that a flag is suppressed.\n\n'
+        'Scoped vs. blanket suppression: a scoped row suppresses ONLY its '
+        '(task_id, flag_type) pair, leaving other flag_types for the same task_id '
+        'free to surface. A blanket row suppresses ALL flag_types for that task_id. '
+        'When both a scoped and a blanket row exist for the same task_id, the '
+        'blanket row wins (union semantics) — a blanket suppression cannot be '
+        'narrowed by a more specific scoped row.\n\n'
+        'If a finding you consider settled re-derives every cycle, keep emitting it '
+        'and name its task_id, its flag_type and why you consider it settled in your '
+        'cycle report, so an operator can decide whether to suppress it.'
     )
+
+
+#: Heading of the section below; other prompt sections refer to it by this constant.
+ENTITY_STANDING_DECISIONS_HEADING = '## Entity Standing Decisions'
 
 
 def render_entity_standing_decision_schema_section() -> str:
@@ -479,7 +484,7 @@ def render_entity_standing_decision_schema_section() -> str:
       deterministic filter (γ) and reads never consult mem0 for authority.
     """
     return (
-        '## Entity Standing Decisions\n'
+        f'{ENTITY_STANDING_DECISIONS_HEADING}\n'
         f'The `{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record is the SOLE '
         'machine-consulted standing-decision form — the durable record that a prior '
         'investigation adjudicated a recurring class of complaint about an entity and '
@@ -502,6 +507,10 @@ def render_entity_standing_decision_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+INVESTIGATION_OUTCOME_RECORDS_HEADING = '## Investigation Outcome Records'
+
+
 def render_investigation_outcome_section() -> str:
     """Render the STAGE-2-ONLY investigation_outcome section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -518,7 +527,7 @@ def render_investigation_outcome_section() -> str:
     design (PRD decision 8).
     """
     return (
-        '## Investigation Outcome Records\n'
+        f'{INVESTIGATION_OUTCOME_RECORDS_HEADING}\n'
         'When you (Stage 2) conclude an investigation of a flagged entity and '
         'determine it is not actionable, write an '
         f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` mem0 record so the conclusion is durable '
@@ -538,7 +547,7 @@ def render_investigation_outcome_section() -> str:
 
 def render_cycle_summary_section() -> str:
     """Render the per-cycle summary metadata convention, faithful to
-    reconciliation/prompts/stage2.py:236-302, interpolating the
+    reconciliation/prompts/stage2.py::STAGE2_SYSTEM_PROMPT, interpolating the
     stage->recon_pool tags from recon_pool_map (task 2140) so the pool tag
     strings stay single-sourced rather than re-hardcoded.
 
@@ -548,10 +557,9 @@ def render_cycle_summary_section() -> str:
     mirror, producing two cycle_summary Mem0 records per run_id (the
     memory_duplicate finding, run f2bb55b4). The section now tells the
     agent that Python owns that write and it must NOT duplicate it. The
-    metadata convention below is retained because it still documents (a)
-    the shape of Python's deterministic mirror and (b) the distinct,
-    legitimately-surviving LLM-authored reconstruction/self-heal write (see
-    stage2.py's "Re-Verify Reconstruction Writes Before Carry-Forward").
+    metadata convention below is retained because it still documents the
+    shape of Python's deterministic mirror. Task 3734 retired the LLM-authored
+    reconstruction write, and the section now forbids it.
     """
     pool_lines = '\n'.join(
         f"  - stage='{stage}' -> recon_pool='{pool}'"
@@ -565,7 +573,10 @@ def render_cycle_summary_section() -> str:
         'this runs unconditionally every cycle. Do NOT author your own per-cycle '
         'summary `add_memory` write on the normal flow: doing so creates a second '
         "cycle_summary record for the same run_id. Python's mirror is tagged with "
-        "metadata={'kind': 'cycle_summary', 'stage': <stage_name>, "
+        # Task 3202 / INV-5: the kind literal is rendered from the shared
+        # CYCLE_SUMMARY_KIND constant, never re-typed, so a rename in
+        # recon_pool_map reaches this prompt instead of stranding it.
+        f"metadata={{'kind': '{CYCLE_SUMMARY_KIND}', 'stage': <stage_name>, "
         "'run_id': <run_id>, 'recon_pool': <recon_pool>, 'record_type': 'ledger_stamp'}. "
         '<run_id> is the exact run_id from the payload context (the same run_id '
         'embedded in the summary content). <recon_pool> is looked up from the '
@@ -607,16 +618,14 @@ def render_cycle_summary_section() -> str:
         'days. Widening tombstone coverage to the paths above is tracked as '
         'task 4422 — treat this as a point-in-time scope, not a closed '
         'set.\n\n'
-        "The `record_type` metadata key discriminates cycle_summary writers by "
-        "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
-        "code mirror described above; `'narrative'` marks the distinct "
-        'LLM-authored reconstruction/self-heal write (see "Re-Verify '
-        'Reconstruction Writes Before Carry-Forward") that you make when '
-        "repairing a PRIOR run's missing summary — that write is still yours to "
-        'author and is unrelated to the normal-flow write this section '
-        'describes.\n\n'
+        "`record_type='ledger_stamp'` marks Python's deterministic code mirror "
+        "described above, and every cycle_summary Mem0 record is Python's. Never "
+        'author one yourself — neither on the normal flow nor to repair a PRIOR '
+        "run's missing summary: a Mem0 write cannot restore the authoritative "
+        'ledger row, so that case is decided under `## Carry-Forward '
+        'Missing-Summary Findings` instead.\n\n'
         'The summary is deterministically findable by a metadata-keyed lookup — '
-        "count_memories_by_metadata(project_id, {'kind': 'cycle_summary', "
+        f"count_memories_by_metadata(project_id, {{'kind': '{CYCLE_SUMMARY_KIND}', "
         "'run_id': <run_id>, 'stage': <stage_name>}) — which downstream stages "
         'use as a second verification path instead of relying on semantic search '
         'alone. The stage key in this lookup is REQUIRED: both Stage 1 and '
@@ -770,42 +779,17 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
 
 
 def render_task_creation_accounting_section() -> str:
-    """Render the Task-Creation Accounting section (task 3046, run_id
-    507bc25b evidence).
+    """Render the Task-Creation Accounting section (tasks 3046, 4873).
 
-    Stage 2's `tasks_created` increment mandate (`## Verifying Task
-    Operations`, prompts/stage2.py) is stated once, but never declares the
-    counter's SCOPE: whether a task confirmed via a mid-cycle side quest —
-    the Proactive Task Sample, the Done-Task Completion-Memory Audit,
-    Cross-Project Routing, a Source-Completion residual, or a
-    predicate-contradiction gate — counts the same as one confirmed from a
-    Stage 1 flagged item. Run 507bc25b filed task 3045 via the
-    proactive/cross-project sample-review surface yet Stage 2 self-reported
-    `tasks_created: 0` — exactly the gap this section closes, by stating the
-    counter is path-agnostic and by giving the framework an action-record
-    list (`task_created_records`) it can repair from, modeled directly on
-    `flag_deleted_records`' established convention (see
-    `## Per-Cycle Counter Schema` in prompts/stage2.py).
-
-    That list is NOT taken as ground truth (task 3051): it is itself LLM
-    self-report, so the framework corroborates each record via `get_task`
-    against the record's own `project_id` before letting it raise the
-    counter. The closing paragraph says so, because a prompt that overstates
-    the framework's safety net lowers agent care on a counter nothing else
-    checks.
-
-    Rendered once, as a shared renderer (INV-5) — not restated in
-    `assemble_payload`'s "Your Task" block, where the Proactive Task Sample /
-    Cross-Project Routing instructions actually live, to avoid two copies of
-    the same rule drifting apart. Like `render_source_completion_section`,
-    this is new canonical text with no prior prompt precedent, and is
-    written as a plain (non-f) string so its literal `{`/`}` record-shape
-    example needs no brace-doubling when interpolated into the f-string
-    ``STAGE2_SYSTEM_PROMPT``.
+    States that ``tasks_created`` is path-agnostic, splits curator folds into
+    ``tasks_combined``, and gives the framework the ``task_created_records``
+    action list it corroborates alongside the code-side creation journal.
+    A plain (non-f) string, so its literal record-shape braces need no
+    doubling inside the f-string ``STAGE2_SYSTEM_PROMPT``.
     """
     return (
         '## Task-Creation Accounting\n'
-        '`tasks_created` is PATH-AGNOSTIC: it counts EVERY task you confirm '
+        '`tasks_created` is PATH-AGNOSTIC: it counts EVERY task you create '
         'this cycle, regardless of which surface produced the work — a '
         'Stage 1 flagged item, the **Proactive Task Sample**, the '
         '`### Done-Task Completion-Memory Audit`, Cross-Project Routing (a '
@@ -814,6 +798,11 @@ def render_task_creation_accounting_section() -> str:
         'or a predicate-contradiction gate. A creation is never exempt from '
         'the count because it was a mid-cycle side-quest rather than the '
         'finding you started from.\n\n'
+        '`tasks_created` counts ONLY `resolve_ticket` status `created`. Status '
+        '`combined` — the curator dropped, combined or idempotently matched '
+        'the candidate, or it collided with an existing candidate key — mints '
+        'no new task id: count it under `tasks_combined`, never under '
+        '`tasks_created`.\n\n'
         'Confirmation rule: see `## Verifying Task Operations` above for the '
         'full rule, including its `get_task`-verified fallback for a status '
         'other than `created`/`combined`/`failed`. Only the '
@@ -821,25 +810,51 @@ def render_task_creation_accounting_section() -> str:
         'or `combined` WITH a `task_id` — is machine-countable via the '
         'action record below; never record on the `submit_task` call '
         'attempt, and `failed` never counts. A creation you confirm via the '
-        '`get_task` fallback still counts toward your own `tasks_created` '
-        'self-report, but has no `task_created_records` entry of its own — '
-        'so under-reporting it is not auto-repaired the way an omitted '
-        '`created`/`combined` record is.\n\n'
+        '`get_task` fallback still counts toward your own self-report, but '
+        'has no `task_created_records` entry of its own — so under-reporting '
+        'it is not auto-repaired.\n\n'
         'Action record: at the moment of each confirmation, append one '
-        "entry to `stats['task_created_records']`:\n"
+        "entry to `stats['task_created_records']` (status `combined` included):\n"
         '  `{"action": "task_created", "task_id": <id>, '
         '"status": "created"|"combined", "project_id": <project the task '
         'was filed into>, "source_path": <short label of the surface that '
         'produced it>}`\n\n'
-        'The framework CORROBORATES every record before it counts for '
-        'anything: it looks each `task_id` up via `get_task` against the '
-        "root of that record's own `project_id`, and REPAIRS "
-        '`tasks_created` upward to the number of records whose task is '
-        'confirmed to EXIST (recording the pre-repair value under '
-        '`tasks_created_reported`), so a missed increment is recovered '
-        'rather than lost. A record naming a task that cannot be confirmed '
-        'to exist will NOT raise the counter — record only creations you '
-        'actually made, with the `project_id` you actually filed into.'
+        'The framework ALSO journals every curator outcome code-side, against '
+        'the `_causation_id` you put in `submit_task` metadata, so a missed '
+        'record is recovered from the journal — but ONLY when that '
+        '`submit_task` call carried `"_causation_id": <run_id>`. It repairs '
+        '`tasks_created` and `tasks_combined` UPWARD to the journaled outcomes '
+        'plus the records whose task it confirms to EXIST via `get_task` '
+        "against the root of that record's own `project_id` (recording the "
+        'pre-repair value under `tasks_created_reported` / '
+        '`tasks_combined_reported`). A record naming a task that cannot be '
+        'confirmed will NOT raise a counter — record only outcomes you '
+        'actually got, with the `project_id` you actually filed into.'
+    )
+
+
+def render_task_hints_update_accounting_section() -> str:
+    """Render the Task-Hints-Update Accounting section (task 4018).
+
+    Gives ``tasks_hints_updated`` the same action-record ground truth
+    ``tasks_created`` has. A plain (non-f) string, like
+    :func:`render_task_creation_accounting_section`.
+    """
+    return (
+        '## Task-Hints-Update Accounting\n'
+        'After the `get_task` SUPERSET confirmation in `## Verifying Task '
+        'Operations` passes for a `memory_hints` attach, append one entry to '
+        "`stats['task_hints_updated_records']` naming the entries you just "
+        'attached:\n'
+        '  `{"action": "task_hints_updated", "task_id": <id>, '
+        '"project_id": <project the task lives in>, "entities": [...], '
+        '"queries": [...]}`\n\n'
+        'The framework re-reads each recorded task via `get_task` against the '
+        "root of that record's own `project_id` and repairs "
+        '`tasks_hints_updated` UPWARD only for records whose stored '
+        '`memory_hints` really contain every recorded entity and query '
+        '(recording the pre-repair value under `tasks_hints_updated_reported`). '
+        'A record the re-read does not confirm will NOT raise the counter.'
     )
 
 

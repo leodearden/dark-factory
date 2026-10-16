@@ -7,8 +7,12 @@ Lives in ``_xdist_crash_fixtures.py`` (not ``conftest.py``) to follow the
 Each constant transcribes a shape pytest / pytest-xdist actually prints, kept
 as a plain string so a consumer's marker profile stays readable at its
 assertion site. Consumers: test_verify_env_transient.py (the
-``_is_bare_xdist_worker_crash`` routing tests) and test_verify.py (the cause
-hint, leg summary, aggregation and failure report).
+``_is_bare_xdist_worker_crash`` routing tests), test_verify.py (the cause
+hint, leg summary, aggregation and failure report), test_flake_discriminator.py
+(the merge gate's truncated-session refusal, and the main probe still
+re-running a crash-co-occurring failure) and
+test_verify_merge_flake_suppression.py (the merge-gate hook and ledger row for
+that refusal).
 """
 
 # task 2365: bare pytest-xdist worker-crash signature. Grounded in
@@ -184,4 +188,29 @@ XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT = (
     + ' short test summary info '.center(80, '=') + '\n'
     + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
     + ' 1 failed, 73 passed in 5.52s '.center(80, '=') + '\n'
+)
+
+# task 5492: the multi-module join `verify.py::_aggregate_results` performs —
+# each module leg's test_output joined with '\n' — with the TRUNCATED module
+# NOT last. A completed -q module follows it, so the joined text's FINAL
+# progress line reads [100%] and the -q stop-percent witness alone cannot see
+# the truncation above it.
+XDIST_Q_TRUNCATED_THEN_COMPLETED_MODULE_OUTPUT = (
+    XDIST_Q_TRUNCATED_OUTPUT
+    + '\n'
+    + '.' * 72 + ' [ 50%]\n'
+    + '.' * 72 + ' [100%]\n'
+    + '300 passed in 5.00s\n'
+)
+
+# task 5492: the no-worker-death CONTROL. A -q session that ran to [100%] and
+# named one ordinary failure: the shape the merge gate's isolated re-run exists
+# to judge.
+COMPLETE_SESSION_FAILED_NODEID = 'orchestrator/tests/test_config.py::TestFoo::test_baz'
+PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT = (
+    '.' * 72 + ' [ 99%]\n'
+    + 'F.........'.ljust(73) + '[100%]\n'
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'FAILED {COMPLETE_SESSION_FAILED_NODEID}\n'
+    + '1 failed, 21082 passed in 1500.00s\n'
 )

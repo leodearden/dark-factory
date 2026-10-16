@@ -5,6 +5,11 @@ import inspect
 import logging
 from collections.abc import Mapping
 
+from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, FindingSeverity
+from fused_memory.reconciliation.recon_self_model import (
+    ENTITY_STANDING_DECISIONS_HEADING,
+    INVESTIGATION_OUTCOME_RECORDS_HEADING,
+)
 from fused_memory.reconciliation.standing_decision_writer import ARM2_MIN_DISTINCT_RUNS
 from fused_memory.utils.referent_resolution import render_referent_declaration_guidance
 
@@ -95,8 +100,7 @@ destroys entities and edges exclusively sourced from that episode.\
 # SHARED between Stage 1 and Stage 2 because every sentence below is true
 # verbatim in both: the holding map, the two-id contract, and the reasons
 # Stage 3 is denied it are all stage-independent facts. Stage 3 must NOT
-# interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py
-# and by test_recon_report_guidance_drift.py's absence guard.
+# interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py.
 #
 # The block states the TRIGGER, not only the capability, because an
 # advertisement whose trigger is unstated is inert. Measured while writing it:
@@ -193,7 +197,6 @@ REFERENT_DECLARATION_GUIDANCE = render_referent_declaration_guidance()
 # SQLite-ledger write. So this section must be interpolated into stage2.py and
 # NOWHERE else: naming the tool in Stage 1 or Stage 3 licenses a ledger write from a
 # stage that is read-only with respect to the ledger, and is failed by
-# test_recon_report_guidance_drift.py's absence guard as well as
 # test_recon_report_stage_gated_tool_advertisement.py.
 #
 # A RENDERER rather than a plain constant, matching the form of the two sections it
@@ -238,7 +241,8 @@ REFERENT_DECLARATION_GUIDANCE = render_referent_declaration_guidance()
 # MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
 # raises RuntimeError unless that sentinel appears exactly once in
 # STAGE2_SYSTEM_PROMPT. Unlike the two shared blocks above, this one DOES reference
-# sections by heading name, and points at them with "above"; that is safe only because
+# sections by heading name (interpolated from recon_self_model.py's *_HEADING
+# constants), and points at them with "above"; that is safe only because
 # it is single-stage, so both headings are reachable, and both their PRESENCE and their
 # ORDER relative to this section are pinned by
 # test_recon_report_stage_gated_tool_advertisement.py rather than left to trust.
@@ -263,9 +267,10 @@ def render_entity_standing_decision_write_section() -> str:
         '## Writing an Entity Standing Decision\n'
         '`mcp__recon-report__write_entity_standing_decision(project_id=..., '
         'entity_uuid=..., grounds=..., evidence=[...])` is the tool that WRITES the '
-        '`entity_standing_decision` ledger record described under `## Entity Standing '
-        'Decisions` above, and the records you write under `## Investigation Outcome '
-        'Records` are what unlock it. Stage 2 is the ONLY stage that holds it — Stage 1 '
+        '`entity_standing_decision` ledger record described under '
+        f'`{ENTITY_STANDING_DECISIONS_HEADING}` above, and the records you write under '
+        f'`{INVESTIGATION_OUTCOME_RECORDS_HEADING}` are what unlock it. Stage 2 is the '
+        'ONLY stage that holds it — Stage 1 '
         'and Stage 3 are denied it (it is the one recon-report tool with a durable '
         'ledger write, and they are read-only with respect to that ledger). Nothing in '
         'your tool listing distinguishes a tool you lack from one nobody told you about, '
@@ -281,8 +286,8 @@ def render_entity_standing_decision_write_section() -> str:
         'anything you assert). An agent-authored record, or one that does not resolve, '
         'does not count however many you cite.\n'
         '- **Arm 2 — independent investigation outcomes.** Satisfied by the record pool '
-        'described under `## Investigation Outcome Records` above, with no `evidence` '
-        'cited at all: `investigation_outcome` records for this same `entity_uuid`, '
+        f'described under `{INVESTIGATION_OUTCOME_RECORDS_HEADING}` above, with no '
+        '`evidence` cited at all: `investigation_outcome` records for this same `entity_uuid`, '
         'marked `actionable=false`, spanning at least '
         f'{ARM2_MIN_DISTINCT_RUNS} DISTINCT `run_id`s. A record carrying no `run_id` '
         'cannot establish independence and is not counted. Distinct RUNS are the point '
@@ -292,9 +297,9 @@ def render_entity_standing_decision_write_section() -> str:
         'cited: do NOT fabricate an evidence list to reach that path. Refs to other '
         'stores (escalation ids, task ids) are recorded as provenance but never count '
         'toward EITHER arm.\n\n'
-        '`grounds` must be a value from the closed enum named under `## Entity Standing '
-        'Decisions` above — that section is where the enum is stated; do not invent a '
-        'value.\n\n'
+        '`grounds` must be a value from the closed enum named under '
+        f'`{ENTITY_STANDING_DECISIONS_HEADING}` above — that section is where the enum '
+        'is stated; do not invent a value.\n\n'
         "**Responses.** On success: `{status: 'written', entity_uuid, grounds, "
         'edge_count_at_decision, expires_at, decided_at}`. Three structured errors, each '
         'keyed by `error`: `insufficient_evidence` when NEITHER arm holds — it carries '
@@ -318,9 +323,11 @@ def render_entity_standing_decision_write_section() -> str:
 # face value. Shared between Stage 1 and Stage 2 because both hold every tool
 # named below (neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds
 # DISALLOW_MEMORY_WRITES) and every sentence is true verbatim in both stages.
-# That precondition is what lets clause (d) name `consolidate_memories`
-# (task 3134): the op sits behind DISALLOW_MEMORY_WRITES, which neither stage
-# folds, so both stages hold it.
+# That precondition does NOT cover a consolidation op (task 5239, PRD D12):
+# neither stage holds consolidate_memories (code's and the curator sitting's op),
+# and only Stage 1 holds propose_consolidation, which its own proposal section
+# teaches — so clause (d) names neither. Pinned by
+# tests/test_stage1_consolidation_guidance.py::TestTheSharedNorm::test_the_shared_norm_names_no_tool_either_stage_is_denied.
 # Placed in the prompt rather than CLAUDE.md because the recon stages are the
 # only consumer of raw episode prose.
 #
@@ -332,11 +339,9 @@ def render_entity_standing_decision_write_section() -> str:
 # none. MUST NOT reference "## UUID Resolution Discipline" by heading name —
 # stage2.py has no such section; refer to `replacement_memory_id` by
 # parameter name instead, a tool-level fact true in both stages. For the same
-# reason MUST NOT reference "## Executing a Cluster Fold" by heading name
-# (task 3134): that section is stage1.py-only, so clause (d) names the op by
-# tool name and the stage-1 section cross-references the op, never the
-# reverse. These four MUST-NOTs are pinned in
-# tests/test_stage1_consolidation_guidance.py::TestSharedNormNamesTheSanctionedPath.
+# reason MUST NOT reference "## Proposing a Cluster Consolidation" by heading
+# name: that section is stage1.py-only. These four MUST-NOTs are pinned in
+# tests/test_stage1_consolidation_guidance.py::TestTheSharedNorm.
 # Not an
 # f-string: it is interpolated INTO f-strings, and braces inside an
 # interpolated value are not re-parsed by the enclosing f-string, so its own
@@ -372,17 +377,13 @@ for what `cascade=True` destroys. Use this only when (a) and (b) cannot resolve 
 problem. A `redact_episode_content` REFUSAL is not such a case: `redact_episode_content` \
 exists precisely to avoid the cascade, so a rejected redaction means fix the \
 `new_content` and retry (b), never escalate to (c).
-(d) **Mem0 cluster consolidation**: to fold a MULTI-record duplicate cluster, call \
-`mcp__fused-memory__consolidate_memories`. It writes the canonical BEFORE any delete, \
-repoints task-metadata citations onto it, tags the retained peers in place (preserving \
-their point ids) and corroborates closure by a deterministic re-read — none of which the \
-hand-rolled sequence guarantees, which is why that sequence nets +1 entry per failed pass. \
-The amend-in-place-then-delete sequence remains right for exactly two cases: (i) \
-superseding a SINGLE record, where `mcp__fused-memory__update_memory` preserves the \
-survivor's id — see the tool listing above for why that matters — and (ii) hand-finishing \
-a `partial` consolidation. In both, amend the SURVIVOR in place FIRST and only THEN delete \
-the redundant entries, naming the survivor via `replacement_memory_id`. Never delete and \
-re-add the survivor.
+(d) **Mem0 duplicate clusters**: a MULTI-record duplicate cluster is consolidated by \
+code, never folded by hand — a hand-rolled write-then-delete sequence nets +1 entry per \
+failed pass. The amend-in-place-then-delete sequence is right only for superseding a \
+SINGLE record: amend the SURVIVOR in place FIRST with `mcp__fused-memory__update_memory`, \
+which preserves its id — see the tool listing above for why that matters — and only \
+THEN delete the redundant entry, naming the survivor via `replacement_memory_id`. Never \
+delete and re-add the survivor.
 
 **Episode prose is a point-in-time narration, not current truth.** An episode's content \
 may assert work as complete that is still in progress by the time you read it. Before \
@@ -402,7 +403,9 @@ value.\
 # rather than pasted: only Stage 2 holds the FIX D escalate_blocker path.
 #
 # The companion mechanism is DISALLOW_ESCALATION_READS in cli_stage_runner.py,
-# which denies the escalation READ tools in every stage. This paragraph is not
+# which denies the escalation READ tools in every stage, with its write-side
+# counterpart DISALLOW_ESCALATION_WRITES denying the filing tools to Stage 1 and
+# Stage 3 (the stages handed the no-action clause below). This paragraph is not
 # decorative: `--disallowed-tools` OMITS a denied tool from the agent's listing
 # rather than rejecting the call, so without it the agent gets no explanation
 # for the missing tool and can conclude the escalation surface does not exist.
@@ -561,6 +564,16 @@ FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
 FLAGGED_ITEM_FINDING_ID_FIELD = 'finding_id'
 FLAGGED_ITEM_CITED_MEMORIES_FIELD = 'cited_memories'
 
+# Declared `kind` of the two recon marker records whose only writer is a stage
+# prompt: the Stage 1 `flag_for_stage2` marker and the Stage 2 `stage2_suppress`
+# guard. A declared kind keeps the marker out of write triage
+# (server/write_triage.py::declares_attach_keys), so it is never filed as a
+# child of another memory. KIND_REGISTRY membership is pinned by
+# tests/test_recon_marker_kind_prompt_guidance.py. Source: PRD
+# plans/write-triage-flip-readiness-prd.md §11 χ.
+FLAG_FOR_STAGE2_MARKER_KIND = 'flag_for_stage2'
+STAGE2_SUPPRESS_GUARD_KIND = 'stage2_suppress_guard'
+
 # The negative half of the vocabulary rule, single-sourced per INV-5
 # `no-lockstep-duplication` for the same reason DUPLICATE_FINDING_SALVAGE_GUIDANCE
 # above is: it was briefly written twice — once in the shared recon-report block
@@ -607,14 +620,13 @@ def render_escalation_boundary_note(*, can_escalate: bool) -> str:
     Stage 3 have no FIX D path and no other sanctioned escalation write, so
     they get the no-action variant.
 
-    This matters beyond tidiness: ``escalate_blocker`` is deliberately NOT in
-    any disallow list (see DISALLOW_ESCALATION_READS in cli_stage_runner.py,
-    which denies only the READ tools), so the tool really is callable from every
-    stage. Naming it in a stage's prompt is therefore a live positive license,
-    not inert prose — and Stage 3 declares itself read-only two lines earlier.
-    Never tell a stage about an action it is not sanctioned to take
-    (loud-over-silent), and never license a durable write from a read-only
-    stage.
+    The mechanism agrees (task 3250): ``escalate_blocker`` is denied to Stage 1
+    and Stage 3 by ``cli_stage_runner.py::DISALLOW_ESCALATION_WRITES`` and is
+    callable only in Stage 2. Because ``--disallowed-tools`` OMITS a denied tool
+    rather than rejecting the call, the no-action clause is the only explanation
+    a Stage 1/3 agent gets for the missing tool. Never tell a stage about an
+    action it is not sanctioned to take (loud-over-silent), and never license a
+    durable write from a read-only stage.
 
     Args:
         can_escalate: True for Stage 2, which holds the FIX D escalate_blocker
@@ -806,7 +818,7 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 _RECON_REPORT_PLACEHOLDERS = {
     'run_id': '<from Reconciliation Context>',
     'finding_id': '<finding_id from add_finding response>',
-    'severity': '<severity>',
+    'severity': '<' + '|'.join(repr(v) for v in FINDING_SEVERITY_VALUES) + '>',
     'category': '<category>',
     'description': '<description>',
     'suggested_action': '<suggested_action>',
@@ -825,6 +837,12 @@ _RECON_REPORT_PLACEHOLDERS = {
     'store': "<'mem0'|'graphiti'>",
     'cited_run_id': '<full 36-char run UUID>',
 }
+
+
+def render_finding_severity_vocabulary() -> str:
+    """Render the finding severity vocabulary, glossed, in ascending order."""
+    items = [f'`{s}` ({s.gloss})' for s in FindingSeverity]
+    return f'{", ".join(items[:-1])}, or {items[-1]}'
 
 
 

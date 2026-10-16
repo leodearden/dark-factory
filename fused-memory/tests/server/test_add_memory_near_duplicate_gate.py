@@ -47,6 +47,7 @@ from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.topic_cluster_store import TopicClusterStore, derive_topic_cluster
 from fused_memory.services.memory_service import RRF_K
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 
 _PROJECT_ID = 'dark_factory'
 _CONTENT = 'canonical .task gitignore gotcha'
@@ -1465,3 +1466,73 @@ class TestRuntimeSeededClusterBlocksAProbeWrite:
 
         assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', result
         mock_service.add_memory.assert_awaited_once()
+
+
+_LONG_PADDING = ' The surrounding narrative restates the cycle context at length.' * 6
+_LONG_SNAPSHOT_CONTENT = (
+    'As of 2026-05-28, project reify has 2 pending / 2 in-progress / '
+    '0 blocked / 1 deferred / 1505 done / 148 cancelled tasks.' + _LONG_PADDING
+)
+
+
+class TestAddMemoryGuardBlocksDiscloseTheirExcerptClip:
+    """Every add_memory soft-block discloses a cut excerpt the same way (task 5365).
+
+    ``near_duplicate_guard`` owns the excerpt shape every pre-service guard
+    spreads, so this pins it at the tool boundary for the near-duplicate gate
+    and for one recon-stage gate in ``server/tools.py``: the excerpt stays
+    ``content[:200]``, and a ``truncation_facts`` list says what was cut.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_near_duplicate_rejection_reports_both_cut_excerpts(self):
+        content = _CONTENT + _LONG_PADDING
+        matched = _near_duplicate_result(content='existing entry.' + _LONG_PADDING)
+        mock_service = AsyncMock()
+        mock_service.search.return_value = [matched]
+        server = create_mcp_server(mock_service)
+
+        result = await _add(server, content)
+
+        assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', result
+        assert result['content_excerpt'] == content[:200], result
+        assert result['matched_excerpt'] == matched.content[:200], result
+        assert result[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': len(content) - 200},
+            {'field': 'matched_excerpt', 'cap': 200, 'elided': len(matched.content) - 200},
+        ], result
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_recon_stage_rejection_reports_its_cut_excerpt(self):
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await _add(
+            server,
+            _LONG_SNAPSHOT_CONTENT,
+            category='temporal_facts',
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        assert result.get('error') == 'count_snapshot_write_blocked', result
+        assert result['content_excerpt'] == _LONG_SNAPSHOT_CONTENT[:200], result
+        assert result[TRUNCATION_FACTS_KEY] == [
+            {
+                'field': 'content_excerpt',
+                'cap': 200,
+                'elided': len(_LONG_SNAPSHOT_CONTENT) - 200,
+            },
+        ], result
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_uncut_rejection_carries_no_truncation_facts(self):
+        mock_service = AsyncMock()
+        mock_service.search.return_value = [_near_duplicate_result()]
+        server = create_mcp_server(mock_service)
+
+        result = await _add(server, _CONTENT)
+
+        assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', result
+        assert TRUNCATION_FACTS_KEY not in result, result

@@ -18,14 +18,18 @@ The verify bundle spawns every build/test command with
 ``start_new_session=True`` (``verify.py`` ``_run_cmd``), making each command
 the leader of its own session and process group — it **escapes** the
 ``verify-merge`` process group.  A plain ``killpg(recorded_group)`` therefore
-strands those zombie builds.  :func:`cancel_request` fixes this by:
+strands those zombie builds.  :func:`kill_process_tree` is the algorithm that
+fixes this:
 
 * Snapshotting the full ``/proc`` PPID map *before* sending any signals
   (killing the root reparents survivors to init, losing tree linkage).
-* Walking the descendant tree of the recorded pgid to collect every
+* Walking the descendant tree of the root to collect every
   ``start_new_session`` escape.
-* ``SIGKILL``-ing every collected descendant **and** firing a
-  ``killpg(pgid, SIGKILL)`` backstop for any same-group stragglers.
+* ``SIGKILL``-ing every collected descendant and the root, then firing an
+  optional ``killpg(..., SIGKILL)`` backstop for any same-group stragglers.
+
+:func:`cancel_request` is its pgid-file caller: it roots the walk, and aims
+the backstop, at the recorded pgid.
 
 pgid-file directory
 -------------------
@@ -71,11 +75,14 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
+
+from shared.proc_group import read_stat_fields
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -179,34 +186,22 @@ def start_own_process_group() -> int:
 
 
 def read_ppid_map() -> dict[int, int]:
-    """Parse ``/proc/*/stat`` and return ``{pid: ppid}`` for every live process.
+    """Return ``{pid: ppid}`` for every live process on the host.
 
-    The ``comm`` field (field 2) may contain spaces and parentheses, so we
-    parse by finding the *last* ``') '`` separator (``rsplit``) rather than
-    splitting on whitespace naïvely.  Vanished or unreadable entries are
-    silently skipped (the process exited between the ``glob`` and the
-    ``read``).
+    This walk covers every process on the host, so no single foreign
+    process may fail it: comm is arbitrary BYTES (``prctl(PR_SET_NAME)``
+    accepts any, and the 15-byte truncation can split a UTF-8 sequence).
+    ``shared/src/shared/proc_group.py::read_stat_fields`` is the single
+    parser of that layout; an entry that vanished or is malformed is skipped.
     """
     ppid_map: dict[int, int] = {}
-    proc = Path('/proc')
-    for entry in proc.iterdir():
+    for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
-        stat_path = entry / 'stat'
-        try:
-            raw = stat_path.read_text()
-        except OSError:
+        fields = read_stat_fields(entry)
+        if fields is None:
             continue
-        # Format: "pid (comm) state ppid ..."
-        # rsplit on ') ' to skip over the comm field safely.
-        try:
-            right = raw.rsplit(') ', 1)[1]
-            fields = right.split()
-            pid = int(entry.name)
-            ppid = int(fields[1])  # field index after stripping pid+comm+state
-            ppid_map[pid] = ppid
-        except (IndexError, ValueError):
-            continue
+        ppid_map[int(entry.name)] = fields.ppid
     return ppid_map
 
 
@@ -242,6 +237,54 @@ def collect_descendants(root: int, ppid_map: dict[int, int]) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
+def kill_process_tree(
+    root_pid: int,
+    *,
+    backstop_pgid: int | None,
+    ppid_map_provider: Callable[[], dict[int, int]] = read_ppid_map,
+    kill: Callable[[int, int], None] = os.kill,
+    killpg: Callable[[int, int], None] = os.killpg,
+) -> frozenset[int]:
+    """SIGKILL *root_pid* and every transitive descendant; return the pids that refused.
+
+    The full ``/proc`` PPID map is snapshotted BEFORE any signal: killing the
+    root reparents its survivors to init and severs the parent chain the walk
+    follows.  The walk (:func:`collect_descendants`) is what reaches
+    ``start_new_session`` escapes, which lead their own groups and so are
+    invisible to any ``killpg``.  Every descendant is SIGKILLed, then the
+    root, then -- only when *backstop_pgid* is not None -- one
+    ``killpg(backstop_pgid, SIGKILL)`` catches same-group stragglers the
+    snapshot missed.
+
+    ``ProcessLookupError`` is success (already dead).  ``PermissionError``
+    means live and unkillable: the sweep carries on and those pids are
+    returned.  Every ``killpg`` error is suppressed (the group may be gone).
+
+    Caller contract:
+
+    * *root_pid* is TRUSTED to still name the tree and is never validated
+      here, so a caller that may hold a reaped -- free, recyclable -- pid
+      must not call this.
+    * *backstop_pgid* is the caller's group-safety policy and is required so
+      every call site states it; never pass a group the caller belongs to.
+    * This never reaps.  A caller that reaps the root does so after this
+      returns, so the backstop fired while the root's pid was still pinned.
+    """
+    ppid_map = ppid_map_provider()
+    refused: set[int] = set()
+    for pid in [*collect_descendants(root_pid, ppid_map), root_pid]:
+        try:
+            kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            refused.add(pid)
+    if backstop_pgid is not None:
+        with contextlib.suppress(OSError):
+            killpg(backstop_pgid, signal.SIGKILL)
+    return frozenset(refused)
+
+
 def cancel_request(
     path: Path,
     *,
@@ -262,26 +305,13 @@ def cancel_request(
        * Parsed value ≤ 0 → nonsensical pgid (0 kills the caller's group;
          negatives are invalid); treat as corrupt, remove, return 0.
 
-    2. **Snapshot first**: call *ppid_map_provider* to get the full ``/proc``
-       PPID map *before* sending any signal.  Killing the root reparents
-       survivors to init and severs the tree linkage — the snapshot must
-       precede all kills.
+    2. :func:`kill_process_tree` the tree rooted at *pgid*, with *pgid* as
+       its ``killpg`` backstop (``setsid`` made the root its own group
+       leader).  Pids that refused with ``PermissionError`` are appended to
+       *failed_pids_out* (if provided) so the caller can emit an actionable
+       diagnostic.
 
-    3. ``collect_descendants(pgid, ppid_map)`` to find every
-       ``start_new_session`` escape (they remain descendants even after
-       escaping the process group).
-
-    4. ``SIGKILL`` every target (descendants ∪ {pgid}):
-
-       * ``ProcessLookupError`` → already dead, counts as success.
-       * ``PermissionError`` → live process we cannot kill; record failure
-         and append the pid to *failed_pids_out* (if provided) so the
-         caller can emit an actionable diagnostic.
-
-    5. ``killpg(pgid, SIGKILL)`` backstop — suppresses ``OSError`` /
-       ``ProcessLookupError`` (group may already be gone).
-
-    6. If any live process could not be killed → return 1 and **retain** the
+    3. If any live process could not be killed → return 1 and **retain** the
        pgid file (lets a retry or β's quarantine probe act on it).
        Otherwise remove the file, report *pgid* on *killed_pgid_out*, and
        return 0.
@@ -395,35 +425,16 @@ def cancel_request(
     # the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate it before
     # trusting the value, plus a GC for the leaked per-request files.
 
-    # Step 2: snapshot PPID map BEFORE any kills (invariant: snapshot precedes kill).
-    # Killing the root reparents its survivors to init, severing the /proc parent
-    # chain — the snapshot MUST capture the full tree first.
-    ppid_map = ppid_map_provider()
-
-    # Step 3: collect every descendant (start_new_session escapes included).
-    # collect_descendants excludes root, so we union in {pgid} to kill it explicitly —
-    # without this, the root would only be hit by the killpg backstop (step 5).
-    descendants = collect_descendants(pgid, ppid_map)
-    targets = descendants | {pgid}  # root always explicit in the kill set
-
-    # Step 4: SIGKILL every target
-    failed = False
-    for pid in targets:
-        try:
-            kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass  # already dead — success
-        except PermissionError:
-            failed = True  # live but unkillable
-            if failed_pids_out is not None:
-                failed_pids_out.append(pid)
-
-    # Step 5: killpg backstop (suppresses errors — group may already be gone)
-    with contextlib.suppress(ProcessLookupError, OSError):
-        killpg(pgid, signal.SIGKILL)
-
-    # Step 6: decide outcome
-    if failed:
+    refused = kill_process_tree(
+        pgid,
+        backstop_pgid=pgid,
+        ppid_map_provider=ppid_map_provider,
+        kill=kill,
+        killpg=killpg,
+    )
+    if refused:
+        if failed_pids_out is not None:
+            failed_pids_out.extend(sorted(refused))
         # Retain the file so a retry can act on it.  Report NOTHING: a live
         # process refused SIGKILL, so it plausibly still holds whatever the
         # caller was about to declare free.
@@ -1172,11 +1183,10 @@ def fire_watchdog_kill(
     *,
     trigger: WatchdogTrigger,
     grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
-    ppid_map_provider=read_ppid_map,
-    kill=os.kill,
-    killpg=os.killpg,
-    sleep=time.sleep,
-    exit_fn=os._exit,
+    ppid_map_provider: Callable[[], dict[int, int]] = read_ppid_map,
+    kill: Callable[[int, int], None] = os.kill,
+    sleep: Callable[[float], None] = time.sleep,
+    exit_fn: Callable[[int], None] = os._exit,
     exit_code: int = 1,
     stderr=None,
 ) -> None:
@@ -1184,25 +1194,27 @@ def fire_watchdog_kill(
 
     Invoked by the stdin watchdog (:func:`run_stdin_watchdog` via
     :func:`start_stdin_watchdog`) when the dispatch connection is judged dead.
-    Mirrors :func:`cancel_request`'s snapshot -> /proc descendant walk ->
-    signal approach (the same ``start_new_session`` escape problem applies:
-    ``verify.py`` ``_run_cmd`` spawns every build command with
-    ``start_new_session=True``, so cargo/rustc leave the verify-merge process
-    group and a bare ``killpg(pgid)`` would strand them), with two
-    differences required because *this* code runs **inside** the target
-    process group rather than as a separate process:
+    Shares :func:`kill_process_tree`'s snapshot -> /proc descendant walk
+    (the same ``start_new_session`` escape problem applies: ``verify.py``
+    ``_run_cmd`` spawns every build command with ``start_new_session=True``,
+    so cargo/rustc leave the verify-merge process group and a bare
+    ``killpg(pgid)`` would strand them) but does NOT delegate to it, because
+    *this* code runs **inside** the target process group rather than as a
+    separate process:
 
-    * It signals only **descendants** of *pgid* (``collect_descendants``
-      already excludes the root) -- never *pgid* itself / the calling
-      process.  A ``killpg(pgid, ...)`` here would signal the watchdog's own
-      process before it could finish the SIGTERM -> grace -> SIGKILL
-      escalation or reach a controlled exit, so *killpg* is accepted for
-      signature symmetry with :func:`cancel_request` but is intentionally
-      never called.
+    * It needs a SIGTERM -> grace -> SIGKILL escalation;
+      :func:`kill_process_tree` is SIGKILL-only.
+    * It must never signal its own group or the calling process: it signals
+      only **descendants** of *pgid* (``collect_descendants`` already
+      excludes the root), with no ``killpg`` -- not even as a fallback when
+      the descendant walk fails -- whereas :func:`kill_process_tree` always
+      SIGKILLs its root.  Either would kill the watchdog before it could
+      finish the escalation or reach a controlled exit.
     * It ends by unconditionally calling ``exit_fn(exit_code)`` -- a
       controlled non-zero self-exit -- rather than returning, so the
       abandoned verify-merge leader always terminates (freeing its flock and
-      letting sshd reap it) even if some descendant could not be killed.
+      letting sshd reap it) even if some descendant could not be killed, and
+      even if the kill phase itself failed.
 
     *trigger* names the :func:`run_stdin_watchdog` branch that judged the
     channel dead.  It is REPORTED, never acted on -- the kill sequence is
@@ -1213,37 +1225,61 @@ def fire_watchdog_kill(
     no structured return path left, and on a remote verify this stderr is the
     only thing the dispatcher still sees.
 
-    Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
-    (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
-    a permission race is fine, this is a best-effort escalation), sleep
-    *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
-    (same suppression), report the trigger on stderr, then
-    ``exit_fn(exit_code)`` as the final action.
+    Sequence: the kill phase (:func:`_signal_descendants`), then report the
+    trigger on stderr, then ``exit_fn(exit_code)`` as the final action.  A
+    failure anywhere in the kill phase (e.g. a raising ``/proc`` snapshot)
+    has its traceback written to stderr and still ends in the trigger line
+    and ``exit_fn``.
     """
-    ppid_map = ppid_map_provider()
-    descendants = collect_descendants(pgid, ppid_map)
-    for pid in descendants:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            kill(pid, signal.SIGTERM)
-
-    sleep(grace_secs)
-
-    ppid_map = ppid_map_provider()
-    survivors = collect_descendants(pgid, ppid_map)
-    for pid in survivors:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            kill(pid, signal.SIGKILL)
+    stream = stderr if stderr is not None else sys.stderr
+    try:
+        _signal_descendants(
+            pgid,
+            grace_secs=grace_secs,
+            ppid_map_provider=ppid_map_provider,
+            kill=kill,
+            sleep=sleep,
+        )
+    except Exception:
+        # Report here: os._exit would discard a propagating exception
+        # unprinted, and the thread excepthook would never run.
+        with contextlib.suppress(Exception):
+            traceback.print_exc(file=stream)
 
     # Flush explicitly: exit_fn is os._exit, which skips stdio flushing, so a
     # buffered line would be dropped.  Suppress everything: a failed
     # diagnostic (broken pipe on a dead ssh channel) must never prevent the
     # self-exit that frees the flock and lets sshd reap the leader.
-    stream = stderr if stderr is not None else sys.stderr
     with contextlib.suppress(Exception):
         stream.write(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n')
         stream.flush()
 
     exit_fn(exit_code)
+
+
+def _signal_descendants(
+    pgid: int,
+    *,
+    grace_secs: float,
+    ppid_map_provider: Callable[[], dict[int, int]],
+    kill: Callable[[int, int], None],
+    sleep: Callable[[float], None],
+) -> None:
+    """SIGTERM every descendant of *pgid*, sleep *grace_secs*, SIGKILL the survivors.
+
+    Each pass takes a fresh ``/proc`` PPID snapshot.  ``ProcessLookupError``
+    and ``PermissionError`` are suppressed per signal: an already-dead target
+    or a permission race is fine, since this is a best-effort escalation.
+    """
+    for pid in collect_descendants(pgid, ppid_map_provider()):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGTERM)
+
+    sleep(grace_secs)
+
+    for pid in collect_descendants(pgid, ppid_map_provider()):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGKILL)
 
 
 def start_stdin_watchdog(

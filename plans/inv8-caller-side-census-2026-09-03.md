@@ -29,6 +29,8 @@ Measured at HEAD `6696f1ce0c`: **167 files scanned, 60 findings.**
 Re-measured over the same 167 files after task 4484's review-amendment
 pass: **62 findings** — one withdrawn as a scanner false positive (§4a),
 three added by widening the vocabulary to `shutil.rmtree` (§4a).
+Task 5099 re-measured at HEAD `b4e1349e1c` when it widened the vocabulary to
+the directory-walk/metadata calls: **190 files, 55 → 91 findings** (§4c).
 
 ---
 
@@ -173,10 +175,8 @@ by a fourth batch. Also added at **zero** new rows: the builtin `open`,
 
 **Deliberately still absent.** The directory-walk and metadata methods, with
 the measured counts that decided it: `mkdir` +18, `exists` +15, `open` as a
-method +7, `unlink` +5, `stat` +4, `iterdir` +4, `glob` +2. ~55 rows, each
-needing a hand-written disposition or the ledger becomes a page of "existing"
-waivers. Filed as its own triage task rather than smuggled into an amendment
-pass.
+method +7, `unlink` +5, `stat` +4, `iterdir` +4, `glob` +2. Done by task
+5099; see §4c.
 
 **The network limb is nominal, and now says so.** No sync HTTP client is
 imported anywhere under `fused-memory/src` (no `requests`, no `httpx`, no
@@ -206,6 +206,64 @@ facts that change a reading of §4 and §6:
 - **One site landed after the census**:
   `_run_remediation_pass -> _file_finding_task_escalation` (task 4821), filed
   to 5270 beside `_escalate`, whose offload it shares.
+
+## 4c. Task 5099: the directory-walk/metadata widening
+
+Measured at HEAD `b4e1349e1c`: **190 files scanned, 55 → 91 findings, +36
+rows, 0 stale.** The rows are in the ledger; this section carries the
+cluster-level triage only.
+
+**Marginal counts.** Each of the seven names the task named, added alone:
+`mkdir` +17, `exists` +15, `open` +8, `unlink` +5, `stat` +4, `iterdir` +4,
+`glob` +2. Together they add **+33**, not the ~55 §4a summed. Per-name counts
+overlap, because one call site reaching two names is one row, and the tree
+drifted between the two measurements. Added alongside them, so the obvious
+bypass spellings do not stay open: `rmdir`, `touch`, `rename`, `rglob` and the
+receiver-pinned `os.makedirs`, `os.mkdir`, `os.rmdir`, `os.remove`,
+`os.unlink`, `os.rename`, `os.stat`, `os.scandir`, `os.path.exists`,
+`os.path.isfile` and `glob.glob` (+0 each), plus `is_file`, `is_dir`,
+`os.replace` and `os.path.isdir` (+1 each on top of everything else).
+
+**One scanner false positive, removed by rule.** Adding `open` flagged
+`server/main.py::_setup_curator_usage_gate`'s `await curator_cost_store.open()`,
+which is `shared.cost_store.CostStore`'s async open. A sync pathlib method
+never returns an awaitable, so a METHOD match that `await`, `async with` or
+`async for` consumes is now skipped
+(`shared/tests/loop_blocking_scan.py::_is_consumed_asynchronously`). The rule
+also keeps the canonical INV-8 fix (`aiofiles`, `anyio.Path`) from being
+flagged. It was a no-op on the tree before the widening; after it, 33 − 1 + 4
+= 36.
+
+**Per-call cost**, measured for the accepted rows (CPython 3.13.9, 20000-call
+timeit, existing dir on local ext4): `mkdir(parents=True, exist_ok=True)`
+6–11 µs; `exists`, `stat` and `is_dir` 3–4 µs.
+
+| root cause | rows | disposition | owner / reason |
+|---|---|---|---|
+| idempotent `mkdir` of a store's data dir as it opens | 11 | accepted | once per store lifetime, or once per MCP call ahead of an awaited `connect_daemon` |
+| fixed-count existence / type guards | 9 | accepted | count set by the code, not the disk; 3–4 µs each |
+| `_missing_files`, one `exists()` per `metadata.files` entry | 2 | accepted | bounded by an authored list |
+| `_append_combine_audit`, one-line append per curator COMBINE | 2 | accepted | follows an LLM decision of seconds |
+| `SeedManager.seed` | 1 | accepted | one-shot maintenance CLI, no server loop |
+| `run_server` → `TopicClusterStore.open()` | 1 | accepted | startup only, before bind |
+| `EventQueue._write_dead_letter`, inline append + rotation | 4 | filed | task 6085: `overflow_drop` fires exactly when the loop is saturated |
+| `BacklogPolicy.on_judge_unhalt` `is_dir` + O(N) `glob` | 2 | filed | task 6086, to fold into 5270 |
+| `manifest_stamping` `is_file` / `os.replace` / `unlink` | 3 | filed | task 6087, to fold into 5276 |
+| `CodebaseVerifier.verify.glob_search`, LLM-chosen pattern | 1 | filed | task 6088, to fold into 5270 |
+
+**Three touched clusters flipped to `filed`.** Their tickets had resolved and
+been coalesced: `backlog_policy` (5075) and `verify.py` `read_file` (5078)
+into task 5270, and `manifest_stamping` (5073) into task 5276. Each now holds
+its justification in one named constant. The extension rows point at their own
+tasks (6086–6088), not at 5270 or 5276, so a landed 5270 or 5276 cannot leave
+a row pointing at a done task that never touched its site.
+
+**Still absent.** `replace`, `remove` and `walk` stay out of the method table
+for good. By attribute name alone they are `str.replace`, `list.remove` and
+`ast.walk`, and every string edit would become a merge-blocking row. Their
+`os.*` spellings are matched as receiver-pinned dotted paths instead. `resolve`
+(`Path.resolve`, +12 rows measured on top of this table) and
+`os.path.realpath` are the next widening, owned by task 6089.
 
 ## 5. Headline finding: four same-shape sites in one file, two of them unfiled
 
@@ -269,7 +327,7 @@ rows on purpose — it is work on the gate, not a blessing for a site.
 | `targeted.py::_sweep_cancelled_descendants` → `is_orchestrator_live_for` | 1 | `tkt_0RT7RKWJG17W03JRC947R8FZZN` |
 | `verify.py::CodebaseVerifier.verify.read_file` — LLM-driven call count | 1 | `tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ` |
 | `harness.py` — `gc_run_config_dir` rmtree on the loop thread (amendment pass) | 3 | `tkt_0RT88VW7RRECTHNCVTJXD6M5RJ` |
-| gate vocabulary — triage the ~55 directory-walk/metadata method sites (amendment pass) | 0 | `tkt_0RT88WDRDHSY547N0TA1DPKZ4Z` |
+| gate vocabulary — triage the ~55 directory-walk/metadata method sites (amendment pass) | 0 | `tkt_0RT88WDRDHSY547N0TA1DPKZ4Z` → task 5099 (§4c) |
 
 Two were filed at `medium` rather than `low`.  The `server/tools.py`
 claim-verification pair, because it is the direct counter-example to task

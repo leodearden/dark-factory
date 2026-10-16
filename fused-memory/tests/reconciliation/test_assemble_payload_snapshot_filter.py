@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _clip_assertions import assert_elided
 
-from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     ContextItem,
@@ -15,37 +15,8 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-
-
-def _scope(project_id: str, project_root: str) -> ProjectScope:
-    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
-    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
-
-
-def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
-    """Build a MemoryConsolidator with mocked deps — mirrors test_stage1.py."""
-    config = ReconciliationConfig()
-    memory_mock = AsyncMock()
-    memory_mock.get_episodes = AsyncMock(return_value=[])
-    memory_mock.mem0 = AsyncMock()
-    memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
-    memory_mock.get_status = AsyncMock(return_value={})
-
-    stage = MemoryConsolidator(
-        StageId.memory_consolidator,
-        memory_mock,
-        AsyncMock(),  # taskmaster
-        AsyncMock(),  # journal
-        config,
-        scope=_scope('test_project', project_root),
-    )
-    stage.episode_limit = 5
-    stage.memory_limit = 10
-    return stage
-
+from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 
 _SNAPSHOT_LINE = '1505 done / 148 cancelled / 1653 total'
 _BENIGN_LINE_A = 'Entity summary line A'
@@ -70,7 +41,7 @@ class TestAssemblePayloadSnapshotStripping:
         - Both benign lines are present.
         - stage._entity_summary_snapshot_lines_stripped == 2 (one from each source).
         """
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.memory.get_episodes = AsyncMock(
             return_value=[
                 {
@@ -121,7 +92,7 @@ class TestAssemblePayloadSnapshotStripping:
         - Benign surrounding lines are present.
         - stage._entity_summary_snapshot_lines_stripped == 1.
         """
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.assembled_payload = AssembledPayload(
             events=[],
             context_items={
@@ -151,6 +122,172 @@ class TestAssemblePayloadSnapshotStripping:
         )
 
 
+def _buffered_events_block(payload: str) -> str:
+    return payload.split('### Buffered Events', 1)[1].split('### Related Context', 1)[0]
+
+
+class TestAssembledPayloadDisclosesTheTokenBudgetClip:
+    """Events the token budget deferred are named under the Buffered Events block."""
+
+    @pytest.mark.asyncio
+    async def test_deferred_events_render_a_clip_note(self):
+        stage = make_consolidator()
+        stage.assembled_payload = AssembledPayload(events=[], events_remaining=7, token_budget=65_000)
+
+        result = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='test_project'), prior_reports=[],
+        )
+
+        [note] = [
+            line for line in _buffered_events_block(result).splitlines() if line.startswith('_NOTE:')
+        ]
+        assert '7 additional buffered event(s)' in note
+        assert 'reconciliation.token_budget=65000 cap' in note
+        assert 'NOT complete this cycle' in note
+        assert 'the newest events (still buffered for a later chunk) were dropped first' in note
+
+    @pytest.mark.asyncio
+    async def test_no_deferred_events_render_no_note(self):
+        stage = make_consolidator()
+        stage.assembled_payload = AssembledPayload(events=[], events_remaining=0, token_budget=65_000)
+
+        result = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='test_project'), prior_reports=[],
+        )
+
+        assert '_NOTE:' not in _buffered_events_block(result)
+
+
+_EPISODES_HEADER = '### New Episodes Since Last Reconciliation'
+_MEMORIES_HEADER = '### New Mem0 Memories Since Last Reconciliation'
+
+
+def _section(payload: str, header: str) -> str:
+    return payload.split(header, 1)[1].split('\n### ', 1)[0]
+
+
+def _episodes(*contents: str, created_at: tuple[str, ...] = ()) -> list[dict]:
+    stamps = created_at or ('2026-05-28T00:00:00Z',) * len(contents)
+    return [
+        {'uuid': f'e{i}', 'created_at': stamp, 'content': c}
+        for i, (c, stamp) in enumerate(zip(contents, stamps, strict=True))
+    ]
+
+
+def _memories(*contents: str, created_at: tuple[str, ...] = ()) -> dict:
+    return {'results': [
+        {'id': f'm{i}', 'memory': c, 'metadata': {'category': 'temporal_facts'},
+         **({'created_at': created_at[i]} if created_at else {})}
+        for i, c in enumerate(contents)
+    ]}
+
+
+async def _time_windowed_payload(stage, watermark: Watermark | None = None) -> str:
+    return await stage.assemble_payload(
+        events=[], watermark=watermark or Watermark(project_id='test_project'), prior_reports=[],
+    )
+
+
+def _rendered_from(section: str, body: str) -> str:
+    """The rest of the line in *section* where *body*'s rendering begins."""
+    return section[section.index(body[:20]):].split('\n', 1)[0]
+
+
+def _notes(section: str) -> list[str]:
+    return [line for line in section.splitlines() if line.startswith('_NOTE:')]
+
+
+class TestTimeWindowedPayloadDisclosesClips:
+    """Per-record body clips and saturated fetch caps are both visible in the Stage-1 payload."""
+
+    @pytest.mark.asyncio
+    async def test_long_records_carry_the_elision_marker_and_short_ones_do_not(self):
+        episode_body = 'e' * 10_000
+        memory_body = 'm' * 10_000
+        stage = make_consolidator()
+        stage.memory.get_episodes = AsyncMock(
+            return_value=_episodes(f'{_SNAPSHOT_LINE}\n{episode_body}', 'short episode'),
+        )
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value=_memories(f'{memory_body}\n{_SNAPSHOT_LINE}', 'short memory'),
+        )
+
+        result = await _time_windowed_payload(stage)
+
+        episodes = _section(result, _EPISODES_HEADER)
+        assert_elided(_rendered_from(episodes, episode_body), episode_body)
+        assert _rendered_from(episodes, 'short episode') == 'short episode'
+        memories = _section(result, _MEMORIES_HEADER)
+        assert_elided(_rendered_from(memories, memory_body), memory_body)
+        assert _rendered_from(memories, 'short memory') == 'short memory'
+        assert stage._entity_summary_snapshot_lines_stripped == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_that_fills_its_limit_renders_a_fetch_cap_note(self):
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory_limit = 3
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes('a', 'b'))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories('x', 'y', 'z'))
+
+        result = await _time_windowed_payload(stage)
+
+        [episode_note] = _notes(_section(result, _EPISODES_HEADER))
+        assert 'episode_limit=2' in episode_note
+        assert 'NOT known complete this cycle' in episode_note
+        [memory_note] = _notes(_section(result, _MEMORIES_HEADER))
+        assert 'memory_limit=3' in memory_note
+        assert 'NOT known complete this cycle' in memory_note
+
+    @pytest.mark.asyncio
+    async def test_a_full_episode_fetch_that_reached_the_watermark_renders_no_note(self):
+        """Episodes arrive newest-first, so one at or before the watermark proves nothing newer was cut."""
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes(
+            'new', 'old', created_at=('2026-05-28T12:00:00Z', '2026-05-27T00:00:00Z'),
+        ))
+        watermark = Watermark(
+            project_id='test_project', last_episode_timestamp=datetime(2026, 5, 28, tzinfo=UTC),
+        )
+
+        result = await _time_windowed_payload(stage, watermark)
+
+        episodes = _section(result, _EPISODES_HEADER)
+        assert 'new' in episodes and 'old' not in episodes
+        assert _notes(episodes) == []
+
+    @pytest.mark.asyncio
+    async def test_a_full_mem0_fetch_notes_even_past_the_watermark(self):
+        """mem0's get_all is not recency-ordered, so a dropped old record proves nothing about the rest."""
+        stage = make_consolidator()
+        stage.memory_limit = 2
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories(
+            'new', 'old', created_at=('2026-05-28T12:00:00+00:00', '2026-05-27T00:00:00+00:00'),
+        ))
+        watermark = Watermark(
+            project_id='test_project', last_memory_timestamp=datetime(2026, 5, 28, tzinfo=UTC),
+        )
+
+        result = await _time_windowed_payload(stage, watermark)
+
+        [memory_note] = _notes(_section(result, _MEMORIES_HEADER))
+        assert 'memory_limit=2' in memory_note
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_under_its_limit_renders_no_note(self):
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory_limit = 3
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes('a'))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories('x', 'y'))
+
+        result = await _time_windowed_payload(stage)
+
+        assert '_NOTE:' not in _section(result, _EPISODES_HEADER)
+        assert '_NOTE:' not in _section(result, _MEMORIES_HEADER)
+
+
 class TestRunSurfacesSnapshotStrippedStat:
     """run() copies _entity_summary_snapshot_lines_stripped into report.stats."""
 
@@ -160,8 +297,8 @@ class TestRunSurfacesSnapshotStrippedStat:
 
         Mirrors the census-inconsistency pattern from TestMemoryConsolidatorRunWiring.
         """
-        stage = _make_consolidator()
-        stage.scope = _scope('test_project', stage.scope.project_root)
+        stage = make_consolidator()
+        stage.scope = make_scope('test_project', stage.scope.project_root)
         stage._entity_summary_snapshot_lines_stripped = 3
 
         base_report = StageReport(

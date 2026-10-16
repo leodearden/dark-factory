@@ -76,12 +76,8 @@ Dry run is the DEFAULT; ``--apply`` is required to write anything::
     uv run --project shared python scripts/sweep_toolcall_markup.py
     uv run --project shared python scripts/sweep_toolcall_markup.py --apply
 
-The ``uv run --project shared`` prefix is not optional. ``shared/__init__.py``
-imports the whole package eagerly, so ``import shared.toolcall_markup`` drags
-in shared's third-party dependencies even though ``toolcall_markup`` is itself
-pure and stdlib-only — a dependency-free system python cannot run this script.
-The same cost is recorded at ``scripts/scan_task_toolcall_leaks.py:102-112``,
-which carries this identical bootstrap.
+``_checkout`` binds this checkout's ``shared``, and ``shared`` serves its
+names lazily, so a plain ``python3`` runs this script too.
 
 ## AUTHORING HAZARD — this file spells NO envelope literal, ever
 
@@ -108,20 +104,9 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
-# shared/src bootstrap. Same idiom and same precedence argument as
-# scripts/scan_task_toolcall_leaks.py:113-115 and
-# scripts/repair_wiped_metadata_files.py:67-73: resolve it from __file__ and
-# insert at sys.path[0], so a run inside a task worktree resolves `shared` to
-# THIS checkout's copy of the envelope-literal enumeration rather than to
-# whatever editable install happens to be on the path. The fused-memory/shared
-# editable installs are ordinary .pth entries, so sys.path ORDER decides the
-# winner and a hardcoded or install-provided path would silently test the main
-# checkout's literals.
-_SHARED_SRC = Path(__file__).resolve().parent.parent / 'shared' / 'src'
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
-
-from shared.toolcall_markup import (  # noqa: E402
+import _checkout as _checkout
+from shared.project_layout import escalation_queue_dir
+from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     INVOKE_CLOSER,
     PREFILTER_NEEDLES,
@@ -201,9 +186,6 @@ LANE_ESCALATIONS = 'escalations'
 #: ``.worktrees/<id>`` check instead.
 LANE_PLANS = 'plans'
 
-#: Where the escalations lane is rooted, relative to the repo root.
-_ESCALATIONS_DIR = ('data', 'escalations')
-
 #: Plan artifacts in the DURABLE per-lane store at
 #: ``.worktrees/.task-meta/*/plan.json``. Same rules as :data:`LANE_PLANS` and
 #: gated by the same live-lane check — the difference is REACH, not policy.
@@ -275,7 +257,7 @@ def discover_targets(root: Path | str) -> list[Target]:
     root_path = Path(root)
     targets: list[Target] = []
 
-    escalations_dir = root_path.joinpath(*_ESCALATIONS_DIR)
+    escalations_dir = escalation_queue_dir(root_path)
     if escalations_dir.is_dir():
         for path in escalations_dir.rglob('*.json'):
             if not path.is_file():
@@ -395,7 +377,7 @@ class Refusal(NamedTuple):
     """A target this sweep declines to write, and why.
 
     Returned as a VALUE, never raised-and-swallowed. ``scripts`` is inside
-    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``shared/tests/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
     ``except Exception`` funnelling into a default would trip the ratchet — and
     would also discard the reason a human needs in order to adjudicate the
     refusal. Every refusal reaches the report.
@@ -467,7 +449,7 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
         return Refusal(path=target.path, lane=target.lane, reason=REASON_NEVER_TOUCH)
 
     if target.lane == LANE_ESCALATIONS:
-        lane_root = Path(os.path.realpath(root_real.joinpath(*_ESCALATIONS_DIR)))
+        lane_root = Path(os.path.realpath(escalation_queue_dir(root_real)))
         if not resolved.is_relative_to(lane_root):
             return Refusal(
                 path=target.path,
@@ -1044,7 +1026,7 @@ def load_target(target: Target) -> LoadedDocument | Refusal:
     Error handling is NARROW by construction — only ``OSError``,
     ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are caught, each
     recorded with a reason and returned as a value. ``scripts`` is inside
-    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``shared/tests/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
     ``except Exception`` funnelling into a default would trip the ratchet; more
     to the point, it would swallow a genuine bug in the repairer as though it
     were a malformed file.

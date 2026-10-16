@@ -5,7 +5,11 @@ PRD ``plans/merge-lane-quality-prd.md`` task alpha. The measures are the ones
 the PRD's Background table quotes -- file lines and prose lines, per-function
 cognitive complexity, function-local (reach-back) imports, re-export shim names,
 distinct test patch targets into lane internals, and private-attribute reads
-from tests. The committed baseline lives at
+from tests -- plus, from PRD task zeta2, ``external_importers``: for each of the
+fourteen old module paths that ``ALIAS_MODULES`` names, the number of distinct
+tracked repo files outside ``merge_lane/`` that still import it or name a path
+into it in a string (a patch target), which is the target PRD task eta drives to
+zero. The committed baseline lives at
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
 enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
@@ -32,15 +36,21 @@ neighbours. Those guards measure OTHER people's files; this one measures a
 fixed, named cluster where a path it cannot read IS the finding. Concretely:
 
 * a ``CLUSTER_PATHS`` LITERAL that is missing, unreadable or unparseable ->
-  ``MetricsError`` naming the path and the cause;
+  ``RatchetError`` (missing, unreadable) or ``source_measures.MetricsError``
+  (unparseable) naming the path and the cause;
 * a ``CLUSTER_PATHS`` GLOB expanding to zero -> fine (that is
   ``merge_lane/**`` until PRD task zeta1 lands);
-* complexipy absent, or resolving outside ``COMPLEXIPY_REQUIRED`` ->
+* complexipy absent, or resolving outside ``source_measures.COMPLEXIPY_REQUIRED`` ->
   ``MetricsError`` naming the tool and the version found;
 * the whole-of-``orchestrator/tests`` sweep keeps the siblings' per-file
   fail-soft polarity, but records every skipped file in
   ``Enumeration.unreadable`` and marks the enumeration incomplete, and
-  ``check_against_baseline`` REFUSES to compare an incomplete enumeration.
+  ``check_against_baseline`` REFUSES to compare an incomplete enumeration;
+* the importer sweep over every tracked ``.py`` follows that same record-and-
+  refuse rule for a file it cannot read or parse, and is HARD where its input
+  is missing: ``git`` absent, failing, or pointed at a root that is not the
+  top of a work tree is a ``MetricsError`` naming the cause, because an empty
+  file list would read as zero importers -- an improvement.
 
 That last clause is what makes "a partial enumeration is distinguishable from a
 complete one in the RESULT, not only in a log line" true rather than aspirational.
@@ -65,7 +75,8 @@ Exit codes
    ``--write-baseline`` REFUSING to absorb one for want of an
    ``--authorize-raise`` (``UnauthorizedRaise``, which deliberately does not
    subclass ``MetricsError`` so it cannot be reclassified as a broken tool).
-2  instrument failure (``MetricsError``) -- an unparseable cluster file,
+2  instrument failure (``source_measures.MetricsError``, or its ``RatchetError``
+   subclass for the ratchet's own faults) -- an unparseable cluster file,
    complexipy missing or out of range, a missing/malformed baseline, or a
    baseline whose recorded parameters no longer match this tree. Deliberately
    distinct from 1 so a broken instrument is never mistaken either for a clean
@@ -78,39 +89,33 @@ import ast
 import dataclasses
 import json
 import sys
-import tokenize
-from collections.abc import Sequence
-from io import StringIO
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
+
+import _checkout as _checkout
+import source_measures
 
 from shared import safe_io
 
-# NOTE: module scope imports only the stdlib and the ``shared`` workspace member
-# (present in every project venv) ON PURPOSE. complexipy and radon are
-# imported lazily inside the functions that need them (see
-# ``_import_complexipy``), so this module stays importable and type-checkable in
-# environments whose dev group does not carry them -- notably the ``shared``
-# project, which owns the ``ruff check scripts/`` and ``pyright scripts/`` gates
-# for this file. Laziness is not softness: the moment a measure actually needs
-# the tool, a missing or wrong-version one raises MetricsError with a named
-# cause (INV-11).
 
+class RatchetError(source_measures.MetricsError):
+    """The ratchet could not do its job: its cluster spec, baseline, ledger,
+    an authorization, or the params a comparison rests on is missing,
+    malformed or inconsistent.
 
-class MetricsError(Exception):
-    """The instrument could not take a measurement it was asked for.
-
-    Always raised with the offending path / tool / version named in the message.
-    Mapped to exit code 2 at the ``main()`` boundary, categorically apart from
-    the exit-1 "the tree regressed" outcome. ``AppendOnlyViolation`` is the one
-    subclass that is a VERDICT rather than a fault, and it says so itself.
+    A ``source_measures.MetricsError`` subclass because both are instrument
+    failures (exit 2) and every boundary catches them together; a type of its
+    own so the ratchet's faults are named by the ratchet, not by the layer it
+    measures with.
     """
 
 
-class AppendOnlyViolation(MetricsError):
+class AppendOnlyViolation(RatchetError):
     """The ledger's recorded history was REWRITTEN -- a verdict, not a fault.
 
-    A ``MetricsError`` subclass, so nothing that already catches one changes
+    A ``RatchetError`` subclass, so nothing that already catches one changes
     behaviour; a DISTINCT type, because the two are read differently at a
     boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
     committer did something the ratchet forbids and can fix) and 2 for its
@@ -152,7 +157,6 @@ CLUSTER_PATHS: tuple[str, ...] = (
     # Empty until PRD task zeta1 creates the package. A glob matching nothing is
     # NOT a failure; a literal matching nothing is.
     'orchestrator/src/orchestrator/merge_lane/**/*.py',
-    'orchestrator/tests/_serial_merge_worker.py',
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
 )
@@ -171,6 +175,45 @@ FILE_LINE_CEILING = 1500
 
 #: A function ABSENT from the baseline may not exceed this cognitive complexity.
 NEW_FUNCTION_COGNITIVE_CEILING = 15
+
+#: THE ONE COPY of the PRD task zeta2 move, as old dotted name -> new dotted
+#: name. Each old module stays importable as an alias of its new home until PRD
+#: task eta migrates its importers and deletes it. The OLD names are what
+#: ``external_importers`` counts, and each is also a ``CLUSTER_PATHS`` literal
+#: (``orchestrator/src/<dotted path>.py``), so the per-file measures keep
+#: measuring the old paths after the move; the NEW names are the migration target
+#: ``--report`` prints beside each count and the mapping task eta rewrites by.
+ALIAS_MODULES: Mapping[str, str] = MappingProxyType(
+    {
+        'orchestrator.merge_queue': 'orchestrator.merge_lane.worker',
+        'orchestrator.merge_gates': 'orchestrator.merge_lane.gates',
+        'orchestrator.merge_types': 'orchestrator.merge_lane.types',
+        'orchestrator.merge_shadow': 'orchestrator.merge_lane.shadow',
+        'orchestrator.merge_liveness': 'orchestrator.merge_lane.liveness',
+        'orchestrator.merge_disposition': 'orchestrator.merge_lane.disposition',
+        'orchestrator.merge_queue_store': 'orchestrator.merge_lane.queue_store',
+        'orchestrator.merge_completion': 'orchestrator.merge_lane.completion',
+        'orchestrator.merge_drift': 'orchestrator.merge_lane.drift',
+        'orchestrator.merge_speculation_controller': (
+            'orchestrator.merge_lane.speculation_controller'
+        ),
+        'orchestrator.merge_request_ledger': 'orchestrator.merge_lane.request_ledger',
+        'orchestrator.merge_skew_tripwire': 'orchestrator.merge_lane.skew_tripwire',
+        'orchestrator.landing_evidence': 'orchestrator.merge_lane.landing_evidence',
+        'orchestrator.landed_outbox': 'orchestrator.merge_lane.landed_outbox',
+    }
+)
+
+#: Repo-relative directory of the package the aliases forward to. Its own files
+#: are the new home, not importers of the old one.
+MERGE_LANE_PACKAGE_DIR = 'orchestrator/src/orchestrator/merge_lane/'
+
+#: Path segments that mark another tree's files: virtualenvs, vendored
+#: ``node_modules`` and nested worktrees. Never this repo's own importers.
+_FOREIGN_TREE_SEGMENTS = frozenset(
+    {'.venv', 'venv', 'site-packages', 'node_modules', '.worktrees'}
+)
+_NESTED_CLAUDE_WORKTREES = '.claude/worktrees/'
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +266,7 @@ class TestTreeCoverage:
 def resolve_cluster_paths(root: Path) -> Enumeration:
     """Resolve ``CLUSTER_PATHS`` against *root* into a complete Enumeration.
 
-    Raises ``MetricsError`` naming the path when a LITERAL entry is missing, is
+    Raises ``RatchetError`` naming the path when a LITERAL entry is missing, is
     not a regular file, or cannot be read. A GLOB entry expanding to zero paths
     is accepted (that is ``merge_lane/**`` until PRD task zeta1).
     """
@@ -236,20 +279,20 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
             continue
         candidate = root / entry
         if not candidate.exists():
-            raise MetricsError(
+            raise RatchetError(
                 f'cluster path {entry!r} does not exist under {root} -- '
                 'CLUSTER_PATHS is the SPOT source of PRD Appendix A; if the '
                 'file was renamed or removed, update CLUSTER_PATHS and '
                 'regenerate the baseline in the same commit'
             )
         if not candidate.is_file():
-            raise MetricsError(
+            raise RatchetError(
                 f'cluster path {entry!r} is not a regular file under {root}'
             )
         try:
             candidate.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError) as exc:
-            raise MetricsError(
+            raise RatchetError(
                 f'cluster path {entry!r} could not be read: {exc.__class__.__name__}: {exc}'
             ) from exc
         resolved.append(entry)
@@ -262,413 +305,12 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
 
 
 # ---------------------------------------------------------------------------
-# Source helpers shared by the per-file measures.
-
-
-def _parse(source: str, *, path: str) -> ast.Module:
-    """Parse *source*, translating a SyntaxError into a named MetricsError.
-
-    INV-11: an unparseable CLUSTER file is the finding, never a skipped measure.
-    Callers sweeping files OUTSIDE the cluster (the whole test tree) catch
-    this and record the path in ``Enumeration.unreadable`` instead.
-    """
-    try:
-        return ast.parse(source)
-    except SyntaxError as exc:
-        raise MetricsError(
-            f'{path}: could not be parsed -- SyntaxError: {exc}'
-        ) from exc
-    except ValueError as exc:  # e.g. source containing a null byte
-        raise MetricsError(
-            f'{path}: could not be parsed -- {exc.__class__.__name__}: {exc}'
-        ) from exc
-
-
-def _read_source(root: Path, relpath: str) -> str:
-    try:
-        return (root / relpath).read_text(encoding='utf-8')
-    except (OSError, UnicodeDecodeError) as exc:
-        raise MetricsError(
-            f'{relpath}: could not be read -- {exc.__class__.__name__}: {exc}'
-        ) from exc
-
-
-def _comment_lines(source: str, *, path: str) -> set[int]:
-    """Line numbers carrying a COMMENT token, via stdlib ``tokenize``.
-
-    Token-based rather than regex-based on purpose: a string literal that merely
-    mentions ``#`` is not a comment, and no regex over source text gets that
-    right.
-    """
-    lines: set[int] = set()
-    try:
-        for token in tokenize.generate_tokens(StringIO(source).readline):
-            if token.type == tokenize.COMMENT:
-                lines.add(token.start[0])
-    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
-        raise MetricsError(
-            f'{path}: could not be tokenized -- {exc.__class__.__name__}: {exc}'
-        ) from exc
-    return lines
-
-
-# ---------------------------------------------------------------------------
-# Per-file size measures.
-
-
-@dataclasses.dataclass(frozen=True)
-class FileSizeMeasures:
-    """Physical lines, and how many of them are docstring or comment."""
-
-    lines: int
-    prose_lines: int
-
-
-def _docstring_lines(tree: ast.Module) -> set[int]:
-    """Line numbers spanned by every docstring in *tree*.
-
-    A docstring is the FIRST body element of a module, class or function when it
-    is a bare string expression -- exactly Python's own rule, so a second string
-    expression in the same body is code, not prose.
-    """
-    lines: set[int] = set()
-    holders: tuple[type[ast.AST], ...] = (
-        ast.Module,
-        ast.FunctionDef,
-        ast.AsyncFunctionDef,
-        ast.ClassDef,
-    )
-    for node in ast.walk(tree):
-        if not isinstance(node, holders):
-            continue
-        body = getattr(node, 'body', None)
-        if not body:
-            continue
-        first = body[0]
-        if (
-            isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-        ):
-            end = first.end_lineno if first.end_lineno is not None else first.lineno
-            lines.update(range(first.lineno, end + 1))
-    return lines
-
-
-def file_size_measures(source: str, *, path: str) -> FileSizeMeasures:
-    """Measure *source*'s physical and prose line counts.
-
-    ``prose_lines`` is the UNION of two line-number sets -- docstring spans
-    (from the AST) and COMMENT-token lines (from stdlib ``tokenize``) -- so a
-    line that is both counts once. Token-based comment detection is what makes
-    ``url = 'http://x/#frag'`` correctly zero prose lines; a regex over source
-    text cannot.
-
-    Raises ``MetricsError`` naming *path* when the source cannot be parsed or
-    tokenized. INV-11: never a zero or None measure for a file we failed to read.
-    """
-    tree = _parse(source, path=path)
-    prose = _docstring_lines(tree) | _comment_lines(source, path=path)
-    return FileSizeMeasures(lines=len(source.splitlines()), prose_lines=len(prose))
-
-
-# ---------------------------------------------------------------------------
-# Structural import measures.
-
-_FUNCTION_NODES: tuple[type[ast.AST], ...] = (ast.FunctionDef, ast.AsyncFunctionDef)
-
-
-def function_local_imports(source: str, *, path: str) -> int:
-    """Count import statements that live inside a function body.
-
-    These are the lane's reach-back imports -- the function-local
-    ``from orchestrator.merge_queue import ...`` sites that exist to break
-    import cycles, plus every other deferred import in the same shape. The PRD's
-    ceiling for this measure is zero.
-
-    Counted per STATEMENT, not per bound name, and deduped by node identity so a
-    nested function's import is counted once rather than once per enclosing
-    function. AST-based, so a docstring quoting an import statement -- which the
-    satellite modules' reach-back notes do verbatim -- is never counted.
-    """
-    tree = _parse(source, path=path)
-    seen: set[int] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, _FUNCTION_NODES):
-            continue
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Import | ast.ImportFrom):
-                seen.add(id(inner))
-    return len(seen)
-
-
-def reexport_names(source: str, *, path: str) -> list[str]:
-    """Names a module imports at module level and never itself references.
-
-    This is the STRUCTURAL reading of a re-export shim, and deliberately not a
-    scan for the ``# noqa: F401  re-export shim`` comment: comments do not exist
-    in the AST at all, and a comment-based detector would zero out on a purely
-    cosmetic edit. The structural predicate is exactly what ruff's F401 computes
-    -- which is precisely why those blocks carry the suppression -- so it agrees
-    with the annotated set while being ungameable.
-
-    Scoped to MODULE-LEVEL ``from X import ...`` bindings: a bare ``import x``
-    binds a module rather than re-exporting a name, a function-local import is
-    the ``function_local_imports`` measure's business, and ``import *`` binds
-    nothing nameable. ``from __future__ import ...`` is likewise excluded: it is
-    a compiler directive, not a name a downstream module could import, and ruff
-    explicitly never flags it under F401 -- counting it would both inflate every
-    baseline and make the ratchet REWARD deleting a future import, which silently
-    changes runtime annotation semantics. Returns the bound names
-    (``asname or name``) sorted and deduped.
-    """
-    tree = _parse(source, path=path)
-    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    # An attribute chain rooted at the binding (`B.attr`) also uses it, and so
-    # does an `__all__` listing -- but `__all__` entries are string constants,
-    # not Names, and a module that re-exports via `__all__` is still a shim by
-    # this measure's definition, which is the reading the PRD's ceiling wants.
-    names: set[str] = set()
-    for node in tree.body:
-        if not isinstance(node, ast.ImportFrom):
-            continue
-        if node.module == '__future__':
-            continue
-        for alias in node.names:
-            if alias.name == '*':
-                continue
-            bound = alias.asname or alias.name
-            if bound not in used:
-                names.add(bound)
-    return sorted(names)
-
-
-# ---------------------------------------------------------------------------
-# The complexipy adapter, and the tool-availability half of INV-11.
-#
-# WHY BOTH BOUNDS EXIST, measured 2026-09-03 against merge_queue.py (21,550
-# lines) in this worktree:
-#
-#   version | wall clock | file total | _verifier_loop | _run_post_merge_verify
-#   3.0.0   |     4.63s  |      2031  |  186           |  183
-#   4.0.0   |     4.31s  |      2124  |  188           |  183
-#   5.0.0   |     4.81s  |      2092  |  192           |  188
-#   6.0.0   |     5.18s  |      2133  |  245           |  175
-#   6.2.0   |     4.75s  |      2133  |  245           |  175
-#   7.0.1   |   247.00s  |      2133  |  245           |  175
-#
-# FLOOR (>=6.2) is CORRECTNESS: the algorithm changed across majors, so 3/4/5
-# compute different numbers for the identical file. An unpinned complexipy would
-# silently rewrite every baseline figure on upgrade, turning a ratchet into
-# noise. 6.x and 7.0.1 agree, and reproduce exactly the numbers the PRD
-# Background table quotes; 6.2.0 is the newest 6.x and the version every
-# committed baseline number was measured with.
-#
-# CEILING (<7) is PERFORMANCE, and it is not hygiene -- it is what keeps this
-# instrument from becoming a suite-truncating landmine. 7.0.1's cost grows
-# roughly cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so
-# the whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The
-# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s, and
-# exceeding it does not merely fail the test: pytest-timeout's thread method
-# os._exit()s the xdist worker and --max-worker-restart=0 then truncates the
-# ENTIRE orchestrator suite, reporting against an innocent test (the esc-3980-1
-# / esc-3787-1 mode documented at orchestrator/tests/_orch_helpers.py::
-# WHOLE_TREE_SCAN_TEST_TIMEOUT).
-#
-# The tuples are the source of truth; the human-readable specifier is derived
-# from them, so the message and the check can never disagree. The same string
-# is pinned against orchestrator/pyproject.toml's dev-group entry by
-# test_pyproject_pin_matches_the_scripts_requirement.
-COMPLEXIPY_MIN: tuple[int, ...] = (6, 2)
-COMPLEXIPY_MAX_EXCLUSIVE: tuple[int, ...] = (7,)
-COMPLEXIPY_REQUIRED = '>={},<{}'.format(
-    '.'.join(str(part) for part in COMPLEXIPY_MIN),
-    '.'.join(str(part) for part in COMPLEXIPY_MAX_EXCLUSIVE),
-)
-
-_COMPLEXIPY_RANGE_REASON = (
-    'complexipy majors compute DIFFERENT cognitive numbers for the same file '
-    '(merge_queue.py totals 2031 at 3.0.0, 2092 at 5.0.0, 2133 at 6.x/7.x), so '
-    'an unpinned engine would silently rewrite every baseline figure; and 7.x '
-    'is ~48x slower on the monolith (247.0s vs 4.75s at 6.2.0, ~330s+ vs 9.52s '
-    'cluster-wide) against the ratchet test\'s 300s timeout, which pytest-'
-    'timeout enforces by os._exit()ing the xdist worker and truncating the '
-    'whole suite. Install the pinned version: `uv sync --all-packages`.'
-)
-
-
-def _version_parts(version: str) -> tuple[int, ...]:
-    """Leading numeric release segments of *version*, e.g. '6.2.0rc1' -> (6, 2, 0).
-
-    Deliberately hand-rolled rather than reaching for ``packaging``: this module
-    imports no third-party package at import time (see the note at the top), and a two-clause
-    ``>=X,<Y`` range over release segments needs nothing more.
-    """
-    parts: list[int] = []
-    for segment in version.split('.'):
-        digits = ''
-        for char in segment:
-            if not char.isdigit():
-                break
-            digits += char
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts)
-
-
-def satisfies_complexipy_requirement(version: str) -> bool:
-    """True when *version* falls inside ``COMPLEXIPY_REQUIRED``."""
-    parts = _version_parts(version)
-    if not parts:
-        return False
-    return COMPLEXIPY_MIN <= parts < COMPLEXIPY_MAX_EXCLUSIVE
-
-
-def complexipy_version() -> str:
-    """The installed complexipy version, or ``MetricsError`` naming the tool."""
-    import importlib.metadata
-
-    try:
-        return importlib.metadata.version('complexipy')
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise MetricsError(
-            'complexipy is not installed, so cognitive complexity cannot be '
-            'measured. It belongs to orchestrator/pyproject.toml '
-            '[dependency-groups] dev, pinned '
-            f'{COMPLEXIPY_REQUIRED}. Run `uv sync --all-packages`.'
-        ) from exc
-
-
-def require_complexipy() -> str:
-    """Assert the installed complexipy is inside ``COMPLEXIPY_REQUIRED``.
-
-    Called once up front by ``build_report`` so a wrong-version environment
-    fails immediately with a named cause rather than after a 250-second
-    measurement whose numbers would be wrong anyway.
-    """
-    # Looked up through the module namespace on purpose, so a test can seed a
-    # version without installing one.
-    version = globals()['complexipy_version']()
-    if not satisfies_complexipy_requirement(version):
-        raise MetricsError(
-            f'complexipy {version} is installed but this instrument requires '
-            f'{COMPLEXIPY_REQUIRED}. {_COMPLEXIPY_RANGE_REASON}'
-        )
-    return version
-
-
-def _import_complexipy():  # noqa: ANN202 - third-party module object
-    """Import complexipy LAZILY, naming it in the failure.
-
-    Lazy so ``scripts/merge_lane_metrics.py`` stays importable and
-    type-checkable under the ``shared`` project that owns its ruff/pyright
-    gates, whose dev group carries neither complexipy nor radon. Lazy is not
-    soft: the moment a measure actually needs the tool, a missing one is an
-    instrument failure with a named cause.
-    """
-    try:
-        import complexipy  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise MetricsError(
-            'complexipy could not be imported, so cognitive complexity cannot '
-            'be measured. It belongs to orchestrator/pyproject.toml '
-            f'[dependency-groups] dev, pinned {COMPLEXIPY_REQUIRED}. '
-            f'Run `uv sync --all-packages`. ({exc})'
-        ) from exc
-    return complexipy
-
-
-def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
-    complexipy = _import_complexipy()
-    try:
-        return complexipy.file_complexity(str(path))
-    except MetricsError:
-        raise
-    except Exception as exc:
-        raise MetricsError(
-            f'{path}: complexipy could not measure this file -- '
-            f'{exc.__class__.__name__}: {exc}'
-        ) from exc
-
-
-@dataclasses.dataclass(frozen=True)
-class FileCognitive:
-    """Both cognitive projections of ONE complexipy measurement of one file."""
-
-    total: int
-    per_function: dict[str, int]
-
-
-def file_cognitive_measures(path: Path) -> FileCognitive:
-    """Measure *path* with complexipy ONCE and derive both projections from it.
-
-    The file total and the per-function map are two VIEWS of a single
-    ``FileComplexity``, so one call answers both and ``build_report`` -- the
-    only caller -- asks once per file. There are deliberately no separate
-    ``cognitive_complexity`` / ``file_cognitive_total`` accessors: with one
-    call site, a named half per projection would be surface kept alive by its
-    own tests. Deliberately NOT a cache either: a memo keyed on a path would
-    return the file as it WAS, would retain every result for the life of a
-    process the merge lane runs on every verify leg, and would need a carve-out
-    to keep ``_file_complexity``'s MetricsError from being swallowed.
-
-    ``total`` is reported and ratcheted alongside ``per_function`` because it
-    also counts module-level control flow belonging to no function. complexipy
-    already emits ``Class::method`` for methods, so the keys need no
-    post-processing, and a module with no functions yields an empty map -- a
-    real measurement, not a skipped one.
-    """
-    result = _file_complexity(path)
-    return FileCognitive(
-        total=int(result.complexity),
-        per_function={
-            function.name: function.complexity for function in result.functions
-        },
-    )
-
-
-def maintainability_index(source: str, *, path: str) -> float:
-    """radon's maintainability index for *source*, in [0, 100].
-
-    REPORTED, never ratcheted: MI is a derived composite (Halstead volume,
-    cyclomatic complexity, SLOC, comment ratio) that already reads 0.00 for both
-    merge_queue.py and git_ops.py, so it has no headroom left to ratchet against
-    and would only ever restate what the line and cognitive measures already
-    say. It earns its place in ``--report`` as the PRD Background table's
-    "Maintainability index (radon) | 0" row -- and it is what makes the `radon`
-    dev-group entry genuinely exercised rather than dead weight.
-    """
-    try:
-        from radon.metrics import mi_visit  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise MetricsError(
-            'radon could not be imported, so the maintainability index cannot '
-            'be reported. It belongs to orchestrator/pyproject.toml '
-            f'[dependency-groups] dev. Run `uv sync --all-packages`. ({exc})'
-        ) from exc
-    try:
-        return float(mi_visit(source, True))
-    except Exception as exc:
-        raise MetricsError(
-            f'{path}: radon could not compute a maintainability index -- '
-            f'{exc.__class__.__name__}: {exc}'
-        ) from exc
-
-
-# ---------------------------------------------------------------------------
 # Test-suite patch targets into lane internals.
 #
-# The two detector shapes below are PORTED from
-# orchestrator/tests/test_merge_queue_reachback_patch_guard.py --
-# `_merge_queue_module_aliases()` and the is_setattr / is_dotted_patch /
-# is_bare_patch / is_patch_object call classification inside
-# `_find_merge_queue_private_patches()` -- with two deliberate generalisations:
-# the alias helper takes a SET of lane module paths rather than the single
-# hardcoded `orchestrator.merge_queue`, and that guard's `forbidden` filter is
-# dropped so ALL leaves are counted rather than only the satellite-private ones.
-# This measure therefore subsumes the guard's allowlist as a COUNT, which is
-# what lets PRD task delta delete the guard once the count reaches zero.
+# The measure is ``source_measures.patch_targets_in_tree`` over
+# ``LANE_PATCH_MODULES``, keeping the distinct leaves. It subsumes the retired
+# reachback guard's allowlist as a COUNT, which is what lets PRD task delta
+# delete the guard once the count reaches zero.
 
 #: Dotted module paths whose attributes count as lane internals when patched.
 #: `merge_lane` is here from day one, before the package exists, precisely so
@@ -679,131 +321,14 @@ LANE_PATCH_MODULES: tuple[str, ...] = (
 )
 
 
-def _lane_module_aliases(tree: ast.AST) -> set[str]:
-    """Names bound directly to a lane module object anywhere in *tree*.
-
-    e.g. ``import orchestrator.merge_queue as mq`` or
-    ``from orchestrator import merge_lane``. Used to recognise the object-path
-    idiom, which targets the identical lookup site as the string-path form
-    without embedding the module path as a string constant.
-    """
-    leaves = {path.rsplit('.', 1)[-1] for path in LANE_PATCH_MODULES}
-    aliases: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name in LANE_PATCH_MODULES and alias.asname:
-                    aliases.add(alias.asname)
-        elif (
-            isinstance(node, ast.ImportFrom)
-            and node.module == 'orchestrator'
-            and not node.level
-        ):
-            for alias in node.names:
-                if alias.name in leaves:
-                    aliases.add(alias.asname or alias.name)
-    return aliases
-
-
-def patch_targets(source: str, *, path: str = '<source>') -> set[str]:
-    """Distinct leaf names patched through a lane module path in *source*.
-
-    Distinct NAMES, not call sites: the PRD's measure is "79 distinct names"
-    across "1,111 call sites", and the ratchet freezes the former.
-
-    AST-based, so a docstring or comment quoting the dotted path -- which the
-    satellite module docstrings and the reachback guard's own ALLOWLIST literal
-    both do -- is never mistaken for a real patch site.
-    """
-    tree = _parse(source, path=path)
-    aliases = _lane_module_aliases(tree)
-    leaves = {module.rsplit('.', 1)[-1] for module in LANE_PATCH_MODULES}
-
-    def _is_lane_ref(expr: ast.expr) -> bool:
-        if isinstance(expr, ast.Name):
-            return expr.id in aliases
-        # The bare attribute chain `orchestrator.merge_queue`. Anchored on the
-        # `orchestrator` root so an unrelated `workflow.merge_queue` attribute
-        # that merely shares the leaf name is not counted.
-        return (
-            isinstance(expr, ast.Attribute)
-            and expr.attr in leaves
-            and isinstance(expr.value, ast.Name)
-            and expr.value.id == 'orchestrator'
-        )
-
-    targets: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        func = node.func
-        is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
-        is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
-        is_bare_patch = isinstance(func, ast.Name) and func.id == 'patch'
-        is_patch_object = (
-            isinstance(func, ast.Attribute)
-            and func.attr == 'object'
-            and (
-                (isinstance(func.value, ast.Name) and func.value.id == 'patch')
-                or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
-            )
-        )
-
-        leaf: str | None = None
-
-        # String-path form: the dotted path IS the first positional argument.
-        if is_setattr or is_dotted_patch or is_bare_patch:
-            first = node.args[0]
-            if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                for module in LANE_PATCH_MODULES:
-                    prefix = module + '.'
-                    if first.value.startswith(prefix):
-                        leaf = first.value[len(prefix):]
-                        break
-
-        # Object-path form: first arg is a lane module reference, second is the
-        # leaf name string.
-        if leaf is None and (is_setattr or is_patch_object) and len(node.args) >= 2:
-            target, name_arg = node.args[0], node.args[1]
-            if (
-                _is_lane_ref(target)
-                and isinstance(name_arg, ast.Constant)
-                and isinstance(name_arg.value, str)
-            ):
-                leaf = name_arg.value
-
-        if leaf:
-            targets.add(leaf)
-    return targets
-
-
 # ---------------------------------------------------------------------------
-# Private-attribute reads from tests.
+# Lane-importing test files, and their two test-suite measures.
 #
-# THIS MEASURE IS DELIBERATELY RECEIVER-AGNOSTIC. It counts every `_x` attribute
-# access in a lane-importing test file except on the bare `self`/`cls`, and it
-# does NOT maintain a list of blessed receiver variable names (`worker`, `mq`,
-# ...). Two reasons, and the first is the decisive one:
-#
-# (1) A receiver-name allowlist is a single SHARED list that all ten of PRD
-#     gamma1..gamma10 would have to edit concurrently -- the same rebase-conflict
-#     hazard the per-path baseline format exists to avoid.
-# (2) It silently UNDER-counts the moment a test uses a receiver name nobody
-#     listed, which is how a ratchet rots into a vacuous pass. Over-counting is
-#     the safe direction here: a ratchet only ever refuses to let a number RISE,
-#     so a superset costs a little extra friction and never lets a regression
-#     through.
-#
-# The `self`/`cls` exclusion is a STRUCTURAL predicate, not a name list: a test
-# class's own helpers are not lane internals, which is the distinction the
-# measure is actually about. Note it excludes only the BARE receiver, so
-# `self.worker._x` still counts.
-#
-# Measured magnitudes on this tree: 18,952 private attribute nodes across all
-# 559 test files, 9,355 restricted to the 167 lane-importing ones. (The PRD
-# Background table's 5,735 came from a narrower ad-hoc receiver set.)
-
-_SELF_RECEIVERS = frozenset({'self', 'cls'})
+# ``private_reads`` is applied to every lane-importing test file, receiver-
+# agnostically (see ``source_measures.private_reads``). Measured magnitudes on
+# this tree: 18,952 private attribute nodes across all 559 test files, 9,355
+# restricted to the 167 lane-importing ones. (The PRD Background table's 5,735
+# came from a narrower ad-hoc receiver set.)
 
 
 def lane_module_names() -> frozenset[str]:
@@ -812,20 +337,21 @@ def lane_module_names() -> frozenset[str]:
     Derived rather than hand-listed so the lane-importing predicate and
     Appendix A can never drift apart.
     """
-    names: set[str] = set()
-    for entry in CLUSTER_PATHS:
-        if '*' in entry or not entry.endswith('.py'):
-            continue
-        parts = entry[: -len('.py')].split('/')
-        if 'src' in parts:
-            names.add('.'.join(parts[parts.index('src') + 1:]))
-    return frozenset(names)
+    return frozenset(
+        name
+        for entry in CLUSTER_PATHS
+        if '*' not in entry and (name := source_measures.src_module_name(entry)) is not None
+    )
 
 
 def imports_lane_module(source: str, *, path: str) -> bool:
     """True when *source* imports any cluster module, or anything under
     ``orchestrator.merge_lane``."""
-    tree = _parse(source, path=path)
+    return imports_lane_module_in_tree(source_measures.parse_source(source, path=path))
+
+
+def imports_lane_module_in_tree(tree: ast.Module) -> bool:
+    """``imports_lane_module`` over an already-parsed tree."""
     lane_names = lane_module_names()
     lane_leaves = {name.rsplit('.', 1)[-1] for name in lane_names}
 
@@ -850,27 +376,6 @@ def imports_lane_module(source: str, *, path: str) -> bool:
     return False
 
 
-def private_reads(source: str, *, path: str) -> int:
-    """Count accesses of a single-underscore attribute in *source*.
-
-    Writes count too: both directions couple the test to an internal name, which
-    is the coupling the measure exists to shrink. Dunders are excluded (Python
-    protocol, not lane internals) and so is the bare ``self``/``cls`` receiver.
-    """
-    tree = _parse(source, path=path)
-    count = 0
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute):
-            continue
-        if not node.attr.startswith('_') or node.attr.startswith('__'):
-            continue
-        receiver = node.value
-        if isinstance(receiver, ast.Name) and receiver.id in _SELF_RECEIVERS:
-            continue
-        count += 1
-    return count
-
-
 def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
     """The two test-suite measures for *source*, or None when it is not
     lane-importing.
@@ -879,12 +384,170 @@ def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
     the MEASURE rather than of the caller, so a non-lane-importing file can
     never be summed into the report by accident.
     """
-    if not imports_lane_module(source, path=path):
+    return test_file_measures_in_tree(source_measures.parse_source(source, path=path))
+
+
+def test_file_measures_in_tree(tree: ast.Module) -> dict[str, object] | None:
+    """``test_file_measures`` over an already-parsed tree."""
+    if not imports_lane_module_in_tree(tree):
         return None
+    lane_targets = source_measures.patch_targets_in_tree(tree, LANE_PATCH_MODULES)
     return {
-        'patch_targets': sorted(patch_targets(source, path=path)),
-        'private_reads': private_reads(source, path=path),
+        'patch_targets': sorted({target.leaf for target in lane_targets}),
+        'private_reads': source_measures.private_reads_in_tree(tree),
     }
+
+
+# ---------------------------------------------------------------------------
+# External importers of the alias modules (PRD task zeta2).
+#
+# WHAT IS COUNTED. For each old module of ``ALIAS_MODULES``, the number of
+# DISTINCT files that depend on it. Every import form counts -- ``import X``,
+# ``import X as Y``, ``from X import ...`` and ``from <package> import <leaf>``
+# -- at module level or inside a function, and under ``if TYPE_CHECKING:``: a
+# type-only import still breaks the day the alias is deleted. So does a string
+# constant that continues past the module name (``'orchestrator.X.attr'``, a
+# patch target): that file never imports X and breaks all the same. A bare
+# ``'orchestrator.X'`` is a logger name and does not. Detection is AST-based and
+# on FULL dotted names, so a docstring quoting a name never counts, and neither
+# does an unrelated module that merely shares a leaf
+# (``dashboard/data/merge_queue.py``). Relative imports are out of scope: the
+# only files that use them for these modules sit inside ``merge_lane/``, which
+# is excluded, and the rest of the tree imports by absolute name.
+#
+# WHAT IS NOT. The alias file itself, everything under ``merge_lane/`` (the new
+# home), and other trees' files -- virtualenvs, ``node_modules``, nested
+# worktrees. Another alias file DOES count as an importer: on the pre-move tree
+# the old modules import each other, and those edges are real fan-in until the
+# move turns each of them into a forwarding stub.
+#
+# DOMAIN, and why it is ``git ls-files`` and not a filesystem walk. The measured
+# domain is the repo's TRACKED ``.py`` files, because that is the one set that is
+# the same in every checkout. A walk of the main checkout also reaches the
+# gitignored run data (``data/``, plugin caches) and untracked scratch -- about
+# three times as many files as are tracked, and many seconds slower than the same
+# walk of a clean worktree -- so its numbers would differ from every worktree's.
+# The price is that a new file is not counted until it is added to the index; the
+# commit that adds it is what the ratchet judges. This is the instrument's one
+# git dependency, and a read-only one -- the history-comparing git work stays in
+# ``scripts/check_staged_ratchet_raise.py``.
+#
+# A cheap text prefilter (the file mentions a leaf name at all) runs before the
+# AST parse. It cannot hide a dependent, since an import or a dotted string must
+# spell the leaf, so a file that is both unparseable and silent about every leaf
+# depends on no alias and is not recorded as unreadable.
+
+_ALIAS_LEAVES = frozenset(name.rsplit('.', 1)[-1] for name in ALIAS_MODULES)
+
+
+#: ``'<old dotted name>.'`` for each alias. The trailing dot is the point: a string
+#: that CONTINUES past the module is a path into it (``patch(...)``,
+#: ``monkeypatch.setattr(...)``, ``importlib`` of a submodule) and breaks when the
+#: alias is deleted, where a bare ``'orchestrator.merge_queue'`` is a logger name
+#: and survives it.
+_ALIAS_STRING_PREFIXES = {name + '.': name for name in ALIAS_MODULES}
+_ALIAS_STRING_PREFIX_TUPLE = tuple(_ALIAS_STRING_PREFIXES)
+
+
+def _aliases_imported_by_statement(node: ast.Import | ast.ImportFrom) -> set[str]:
+    if isinstance(node, ast.Import):
+        imported = [alias.name for alias in node.names]
+    elif node.module and not node.level:
+        imported = [node.module] + [f'{node.module}.{alias.name}' for alias in node.names]
+    else:
+        return set()
+    return {name for name in imported if name in ALIAS_MODULES}
+
+
+def _aliases_named_by_string(value: str) -> set[str]:
+    if not value.startswith(_ALIAS_STRING_PREFIX_TUPLE):
+        return set()
+    return {
+        name for prefix, name in _ALIAS_STRING_PREFIXES.items() if value.startswith(prefix)
+    }
+
+
+def referenced_alias_modules(source: str, *, path: str = '<source>') -> frozenset[str]:
+    """The old dotted names of ``ALIAS_MODULES`` that *source* depends on.
+
+    Raises ``MetricsError`` naming *path* when the source cannot be parsed.
+    """
+    return referenced_alias_modules_in_tree(source_measures.parse_source(source, path=path))
+
+
+def referenced_alias_modules_in_tree(tree: ast.Module) -> frozenset[str]:
+    """``referenced_alias_modules`` over an already-parsed tree.
+
+    A module is depended on in two ways. It is IMPORTED: ``from P import m`` binds
+    the module ``P.m`` whenever that is a module, so each name in the statement
+    is also tried joined to ``P`` -- which is how ``from orchestrator import
+    merge_queue`` is read without this function knowing the word
+    ``orchestrator``. Or it is NAMED BY PATH in a string constant that continues
+    past the module, ``'orchestrator.landing_evidence._helper'``: a file that
+    patches an alias's attribute never imports it, and counting only imports
+    would let task eta read zero, delete the alias, and break that file. Neither a
+    docstring nor a bare module-name string (a logger name) counts.
+    """
+    found: set[str] = set()
+    docstring_values: set[int] = set()
+    # One walk, parents before children, so a holder has named its docstring's
+    # constant before the walk reaches it.
+    for node in ast.walk(tree):
+        if (docstring := source_measures.docstring_of(node)) is not None:
+            docstring_values.add(id(docstring.value))
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            found |= _aliases_imported_by_statement(node)
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstring_values
+        ):
+            found |= _aliases_named_by_string(node.value)
+    return frozenset(found)
+
+
+def is_external_importer_source(relpath: str) -> bool:
+    """False for the files an importer count must not read: the new package's
+    own files, and other trees' (virtualenv, ``node_modules``, nested worktree)."""
+    return not (
+        relpath.startswith((MERGE_LANE_PACKAGE_DIR, _NESTED_CLAUDE_WORKTREES))
+        or _FOREIGN_TREE_SEGMENTS.intersection(relpath.split('/'))
+    )
+
+
+def _mentions_an_alias_leaf(source: str) -> bool:
+    return any(leaf in source for leaf in _ALIAS_LEAVES)
+
+
+def _external_aliases_referenced_by(tree: ast.Module, relpath: str) -> frozenset[str]:
+    own_name = source_measures.src_module_name(relpath)
+    return frozenset(
+        name for name in referenced_alias_modules_in_tree(tree) if name != own_name
+    )
+
+
+def alias_importer_measure(relpath: str, counts: Mapping[str, int]) -> dict[str, int]:
+    """The ``external_importers`` entry for cluster path *relpath*; empty unless
+    *relpath* is one of the alias modules."""
+    name = source_measures.src_module_name(relpath)
+    if name is None or name not in counts:
+        return {}
+    return {'external_importers': counts[name]}
+
+
+def _require_aliases_in_cluster() -> None:
+    """Every ``ALIAS_MODULES`` key must be a ``CLUSTER_PATHS`` literal's name.
+
+    A count with no ``files`` entry to land on would be measured and dropped,
+    which reads as a measure that is fine.
+    """
+    missing = sorted(set(ALIAS_MODULES) - lane_module_names())
+    if missing:
+        raise RatchetError(
+            f'ALIAS_MODULES names {missing}, which no CLUSTER_PATHS literal '
+            'carries -- each old module must stay in the cluster so its '
+            'external_importers has a files entry to be recorded on'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -915,27 +578,29 @@ def build_report(root: Path) -> dict[str, object]:
     # Up front, before any measurement: a wrong-version engine must fail
     # immediately with a named cause rather than after a 250-second run whose
     # numbers would be wrong anyway.
-    version = require_complexipy()
+    version = source_measures.require_complexipy()
     enumeration = resolve_cluster_paths(root)
+    _require_aliases_in_cluster()
+    sweep = sweep_repo(root)
 
     files: dict[str, object] = {}
     functions: dict[str, int] = {}
     for relpath in enumeration.resolved:
-        source = _read_source(root, relpath)
-        size = file_size_measures(source, path=relpath)
+        source = source_measures.read_source(root, relpath)
+        tree = source_measures.parse_source(source, path=relpath)
+        size = source_measures.file_size_measures_in_tree(source, tree, path=relpath)
         target = root / relpath
-        cognitive = file_cognitive_measures(target)
+        cognitive = source_measures.file_cognitive_measures(target)
         files[relpath] = {
             'lines': size.lines,
             'prose_lines': size.prose_lines,
             'cognitive': cognitive.total,
-            'function_local_imports': function_local_imports(source, path=relpath),
-            'reexport_names': len(reexport_names(source, path=relpath)),
+            'function_local_imports': source_measures.function_local_imports_in_tree(tree),
+            'reexport_names': len(source_measures.reexport_names_in_tree(tree)),
+            **alias_importer_measure(relpath, sweep.alias_importers),
         }
         for qualname, score in cognitive.per_function.items():
             functions[f'{relpath}::{qualname}'] = score
-
-    tests, test_unreadable, coverage = _sweep_test_tree(root)
 
     return {
         'schema_version': SCHEMA_VERSION,
@@ -945,64 +610,136 @@ def build_report(root: Path) -> dict[str, object]:
             'file_line_ceiling': FILE_LINE_CEILING,
             'new_function_cognitive_ceiling': NEW_FUNCTION_COGNITIVE_CEILING,
         },
-        'enumeration': _report_enumeration(enumeration, test_unreadable, coverage),
+        'enumeration': _report_enumeration(
+            enumeration, sweep.unreadable, sweep.test_tree
+        ),
         'files': dict(sorted(files.items())),
         'functions': dict(sorted(functions.items())),
-        'tests': dict(sorted(tests.items())),
+        'tests': dict(sorted(sweep.tests.items())),
     }
 
 
-def _sweep_test_tree(
-    root: Path,
-) -> tuple[dict[str, object], tuple[str, ...], TestTreeCoverage]:
-    """Measure every lane-importing file under ``orchestrator/tests``.
+@dataclasses.dataclass(frozen=True)
+class RepoSweep:
+    """What the ONE pass over the repo's Python files found.
 
-    Returns the measures, the paths SKIPPED (by name, verbatim), and how broad
-    the sweep was as counts. The swept paths themselves are deliberately not
+    ``tests`` is every lane-importing file under ``orchestrator/tests`` with its
+    two measures; ``alias_importers`` is the importer count of EVERY alias
+    module, zeros included (an alias reaching zero is the state task eta is
+    after and must stay recorded as zero, not vanish); ``unreadable`` names the
+    paths either measure had to skip, verbatim; ``test_tree`` is how broad the
+    test-tree half was, as counts. The swept paths themselves are deliberately not
     accumulated: the caller has no use for a 568-entry manifest of other
     people's test files, and building one is how it ended up frozen in the
     committed baseline (esc-5021-7).
+    """
+
+    tests: dict[str, object]
+    alias_importers: Mapping[str, int]
+    unreadable: tuple[str, ...]
+    test_tree: TestTreeCoverage
+
+
+@dataclasses.dataclass(frozen=True)
+class _FileFindings:
+    test_measures: dict[str, object] | None
+    imported_aliases: frozenset[str]
+
+
+def _test_tree_files(root: Path) -> frozenset[str]:
+    return frozenset(
+        path.relative_to(root).as_posix() for path in (root / TESTS_ROOT).rglob('*.py')
+    )
+
+
+def _measure_file(
+    root: Path, relpath: str, *, in_test_tree: bool, is_importer_source: bool
+) -> _FileFindings:
+    """Read *relpath* once, parse it at most once, and take every measure it is
+    in the domain of from that one tree.
+
+    A file that is not in the test tree and names no alias leaf is not parsed at
+    all: a reference to an alias must spell the leaf.
+    """
+    source = (root / relpath).read_text(encoding='utf-8')
+    is_importer = is_importer_source and _mentions_an_alias_leaf(source)
+    if not (in_test_tree or is_importer):
+        return _FileFindings(test_measures=None, imported_aliases=frozenset())
+    tree = source_measures.parse_source(source, path=relpath)
+    return _FileFindings(
+        test_measures=test_file_measures_in_tree(tree) if in_test_tree else None,
+        imported_aliases=(
+            _external_aliases_referenced_by(tree, relpath)
+            if is_importer
+            else frozenset()
+        ),
+    )
+
+
+def sweep_repo(root: Path) -> RepoSweep:
+    """Take the two open-sweep measures in ONE pass over the repo's Python files.
+
+    The two measures have different domains and keep them: the test-suite
+    measures cover every ``.py`` under ``orchestrator/tests`` on disk, as they
+    always have, and the importer count covers the tracked files outside
+    ``merge_lane/`` (see ``source_measures.tracked_python_files``). The pass walks their union
+    once, so a lane-importing test file -- which is both, and is among the
+    largest files in the repo -- is read once and parsed once rather than once
+    per measure.
 
     THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
-    unrelated mid-edit test file must not redden the ratchet, which is the
+    unrelated mid-edit file must not redden the ratchet, which is the
     misattribution every neighbouring guard exists to avoid. What is NOT soft is
     the record: each skipped file lands in ``Enumeration.unreadable``, the
     enumeration goes incomplete, and ``check_against_baseline`` then refuses to
     compare at all. That split is the INV-11 seam between "this cluster file is
-    unmeasurable, which IS the finding" and "some unrelated test file is
-    mid-edit".
+    unmeasurable, which IS the finding" and "some unrelated file is mid-edit". A
+    failure to list the tracked files is not per-file and is not soft -- see
+    ``source_measures.tracked_python_files``.
     """
+    tracked = frozenset(source_measures.tracked_python_files(root))
+    test_tree = _test_tree_files(root)
+    alias_importers = dict.fromkeys(ALIAS_MODULES, 0)
     tests: dict[str, object] = {}
-    requested = 0
     unreadable: list[str] = []
-    for path in sorted((root / TESTS_ROOT).rglob('*.py')):
-        relpath = path.relative_to(root).as_posix()
-        requested += 1
-        try:
-            source = path.read_text(encoding='utf-8')
-        except (OSError, UnicodeDecodeError):
-            unreadable.append(relpath)
+    for relpath in sorted(tracked | test_tree):
+        in_test_tree = relpath in test_tree
+        is_importer_source = relpath in tracked and is_external_importer_source(
+            relpath
+        )
+        if not (in_test_tree or is_importer_source):
             continue
         try:
-            measures = test_file_measures(source, path=relpath)
-        except MetricsError:
+            found = _measure_file(
+                root,
+                relpath,
+                in_test_tree=in_test_tree,
+                is_importer_source=is_importer_source,
+            )
+        except (OSError, UnicodeDecodeError, source_measures.MetricsError):
             unreadable.append(relpath)
             continue
-        if measures is not None:
-            tests[relpath] = measures
-    return (
-        tests,
-        tuple(unreadable),
-        TestTreeCoverage(requested=requested, resolved=len(tests)),
+        if found.test_measures is not None:
+            tests[relpath] = found.test_measures
+        for name in found.imported_aliases:
+            alias_importers[name] += 1
+    return RepoSweep(
+        tests=tests,
+        alias_importers=MappingProxyType(alias_importers),
+        unreadable=tuple(unreadable),
+        test_tree=TestTreeCoverage(requested=len(test_tree), resolved=len(tests)),
     )
 
 
 def _report_enumeration(
     cluster: Enumeration,
-    test_unreadable: tuple[str, ...],
+    swept_unreadable: tuple[str, ...],
     coverage: TestTreeCoverage,
 ) -> dict[str, object]:
     """The report's enumeration block: cluster paths, test-tree counts, INV-11.
+
+    *swept_unreadable* is every path either open sweep (the test tree and the
+    alias-importer sweep) had to skip.
 
     The two halves stay APART rather than being flattened into one pair of
     lists. Flattening cost information as well as bytes: the three CLUSTER_PATHS
@@ -1020,8 +757,8 @@ def _report_enumeration(
         'requested': list(cluster.requested),
         'resolved': list(cluster.resolved),
         'test_tree': coverage.to_dict(),
-        'unreadable': list(cluster.unreadable) + list(test_unreadable),
-        'complete': cluster.complete and not test_unreadable,
+        'unreadable': list(cluster.unreadable) + list(swept_unreadable),
+        'complete': cluster.complete and not swept_unreadable,
     }
 
 
@@ -1032,6 +769,7 @@ _SUMMED_FILE_MEASURES = (
     'cognitive',
     'function_local_imports',
     'reexport_names',
+    'external_importers',
 )
 
 
@@ -1149,7 +887,15 @@ BASELINE_README = (
     'sweeps every .py under '
     'orchestrator/tests for the measures in the tests section, and that sweep '
     'is sized by --report rather than ratcheted here, so an unrelated test file '
-    'arriving never touches these bytes.\n'
+    'arriving never touches these bytes. The files entry of each of the fourteen '
+    'old merge-lane modules also carries external_importers: how many tracked '
+    'repo files outside orchestrator/src/orchestrator/merge_lane/ still import '
+    'that module by its old name, or name a path into it in a string such as a '
+    "patch target ('orchestrator.<old name>.<attr>'; a bare module-name string, "
+    'which is a logger name, does not count) (PRD task zeta2). It is ratcheted '
+    'like every '
+    'other measure, per module and in the derived total, and PRD task eta drives '
+    'it to 0.\n'
     # Composed, never paraphrased: this is the one string in the instrument that
     # changes what a blocked agent does next, and the copy that mattered was
     # always the one in THIS file.
@@ -1164,7 +910,7 @@ def _stored_enumeration(enumeration: dict) -> dict:
     """Strip the live-only test-tree counts; the baseline stores the cluster half.
 
     WHY THE TEST TREE IS NOT STORED AT ALL, in paths OR in counts (esc-5021-7).
-    ``_sweep_test_tree`` walks every ``*.py`` under ``orchestrator/tests`` -- 568
+    ``sweep_repo`` walks every ``*.py`` under ``orchestrator/tests`` -- 568
     paths, of which only the lane-importing ones are ever measured. Freezing that
     manifest in the committed baseline made this gate a hair trigger: any task
     ANYWHERE in the repo that added, removed or renamed a single test file
@@ -1350,9 +1096,11 @@ def write_baseline(
     can see it.
 
     THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
-    means comparing against the copy in git HEAD, which is a git dependency this
-    instrument still does not have: ``scripts/check_staged_ratchet_raise.py``
-    holds every git invocation, runs in pre-commit on every branch, and calls
+    means comparing against the copy in git HEAD, which is a dependency on git
+    HISTORY this instrument still does not have (its one git call is the
+    read-only listing of tracked files, ``source_measures.tracked_python_files``):
+    ``scripts/check_staged_ratchet_raise.py`` holds every git invocation that
+    reads history or the index, runs in pre-commit on every branch, and calls
     ``compare_baseline_files`` here for the comparison itself, so there is one
     definition of "did a measure rise" and only one file that knows what a
     commit is. The boundary is still drawn rather than overclaimed -- the write
@@ -1360,7 +1108,7 @@ def write_baseline(
     and neither sees a raise replayed by a rebase or landed by the merge
     worker's hook-free ``update-ref``.
 
-    A MALFORMED destination propagates ``load_baseline``'s ``MetricsError``
+    A MALFORMED destination propagates ``load_baseline``'s ``RatchetError``
     rather than being overwritten: a previous baseline you cannot read is one
     whose raises you cannot see.
     """
@@ -1394,24 +1142,24 @@ def load_baseline(path: Path) -> dict:
     try:
         text = target.read_text(encoding='utf-8')
     except FileNotFoundError as exc:
-        raise MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} does not exist -- a missing baseline is '
             'a hard failure, never an empty-baseline pass; regenerate it with '
             '--write-baseline if this is the commit that introduces it'
         ) from exc
     except (OSError, UnicodeDecodeError) as exc:
-        raise MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} could not be read: '
             f'{exc.__class__.__name__}: {exc}'
         ) from exc
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} is not valid JSON: {exc}'
         ) from exc
     if not isinstance(loaded, dict):
-        raise MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} holds a '
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
@@ -1431,7 +1179,7 @@ def load_baseline(path: Path) -> dict:
 def _require_non_blank(authorization: RaiseAuthorization, field: str) -> None:
     value = getattr(authorization, field)
     if not isinstance(value, str) or not value.strip():
-        raise MetricsError(
+        raise RatchetError(
             f'authorized raise is missing {field}: {value!r}. An authorization '
             f'with no {field} is not an authorization -- the ledger entry exists '
             'to tell a reviewer WHO raised a measure and WHY, and an entry that '
@@ -1575,13 +1323,13 @@ def render_ledger(ledger: dict) -> str:
     ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
     rather than a churned file.
 
-    Plain ``json.dumps(indent=2)`` rather than the baseline's hand-rolled
-    one-line-per-entry writer. That writer exists for one stated reason -- ten
-    parallel PRD gamma branches each editing different per-path measures would
-    conflict inside indent=2's six-line-per-path hunks. An append-only file
-    gaining one entry per authorizing task has no such shape, so inheriting the
-    custom writer would cargo-cult a constraint that does not apply and cost
-    legibility for it.
+    Plain ``json.dumps(indent=2)``: the baseline's one-line-per-entry writer
+    would buy nothing here. It makes edits at DIFFERENT positions disjoint
+    hunks, but two concurrent authorizations both append at the tail of
+    ``raises``, which conflicts under any line layout. The conflict is loud;
+    a merge commit's resolution of it is audited in pre-commit by
+    ``ledger_merged_entries``, and a rebase's is the residual ``RAISE_REMEDY``
+    names.
     """
     body = {key: value for key, value in ledger.items() if key != '_README'}
     return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'
@@ -1609,23 +1357,23 @@ def load_ledger(path: Path) -> dict:
     except FileNotFoundError:
         return empty_ledger()
     except (OSError, UnicodeDecodeError) as exc:
-        raise MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} could not be read: '
             f'{exc.__class__.__name__}: {exc}'
         ) from exc
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} is not valid JSON: {exc}'
         ) from exc
     if not isinstance(loaded, dict):
-        raise MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} holds a '
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
     if not isinstance(loaded.get('raises'), list):
-        raise MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} has no "raises" list -- a ledger '
             'whose entries cannot be read is one whose history cannot be '
             'audited, which must never read as "nothing was authorized"'
@@ -1676,7 +1424,7 @@ def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
     *previous* must be a PREFIX of *current* -- length equality is not prefix
     equality, so an entry rewritten in place is refused exactly like a dropped
     one, and a reorder like both. The refusal is an ``AppendOnlyViolation``
-    rather than a bare ``MetricsError`` so a caller can tell this VERDICT apart
+    rather than a bare ``RatchetError`` so a caller can tell this VERDICT apart
     from an instrument failure at its own exit boundary.
 
     Pure: two loaded dicts in, the suffix out. The caller decides where the two
@@ -1843,7 +1591,7 @@ def _section(report: dict, name: str) -> dict:
 def _params(report: dict, which: str) -> dict:
     params = report.get('params')
     if not isinstance(params, dict):
-        raise MetricsError(
+        raise RatchetError(
             f'{which} report has no "params" block -- it was not produced by '
             'build_report, so there is nothing to state how it was measured'
         )
@@ -1853,14 +1601,14 @@ def _params(report: dict, which: str) -> dict:
 def _require_complete_enumeration(current: dict) -> None:
     enumeration = current.get('enumeration')
     if not isinstance(enumeration, dict):
-        raise MetricsError(
+        raise RatchetError(
             'current report has no "enumeration" block -- completeness must be '
             'legible in the RESULT, not only in a log line (INV-11)'
         )
     if enumeration.get('complete') is True:
         return
     unreadable = list(enumeration.get('unreadable', ()))
-    raise MetricsError(
+    raise RatchetError(
         'refusing to compare a PARTIAL measurement against the baseline: '
         f'{len(unreadable)} path(s) were skipped -- {unreadable}. A sweep that '
         'skipped files measures LOWER than the truth, so comparing it would '
@@ -1873,14 +1621,14 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
     current_version = _params(current, 'current').get('complexipy_version')
     baseline_version = _params(baseline, 'baseline').get('complexipy_version')
     if current_version != baseline_version:
-        raise MetricsError(
+        raise RatchetError(
             f'complexipy version drift: the baseline was measured with '
             f'{baseline_version!r}, this run used {current_version!r}. Cognitive '
             'numbers are version-dependent -- the same merge_queue.py measures '
             '2031 at 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x -- so a silent '
             'drift rewrites every number at once and leaves the ratchet '
             'comparing two incomparable measurements. Pin the dev group '
-            f'({COMPLEXIPY_REQUIRED}), or regenerate the baseline deliberately '
+            f'({source_measures.COMPLEXIPY_REQUIRED}), or regenerate the baseline deliberately '
             '-- which is a RE-MEASUREMENT, not code growth, and the write gate '
             'cannot tell the difference: every number the new version reads '
             'higher is a raise it will refuse. Pass --authorize-raise with a '
@@ -1894,7 +1642,7 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
     if recorded != live:
         added = [p for p in recorded if p not in live]
         removed = [p for p in live if p not in recorded]
-        raise MetricsError(
+        raise RatchetError(
             'the baseline\'s recorded cluster_paths no longer match '
             f'CLUSTER_PATHS. Recorded but no longer in the cluster: {added}. '
             f'In the cluster but not recorded: {removed}. Editing PRD Appendix A '
@@ -2046,7 +1794,7 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     """Compare a fresh report against the committed baseline. Pure.
 
     Order of operations is deliberate. The three hard-failure preconditions run
-    FIRST and raise ``MetricsError``, so a wrong-version or partial measurement
+    FIRST and raise ``RatchetError``, so a wrong-version or partial measurement
     reports its own named cause instead of a wall of downstream violations that
     would send the reader hunting a regression which does not exist.
 
@@ -2162,6 +1910,22 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _alias_importer_rows(files: dict) -> list[str]:
+    """One row per alias module: its old name, the new name to migrate to, and
+    how many files still import the old one -- the number PRD task eta drives to 0."""
+    rows: dict[str, int] = {}
+    for path, entry in files.items():
+        name = source_measures.src_module_name(path)
+        if name is not None and name in ALIAS_MODULES and 'external_importers' in entry:
+            rows[name] = entry['external_importers']
+    old_width = max(map(len, rows), default=0)
+    new_width = max((len(ALIAS_MODULES[name]) for name in rows), default=0)
+    return [
+        f'  {name:<{old_width}} -> {ALIAS_MODULES[name]:<{new_width}}  {rows[name]:>7}'
+        for name in sorted(rows)
+    ]
+
+
 def _render_table(report: dict, root: Path) -> str:
     """The human-readable measure table printed by ``--report``.
 
@@ -2183,7 +1947,8 @@ def _render_table(report: dict, root: Path) -> str:
         '-' * (width + 36),
     ]
     for path, entry in sorted(files.items()):
-        mi = maintainability_index(_read_source(root, path), path=path)
+        source = source_measures.read_source(root, path)
+        mi = source_measures.maintainability_index(source, path=path)
         lines.append(
             f'{path:<{width}}  {entry["lines"]:>7}  {entry["prose_lines"]:>7}  '
             f'{entry["cognitive"]:>9}  {mi:>6.2f}'
@@ -2196,6 +1961,8 @@ def _render_table(report: dict, root: Path) -> str:
             '',
             f'function_local_imports  {totals["function_local_imports"]:>7}',
             f'reexport_names          {totals["reexport_names"]:>7}',
+            f'external_importers      {totals["external_importers"]:>7}',
+            *_alias_importer_rows(files),
             '',
             f'test suite -- {len(report.get("tests", {}))} lane-importing files '
             f'under {TESTS_ROOT}',
@@ -2244,7 +2011,7 @@ def _build_parser() -> argparse.ArgumentParser:
             'Exit codes: 0 clean; 1 ratchet violations (a measure rose above '
             'the baseline, or a new file/function breached a ceiling); '
             '2 instrument failure (an unparseable cluster file, complexipy '
-            f'missing or outside {COMPLEXIPY_REQUIRED}, a missing or malformed '
+            f'missing or outside {source_measures.COMPLEXIPY_REQUIRED}, a missing or malformed '
             'baseline, or a baseline whose recorded parameters no longer match '
             'this tree). 1 and 2 are deliberately distinct: a broken instrument '
             'must never read as a clean tree or as a real regression.'
@@ -2330,7 +2097,7 @@ def _resolve_authorization(
         )
     try:
         return RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
-    except MetricsError as exc:
+    except RatchetError as exc:
         parser.error(str(exc))
 
 
@@ -2410,7 +2177,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f'  {violation.message}', file=sys.stderr)
         print(RAISE_REMEDY, file=sys.stderr)
         return 1
-    except MetricsError as exc:
+    except source_measures.MetricsError as exc:
         print(f'merge_lane_metrics: {exc}', file=sys.stderr)
         return 2
 

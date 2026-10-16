@@ -1,8 +1,11 @@
 """pytest configuration — ensure local src takes precedence over installed package."""
 import importlib
 import sys
+import tempfile
+from functools import partial
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 # Insert this worktree's src directory at the front of sys.path so that
 # `import shared` loads the local (possibly modified) code rather than
@@ -33,11 +36,24 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
+from session_prebuild import SessionPrebuild  # noqa: E402
+from silent_fallthrough_scan import ParsedFile, parse_first_party_tree  # noqa: E402
+
+from shared import usage_gate  # noqa: E402
+
+_FIRST_PARTY_TREE = SessionPrebuild(
+    'first_party_tree', partial(parse_first_party_tree, REPO_ROOT)
+)
 
 
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+def pytest_collection_finish(session):
+    """Build the first-party tree here: after collection, before any item's pytest-timeout timer."""
+    _FIRST_PARTY_TREE.prebuild_if_requested(session)
 
 
 @pytest.fixture
@@ -93,30 +109,75 @@ def reload_module_under_env(monkeypatch):
 
 
 @pytest.fixture(scope='session')
-def first_party_tree():
+def first_party_tree(request: pytest.FixtureRequest) -> tuple[ParsedFile, ...]:
     """The whole first-party source tree, read and parsed ONCE per session.
 
     The single source every gate module in this directory walks (task 4520).
-    Before it, ``test_silent_fallthrough_gate.tree_scan_data`` and
-    ``test_config_dir_archival_gate._scan`` each did the read+parse privately,
-    so the same 461 files were read twice and parsed three times — and since
-    pytest-timeout arms its timer over the WHOLE runtest protocol
-    (``func_only=False``), that duplicated work was charged to whichever single
-    test item happened to trigger the fixture, producing ERROR-at-setup bursts
-    under load.
+    The one read+parse happens in ``pytest_collection_finish``, and only when a
+    collected item requests this fixture, so it sits outside every item's
+    pytest-timeout timer (see ``session_prebuild``). Under xdist each worker
+    collects every item, so each worker that collects a requester builds its
+    own copy.
 
-    Session-scoped so the cost is paid at most once. The provider is itself
-    memoized on the resolved root, so a direct
-    ``parse_first_party_tree(REPO_ROOT)`` call returns the same object.
+    The provider is memoized on the resolved root, so a direct
+    ``parse_first_party_tree(REPO_ROOT)`` call returns the same object. Its
+    other cost is memory: ~361 MB of ASTs retained until the process exits.
+    ``parse_first_party_tree``'s docstring records both halves and why the trade
+    is currently made in CPU's favour — read it before tuning either.
 
-    That cost has two halves, and this fixture is what makes the second one
-    process-lifetime: ~5s of CPU paid once, and ~361 MB of ASTs retained until
-    the process exits (they were transient before task 4520).
-    ``parse_first_party_tree``'s docstring records both measurements and why
-    the trade is currently made in CPU's favour — read it before tuning either.
-
-    Consumers walk the ASTs READ-ONLY — they are shared with every other gate.
+    Take it as a fixture argument: a dynamic
+    ``request.getfixturevalue('first_party_tree')`` is invisible at collection
+    and fails loudly. Consumers walk the ASTs READ-ONLY — they are shared with
+    every other gate.
     """
-    from silent_fallthrough_scan import parse_first_party_tree
+    return _FIRST_PARTY_TREE.result(request.session)
 
-    return parse_first_party_tree(REPO_ROOT)
+
+@pytest.fixture(scope='session')
+def _usage_gate_sweep_parent(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp('usage-gate-sweep')
+
+
+@pytest.fixture
+def usage_gate_sweep_root(_usage_gate_sweep_parent: Path) -> Path:
+    """The private, initially empty dir every UsageGate probe-dir sweep in this test is confined to.
+
+    Request it to plant dirs the sweep should see.
+    """
+    return Path(tempfile.mkdtemp(dir=_usage_gate_sweep_parent))
+
+
+@pytest.fixture
+def real_probe_dir_sweep() -> bool:
+    """Opt this test out of ``_confine_usage_gate_sweep`` (task 3086).
+
+    The test must itself redirect ``tempfile.gettempdir`` — e.g.
+    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``
+    — because the real sweep deletes under it.
+    """
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _confine_usage_gate_sweep(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-base, not stub, the probe-dir sweep of every UsageGate built in this package.
+
+    ``UsageGate.__init__`` sweeps dead-PID probe dirs under the system tempdir.
+    Confining that sweep for every test means safety no longer rests on which
+    test first set the once-per-process mark. ``real_probe_dir_sweep`` is the
+    escape hatch. ``usage_gate_sweep_root`` is resolved on the first sweep, so a
+    test that builds no gate and does not request it creates no directory.
+    """
+    if 'real_probe_dir_sweep' in request.fixturenames:
+        return
+    real_sweep = usage_gate.sweep_stale_pid_dirs
+
+    def _confined_sweep(prefix: str, **kwargs: Any) -> int:
+        if 'base_dir' not in kwargs:
+            kwargs['base_dir'] = request.getfixturevalue('usage_gate_sweep_root')
+        return real_sweep(prefix, **kwargs)
+
+    monkeypatch.setattr(usage_gate, 'sweep_stale_pid_dirs', _confined_sweep)

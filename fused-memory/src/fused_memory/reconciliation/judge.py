@@ -619,18 +619,17 @@ Review this run and provide your verdict as JSON.
         resume_session_id:`` branch too — both the schema and the system
         prompt survive every resume (cli_invoke.py, task 3983).
 
-        ``disallowed_tools=['*']`` is still passed VERBATIM.  cli_invoke expands
-        the wildcard into ``_REAL_BUILTIN_TOOLS_DENYLIST`` when a schema is
-        present — a list that omits the synthetic ``StructuredOutput`` tool the
-        schema is delivered through — so no real file/bash/web tool access is
-        preserved while the schema tool gets through.  Pre-expanding here would
-        duplicate a list documented as needing to stay in sync with the CLI's
-        built-ins and would skip future central fixes.
+        ``disallowed_tools=['*']`` is still passed VERBATIM.  When a schema is
+        present, cli_invoke replaces the wildcard with ``--tools ''``, the
+        registry filter that leaves only the synthetic ``StructuredOutput`` tool
+        the schema is delivered through.  So no built-in or deferred tool is
+        reachable while the schema tool gets through.  Doing that substitution
+        here would skip future central fixes.
 
         MCP tools are closed SEPARATELY, by ``mcp_config=no_mcp_servers_config()``
-        + ``strict_mcp_config=True``.  The wildcard expansion above covers
-        built-ins ONLY — it carries no MCP tool pattern — so it does NOT deny MCP
-        tools, and ``cwd`` here is the project root, which holds a live
+        + ``strict_mcp_config=True``.  ``--tools ''`` removes built-in and
+        deferred tools but does NOT filter MCP tools, and ``cwd`` here is the
+        project root, which holds a live
         ``.mcp.json`` (servers ``escalation``, ``fused-memory``) that the CLI
         would otherwise ambient-merge and expose under ``bypassPermissions``.
         These two kwargs emit ``--strict-mcp-config`` and scope the run to zero
@@ -653,7 +652,7 @@ Review this run and provide your verdict as JSON.
                 disallowed_tools=['*'],
                 output_schema=JUDGE_VERDICT_SCHEMA,
                 # Closes MCP separately from the wildcard deny above, which the
-                # schema expands into a BUILT-INS-ONLY list. See the docstring:
+                # schema turns into --tools '' (no MCP filter). See the docstring:
                 # must stay truthy, or --strict-mcp-config is never emitted.
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
@@ -799,11 +798,11 @@ Review this run and provide your verdict as JSON.
         #
         # Schema-tool denial first (CLI 2.1.168 regression guard). The verdict
         # contract now rides --json-schema, which is delivered through the
-        # synthetic ``StructuredOutput`` tool that cli_invoke's wildcard expansion
-        # deliberately omits from _REAL_BUILTIN_TOOLS_DENYLIST (:207-226). If a
+        # synthetic ``StructuredOutput`` tool, the one tool cli_invoke's
+        # ``'*'`` -> ``--tools ''`` substitution keeps in the registry. If a
         # future CLI change starts denying that tool, EVERY judge run is starved
-        # of its verdict, and the remedy is specific (fix the cli_invoke
-        # deny-list) — so it gets its own machine-readable code rather than being
+        # of its verdict, and the remedy is specific (fix that substitution in
+        # build_claude_argv) — so it gets its own machine-readable code rather than being
         # folded into the anonymous UNKNOWN dump below.
         #
         # This is the ONLY branch where the check can fire: cli_invoke sets

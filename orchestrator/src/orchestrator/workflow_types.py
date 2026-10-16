@@ -116,6 +116,11 @@ class TerminalReport:
     (``config.auto_eval_phases``) keeps matching plan/execute/verify/review
     blocks instead of seeing the terminal ``'blocked'`` state (REVIEW-CYCLE-1
     fix — see that design decision).
+
+    ``block_category`` is ``_mark_blocked``'s ``category=`` argument — the
+    ESCALATION taxonomy (``'task_failure'``, ``'wip_conflict'``,
+    ``'infra_issue'``, ...), unrelated to ``category`` above — and ``''`` on
+    every exit that did not pass through ``_mark_blocked``.
     """
 
     outcome: WorkflowOutcome
@@ -124,6 +129,7 @@ class TerminalReport:
     detail: str
     category: FailureCategory | None
     blocked_from_phase: WorkflowState | None = None
+    block_category: str = ''
     # Task 2988 (PRD ε / W3): whether this terminal outcome's requeue counts
     # against the per-task requeue cap.  Set from
     # ``BlockDisposition.counts_against_requeue_cap`` at the REQUEUED
@@ -256,6 +262,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
     from shared.cli_invoke import AllAccountsCappedException
     from shared.usage_gate import (
         IllegalTransitionError,
+        PoolFrozen,
         ProbeSpawnError,
         SessionBudgetExhausted,
     )
@@ -304,6 +311,19 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Session budget exhausted',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Raised only to a park=False caller; no orchestrator site opts in
+        # (only scripts/legibility/session_runner.py does), so this row
+        # mirrors AllAccountsCappedException's. Its message names any
+        # AUTH_FAILED accounts, so a credential freeze stays legible in the
+        # block reason without paging a human for an ordinary all-capped pool.
+        PoolFrozen: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Account pool frozen',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── Warm-lane requeue family ─────────────────────────────────────

@@ -54,8 +54,9 @@ unseen here. ``dashboard/data/memory.py::_post`` keeps such cancels out.
 VERIFIED AGAINST httpx 0.28.1 / httpcore 1.0.9 — the same discipline, and the
 same reason, as ``app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS``: this module reads
 attributes those releases do not promise to keep. RE-CHECK AFTER AN UPGRADE.
-:func:`_resolve_pool` is the single place that touches them, and it degrades
-loudly rather than silently if they move.
+:func:`_resolve_pool` is the single place that touches them. If they move, it
+names where the walk broke, and :class:`OrphanReaper` announces it loudly
+rather than going silently inert.
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -117,35 +119,15 @@ class _LatchedWarning:
         logger.warning(message, *args)
 
 
-_shape_guard = _LatchedWarning()
-
-
-def reset_shape_guard() -> None:
-    """Re-arm the once-per-process shape WARNING. For tests.
-
-    Part of this module's interface rather than a private global for tests to
-    poke — the same role ``memory.reset_sessions()`` plays for the session
-    cache. The latch is state this module owns, so clearing it is this
-    module's operation to offer, and a test asserting on the WARNING can do so
-    without depending on whether some other test ran first.
-    """
-    _shape_guard.clear()
-
-
-def _report_unresolved(path: str) -> None:
-    """Announce a pool attribute this module can no longer find.
-
-    Latched, for the reason :class:`_LatchedWarning` gives: this is the one
-    line that turns "the reaper stopped working" from a 32-hour mystery into a
-    grep, so it has to survive weeks of journal, which means it has to be rare.
-    """
-    _shape_guard.fire(
-        'httpx connection pool is not where this module expects it: cannot resolve '
-        'client.%s. The orphan reaper is INERT until this is repaired — see '
-        'dashboard/src/dashboard/http_pool.py for the attributes it reads and the '
-        'httpx/httpcore versions they were verified against.',
-        path,
-    )
+# The one line that turns "the reaper stopped working" from a 32-hour mystery
+# into a grep. Latched, for the reason `_LatchedWarning` gives: it has to
+# survive weeks of journal, which means it has to be rare.
+_UNRESOLVED_POOL_WARNING = (
+    'httpx connection pool is not where this module expects it: cannot resolve '
+    'client.%s. The orphan reaper is INERT until this is repaired — see '
+    'dashboard/src/dashboard/http_pool.py for the attributes it reads and the '
+    'httpx/httpcore versions they were verified against.'
+)
 
 
 @dataclass(frozen=True)
@@ -174,53 +156,31 @@ class PoolCensus:
 # invisible for 32 hours.
 POOL_HIGH_WATER_FRACTION = 0.8
 
-_saturation_alarm = _LatchedWarning()
 
+@dataclass(frozen=True)
+class _UnresolvedPool:
+    """Where the walk from a client to its pool broke.
 
-def reset_saturation_guard() -> None:
-    """Re-arm the saturation alarm. For tests.
-
-    Companion to :func:`reset_shape_guard`, and separate from it on purpose:
-    the two latches answer different questions ("can this module still read the
-    pool?" and "is the pool filling up?"), so a test that wants one in a known
-    state should not have to disturb the other.
+    ``path`` is the attribute path off the client that could not be resolved,
+    e.g. ``'_transport._pool._requests'``.
     """
-    _saturation_alarm.clear()
+
+    path: str
 
 
-def _report_occupancy(reading: PoolCensus) -> None:
-    """Report pool occupancy at or above :data:`POOL_HIGH_WATER_FRACTION`.
-
-    RE-ARMS ON THE WAY BACK DOWN, which is the only thing distinguishing this
-    report from the shape guard's. A pool that saturates, recovers, and
-    saturates again has had two incidents, and the second matters at least as
-    much as the first; a latch that only ever fell one way would report the
-    first episode a process saw and nothing after it.
-
-    The whole census goes in the line, not just the ratio: "80 of 100" does not
-    say whether those are healthy in-flight requests or orphans this module
-    failed to reclaim, and that is the first question an operator asks.
-    """
-    if reading.total < reading.max_connections * POOL_HIGH_WATER_FRACTION:
-        _saturation_alarm.clear()
-        return
-    _saturation_alarm.fire(
-        'httpx connection pool at or above its high-water mark (%.0f%% of capacity): '
-        '%s. Sustained saturation ends in httpx.PoolTimeout, which the dashboard '
-        'renders as an "offline" pill on a healthy orchestrator.',
-        POOL_HIGH_WATER_FRACTION * 100,
-        reading,
-    )
-
-
-def _resolve_pool(client: httpx.AsyncClient) -> httpcore.AsyncConnectionPool | None:
-    """Return *client*'s underlying httpcore pool, or ``None`` if unrecognised.
+def _resolve_pool(
+    client: httpx.AsyncClient,
+) -> httpcore.AsyncConnectionPool | _UnresolvedPool:
+    """Return *client*'s underlying httpcore pool, or where the walk to it broke.
 
     THE ONLY PLACE private attributes are reached. Both the walk
     (``client._transport`` -> ``_pool``) and the shape check live here, so an
     httpx release that relocates either is a single-function repair rather
     than a hunt — and so the rest of the module stays typed, with no
     ``# type: ignore`` scattered across it.
+
+    It reports WHERE the walk broke and logs nothing: announcing that the
+    reaper is inert is :class:`OrphanReaper`'s job.
 
     The shape check is what makes the :func:`cast` honest: every attribute the
     module goes on to read is confirmed present before the pool is handed
@@ -229,16 +189,13 @@ def _resolve_pool(client: httpx.AsyncClient) -> httpcore.AsyncConnectionPool | N
     """
     transport = getattr(client, '_transport', None)
     if transport is None:
-        _report_unresolved('_transport')
-        return None
+        return _UnresolvedPool('_transport')
     pool = getattr(transport, '_pool', None)
     if pool is None:
-        _report_unresolved('_transport._pool')
-        return None
+        return _UnresolvedPool('_transport._pool')
     for attribute in _REQUIRED_POOL_ATTRIBUTES:
         if not hasattr(pool, attribute):
-            _report_unresolved(f'_transport._pool.{attribute}')
-            return None
+            return _UnresolvedPool(f'_transport._pool.{attribute}')
     return cast(httpcore.AsyncConnectionPool, pool)
 
 
@@ -262,16 +219,8 @@ def _orphaned(
     ]
 
 
-def census(client: httpx.AsyncClient) -> PoolCensus | None:
-    """Read *client*'s pool occupancy, or ``None`` if its shape is unrecognised.
-
-    ``None`` rather than a zeroed census: an unreadable pool and an empty one
-    are different facts, and reporting the first as the second would make a
-    broken guard indistinguishable from a healthy system.
-    """
-    pool = _resolve_pool(client)
-    if pool is None:
-        return None
+def _read(pool: httpcore.AsyncConnectionPool) -> PoolCensus:
+    """Read *pool*'s occupancy."""
     connections = list(pool._connections)
     return PoolCensus(
         total=len(connections),
@@ -281,15 +230,29 @@ def census(client: httpx.AsyncClient) -> PoolCensus | None:
     )
 
 
-async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
-    """Close and unpool *client*'s orphaned connections. Returns how many closed.
+def census(client: httpx.AsyncClient) -> PoolCensus | None:
+    """Read *client*'s pool occupancy, or ``None`` if its shape is unrecognised.
+
+    ``None`` rather than a zeroed census: an unreadable pool and an empty one
+    are different facts, and reporting the first as the second would make a
+    broken guard indistinguishable from a healthy system.
+
+    Silent on an unrecognised pool: the ``None`` tells the caller, and
+    announcing it is :class:`OrphanReaper`'s job, not a measuring read's.
+    """
+    pool = _resolve_pool(client)
+    return None if isinstance(pool, _UnresolvedPool) else _read(pool)
+
+
+async def _reap(pool: httpcore.AsyncConnectionPool) -> int:
+    """Close and unpool *pool*'s orphaned connections. Returns how many closed.
 
     FOUR PHASES, AND THE ORDER IS LOAD-BEARING.
 
-    1. SYNCHRONOUS — resolve the pool and decide the doomed set. There is no
-       ``await`` between reading ``_requests`` and fixing that set, so httpcore
-       cannot assign a queued request to one of these connections in between.
-       Without that, the reaper would race live traffic rather than avoid it.
+    1. SYNCHRONOUS — decide the doomed set. There is no ``await`` between
+       reading ``_requests`` and fixing that set, so httpcore cannot assign a
+       queued request to one of these connections in between. Without that,
+       the reaper would race live traffic rather than avoid it.
 
     2. AWAIT — close each doomed connection. ``Exception`` is suppressed per
        connection so one bad close cannot strand the rest; ``BaseException``
@@ -332,10 +295,6 @@ async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
     run ``_assign_requests_to_connections``, which removes a connection this
     sweep has just closed. Already gone is the outcome this phase wanted.
     """
-    pool = _resolve_pool(client)
-    if pool is None:
-        return 0
-
     doomed = _orphaned(pool)
     if not doomed:
         # The overwhelmingly common sweep. Returning here keeps it a pure read:
@@ -369,6 +328,70 @@ async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
     return closed
 
 
+class OrphanReaper:
+    """Sweeps ONE client's pool: reclaims its orphans and reports on that pool.
+
+    Its warn-once latches are its own, not the process's, so each pool's
+    reports hear only that pool. Pinned by
+    ``dashboard/tests/test_http_pool.py::TestPoolSaturationAlarm::test_a_healthy_pools_sweep_does_not_re_arm_a_saturated_pools_alarm``.
+    """
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self._client = client
+        self._shape_guard = _LatchedWarning()
+        self._saturation_alarm = _LatchedWarning()
+
+    async def sweep(self) -> int:
+        """Reap the pool once, then report on what the reap left.
+
+        Returns how many orphans closed cleanly, which :func:`_reap` defines;
+        ``0`` on an unrecognised pool, after announcing it.
+        """
+        pool = _resolve_pool(self._client)
+        if isinstance(pool, _UnresolvedPool):
+            self._shape_guard.fire(_UNRESOLVED_POOL_WARNING, pool.path)
+            return 0
+        reaped = await _reap(pool)
+        # One reading, taken AFTER the reap and shared by both reports below:
+        # post-reap occupancy is the number that actually predicts a wedge, and
+        # two separate readings could disagree.
+        reading = _read(pool)
+        if reaped:
+            # Loud on every reap: at roughly 2/hour, one line each is a usable
+            # history of the defect, and the census in it says whether the
+            # pool is healthy now or filling faster than this sweep empties it.
+            logger.warning(
+                'Reaped %d orphaned pool connection(s); pool now %s', reaped, reading
+            )
+        self._report_occupancy(reading)
+        return reaped
+
+    def _report_occupancy(self, reading: PoolCensus) -> None:
+        """Report pool occupancy at or above :data:`POOL_HIGH_WATER_FRACTION`.
+
+        RE-ARMS ON THE WAY BACK DOWN, which is the only thing distinguishing
+        this report from the shape guard's. A pool that saturates, recovers,
+        and saturates again has had two incidents, and the second matters at
+        least as much as the first; a latch that only ever fell one way would
+        report the first episode this reaper saw and nothing after it.
+
+        The whole census goes in the line, not just the ratio: "80 of 100" does
+        not say whether those are healthy in-flight requests or orphans this
+        module failed to reclaim, and that is the first question an operator
+        asks.
+        """
+        if reading.total < reading.max_connections * POOL_HIGH_WATER_FRACTION:
+            self._saturation_alarm.clear()
+            return
+        self._saturation_alarm.fire(
+            'httpx connection pool at or above its high-water mark (%.0f%% of '
+            'capacity): %s. Sustained saturation ends in httpx.PoolTimeout, which '
+            'the dashboard renders as an "offline" pill on a healthy orchestrator.',
+            POOL_HIGH_WATER_FRACTION * 100,
+            reading,
+        )
+
+
 # How often the background sweep runs, and the arithmetic that sized it.
 #
 # THE LEAK RATE IS MEASURED, not assumed: ~1.9-2.4 orphans/hour in production,
@@ -392,7 +415,10 @@ REAP_INTERVAL_SECONDS = 60.0
 
 
 async def reaper_loop(
-    client: httpx.AsyncClient, interval: float = REAP_INTERVAL_SECONDS
+    client: httpx.AsyncClient,
+    interval: float = REAP_INTERVAL_SECONDS,
+    *,
+    reaper_factory: Callable[[httpx.AsyncClient], OrphanReaper] = OrphanReaper,
 ) -> None:
     """Sweep *client*'s pool for orphans forever, at *interval*.
 
@@ -408,28 +434,15 @@ async def reaper_loop(
 
     Sleeps BEFORE its first sweep: a pool that has served no requests yet can
     hold no orphans, so a sweep at startup could only ever find nothing.
+
+    ONE reaper for the loop's whole life, built by *reaper_factory* from
+    *client*, so its warn-once latches last exactly as long as the loop: a
+    fresh reaper per tick would re-announce a broken pool every *interval*.
     """
+    reaper = reaper_factory(client)
     while True:
         await asyncio.sleep(interval)
         try:
-            reaped = await reap_orphaned_connections(client)
-            # One reading per sweep, taken AFTER the reap and shared by both
-            # reports below: post-reap occupancy is the number that actually
-            # predicts a wedge, and two separate readings could disagree.
-            reading = census(client)
-            if reaped:
-                # Loud on every reap, and it can afford to be: reaps run at
-                # roughly 2/hour, so one line each is a usable history of the
-                # defect rather than a flood. The census makes that one line
-                # answer the follow-up question too — whether the pool is
-                # actually healthy now, or filling faster than this sweep
-                # empties it.
-                logger.warning(
-                    'Reaped %d orphaned pool connection(s); pool now %s',
-                    reaped,
-                    reading,
-                )
-            if reading is not None:
-                _report_occupancy(reading)
+            await reaper.sweep()
         except Exception:
             logger.warning('Orphan reaper sweep failed', exc_info=True)

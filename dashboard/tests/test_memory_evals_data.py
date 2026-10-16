@@ -323,6 +323,10 @@ _PAYLOAD_KEYS = {
     'issue_count',
     'unmatched_escalations',
 }
+# The route's body: the builder's keys plus the ESCALATIONS subsection id where
+# every escalation the payload links lives. The shape layer adds it, because
+# the route, not the builder, knows which corpus queue it read.
+_BODY_KEYS = _PAYLOAD_KEYS | {'escalation_queue'}
 
 
 def _two_eval_tree(tmp_path: Path) -> tuple[Path, Path]:
@@ -3607,7 +3611,7 @@ class TestShapeMemoryEvals:
 
         body = redux_api.shape_memory_evals(**payload)['MEMORY_EVALS']
 
-        assert set(body) == _PAYLOAD_KEYS
+        assert set(body) == _BODY_KEYS
         # Value-for-value, not merely key-for-key: the shape layer reshapes
         # nothing, it only names the slice.
         for key in _PAYLOAD_KEYS:
@@ -3678,7 +3682,8 @@ class TestShapeMemoryEvals:
 
         body = redux_api.shape_memory_evals()['MEMORY_EVALS']
 
-        assert set(body) == _PAYLOAD_KEYS
+        assert set(body) == _BODY_KEYS
+        assert body['escalation_queue'] is None
         assert body['root_present'] is False
         assert body['storm_escape'] is None
         assert body['evals'] == []
@@ -3686,6 +3691,15 @@ class TestShapeMemoryEvals:
         assert body['issue_count'] == 0
         assert body['unmatched_escalations'] == []
         assert body['generated_at'] is None
+
+    def test_escalation_queue_is_emitted_as_given(self) -> None:
+        """The queue the route names reaches the body verbatim, beside the same keys."""
+        from dashboard.data import redux_api
+
+        body = redux_api.shape_memory_evals(escalation_queue='reconciliation')['MEMORY_EVALS']
+
+        assert set(body) == _BODY_KEYS
+        assert body['escalation_queue'] == 'reconciliation'
 
     def test_shape_is_io_free(self, tmp_path: Path, monkeypatch) -> None:
         """No filesystem read in the shape layer — all I/O belongs to the builder.
@@ -4079,7 +4093,7 @@ class TestMemoryEvalsEndpoint:
         body = resp.json()
         assert set(body) == {'MEMORY_EVALS'}
         payload = body['MEMORY_EVALS']
-        assert set(payload) == _PAYLOAD_KEYS
+        assert set(payload) == _BODY_KEYS
         assert payload['root_present'] is True
         assert payload['issue_count'] == len(payload['issues']) == 0
 
@@ -4111,6 +4125,42 @@ class TestMemoryEvalsEndpoint:
         assert alarmed['parity'] == 'alarmed_open'
         assert by_id['canonical-in-top-5']['parity'] == 'clear'
         assert payload['unmatched_escalations'] == []
+
+    def test_escalation_queue_is_the_reconciliation_subsection_escalations_serves(
+        self, client, tmp_path: Path,
+    ) -> None:
+        """MEMORY_EVALS names a queue ESCALATIONS serves, and it is the reconciliation one.
+
+        The client resolves a memory-eval link to a row by ``(queue, id)``
+        (``escalation_focus.js::findEscalationRow``), so this pins the contract
+        that lookup relies on across the two payloads, not a literal.
+        """
+        from unittest.mock import patch
+
+        from _canned_mcp import CannedMCP
+
+        from dashboard.app import _memory_evals_cache_clear
+        from dashboard.data import escalation_corpus
+
+        config = _route_tree(tmp_path)
+        client.app.state.config = config
+        _memory_evals_cache_clear()
+        escalation_corpus._corpus_cache_clear()
+
+        queue = client.get(_ROUTE_URL).json()['MEMORY_EVALS']['escalation_queue']
+        with patch('dashboard.data.tasks.mcp_tool_call', new=CannedMCP(status_page_size=2000)):
+            resp = client.get('/api/v2/dashboard/escalations')
+        escalation_corpus._corpus_cache_clear()
+
+        assert resp.status_code == 200
+        subsections = resp.json()['ESCALATIONS']['subsections']
+        named = [sub for sub in subsections if sub['id'] == queue]
+        assert len(named) == 1, (
+            f'MEMORY_EVALS.escalation_queue={queue!r} names '
+            f'{len(named)} of the served subsections {[sub["id"] for sub in subsections]}'
+        )
+        assert named[0]['kind'] == 'reconciliation'
+        assert [row['id'] for row in named[0]['escalations']] == ['esc-eval-1']
 
     def test_malformed_artifact_never_500s_and_is_counted(self, client, tmp_path: Path) -> None:
         """The row-9 contract, for this route: degrade loudly, never crash.

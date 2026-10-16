@@ -2,10 +2,12 @@
 """Audit the blast radius of the curator-combine ``metadata`` wipe.
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
-a ticket record, or a manifest file. Every database connection it opens is a
-read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
-so the sweep is structurally incapable of writing to the live WAL databases
-the running orchestrator holds open. Manifest YAML on disk is only ever read.
+a ticket record, or a manifest file. Every database connection it opens is
+read-only: the task store goes through ``_task_db_scan.py::connect_ro``, and
+tickets.db through a read-only SQLite URI
+(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
+structurally incapable of writing to the live WAL databases the running
+orchestrator holds open. Manifest YAML on disk is only ever read.
 There is no ``--apply`` flag and no MCP client is ever constructed.
 REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — backfilling a lost key from
 this report is never done by this script (the audit/repair split of tasks
@@ -57,6 +59,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+import _checkout as _checkout
+
 # Tier 1 (tasks.db discovery) and Tier 3 (audit-script CLI plumbing: the roots
 # loop, the warn-and-continue skip, the exit-code ladder and the two reporting
 # layout primitives), imported as a flat sibling and shared with
@@ -80,28 +84,18 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    connect_ro,
     decode_metadata,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
     tasks_db_path,
 )
-
-# Bind `shared` to the SAME checkout as this script via a __file__-relative
-# path, never a hardcoded absolute. An editable install puts the MAIN
-# checkout's shared/src on sys.path for a bare `python3`, so without this a
-# copy of this script running from a worktree would validate manifests using
-# the MAIN checkout's schema. Same reasoning and same form as
-# repair_wiped_metadata_files.py:65-75 (tasks 2881/2882/3329). The
-# shared.capability_manifest import below MUST stay after this insert.
-_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
-
-from shared.capability_manifest import (  # noqa: E402
+from shared.capability_manifest import (
     MECHANICAL_CHECK_KINDS,
     load_capability_manifest,
 )
+from shared.project_id import project_id_for_root
 
 # The curator verdict this audit is about. The sibling verdict is 'create',
 # which files a NEW task and wipes nothing.
@@ -138,14 +132,12 @@ def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTar
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
-    Opens the database via a read-only URI (``mode=ro``) so the load is
-    structurally incapable of mutating live task records even while
-    fused-memory holds the same file open in WAL mode. Closed in a
-    ``try/finally`` and never a ``with`` block — a sqlite3 ``with`` is a
-    TRANSACTION, not a close.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Closed in a ``try/finally`` and never a ``with`` block — a
+    sqlite3 ``with`` is a TRANSACTION, not a close.
     """
     targets: dict[tuple[str, int], CombineTarget] = {}
-    conn = sqlite3.connect(f"file:{tasks_db_path}?mode=ro", uri=True)
+    conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
         for tag, task_id, status, metadata in cursor:
@@ -527,13 +519,15 @@ def classify_gap(key: str, expected_value: object) -> tuple[str, str]:
 def resolve_project_id(project_root: str, override: str | None = None) -> str:
     """Derive the tickets.db ``project_id`` for *project_root*.
 
-    ``/home/leo/src/dark-factory`` -> ``dark_factory``: the directory name with
-    ``-`` mapped to ``_``. *override* wins outright when supplied, which is the
-    escape hatch for a project whose directory name does not match its id.
+    ``/home/leo/src/dark-factory`` -> ``dark_factory``: the one project-id rule,
+    ``shared.project_id.project_id_for_root``, over the directory
+    *project_root* names, resolved, so ``.`` is the cwd's id.
+    *override* wins outright when supplied, which is the escape hatch for a
+    project whose directory name does not match its id.
     """
     if override:
         return override
-    return Path(project_root).name.replace("-", "_")
+    return project_id_for_root(Path(project_root).resolve())
 
 
 def _distinct_ticket_project_ids(tickets_db_path: str) -> set[str]:
@@ -1146,7 +1140,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
     """Audit ONE project root under the (possibly overridden) project_id.
 
-    Raises ``sqlite3.Error`` for an unreadable project, which is what
+    Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` for an
+    unreadable project, which is what
     :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
     other exception propagates. Returns exactly one audit, per that function's
     one-audit-per-root contract.

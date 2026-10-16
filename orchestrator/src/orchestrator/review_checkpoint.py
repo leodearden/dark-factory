@@ -9,7 +9,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AllAccountsCappedException,
+    classify_cap_kill,
+    invoke_with_cap_retry,
+)
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
@@ -188,7 +192,10 @@ class ReviewCheckpoint:
 
         # Phase 1: mechanical verification
         logger.info('Review [%s]: Phase 1 — running full verification', review_id)
-        phase1 = await run_full_verification(self.config.project_root, self.config)
+        # A periodic project-wide review of the main checkout, not a task's verify: it queues as background.
+        phase1 = await run_full_verification(
+            self.config.project_root, self.config, role='background', event_store=self.event_store,
+        )
         logger.info('Review [%s]: Phase 1 complete — %s', review_id, phase1.summary)
 
         # Load review briefing
@@ -230,6 +237,7 @@ class ReviewCheckpoint:
             event_store=self.event_store,
             cost_store=self.cost_store,
         )
+        backend = getattr(self.config.backends, 'deep_reviewer', 'claude')
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -245,7 +253,7 @@ class ReviewCheckpoint:
                 disallowed_tools=DEEP_REVIEWER.disallowed_tools or None,
                 mcp_config=mcp_config,
                 effort=decision.effort,
-                backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
+                backend=backend,
             )
         except AllAccountsCappedException as e:
             # BD-1: the reason text is single-sourced from the SAME
@@ -280,7 +288,13 @@ class ReviewCheckpoint:
             try:
                 # Report the RESOLVED model (task η) — diverges from raw
                 # config.models.deep_reviewer under a policy rule / override.
+                # `model` is that routing-resolved lineage alias; `model_id` is
+                # the exact version the CLI actually served (task 4826).
                 model_name = decision.model
+                capped_reason = classify_cap_kill(
+                    result, budget_usd=decision.budget_usd, max_turns=decision.max_turns,
+                    backend=backend,
+                )
                 await self.cost_store.save_invocation(
                     run_id=self.run_id,
                     task_id=None,
@@ -294,7 +308,9 @@ class ReviewCheckpoint:
                     cache_read_tokens=result.cache_read_tokens,
                     cache_create_tokens=result.cache_create_tokens,
                     duration_ms=elapsed_ms,
-                    capped=False,
+                    capped=capped_reason is not None,
+                    capped_reason=capped_reason,
+                    model_id=result.model_id,
                     started_at=started_at,
                     completed_at=completed_at,
                 )

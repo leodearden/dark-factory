@@ -15,6 +15,13 @@ docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
 to ``action="create"`` so task creation is never blocked.
 
+A timed-out LLM call is classified from its own transcript when the curator is gated
+(task 3995): a pre-turn stall (0 assistant turns) degrades to create and files a ZOT
+escalation that folds into one record per project; a run killed with progress returns
+a verdict the CLI accepted (its ``structured_output`` attachment) if the transcript
+holds one, else escalates with its real turn count and tool sequence; any non-schema
+tool use logs a loud WARNING. A schema-tool denial is always escalated, never salvaged.
+
 Batch API (task 924)
 --------------------
 :meth:`TaskCurator.curate_batch` is the preferred entry point for the ticket worker:
@@ -30,6 +37,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid as uuid_mod
 from collections.abc import Callable, Iterable, Mapping
@@ -41,8 +49,19 @@ from typing import TYPE_CHECKING, Any, Literal
 from shared.cli_invoke import (
     AgentResult,
     AllAccountsCappedException,
+    TranscriptEvidence,
+    claude_binary_spec,
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    no_mcp_servers_config,
+    resolve_claude_binary,
+    transcript_evidence_for_session,
+)
+from shared.config_dir import (
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
@@ -57,6 +76,7 @@ from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -88,6 +108,10 @@ class CuratorFailureError(RuntimeError):
     ``StructuredOutput`` schema tool was permission-denied (a systemic deny-list
     break, not a flaky candidate).  When set, :class:`CuratorEscalator` raises a
     distinct, un-suppressed escalation so the deny-list gets fixed promptly.
+
+    On a killed run ``turns`` and ``cost_usd`` are empty-stdout defaults, so
+    ``transcript_turns`` is the observation, and ``tools_used`` lists the
+    non-schema tools the call's transcript recorded (None when it was not read).
     """
 
     def __init__(
@@ -102,6 +126,8 @@ class CuratorFailureError(RuntimeError):
         proc_tree: str = '',
         account_name: str = '',
         cost_usd: float | None = None,
+        transcript_turns: int | None = None,
+        tools_used: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
@@ -112,6 +138,24 @@ class CuratorFailureError(RuntimeError):
         self.proc_tree = proc_tree
         self.account_name = account_name
         self.cost_usd = cost_usd
+        self.transcript_turns = transcript_turns
+        self.tools_used = tools_used
+
+
+_EXCEPTION_SUMMARY_MAX_CHARS = 120
+
+
+def exception_summary(exc: BaseException) -> str:
+    """How an exception is written into a decision justification or a ticket reason.
+
+    ``<ExcType>: <first line of the message>``, the line cut to
+    ``_EXCEPTION_SUMMARY_MAX_CHARS``: diagnostic enough to name a missing
+    binary, yet bounded, so identical failures group under one reason.
+    """
+    lines = str(exc).strip().splitlines()
+    first_line = lines[0][:_EXCEPTION_SUMMARY_MAX_CHARS] if lines else ''
+    name = type(exc).__name__
+    return f'{name}: {first_line}' if first_line else name
 
 
 # 'drop', 'combine' and 'create' are the only actions the LLM may request — see
@@ -144,6 +188,72 @@ if DEFAULT_PRIORITY not in _PRIORITY_RANK:
 # best-effort path — a real behavioural regression — so we override with a short
 # minutes-scale bound that preserves the fast-fail/defer contract.
 _CURATOR_CAP_WAIT_SANITY_SECS = 120.0  # 2 minutes; override for shared 14-day default
+
+# Stem of a gated curator's per-process CLAUDE_CONFIG_DIR. The dead-PID sweep
+# builds its prefix from the same constant, so the two cannot drift apart.
+_CONFIG_DIR_TASK_PREFIX = 'fm-curator-'
+
+
+def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
+    """Reclaim curator config dirs whose owning process is dead. Never raises."""
+    prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
+    sweep_stale_pid_dirs_once(
+        prefix,
+        sweep=sweep_stale_pid_dirs,
+        on_reclaimed=lambda reclaimed: logger.info(
+            'TaskCurator: reclaimed %d stale config dir(s) under %s (dead-PID sweep)',
+            reclaimed, prefix,
+        ),
+        on_failure=lambda _exc: logger.warning(
+            'TaskCurator: dead-PID sweep of %s failed; continuing without it',
+            prefix, exc_info=True,
+        ),
+        base_dir=base_dir,
+    )
+
+
+@dataclass(frozen=True)
+class _TranscriptScope:
+    """Where one gated curator call's transcript lands, and its first-turn grace.
+
+    config_dir and session_id together make ``transcript_turns`` stampable,
+    which is what makes ``is_zero_output_timeout`` transcript-authoritative.
+    The grace equals the call's own timeout because the curator's measured
+    first-turn latency tail exceeds the 120s default (task 3995 plan).
+    """
+
+    config_dir: TaskConfigDir
+    session_id: str
+    startup_grace_secs: float
+
+    def as_invoke_kwargs(self) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that thread this scope."""
+        return {
+            'config_dir': self.config_dir,
+            'session_id': self.session_id,
+            'startup_grace_secs': self.startup_grace_secs,
+        }
+
+
+def _salvageable_verdict(
+    agent_result: AgentResult, evidence: TranscriptEvidence | None,
+) -> dict | None:
+    """The verdict a failed call may be salvaged with, else None.
+
+    Only a run that was KILLED (so its stdout never arrived) after the CLI
+    accepted its verdict qualifies. Any other failure's stdout was already
+    parsed by ``_parse_claude_output``, which owns stdout salvage, and a denied
+    schema tool must reach its loud escalation.
+    """
+    if (
+        not agent_result.timed_out
+        or agent_result.schema_tool_denied
+        or agent_result.structured_output is not None
+        or evidence is None
+    ):
+        return None
+    return evidence.accepted_schema_payload
+
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
@@ -330,6 +440,16 @@ class CuratorDecision:
     # candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
+    # True for a fail-open create that no dedupe judgement stands behind: the
+    # response itself was unusable, or the curator never got one. False for a
+    # usable decision that POOL STATE vetoed. Every fail-open create states it
+    # explicitly, as enforced (with the classification rule spelled out) by
+    # fused-memory/tests/test_curator_arm_instrumentation_guard.py.
+    degraded: bool = False
+    # Structured signal that dedupe was silently skipped for this create by a
+    # zero-output hang; never derived from ``justification``, which is shared.
+    degraded_by_zot: bool = False
+    zot_escalation_id: str | None = None
 
     def to_log_fields(self) -> dict[str, Any]:
         return {
@@ -635,6 +755,20 @@ def normalize_title(title: str | None) -> str:
     return ' '.join((title or '').strip().lower().split())
 
 
+def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
+    """Compose the text every curator corpus embedding is computed over.
+
+    Single owner: a caller comparing cosine scores against stored tasks must
+    compose its query with this, or the scores are not comparable.
+    """
+    parts = [title]
+    if description:
+        parts.append(description)
+    if files_to_modify:
+        parts.append('\n'.join(files_to_modify))
+    return '\n\n'.join(parts)
+
+
 def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
     """Compute a scaled LLM budget clamped at ``cap``.
 
@@ -647,6 +781,19 @@ def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float
     constant is tuned.
     """
     return min(base + per_entry * size, cap)
+
+
+@dataclass
+class _DegradedStreak:
+    """One project's run of consecutive degraded curations.
+
+    ``alarm_fired`` latches so a streak escalates once, not once per curation
+    past the threshold; the whole record is discarded on that project's next
+    usable decision.
+    """
+
+    count: int = 0
+    alarm_fired: bool = False
 
 
 class _LazyRegistry:
@@ -734,13 +881,11 @@ class _LazyRegistry:
                     try:
                         self._entries = await asyncio.to_thread(loader, path)
                     except Exception as exc:
-                        # The loader documents "never raises", but
-                        # asyncio.to_thread adds a raise path (thread-pool
-                        # failure, or an exception type the loader's own
-                        # internal except does not cover — e.g. a registry
-                        # that is not valid UTF-8 raises UnicodeDecodeError,
-                        # a ValueError, not an OSError) that no loader-
-                        # internal except can ever cover. Fail OPEN (guard
+                        # The loaders never raise (their file-level contract is
+                        # fused_memory/utils/safe_yaml.py::load_yaml_list_file),
+                        # but asyncio.to_thread adds a raise path of its own
+                        # (thread-pool failure or shutdown) that no loader-
+                        # internal except can cover. Fail OPEN (guard
                         # disabled) rather than escaping into curate() /
                         # curate_batch_prepared, which call the guard
                         # methods unguarded — an escape would fail the whole
@@ -773,13 +918,19 @@ class TaskCurator:
         cwd: Path | None = None,
         escalator: CuratorEscalator | None = None,
         prompt_store: PromptArtifactStore | None = None,
+        config_dir_base: Path | None = None,
+        cost_store: CostStore | None = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._cwd = cwd
         self._escalator = escalator
         self._prompt_store = prompt_store
+        # Parent of the per-process config dir; None means the system tempdir.
+        self._config_dir_base = config_dir_base
+        self._config_dir: TaskConfigDir | None = None  # lazy, gated only
         self._qdrant_client = None  # AsyncQdrantClient, lazy
         self._embedder = None  # OpenAIEmbedder, lazy
         self._initialized_collections: set[str] = set()
@@ -816,6 +967,13 @@ class TaskCurator:
         self._consecutive_zero_output_timeouts: int = 0
         # monotonic() time until which the breaker is open (None = closed).
         self._zero_output_breaker_open_until: float | None = None
+        # Degraded-curation streaks by project_id (task 4448). Distinct from
+        # the ZOT counter above: that one counts hung calls in order to stop
+        # paying for them; these count degraded decisions of every cause, in
+        # order to make a sustained outage visible. Keyed by project because
+        # one curator serves every project, so a shared count would let one
+        # project's healthy curations mask another's outage.
+        self._degraded_streaks: dict[str, _DegradedStreak] = {}
 
     # ------------------------------------------------------------------
     # Zero-output-timeout circuit breaker (task 1743)
@@ -938,18 +1096,6 @@ class TaskCurator:
             logger.info('Created task curator collection: %s', name)
         self._initialized_collections.add(name)
         return name
-
-    @staticmethod
-    def _embedding_text(
-        title: str, description: str, files_to_modify: list[str],
-    ) -> str:
-        """Text used for embedding — title + description + file list."""
-        parts = [title]
-        if description:
-            parts.append(description)
-        if files_to_modify:
-            parts.append('\n'.join(files_to_modify))
-        return '\n\n'.join(parts)
 
     # ------------------------------------------------------------------
     # Public API
@@ -1187,9 +1333,9 @@ class TaskCurator:
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
         - The registry file is missing, unreadable, or unparseable, or the
-          offloaded load raised — for example a registry file that is not
-          valid UTF-8 (one WARNING logged; the guard then stays disabled for
-          this TaskCurator instance rather than retrying per call). This is
+          offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per
+          call). This is
           deliberate even for a cause that is transient in principle (a
           partially-written file observed mid-deploy, a momentary worker
           thread I/O error): :class:`_LazyRegistry.entries`'s
@@ -1507,6 +1653,128 @@ class TaskCurator:
         )
         return decision
 
+    # ------------------------------------------------------------------
+    # Backend-binary startup self-check (task 4448)
+    # ------------------------------------------------------------------
+
+    async def startup_self_check(self, project_id: str, project_root: str) -> bool:
+        """Report whether the curator's backend CLI binary resolves. Never raises.
+
+        An unresolvable binary degrades every curation; asking once at wiring
+        time escalates it before the first candidate is filed. A verdict, not
+        a precondition: a curator without its binary still fails open to
+        ``action='create'``, whereas raising would reach the interceptor's
+        ``except Exception -> return None`` and disable dedupe outright.
+        """
+        spec = claude_binary_spec()
+        resolved = resolve_claude_binary()
+        if resolved is not None:
+            logger.info(
+                'task_curator: backend binary %r resolves to %s', spec, resolved,
+            )
+            return True
+
+        search_path = os.environ.get('PATH', '')
+        logger.error(
+            'task_curator: backend binary %r does not resolve (PATH=%s) — every '
+            'curation for project %s will degrade to action=create WITHOUT '
+            'dedupe until this is fixed. Set CLAUDE_BINARY to an absolute path, '
+            'or pin Environment=PATH= in the fused-memory systemd unit.',
+            spec, search_path, project_id,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_backend_binary_unresolvable(
+                project_root=project_root,
+                project_id=project_id,
+                binary_spec=spec,
+                search_path=search_path,
+            )
+        return False
+
+    # ------------------------------------------------------------------
+    # Class-agnostic degraded-streak alarm (task 4448)
+    # ------------------------------------------------------------------
+
+    def _reset_degraded_streak(self, project_id: str) -> None:
+        """Clear *project_id*'s streak and re-arm its alarm, on a usable decision."""
+        self._degraded_streaks.pop(project_id, None)
+
+    async def _degraded_create(
+        self,
+        *,
+        justification: str,
+        pool_sizes: dict[str, int],
+        start: float,
+        candidate: CandidateTask,
+        project_id: str,
+        project_root: str,
+        degraded_by_zot: bool = False,
+        zot_escalation_id: str | None = None,
+    ) -> CuratorDecision:
+        """Build a degraded ``action='create'`` decision and count it.
+
+        The only ``TaskCurator`` method that builds a create of its own, which
+        is what lets the streak be counted without enumerating why a curation
+        can degrade; fused-memory/tests/test_curator_arm_instrumentation_guard.py
+        enforces that. Degrading is the designed fail-open, so this neither
+        raises nor alters the decision; it only notices when degrading has
+        stopped being occasional.
+        """
+        decision = CuratorDecision(
+            action='create',
+            justification=justification,
+            pool_sizes=pool_sizes,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            degraded=True,
+            degraded_by_zot=degraded_by_zot,
+            zot_escalation_id=zot_escalation_id,
+        )
+        await self._count_degraded(
+            justification=justification,
+            project_id=project_id,
+            project_root=project_root,
+            candidate_title=candidate.title,
+        )
+        return decision
+
+    async def _count_degraded(
+        self,
+        *,
+        justification: str,
+        project_id: str,
+        project_root: str,
+        candidate_title: str,
+    ) -> None:
+        """Advance *project_id*'s streak by one degraded curation, alarming once.
+
+        Shared by :meth:`_degraded_create` (single-candidate paths) and by
+        :meth:`_call_llm_batch` (items a successful round-trip nonetheless
+        failed to decide).  The alarm is class-agnostic by construction: it
+        takes only the fact that a curation degraded, never the reason.
+        """
+        streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
+        streak.count += 1
+        threshold = self._config.curator.degraded_streak_threshold
+        if streak.count < threshold or streak.alarm_fired:
+            return
+
+        streak.alarm_fired = True
+        logger.error(
+            'task_curator: %d consecutive degraded curations for project %s '
+            '(threshold %d) — every candidate in that run was filed without '
+            'dedupe. Last: %s',
+            streak.count, project_id, threshold, justification,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_consecutive_degraded(
+                project_root=project_root,
+                project_id=project_id,
+                streak=streak.count,
+                threshold=threshold,
+                last_justification=justification,
+                candidate_title=candidate_title,
+            )
+
     async def curate(
         self,
         candidate: CandidateTask,
@@ -1597,11 +1865,14 @@ class TaskCurator:
                 candidate.title,
                 self._consecutive_zero_output_timeouts,
             )
-            return CuratorDecision(
-                action='create',
+            return await self._degraded_create(
                 justification='zero-output-breaker-open',
                 pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
+                degraded_by_zot=True,
             )
 
         if prepared is not None and prepared.corpus_error is None:
@@ -1619,13 +1890,15 @@ class TaskCurator:
                     exc,
                     exc_info=True,
                 )
-                decision = CuratorDecision(
-                    action='create',
-                    justification=f'corpus-failed: {exc}',
+                decision = await self._degraded_create(
+                    justification=f'corpus-failed: {exception_summary(exc)}',
                     pool_sizes={
                         'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
                     },
-                    latency_ms=int((time.monotonic() - start) * 1000),
+                    start=start,
+                    candidate=candidate,
+                    project_id=project_id,
+                    project_root=project_root,
                 )
                 self._store_cache(payload_hash, decision)
                 return decision
@@ -1643,6 +1916,17 @@ class TaskCurator:
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
             self._reset_zero_output_breaker()
+            # A completed call can still carry no usable decision (the parser
+            # fails open without raising), so the streak keys on the decision.
+            if decision.degraded:
+                await self._count_degraded(
+                    justification=decision.justification,
+                    project_id=project_id,
+                    project_root=project_root,
+                    candidate_title=candidate.title,
+                )
+            else:
+                self._reset_degraded_streak(project_id)
         except AllAccountsCappedException as exc:
             logger.warning(
                 'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
@@ -1657,16 +1941,19 @@ class TaskCurator:
                     timed_out=False,
                     duration_ms=int(exc.elapsed_secs * 1000),
                 )
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification='all-accounts-capped',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
         except CuratorFailureError as exc:
+            zot_escalation_id: str | None = None
             if self._escalator is not None:
                 # May re-raise CuratorFailureError on the interactive path.
-                await self._escalator.report_failure(
+                zot_escalation_id = await self._escalator.report_failure(
                     project_root=project_root,
                     project_id=project_id,
                     justification=str(exc),
@@ -1680,6 +1967,8 @@ class TaskCurator:
                     subtype=exc.subtype,
                     cost_usd=exc.cost_usd,
                     pool_sizes=pool_sizes,
+                    transcript_turns=exc.transcript_turns,
+                    tools_used=exc.tools_used,
                 )
             else:
                 logger.warning(
@@ -1692,21 +1981,46 @@ class TaskCurator:
                 # from when the failure was observed, not from before the
                 # (potentially 180s) hung LLM call started.
                 self._record_zero_output_timeout(time.monotonic())
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification='llm-error-escalated',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
+                degraded_by_zot=exc.zero_output_timeout,
+                zot_escalation_id=zot_escalation_id if exc.zero_output_timeout else None,
             )
         except Exception as exc:
+            # An exception class nobody anticipated: degrade AND report, like
+            # the named arms. A silent create here is indistinguishable
+            # downstream from a healthy one.
             logger.warning(
-                'task_curator: LLM call failed, falling through to create: %s', exc,
+                'task_curator: LLM call failed with unexpected %s, '
+                'falling through to create: %s',
+                type(exc).__name__,
+                exc,
+                exc_info=True,
             )
-            decision = CuratorDecision(
-                action='create',
-                justification=f'llm-failed: {exc}',
+            if self._escalator is not None:
+                # Unguarded on purpose, as in the CuratorFailureError arm: with
+                # no orchestrator to escalate to, report_failure raises
+                # CuratorFailureError and the caller sees a loud failure.
+                await self._escalator.report_failure(
+                    project_root=project_root,
+                    project_id=project_id,
+                    justification=f'unexpected-exception: {type(exc).__name__}: {exc}',
+                    candidate_title=candidate.title,
+                    subtype=f'unexpected-exception:{type(exc).__name__}',
+                    pool_sizes=pool_sizes,
+                )
+            decision = await self._degraded_create(
+                justification=f'llm-failed: {exception_summary(exc)}',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
 
         self._store_cache(payload_hash, decision)
@@ -2025,20 +2339,21 @@ class TaskCurator:
         # and size-1 alike — not just the size-1 successes handled by
         # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
-            batch_breaker_now = time.monotonic()
             logger.warning(
                 'curate_batch: zero-output-breaker open — short-circuiting %d '
                 'LLM-bound candidate(s) to create (consecutive ZOTs=%d)',
                 len(llm_k_list),
                 self._consecutive_zero_output_timeouts,
             )
-            _empty_pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
             for _k in llm_k_list:
-                cache_hit_map[_k] = CuratorDecision(
-                    action='create',
+                cache_hit_map[_k] = await self._degraded_create(
                     justification='zero-output-breaker-open',
-                    pool_sizes=_empty_pool_sizes,
-                    latency_ms=int((batch_breaker_now - start) * 1000),
+                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    start=start,
+                    candidate=candidates[unique_indices[_k]],
+                    project_id=project_id,
+                    project_root=project_root,
+                    degraded_by_zot=True,
                 )
             llm_k_list = []
 
@@ -2148,7 +2463,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2264,7 +2579,7 @@ class TaskCurator:
 
         Args:
             query: Free-text query, embedded as-is (NOT passed through
-                ``_embedding_text``, which composes stored-task fields).
+                ``embedding_text``, which composes stored-task fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
@@ -2349,7 +2664,7 @@ class TaskCurator:
 
             description = str(task.get('description', '') or '')
             files = _task_files(task)
-            text = self._embedding_text(title, description, files)
+            text = embedding_text(title, description, files)
 
             try:
                 async with sem:
@@ -2607,7 +2922,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2802,6 +3117,108 @@ class TaskCurator:
     # LLM call
     # ------------------------------------------------------------------
 
+    def _transcript_config_dir(self) -> TaskConfigDir | None:
+        """This process's curator config dir, or None when there is no UsageGate.
+
+        Gate-less, no per-call OAuth token is passed, so the CLI needs the login
+        in its default config dir, which an isolated one would hide. Concurrent
+        gated calls share this dir safely: each authenticates from its own
+        ``CLAUDE_CODE_OAUTH_TOKEN``, never from the ``.credentials.json`` they
+        all rewrite (``shared/tests/test_config_dir_credentials_live.py``).
+        """
+        if self._usage_gate is None:
+            return None
+        if self._config_dir is None:
+            _sweep_stale_curator_config_dirs_once(self._config_dir_base)
+            self._config_dir = TaskConfigDir(
+                f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
+            )
+        return self._config_dir
+
+    def _ledger_kwargs(self, role: str) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
+
+        ``run_id`` is read from the gate, so curator invocations and the gate's
+        own account events share one run key.
+        """
+        run_id = (self._usage_gate.run_id or '') if self._usage_gate is not None else ''
+        return {'cost_store': self._cost_store, 'role': role, 'run_id': run_id}
+
+    def _transcript_scope(self, timeout_seconds: float) -> _TranscriptScope | None:
+        """A fresh transcript scope for one call, or None when there is no UsageGate."""
+        config_dir = self._transcript_config_dir()
+        if config_dir is None:
+            return None
+        return _TranscriptScope(config_dir, str(uuid_mod.uuid4()), timeout_seconds)
+
+    async def _read_failure_evidence(
+        self, transcript_scope: _TranscriptScope,
+    ) -> TranscriptEvidence | None:
+        """What a failed call's own transcript recorded, or None when unknown.
+
+        Reads once per failed call, off the event loop (a bisected batch fails
+        as several concurrent calls), and never raises: a transcript fault must
+        not replace the LLM failure on the synchronous add_task path.
+        """
+        session_id = transcript_scope.session_id
+        try:
+            evidence = await asyncio.to_thread(
+                transcript_evidence_for_session, transcript_scope.config_dir.path, session_id,
+            )
+        except Exception:
+            logger.warning(
+                'TaskCurator: could not read the transcript of failed session %s; '
+                'reporting the failure without it', session_id, exc_info=True,
+            )
+            return None
+        if evidence is not None and evidence.other_tool_uses:
+            logger.warning(
+                'TaskCurator: pure-classifier contract violated: failed session %s '
+                'used tools %s over %d assistant turn(s), but its registry should '
+                "hold only StructuredOutput. Check the schema + '*' -> --tools '' "
+                'substitution in shared.cli_invoke.build_claude_argv.',
+                session_id, list(evidence.other_tool_uses), evidence.assistant_turns,
+            )
+        return evidence
+
+    async def _resolve_failed_result(
+        self, agent_result: AgentResult, transcript_scope: _TranscriptScope | None,
+    ) -> tuple[AgentResult, TranscriptEvidence | None]:
+        """Read a failed call's transcript evidence, and salvage its verdict if allowed.
+
+        Returns ``(result, evidence)``. A successful or gate-less result comes
+        back unchanged and unread. A failed gated one gets ONE evidence read,
+        for reporting.
+        Salvage is only for a run KILLED after the CLI accepted its verdict (the
+        transcript's ``structured_output`` attachment). The result then becomes
+        a success carrying that verdict, which meets exactly the parsing and
+        validation a returned one does. A denied or non-kill failure is never
+        salvaged.
+
+        Known limitation: when ``invoke_with_cap_retry`` re-mints the session id
+        for a fresh retry (after a cap hit or a pre-turn rejection,
+        ``_reset_for_fresh_retry``), the curator's session id names an EARLIER
+        attempt. Evidence is then absent or stale. That can only cause a missed
+        salvage, never a false one, since a capped or rejected attempt has no
+        acceptance record.
+        """
+        if agent_result.success or transcript_scope is None:
+            return agent_result, None
+        evidence = await self._read_failure_evidence(transcript_scope)
+        verdict = _salvageable_verdict(agent_result, evidence)
+        if verdict is None:
+            return agent_result, evidence
+        logger.warning(
+            'TaskCurator: salvaged an accepted verdict from the transcript of killed '
+            'session %s (subtype=%s, transcript_turns=%s); stdout never delivered it: %.300s',
+            transcript_scope.session_id, agent_result.subtype,
+            agent_result.transcript_turns, json.dumps(verdict, default=str),
+        )
+        salvaged = replace(
+            agent_result, success=True, structured_output=verdict, schema_salvaged=True,
+        )
+        return salvaged, evidence
+
     async def _call_llm(
         self,
         candidate: CandidateTask,
@@ -2836,6 +3253,7 @@ class TaskCurator:
             self._config.curator.single_call_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+        transcript_scope = self._transcript_scope(self._config.curator.timeout_seconds)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2856,18 +3274,26 @@ class TaskCurator:
             # headroom for harder combine-vs-create decisions.
             max_turns=self._config.curator.max_turns,
             max_budget_usd=budget,
-            disallowed_tools=['*'],  # no tool access — this is a pure classifier
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
+            disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **self._ledger_kwargs('task_curator'),
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
                 f'curator LLM call failed: output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -2880,6 +3306,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         return _parse_decision(
@@ -2941,6 +3369,7 @@ class TaskCurator:
             self._config.curator.batch_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_BATCH_SPEC)
+        transcript_scope = self._transcript_scope(timeout)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2952,19 +3381,27 @@ class TaskCurator:
             model=self._config.curator.model,
             max_turns=max_turns,
             max_budget_usd=budget,
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
             disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **self._ledger_kwargs('task_curator_batch'),
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
                 f'curator batch LLM call failed: batch_size={n} '
                 f'output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -2977,6 +3414,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         # Success: a real LLM round-trip completed, so the service is not
@@ -2986,10 +3425,9 @@ class TaskCurator:
         # many healthy BATCH calls in a batch-dominant deployment until
         # threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
-        # Keyed on agent_result.success, not on decision quality:
-        # _parse_batch_decisions degrades unparseable items to
-        # action='create' without raising, and a degraded decision is
-        # still evidence the CLI round-trip completed.
+        # Keyed on agent_result.success, not on decision quality: what this
+        # breaker asserts is a wedged BACKEND, and a completed round-trip
+        # disproves that however unusable its payload turns out to be.
         #
         # This also closes an ALREADY-OPEN breaker/cooldown, not just the
         # counter: _call_llm_batch_with_fallback's two bisect halves run
@@ -3002,12 +3440,29 @@ class TaskCurator:
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
         self._reset_zero_output_breaker()
 
-        return _parse_batch_decisions(
+        decisions = _parse_batch_decisions(
             agent_result,
             pools=pools,
             pool_sizes_list=pool_sizes_list,
             latency_ms=latency_ms,
         )
+
+        # The streak, unlike the breaker, needs a usable DECISION rather than a
+        # completed round-trip: _parse_batch_decisions fails items open to
+        # action='create' without raising. One usable decision suffices — the
+        # other items' degradation is then the designed per-item fail-open.
+        if any(not d.degraded for d in decisions):
+            self._reset_degraded_streak(project_id)
+        else:
+            for candidate, decision in zip(candidates, decisions, strict=True):
+                await self._count_degraded(
+                    justification=decision.justification,
+                    project_id=project_id,
+                    project_root=project_root,
+                    candidate_title=candidate.title,
+                )
+
+        return decisions
 
     async def _call_llm_batch_with_fallback(
         self,
@@ -3419,7 +3874,7 @@ def _parse_decision_dict(
 
     Called by both :func:`_parse_decision` (single-item) and
     :func:`_parse_batch_decisions` (per-item inside a batch).  The function
-    **never raises**: every malformed-input path returns a degraded
+    **never raises**: every malformed-input path fails open to
     ``CuratorDecision(action='create', ...)`` instead of propagating an
     exception.  Per-item isolation in the batch path is provided by the
     ``try/except`` wrapper in :func:`_parse_batch_decisions`, not by
@@ -3433,6 +3888,7 @@ def _parse_decision_dict(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=cost_usd,
+            degraded=True,
         )
 
     justification = str(raw.get('justification', ''))
@@ -3476,23 +3932,39 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         is_within_batch_drop = (
             action == 'drop'
             and batch_target_index is not None
             and target_id is None
         )
-        if not is_within_batch_drop and (not target_id or target_id not in valid_ids):
-            return CuratorDecision(
-                action='create',
-                justification=(
-                    f'invalid-target: action={action} target_id={target_id!r}; '
-                    f'not in pool'
-                ),
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=cost_usd,
-            )
+        if not is_within_batch_drop:
+            # Two causes, two branches: they fall on opposite sides of the
+            # degraded line (see CuratorDecision.degraded).
+            if not target_id:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'missing-target: action={action} has no target_id'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    degraded=True,
+                )
+            if target_id not in valid_ids:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'invalid-target: action={action} target_id={target_id!r}; '
+                        f'not in pool'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    degraded=False,
+                )
         # RC3 create-safe guard: never drop/combine against a pool entry whose
         # status is unconfirmable ('unknown' — e.g. a thin fallback entry built
         # after a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).
@@ -3511,6 +3983,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
         # combine-only tasks must also be combine_eligible (pending status).
         if action == 'combine' and target_entry is not None and not target_entry.combine_eligible:
@@ -3523,6 +3996,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
 
     rewritten: RewrittenTask | None = None
@@ -3535,6 +4009,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         try:
             rewritten = RewrittenTask(
@@ -3551,6 +4026,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         if not rewritten.title or not rewritten.details:
             return CuratorDecision(
@@ -3559,6 +4035,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
 
     return CuratorDecision(
@@ -3599,6 +4076,7 @@ def _parse_decision(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=agent_result.cost_usd,
+                degraded=True,
             )
 
     if not isinstance(raw, dict):
@@ -3608,6 +4086,7 @@ def _parse_decision(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=agent_result.cost_usd,
+            degraded=True,
         )
 
     return _parse_decision_dict(
@@ -3685,6 +4164,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             ))
             continue
         try:
@@ -3702,6 +4182,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             )
         results.append(decision)
 
@@ -3722,6 +4203,7 @@ def _parse_batch_decisions(
                     pool_sizes=d.pool_sizes,
                     latency_ms=d.latency_ms,
                     cost_usd=d.cost_usd,
+                    degraded=True,
                 )
 
     # Build the directed graph for cycle detection (only batch-drop edges).
@@ -3770,6 +4252,7 @@ def _parse_batch_decisions(
             pool_sizes=d.pool_sizes,
             latency_ms=d.latency_ms,
             cost_usd=d.cost_usd,
+            degraded=True,
         )
 
     return results

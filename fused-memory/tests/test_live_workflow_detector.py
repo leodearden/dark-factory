@@ -15,14 +15,16 @@ import pytest
 
 # RED in step-1: module does not exist yet; import will fail until step-2.
 from _fm_helpers import as_async_run_git as _as_async_run_git
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
-    DEFAULT_HEARTBEAT_TTL,
     DEFAULT_MAX_WORKTREE_AGE_HOURS,
+    ClaimantLabel,
     WorkflowLiveness,
     _routing_decided_after_restart,
     _task_in_scheduler_holders_or_parks,
+    claimant_label,
     corroboration_for_task,
     detect_live_workflow,
     has_live_workflow_corroboration,
@@ -1807,8 +1809,31 @@ class TestCorroborationForTask:
 
     _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
 
-    def test_default_heartbeat_ttl_is_ten_minutes(self):
-        assert timedelta(minutes=10) == DEFAULT_HEARTBEAT_TTL
+    def _default_ttl_task(self, heartbeat_at: datetime) -> dict:
+        return {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/sess-1/pid=42',
+            'heartbeat_at': heartbeat_at.isoformat(),
+        }
+
+    def test_default_ttl_just_inside_is_corroborated(self):
+        task = self._default_ttl_task(
+            _CORROB_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(seconds=1),
+        )
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is True
+
+    def test_default_ttl_just_outside_is_not_corroborated(self):
+        task = self._default_ttl_task(
+            _CORROB_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(seconds=1),
+        )
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is False
 
     def test_fresh_heartbeat_true(self):
         task = {
@@ -1879,6 +1904,62 @@ class TestCorroborationForTask:
             task, _CORROB_TASK_ID, now=_CORROB_NOW,
             scheduler_state=None, orchestrator_started_at=None,
         ) is False
+
+
+class TestClaimantLabel:
+    """claimant_label: the display-only claimant state of a task dict, total over its input."""
+
+    _NOW = datetime(2026, 8, 18, 22, 20, tzinfo=UTC)
+    _RUN = 'run-a1d3b5dba75a/3879-011fcff1/pid=1807449'
+
+    def _label(self, task: object, **kwargs) -> ClaimantLabel:
+        return claimant_label(task, now=self._NOW, **kwargs)
+
+    def test_fresh_heartbeat_is_live(self):
+        task = {'claimant_run_id': self._RUN, 'heartbeat_at': (self._NOW - timedelta(seconds=30)).isoformat()}
+        assert self._label(task) is ClaimantLabel.LIVE
+
+    def test_heartbeat_older_than_the_ttl_is_stale(self):
+        task = {'claimant_run_id': self._RUN, 'heartbeat_at': (self._NOW - timedelta(minutes=45)).isoformat()}
+        assert self._label(task) is ClaimantLabel.STALE
+
+    def test_claimant_without_heartbeat_is_stale(self):
+        assert self._label({'claimant_run_id': self._RUN, 'heartbeat_at': None}) is ClaimantLabel.STALE
+
+    def test_claimant_with_unparseable_heartbeat_is_stale(self):
+        task = {'claimant_run_id': self._RUN, 'heartbeat_at': 'not-a-timestamp'}
+        assert self._label(task) is ClaimantLabel.STALE
+
+    def test_null_claimant_is_none(self):
+        assert self._label({'claimant_run_id': None, 'heartbeat_at': None}) is ClaimantLabel.NONE
+
+    def test_blank_claimant_is_none(self):
+        assert self._label({'claimant_run_id': '   ', 'heartbeat_at': None}) is ClaimantLabel.NONE
+
+    def test_empty_task_is_none(self):
+        assert self._label({}) is ClaimantLabel.NONE
+
+    @pytest.mark.parametrize('unreadable', [None, 'task 3254'])
+    def test_unreadable_task_is_unknown_never_none(self, unreadable: object):
+        assert self._label(unreadable) is ClaimantLabel.UNKNOWN
+
+    def test_explicit_ttl_is_honoured(self):
+        task = {'claimant_run_id': self._RUN, 'heartbeat_at': (self._NOW - timedelta(minutes=45)).isoformat()}
+        assert self._label(task, heartbeat_ttl=timedelta(hours=2)) is ClaimantLabel.LIVE
+
+    def test_default_ttl_is_the_corroboration_ttl(self):
+        just_inside = {
+            'claimant_run_id': self._RUN,
+            'heartbeat_at': (self._NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(seconds=1)).isoformat(),
+        }
+        assert self._label(just_inside) is ClaimantLabel.LIVE
+
+    def test_default_ttl_just_outside_is_stale(self):
+        just_outside = {
+            'claimant_run_id': self._RUN,
+            'heartbeat_at': (self._NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(seconds=1)).isoformat(),
+        }
+        assert self._label(just_outside) is ClaimantLabel.STALE
 
 
 class TestCorroborationGate:
@@ -2629,7 +2710,7 @@ class TestWorktreeIndexForLogsEveryUnknownLoudly:
 class TestWorktreeIndexKwargs:
     """`worktree_index_kwargs` is the SINGLE home of the hoist wiring.
 
-    Both fan-out call sites (`_render_live_workflow_section` and the harness
+    Both fan-out call sites (`render_live_workflow_section` and the harness
     integrity gate) splat it into `detect_live_workflow`, so the three-valued
     contract — and its fail-safe — lives in one place rather than being spelled
     out twice (task 3778 review, heuristic 11 SPOT).

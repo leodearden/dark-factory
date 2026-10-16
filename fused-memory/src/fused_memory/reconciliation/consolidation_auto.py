@@ -510,7 +510,8 @@ def _member_hazards(
         # warn-vs-reject driven by `memory_metadata.enforce`, which ships False
         # (task 3626) — so it is a real corpus state, not a hypothetical. The
         # incumbent stays exempt, so this code and the canonical-level codes
-        # remain disjoint.
+        # remain disjoint. `member_different_topic` is an `elif` because this
+        # detail already names the foreign topic: one fact, one code.
         if metadata.get('canonical') is True and not _is_incumbent(record, proposal.topic):
             reasons.append(
                 AutoReason(
@@ -525,8 +526,7 @@ def _member_hazards(
                     ),
                 ),
             )
-
-        if foreign_topic:
+        elif foreign_topic:
             reasons.append(
                 AutoReason(
                     code=AutoReasonCode.member_different_topic,

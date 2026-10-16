@@ -41,12 +41,20 @@ detector fires on exactly the 8 pre-fix defect sites and nothing else:
 ``scripts/migrate_metadata_modules_to_files.py`` 86;
 ``scripts/trial_module_tagger_haiku.py`` 658;
 ``fused-memory/scripts/strip_leaked_control_keys.py`` 89. Run over the
-post-fix tree across the seven sweep directories it flags only the two
-deliberately-excluded lines (``reconciliation/stages/base.py::_build_mcp_config``,
-an MCP config entry for the Claude CLI's own redirect-following client, and two
-display/log strings in ``server/main.py::run_server``). Non-vacuous in both
-directions, which is the property the guard needs and the property a
-constant-pinned-against-itself meta-test cannot have.
+post-fix tree across the seven sweep directories it flags only three
+deliberate lines (``reconciliation/stages/base.py::_build_mcp_config``, an MCP
+config entry for the Claude CLI's own redirect-following client, and two
+display/log strings in ``server/main.py::run_server``), and each of those now
+carries an inline ``# mcp-url-sweep: allow <reason>`` marker that
+:func:`sweep_source` honours. Non-vacuous in both directions, which is the
+property the guard needs and the property a constant-pinned-against-itself
+meta-test cannot have.
+
+MARKERS ARE COMMENT TOKENS, NOT SUBSTRINGS. :func:`sweep_source` finds them
+with ``tokenize`` rather than by searching the line text, because a marker
+spelled inside a string argument would otherwise mute its own call's hit, and a
+docstring that merely documents the convention would read as a stale marker.
+Neither produces a ``COMMENT`` token, so neither can exempt or go stale.
 
 A ``_``-prefixed, uniquely-named sibling module (like
 ``_verify_config_corpus.py``, ``_orch_helpers.py``): ``conftest.py`` inserts
@@ -59,12 +67,46 @@ subprojects under ``sys.modules['conftest']`` — see that file's docstring.
 from __future__ import annotations
 
 import ast
+import io
+import re
+import tokenize
+from dataclasses import dataclass
 
-__all__ = ['SLASHED_TAIL', 'find_trailing_slash_mcp_urls']
+__all__ = [
+    'ALLOW_MARKER_KEY',
+    'SLASHED_TAIL',
+    'SweepFindings',
+    'find_trailing_slash_mcp_urls',
+    'sweep_source',
+]
 
 #: The tail that makes a URL get redirected. Compared against the parsed
 #: literal's value, never searched for in raw source text.
 SLASHED_TAIL = '/mcp/'
+
+#: A comment whose body begins with this is an allow marker, well-formed or
+#: not. Only ``# mcp-url-sweep: allow <reason>`` is well-formed.
+ALLOW_MARKER_KEY = 'mcp-url-sweep:'
+
+_MARKER_COMMENT = re.compile(r'#\s*' + re.escape(ALLOW_MARKER_KEY))
+_WELL_FORMED_MARKER = re.compile(
+    r'#\s*' + re.escape(ALLOW_MARKER_KEY) + r'\s*allow\s+(?P<reason>\S.*)'
+)
+
+
+@dataclass(frozen=True)
+class SweepFindings:
+    """What :func:`sweep_source` found in one file, as ``(lineno, text)`` pairs.
+
+    ``offenders`` are slashed-URL hits no well-formed marker exempts (text is
+    the stripped source line); ``stale_markers`` are well-formed markers on a
+    line that builds no slashed URL; ``malformed_markers`` are marker comments
+    that do not read ``mcp-url-sweep: allow <reason>`` and so exempt nothing.
+    """
+
+    offenders: tuple[tuple[int, str], ...] = ()
+    stale_markers: tuple[tuple[int, str], ...] = ()
+    malformed_markers: tuple[tuple[int, str], ...] = ()
 
 
 def _literal_tail(node: ast.expr) -> str:
@@ -121,12 +163,27 @@ def _owns_child_tail(node: ast.AST) -> bool:
 def find_trailing_slash_mcp_urls(source: str, *, filename: str) -> list[tuple[int, str]]:
     """Return ``(lineno, stripped_source_line)`` for every ``/mcp/``-tailed literal.
 
-    Raises ``AssertionError`` naming *filename* if *source* does not parse.
-    Swallowing ``SyntaxError`` into an empty result is the one failure mode
-    that would let the sweep guard silently stop covering a file while staying
-    green, so every failure at this boundary IS a finding — the same reasoning
-    ``_verify_config_corpus.load_config_scalar`` re-raises on.
+    *lineno* is where the outermost expression ending in the slashed literal
+    begins. Raises ``AssertionError`` naming *filename* if *source* does not
+    parse. Swallowing ``SyntaxError`` into an empty result is the one failure
+    mode that would let the sweep guard silently stop covering a file while
+    staying green, so every failure at this boundary IS a finding — the same
+    reasoning ``_verify_config_corpus.load_config_scalar`` re-raises on.
     """
+    lines = source.splitlines()
+    return sorted(
+        _reported_line(lines, first)
+        for first, _ in _slashed_url_spans(source, filename=filename)
+    )
+
+
+def _reported_line(lines: list[str], lineno: int) -> tuple[int, str]:
+    text = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ''
+    return lineno, text
+
+
+def _slashed_url_spans(source: str, *, filename: str) -> list[tuple[int, int]]:
+    """Return ``(first_line, last_line)`` of each outermost slashed-URL expression."""
     try:
         tree = ast.parse(source, filename=filename)
     except SyntaxError as exc:
@@ -153,7 +210,7 @@ def find_trailing_slash_mcp_urls(source: str, *, filename: str) -> list[tuple[in
     # vs 6.2s for the equivalent sub-walk form. (Parsing those files costs
     # ~7s on top of either, so this is a real but not dominant share; the
     # guard's actual fix for wall clock is caching the walk — see
-    # ``_sweep_hits``.)
+    # ``test_mcp_post_transport.py::_sweep_findings``.)
     nested: set[int] = set()
     for node in ast.walk(tree):
         # A suppressed node's descendants are suppressed too; a tail-owning
@@ -162,17 +219,57 @@ def find_trailing_slash_mcp_urls(source: str, *, filename: str) -> list[tuple[in
             for child in ast.iter_child_nodes(node):
                 nested.add(id(child))
 
-    lines = source.splitlines()
-    hits: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if id(node) in nested:
-            continue
-        if not isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-            continue
-        if not _literal_tail(node).endswith(SLASHED_TAIL):
-            continue
-        lineno = node.lineno
-        text = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ''
-        hits.append((lineno, text))
+    return [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(tree)
+        if id(node) not in nested
+        and isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp))
+        and _literal_tail(node).endswith(SLASHED_TAIL)
+    ]
 
-    return sorted(hits)
+
+def _marker_comments(source: str) -> dict[int, str]:
+    """Map line number to marker comment text for every marker in *source*.
+
+    The substring prefilter is sound because every marker comment contains
+    :data:`ALLOW_MARKER_KEY`, and it keeps the whole-tree sweep from lexing
+    every file a second time: only files that mention the key are tokenized.
+    """
+    if ALLOW_MARKER_KEY not in source:
+        return {}
+    return {
+        token.start[0]: token.string.rstrip()
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT and _MARKER_COMMENT.match(token.string)
+    }
+
+
+def sweep_source(source: str, *, filename: str) -> SweepFindings:
+    """Apply the inline allow-marker policy to the raw hits in *source*.
+
+    A ``# mcp-url-sweep: allow <reason>`` comment exempts a hit when it sits on
+    any line the flagged expression spans. The guard reports the line where
+    the outermost expression ending in the slashed literal begins, and that
+    line always works unless it ends inside a string running over several
+    lines, where the only place a comment can go is after the closing quotes.
+    A marker with no reason never exempts anything, so it cannot be a silent
+    mute. Raises ``AssertionError`` naming *filename* if *source* does not
+    parse, exactly as :func:`find_trailing_slash_mcp_urls` does.
+    """
+    spans = _slashed_url_spans(source, filename=filename)
+    allowed: list[tuple[int, str]] = []
+    malformed: list[tuple[int, str]] = []
+    for lineno, comment in _marker_comments(source).items():
+        bucket = allowed if _WELL_FORMED_MARKER.fullmatch(comment) else malformed
+        bucket.append((lineno, comment))
+
+    allowed_lines = {lineno for lineno, _ in allowed}
+    spanned_lines = {line for first, last in spans for line in range(first, last + 1)}
+    lines = source.splitlines()
+    offenders = sorted(
+        _reported_line(lines, first)
+        for first, last in spans
+        if allowed_lines.isdisjoint(range(first, last + 1))
+    )
+    stale = [marker for marker in allowed if marker[0] not in spanned_lines]
+    return SweepFindings(tuple(offenders), tuple(sorted(stale)), tuple(sorted(malformed)))

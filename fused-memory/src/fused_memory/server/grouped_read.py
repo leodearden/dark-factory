@@ -120,18 +120,18 @@ CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested'
 #: module builds, so a consumer holding only the nested entry can still tell
 #: which project the body came from.
 #:
-#: This tuple deliberately MIRRORS ``FOREIGN_PROJECT_TAG_KEYS`` in
-#: ``orchestrator/src/orchestrator/agents/briefing.py`` (:56), whose
-#: ``filter_foreign_project_results`` is the consumer this exists for.  The
+#: This tuple deliberately MIRRORS
+#: ``orchestrator/src/orchestrator/agents/memory_recall.py::FOREIGN_PROJECT_TAG_KEYS``,
+#: whose ``filter_foreign_project_results`` is the consumer this exists for.  The
 #: coupling is ONE-WAY and by COPY, not by import: orchestrator declares no
 #: runtime dependency on fused-memory (fused-memory appears only in
 #: ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
-#: type-checking-only reference — see briefing.py:80-85), so neither side can
+#: type-checking-only reference), so neither side can
 #: import the other's constant.  A key added on ONE side must be added HERE
 #: too, or the briefing's nested cross-project safeguard silently stops firing
 #: on it.
 #:
-#: ``dst_project`` is deliberately ABSENT for exactly the reason briefing.py
+#: ``dst_project`` is deliberately ABSENT for exactly the reason memory_recall.py
 #: gives: it names where a rehomed fact was relocated TO, not where it came
 #: FROM, so consulting it would falsely certify a rehomed foreign fact as
 #: local.  No member of ``MEM0_MANAGED_METADATA_KEYS`` appears here either, so

@@ -1,5 +1,9 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+import json
+
+from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
+from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
@@ -9,12 +13,20 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
 from fused_memory.reconciliation.internal_writers import (
     INTERNAL_WRITER_POPULATION_NOTE,
 )
+from fused_memory.reconciliation.live_workflow_section import (
+    NOT_LIVE_TOKEN,
+    render_live_workflow_authority_rules,
+)
+from fused_memory.reconciliation.preservation_specimen_guard import (
+    preservation_mem0_filters,
+)
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    FLAG_FOR_STAGE2_MARKER_KIND,
     REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -31,6 +43,7 @@ from fused_memory.reconciliation.recon_self_model import (
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
 )
+from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
 
 _STAGE1_GATE_STALL_THRESHOLD_HOURS = int(
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS // 3600
@@ -43,18 +56,37 @@ future change to it cannot leave stale prompt text behind.  Pinned by
 ``tests/test_recon_escalation_probe_precondition.py``.
 """
 
-#: The cluster-fold execution section's title and heading (task 3134), exported
-#: so a rename moves the prompt and the wiring pins in
+#: The cluster-proposal section's title and heading (task 5239), exported so a
+#: rename moves the prompt and the wiring pins in
 #: ``tests/test_stage1_consolidation_guidance.py`` together.  Those tests slice
 #: the prompt by this heading; without the shared constant a pure rename with a
 #: byte-identical body turns them red for no behavioural reason.
-EXECUTING_A_CLUSTER_FOLD_TITLE = 'Executing a Cluster Fold'
-EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
+PROPOSING_A_CONSOLIDATION_TITLE = 'Proposing a Cluster Consolidation'
+PROPOSING_A_CONSOLIDATION_HEADING = f'## {PROPOSING_A_CONSOLIDATION_TITLE}'
 
 #: The live-state freshness section's heading (task 5271), exported for the
 #: same reason, for ``tests/reconciliation/test_stage1.py``.
 LIVE_STATE_FRESHNESS_TITLE = 'Live-State Freshness Before Re-Flagging'
 LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
+
+#: The preserved-specimen section's heading (task 5465), exported for the same
+#: reason, for ``tests/reconciliation/test_stage1_preservation_specimen_prompt.py``.
+PRESERVED_SPECIMEN_CORROBORATION_TITLE = 'Preserved-Specimen Corroboration'
+PRESERVED_SPECIMEN_CORROBORATION_HEADING = f'## {PRESERVED_SPECIMEN_CORROBORATION_TITLE}'
+
+_CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
+
+#: The Authority-Model carve-out for child memories (task 6193), exported so
+#: tests mirror ``server/grouped_read.py::CHILD_KINDS`` against it.
+CHILD_MEMORY_AUTHORITY_RULE = (
+    f'- A Mem0 memory whose metadata carries `{PARENT_ID_KEY}` with a `kind` of '
+    f'{_CHILD_KIND_NAMES} is a CHILD of the memory that `{PARENT_ID_KEY}` names, not a '
+    f"duplicate of it; the payload shows that link beside the memory's id. Never delete a "
+    f'child with `delete_memory` to dedupe it against its parent or a sibling child. This '
+    f'overrides the duplicate rule above: a sighting restates its parent by design and is '
+    f"what the parent's sighting count counts, and an amendment holds the only copy of its "
+    f'newer text.'
+)
 
 _DOCUMENTED_SWEEP_DELETERS = ', '.join(f'`{d}`' for d in MEM0_TOMBSTONE_DELETERS)
 
@@ -81,13 +113,17 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
-- `mcp__fused-memory__consolidate_memories` — the SANCTIONED path for folding a \
-duplicate Mem0 cluster into one canonical entry, in place of a hand-rolled \
-`add_memory`/`update_memory` plus N `delete_memory` sequence; see the \
-**{EXECUTING_A_CLUSTER_FOLD_TITLE}** section below for the contract.
+- `mcp__fused-memory__propose_consolidation` — propose a near-duplicate Mem0 cluster \
+for consolidation; code decides and executes. See the \
+**{PROPOSING_A_CONSOLIDATION_TITLE}** section below.
 - `mcp__fused-memory__get_memory_by_id` — read one Mem0 entry by id, returning its \
 RAW stored payload under `metadata` (including the `agent_id` that wrote it, which \
 search results do NOT carry)
+- `mcp__fused-memory__get_memories_by_metadata` — enumerate the Mem0 entries whose \
+metadata EQUALS every key in `filters`. A deterministic payload scroll, not a ranked \
+`search`, so a low-similarity match is never cut off; each row's `metadata` is the raw \
+stored payload, prose included. See the **{PRESERVED_SPECIMEN_CORROBORATION_TITLE}** \
+section below.
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
 {AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
@@ -97,7 +133,7 @@ against the ReconLedgerStore `cycle_summary` row (the source of truth written by
 `write_cycle_summary` / `write_stage1_cycle_summary`), as opposed to \
 `count_memories_by_metadata`'s best-effort Mem0 mirror query. Returns \
 `{{'present': bool, 'ledger_available': bool, 'project_id': ..., 'run_id': ..., \
-'stage': ..., 'remediation': bool|null, 'reason': str, 'expected': bool|null, \
+'stage': ..., 'remediation': bool|null, 'agent_outcome': str|null, 'reason': str, 'expected': bool|null, \
 'run_lookup_available': bool, 'run_status': str|null}}`. \
 `present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
 `expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
@@ -117,7 +153,9 @@ You do not have access to task *write* tools — task reconciliation is Stage 2'
 {render_escalation_boundary_note(can_escalate=False)}
 
 ## Your Consolidation Tasks
-1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. Merge or delete.
+1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. PROPOSE a \
+duplicate cluster (see the **{PROPOSING_A_CONSOLIDATION_TITLE}** section below) rather \
+than merging it by hand; delete or amend stale and contradicted entries.
 2. **Within Graphiti**: Review entity consistency and superseded temporal facts via episodes.
 3. **Cross-store**: Check for contradictions between stores. Promote solidified patterns from \
 observations to preferences/procedures when warranted.
@@ -128,81 +166,45 @@ invalidates task assumptions, completed work not reflected in tasks).
 
 {render_consolidation_gate_section(can_file_tasks=False)}
 
-{EXECUTING_A_CLUSTER_FOLD_HEADING}
-The section above states WHAT a folded cluster must look like when you are done. \
-This one states HOW to get there. Do not hand-roll it.
+{PROPOSING_A_CONSOLIDATION_HEADING}
+The section above states WHAT a consolidated cluster must look like. This one states \
+how you put one forward: you PROPOSE a cluster, and code DECIDES whether to consolidate \
+it and EXECUTES the ratified retain arm. You do not hold `consolidate_memories`, and you \
+must not hand-roll a fold either: an `add_memory` plus N `update_memory`/`delete_memory` \
+sequence nets +1 entry per failed pass.
 
-**Call the op, not the choreography.** To fold a duplicate Mem0 cluster, call \
-`mcp__fused-memory__consolidate_memories(canonical_content=..., topic=<slug>, \
-project_id=..., supersedes=[full 36-char UUIDs to FOLD AND DELETE], \
-retain=[full 36-char UUIDs to TAG IN PLACE], run_id=<the run_id from your \
-## Reconciliation Context>)` instead of a hand-rolled `update_memory` plus N \
-`delete_memory` sequence. List each id ONCE across both arms: a repeat is refused by \
-name, never de-duplicated for you.
+To propose a duplicate Mem0 cluster, call \
+`mcp__fused-memory__propose_consolidation(project_id=..., run_id=<the run_id from your \
+## Reconciliation Context>, topic=<slug>, member_ids=[<full 36-char UUID>, ...], \
+category=..., claim=..., rationale=..., seeded_from=..., \
+agent_id='recon-stage-memory_consolidator')`.
 
-**`topic` is REQUIRED.** It is a positional parameter of the op, so a fold cannot mint \
-an unstamped canonical — the shared `metadata.topic` scroll the closure check reads is \
-written by construction rather than by a step a prompt can forget. Retained ids are \
-stamped with that same topic and become PEERS of the canonical: they keep their point \
-ids, are never deleted, and never receive `canonical` or `parent_id`.
+**`claim` is ONE assertion** and becomes the canonical's first paragraph verbatim. A \
+`ValidationError` names every offender in the call at once, and its `hint` states the \
+shape rules: fix them all and call again in this turn. `rationale` and `seeded_from` \
+are for the reviewer and never reach the canonical. Re-calling for the same `topic` in \
+this run overwrites your earlier proposal. The tool takes no `metadata`.
 
-**ORDERING IS THE CONTRACT.** The op runs: validate → authorize → citation pre-flight \
-(a non-mutating `scan_only` pass over the whole delete set) → WRITE THE CANONICAL → \
-and only THEN tag the retained peers and delete each supersede. A refusal from any of \
-those first four steps leaves the corpus BYTE-IDENTICAL, which is why a bad argument \
-set costs you nothing. Know the limit of that guarantee: it does NOT extend to a \
-per-id refusal BELOW the canonical write. The mutating repoint pass runs over the whole \
-delete set immediately after the canonical is written, before it is known whether any \
-given id's delete can be earned — so an id refused later has already had its live task \
-citations rewritten onto the canonical while it is still in the corpus. That is the \
-recoverable direction, but it is a mutation: a partial run is not a no-op.
-
-**`survivors` is the load-bearing outcome.** Closure is corroborated by a deterministic \
-re-read, never inferred from "the delete returned ok". `survivors` names ids whose \
-delete reported success but which STILL RESOLVE on that re-read — a non-empty \
-`survivors` means the fold did NOT close. `survivor_check_failed` names ids proven \
-NEITHER gone NOR alive; re-read those with `get_memory_by_id` before acting on them. \
-Read both before reporting a consolidation as complete.
-
-**`'partial'` IS NOT A RETRY SIGNAL.** There is no resume arm. The op takes no existing \
-canonical id, so a second `consolidate_memories` call for the same (project, topic) \
-writes a SECOND canonical — which is precisely the +1-per-pass ratchet this op exists \
-to end, and it is admitted rather than refused wherever canonical uniqueness is still \
-in warn mode. Finish the named ids BY HAND instead: read `failed_deletes`, \
-`reparent_failures` and `retain_failures` for what did not happen and why, fix the \
-cause, then `delete_memory` per still-listed id and `update_memory` to tag any peer \
-that was not retained. The response's `hint` carries that procedure.
-
-**`run_id` names the run PERFORMING the deletion** — yours, stamped as each tombstone's \
-`deleting_run_id`. It is deliberately NOT the victims' own `metadata.run_id`, which \
-names the run that WROTE them. Conflating the two is what makes a deletion audit \
-unreadable, so a delete that cannot be attributed is refused rather than guessed at. \
-It is required whenever `supersedes` is non-empty.
-
-**The near-duplicate guards now apply to YOU.** Your own \
-`add_memory(category='procedural_knowledge')` writes are no longer exempt from the \
-write-time near-duplicate and topic-cluster guards: as of task 3134 they bind you \
-exactly as they bind every other caller. The exemption existed because a merged \
-canonical necessarily resembles the duplicates it replaces and nothing guaranteed those \
-duplicates were deleted first — both are the op's problem now rather than yours, and \
-`consolidate_memories` writes its canonical by a path that never meets this guard at \
-all, so the sanctioned route above is unaffected. A \
+**The near-duplicate guards apply to YOU.** Your own \
+`add_memory(category='procedural_knowledge')` writes meet the write-time near-duplicate \
+and topic-cluster guards exactly as every other caller's do. A \
 `ProceduralKnowledgeNearDuplicateWriteRejected` or a \
 `ProceduralKnowledgeKnownTopicClusterWriteRejected` is therefore a SIGNAL, not an \
 obstacle: the block NAMES the incumbent record, which is to say the cluster you were \
-about to add to already exists. Fold it with `consolidate_memories`, or amend that \
+about to add to already exists. Propose it with `propose_consolidation`, or amend that \
 incumbent in place with `mcp__fused-memory__update_memory` — do not add one more \
 paraphrase beside it. Do NOT answer a soft-block with \
 `metadata={{'allow_near_duplicate': True}}` as a reflex: that flag is for content \
 genuinely DISTINCT from the record the block named, and reaching for it in a loop is \
-precisely how the cluster you are now folding grew in the first place. Where \
-`write_triage.enabled` is on nothing is soft-blocked at all — your write is ROUTED like \
-any other caller's, coming back with `routed` set to `stored`, `restated`, `amended` or \
-`contested`; a `restated` ack is a successful outcome and needs no retry.
+precisely how the cluster grew in the first place. Where `write_triage.enabled` is on \
+nothing is soft-blocked at all — your write is ROUTED like any other caller's, coming \
+back with `routed` set to `stored`, `restated`, `amended` or `contested`; a `restated` \
+ack is a successful outcome and needs no retry.
 
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
 - Duplicate knowledge across stores → Keep most recent / highest confidence. Delete duplicate.
+{CHILD_MEMORY_AUTHORITY_RULE}
 
 ## Guidelines
 - Be surgical: only modify what needs changing. Don't rewrite memories that are fine.
@@ -296,13 +298,6 @@ a loop default: reaching for it reflexively across a run of refusals is how genu
 pointers get destroyed silently, and a consolidation delete — which has a survivor by \
 definition — must name that survivor instead.
 
-**`consolidate_memories` exposes NO dangling-citation escape at all,** and needs none: \
-its canonical IS the repoint target by construction, so the "you named no survivor" \
-refusal is unreachable there. The reachable citation refusal is `CitationScanFailed`, \
-which fails CLOSED — an unreadable task DB must never be read as "no citations" before \
-an irreversible delete. Retry it once the task backend is reachable; do not look for a \
-flag to bypass it, because there isn't one.
-
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
 terminal state (done / cancelled / deferred / blocked), follow this verification:
@@ -362,6 +357,8 @@ more recently than that is NOT stalled and must not be reported as such. This ch
 needs no escalation read at all: the stamp lives on the task record, which you do hold.
 
 {REFERENT_DECLARATION_GUIDANCE}
+
+{render_metadata_vocabulary_guidance()}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
@@ -487,6 +484,26 @@ not guess from line counts.
 key actions taken") are NOT volatile counts and may still be written as \
 `temporal_facts` edges when they capture non-recoverable per-cycle decisions or \
 observations. Keep run summaries concise and deduplicated across cycles.
+
+### Pin-order and priority-override state — DO NOT persist as durable edges
+Pin order, pinned status, boost tier, `reserve_now` and TTL are LIVE-QUERIED state. \
+The authoritative source is `scheduler_overrides.db`, read via the `get_pin_queue` \
+MCP tool — that live read is the single source of truth for the current cycle. \
+Structural per-change history already exists in `data/orchestrator/runs.db` \
+(`priority_override_set`, `priority_override_cleared`, `task_pinned`, `task_unpinned`, \
+`pin_queue_reordered`) and is surfaced by the `get_scheduler_events` MCP tool.
+
+**MUST NOT**: write pin-order or priority-override state as durable Graphiti edges \
+— not via `add_memory` under any GRAPHITI_PRIMARY category \
+(`entities_and_relations`, `temporal_facts`, `decisions_and_rationale`), and not via \
+`add_episode`. This state churns and is routinely CLEARED with no corresponding \
+write, so a persisted edge goes stale within the hour while still reading as current. \
+Extraction also produces facts that name no task at all (e.g. "Pin order is set to \
+10."), which no sweep can attribute to a task or drain.
+
+**Do not be the writer**: since task 3853 (the esc-3834-1 ruling) this edge class no \
+longer originates from the MCP override tools, which emit no memory write at all. Do \
+not re-mint it from a pin-queue observation.
 
 ### Stale task-count snapshot edges — do NOT emit correction findings
 
@@ -759,8 +776,7 @@ only ever as a report-only note per the audit rule above — never as a finding.
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
 unavailable), treat as inconclusive and do NOT reconstruct — the documented harm is \
 false-positive reconstruction (wasteful duplicate summaries), so bias toward skipping \
-reconstruction on uncertainty. Note the tool error in your cycle report instead. \
-This mirrors the Flag Suppression Check's conservative handling of search failures.
+reconstruction on uncertainty. Note the tool error in your cycle report instead.
 
 Rationale: back-to-back remediation passes otherwise trigger double-reconstruction of \
 the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
@@ -779,14 +795,13 @@ search Mem0 for a completion summary written by TaskInterceptor / TargetedReconc
   project_id=..., categories=['observations_and_summaries'], stores=['mem0'], limit=20)
 
 Including `task_id=<task_id>` in the query biases the vector ranking toward the specific \
-task's entry (mirroring the Flag Suppression Check which uses \
-`query="stage1_flag_suppression task_id=<N>"`); without it a generic query risks ranking \
+task's entry; without it a generic query risks ranking \
 the relevant entry out of the top-20 when many tasks have completion summaries.
 
 Inspect each result: if any result satisfies BOTH of the following, do NOT emit the \
 missing-completion-summary finding for that task:
   1. `str(result.metadata.get('task_id')) == str(task_id)` (both sides coerced to str \
-to handle legacy int vs str task_id — consistent with the Flag Suppression Check)
+to handle legacy int vs str task_id)
   2. `result.metadata.get('source') == 'targeted_reconciliation'` \
 OR the result content contains "completed"
 
@@ -808,62 +823,19 @@ through can be cleaned up in a later consolidation cycle.
 ## Flag Suppression Check
 **The deterministic suppression gate is enforced in code** by \
 `flag_dedup.filter_suppressed`, which runs as the first step of the post-processor \
-before any flag reaches the signature-dedup loop.  You do not need to perform this \
-check yourself — suppressed flags are dropped automatically.
+before any flag reaches the signature-dedup loop and reads ONLY `recon_ledger` rows.  \
+You do not need to perform this check yourself — suppressed flags are dropped automatically.
 
-As an optimisation you *may* skip emitting a flag for a task that you know is \
-suppressed, but the code gate is the authoritative enforcement point; any flag you \
-emit for a suppressed task_id (and, for a scoped record, matching flag_type — see \
-below) will be dropped by the post-processor regardless.
+Do NOT withhold a flag because you believe it is suppressed: emit it. The code gate \
+is the only authority on what is suppressed, and it drops every flag matched by an \
+active suppression row (for a scoped row, only a matching flag_type — see below).
 
 {render_suppression_schema_section()}
-
-Producing a suppression record: operators and remediation hooks should call \
-`fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
-project_id=..., task_id=N, flag_types=[...])` rather than constructing the \
-canonical schema by hand. The helper coerces `task_id` to a string (accepting a \
-single numeric id or a comma-joined composite signature), sorts/dedupes \
-`flag_types`, and pins the metadata.kind/content shape so future schema changes \
-touch one location. **Prefer a scoped record** (explicit `flag_types`) over the \
-legacy blanket form: scoping to the specific flag_type(s) you intend to suppress \
-means a newly-relevant flag_type for the same task is NOT silently blanket-blocked. \
-This is not hypothetical — an unscoped record once let an unrelated flag_type's \
-blanket suppression hide a genuinely recurring \
-`live_workflow_recurrence_counter_needed` flag for 6+ cycles with no tracking task. \
-Omit `flag_types` only when you deliberately want to silence every flag_type for \
-that task.
-
-If you do choose to check: call \
-`search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
-categories=['observations_and_summaries'], stores=['mem0'], limit=50)`. \
-`task_id=<N>` in the query biases vector ranking; `limit=50` overrides the \
-default `limit=10` so a busy project doesn't drop the record; `limit=50` is \
-intentionally smaller than `filter_suppressed`'s bulk-sweep `limit=501` because \
-the `task_id=<N>` bias makes 50 sufficient for a single-task lookup. \
-Historical/legacy suppression records were written with `task_id` as either \
-`int` or `str`; new records are pinned to `int` by `build_suppression_payload`, \
-but readers MUST coerce both sides via `str(...)` to remain compatible with \
-legacy data: a result is a valid suppression record ONLY when BOTH \
-`metadata.kind == "stage1_flag_suppression"` AND \
-`str(result.metadata.get('task_id')) == str(target_task_id)`. When the matched \
-record also carries a non-empty `metadata.flag_types`, it is in effect for your \
-candidate flag ONLY if `str(candidate_flag_type)` also appears in that list \
-(str-coerced, same convention as task_id); an empty/absent `flag_types` means the \
-record is blanket and applies regardless of flag_type. Do NOT rely on \
-semantic/vector proximity alone — a result that fails either metadata field, or \
-an empty result set, means "no suppression in effect"; proceed normally.
-
-If the suppression search returns an error or times out, treat suppression as \
-not-in-effect and proceed with normal flag emission; record the search failure \
-in your cycle summary so operators can re-check. This mirrors the conservative \
-pass-through that the post-processor's `filter_suppressed` already performs in \
-code, keeping prompt-driven and code-driven outcomes aligned.
 
 Suppression is distinct from the post-processor dedup described in the next section. \
 Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
 suppression authoritatively forbids flag emission for a task_id — either for every \
-flag_type (legacy blanket record) or for a scoped subset of flag_types (a record \
-carrying a non-empty `flag_types`). \
+flag_type (blanket rows) or for a scoped subset of flag_types (scoped rows). \
 The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
 detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
@@ -926,7 +898,18 @@ both; the `flagged_items` entry should carry the same `task_id`, `flag_type`, an
 `description` as the Mem0 memory.
 
 Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<current_run_id>` \
-(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt).
+(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt) \
+and `metadata.kind='{FLAG_FOR_STAGE2_MARKER_KIND}'`, which keeps the marker a standalone \
+record rather than one filed under a memory it resembles.
+
+Garbage collection of this marker keys on `metadata.task_id` and `metadata.kind`. When the \
+flag concerns a task, set `metadata.task_id` to that ONE task's id, never a comma-joined \
+list: the marker is collected once that task is done or cancelled AND the marker has aged \
+past the relay's minimum age, so a marker outliving its task's closure for a while is \
+normal and needs no action from you. A comma-joined or otherwise unresolvable `task_id` is \
+never collected. A marker with no `task_id` has no task to close, so it is collected only \
+after a much longer age ceiling and only if its `kind` is exactly \
+`'{FLAG_FOR_STAGE2_MARKER_KIND}'`; one declaring any other kind is never collected.
 
 Post-write confirmation (LLM-side variant of the findability discipline enforced in code by flag_dedup.confirm_marker_persisted — task-1400, post-task-1413): \
 `add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
@@ -978,38 +961,42 @@ injected/fabricated" purely because the imperative writing style looked foreign 
 
 ## Live-Workflow Authority
 The payload may include a `### Live-Workflow Signals` section. When present, it lists \
-tasks whose branch `task/<id>` has at least one live-workflow signal: a registered \
-git worktree, a recent branch commit (within the last 6 hours), or an active \
-orchestrator process holding the project lock. These signals indicate that a live \
+tasks whose branch `task/<id>` has a per-task live-workflow signal (a registered git \
+worktree, or a recent branch commit within the last 6 hours), tasks that are live only \
+through the project-wide orchestrator lock (stated once, on the section's own project \
+line), and tasks whose work has already landed on main. A live listing suggests that a \
 pipeline — typically the reify-build orchestrator — is actively driving that task's \
-lifecycle.
+lifecycle; the rules below say how to confirm it.
 
-**For any task listed in `### Live-Workflow Signals`, do NOT emit a stranded-work or \
-blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
-`severity='moderate'` with `actionable=true`.** A task under an active live pipeline is \
-mid-flight, not stranded — asserting a moderate/actionable disposition for it contradicts \
+{render_live_workflow_authority_rules()}
+
+**For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
+`{NOT_LIVE_TOKEN}`), do NOT emit a stranded-work or blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
+`severity='{FindingSeverity.moderate}'` with `actionable=true`.** A task under an active live pipeline is \
+mid-flight, not stranded — asserting a {FindingSeverity.moderate}/actionable disposition for it contradicts \
 Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contradictory \
 disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
 
-Instead, for a task listed under `### Live-Workflow Signals`, do one of:
-1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
+Instead, for a task with a live row, do one of:
+1. **Downgrade** the flag to `severity='{FindingSeverity.minor}'` and `actionable=false`, or
 2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
    and leave the final disposition to Stage 2, which has direct access to live scheduler \
    state.
 
 Either remediation is acceptable; what is NOT acceptable is emitting the flag at \
-`severity='moderate'` with `actionable=true` as though the task were genuinely stranded.
+`severity='{FindingSeverity.moderate}'` with `actionable=true` as though the task were genuinely stranded.
 
 **Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
-is present** — i.e., the task is absent from `### Live-Workflow Signals` (all three \
-signals are False: no worktree, no recent commits, no active orchestrator). That is the \
-genuinely stranded case that legitimately needs operator attention.
+is present** — i.e., the task has no live row in `### Live-Workflow Signals`, or \
+`get_task` shows no live claimant for it (the tie-breaker above), and its work has not \
+landed. That is the genuinely stranded case that legitimately needs operator attention.
 
-If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
-for every task; no live-workflow suppression applies, and stranded/blocked-escalation \
+If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
+neither through a per-task signal nor through the project-wide lock — and none has \
+landing evidence; no live-workflow suppression applies, and stranded/blocked-escalation \
 flags may be emitted normally.
 
-## Preserved-Specimen Corroboration
+{PRESERVED_SPECIMEN_CORROBORATION_HEADING}
 Absence of a live-workflow signal is necessary for the stranded claim but it is NOT \
 sufficient. Some tasks are left `in-progress` with a null claimant and a null heartbeat \
 DELIBERATELY, because that state is itself the evidence something else is waiting on — \
@@ -1019,11 +1006,13 @@ signals alone, and a reset would destroy the very thing it is being kept for.
 **Before asserting that a no-claimant / dead-heartbeat `in-progress` task is stranded, \
 corroborate that its state is unintentional.** Two places already hold the answer:
 1. `get_entity('Task <id>')` — a preserved specimen usually has an edge saying so.
-2. the task's `investigation_outcome` memories — a prior cycle that adjudicated this \
-   exact question records its verdict there.
+2. `mcp__fused-memory__get_memories_by_metadata(project_id=..., \
+filters={json.dumps(preservation_mem0_filters('<id>'))})` — the prior cycles' recorded not-actionable \
+verdicts on this exact question; read each row's prose. Use this scroll rather than \
+`search`, whose top-N cutoff can drop the one row that matters.
 
 If either names the task as a preserved / validation specimen, do NOT recommend a status \
-reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \
+reset, a redispatch, or an operator gate task. Emit the finding at `severity='{FindingSeverity.minor}'` with \
 `actionable=false`, or omit it, and say in the description which citation you read.
 
 **The deterministic gate is enforced in code** by \

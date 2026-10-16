@@ -94,6 +94,7 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git diff ...)` | Diff between commits or branches to identify breaking changes |
 | `Bash(git show ...)` | Read a specific commit's diff |
 | `Bash(git status ...)` | Working-tree state at the project root |
+| `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only). Advisory entry: not in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`; it runs because the rotation's `bypassPermissions` mode admits Bash, as `scripts/watcher-rearm.sh` does |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
 | `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
@@ -121,6 +122,8 @@ A hypothesis is a **stable, human-readable string** you will pass as `root_cause
 - Too vague: `"infra"`, `"failure"`
 - Too specific: `"task-42-import-error-line-17-of-reconciler.py"` (won't match task-43's variant)
 
+A hypothesis that joins two or more failure events of one task is formed from counted rows, per `$DARK_FACTORY_ROOT/skills/_shared/counting-failure-events.md`.
+
 ## Promote to L2
 
 Use `mcp__escalation__promote_to_l2` whenever an escalation (or cluster of escalations) requires human judgment. This replaces leaving items pending at L1.
@@ -142,7 +145,11 @@ result = mcp__escalation__promote_to_l2(
 )
 # result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...],
 #          'severity': <what was actually filed>}
+#   or, for an eval-lane task_id or any eval-lane member, the refusal
+#          {'error': ..., 'code': 'eval_lane_contained'}  (nothing minted)
 ```
+
+An `eval_lane_contained` refusal is final for the eval-lane records it names: close them instead, per [Eval-lane records](#eval-lane-records-any-category--close-never-promote), and re-promote any production members without them.
 
 ### Severity of a promoted L2
 
@@ -421,6 +428,8 @@ sits parked.
 1. The **PREDICATE** — a machine-checkable condition, e.g. `` `task-604 status==done` `` — not a conclusion like "resume will close it". A conclusion-only note is untrusted prose: exactly this anti-pattern on esc-2584 was empirically refuted twice, costing two churn cycles and five separate `resolve_issue` calls before the item was actually closed.
 2. The **PROBE** used to verify it — command + key output line, e.g. `` `probe: get_task 604 -> status=done` ``. This mirrors the [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) evidence convention (quote a live-probe `key=value` token verbatim) and the [`stranded_blocked`](#stranded_blocked) "re-verify the predicate still holds" pattern — `triage_note` generalizes both into one durable rotation-to-rotation handoff note.
 
+**A PROBE offered AGAINST an escalation's premise counts only if it ran in the premise's execution context.** This rotation's own session is not a systemd unit or timer, not the verify subprocess, and not another agent's worktree. If yours did not match, write the note as a non-reproduction that names the context you used, e.g. `` `premise not reproduced in <context> | probe: ...` ``, and never make such a note the basis of a benign `close_only`. Single normative statement of the rule: `$DARK_FACTORY_ROOT/orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
+
 `triaged_at` (stamped automatically) is the **freshness anchor** — there is no separate `verified_at` field; treat them as identical. `updated_at` defaults to `None` (never bumped) until the record's first real content change (e.g. an L2 gaining a member via `promote_to_l2`), so a triaged record that hasn't changed since still reads `updated_at = None` — that is the common case, not an edge case. On each drain cycle (step 5 above):
 - **Skip** re-deriving any item whose `triaged_at` is fresh (< ~6h old) and whose `triage_note` predicate still plausibly covers the record's current state.
 - **Re-assess** — re-run the probe, don't trust the stale note — when `updated_at` is not `None` **and** `updated_at > triaged_at` (the record changed since you triaged it, e.g. an L2 cluster gained a new member via `promote_to_l2`), or the existing note is stale or conclusion-only. Guard the comparison explicitly: treat `updated_at is None` as "not newer than `triaged_at`" rather than ordering `None` against a timestamp string (e.g. Python raises `TypeError` comparing `None > str`).
@@ -458,6 +467,56 @@ Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `clo
 - **`benign`** — a confirmed **no-action** close: the stated condition was stale, superseded, already-cleared, or a duplicate, and nothing real changed beyond closing the record. This covers the [L2 rubber-stamp carve-out](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) closes and the [`stranded_blocked`](#stranded_blocked) predicate-stale close.
 
 The class describes the **escalation's usefulness**, not your effort — a `resume` you performed in one call is still `actionable`; a stale record you spent effort verifying is still `benign`. `promote_to_l2` takes **no** `resolution_class` (promotion does not resolve — member L1s stay pending; the class is stamped only when the resulting L2 is finally resolved). When genuinely unsure, prefer `actionable` (it never suppresses a record from the human-review benign-rate metric).
+
+### Eval-lane records (any category) — close, never promote
+
+**Class discriminator.** A pending record is eval-lane when **either** holds:
+- its `task_id` matches the eval fixture grammar — `<repo>_task_<n>[_<suffix>]` (e.g. `df_task_2430_adv_plan`, `reify_task_5221`, `kl_task_543`) or `shadow_<task_id>_<cell_id>` (e.g. `shadow_5383_01JCELL`);
+- its `worktree` has a path component ending in `-eval-worktrees` or named `.eval-worktrees` (e.g. `/home/leo/src/dark-factory-eval-worktrees/df_task_2339/run-ac3ab562`), even when its `task_id` is a real numeric task. A directory that merely contains `eval-worktree` in its name (a project called `eval-worktree-tools`) is production.
+
+The single source of both signals is `shared/src/shared/eval_lane.py::eval_lane_provenance`; match it, do not approximate it. Other non-numeric ids are **not** eval-lane: `task-path-guard`, `__recovery_veto_streak__*`, `main-sweep-*`, `__scheduler__` and their kin are production harness sentinels whose L2s must still reach a human. A reaper-minted L1 carries `worktree=None`, so on an L1 the `task_id` is usually the only signal.
+
+**Why they exist.** Adversarial eval fixtures seed a deliberately wrong plan step, and the implementer's refuse-and-escalate IS the measured behaviour. It is scored from the eval cell's result artifacts (`orchestrator/src/orchestrator/evals/scoring.py`), never from the escalation queue, so these records carry no production signal. The orphan reaper also used to flag throwaway fixture worktrees as orphans.
+
+**What the system does with them.** The escalation server files eval-lane escalations already-resolved (`resolved_by='escalation-eval-lane-containment'`); the orphan reaper dismisses an eval-lane L0 instead of promoting it; `promote_to_l2` refuses an eval-lane `task_id`, or any eval-lane member under whatever `task_id`, with `code: 'eval_lane_contained'` and mints nothing. A rotation should rarely meet one.
+
+**Disposition for any that still reach a rotation** (records filed before containment shipped, or written by a path that bypasses the server). Never `promote_to_l2`. Never `resolve_issue(action='resume')`. Close each member L1:
+
+```
+mcp__escalation__resolve_issue(
+  escalation_id="...",
+  resolution="eval-lane artifact (<task_id> / <worktree>) — eval fixture behaviour, scored from the eval cell result artifacts; not a production signal. Closed informational.",
+  action='close_only',
+  resolved_by="escalation-watcher-auto",
+  resolution_class="benign"
+)
+```
+
+Close it; do not `stamp_triage` it. A stamp leaves the record pending, and a pending L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) respawning rotations.
+
+**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. This rotation holds no escalation-filing tool, so the digest is the report: append `— BYPASS? filed <timestamp>` to that record's digest line.
+
+**Digest — one line per record, mandatory:**
+
+`AUTO-CLOSED (L1 <escalation_id>): eval-lane-contained — <task_id> — eval fixture artifact, measurement scored from cell result artifacts [benign]`
+
+### Converted strands (any category) — `metadata.strand_converted`
+
+**What it is.** The stranded-task sweep (`orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded`, active only when `convert_to_blocked_enforce` is true) moves an `in-progress` row with no live claimant and an open pinning record to `blocked`. It files nothing. It stamps `metadata.strand_converted = {at, shape, pinning_escalation_ids}` (schema `shared/src/shared/strand_conversion.py::StrandConverted`) and emits one `strand_converted` event naming the same records. Those records are the row's ownership tokens: resolving them is its only exit, and a `resume` re-pends it.
+
+**Class discriminator.** On `get_task(<task_id>)`, both hold:
+- `task["status"] == "blocked"`
+- the record's id is in `task["metadata"]["strand_converted"]["pinning_escalation_ids"]`
+
+The stamp outlives the conversion, so it is the status check together with the id membership that makes it current.
+
+**Disposition.** Route the record by its OWN category exactly as the rows below say; conversion changes no category's disposition. On top of that:
+- Add `converted strand: strand_converted.at=<at> shape=<shape>` to the promote `evidence`, or to the `resolution` when you close.
+- An absent `dry_run_proposals` entry is EXPECTED. Conversion files nothing, so no block-time proposal ran, and the low-risk auto-unblocker aborting on the record is by design (spec `docs/task-escalation-state-spec.md` §7, item 8). Write "no proposal: converted strand (by design)" rather than treating it as a defect.
+- Never `close_only` the record as stale merely because the task is `blocked` with no active workflow. That shape IS the converted state, and closing the record removes the row's only owner.
+- Never set the task's status or re-pend it by hand, and never file a new record for it.
+
+**Digest.** Append ` [converted strand <at>]` to the category's normal digest line.
 
 ### Autonomous dispatch categories (handle and resolve)
 
@@ -828,6 +887,45 @@ category. If `disposition == "integration_skew"`:
    ```
 4. Add to digest: `PROMOTED (L2 <id>): task_failure — <task_id> — <summary>` (include proposal snippet if present)
 
+#### `workflow_exit_contract`
+
+**Producer.** `orchestrator/src/orchestrator/exit_contract.py::record_exit_verdict` files ONE L1 per task (deduped on an open L1 of this category), with `agent_role="orchestrator"`, `severity="blocking"` and `suggested_action="investigate_exit_contract"`, and only when `workflow_exit_contract_enforce` is true. With it false (the shipped default) the contract runs in log mode: events only, no records. A `verdict='store_unavailable'` never files a record.
+
+**Meaning.** A workflow's `run()` exited with an (outcome, status) pair outside the proven `shared/src/shared/task_transitions.py::_OUTCOME_ALLOWED` table (`check='outcome_status'`), or with a report phase that disagrees with the state machine (`check='phase'`). It is a CONTRACT violation, not a task failure: the task's own work may be fine, and its status row was left exactly as found.
+
+**Extraction.** The first line of `detail` is the rendered verdict, `verdict='violation' mode='enforce' check=... outcome=... status=... report_phase=... machine_state=... failed_write=... escalation_id=...` (values repr-quoted). Read `check`, `outcome`, `status`, `report_phase` and `machine_state` from it, and quote the line.
+
+**Pin warning.** An open blocking L1 on the real task id is a queue-handoff pin (`escalation/src/escalation/pins.py::classify_pins`, link 3), so while it is open the recovery sweeps hold the task. Do not `close_only` it to unstick the task.
+
+**Disposition.** Always promote: the call is a judgement between two causes.
+- (a) THE PAIR IS LEGITIMATE AND THE TABLE IS TOO TIGHT. A designed producer reaches this pair, and `_OUTCOME_ALLOWED[<outcome>]` simply does not list `<status>`. The fix is to widen the table, a code change filed against the exit-contract table.
+- (b) THE WORKFLOW GENUINELY EXITED WRONGLY. The defect is in the exiting path (the producer that wrote, or failed to write, the status), and the task row may need human repair.
+
+`check='phase'` is always (b): the table is not involved. Before promoting, Grep `_OUTCOME_ALLOWED` for the `<outcome>` row and quote it in the evidence, and re-read the task's status with `get_task`.
+
+**Cluster.** Every pending `workflow_exit_contract` L1 with the same `(check, outcome, status)` shares one cause, whichever task it is on; cluster them.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<task_id>,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="workflow-exit-contract:<check>:<outcome>-><status>",
+  evidence=<detail line + quoted _OUTCOME_ALLOWED row + current status>,
+  options=[
+    "A: the pair is legitimate — widen _OUTCOME_ALLOWED[<outcome>] to admit <status>",
+    "B: the workflow exited wrongly — fix the exiting path; repair the task row if it is stuck",
+    "C: an existing task already owns this pair — link it and keep the record open until it lands",
+    "D: something else",
+  ],
+  summary=<escalation summary>,
+  category="workflow_exit_contract",
+  # severity omitted — inherited from the members.
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): workflow_exit_contract — <task_id> — <check> <outcome>-><status>`
+
 #### `infra_issue`
 
 Infrastructure problem. Do NOT attempt automated fixes.
@@ -1036,6 +1134,9 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 
 ### Auto-closed L1 (path-guard synthetic-anchor audit)
 - AUTO-CLOSED (L1 esc-task-path-guard-37): path-guard-audit — mode=rejection — synthetic anchor task-path-guard (no real task); closed informational [benign]
+
+### Auto-closed L1 (eval-lane contained)
+- AUTO-CLOSED (L1 esc-df_task_2430_adv_plan-7): eval-lane-contained — df_task_2430_adv_plan — eval fixture artifact, measurement scored from cell result artifacts [benign]
 
 ### Auto-closed L2 (narrow carve-out)
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]

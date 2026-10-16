@@ -116,9 +116,12 @@ LEASE_DIR_ENV = 'DF_EPHEMERAL_COLLECTION_LEASE_DIR'
 
 #: How many times :func:`hold_lease` re-attempts an acquisition a concurrent
 #: sweep reclaimed under it.  Bounded, and small: each retry is answering a
-#: race that only a sweep running in the same microsecond can cause, and a
-#: holder that loses three in a row is better off failing OPEN and saying so
-#: than spinning inside a context manager a test is waiting on.
+#: race that only a sweep running in the same microsecond can cause, and the
+#: sweep fires every six hours, so losing it three times in a row, against a
+#: fresh filename each time, is far past the plausible worst case.  This runs
+#: inside live experiments and tests, so a pathological loop must degrade to
+#: the documented fail-open (one stderr line, no guard) rather than hang a
+#: bake-off or a context manager a test is waiting on.
 _ACQUIRE_ATTEMPTS = 3
 
 #: ``flock`` refusals that mean "someone else holds this right now" rather
@@ -202,28 +205,6 @@ def _lease_body(owner: str) -> bytes:
     return json.dumps(record).encode()
 
 
-#: How many times :func:`hold_lease` re-attempts an acquisition a concurrent
-#: sweep unlinked out from under it.  Bounded rather than unbounded because
-#: this runs inside live experiments: a pathological loop must degrade to the
-#: documented fail-open (one stderr line, no guard) instead of hanging a
-#: bake-off.  Three is already far past the plausible worst case — the sweep
-#: fires every six hours and would have to lose the same microsecond race
-#: three times in a row, against a fresh filename each time.
-_ACQUIRE_ATTEMPTS = 3
-
-
-def _still_linked(fd: int) -> bool:
-    """Is the flocked file still IN the directory, or was it unlinked?
-
-    ``st_nlink == 0`` means some other process unlinked this path while the
-    acquisition was in flight — a lock on an inode nothing can name, which
-    :func:`live_leases` will never see again.  Asked AFTER the flock, of the
-    open file description rather than the path, so the answer cannot be
-    stale: once the flock is held, the file can no longer be reaped.
-    """
-    return os.fstat(fd).st_nlink != 0
-
-
 @contextlib.contextmanager
 def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
     """Publish a lease that holds :func:`main`'s sweep off while it is open.
@@ -265,7 +246,6 @@ def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
     ``shared/verify_admission.py::acquire_task_slot`` (clause C-fail-open).
     """
     target = lease_dir() if directory is None else Path(directory)
-    path = None
     fd = None
     # The path this holder created, or None when it created nothing: what the
     # `finally` has to take away again, tracked separately from `fd` because a
@@ -373,7 +353,7 @@ def _is_held(path: Path) -> bool | None:
     The probe is ``LOCK_SH``, not ``LOCK_EX``: two sweepers running at once
     must not exclude each other and mistake a peer's probe for a live run.
     Shape copied from
-    ``fused_memory/middleware/ticket_janitor.py::_orchestrator_running``;
+    ``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``;
     copied rather than imported because cron runs this file under the system
     ``python3``, where ``fused_memory`` is not importable.
     """
@@ -499,13 +479,15 @@ def reap_dead_leases(*, directory: Path | None = None) -> int:
     A file that cannot be probed at all is skipped rather than removed —
     unprobeable is not the same as dead.
 
-    The one file this CAN take from a living process is one still being
-    ACQUIRED: created, not yet flocked, and from here identical to litter —
-    same bytes, same absent lock.  That is unresolvable from this side, so it
-    is resolved on the holder's instead: :func:`hold_lease` re-checks after
-    locking and starts over when its file has been taken.  Named rather than
-    implied, because this is the only case in which the paragraph above is
-    not the whole truth.
+    A file still being ACQUIRED — created, not yet flocked — is from here
+    identical to litter: same bytes, same absent lock.  Both sides close that
+    case.  On this side, a holder that has already won ``LOCK_EX`` refuses
+    the probe's ``LOCK_SH``, so its file is skipped; and a probe that wins
+    first keeps its shared lock across the unlink.  On the holder's side,
+    :func:`hold_lease` then finds its ``LOCK_EX`` refused, or its directory
+    entry gone after locking, and starts over under a fresh name.  Named
+    rather than implied, because this is the only case in which the
+    paragraph above is not the whole truth.
 
     Never raises, for the same reason as :func:`live_leases`: two sweeps can
     overlap (an operator running this by hand while cron fires), and the

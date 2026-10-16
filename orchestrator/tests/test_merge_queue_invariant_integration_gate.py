@@ -83,7 +83,9 @@ Fault-injection inventory (no real ssh/build/merge-to-main):
     verify: pass, fail, raise ``RunnerUnavailable``, or park on an event.
   - a fake remote runner injected through the two-host allocator gives the
     speculative downstream its own host.
-  - ``clock=FakeClock`` ages the heartbeat for row 5 without a real wait.
+  - ``clock=healthy_verify_clock()`` ages the heartbeat for row 5 in
+    production-sized ticks of at most ``FakeClock.sleep_cap`` real each, on
+    a merge worktree the wedged verify keeps writing to.
   - ``patch.object(git_ops, 'advance_main')`` forges the CAS-retry outcome
     row 8 needs (a git_ops method, not a lane internal).
 """
@@ -98,15 +100,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import (
-    FakeClock,
     FakeVerifier,
     VerifyScript,
     fails,
+    healthy_verify_clock,
     lane_scene_config,
     main_health_probe_spawned,
     passes,
 )
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
     _gated_runner,
     _inject_two_host_allocator,
@@ -116,7 +118,7 @@ from test_merge_queue_concurrent_verify import (
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
-from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane import MergeLane, WaiterRecord
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
@@ -124,7 +126,6 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
-    WaiterRecord,
     coalesce_or_enqueue_merge_request,
     item_merge_wt,
 )
@@ -441,8 +442,12 @@ class TestScenario1SpeculativeCascade:
             # task can unblock even if cancel() arrives slightly late.
             follower_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result, label='casc1-a (N, head) outcome after head-failure cascade',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result, label='casc1-b (N+1, remote) outcome after cascade re-merge',
+            )
 
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail (genuine VerifyResult failure, not '
@@ -508,7 +513,9 @@ class TestScenario234VerifierLifecycleFaults:
             req = await _submitted(git_ops, config, 'ru2', 'ru2.py', 'r = 1\n')
             await queue.put(req)
 
-            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(
+                req.result, label='ru2 outcome after RunnerUnavailable re-dispatch',
+            )
 
             assert outcome.status == 'done', (
                 f'RUNNER_UNAVAILABLE is transient — the item must be re-dispatched '
@@ -555,7 +562,9 @@ class TestScenario234VerifierLifecycleFaults:
 
             lane.unhalt_all_lanes('row-3 unhalt')
             verify_gate.set()
-            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(
+                req.result, label='halt3 outcome after unhalt re-verify',
+            )
             assert outcome.status == 'done', (
                 f'expected the re-verify after unhalt to land "done", got {outcome!r}'
             )
@@ -619,11 +628,17 @@ class TestScenario5LivenessEscalation:
     the heartbeat files a dedup'd category='merge_request_stuck' escalation
     [η=1992].
 
-    The ageing is done by the injected clock, not by waiting: ``FakeClock``
-    advances by whatever the heartbeat asks to sleep, so the lane's own
-    ``_HEARTBEAT_POLL_S`` cadence carries wall-clock time past the threshold
-    within a few event-loop turns. The escalation therefore comes off the
-    real heartbeat wiring rather than a direct call to the check.
+    The ageing is done by the injected clock: each heartbeat poll waits at
+    most ``FakeClock.sleep_cap`` of real time and charges its full
+    ``_HEARTBEAT_POLL_S``, alongside the reprobe loop's interval, so the
+    lane's own cadence carries wall-clock time past the threshold. The
+    escalation therefore comes off the real heartbeat wiring rather than a
+    direct call to the check.
+
+    The clock shows content progress (``healthy_verify_clock``) because a
+    frozen merge worktree would be aborted as dead before the stuck
+    threshold. In production too, a verify must keep writing to stay in
+    flight that long.
     """
 
     async def test_wedged_verify_escalates_liveness(
@@ -637,7 +652,8 @@ class TestScenario5LivenessEscalation:
         escalations = _FakeEscalationQueue(open_l1=False)
 
         async with _running_lane(
-            git_ops, verifier=verifier, escalation_queue=escalations, clock=FakeClock(),
+            git_ops, verifier=verifier, escalation_queue=escalations,
+            clock=healthy_verify_clock(),
         ) as (_lane, queue):
             req = await _submitted(git_ops, config, 'wedge5', 'wedge5.py', 'w = 1\n')
             await queue.put(req)
@@ -792,7 +808,9 @@ class TestScenario8CasRetryTipCarry:
             req = await _submitted(git_ops, config, 'row8', 'row8.py', 'row8 = 1\n')
             with patch.object(git_ops, 'advance_main', side_effect=_fake_advance):
                 await queue.put(req)
-                outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+                outcome = await wait_responsive(
+                    req.result, label='row8 outcome after rebased_pending_reverify CAS retry',
+                )
 
             assert len(advance_calls) >= 2, (
                 f'expected the CAS retry to re-advance after the rebase, got '
@@ -872,7 +890,9 @@ class TestScenario10VerifyBaseMismatch:
             # Draining the item clears the surface: quiescence is measured
             # against the main the pipeline actually ends on.
             verify_gate.set()
-            await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            await wait_responsive(
+                req.result, label='vb10 outcome after the verify-base mismatch drains',
+            )
             main_final = await git_ops.get_main_sha()
             _assert_quiescent(lane, main_final, [req])
 
@@ -1066,8 +1086,12 @@ class TestB8MidPipelineCensus:
             head_gate.set()
             follower_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result, label='b8-a (N, head) outcome after the mid-pipeline sample',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result, label='b8-b (N+1, remote) outcome after cascade re-merge',
+            )
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail (genuine VerifyResult failure), got {outcome_a!r}.'
             )

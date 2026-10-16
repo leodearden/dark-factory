@@ -17,6 +17,7 @@ explicitly and concluded aggregation is moot for this module.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 from datetime import UTC, datetime
@@ -35,6 +36,13 @@ _DEFAULT_BURST_COOLDOWN = 150
 _ACTIVE_THRESHOLD_SECONDS = 3600  # 1 hour
 
 
+class AgentActivity(enum.StrEnum):
+    """Which arm of :func:`partition_burst_state`'s rule admitted an agent as active."""
+
+    NON_IDLE = 'non_idle'
+    RECENT_WRITE = 'recent_write'
+
+
 def partition_burst_state(
     burst_state: list[dict],
     *,
@@ -44,7 +52,11 @@ def partition_burst_state(
     """Split burst agents into active and idle lists.
 
     Active means ``state != 'idle'`` **or** ``last_write_at`` within
-    *active_threshold_seconds*.  Everything else is idle/stale.
+    *active_threshold_seconds*.  Everything else is idle/stale.  Each active
+    agent comes back as a copy stamped with ``activity``, the
+    :class:`AgentActivity` arm that admitted it, so a consumer reads the
+    rule's own decision instead of re-deriving it; idle agents are returned
+    as given.
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results.
@@ -54,14 +66,14 @@ def partition_burst_state(
     idle: list[dict] = []
     for agent in burst_state:
         if (agent.get('state') or 'idle') != 'idle':
-            active.append(agent)
+            active.append({**agent, 'activity': AgentActivity.NON_IDLE})
             continue
         # Idle agents with recent writes are still "active" for display
         last_write_at = agent.get('last_write_at')
         try:
             last_write = parse_utc(last_write_at).astimezone(UTC)
             if (now - last_write).total_seconds() < active_threshold_seconds:
-                active.append(agent)
+                active.append({**agent, 'activity': AgentActivity.RECENT_WRITE})
                 continue
         except (ValueError, TypeError) as exc:
             logger.debug(

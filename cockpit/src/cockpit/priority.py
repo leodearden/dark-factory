@@ -8,11 +8,8 @@ from a global or a clock read.
 
 from __future__ import annotations
 
-import contextlib
 import importlib.resources
 import logging
-import os
-import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +17,7 @@ from typing import Any
 
 import yaml
 from orchestrator.session_registry import normalize_project_token
+from shared import safe_io
 
 logger = logging.getLogger(__name__)
 
@@ -492,34 +490,20 @@ def load_priorities(path: Path | None = None) -> Priorities:
 
 
 def save_priorities(priorities: Priorities, path: Path | None = None) -> None:
-    """Atomically write *priorities* to *path* (default ``~/.claude/fleet/priorities.yaml``).
+    """Atomically write *priorities* to *path*, owner-only (0600).
 
-    The exact inverse of load_priorities/_priorities_from_dict (see
+    *path* defaults to ``~/.claude/fleet/priorities.yaml``. The exact inverse of load_priorities/_priorities_from_dict (see
     _priorities_to_dict): writes the same six sections load_priorities
     reads, so ``load_priorities(path) == priorities`` after this call.
-    Mirrors ui_config.save_ui_config's atomic tmp-file-in-target's-own-
-    parent-dir + os.replace idiom, so a save is never observed
-    half-written. Fail-soft: ANY exception during the write (not just
-    OSError -- e.g. an unexpected yaml.safe_dump fault) is logged and
-    swallowed, never raised, per the cockpit's hard constraint that a view
-    must never be a dependency (PRD §2).
+    Never raises: ANY exception during the write -- e.g. an unexpected
+    yaml.safe_dump fault -- is logged and swallowed, because a view must
+    never be a dependency (PRD §2).
     """
     target = path if path is not None else _default_priorities_path()
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp',
-            prefix=target.stem,
-            dir=str(target.parent),
+        safe_io.atomic_write_text(
+            target, yaml.safe_dump(_priorities_to_dict(priorities)), mode=0o600, mkdir=True
         )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                yaml.safe_dump(_priorities_to_dict(priorities), f)
-            os.replace(tmp_path_str, str(target))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
     except Exception as exc:
         logger.warning('save_priorities: failed to write %s: %s', target, exc)
 

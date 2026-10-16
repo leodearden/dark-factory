@@ -8,20 +8,31 @@ scheduler_utils.jsx inside a node vm sandbox and asserts the returned
 
 Uses the same node-vm harness established in test_chip_label_disambiguation.py.
 Tests skip when node is absent from PATH (CI requires node).
+
+It is the ONE lock classifier. lockChipStateFor wraps it with the one
+derivation of "this lock is mine" from a task's view of a SCHEDULER.modules
+entry, and the Scheduler heatmap's cellStateFor is executed below beside it:
+it must answer every lock state exactly as the task-row LockChip does —
+membership (rowTouchesModule) is the only thing it adds.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import pathlib
-import shutil
 import subprocess
 
 import pytest
-
-SCHED_UTILS_PATH = str(
-    pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/scheduler_utils.jsx'
+from _lock_chip_matrix import (
+    CELL_MATRIX,
+    MODULE_PATH,
+    ROW_PROJECT,
+    ROW_TASK,
+    SCHED_UTILS_PATH,
+    heatmap_cell_and_chip,
+    heatmap_module,
+    heatmap_row,
+    lock_chip_states_for,
+    node_path,
 )
 
 # Node driver: extracts the pure-JS helper section from scheduler_utils.jsx
@@ -52,19 +63,10 @@ process.stdout.write(JSON.stringify(sandbox.__result) + '\n');
 """
 
 
-def _node():
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
-
-
 def _eval_sched_utils_fn(fn_name, *args):
     """Call fn_name(*args) in a node vm sandbox and return the decoded result."""
     result = subprocess.run(
-        [_node(), '-e', _DRIVER, SCHED_UTILS_PATH, fn_name, json.dumps(list(args))],
+        [node_path(), '-e', _DRIVER, SCHED_UTILS_PATH, fn_name, json.dumps(list(args))],
         capture_output=True,
         text=True,
         check=True,
@@ -149,3 +151,71 @@ class TestLockChipStatePrecedence:
         assert result['cls'] != 'lock-parked', (
             "held+parked must NOT yield cls='lock-parked' — holder takes precedence"
         )
+
+
+class TestLockChipStateForDecidesMine:
+    """lockChipStateFor(module, taskId, project) is the one place a lock is "mine".
+
+    Mine means held by this task id IN this project; a module that names no
+    holder_project is read as the task's own project.
+    """
+
+    @pytest.mark.parametrize('fields, cls, owner_label', [
+        ({'holder': ROW_TASK, 'holder_project': ROW_PROJECT}, 'lock-mine', None),
+        ({'holder': ROW_TASK}, 'lock-mine', None),
+        ({'holder': ROW_TASK, 'holder_project': 'Q'}, 'lock-taken', f'T-{ROW_TASK}'),
+        ({'holder': 'A', 'holder_project': ROW_PROJECT}, 'lock-taken', 'T-A'),
+        ({'parked_by': 'C', 'parked_owner_live': False}, 'lock-parked', 'T-C ⚠'),
+        ({}, 'lock-free', None),
+    ], ids=['own task, own project', 'own task, no holder_project',
+            'own task id, another project', 'another task', 'parked, dead owner', 'free'])
+    def test_mine_is_this_task_in_this_project(self, fields, cls, owner_label):
+        [state] = lock_chip_states_for([(heatmap_module(**fields), ROW_TASK, ROW_PROJECT)])
+        assert (state['cls'], state['ownerLabel']) == (cls, owner_label), state
+
+    def test_a_module_the_scheduler_does_not_list_is_free(self):
+        [state] = lock_chip_states_for([(None, ROW_TASK, ROW_PROJECT)])
+        assert state['cls'] == 'lock-free', state
+
+
+# ---------------------------------------------------------------------------
+# The heatmap cell is classified by lockChipStateFor too (PRD sketch #12,
+# second half). cellStateFor is EXECUTED, not grepped, by
+# _lock_chip_matrix.heatmap_cell_and_chip.
+# ---------------------------------------------------------------------------
+
+
+class TestHeatmapCellIsTheLockChip:
+    def test_parked_and_held_reads_as_taken_in_both(self):
+        """A cell held by A and parked by this row's own task is lock-taken, as the chip is.
+
+        The heatmap used to rank parked-by-me first and the chip ranks the
+        holder first, so the same lock read 'parked' in one view and 'taken'
+        in the other.
+        """
+        module = heatmap_module(holder='A', holder_project=ROW_PROJECT,
+                                parked_by=ROW_TASK, parked_owner_live=True)
+        row = heatmap_row(module)
+        assert row['park_state'] == {'modules': [MODULE_PATH]}
+        cell, chip = heatmap_cell_and_chip(row, module)
+        assert cell == chip, f'heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
+        assert chip['cls'] == 'lock-taken'
+
+    @pytest.mark.parametrize('case', sorted(CELL_MATRIX))
+    def test_every_lock_state_classifies_as_the_chip_does(self, case):
+        module = heatmap_module(**CELL_MATRIX[case])
+        cell, chip = heatmap_cell_and_chip(heatmap_row(module), module)
+        assert cell == chip, f'{case}: heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
+
+    @pytest.mark.parametrize('row_project, lock_set', [
+        (ROW_PROJECT, ()),
+        ('Q', (MODULE_PATH,)),
+    ], ids=['module outside the lock set', 'same path, another project'])
+    def test_a_module_the_row_does_not_lock_is_not_in_set(self, row_project, lock_set):
+        module = heatmap_module(holder='A', holder_project=ROW_PROJECT)
+        row = {**heatmap_row(module, lock_set=lock_set), 'project': row_project}
+        cell, _chip = heatmap_cell_and_chip(row, module)
+        assert isinstance(cell, dict) and set(cell) == {'cls', 'hint', 'ownerLabel'}, (
+            f'cellStateFor does not answer in lockChipState\'s shape: {cell!r}'
+        )
+        assert cell['cls'] == 'not-in-set'

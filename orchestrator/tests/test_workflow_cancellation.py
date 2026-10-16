@@ -44,6 +44,7 @@ import pytest
 from _orch_helpers import (
     CANCEL_SCOPE_BARRIER_TIMEOUT,
     CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     _init_harness_state_for_test,
     wire_scheduler_liveness_mock,
 )
@@ -613,7 +614,7 @@ def task_assignment() -> TaskAssignment:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
 class TestRunSingleCatchHardCancel:
     """Boundary row 14: ``run()`` must RETURN a ``TerminalReport`` on a
     harness-style hard-cancel, never let ``CancelledError`` escape — and
@@ -953,7 +954,7 @@ class TestOnTerminalCleanups:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
 class TestSoftCancelCoversNewAwait:
     """Boundary row 15(a): a soft-cancel during a long await NOT wrapped by
     ``_await_cancellable`` is still caught by the ``CancellationScope``'s own
@@ -1167,7 +1168,7 @@ def _make_harness_for_run_slot() -> Harness:
     return h
 
 
-@pytest.mark.timeout(180)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
 class TestHarnessSyntheticCancelRetirement:
     """RED (step-13): ``TaskReport`` sheds ``synthetic_cancel`` — it can no
     longer be constructed with the field, and the harness's hard-cancel

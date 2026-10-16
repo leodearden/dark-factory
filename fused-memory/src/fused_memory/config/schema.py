@@ -500,6 +500,26 @@ class WriteJournalConfig(BaseModel):
         return self
 
 
+class WriteJournalGrowthAlarmConfig(BaseModel):
+    """Ceilings for ``services/journal_growth_alarm.py``.
+
+    Restart-only, in the same posture as ``WriteJournalConfig``: absent from
+    ``config/reload.py::RELOADABLE_FIELDS``. The measured basis of both ceilings
+    lives in the ``write_journal_growth_alarm`` block of
+    ``fused-memory/config/config.yaml``. Task 5405 must re-anchor both values
+    after its rollup lands.
+    """
+
+    #: On-disk bytes of ``write_journal.db`` plus its ``-wal`` / ``-shm`` sidecars.
+    max_file_bytes: int = Field(default=19_327_352_832, gt=0)
+    #: ``write_ops`` rows inserted in the trailing 24 h.
+    max_rows_inserted_per_day: int = Field(default=1_500_000, gt=0)
+    #: Minimum seconds between two checks. Checks ride the checkpoint loop's tick
+    #: (``server/main.py::_CHECKPOINT_INTERVAL``), so the effective interval is
+    #: this value rounded UP to a whole number of ticks: below one tick, every tick.
+    check_interval_seconds: float = Field(default=3600.0, gt=0)
+
+
 # --- Taskmaster ---
 
 class TaskmasterConfig(BaseModel):
@@ -1511,7 +1531,14 @@ class ReconciliationConfig(BaseModel):
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')
     agent_max_tokens: int = Field(default=8192)
-    agent_max_steps: int = Field(default=50)
+    agent_max_steps: int = Field(
+        default=50,
+        description=(
+            'Outer tool-dispatch steps for the in-process agent providers '
+            '(anthropic/openai). The claude_cli provider runs its loop inside one '
+            'CLI invocation capped by agent_loop.py::_AGENT_CLI_MAX_TURNS instead.'
+        ),
+    )
 
     # Judge settings
     judge_enabled: bool = Field(default=True)
@@ -1631,7 +1658,8 @@ class ReconciliationConfig(BaseModel):
         default=180,
         gt=0,
         description=(
-            'Wall-clock budget for a single agent_loop._call_claude_cli invocation. '
+            'Wall-clock budget for a single agent_loop._call_claude_cli invocation, '
+            'which carries the whole verification (task 4344). '
             'Distinct from stage_timeout_seconds (outer stage guard). '
             'Restores the pre-881 hard-coded 180s ceiling.'
         ),
@@ -1645,9 +1673,20 @@ class ReconciliationConfig(BaseModel):
             'Restores the pre-881 hard-coded 600s ceiling.'
         ),
     )
+    stage_startup_grace_secs: float = Field(
+        default=450.0,
+        gt=0,
+        description=(
+            'How long (s) a recon stage CLI agent may run before its first '
+            'assistant turn; past it, shared\'s startup-wedge watchdog kills it. '
+            'Distinct from stage_timeout_seconds (the whole-stage bound). '
+            'Basis: plans/recon-stage-startup-wedge-rca-2026-09-27.md.'
+        ),
+    )
     @model_validator(mode='after')
     def _validate_cli_timeouts_within_stage(self) -> 'ReconciliationConfig':
-        """Enforce timeout hierarchy: per-CLI budgets ≤ stage guard ≤ cycle guard;
+        """Enforce timeout hierarchy: per-CLI budgets and the stage startup grace
+        ≤ stage guard ≤ cycle guard;
         backlog_iteration_budget_seconds ≤ cycle guard."""
         if self.agent_cli_timeout_seconds > self.stage_timeout_seconds:
             raise ValueError(
@@ -1660,6 +1699,12 @@ class ReconciliationConfig(BaseModel):
                 f'judge_cli_timeout_seconds ({self.judge_cli_timeout_seconds}) must be '
                 f'<= stage_timeout_seconds ({self.stage_timeout_seconds}): '
                 'the per-call budget cannot exceed the outer stage guard.'
+            )
+        if self.stage_startup_grace_secs > self.stage_timeout_seconds:
+            raise ValueError(
+                f'stage_startup_grace_secs ({self.stage_startup_grace_secs}) must be '
+                f'<= stage_timeout_seconds ({self.stage_timeout_seconds}): '
+                'a startup bound past the stage guard can never fire.'
             )
         if self.stage_timeout_seconds > self.cycle_timeout_seconds:
             raise ValueError(
@@ -2112,6 +2157,20 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+class DedupOutageDetectorConfig(BaseModel):
+    """Detects a window of curated tickets with no combine at all, resolved
+    faster than any real curator LLM call can complete.
+
+    The back-test behind these defaults is in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    enabled: bool = Field(default=True)
+    window_seconds: float = Field(default=21600.0, gt=0)
+    min_samples: int = Field(default=10, ge=1)
+    max_median_resolve_seconds: float = Field(default=15.0, gt=0)
+
+
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
 
@@ -2126,6 +2185,7 @@ class TicketJanitorConfig(BaseModel):
     interval_seconds: float = Field(default=60.0)
     cooldown_seconds: float = Field(default=3600.0)
     batch_limit: int = Field(default=100)
+    dedup_outage: DedupOutageDetectorConfig = Field(default_factory=DedupOutageDetectorConfig)
 
 
 class SummaryRebuildConfig(BaseModel):
@@ -2167,6 +2227,9 @@ class CuratorConfig(BaseModel):
     # 180s bounds a silent Anthropic-API hang for the curator's best-effort
     # contract while still giving ~20% headroom over the slowest legitimate
     # single-item decision observed in production (~150s); see esc-task-curator-20.
+    # Time to the FIRST assistant record alone has a long tail (p99 117.3s, max
+    # 203.3s over 5,484 curator transcripts, task 3995), so a gated curator sets
+    # startup_grace_secs equal to this timeout rather than the 120s default.
     timeout_seconds: float = Field(default=180.0)
     # Durable flat $2.00 per-call ceiling (task 1980 / esc-task-curator-194).
     # A prior scale-by-batch-size attempt (reify task 2254) was cancelled and
@@ -2323,8 +2386,10 @@ class CuratorConfig(BaseModel):
     janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
 
     # Zero-output-timeout (ZOT) circuit-breaker watchdog.
-    # Root cause: transient Anthropic-backend degradation on the curator's
-    # sonnet+json-schema call shape (task 1743). Each hang burns the full
+    # ZOTs are an accepted, recurring transient pre-turn hang on the curator's
+    # sonnet+json-schema call shape (ACCEPT-AND-RETUNE ruling on
+    # esc-task-curator-17); for a gated curator the classification is
+    # transcript-authoritative (0 assistant turns). Each hang burns the full
     # timeout_seconds (180s); the breaker stops every call burning that cost
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
@@ -2339,6 +2404,19 @@ class CuratorConfig(BaseModel):
     # task_curator.py::TaskCurator._reset_zero_output_breaker and
     # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
+    # Post-ZOT duplicate sweep (fused_memory/middleware/curator_zot_duplicate_sweep.py).
+    # The threshold is the sweep's own cosine flagging cutoff, not a curator
+    # combine threshold: combine-vs-create is an LLM judgement with no numeric cutoff.
+    zot_duplicate_sweep_enabled: bool = Field(default=True)
+    zot_duplicate_score_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    zot_duplicate_search_limit: int = Field(default=5, ge=1)
+
+    # Degraded-streak alarm (task 4448): escalate once when one project's run
+    # of CONSECUTIVE degraded curations, of any cause, reaches this length.
+    # Counted per project_id, so another project's healthy curations neither
+    # reset nor mask it. Distinct from zero_output_breaker_threshold above,
+    # which counts only hung calls and short-circuits them; this only reports.
+    degraded_streak_threshold: int = Field(default=5, ge=1)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
@@ -2468,6 +2546,38 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     )
 
 
+#: The reasoning efforts the write-triage judge may send on the Responses API.
+#: The single home of that vocabulary: the judge's resolver reads it with
+#: ``typing.get_args`` rather than restating the words.
+JudgeReasoningEffort = Literal['none', 'low', 'medium', 'high']
+
+
+def _require_cutoffs_in_unit_range(
+    value: dict[str, float], *, field_path: str,
+) -> dict[str, float]:
+    """Every per-category cutoff must lie in the cosine unit range, or none load.
+
+    Bounded at load rather than at the consumer because the failure would
+    otherwise be invisible until it changed what got DELETED: a cutoff of
+    42.0 matches nothing and a negative one matches everything, and either
+    surfaces as (un)deleted memories rather than as a config error.
+    Rejecting the whole map on one bad entry keeps a half-valid set of
+    cutoffs from gating a sweep.
+    """
+    out_of_range = {
+        category: cutoff for category, cutoff in value.items()
+        if not 0.0 <= cutoff <= 1.0
+    }
+    if out_of_range:
+        raise ValueError(
+            f'{field_path} cutoffs must lie in the cosine '
+            f'unit range [0.0, 1.0]; got {out_of_range!r}. This map is an '
+            'output of scripts/calibrate_write_triage.py — re-run it rather '
+            'than hand-editing.',
+        )
+    return value
+
+
 class WriteTriageConfig(BaseModel):
     """Server-owned band thresholds for add_memory write triage (task 3130).
 
@@ -2541,8 +2651,8 @@ class WriteTriageConfig(BaseModel):
     # --- judge knobs (leaf gamma, task 3128) -------------------------------
     #
     # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
-    # they ship with real defaults, and None on the two inheriting leaves means
-    # "follow llm.*", never "uncalibrated". All six are green-tier
+    # they ship with real defaults, and None on the inheriting leaves means
+    # "follow llm.*", never "uncalibrated". Every judge_* leaf is green-tier
     # hot-reloadable and read LIVE per middle-band write by
     # server/write_triage_judge.py's resolvers — nothing is captured at import
     # or construction, which is what makes the registration in
@@ -2584,15 +2694,28 @@ class WriteTriageConfig(BaseModel):
         description=(
             'The model the judge calls. None INHERITS llm.model. The PRD\'s '
             '"haiku-class" is a cost/size class, not a vendor pin: this is a '
-            'single-turn ~2.5k-token classification with a four-word closed '
+            'single-turn classification with a four-word closed '
             'output, so the smallest capable model is the right one. Whatever '
             'is resolved here is stamped into the accuracy report\'s provenance '
             'block by scripts/eval_write_triage_judge.py, so the operator at '
             'the 3169 flip gate can tell which model produced the numbers.'
         ),
     )
+    judge_api_url: str | None = Field(
+        default=None,
+        description=(
+            "The judge's OWN endpoint. None INHERITS "
+            'llm.providers.<resolved judge provider>.api_url. When set it is '
+            "the judge's SDK base_url for whichever provider arm the judge "
+            'resolves, and nothing else reads it: the main LLM arm and '
+            'add_memory auto-classification keep llm.providers.*.api_url. The '
+            'api_key still comes from the provider section. Blank means '
+            'inherit. Green-tier hot-reloadable, read live per judge call. See '
+            "plans/write-triage-flip-readiness-prd.md C1' (task σ)."
+        ),
+    )
     judge_timeout_seconds: float = Field(
-        default=10.0,
+        default=15.0,
         gt=0,
         description=(
             'Per-call wall-clock budget for the judge, enforced with '
@@ -2604,7 +2727,25 @@ class WriteTriageConfig(BaseModel):
             'TimeoutError propagates into triage_write\'s fail-open arm, which '
             'is exactly C1\'s "judge error/timeout => stored + storm counter" '
             '(INV-4). Bounded gt=0 because a zero budget would fail every call '
-            'and read as a total judge outage caused by nothing.'
+            'and read as a total judge outage caused by nothing. 15 s rather '
+            'than 10 s because the frontier judge arms measured p95 4.6-6.4 s '
+            '(plans/write-triage-flip-readiness-prd.md §11.2 D15).'
+        ),
+    )
+    judge_reasoning_effort: JudgeReasoningEffort | None = Field(
+        default=None,
+        description=(
+            'Reasoning effort the judge requests. None OMITS the reasoning '
+            'parameter and sends temperature=0.0 instead, which is what a '
+            'non-reasoning model such as gpt-4o-mini needs; a reasoning model '
+            'rejects a temperature, so it needs a value here. A value is sent '
+            'as reasoning={"effort": value} on the '
+            'Responses API, and only an endpoint that serves that API '
+            "(llm.client_class 'openai') can honour it; a set value on any other "
+            'arm is refused per call and counted as a fail-open rather than '
+            'silently dropped. Set together with judge_model from the judge-arm '
+            "selection at the task-3169 flip. PRD: "
+            "plans/write-triage-flip-readiness-prd.md §11.3 C1''."
         ),
     )
     judge_candidate_count: int = Field(
@@ -2620,6 +2761,21 @@ class WriteTriageConfig(BaseModel):
             'this cap. Bounded ge=1 so a 0 cannot silently empty the slate — '
             'that would answer `stored` on every middle-band write, reducing '
             'triage to its below-t_low behaviour with nothing logged.'
+        ),
+    )
+    judge_field_chars: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            'Per-field character cap applied to the new entry and to every '
+            'candidate before the judge sees them; a cut field is marked '
+            '`…[elided]` so the model knows it is reading a truncation. Why '
+            '4000 replaced 1,200 — the measured recall loss at the old cap and '
+            'the call cost at the new one — is the decision record '
+            'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
+            'because a zero cap would elide every field to nothing and show the '
+            'model empty records. Green-tier hot-reloadable, read live per '
+            'middle-band write.'
         ),
     )
     judge_accuracy_report_path: str | None = Field(
@@ -2697,34 +2853,62 @@ class WriteTriageConfig(BaseModel):
         ),
     )
 
+    @field_validator('judge_api_url')
+    @classmethod
+    def _blank_judge_api_url_inherits(cls, value: str | None) -> str | None:
+        """A blank endpoint is stored as None, the leaf's one spelling of inherit.
+
+        The judge's resolver applies the same rule at use; normalising here
+        too means a reload of a blank value reports null rather than an
+        applied '' that the judge then silently ignores.
+        """
+        if value is None or not value.strip():
+            return None
+        return value
+
     @field_validator('t_high_by_category')
     @classmethod
     def _bound_per_category_cutoffs(
         cls, value: dict[str, float] | None,
     ) -> dict[str, float] | None:
-        """Every cutoff must lie in the cosine unit range, or none load.
-
-        Bounded here rather than at the consumer because the failure would
-        otherwise be invisible until it changed what got DELETED: a cutoff of
-        42.0 matches nothing and a negative one matches everything, and
-        either surfaces as (un)deleted memories rather than as a config
-        error. Rejecting the whole map on one bad entry keeps a half-valid
-        set of cutoffs from gating a sweep.
-        """
         if value is None:
             return None
-        out_of_range = {
-            category: cutoff for category, cutoff in value.items()
-            if not 0.0 <= cutoff <= 1.0
-        }
-        if out_of_range:
-            raise ValueError(
-                f'write_triage.t_high_by_category cutoffs must lie in the cosine '
-                f'unit range [0.0, 1.0]; got {out_of_range!r}. This map is an '
-                'output of scripts/calibrate_write_triage.py — re-run it rather '
-                'than hand-editing.',
-            )
-        return value
+        return _require_cutoffs_in_unit_range(
+            value, field_path='write_triage.t_high_by_category',
+        )
+
+
+class WriteTriageProjectCalibration(BaseModel):
+    """Per-PROJECT ANN cutoffs, measured on that project's own curator-labelled fixture.
+
+    One entry of `write_triage_project_calibrations`, keyed by project_id.
+    Written by scripts/calibrate_write_triage.py --write-project-config and read
+    only by scripts/audit_duplicate_memories.py for a run whose --project-id is
+    the key. The write path never reads it, and it is never pooled with
+    write_triage's reify-derived bands. The corpus each entry describes is
+    documented in fused-memory/tests/fixtures/README.md.
+    """
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    calibration_report_path: str = Field(
+        description=(
+            'Package-relative path to the calibration report that derived these '
+            'cutoffs; its provenance.project_id is this entry\'s key.'
+        ),
+    )
+    t_high_by_category: dict[str, float] = Field(
+        description=(
+            'Per-Mem0-category deterministic cutoffs derived from this project\'s '
+            'own measured pairs. A category absent here falls back to '
+            'write_triage.t_high_by_category.'
+        ),
+    )
+
+    @field_validator('t_high_by_category')
+    @classmethod
+    def _bound_per_category_cutoffs(cls, value: dict[str, float]) -> dict[str, float]:
+        return _require_cutoffs_in_unit_range(value, field_path='t_high_by_category')
 
 
 class Mem0UpdateConfig(BaseModel):
@@ -3175,6 +3359,93 @@ class ConsolidationAutoConfig(BaseModel):
             )
         return self
 
+
+class LinkHealConfig(BaseModel):
+    """Caps, storm escapes and adjudicator knobs for link healing (tasks 6181, 6184).
+
+    Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
+    escapes", and H2, the link adjudicator. The consumers are
+    ``fused-memory/scripts/link_heal.py`` and
+    ``fused-memory/scripts/eval_link_adjudicator.py``, both of which load config
+    afresh at each run start; the server holds no copy, so every leaf is
+    green-tier.
+    """
+
+    max_actions_per_run: int = Field(
+        default=25,
+        ge=0,
+        description=(
+            'Most write attempts one unattended run may make, oldest-planned '
+            'first; the rest stay pending as skipped_cap. 0 applies nothing '
+            'unattended. PRD H1.'
+        ),
+    )
+    backlog_multiplier: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'An unattended writing run escalates once under link-heal-backlog '
+            'when pending actions exceed max_actions_per_run times this. PRD H1.'
+        ),
+    )
+    write_failure_streak: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive failed actions that stop a run with a non-zero exit '
+            'and escalate under link-heal-write-failure. PRD H1.'
+        ),
+    )
+    adjudicator_model: str = Field(
+        default='opus',
+        min_length=1,
+        description=(
+            'Claude CLI model alias for the link adjudicator; the δm/Γ_A '
+            'selection re-bases it. PRD H2.'
+        ),
+    )
+    shard_size: int = Field(
+        default=40,
+        ge=1,
+        description='Pairs per adjudicator CLI call. PRD H2.',
+    )
+    field_chars: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            "Cap per text, with the rater brief's truncation marker; the cap "
+            'the 359 hand-link ratings used. PRD H2.'
+        ),
+    )
+    misfile_share_ceiling: float = Field(
+        default=0.25,
+        ge=0,
+        le=1,
+        description=(
+            'A run whose adjudicated misfile share exceeds this writes nothing '
+            'and escalates under link-heal-misfile-share. PRD H2.'
+        ),
+    )
+    corrects_share_ceiling: float = Field(
+        default=0.60,
+        ge=0,
+        le=1,
+        description=(
+            'A run whose adjudicated CORRECTS share exceeds this writes nothing '
+            'and escalates under link-heal-corrects-share. PRD H2.'
+        ),
+    )
+    shard_failure_streak: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive failed adjudicator shards that stop adjudicating. A plan run '
+            'records the storm as would_escape under link-heal-adjudicator and files '
+            'nothing; a writing run that adjudicates files it. PRD H1, H2.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -3191,6 +3462,9 @@ class FusedMemoryConfig(BaseSettings):
     # startup-only prune. Nullability would bucket the whole section as one
     # atomic leaf instead.
     write_journal: WriteJournalConfig = Field(default_factory=WriteJournalConfig)
+    write_journal_growth_alarm: WriteJournalGrowthAlarmConfig = Field(
+        default_factory=WriteJournalGrowthAlarmConfig
+    )
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
     memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)
@@ -3200,6 +3474,21 @@ class FusedMemoryConfig(BaseSettings):
     # reload.py descends only into required submodels, so nullability here would
     # cost the section its per-leaf hot-reload.
     write_triage: WriteTriageConfig = Field(default_factory=WriteTriageConfig)
+    # Top-level, NOT inside write_triage: calibrate_write_triage.py's pooled
+    # writer owns that block's span, so a nested key would be re-emitted among
+    # the hand-set knobs or dropped by a reify --write-config.
+    write_triage_project_calibrations: dict[str, WriteTriageProjectCalibration] = Field(
+        default_factory=dict,
+        description=(
+            'Per-project ANN cutoffs keyed by project_id. Written by '
+            'scripts/calibrate_write_triage.py --write-project-config. A project '
+            'ABSENT from this map has no project calibration; absence is the only '
+            'spelling of that. Read by scripts/audit_duplicate_memories.py '
+            'resolve_ann_threshold for the run\'s --project-id, ahead of '
+            'write_triage.t_high_by_category. Green-tier hot-reloadable as ONE '
+            'atomic leaf.'
+        ),
+    )
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
@@ -3213,6 +3502,8 @@ class FusedMemoryConfig(BaseSettings):
     consolidation_auto: ConsolidationAutoConfig = Field(
         default_factory=ConsolidationAutoConfig,
     )
+    # Bare submodel for the same per-leaf-reload reason as write_triage above.
+    link_heal: LinkHealConfig = Field(default_factory=LinkHealConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(

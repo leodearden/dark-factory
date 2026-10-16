@@ -13,7 +13,7 @@ Code structure, module paths, function signatures, call chains — `/review` dis
 
 ## Standing project invariants (record in every briefing, enforce in every review)
 
-- **TODO tracking invariant** — every real TODO in the codebase (TODO/FIXME/HACK comment markers, and stub idioms like Rust `todo!()`/`unimplemented!()`) must be tracked by a specific **non-terminal** task whose brief names resolving that TODO as a completion condition. A TODO merely *citing* a task id is not tracked — the cited task's brief must actually cover it ("TODO-cites-task ≠ tracked"). A TODO whose tracking task is now `done`/`cancelled` while the marker still applies is **orphaned** and must be re-attached to a live task or re-filed. When creating or updating a briefing, record this invariant under `conventions`; treat untracked/orphaned TODOs surfaced during validation as `known_gaps` candidates until a task owns them.
+- **TODO tracking invariant** — every real TODO in the codebase (TODO/FIXME/HACK comment markers, and stub idioms like Rust `todo!()`/`unimplemented!()`) must be tracked by a specific **non-terminal** task whose brief names resolving that TODO as a completion condition. A TODO merely *citing* a task id is not tracked — the cited task's brief must actually cover it ("TODO-cites-task ≠ tracked"). A TODO whose tracking task is now `done`/`cancelled` while the marker still applies is **orphaned** and must be re-attached to a live task or re-filed. When creating or updating a briefing, record this invariant under `conventions`; report untracked/orphaned TODOs surfaced during validation. One becomes a `known_gaps` entry only once a task owns it (`accepted_by`, below).
 - **Deferred-task invariant** — a task must never sit in `deferred` status without a concrete, actionable "flip to pending" condition recorded on the task. If the gate is dependency-shaped, express it as dependency edges and keep the task `pending` (the scheduler respects deps; `deferred` quarantines). Human judgment gates follow the escalate-on-dispatch SOP instead of deferral: file the task `pending` with correct deps and a brief that, on dispatch, immediately escalates the decision to the human with concrete evidence — judgment gates are used sparingly, justified by nontrivial risk, and must present concrete information to weigh between alternatives (A/B, go/no-go). A `deferred` task without a recorded trigger is quarantine rot: nobody polls it.
 
 ## Parse invocation
@@ -29,16 +29,19 @@ Code structure, module paths, function signatures, call chains — `/review` dis
 
 ## Mode: Validate (`--validate`)
 
-Quick structural check against the existing `review/briefing.yaml`:
+Per-section staleness checks against the existing `review/briefing.yaml`. There is no commit-count or age rule: a briefing is stale exactly where one of these checks fails. Resolve `project_root` (the main checkout: `git worktree list | head -1 | awk '{print $1}'`) and `project_id` (`fused_memory.project_id` in `<project_root>/dark-factory-orchestrator.yaml`) first. Read tasks by id (`get_task`, or `get_statuses(ids=[…])` for a batch) — never `get_tasks` over the whole store.
 
-1. **Subproject coverage** — detect subprojects in the repo not represented in the briefing
-2. **Removed subprojects** — briefing references subprojects that no longer exist
-3. **Task references** — each `known_gaps[].tracking` task ID exists in the task tree
-4. **Known gap staleness** — tasks referenced in `known_gaps` that are now `done`
-5. **TODO tracking invariant** — sweep the codebase for TODO/FIXME/HACK markers and `todo!()`/`unimplemented!()` stubs; each real one must map to a non-terminal task briefed to resolve it. Report untracked markers and orphaned ones (tracking task `done`/`cancelled` but the marker still applies)
-6. **Deferred-task invariant** — every `deferred` task in the task tree records a concrete, actionable flip-to-pending condition; report deferred tasks whose only gate is dependency-shaped (should be `pending` + dep edges) or whose recorded condition has already fired
+1. **`last_updated`** — the top-level key exists and parses as an ISO-8601 date. A header comment does not count.
+2. **Subprojects == workspace members** — every workspace member (root `pyproject.toml` `[tool.uv.workspace].members`, Cargo `[workspace].members`, `package.json` `workspaces`) is a `subprojects` key, and every `subprojects` key is a member or an existing directory the briefing says why it covers. A member with no entry is a defect: the findings contract's area vocabulary is these keys (`docs/quality-findings-contract.md` §3).
+3. **Known-gap pointers** — every `known_gaps` entry carries `accepted_by: <task id>` (a legacy `tracking:` is read as `accepted_by` and reported for migration). The task must exist and must not be `done`. A `cancelled` task carrying `metadata.x_acceptance_reason` is an acceptance (contract §7); `pending`/`in-progress`/`blocked`/`deferred` is in-flight or postponed work, valid until it lands and reported as `in-flight`. `done` → defect (the gap closed, or the pointer is wrong); `cancelled` without `x_acceptance_reason` → defect (abandoned, not accepted); no pointer → defect.
+4. **Conventions' citations** — every task id cited in a `conventions` rule or `why` exists, and one cited as tracking or owning something is non-terminal; every cited path exists at HEAD, and every cited `path::symbol` resolves (`git grep -n -E '(def|class) <symbol>\b' -- <path>`). Line numbers in a citation are not checked.
+5. **TODO tracking invariant** — sweep for TODO/FIXME/HACK markers and `todo!()`/`unimplemented!()` stubs; each real one maps to a non-terminal task briefed to resolve it. Report untracked and orphaned markers (tracking task `done`/`cancelled` while the marker still applies).
+6. **Deferred-task invariant** — every `deferred` task records a concrete flip-to-pending condition; report those whose only gate is dependency-shaped (should be `pending` + dep edges) or whose condition has already fired. List deferred tasks with the read-only forensic query (`status = 'deferred'`, see `CLAUDE.md` §"Forensic reads of tasks.db"), not `get_tasks`.
 
-Output: pass/fail with specifics. Offer to fix.
+Output: one line per defect, `<check>: <section path>: <what is wrong>`, then pass/fail.
+
+- **Interactive:** offer to fix each defect.
+- **From `/review`:** report only. `/review` copies the defect lines into its report's `method.extra.briefing_defects` and continues; nothing here blocks a review.
 
 If no `review/briefing.yaml` exists, say so and suggest running `/review-briefing`.
 
@@ -46,10 +49,10 @@ If no `review/briefing.yaml` exists, say so and suggest running `/review-briefin
 
 ## Mode: Diff (`--diff`)
 
-Show what's changed in the project since the briefing's `last_updated` timestamp:
+Show what's changed in the project since the briefing's `last_updated` key (`git log --since=<last_updated>`):
 
 1. **New subprojects** not in the briefing
-2. **Known gaps resolved** — tasks in `known_gaps` now marked `done`
+2. **Known gaps resolved** — `accepted_by` tasks now marked `done`
 3. **New stubs** — `TODO`, `NotImplementedError`, `pass` bodies introduced since last update (candidates for `known_gaps`)
 4. **Major structural changes** — new entry points, removed modules, renamed subprojects
 
@@ -62,17 +65,18 @@ Present a summary and suggest a full update if changes are significant.
 ### Step 0: Gather context
 
 1. **Check for existing briefing** — if `review/briefing.yaml` exists, this is an **update**
-2. **Search project memory** for decisions, conventions, and known tensions:
+2. **Resolve the project** — `project_root` and `project_id` as in Validate mode. Never assume either.
+3. **Search project memory** for decisions, conventions, and known tensions:
    ```
-   search(query="architectural decisions, conventions, and design rationale", project_id="dark_factory")
-   search(query="known gaps, deferred work, intentional limitations", project_id="dark_factory")
+   search(query="architectural decisions, conventions, and design rationale", project_id="<project_id>")
+   search(query="known gaps, deferred work, intentional limitations", project_id="<project_id>")
    ```
-3. **Read documentation** — CLAUDE.md, DESIGN.md, architecture docs, PRDs
-4. **Load task tree** — `get_tasks(project_root="/home/leo/src/dark-factory")` for active/blocked/deferred work
+4. **Read documentation** — CLAUDE.md, DESIGN.md, architecture docs, PRDs
+5. **Task context** — read the tasks the briefing and docs cite with `get_task`, and find deferred or blocked work with `search_tasks` plus the read-only forensic query for `deferred` (which `search_tasks` excludes). Never `get_tasks` over the whole store.
 
 ### Step 1: Exploration (parallel Sonnet agents)
 
-Detect subprojects (directories with `pyproject.toml` or `package.json`). If `--scope` is set, explore only that one.
+Detect subprojects: every workspace member first (Validate check 2), then other top-level directories with `pyproject.toml`, `Cargo.toml` or `package.json`. If `--scope` is set, explore only that one.
 
 Spawn one Sonnet agent per subproject to build a **working understanding** of what each subproject does. The goal is not to catalogue the code — it's to understand enough to ask the user smart questions.
 
@@ -100,7 +104,7 @@ what this subproject IS FOR and how it fits into the larger project. Return:
 
 Use `model: "sonnet"`. Read enough code to understand purpose and structure, but don't catalogue every file.
 
-### Step 2: Synthesis (you, Opus)
+### Step 2: Synthesis (coordinator, high effort)
 
 Collect discovery outputs and the memory/documentation context from Step 0. Now synthesize your understanding before going to the user.
 
@@ -114,7 +118,7 @@ For each subproject, draft:
 For the project as a whole, draft:
 
 - **Conventions** — rules and norms, especially any from memory where you notice tension, ambiguity, or gaps between different sources. Include the *rationale* when known.
-- **Known gaps** — things that are intentionally incomplete, with *why* they were deferred and any tracking references. Describe gaps conceptually, not by filename — "there's a legacy in-memory queue superseded by the durable queue" is good; "queue_service.py is still in the codebase" is a code detail that `/review` will discover on its own and that goes stale if the file is renamed or removed
+- **Known gaps** — things that are intentionally incomplete, each owned by a task (`accepted_by`) whose record holds the *why*. Describe gaps conceptually, not by filename — "there's a legacy in-memory queue superseded by the durable queue" is good; "queue_service.py is still in the codebase" is a code detail that `/review` will discover on its own and that goes stale if the file is renamed or removed
 - **Exclusions** — areas to skip in review, with reasons
 
 ### Step 3: Interview the user
@@ -153,12 +157,30 @@ Compile the final YAML incorporating user feedback. See `references/briefing-sch
 mkdir -p review
 ```
 
+**Every known gap needs an owning task.** For a gap the user confirms that no task owns yet, file the acceptance (contract §7) and point at it:
+
+```python
+r = submit_task(project_root=project_root, planning_mode=True,
+                title="Accepted gap: <what>", description="<what is incomplete>",
+                details="Accepted by <who> on <date>. Revisit when <condition>.",
+                metadata={"source": "review-briefing", "x_acceptance_reason": "<why>"})
+set_task_status(id=r["task_id"], status="cancelled", project_root=project_root)
+```
+
+The reason goes in at submit because a cancelled task's metadata is frozen; never record an acceptance by deferring a task.
+
+The briefing entry is then `{what: "<one line>", accepted_by: <task id>}`; the why lives on the task.
+
+Set the top-level `last_updated` key to today's date on every write.
+
 **Create mode:** Write `review/briefing.yaml` directly.
 
 **Update mode:**
 1. Show diff against existing briefing
 2. Preserve sections marked `# human-edited`
 3. Confirm with user before writing
+
+Then run Validate mode and fix what it reports before finishing.
 
 ### Step 5: Write observations to memory
 
@@ -168,8 +190,9 @@ Write anything you learned about the project's intent, priorities, or review con
 add_memory(
   content="Review briefing created/updated. Key context: {notable discoveries about project intent, user priorities, or conventions}",
   category="observations_and_summaries",
-  project_id="dark_factory",
-  agent_id="claude-interactive"
+  project_id="<project_id>",
+  agent_id="claude-review-briefing",
+  entities=[]
 )
 ```
 
@@ -182,9 +205,7 @@ When a briefing already exists:
 1. Load the existing briefing
 2. Run exploration (Step 1) to detect structural changes
 3. Diff against existing briefing:
-   - New subprojects not covered
-   - Subprojects removed or renamed
-   - Known gaps where tracking tasks are now done
+   - Every Validate-mode defect
    - New conventions or decisions in memory since last update
 4. Present **only the changes** to the user (don't re-interview unchanged sections)
 5. Merge approved changes, preserving human edits
@@ -196,9 +217,9 @@ When a briefing already exists:
 | Missing | Impact | Behaviour |
 |---------|--------|-----------|
 | fused-memory | No memory context for conventions/decisions | Warn, derive from documentation only |
-| Task tree | Can't cross-reference known gaps against tasks | Note gaps as "untracked" |
+| Task store | Can't check `accepted_by` pointers or file acceptances | Report Validate checks 3, 4 and 6 as not run; write no new known gaps |
 | CLAUDE.md / docs | Less context for conventions | Rely more on user interview |
-| pyproject.toml | Can't auto-detect subprojects | Ask the user |
+| Workspace manifest | Can't auto-detect subprojects | Ask the user |
 
 Never fail silently.
 

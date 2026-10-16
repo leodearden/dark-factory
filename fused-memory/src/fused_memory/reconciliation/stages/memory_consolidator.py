@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -48,6 +48,12 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     normalize_gate_owned_suggested_actions,
     stamp_curator_gate_sweep_provenance,
 )
+from fused_memory.reconciliation.live_workflow_citation_guard import check_live_workflow_citations
+from fused_memory.reconciliation.live_workflow_section import (
+    CITATION_CONTRADICTIONS_STAT,
+    LiveWorkflowSnapshot,
+    build_live_workflow_snapshot,
+)
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
@@ -68,10 +74,7 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
-from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    _render_live_workflow_section,
-)
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
     PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
@@ -102,6 +105,8 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     strip_snapshot_lines,
 )
+from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
+from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -116,17 +121,8 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
+_RECORD_BODY_CHARS = 500
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
-
-
-class RequiredSection(NamedTuple):
-    """One payload section every Stage-1 payload builder must emit (task 4708).
-
-    See :attr:`MemoryConsolidator.REQUIRED_SECTIONS` for the inclusion criterion.
-    """
-
-    header: str  # exact markdown header the shipped Stage-1 prompt names
-    renderer: str  # name of the MemoryConsolidator method that renders it
 
 
 async def write_stage1_cycle_summary(
@@ -173,10 +169,11 @@ class MemoryConsolidator(BaseStage):
     # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
     # tells the model to draw an inference from that section's ABSENCE. Today
     # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
-    # payload, all three signals are False for every task; no live-workflow
-    # suppression applies …". That makes absence load-bearing: a payload builder
-    # that omits the section does not merely produce a terser payload, it makes
-    # the model conclude something FALSE. Every builder therefore renders these
+    # payload, no task is live this cycle — neither through a per-task signal nor
+    # through the project-wide lock — and none has landing evidence; no
+    # live-workflow suppression applies …". That makes absence load-bearing: a
+    # payload builder that omits the section does not merely produce a terser
+    # payload, it makes the model conclude something FALSE. Every builder therefore renders these
     # via _render_required_sections() — adding a section is ONE edit here, not
     # one edit per builder. Enforced by
     # tests/reconciliation/test_stage1_payload_section_parity.py.
@@ -260,6 +257,7 @@ class MemoryConsolidator(BaseStage):
         # state across all instances (and across reused-instance runs).
         self._fetch_degraded_sources: list = []
         self._undatable_freshness_records: int = 0
+        self._live_workflow_snapshot: LiveWorkflowSnapshot | None = None
 
     async def run(
         self,
@@ -276,6 +274,7 @@ class MemoryConsolidator(BaseStage):
         point of a remediation pass is to re-emit a curated list, and running
         dedup on those flags would defeat the remediation contract.
         """
+        self._live_workflow_snapshot = None
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
             resume_session_id=resume_session_id,
@@ -450,6 +449,18 @@ class MemoryConsolidator(BaseStage):
                 'passing %d flag(s) through unfiltered this cycle)',
                 self.project_id, len(report.items_flagged or []),
             )
+
+        # Live-workflow citation guard (task 4874): annotate, never drop, a finding
+        # citing a signal THIS run's section did not render (rationale: the module
+        # docstring of live_workflow_citation_guard).  Above the remediation
+        # early-return, like the guard above, so both passes are covered.
+        report.stats[CITATION_CONTRADICTIONS_STAT] = 0
+        try:
+            report.items_flagged, report.stats[CITATION_CONTRADICTIONS_STAT] = (
+                check_live_workflow_citations(report.items_flagged or [], self._live_workflow_snapshot)
+            )
+        except Exception:
+            logger.exception('live-workflow citation guard failed for project %s', self.project_id)
 
         # Always present (task 4814, same convention as the three pre-inits
         # above — tasks 2312 / 2229 / 3084): set BEFORE the remediation
@@ -1284,6 +1295,9 @@ class MemoryConsolidator(BaseStage):
         # `..._enumeration_incomplete_kind` names which way it was partial.
         # Two additions, one pattern — 0-vs-N ambiguities resolved in the
         # stats rather than left for a reader to reconstruct from logs.
+        # The `_candidates`/`_errors` pair closes the last one (task 4851):
+        # `_invalidated` alone cannot tell "nothing was stale" from "every
+        # invalidation failed".
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and NONE of
         # these stats is set for this cycle.  That includes the enumeration
@@ -1310,6 +1324,12 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_status_snapshot_edges_scanned'] = (
                 snapshot_sweep_stats['scanned']
+            )
+            report.stats['stale_status_snapshot_edges_candidates'] = (
+                snapshot_sweep_stats['candidate_edges']
+            )
+            report.stats['stale_status_snapshot_edges_errors'] = (
+                snapshot_sweep_stats['errors']
             )
             report.stats['stale_blocked_edges_superseded'] = (
                 snapshot_sweep_stats['superseded']
@@ -1643,6 +1663,17 @@ class MemoryConsolidator(BaseStage):
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
+        # Episodes arrive newest-first (undatable last), so one the watermark filter
+        # dropped proves nothing newer lay past the cap. mem0's get_all scrolls in
+        # point-id order, which proves nothing, so its note rests on the count alone.
+        if len(new_episodes) == len(episodes):
+            episodes_str = _append_note(episodes_str, fetch_cap_note(
+                fetched=len(episodes), noun='episode(s)', cap_name='episode_limit', cap=self.episode_limit,
+            ))
+        memories_str = _append_note(memories_str, fetch_cap_note(
+            fetched=len(mem0_memories), noun='memory record(s)', cap_name='memory_limit',
+            cap=self.memory_limit,
+        ))
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
@@ -1706,6 +1737,14 @@ Review the above data and perform memory consolidation:
         self._undatable_freshness_records = 0
 
         event_summary = _format_events(ap.events)
+        deferred_events_note = clip_note(
+            omitted=ap.events_remaining,
+            omitted_noun='buffered event(s)',
+            cap_name='reconciliation.token_budget',
+            cap=ap.token_budget,
+            dropped_first='the newest events (still buffered for a later chunk)',
+        )
+        event_summary = _append_note(event_summary, deferred_events_note)
 
         # Store status (cheap fetch, always useful)
         status = await self._fetch_status()
@@ -1817,30 +1856,33 @@ Review the above data and perform memory consolidation:
     async def _build_live_workflow_section(self) -> str:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
-        Mirrors Stage 2's guard/source exactly (task 1655): renders over
-        ``self.filtered_task_tree.active_tasks`` when ``self.filtered_task_tree``
-        is set and ``active_tasks`` is non-empty. A stage is only constructible
-        with a validated ``ProjectScope``, so ``self.project_root`` is always a
-        non-empty absolute path and is not part of this guard (task 2150).
-        Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
-        task_knowledge_sync.py) so both stages emit byte-identical section
-        formatting for the same underlying live-workflow signals (task 1977).
+        Renders over Stage 2's source, ``self.filtered_task_tree.active_tasks``
+        (task 1655). A stage is only constructible with a validated
+        ``ProjectScope``, so ``self.project_root`` is always a non-empty
+        absolute path and is not part of this guard (task 2150).
+        Reuses Stage 2's snapshot builder,
+        ``reconciliation/live_workflow_section.py::build_live_workflow_snapshot``,
+        so both stages emit byte-identical section formatting for the same
+        underlying live-workflow signals (task 1977).
         This reuse means detector-layer behavior changes apply here
         automatically with no code change — including the blocked-normal
         bare-orchestrator-signal suppression added in task 2409.
 
-        Returns '' when the guard fails or no active task is currently live —
-        keeps the payload tight, matching _build_task_tree_section's pattern.
+        Returns '' when no task tree is set or no active task is listed — keeps
+        the payload tight, matching _build_task_tree_section's pattern.  The
+        snapshot is retained for :meth:`run`'s citation guard.  A tree with no
+        active task yields a real, empty snapshot, because an absent section
+        tells this stage that no task is live; only an unset tree leaves it
+        None, and the guard inert.
         """
-        if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
+        if self.filtered_task_tree is None:
             return ''
-        section = await _render_live_workflow_section(
+        self._live_workflow_snapshot = await build_live_workflow_snapshot(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
         )
-        if not section:
-            return ''
-        return '\n' + section
+        section = self._live_workflow_snapshot.render()
+        return '\n' + section if section else ''
 
     def _build_task_count_census_section(self) -> str:
         """Return the Task Count Census payload section, or empty string if unavailable.
@@ -1966,6 +2008,10 @@ def _format_events(events: list[ReconciliationEvent]) -> str:
     return '\n'.join(lines)
 
 
+def _append_note(body: str, note: str) -> str:
+    return f'{body}\n\n{note}' if note else body
+
+
 def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
     if not episodes:
         return 'No new episodes.', 0
@@ -1975,9 +2021,17 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
         raw = ep.get('content') or ''
         cleaned, n = strip_snapshot_lines(raw)
         total_stripped += n
-        content = cleaned[:500]
+        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
         lines.append(f'- [{ep.get("uuid", "?")}] {ep.get("created_at", "?")}: {content}')
     return '\n'.join(lines), total_stripped
+
+
+def _parent_link(meta: Mapping[str, Any]) -> str:
+    """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
+    parent_id = _parent_id_in_meta(meta)
+    if parent_id is None:
+        return ''
+    return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
 
 
 def _format_memories(memories: list[dict]) -> tuple[str, int]:
@@ -1989,10 +2043,10 @@ def _format_memories(memories: list[dict]) -> tuple[str, int]:
         raw = m.get('memory') or ''
         cleaned, n = strip_snapshot_lines(raw)
         total_stripped += n
-        content = cleaned[:500]
+        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
-        lines.append(f'- [{m.get("id", "?")}] ({cat}): {content}')
+        lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')
     return '\n'.join(lines), total_stripped
 
 

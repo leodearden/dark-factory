@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import importlib.resources
 import logging
+import math
 import os
 import re
 import stat
@@ -40,8 +41,21 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
+from orchestrator.verify_admission_gate import AdmissionOrder
 
 logger = logging.getLogger(__name__)
+
+
+# --- Merge-verify host selection policy (Lever C) ---
+#
+# Defined ONCE here and imported by verify_runner.py, so the config field and
+# HostAllocator.acquire's parameter share one vocabulary: acquire's match ends
+# in assert_never, so a future third policy added here is a pyright error until
+# the allocator handles it, and pyright rejects a typo'd policy string at every
+# call site.  The import direction is
+# one-way (verify_runner -> config); config.py imports nothing from
+# verify_runner.py, so there is no cycle.
+VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
 
 
 # --- Priority-tier constants (value/h scheduler) ---
@@ -67,6 +81,15 @@ TIER_BASE: dict[str, int] = {
     'low': 2000,
     'polish': 1000,
 }
+
+# Defaults of ScoringConfig's sub-budgets (plans/scheduler-dispatch-scoring-and-
+# lock-layer-prd.md C2).  Each bonus term is bounded by its own budget, and the
+# budgets together stay inside one TIER_WIDTH (I-1), so no term masks another.
+CPM_BUDGET: float = 300.0
+CPM_D_CAP: int = 32
+AGE_BUDGET: float = 500.0
+AGE_HALF_SECS: float = 259200.0
+CONTINUITY_CREDIT: float = 120.0
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
@@ -567,6 +590,86 @@ class FairnessConfig(BaseModel):
                 )
             )
         return int(self.skip_threshold)
+
+
+class ScoringConfig(BaseModel):
+    """Dispatch-score sub-budgets (task 3819; plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C2).
+
+    A candidate scores ``TIER_BASE[tier]`` plus three bonus terms, each capped
+    by its own budget, so a saturated term can never mask the others:
+    critical-path weight (``cpm_budget``), pending age (``age_budget``) and
+    work-product continuity (``continuity_credit``).  The scheduler arms this
+    formula only on ticks where at least ``new_scoring_min_anchor_coverage``
+    of the candidates carry a usable ``pending_since`` anchor (PRD I-6).
+
+    Plain BaseModel (no ``validate_assignment``) so ``_set_leaf`` can write a
+    multi-leaf retune one leaf at a time — see :class:`MergeDeepConfig`.  The
+    cross-leaf invariants still bind a reload: ``apply_reload`` re-validates
+    the whole config afterwards and rolls back on failure.  Every leaf is
+    green-tier (PRD D8).
+    """
+
+    cpm_budget: float = Field(
+        default=CPM_BUDGET,
+        gt=0,
+        description='Ceiling of the critical-path term, reached at cpm_d_cap transitive dependents (PRD C2).',
+    )
+    cpm_d_cap: int = Field(
+        default=CPM_D_CAP,
+        ge=1,
+        description='Transitive-dependent count at which the critical-path term saturates (PRD C2).',
+    )
+    age_budget: float = Field(
+        default=AGE_BUDGET,
+        gt=0,
+        description='Ceiling the pending-age term approaches as a task waits (PRD C2).',
+    )
+    age_half_secs: float = Field(
+        default=AGE_HALF_SECS,
+        gt=0,
+        description='Seconds pending at which the age term reaches half of age_budget (PRD C2).',
+    )
+    continuity_credit: float = Field(
+        default=CONTINUITY_CREDIT,
+        ge=0,
+        description='Flat credit for a task that already carries work product (PRD C2).',
+    )
+    new_scoring_min_anchor_coverage: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Share of a tick\'s candidates that must carry a usable pending_since '
+            'anchor for that tick to score on the sub-budget formula; below it the '
+            'whole tick falls back to the legacy formula (PRD D12, I-6).'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _reject_budget_sum_crossing_tier(self) -> 'ScoringConfig':
+        total = self.cpm_budget + self.age_budget + self.continuity_credit
+        if total > TIER_WIDTH - 1:
+            raise ValueError(
+                'ScoringConfig.cpm_budget + age_budget + continuity_credit '
+                f'({self.cpm_budget} + {self.age_budget} + {self.continuity_credit} '
+                f'= {total}) must be <= TIER_WIDTH - 1 ({TIER_WIDTH - 1}); a larger '
+                'sum lets a bonus lift a task across a priority-tier boundary. '
+                'Lower one of the three budgets.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _reject_continuity_above_cpm_d4(self) -> 'ScoringConfig':
+        cpm_at_d4 = self.cpm_budget * math.log1p(4) / math.log1p(self.cpm_d_cap)
+        if self.continuity_credit >= cpm_at_d4:
+            raise ValueError(
+                f'ScoringConfig.continuity_credit ({self.continuity_credit}) must be '
+                f'< the critical-path term at four dependents ({cpm_at_d4:.4f}, from '
+                f'cpm_budget={self.cpm_budget} and cpm_d_cap={self.cpm_d_cap}); '
+                'otherwise resuming a half-done task outranks unblocking four others. '
+                'Lower continuity_credit, or raise cpm_budget.'
+            )
+        return self
 
 
 class StarvationWatchdogConfig(BaseModel):
@@ -1332,10 +1435,16 @@ class SandboxConfig(BaseModel):
     """Filesystem sandbox configuration.
 
     ``backend`` selects the enforcement mechanism:
-    - ``auto`` (default): prefer landlock if available, else bwrap, else unsandboxed
-    - ``landlock``: kernel LSM; works in all namespaces. Requires kernel 5.13+
-    - ``bwrap``: bubblewrap + user namespace. Bun v1.3.13 crashes under this
-      on kernel 6.17; prefer landlock on affected hosts
+    - ``auto`` (default): prefer landlock if available, else bwrap; a sandboxed
+      role that resolves to neither is refused, not run unsandboxed
+      (``agents/sandbox_dispatch.py::resolve_backend_or_refuse``, PRD D4)
+    - ``landlock``: kernel LSM; works in all namespaces. Requires kernel 5.13+.
+      Validated on x86_64 only: its syscall numbers are hardcoded with no
+      architecture gate (``agents/landlock.py::SYS_landlock_create_ruleset``).
+      The fleet's posture: ``docs/sandbox-fleet-status.md``
+    - ``bwrap``: bubblewrap + user namespace; legacy passthrough (PRD D10).
+      Bun v1.3.13 crashes under this on kernel 6.17; prefer landlock on
+      affected hosts
     - ``none``: explicit opt-out — run unsandboxed (same effect as ``enabled: false``)
     """
 
@@ -2952,9 +3061,12 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
-    # Sticker rate; codex reports no cached-input split, so this prices every
-    # input token at the uncached rate (an upper bound on the true spend).
+    # Codex sticker rates; codex reports no cached-input split, so these price
+    # every input token at the uncached rate (an upper bound on the true
+    # spend). gpt-5.6-sol's rate is promotional through at least 2026-11-21.
     'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00},
+    'gpt-5.6-sol': {'input_per_1m': 4.00, 'output_per_1m': 20.00},
+    'gpt-5.6-terra': {'input_per_1m': 2.00, 'output_per_1m': 12.00},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
     'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
@@ -3144,6 +3256,15 @@ class OrchestratorConfig(BaseSettings):
     # separate from the paused-idle constant (_PAUSED_IDLE_POLL_SECS) so the
     # poll cadence can be tuned independently of the pause-recovery cadence.
     idle_poll_secs: float = Field(default=15.0)
+    # Cadences of the merge-heartbeat and stale-service-restart background
+    # services, which run whatever the dispatch loop is doing (task 5344).
+    # The heartbeat must refresh well inside the drain gate's fresh window
+    # (ORCH_DRAIN_FRESH_WINDOW_SECS, scripts/drain_check.py --fresh-window);
+    # the restart interval bounds how late an owed force-fire can be.
+    # Restart-only (not in RELOADABLE_FIELDS): captured once by
+    # Harness._build_lifecycle_registry.
+    merge_heartbeat_interval_secs: float = Field(default=15.0, gt=0)
+    stale_service_restart_interval_secs: float = Field(default=15.0, gt=0)
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
@@ -3513,6 +3634,10 @@ class OrchestratorConfig(BaseSettings):
     # verify_env): read fresh each verify with no in-flight-split risk.
     # Deliberately NOT in _OVERRIDABLE_FIELDS — it is a whole-worktree concern,
     # not a per-module override.
+    # Remote verifies receive this value in their spec (MergeVerifySpec /
+    # TaskVerifySpec, applied by verify_spec_shared.py::apply_spec_to_host_config),
+    # so the deployed value still lives only in dark-factory-orchestrator.yaml,
+    # and a remote host's copy is a fallback.
     verify_cold_preprovision_command: str = Field(default='')
 
     # Per-model USD/1M-token prices for backends without native cost
@@ -3687,6 +3812,15 @@ class OrchestratorConfig(BaseSettings):
     # the existing test suite are unchanged; opt in per project where
     # `systemd-run --user` is available.
     verify_use_cgroup_scope: bool = Field(default=False)
+    # Per-role cgroup v2 cpu.weight each verify scope is spawned with
+    # (`systemd-run -p CPUWeight=`), only when verify_use_cgroup_scope is on.
+    # nice orders threads only INSIDE one cgroup, so without a weight the role
+    # tiers are inert across sibling scopes. task/background are lowered rather than merge raised, so the
+    # merge scope stays at parity (100) with each orchestrator unit and the
+    # operator's terminals under app.slice; 33/10 keep the 3:1 merge:task intent.
+    verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
+    verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
+    verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -3731,6 +3865,15 @@ class OrchestratorConfig(BaseSettings):
     # load/reload instead of silently reaching pytest-xdist and failing the
     # whole test leg at verify time.
     verify_admission_pytest_n: str = Field(default='auto')
+    # The in-process admission gate in front of that flock slot (task 5628;
+    # plans/verify-admission-fifo-prd.md). The code default 'unordered' keeps
+    # today's random winner; a project flips to 'arrival' in its yaml. Promote
+    # is the gate age at which a background waiter ranks with task verifies,
+    # keeping its own arrival stamp. The alarm age sits above today's p90 wait
+    # (about 11h), so it is not a standing alarm.
+    verify_admission_order: AdmissionOrder = Field(default='unordered')
+    verify_admission_background_promote_secs: float = Field(default=7200.0, gt=0)
+    verify_admission_wait_alarm_secs: float = Field(default=43200.0, gt=0)
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
@@ -3796,7 +3939,10 @@ class OrchestratorConfig(BaseSettings):
         default_factory=lambda: {'plan', 'execute', 'verify', 'review'},
         description=(
             'Block phases that trigger auto-eval. Merge/infra failures are '
-            'excluded — they are unlikely to differ on the full path.'
+            'excluded — they are unlikely to differ on the full path; '
+            'infra-class block categories are excluded by '
+            'orchestrator/src/orchestrator/harness.py::'
+            '_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES whatever their phase.'
         ),
     )
 
@@ -3825,23 +3971,14 @@ class OrchestratorConfig(BaseSettings):
     fused_memory_restart_script: str = Field(
         default='scripts/restart-fused-memory.sh'
     )
-    # Force-fire escape for the fused-memory coordinator (task 2817): once a
-    # restart is pending, the coordinator normally only fires from the polite
-    # idle path (agents_idle + debounce). Under chronic fleet saturation
-    # agents_idle is rarely true, so that path can starve indefinitely and the
-    # armed restart never fires (fire-once-or-never) — the operator then has to
-    # restart fused-memory by hand (born-at-L2 esc-2814-1). Once a pending
-    # restart has been owed for this many seconds, maybe_restart bypasses
-    # agents_idle and the debounce and force-fires even on the busy-wait branch,
-    # while still preferring the polite idle path for the common (healthy) case.
-    # fused-memory keeps no min_interval rate cap, so nothing throttles the
-    # force-fire. 0 disables force-fire (byte-identical prior behaviour); the
-    # 15-min default caps the worst-case stale-bytecode window under saturation
-    # (far below the orchestrator's 4500s bound — a `--drain` fused-memory
-    # restart is far cheaper than a full orchestrator fleet redeploy).
-    # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only, captured
-    # once at coordinator construction (_build_service_restart_coordinator),
-    # matching its orchestrator_restart_force_fire_after_secs sibling.
+    # Force-fire escape for the fused-memory coordinator (task 2817): the
+    # polite path needs agents_idle, which chronic fleet saturation can deny
+    # indefinitely (esc-2814-1). Once a restart has been owed this long,
+    # maybe_restart bypasses agents_idle and the debounce; the
+    # stale-service-restart service evaluates it whatever the dispatch loop
+    # is doing (task 5344). 0 disables. No
+    # min_interval cap throttles it. Restart-only (not in RELOADABLE_FIELDS),
+    # like orchestrator_restart_force_fire_after_secs.
     fused_memory_restart_force_fire_after_secs: float = Field(
         default=900.0,
         description=(
@@ -3968,25 +4105,32 @@ class OrchestratorConfig(BaseSettings):
     # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
     # the coordinator stands down; the bound is what keeps a lease stranded by
     # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
-    # wedging the fleet. DERIVED, not picked: the worst LEGITIMATE sweep is one
-    # permanently-busy unit burning the whole 4500s drain busy-grace, plus ~6
-    # stale/absent units at 120s each, plus 7 x (verify 30 + grace 120) =
-    # 6270s ~= 1.74h, so 7200 clears it with headroom while staying far below
-    # the 8h orchestrator_restart_min_interval_secs — a leaked lease therefore
-    # delays at most ONE redeploy window. Deliberately NOT in RELOADABLE_FIELDS:
+    # wedging the fleet. DERIVED, not picked: the common long --drain sweep
+    # (task 5371) is the whole 11400s ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait
+    # cap, plus 7 x (verify 30 + grace 120) restart verification, plus 7 x 120s
+    # stale/absent grace = ~13,300s ~= 3.7h, so 14400 (4h) clears it with
+    # headroom while staying far below the 8h
+    # orchestrator_restart_min_interval_secs — a leaked lease therefore delays at
+    # most ONE redeploy window. NOT a worst case: each unit left on the legacy
+    # merge-idle gate (pre-5371 code, or a refused request) can add its 600s
+    # busy grace, so two of them on top of a capped verify wait overrun it and
+    # the sweep degrades, bounded, to the pre-4755 collision. Deliberately NOT
+    # in RELOADABLE_FIELDS:
     # red-tier / restart-only, matching its siblings
     # orchestrator_restart_merge_phase_grace_secs /
     # orchestrator_restart_force_fire_after_secs /
     # orchestrator_restart_min_interval_secs (captured at coordinator
     # construction).
     orchestrator_restart_lease_max_age_secs: float = Field(
-        default=7200.0,
+        default=14400.0,
         description=(
             'Max age of the in-flight fleet-redeploy lease before the '
             'orchestrator coordinator stops honouring it and redeploys anyway. '
-            'Derived from the worst legitimate --drain sweep (~6270s) and kept '
-            'far below the 8h min-interval, so a lease stranded by a SIGKILLed '
-            'sweep delays at most one window. 2h default.'
+            'Derived from the common long --drain sweep (~13,300s: the '
+            '11400s verify-wait cap plus per-unit restart verification and '
+            'stale-heartbeat grace; legacy-gate units can add 600s each) and '
+            'kept far below the 8h min-interval, so a lease stranded by a '
+            'SIGKILLed sweep delays at most one window. 4h default.'
         ),
     )
 
@@ -4027,6 +4171,39 @@ class OrchestratorConfig(BaseSettings):
     # pre-enqueue merge-phase duration bound), not a guessed threshold.
     # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
     orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
+
+    # Info-L0 disposition router (plans/info-l0-disposition-router-prd.md
+    # D5/D9/D12, plus beta's reviewer block): routes info-severity L0s at
+    # workflow exit, in the orphan-L0 reaper, and at restart.  The kill switch
+    # disables routing; the ticket timeout bounds a D9 curator hold; the
+    # conversion cap bounds curator tickets per sweep (D12); the detail
+    # budget bounds each note shown to the reviewer.  All four are green-tier
+    # hot-reloadable (see RELOADABLE_FIELDS).
+    info_l0_router_enabled: bool = Field(
+        default=True,
+        description='Set to false to leave info-severity L0s on their pre-router paths.',
+    )
+    info_l0_router_ticket_timeout_secs: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            'Max seconds a D9 hold waits on a curator ticket before promoting; '
+            'the default matches steward_completion_timeout.'
+        ),
+    )
+    info_l0_router_max_conversions_per_sweep: int = Field(
+        default=20,
+        ge=0,
+        description='Curator conversions per routing sweep (D12); overflow is promoted under D5.',
+    )
+    info_l0_note_detail_chars: int = Field(
+        default=1200,
+        ge=0,
+        description=(
+            "Detail prefix shown per note in the reviewer's notes block; the "
+            'full text stays reachable by escalation id.'
+        ),
+    )
 
     # Terminal-status watcher — periodically polls fused-memory for active
     # workflow tasks whose status has gone terminal out-of-band (typical
@@ -4071,6 +4248,12 @@ class OrchestratorConfig(BaseSettings):
     # full builds when main hasn't advanced within the interval.
     main_tip_sweep_enabled: bool = Field(default=True)
     main_tip_sweep_interval_secs: float = Field(default=1800.0)
+    # The sweep builds WARM (CoW-seeded from the warm-lane base) by default and
+    # COLD, as the ground-truth control, at most once per this many seconds since
+    # the last cold sweep that reached a verdict (persisted in runs.db; task 5812,
+    # superseding task 2567's always-cold sweep).  0 = every sweep cold.
+    # Restart-only (not in RELOADABLE_FIELDS), like the rest of the family.
+    main_tip_sweep_cold_interval_secs: float = Field(default=86400.0, ge=0.0)
 
     # Periodic deterministic-strand reconciliation sweep (task 2074).
     # Defensive/non-blocking background recovery sweep for deterministic
@@ -4436,6 +4619,46 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # Pin reservations (task 6040): the head lock-blocked pin(s) hold a
+    # reservation on their modules — see orchestrator/pin_reservation.py.
+    # Flat top-level fields beside backfill_*, read from self.config at tick
+    # time, so green-tier membership is the whole reload story.
+    pin_reservations_enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for pin reservations. When False the pin loop behaves '
+            'as before task 6040: a lock-blocked pinned task is granted no '
+            'reservation and emits no pin_blocked event, and any pin '
+            'reservations left over from before the switch flipped are released '
+            'once, on the next tick (reservation_expired reason '
+            "'pin_reservations_disabled')."
+        ),
+    )
+    pin_reservation_max_active: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            'How many of the lowest-pin_order, eligible, lock-blocked pins may '
+            'hold a pin reservation at once. The default of 1 is the EASY-'
+            'backfill head reservation: one operator-chosen reservation cannot '
+            'gridlock with itself, its idle cost is one footprint, and backfill '
+            'still borrows through it. Raising it moves toward the general '
+            'below-rank-1 park installation that '
+            'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md section 7 '
+            'measured as harmful. ge=1 because pin_reservations_enabled is the '
+            'single off lever.'
+        ),
+    )
+    pin_blocked_emit_interval_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'pin_blocked is emitted when a pinned task becomes blocked, then at '
+            'most once per this many seconds while it stays blocked. A dispatch, '
+            'or the task leaving the pin queue, resets it.'
+        ),
+    )
+
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
     # windows with rotation, exponential backoff, and a crashloop→pause_scheduler
@@ -4673,6 +4896,11 @@ class OrchestratorConfig(BaseSettings):
     # Scheduler fairness / anti-starvation
     fairness: FairnessConfig = Field(default_factory=FairnessConfig)
 
+    # Dispatch-score sub-budgets (task 3819).  An absent stanza yields the
+    # default instance; age_alpha / cpm_beta below remain the legacy formula's
+    # knobs, which the anchor-coverage gate still falls back to.
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
+
     # Scheduler starvation watchdog (task 1880).
     starvation_watchdog: StarvationWatchdogConfig = Field(
         default_factory=StarvationWatchdogConfig,
@@ -4826,6 +5054,26 @@ class OrchestratorConfig(BaseSettings):
             'trip (streak-only).  Complements verify_host_unreachable_escalate_after_n: '
             'the time-based threshold guarantees the alarm fires within ~T seconds even '
             'when merges are sparse and RU events are infrequent.'
+        ),
+    )
+    verify_host_policy: VerifyHostPolicy = Field(
+        default='prefer_local',
+        description=(
+            'When Lever C is on, which host the NEXT merge-verify dispatch prefers.  '
+            "'prefer_local' (default) keeps today's order byte-for-byte: take the "
+            'local slot when it is free, overflow to the first eligible remote '
+            "otherwise.  'prefer_remote' inverts it: take the first eligible remote "
+            '(FREE, not quarantined, not PARKED) and fall back to local when no '
+            'remote is available, so a free remote host absorbs verify load instead '
+            'of idling while the lane serialises on local.  Eligibility rules are '
+            'unchanged in both directions, so a busy/quarantined/PARKED remote still '
+            'falls through to local and the queue never stalls.  '
+            'TRUST-ANCHOR CAVEAT: prefer-local exists because local is the trust '
+            'anchor — a laptop false-green once landed a red commit.  Under '
+            "'prefer_remote' nearly every verdict becomes a REMOTE verdict, so "
+            'verify_drift_check_every_n_lands becomes the standing fidelity guard '
+            'rather than a spot check.  This field changes no cadence; set that one '
+            'deliberately before flipping this one.'
         ),
     )
     verify_host_reprobe_interval_s: float = Field(
@@ -5760,6 +6008,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
+    # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
+    # which is why the old age_alpha / cpm_beta constants were never tuned.
+    # I-1 / I-3 still bind a reload through apply_reload's whole-config
+    # re-validation.
+    _submodel_leaf_paths('scoring', ScoringConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a
@@ -5798,6 +6052,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'backfill_safety_factor',
         'backfill_min_samples',
         'backfill_max_park_age_secs',
+        # Pin reservations (task 6040).  Explicit literals for the same reason
+        # as the backfill_* group: FLAT top-level fields.  Read from
+        # self.config at tick time, so no reload hook is needed.
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
@@ -5842,6 +6102,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # hot-reloadable so the merge-phase FP-suppression window can be tuned
         # without a redeploy.
         'orphan_l0_merge_phase_freshness_secs',
+        # Siblings of orphan_l0_timeout_secs, read live on each sweep or exit:
+        # a retune lands on the next routing pass, and the kill switch must not need a restart.
+        'info_l0_router_enabled',
+        'info_l0_router_ticket_timeout_secs',
+        'info_l0_router_max_conversions_per_sweep',
+        'info_l0_note_detail_chars',
         'watcher_rotation_escalations',
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',
@@ -5874,6 +6140,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # merge's breadth, and is read fresh off req.config at each gate
         # evaluation.  A safety kill switch behind a restart is not one.
         'merge_disjoint_skip_requires_verified_drift',
+        # Merge-verify host selection order (task 5097, Lever C) — green-tier
+        # because the policy is read per HostAllocator.acquire call and never
+        # captured on the allocator, so a flip only changes which host the NEXT
+        # dispatch prefers and cannot split an in-flight merge.  Read the
+        # field's trust-anchor caveat before flipping it live.
+        'verify_host_policy',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task
@@ -5901,7 +6173,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Verify admission control (task 2390 T2; task 2394 T6 adds the
         # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
         # can retune slot counts / nice tiers / the -n cap / toggle the gate
-        # without a process restart.
+        # without a process restart. The admission gate's knobs (task 5628)
+        # are read at each grant (slots/order/promote) or each watch tick
+        # (alarm), so a reload applies to the next grant or tick.
         'verify_admission_enabled',
         'verify_admission_task_slots',
         'verify_admission_slots_dir',
@@ -5909,6 +6183,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'verify_admission_nice_task',
         'verify_admission_nice_background',
         'verify_admission_pytest_n',
+        'verify_admission_order',
+        'verify_admission_background_promote_secs',
+        'verify_admission_wait_alarm_secs',
+        # Per-role verify scope CPUWeight (task 5205): read at each verify scope
+        # spawn (verify.py::_resolve_scope_cpu_weight), so a reload applies from
+        # the next spawn; a scope already running keeps the weight it started with.
+        'verify_cgroup_cpu_weight_merge',
+        'verify_cgroup_cpu_weight_task',
+        'verify_cgroup_cpu_weight_background',
         # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.

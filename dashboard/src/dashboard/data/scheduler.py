@@ -54,6 +54,15 @@ Shape contract (returned by collect_scheduler_state):
         the high-rate ``task_skipped`` fetch — otherwise skip rows could
         exhaust the budget and an empty tail would be projected as a confident
         zero.  See ``_RECOVERY_EVENTS_LIMIT`` for the full rationale.
+
+    degraded_projects: list[str]  — project labels whose state is UNKNOWN
+        because the whole-handler budget expired before they were read.
+
+        Deliberately its OWN element, never merged into ``offline_projects``:
+        offline means the read demonstrably FAILED (fused-memory is
+        unreachable), degraded means nothing was proven at all.  An operator
+        reading a degraded project as offline goes and restarts a healthy
+        fused-memory.  The two must never be collapsed.
 """
 
 from __future__ import annotations
@@ -66,9 +75,10 @@ import httpx
 from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
-from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
+from dashboard.data.active_tasks import collect_tasks_with_counts
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success, project_label
 from dashboard.data.memory import mcp_tool_call
+from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -397,8 +407,8 @@ def _stranded_park_rows(
 
     Args:
         park_stacks:   ``{module_key: [entry, ...]}`` from the scheduler
-                       snapshot.  Each stack entry has ``owner``, ``rank``,
-                       ``shadowed``, and ``installed_at`` fields.
+                       snapshot; entry fields are owned by
+                       ``orchestrator/src/orchestrator/scheduler.py::ModuleLockTable.snapshot_park_stacks``.
         live_task_ids: Set of task_ids present in the active-tasks snapshot
                        (``{r['task_id'] for r in rows}``).  Owners in this
                        set are live and are skipped.
@@ -416,7 +426,7 @@ def _stranded_park_rows(
           park_state={'modules': sorted(mods), 'installed_at': str},
           lock_set=sorted(mods), age_seconds=int.
     """
-    # Build {owner: {'mods': [module, ...], 'installed_at': str}} across all stacks.
+    # Build {owner: {'mods': {module, ...}, 'installed_at': str}} across all stacks.
     owner_data: dict[str, dict] = {}
     for mod, stack in (park_stacks or {}).items():
         for entry in stack:
@@ -424,8 +434,8 @@ def _stranded_park_rows(
             if not owner:
                 continue
             if owner not in owner_data:
-                owner_data[owner] = {'mods': [], 'installed_at': ''}
-            owner_data[owner]['mods'].append(mod)
+                owner_data[owner] = {'mods': set(), 'installed_at': ''}
+            owner_data[owner]['mods'].add(mod)
             # Keep first non-empty installed_at encountered across all modules.
             if not owner_data[owner]['installed_at']:
                 ia = entry.get('installed_at') or ''
@@ -473,7 +483,7 @@ def _compose_rows(
 
     Each active task in *active_tasks* must carry a ``task_id`` field (the raw
     numeric string used as key in the snapshot dicts).  The ``started`` field is
-    the task age in minutes (from ``collect_active_tasks``).
+    the task age in minutes (from ``collect_tasks_with_counts``).
 
     The row's ``lock_set`` is the task's footprint **normalized to module locks**
     at *depth* (the scheduler's ``lock_depth``) via ``files_to_modules`` — so the
@@ -625,25 +635,26 @@ async def collect_scheduler_state(
     now: datetime | None = None,
 ) -> tuple[
     list[dict], list[dict], list[dict], dict[str, dict], list[str], list[dict],
-    dict[str, list[dict]],
+    dict[str, list[dict]], list[str],
 ]:
     """Fan out over all configured project roots and aggregate scheduler state.
 
     For each project root:
       - Calls ``get_scheduler_state`` and ``get_scheduler_events`` via
         ``mcp_tool_call``.
-      - Joins with ``collect_active_tasks`` output for task metadata and lock sets.
+      - Joins with ``collect_tasks_with_counts`` output for task metadata and
+        lock sets.
       - Composes rows, module contention list, and per-task event sparklines.
 
     *now* is resolved ONCE (via :func:`dashboard.data.utils.resolve_now`) at
-    this aggregation boundary and threaded into ``collect_active_tasks``,
+    this aggregation boundary and threaded into ``collect_tasks_with_counts``,
     ``_compose_rows``, ``_stranded_park_rows``, and ``_skip_event_sparkline``
     (as ``until``), plus the 1-hour event-history ``since`` window — so every
     row and sparkline in one collection shares a single reference instant.
 
     Returns:
         ``(rows, modules, pin_queue, events_by_task, offline_projects,
-        paused_projects, recovery_events)``
+        paused_projects, recovery_events, degraded_projects)``
 
         rows:             Composed task rows (see module docstring).
         modules:          Sorted module-contention list.
@@ -658,22 +669,38 @@ async def collect_scheduler_state(
                           event that is NOT ``task_skipped``.  Present-with-``[]``
                           means the project answered and had no sweeps; ABSENT
                           means offline (see module docstring).
+        degraded_projects: Project labels whose state is UNKNOWN because the
+                          whole-handler budget expired before they were read;
+                          never merged into ``offline_projects`` (see module
+                          docstring).  Their park stacks are withheld from
+                          ``rows`` and ``modules``: with no task rows, no
+                          owner's liveness is known.
+
+    Snapshot data is joined to its root by position, so two roots sharing a
+    basename keep their own pin queue, park stacks and ``project_root``; the
+    label-keyed outputs (task rows, sparkline and recovery keys, module
+    contention) still collapse them.
     """
     effective_now = resolve_now(now)
     since = effective_now - timedelta(hours=1)
 
-    # Fetch active tasks (for lock sets and titles)
-    all_active, active_offline = await collect_active_tasks(client, config, now=effective_now)
-
-    offline_projects: list[str] = list(active_offline)
+    # Fetch active tasks (for lock sets and titles).
+    all_active, snapshots = await collect_tasks_with_counts(client, config, now=effective_now)
+    health = {label: classify(snapshot) for label, snapshot in snapshots.items()}
+    offline_projects: list[str] = [
+        label for label, h in health.items() if h is SnapshotHealth.OFFLINE
+    ]
+    degraded_projects: list[str] = [
+        label for label, h in health.items() if h is SnapshotHealth.DEGRADED
+    ]
 
     # Determine which project roots still need querying
     roots_to_query = [
-        root for root in _all_project_roots(config)
-        if _project_label(root) not in offline_projects
+        root for root in config.all_project_roots
+        if project_label(root) not in offline_projects
     ]
 
-    async def _one_project(root) -> tuple[str, dict | None, list[dict], list[dict]]:
+    async def _one_project(root) -> tuple[dict | None, list[dict], list[dict]]:
         """Fetch snapshot + skip events + recovery events for one project root.
 
         Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
@@ -694,16 +721,16 @@ async def collect_scheduler_state(
         one row budget lets high-rate skip rows crowd out the rare recovery
         rows, which the projection would then report as a confident zero.
 
-        Returns ``(label, snapshot, skip_events, recovery_events)`` on success —
+        Returns ``(snapshot, skip_events, recovery_events)`` on success —
         ``snapshot`` may be ``{}`` for a project with no scheduler state yet
         (online but empty), and is normalised to ``{}`` if the MCP server
         returns a non-dict (defensive — older/buggy servers should never crash
-        the aggregator).  Returns ``(label, None, [], [])`` when every URL
-        fails; the ``None`` sentinel lets the caller distinguish *offline* from
+        the aggregator).  Returns ``(None, [], [])`` when every URL fails;
+        the ``None`` sentinel lets the caller distinguish *offline* from
         *online-but-empty* so a legitimately quiescent project is never
         misclassified as offline.
         """
-        label = _project_label(root)
+        label = project_label(root)
 
         async def _fetch_events(
             url: str, event_types: list[str], limit: int, kind: str,
@@ -766,18 +793,13 @@ async def collect_scheduler_state(
             config.fused_memory_urls,
             _call,
             # String-identical to the former f'get_scheduler_state[{label}]' —
-            # fanout_label's basename form IS _project_label's. Routed through
+            # fanout_label's basename form IS project_label's. Routed through
             # the helper so all four fan-out sites share one definition of the
             # per-project-root throttle-key convention (see its docstring).
             log_label=fanout_label('get_scheduler_state', root),
             offline_result=lambda errs: (None, [], []),
         )
-        return label, snapshot, skip_events, recovery_events
-
-    # Build a label→root map for O(1) lookup after asyncio.gather.
-    # (A linear next(...) search over roots_to_query would be O(n²) in the
-    # number of projects — trivially avoidable with a single pre-pass.)
-    label_to_root = {_project_label(r): r for r in roots_to_query}
+        return snapshot, skip_events, recovery_events
 
     # Fan out to all project roots concurrently (mirrors metrics.py pattern)
     per_project_results = await asyncio.gather(
@@ -799,11 +821,15 @@ async def collect_scheduler_state(
     # present-with-[] means "read succeeded, no sweeps", absent means offline.
     all_recovery_events: dict[str, list[dict]] = {}
 
-    for result in per_project_results:
+    # Paired by position: two roots may share a basename.
+    for root, result in zip(roots_to_query, per_project_results, strict=True):
         if isinstance(result, BaseException):
-            logger.warning('_one_project raised unexpectedly: %s', result)
+            logger.warning(
+                '_one_project raised unexpectedly for %s: %s', root, result,
+            )
             continue
-        label, snapshot, skip_events, recovery_events = result
+        snapshot, skip_events, recovery_events = result
+        label = project_label(root)
 
         # None snapshot means every URL failed (offline); {} means online-but-empty.
         if snapshot is None:
@@ -817,11 +843,6 @@ async def collect_scheduler_state(
                 'project': label,
                 'reason': snapshot.get('pause_reason'),
             })
-
-        # O(1) lookup via pre-built map (avoids O(n²) linear search per project)
-        root = label_to_root.get(label)
-        if root is None:
-            continue
 
         # Build task lookup from active_tasks for this project
         project_active = [t for t in all_active if t.get('project') == label]
@@ -859,7 +880,12 @@ async def collect_scheduler_state(
         live_task_ids: set[str] = {r['task_id'] for r in rows}
         # park_stacks: dict[module → list[entry]] from the snapshot (β pass-through).
         # None-safe: pre-upgrade snapshots lacking the key degrade to empty dict.
-        park_stacks: dict = snapshot.get('park_stacks') or {}
+        # A degraded project's live set is empty because its task read never
+        # finished, so every park verdict drawn from it would be a guess.
+        park_stacks: dict = (
+            {} if label in degraded_projects
+            else snapshot.get('park_stacks') or {}
+        )
 
         # Module contention from composed rows + snapshot holders.
         # Tag each module with the owning `project` so _merge_module_lists can
@@ -958,6 +984,7 @@ async def collect_scheduler_state(
         offline_projects,
         all_paused_projects,
         all_recovery_events,
+        degraded_projects,
     )
 
 

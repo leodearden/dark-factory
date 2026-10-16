@@ -13,7 +13,7 @@ import json
 import logging
 import sqlite3
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
@@ -81,6 +81,16 @@ class EventType(StrEnum):
     # restart noise.  `WHERE event_type = 'stale_l0_strand_dismissed'` answers
     # it directly; a json_extract discriminator over every resolution would not.
     stale_l0_strand_dismissed = 'stale_l0_strand_dismissed'
+    # One info-severity L0 was dispositioned by the router or the reviewer leg
+    # (plans/info-l0-disposition-router-prd.md D11).  The escalation record is
+    # the fact's home; this row is telemetry naming it, keyed on the subject's
+    # REAL task_id.
+    # data: {escalation_id, class, by, exit_kind, ticket, task_id, decided_at}
+    #   class: the escalation.disposition class written (a RESOLUTION_CLASSES
+    #   member when the record closed); by: the dispositioning actor;
+    #   exit_kind: an escalation.disposition.ExitKind value; ticket: the
+    #   curator ticket id, or null; decided_at: ISO-8601 UTC.
+    info_l0_dispositioned = 'info_l0_dispositioned'
 
     # Waste detection
     waste_detected = 'waste_detected'
@@ -177,6 +187,13 @@ class EventType(StrEnum):
     # measured_at: ISO-8601 str} — the suppressed pytest node-ids, the merge
     # commit whose verify was suppressed, and when the suppression was decided.
     merge_flake_suppressed = 'merge_flake_suppressed'
+    # One firing of Abort trigger 3 (no in-flight verify progress for a full
+    # budget) in orchestrator/src/orchestrator/merge_lane/worker.py::
+    # SpeculativeMergeWorker._run_inflight_verify, requeue and cap-out alike.
+    # task_id-keyed, phase='merge'; data is defined by
+    # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
+    # NoProgressAbort.event_data.
+    merge_verify_progress_abort = 'merge_verify_progress_abort'
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch
@@ -541,7 +558,20 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
+    # {anchor: int, pending_since: str}: the max_id the task's age now counts
+    # from, and the stamp whose change signalled the reset.  Emitted once per
+    # applied reset; restoring that anchor at a later process start emits
+    # nothing.
+    age_anchor_reset = 'age_anchor_reset'
+    # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
+    # Every emitted reservation_* event carries data.source in {pin, fairness}
+    # (task 6040): an operator pin's reservation, or the automatic machinery's.
+    # Pin-sourced installed / shadowed / install_blocked carry pin_order in
+    # place of the tier fields (priority, preempted_by_priority): a pin rank
+    # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
+    reservation_install_blocked = 'reservation_install_blocked'
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'
@@ -549,6 +579,13 @@ class EventType(StrEnum):
     reservation_used = 'reservation_used'
     reservation_force_evicted = 'reservation_force_evicted'
     reservation_force_evict_refused = 'reservation_force_evict_refused'
+    # A pinned task failed to take its module locks (task 6040).  Producer:
+    # scheduler.py::Scheduler._phase_select_pins.  Payload: {task_id,
+    # pin_order, head, blockers: [{module, owner, kind: held|parked}]}, with
+    # the blockers named BEFORE the head's own reservation installs.  Emitted
+    # when the pin becomes blocked, then at most once per
+    # pin_blocked_emit_interval_secs while it stays blocked.
+    pin_blocked = 'pin_blocked'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).
@@ -578,6 +615,13 @@ class EventType(StrEnum):
     # NOT emitted through _emit_lock_event: that chokepoint is contractually
     # the lock-event single writer and raises on any other event type.
     park_backfill_overstay = 'park_backfill_overstay'
+    # Anchor-coverage arming gate (task 3819 / scheduler-scoring PRD D12, I-6).
+    # Producer: scheduler.py::Scheduler._note_anchor_coverage, once per tick whose
+    # share of candidates carrying a parseable metadata.pending_since is below
+    # scoring.new_scoring_min_anchor_coverage — the whole tick then scores on
+    # the legacy formula.  Scheduler-scoped (task_id=None).  Payload:
+    # {coverage, threshold, candidates, with_anchor, consecutive_ticks}.
+    scoring_anchor_coverage_low = 'scoring_anchor_coverage_low'
 
     # Scheduler priority overrides
     #
@@ -615,10 +659,15 @@ class EventType(StrEnum):
     # scheduler_pause_restored: emitted on orchestrator restart when a persisted
     #   pause is loaded from runs.db.  Distinct from scheduler_paused so the
     #   event timeline self-documents cross-run continuity.  Data payload:
-    #   {reason, pause_at, restored_from_run_id}.
+    #   {reason, pause_at, restored_from_run_id, reasserted, ewa_value,
+    #   ewa_threshold, disposition}.  reasserted=false ends the pause (read by
+    #   digest.py::repended_during_current_pause).
     scheduler_paused = 'scheduler_paused'
     scheduler_resumed = 'scheduler_resumed'
     scheduler_pause_restored = 'scheduler_pause_restored'
+    # A resolution re-pended a task while dispatch is paused (task 5311).
+    #   Emitted by Harness._flag_repend_while_paused; payload {escalation_id, pause_reason}.
+    repend_while_paused = 'repend_while_paused'
 
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
@@ -704,6 +753,14 @@ class EventType(StrEnum):
     # a restart of a backing service (e.g. fused-memory.service after a merge
     # whose landed diff touched fused-memory/src/).
     service_restart = 'service_restart'
+
+    # Restart drain (task 5371) — one per honoured drain request, emitted by
+    # orchestrator/src/orchestrator/fleet_drain.py::DrainEventTracker via the
+    # harness. data keys: unit, requested_ts, sweep_pid, waited_secs, outcome
+    # ('drained' | 'verifies_killed' | 'abandoned'), refused (the refusal that
+    # abandoned it, else null), merge_verifies_awaited, merge_verifies_killed
+    # (each a list of {task_id, host, kind, started_ts, deadline_ts}).
+    fleet_drain = 'fleet_drain'
 
     # Cross-project external-dep gate held — emitted when a pending task's
     # external deps have been holding dispatch for ``threshold`` consecutive
@@ -875,6 +932,12 @@ class EventType(StrEnum):
     # these rows for a stranded task is therefore meaningful: nothing held it.
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
+    # strand_converted — one row per convert-to-blocked the stranded-task sweep
+    # actually applied (task 6476).  Payload:
+    # orchestrator/src/orchestrator/strand_conversion.py::strand_converted_payload.
+    # An ACTION, not a hold, so not signature-gated: one row per conversion.
+    # task_id is ALSO a first-class column.
+    strand_converted = 'strand_converted'
 
     # workflow_exit_contract — one row per run() exit whose contract verdict is
     # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
@@ -892,6 +955,47 @@ class EventType(StrEnum):
     # task_id is ALSO a first-class column.  Task mu's soak counts
     # verdict='violation' rows with mode='log' before flipping enforce on.
     workflow_exit_contract = 'workflow_exit_contract'
+
+    # Task-verify admission gate (task 5628; plans/verify-admission-fifo-prd.md).
+    # Every payload carries `order`, so before/after a policy flip is read from
+    # the rows themselves, never from dates. Wall-clock ISO times only.
+    #
+    # verify_admission_plan — one row per gated verify plan
+    #   (verify.py::run_scoped_verification / run_full_verification) that
+    #   returned with an admitted leg, or that raised while admission was on;
+    #   a cancelled plan emits none. task_id and role are also first-class
+    #   columns; phase 'verify'. Payload:
+    #   {plan_id, task_id, role,
+    #    outcome,           # 'returned' | 'raised'; a raised plan's legs never came back: []
+    #    order,             # the legs' common order; null if a reload changed it mid-plan, or no legs
+    #    plan_arrival_at, completed_at,
+    #    legs: [verify_admission_record.py::AdmissionLeg.to_dict()]}
+    verify_admission_plan = 'verify_admission_plan'
+    # verify_admission_heartbeat — from the harness watch
+    #   (verify_admission_watch.py::AdmissionWatch), once per tick and only
+    #   while any waiter is queued. Payload:
+    #   {depth, oldest_wait_secs, oldest: {task_id, module, role, plan_id},
+    #    holders: [{task_id, module, role, held_secs}], order}
+    verify_admission_heartbeat = 'verify_admission_heartbeat'
+    # verify_admission_wait_aged — from the same watch, when the oldest waiter
+    #   past the alarm age first appears, and again only when that waiter's
+    #   identity changes: one fact per change, never one per waiter per tick
+    #   (INV-4). Age surfacing only; nothing times out. Payload:
+    #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
+    verify_admission_wait_aged = 'verify_admission_wait_aged'
+
+
+class _MergeFinalizedKey(Enum):
+    """The field a merge_finalized read matches on; each value is its fixed SQL predicate."""
+
+    request_id = "json_extract(data, '$.request_id') = ?"
+    branch = "json_extract(data, '$.branch') = ?"
+    task_id = 'task_id = ?'
+    superseded_by = "json_extract(data, '$.superseded_by') = ?"
+    absorbs = (
+        "EXISTS (SELECT 1 FROM json_each(events.data, '$.absorbed_request_ids') "
+        'WHERE json_each.value = ?)'
+    )
 
 
 class EventStore:
@@ -982,77 +1086,137 @@ class EventStore:
         request_id: str | None = None,
         branch: str | None = None,
         task_id: str | None = None,
+        *,
+        cross_run: bool = False,
     ) -> dict | None:
-        """Return the most-recent merge_finalized event row matching the given key.
+        """Return the most-recent merge_finalized row matching the given key.
 
         Lookup precedence: request_id > branch > task_id.  When no key is
         provided, returns None immediately.
 
-        Queries are scoped to the current run (``self.run_id``).  branch= and
-        task_id= lookups therefore return the most-recent outcome for the
-        *current* orchestrator run only; results from previous runs that
-        reused the same branch or task_id are not returned.  This prevents
-        merge_status from silently surfacing stale prior-run terminal outcomes.
+        Run-scoped by default: only rows this run (``self.run_id``) wrote are
+        considered, because branches and task_ids are reused across runs and a
+        prior run's terminal state must never read as this run's outcome.
+        ``cross_run=True`` is the explicit opt-in for history.  Every row
+        carries ``run_id`` and ``is_current_run``, so history is always
+        labelled as such (plans/merge-status-durable-non-landed-prd.md D2).
 
-        The returned dict has keys:
-            request_id, task_id, branch, state, snapshot_tip, merge_sha,
-            reason, finished_at (ISO-8601 timestamp string from the events table).
+        The returned dict has keys request_id, task_id, branch, state,
+        snapshot_tip, merge_sha, superseded_by, reason, finished_at (the
+        events-table timestamp), run_id, is_current_run and
+        absorbed_request_ids (None on rows written before that key existed).
 
-        Returns None on miss, on unknown key, or if all keys are None.
-        Errors are logged and return None (read path is fire-safe).
+        Returns None on miss.  Errors are logged and return None (read path is
+        fire-safe).
         """
-        if request_id is None and branch is None and task_id is None:
+        if request_id is not None:
+            key, value = _MergeFinalizedKey.request_id, request_id
+        elif branch is not None:
+            key, value = _MergeFinalizedKey.branch, branch
+        elif task_id is not None:
+            key, value = _MergeFinalizedKey.task_id, task_id
+        else:
             return None
+        rows = self._select_merge_finalized(
+            'latest_merge_finalized', key, value, cross_run=cross_run, latest_only=True,
+        )
+        return rows[0] if rows else None
+
+    def merge_finalized_superseded_by(
+        self, superseded_by: str, *, cross_run: bool = False,
+    ) -> list[dict]:
+        """Return the member rows a coalesce-* train id or a gen-(n+1) request id superseded.
+
+        Oldest first, in latest_merge_finalized's projection and run scope
+        (plans/merge-status-durable-non-landed-prd.md D7).  Fire-safe: errors
+        are logged and return [].
+        """
+        if not superseded_by:
+            return []
+        return self._select_merge_finalized(
+            'merge_finalized_superseded_by',
+            _MergeFinalizedKey.superseded_by,
+            superseded_by,
+            cross_run=cross_run,
+            latest_only=False,
+        )
+
+    def merge_finalized_absorbing(
+        self, request_id: str, *, cross_run: bool = False,
+    ) -> dict | None:
+        """Return the newest primary row whose absorbed_request_ids lists *request_id*.
+
+        Resolves an attach or door-coalesced loser, which never gets a row of
+        its own, to the primary's outcome: the durable, restart-surviving
+        replacement for TerminalOutcomeRetention.record_alias
+        (plans/merge-status-durable-non-landed-prd.md D6/D7).  Kept apart from
+        latest_merge_finalized so a caller can tell an alias hit from a direct
+        one.  Whole-id match; same projection, run scope and fire-safe policy.
+        """
+        if not request_id:
+            return None
+        rows = self._select_merge_finalized(
+            'merge_finalized_absorbing',
+            _MergeFinalizedKey.absorbs,
+            request_id,
+            cross_run=cross_run,
+            latest_only=True,
+        )
+        return rows[0] if rows else None
+
+    def _select_merge_finalized(
+        self,
+        reader: str,
+        key: _MergeFinalizedKey,
+        value: str,
+        *,
+        cross_run: bool,
+        latest_only: bool,
+    ) -> list[dict]:
+        """Every merge_finalized read: run scope, key match, order and projection.
+
+        *reader* names the public method in the fire-safe warning.
+        """
+        sql = (
+            'SELECT run_id, task_id, data, timestamp FROM events '
+            "WHERE event_type = 'merge_finalized'"
+        )
+        params: list[str] = []
+        if not cross_run:
+            sql += ' AND run_id = ?'
+            params.append(self.run_id)
+        sql += f' AND {key.value}'
+        params.append(value)
+        sql += ' ORDER BY id DESC LIMIT 1' if latest_only else ' ORDER BY id'
         try:
             conn = self._connect()
             try:
-                if request_id is not None:
-                    row = conn.execute(
-                        "SELECT task_id, data, timestamp FROM events "
-                        "WHERE event_type='merge_finalized' "
-                        "  AND run_id = ? "
-                        "  AND json_extract(data,'$.request_id')=? "
-                        "ORDER BY id DESC LIMIT 1",
-                        (self.run_id, request_id),
-                    ).fetchone()
-                elif branch is not None:
-                    row = conn.execute(
-                        "SELECT task_id, data, timestamp FROM events "
-                        "WHERE event_type='merge_finalized' "
-                        "  AND run_id = ? "
-                        "  AND json_extract(data,'$.branch')=? "
-                        "ORDER BY id DESC LIMIT 1",
-                        (self.run_id, branch),
-                    ).fetchone()
-                else:
-                    row = conn.execute(
-                        "SELECT task_id, data, timestamp FROM events "
-                        "WHERE event_type='merge_finalized' "
-                        "  AND run_id = ? "
-                        "  AND task_id=? "
-                        "ORDER BY id DESC LIMIT 1",
-                        (self.run_id, task_id),
-                    ).fetchone()
+                rows = conn.execute(sql, params).fetchall()
             finally:
                 conn.close()
-            if row is None:
-                return None
-            db_task_id, raw_data, timestamp = row
-            data = json.loads(raw_data) if raw_data else {}
-            return {
-                'request_id': data.get('request_id'),
-                'task_id': db_task_id,
-                'branch': data.get('branch'),
-                'state': data.get('state'),
-                'snapshot_tip': data.get('snapshot_tip'),
-                'merge_sha': data.get('merge_sha'),
-                'superseded_by': data.get('superseded_by'),
-                'reason': data.get('reason'),
-                'finished_at': timestamp,
-            }
+            return [self._merge_finalized_row(*row) for row in rows]
         except Exception:
-            logger.warning('event_store.latest_merge_finalized failed', exc_info=True)
-            return None
+            logger.warning('event_store.%s failed', reader, exc_info=True)
+            return []
+
+    def _merge_finalized_row(
+        self, run_id: str, task_id: str | None, raw_data: str | None, timestamp: str,
+    ) -> dict:
+        data = json.loads(raw_data) if raw_data else {}
+        return {
+            'request_id': data.get('request_id'),
+            'task_id': task_id,
+            'branch': data.get('branch'),
+            'state': data.get('state'),
+            'snapshot_tip': data.get('snapshot_tip'),
+            'merge_sha': data.get('merge_sha'),
+            'superseded_by': data.get('superseded_by'),
+            'reason': data.get('reason'),
+            'finished_at': timestamp,
+            'run_id': run_id,
+            'is_current_run': run_id == self.run_id,
+            'absorbed_request_ids': data.get('absorbed_request_ids'),
+        }
 
     def fetch_events_by_type(self, event_type: str | EventType) -> list[dict]:
         """Return all events of *event_type* emitted in the current run, ordered by id.

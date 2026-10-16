@@ -15,6 +15,8 @@ Covers:
   amend cy3    — an unreadable `git rev-parse HEAD` is a loud merge_error,
                  not a phantom EMPTY-STRING link (the same hazard as step-17
                  reached via an unchecked rc)
+  task 4206    — the acquired lane must be at head_merge_commit before
+                 anything is stacked on it ('lane_base_mismatch')
 
 Reference: ``plans/deep-merge-ahead-prd.md``.
 
@@ -23,23 +25,28 @@ Harness notes (see plan pre-1):
     runs STRICT, so ``@pytest.mark.asyncio`` is required on async test classes.
   * That same config turns "marked with @pytest.mark.asyncio but not an async
     function" into an ERROR — never put a sync ``test_*`` inside a marked class.
-  * Default per-test ``timeout = 60``; real-git classes carry
-    ``@pytest.mark.timeout(180)`` since a chain of 3 merges plus worktree
-    creation can exceed it.
+  * Real-git classes carry
+    ``@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`` because a chain of 3
+    merges plus worktree creation is slow.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Literal
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.liveness import release_chain_build_lane
+from orchestrator.merge_lane.worker import build_chain
 from orchestrator.merge_queue import ItemLifecycleState, MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import GroupMergeRequest, QueuedBranch
+from orchestrator.warm_lane_pool import LaneState
 
 # ── repo fixtures (mirrors test_merge_queue_conflict_graph.py:34-50) ──────────
 
@@ -65,6 +72,16 @@ async def _setup_repo(repo: Path) -> None:
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
+async def _commit_seed_script(repo: Path, body: str, message: str) -> None:
+    """Commit an executable ``scripts/seed-warm-lane.sh`` running *body* at HEAD."""
+    script = repo / 'scripts' / 'seed-warm-lane.sh'
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('#!/usr/bin/env bash\n' + body)
+    script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', message], cwd=repo)
+
+
 async def _add_recording_seed_to_repo(repo: Path) -> None:
     """Commit a recording ``scripts/seed-warm-lane.sh`` into the repo at HEAD.
 
@@ -76,18 +93,13 @@ async def _add_recording_seed_to_repo(repo: Path) -> None:
     ``scripts/seed-warm-lane.sh`` still resolves first — which is why
     committing it here works.
     """
-    scripts_dir = repo / 'scripts'
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    script = scripts_dir / 'seed-warm-lane.sh'
-    script.write_text(
-        '#!/usr/bin/env bash\n'
+    await _commit_seed_script(
+        repo,
         '# argv: <base_target> <lane_dir> <mode>\n'
         'ARGV_FILE="$2/scripts/seed-warm-lane.sh.argv"\n'
         'echo "$@" >> "$ARGV_FILE"\n',
+        'add recording seed-warm-lane.sh',
     )
-    script.chmod(0o755)
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'add recording seed-warm-lane.sh'], cwd=repo)
 
 
 @pytest.fixture
@@ -351,7 +363,7 @@ class TestChainResultContract:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestMergeBranchIntoWorktree:
     """merge_branch_into_worktree merges into a CALLER-SUPPLIED worktree.
 
@@ -614,7 +626,7 @@ class TestMergeBranchIntoWorktree:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestChainBuildLane:
     """The chain-build worktree-routing seam in merge_liveness.py."""
 
@@ -787,7 +799,7 @@ class TestChainBuildLane:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestChainSnapshot:
     """chain_snapshot() returns queued items in pick order without mutating."""
 
@@ -980,7 +992,7 @@ def _count_spec_lane_acquires(git_ops: GitOps, monkeypatch) -> list[str]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainDegenerate:
     """Degenerate inputs return an empty ChainResult and touch ZERO worktrees.
 
@@ -1120,7 +1132,7 @@ class TestBuildChainDegenerate:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainClean:
     """A clean 3-item chain builds in exactly one worktree."""
 
@@ -1348,7 +1360,7 @@ async def _assert_lane_clean_at(lane: Path, tip: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainTruncation:
     """The task's headline signal: clean prefix, conflicted item UNTOUCHED, ONE worktree.
 
@@ -1877,7 +1889,7 @@ def _fail_rev_parse_head(monkeypatch, *, after_merge: bool) -> dict[str, int]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestMergeBranchIntoWorktreeRevParseGuard:
     """An unreadable HEAD must be a loud failure, never a phantom empty sha.
 
@@ -1973,4 +1985,124 @@ class TestMergeBranchIntoWorktreeRevParseGuard:
         # Purity holds on this arm too (PRD decision #4).
         assert not snap[0].result.done()
         assert not snap[1].result.done()
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# task 4206: RED — the acquired lane must be at head_merge_commit
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _all_pool_lanes_free(git_ops: GitOps) -> bool:
+    pool = git_ops.spec_warm_lane_pool
+    assert pool is not None
+    return all(pool.state(lane) is LaneState.FREE for lane in pool.lane_paths())
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestBuildChainLaneBase:
+    """Nothing is stacked on a lane that is not checked out at the base.
+
+    ``ChainResult.tip`` is what δ's ``_land_chain_prefix`` CAS-advances main
+    onto, so a chain rooted anywhere but ``head_merge_commit`` would land a
+    history main never had.  The repo's own ``scripts/seed-warm-lane.sh`` runs
+    LAST during ``acquire_spec_lane``, with the lane checked out — so a
+    committed hostile seed drives the real warm acquisition route off-base
+    with no patch target.  The refusal is a lane fault, not an item's, so it
+    carries its own reason rather than ``'merge_error'`` against item 0.
+    """
+
+    async def _build_on_a_seeded_lane(
+        self, git_repo: Path, monkeypatch, seed_body: str, message: str,
+    ):
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
+        await _commit_seed_script(git_repo, seed_body, message)
+        head = await _rev_parse(git_repo)
+        acquires = _count_spec_lane_acquires(git_ops, monkeypatch)
+        merges = _spy_merges(git_ops, monkeypatch)
+        snap = (
+            _make_req('101', '101', config, git_repo),
+            _make_req('102', '102', config, git_repo),
+        )
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=2)
+
+        return git_ops, snap, head, res, acquires, merges
+
+    async def test_lane_moved_off_base_by_the_seed_script_stacks_nothing(
+        self, git_repo: Path, monkeypatch, caplog,
+    ):
+        off = await _rev_parse(git_repo)
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+
+        git_ops, snap, head, res, acquires, merges = await self._build_on_a_seeded_lane(
+            git_repo, monkeypatch,
+            'git -C "$2" checkout -q --detach HEAD~1\n',
+            'hostile seed: moves the lane off its base',
+        )
+
+        assert await _rev_parse(git_repo, 'HEAD~1') == off
+        assert res.links == []
+        assert res.depth == 0
+        assert res.tip == head
+        assert res.truncated_at == '101'
+        assert res.truncated_reason == 'lane_base_mismatch'
+        assert merges == []
+        assert len(acquires) == 1
+        assert res.lane is None
+        assert res.lane_warm is False
+        assert _all_pool_lanes_free(git_ops)
+        assert all(not r.result.done() for r in snap)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'lane_base_mismatch' in m and f'HEAD={off[:8]}, expected {head[:8]};' in m
+            for m in warnings
+        )
+        assert any('reason=lane_base_mismatch' in m and 'elapsed_ms=' in m for m in warnings)
+
+    async def test_unreadable_lane_head_is_a_base_mismatch_not_an_item_merge_error(
+        self, git_repo: Path, monkeypatch, caplog,
+    ):
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+
+        git_ops, snap, head, res, _, merges = await self._build_on_a_seeded_lane(
+            git_repo, monkeypatch,
+            'echo "gitdir: /nonexistent-4206" > "$2/.git"\n',
+            'hostile seed: makes the lane HEAD unreadable',
+        )
+
+        assert res.truncated_reason == 'lane_base_mismatch'
+        assert res.truncated_at == '101'
+        assert res.links == []
+        assert res.tip == head
+        assert merges == []
+        assert res.lane is None
+        assert res.lane_warm is False
+        assert _all_pool_lanes_free(git_ops)
+        assert all(not r.result.done() for r in snap)
+        assert any(
+            f'HEAD=None, expected {head[:8]};' in r.getMessage()
+            for r in caplog.records if r.levelno >= logging.WARNING
+        )
+
+    async def test_cold_fallback_lane_passes_the_base_check(self, git_repo: Path):
+        """The production default (no warm pool) still chains: no false positive."""
+        git_ops = _make_git_ops(git_repo, pool=False)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        head = await _rev_parse(git_repo)
+        snap = (_make_req('101', '101', config, git_repo),)
+
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=1)
+
+        assert [t for t, _ in res.links] == ['101']
+        assert res.lane_warm is False
+        assert res.truncated_at is None
+        assert res.truncated_reason is None
+        assert res.lane is not None
+        assert await _rev_parse(res.lane, f'{res.links[0][1]}^1') == head
         await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)

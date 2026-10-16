@@ -74,8 +74,19 @@ from shared.proc_group import (
 )
 from shared.transcript_archive import archive_before_delete
 
-from orchestrator import rebase_recovery
+from orchestrator import branch_stack, rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.branch_stack import (
+    PreStackTip,
+    StackBaseLedger,
+    TipRestore,
+    TipRestoreOutcome,
+    UnstackOutcome,
+    UnstackResult,
+    base_owners,
+    foreign_commit_cut,
+    rebase_own_delta,
+)
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.lane_lifecycle import (
     ACQUIRE_ROUTE_TRANSITIONS,
@@ -95,7 +106,8 @@ from orchestrator.verify_cancel import (
     write_lock_holder_pgid,
 )
 from orchestrator.verify_classify import _ENOSPC_MARKERS
-from orchestrator.warm_lane_pool import WarmLanePoolCensus
+from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus
+from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -337,9 +349,13 @@ class TrainStackResult:
     ejected:   member ids that conflicted during stacking and were dropped;
                their branches are left clean (rebase aborted) so they can
                merge solo.
+    pre_stack_tips: one restore point per stacked survivor (never the
+               anchor, which is not rebased), so a train that does not land
+               can hand it back.
     """
     survivors: list[str]
     ejected: list[str]
+    pre_stack_tips: tuple[PreStackTip, ...] = ()
 
 
 # Default commit-citation pattern for ``find_task_citation_commit``.
@@ -2598,10 +2614,10 @@ async def _run(
     A thin adapter over :func:`shared.git_async.run_git` (task 3778), which
     owns the spawn mechanism and its rationale: the ``LC_ALL=C`` locale pin
     :func:`_git_clean_failure_is_benign` depends on, stdin feeding, and the
-    task-2608 cancellation kill+reap.  What stays here is orchestrator-
-    specific: the :class:`WorktreeMissing` taxonomy and the 3-tuple return.
-    ``run_git`` is imported by bare name so ``git_ops.run_git`` is the single
-    patchable spawn seam.
+    process-group kill+reap on cancellation (tasks 2608/4155).  What stays
+    here is orchestrator-specific: the :class:`WorktreeMissing` taxonomy and
+    the 3-tuple return.  ``run_git`` is imported by bare name so
+    ``git_ops.run_git`` is the single patchable spawn seam.
 
     ``input_text``, when given, is piped to the child's stdin, e.g. a diff
     into ``git patch-id`` (see :meth:`GitOps.find_equivalent_commit`).
@@ -2712,6 +2728,16 @@ def _merge_subject(branch: str, main_branch: str) -> str:
     use the new format.
     """
     return f'Merge {branch} into {main_branch}'
+
+
+def _merge_worktree_remove_argv(path: Path) -> list[str]:
+    """``git worktree remove`` for a ``_merge-*`` tree, overriding git's lock.
+
+    git refuses a single ``--force`` on a locked tree. Nothing in this repo
+    locks a worktree, so a lock on a ``_merge-*`` tree is git's abandoned
+    ``initializing`` marker (task 4828), never a liveness signal.
+    """
+    return ['git', 'worktree', 'remove', '--force', '--force', str(path)]
 
 
 # Sentinel range used to represent files that are fully deleted or renamed.
@@ -2898,7 +2924,6 @@ class GitOps:
         # OrchestratorConfig.max_concurrent_tasks by Harness at startup (D9).
         self._warm_lane_pool_size = warm_lane_pool_size
         if warm_lane_pool_size > 0 and config.warm_lane_pool:
-            from orchestrator.warm_lane_pool import WarmLanePool
             self.warm_lane_pool: WarmLanePool | None = WarmLanePool(
                 worktree_base=self.worktree_base,
                 size=warm_lane_pool_size,
@@ -2922,8 +2947,7 @@ class GitOps:
         # Default-off, byte-identical at default, mirrors warm_lane_pool above.
         self._merge_spec_warm_lane_pool_size = merge_spec_warm_lane_pool_size
         if merge_spec_warm_lane_pool_size > 0 and config.merge_spec_warm_lane_pool:
-            from orchestrator.warm_lane_pool import WarmLanePool as _WLP
-            self.spec_warm_lane_pool: WarmLanePool | None = _WLP(
+            self.spec_warm_lane_pool: WarmLanePool | None = WarmLanePool(
                 worktree_base=self.worktree_base,
                 size=merge_spec_warm_lane_pool_size,
                 name_prefix='_spec-',
@@ -3246,9 +3270,9 @@ class GitOps:
                 below, so an unsuppressed raise here would leak the
                 registered worktree instead of degrading to cold. A
                 non-resolvable base (ABSENT/INDETERMINATE) skips the seed
-                subprocess entirely. Default ``False`` keeps
-                ``run_main_tip_sweep`` (``MAIN_SWEEP``) byte-identical to
-                before this parameter existed.
+                subprocess, logged at INFO for a ``MAIN_SWEEP`` (its warm/cold
+                mode is a verdict input) and DEBUG for a hot-path
+                ``MAIN_PROBE``. Default ``False``: cold.
 
         Yields:
             The minted worktree path, already checked out at *sha*.
@@ -3379,10 +3403,10 @@ class GitOps:
                                 kind.name, seed_rc, tmp_path,
                             )
                     else:
-                        logger.debug(
+                        logger.log(
+                            {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
                             'ephemeral_worktree(%s): warm base not resolvable — '
-                            'skipping seed, proceeding COLD for %s',
-                            kind.name, tmp_path,
+                            'skipping seed, proceeding COLD for %s', kind.name, tmp_path,
                         )
                 except Exception:
                     logger.warning(
@@ -3677,7 +3701,15 @@ class GitOps:
            concurrent in-process holder would be libelled, most sharply
            :meth:`task_verify_lease`, which by design never writes the
            rendezvous layer 3 reads.  This layer gets strictly more important
-           as in-process holds widen.
+           as in-process holds widen — and task 4189 is that widening made
+           concrete: :meth:`merge_verify_lease` on an EPHEMERAL
+           ``_merge-<hash>`` lane now also declines to write the rendezvous,
+           so layer 3 no longer vetoes there and this registry is what keeps a
+           healthy ephemeral hold (a cold-shadow verify, a drift check, the
+           DF-2822 cross-check) from being libelled as a self-owned leak.
+           :meth:`_acquire_lane_flock_off_thread` registers every won fd on its
+           OWN worker thread (task 3783), so the registry never lags the
+           kernel and this substitution is exact.
         3. **Liveness** — no live recorded verify
            (:meth:`_merge_verify_lease_active`, reused unchanged with its
            fail-OPEN semantics).  A genuine long verify holding the lane past
@@ -3975,12 +4007,53 @@ class GitOps:
         ``_merge-<hash>`` speculation worktree the DF 2822 per-land REMOTE-green
         cross-check actually verifies in) flocks THAT lane instead, so the
         cross-check mutually excludes a concurrent reseed/reclaim of its OWN
-        lane (task 2873). Only the flocked inode is parametrized — the
-        holder-pgid rendezvous below stays keyed to the GLOBAL
-        :attr:`worktree_base` (a fail-open liveness hint consumed only by
-        persistent-lane actors; an ephemeral-lane lease writing it is a safe
-        over-approximation that at worst makes a concurrent persistent
-        reseed/GC defer during the cross-check, never a clobber).
+        lane (task 2873).
+
+        The GLOBAL holder-pgid rendezvous below — the single FIXED-key
+        ``verify_cancel.LOCK_HOLDER_PGID_KEY`` file under
+        :attr:`worktree_base`, a fail-open liveness hint consumed only by
+        PERSISTENT-lane actors — is written AND removed ONLY when *lane_dir*
+        is ``None`` or satisfies :meth:`is_persistent_merge_lane` (task 4189).
+        An ephemeral lane still gets the flock and the
+        fail-closed contended raise below; it simply never touches the
+        global. Task 2873 kept the rendezvous unconditional as "a safe
+        over-approximation", but that argument contemplated only the SHORT
+        DF-2822 cross-check and only the DEFER direction, and it cost two
+        things:
+
+        (i) :meth:`_run_warm_lane_gc_reclaim` defers (127) unconditionally
+            while the rendezvous names a live pgid and deliberately does NOT
+            exclude self, so an hours-long cold-shadow verify on an ephemeral
+            lane (``merge_shadow.py``) blocked warm-lane reclaim for its WHOLE
+            window — while touching nothing in the pool that reclaim resets.
+
+        (ii) The key is not refcounted and carries no owner check (last writer
+            wins, first remover wins). Shadow compares run as background
+            asyncio tasks alongside the NEXT merge's persistent-lane verify,
+            so whichever lease exited FIRST stripped the other's LIVE
+            rendezvous — the exact remove-side stomp
+            :meth:`task_verify_lease`'s docstring already cites as its own
+            reason for being flock-only. On an ephemeral lane the two leases
+            now agree on the rendezvous.
+
+        :meth:`reset_persistent_merge_worktree` is unaffected either way: its
+        guard already excludes our own pgid, so an in-process ephemeral lease
+        never blocked it. The ``records_rendezvous`` flag is computed ONCE,
+        before the acquire, and reused for both the write and the ``finally``'s
+        remove, so the pair can never go asymmetric (a write with no remove
+        would leak a permanently live-looking rendezvous; a remove with no
+        write is stomp (ii) itself).
+
+        Neither side of that pair may orphan the won flock. The write runs
+        AFTER the acquire but BEFORE the ``try`` that owns the release, and
+        ``write_pgid_file`` is ``mkdir`` + ``write_text`` + ``os.replace`` with
+        nothing suppressed, so an ENOSPC/EACCES/EROFS there is caught only to
+        release the fd and re-raise; the remove sits inside a nested ``try``
+        whose ``finally`` IS the release, because ``remove_pgid_file``
+        suppresses ``FileNotFoundError`` alone. Both keep
+        :meth:`_release_lane_flock` reachable on every path out — the B12
+        orphaned-lane-flock invariant, which the pool-full case (when
+        warm-lane GC matters most) is the likeliest to test.
 
         On a contended flock (the bounded wait in
         :func:`acquire_merge_verify_flock` times out after
@@ -4003,6 +4076,23 @@ class GitOps:
         """
         lock_path = lane_lock_path(
             lane_dir if lane_dir is not None else self.persistent_merge_worktree_path
+        )
+        # Does this lease record the GLOBAL holder-pgid rendezvous?  ONLY for
+        # the persistent merge lane (task 4189).  The full argument — both
+        # consequences it retires, and why it is keyed on the RESOLVED PATH
+        # rather than on "was an argument passed" — is in the docstring above;
+        # the comparison itself lives once, in is_persistent_merge_lane.  The
+        # two facts a reader AT THIS LINE needs:
+        #
+        #   * computed ONCE, so the write below and the finally's remove can
+        #     never go asymmetric (a write with no remove leaks a permanently
+        #     live-looking rendezvous that wedges warm-lane GC until process
+        #     exit; a remove with no write IS the cross-lease stomp being
+        #     fixed);
+        #   * computed BEFORE the acquire, so anything it raises raises while
+        #     NO fd is held and can never orphan a lane flock (B12).
+        records_rendezvous = (
+            lane_dir is None or self.is_persistent_merge_lane(lane_dir)
         )
         # Off-thread bounded-wait acquire (shared skeleton, task 3027):
         # _acquire_lane_flock_off_thread wraps the asyncio.to_thread(
@@ -4062,12 +4152,38 @@ class GitOps:
                 _MERGE_VERIFY_LEASE_WAIT_SECS,
                 holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
             )
-        write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+        if records_rendezvous:
+            # The flock is WON here but the try/finally that releases it has
+            # not been entered yet, and this write is not a pure in-memory op:
+            # write_pgid_file does mkdir + write_text + os.replace, none of
+            # them suppressed, so ENOSPC/EACCES/EROFS raises with `fd` HELD
+            # and unreleased — the lane would stay locked until process exit,
+            # the orphaned-lane-flock outage shape B12 exists to prevent. Most
+            # likely to fire when the pool mount is full, i.e. exactly when
+            # warm-lane GC matters most. Release, then re-raise (loudly — a
+            # lease that cannot record its rendezvous must not run as if it
+            # had). The write/remove pair stays symmetric by construction: a
+            # failed write never enters the try, so the finally can never
+            # remove a file this lease did not write, which would be stomp
+            # (ii) against whoever's rendezvous is actually live.
+            try:
+                write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+            except OSError:
+                self._release_lane_flock(fd)
+                raise
         try:
             yield
         finally:
-            remove_lock_holder_pgid(self.worktree_base)
-            self._release_lane_flock(fd)
+            # Nested finally, not two statements: remove_pgid_file suppresses
+            # only FileNotFoundError, so an EACCES/EROFS unlink raising here
+            # would skip the release and orphan the lane the same way. The
+            # release must be unconditional BY CONSTRUCTION, not by the
+            # happenstance that the line above usually cannot raise.
+            try:
+                if records_rendezvous:
+                    remove_lock_holder_pgid(self.worktree_base)
+            finally:
+                self._release_lane_flock(fd)
 
     @contextlib.asynccontextmanager
     async def task_verify_lease(self, lane_dir: Path):
@@ -4097,6 +4213,17 @@ class GitOps:
           hold) and would spuriously gate merge-lane resets/GC. The per-lane
           flock alone is the cross-process mechanism reify consults, so the
           rendezvous stays single-purpose to the merge lane.
+
+          As of task 4189 this is no longer a CONTRAST on non-persistent
+          lanes: :meth:`merge_verify_lease` records the rendezvous only for
+          the PERSISTENT merge lane, so on an ephemeral ``_merge-<hash>``
+          speculation lane the two leases now agree — flock held, rendezvous
+          untouched. The stomp rationale written just above was the reason
+          this lease never wrote it, and is now the SHARED justification for
+          both; the ephemeral merge lane hit exactly that shape (a cold-shadow
+          compare's finally clearing the next merge's live persistent-lane
+          hold). What still diverges is the fail-mode (fail-OPEN below vs.
+          :meth:`merge_verify_lease`'s raise) and the timeout constant.
         * **fail-OPEN on contention** — on acquire timeout (a racing reseed
           held the lane lock past ``_TASK_VERIFY_LEASE_WAIT_SECS``) it logs a
           WARNING and yields WITHOUT the hold, rather than raising. The hold is
@@ -4379,16 +4506,19 @@ class GitOps:
         out-of-band to the orchestrator/operator (see
         docs/shared-repo-git-maintenance.md).
 
-        Idempotent: ``git config`` overwrites the value in place, so calling this
-        repeatedly (harness startup + every create_worktree) leaves the same
-        result.  Best-effort/loud: a non-zero git rc is logged at WARNING but
+        Idempotent: ``git config --replace-all`` converges from any prior state
+        (absent, single, or duplicated value) to exactly one value, so calling
+        this repeatedly (harness startup + every create_worktree) leaves the
+        same result.  A plain ``git config`` would be refused (exit 5) on an
+        already-multivalued key.  Best-effort/loud: a non-zero git rc is logged at WARNING but
         never raised — failing to set the key merely leaves auto-gc enabled
         (itself only a benign-but-noisy failure), which must not block
         orchestrator startup or a task dispatch (loud-over-silent-degradation).
         """
         for key, value in (('gc.auto', '0'), ('maintenance.auto', 'false')):
             rc, _, stderr = await _run(
-                ['git', 'config', key, value], cwd=self.project_root,
+                ['git', 'config', '--replace-all', key, value],
+                cwd=self.project_root,
             )
             if rc != 0:
                 logger.warning(
@@ -4465,12 +4595,9 @@ class GitOps:
         # maintenance.auto=false on every worktree-create so background
         # auto-gc never fires under the narrow shared-.git write-set (and
         # any config drift/re-clone is re-covered).  Idempotent & best-effort
-        # (never raises) — safe to run every time.  NOTE it does NOT share the
-        # core.hooksPath block's convergence property: it sets gc.auto /
-        # maintenance.auto with a plain single-value `git config`, which git
-        # refuses (exit 5) on an already-multivalued key.  Don't copy this as
-        # the model for a self-heal; the rc is logged at WARNING and the only
-        # consequence here is that auto-gc stays enabled.
+        # (never raises) — safe to run every time.  Like the core.hooksPath
+        # block above it uses --replace-all, so it converges from a
+        # duplicated key too.
         await self.disable_shared_repo_auto_maintenance()
 
         # ── Resolve start-ref: train-predecessor tip or freshened main ──
@@ -5367,8 +5494,8 @@ class GitOps:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
         Invokes ``<lane_dir>/scripts/seed-warm-lane.sh <base_target> <lane_dir> <mode>``
-        where *base_target* is the resolved base path and *mode* is either
-        ``'--fresh-checkout'`` or ``'--reset-in-place'``.
+        where *base_target* is the resolved base path and *mode* is ``'--fresh-checkout'``
+        (``'--reset-in-place'`` refuses a non-empty ``target/``: any lane seeded before).
 
         **D8 gen-dir symlink resolution (reify activation-seam R1)**:
         When :attr:`warm_lane_base_target_path` is a symlink (e.g. ``target`` →
@@ -6076,13 +6203,32 @@ class GitOps:
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
         **Merge-verify lease guard (task 2315, BUG 1)**: defers (127) while
-        ANY merge-verify lease is held — INCLUDING our own.  The reclaim
-        script operates over the whole pool mount (which CONTAINS
+        any PERSISTENT-LANE merge-verify lease is held — INCLUDING our own.
+        The reclaim script operates over the whole pool mount (which CONTAINS
         ``_merge-verify``), so an in-process local verify must be deferred
         to just as much as a foreign one; unlike
         :meth:`reset_persistent_merge_worktree`'s lease guard, self is NOT
         excluded here.  Checked BEFORE the pool-storage guard below so the
         skip is attributable to the lease even when the sentinel is fine.
+
+        An EPHEMERAL ``_merge-<hash>`` speculation-lane lease no longer
+        records the holder-pgid rendezvous this predicate reads (task 4189),
+        so it no longer defers the reclaim: such a lane is not one the
+        reclaim resets, and an hours-long cold-shadow verify
+        (``merge_shadow.py``) previously blocked the whole pool's reclaim for
+        its entire window.  What keeps that ephemeral lane itself safe is the
+        script's own BAND protection, not this predicate: ``_merge-`` is a
+        :data:`PROTECTED_PREFIXES` key, so it is rendered into
+        ``warm-lane-gc.sh``'s ``PROTECT_GLOB`` (``lane_protect_glob _lane-
+        _spec-``, which subtracts only the pool bands that sweep OWNS) and the
+        entry is counted ``preserved`` and skipped in the enumeration loop
+        BEFORE either pass looks at it — the script never opens that lane's
+        lock at all.  Should ``_merge-`` ever leave that registry, the backstop
+        is Pass 1's and Pass 2's own non-blocking ``flock -n`` on the lane
+        lock, which is exactly the lock this lease holds for the whole verify
+        body.  Naming the flock as the PRIMARY gate would be drift: it is the
+        second line, and a later reader could use the misattribution to
+        license removing the first.
 
         **Pool-storage guard (task 2099, self-heal task 2315)**: routes
         through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
@@ -6457,23 +6603,23 @@ class GitOps:
 
         **Create-once path** (lane not yet a registered worktree):
             ``git worktree add --detach <lane> <merge_commit>``, then seed via
-            :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+            :meth:`_seed_warm_lane(lane, '--fresh-checkout')`.
 
         **Reset-in-place path** (lane already registered):
             ``git reset --hard <merge_commit>`` + ONE ``git clean -xfd -e <dir>``
             invocation (one -e per :attr:`~GitConfig.reap_build_artifact_dirs`
             entry) mirroring :meth:`reset_persistent_merge_worktree`'s pattern,
-            then always re-seeded via :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+            then always re-seeded via :meth:`_seed_warm_lane(lane, '--fresh-checkout')`.
 
-        **inv.8 always-re-seed-at-acquire**: target/ is re-CoW-seeded from the
-        current warm base on every acquire, so each speculative verify starts
-        from the latest base regardless of which lane it lands on.
+        **inv.8 always-re-seed-at-acquire**: every acquire re-seeds with
+        ``--fresh-checkout`` (reify PRD D10), which replaces the retained target/
+        and delta-touches sources against the base commit, so freshness never
+        depends on lane history.
 
-        **Cold-fallback path** (pool exhausted or seed failure — inv.6):
-            On any failure (pool exhausted, worktree creation failure, seed
-            failure) the partially-acquired lane (if any) is released back to
-            FREE and an ephemeral cold worktree is returned with warm=False.
-            Logs at DEBUG; never raises (a fallback cannot block the scheduler).
+        **Cold-fallback path** (inv.6: never raises, never blocks the scheduler):
+            Knob off or pool exhausted returns a cold worktree with warm=False,
+            logged at DEBUG.  A fault while holding a lane goes through
+            :meth:`_spec_lane_cold_fallback`, which logs at WARNING.
 
         Args:
             merge_commit: The merge commit SHA to check out in the spec lane.
@@ -6482,7 +6628,8 @@ class GitOps:
             ``(lane_path, True)`` when the warm spec lane is ready;
             ``(cold_path, False)`` on pool exhaustion or any failure (inv.6).
         """
-        if self.spec_warm_lane_pool is None:
+        pool = self.spec_warm_lane_pool
+        if pool is None:
             # Knob off or size=0 — always cold (byte-identical to default).
             logger.debug(
                 'acquire_spec_lane: spec pool absent (knob off) — cold fallback '
@@ -6491,7 +6638,7 @@ class GitOps:
             wt = await self.create_throwaway_verify_worktree(merge_commit)
             return wt, False
 
-        lane = await self.spec_warm_lane_pool.try_acquire()
+        lane = await pool.try_acquire()
         if lane is None:
             # Pool exhausted — inv.6: cold ephemeral fallback, never block.
             logger.debug(
@@ -6540,34 +6687,25 @@ class GitOps:
                         )
                         self.mark_pool_storage_present()
                     else:
-                        logger.warning(
-                            'acquire_spec_lane: create-once — pool storage '
-                            'absent/unmounted at %s — refusing to create spec '
-                            'lane %s on the underlying filesystem; cold fallback',
-                            self.worktree_base, lane,
-                        )
                         self._note_pool_storage_absent()
-                        await self.spec_warm_lane_pool.release(lane)
-                        wt = await self.create_throwaway_verify_worktree(merge_commit)
-                        return wt, False
+                        return await self._spec_lane_cold_fallback(
+                            pool, lane, merge_commit,
+                            'create-once refused: pool storage absent/unmounted '
+                            f'at {self.worktree_base}',
+                        )
                 # Self-heal a stale unregistered directory first
                 # (mirrors reset_persistent_merge_worktree's self-heal pattern).
                 if lane.exists():
-                    import shutil as _shutil
-                    _shutil.rmtree(lane)
+                    shutil.rmtree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
                 rc, _, err = await _run(
                     ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
                     cwd=self.project_root,
                 )
                 if rc != 0:
-                    logger.warning(
-                        'acquire_spec_lane: worktree add failed for %s (rc=%d,'
-                        ' err=%r) — releasing lane, cold fallback', lane, rc, err,
+                    return await self._spec_lane_cold_fallback(
+                        pool, lane, merge_commit, f'worktree add failed (rc={rc}, err={err!r})',
                     )
-                    await self.spec_warm_lane_pool.release(lane)
-                    wt = await self.create_throwaway_verify_worktree(merge_commit)
-                    return wt, False
                 logger.info(
                     'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
                 )
@@ -6579,51 +6717,46 @@ class GitOps:
                 cwd=lane,
             )
             if rc != 0:
-                logger.debug(
-                    'acquire_spec_lane: reset --hard failed for %s (rc=%d, err=%r)'
-                    ' — releasing lane, cold fallback', lane, rc, err,
+                return await self._spec_lane_cold_fallback(
+                    pool, lane, merge_commit, f'reset --hard failed (rc={rc}, err={err!r})',
                 )
-                await self.spec_warm_lane_pool.release(lane)
-                wt = await self.create_throwaway_verify_worktree(merge_commit)
-                return wt, False
             ok, err = await self._clean_lane_retaining_artifacts(
                 lane, caller='acquire_spec_lane',
             )
             if not ok:
-                logger.debug(
-                    'acquire_spec_lane: git clean failed for %s (err=%r)'
-                    ' — releasing lane, cold fallback', lane, err,
+                return await self._spec_lane_cold_fallback(
+                    pool, lane, merge_commit, f'git clean failed (err={err!r})',
                 )
-                await self.spec_warm_lane_pool.release(lane)
-                wt = await self.create_throwaway_verify_worktree(merge_commit)
-                return wt, False
             logger.info(
                 'acquire_spec_lane: reset %s to HEAD=%s', lane, merge_commit[:8],
             )
 
         # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
-        rc = await self._seed_warm_lane(lane, '--reset-in-place')
+        rc = await self._seed_warm_lane(lane, '--fresh-checkout')
         if rc != 0:
-            # Seed failed — release the partially-acquired lane back to FREE
-            # (inv.6: cold fallback on seed failure, never block scheduler).
-            logger.debug(
-                'acquire_spec_lane: seed failed for %s (rc=%d) — releasing lane, cold fallback',
-                lane, rc,
+            return await self._spec_lane_cold_fallback(
+                pool, lane, merge_commit, f'seed failed (rc={rc})',
             )
-            await self.spec_warm_lane_pool.release(lane)
-            wt = await self.create_throwaway_verify_worktree(merge_commit)
-            return wt, False
-
         return lane, True
+
+    async def _spec_lane_cold_fallback(
+        self, pool: WarmLanePool, lane: Path, merge_commit: str, reason: str,
+    ) -> tuple[Path, bool]:
+        """Give an acquired ``_spec-`` lane back and verify cold instead (inv.6)."""
+        logger.warning(
+            'acquire_spec_lane: %s for %s — releasing lane; speculative verify '
+            'of %s runs COLD', reason, lane, merge_commit[:8],
+        )
+        await pool.release(lane)
+        return await self.create_throwaway_verify_worktree(merge_commit), False
 
     async def release_spec_lane(self, lane: Path, *, warm: bool) -> None:
         """Release a ``_spec-`` lane after a speculative merge verify.
 
         **Warm path** (``warm=True`` — pool lane):
             ``await self.spec_warm_lane_pool.release(lane)`` — flips
-            ASSIGNED→FREE retaining the worktree and ``target/`` on disk so
-            the next :meth:`acquire_spec_lane` can re-seed from a warm base
-            (CoW-cheap, harmless to retain).  The worktree is never removed.
+            ASSIGNED→FREE, never removing the worktree; its retained ``target/``
+            is harmless, since the next acquire's ``--fresh-checkout`` replaces it.
 
         **Cold path** (``warm=False`` — ephemeral fallback worktree):
             ``await self.cleanup_merge_worktree(lane)`` — removes the
@@ -9967,7 +10100,16 @@ class GitOps:
         ``rebase_onto_main(wt, onto=...)``.
 
         On a clean rebase the member is appended to *survivors* and becomes
-        the new last-good predecessor for the next member.
+        the new last-good predecessor for the next member, and the base it
+        was stacked onto is recorded (see
+        ``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``).
+        Records are only ever written here, so this is also where the
+        records of branches that no longer exist are pruned.
+        A member is always stacked from its own delta: before the rebase it
+        is un-stacked from any earlier unlanded base, and a member that
+        cannot be un-stacked is ejected.  Its tips from before and after the
+        rebase are its restore point (``pre_stack_tips``); a member whose tip
+        cannot be read is ejected, so no member is stacked without one.
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
@@ -9981,14 +10123,16 @@ class GitOps:
             member_ids: Ordered list of member task ids, anchor first.
 
         Returns:
-            TrainStackResult(survivors, ejected).
+            TrainStackResult(survivors, ejected, pre_stack_tips).
         """
         if not member_ids:
             return TrainStackResult(survivors=[], ejected=[])
+        await self._stack_ledger().prune_orphans()
 
         anchor_id = member_ids[0]
         survivors: list[str] = [anchor_id]
         ejected: list[str] = []
+        pre_stack_tips: list[PreStackTip] = []
         last_good_id = anchor_id
 
         for member_id in member_ids[1:]:
@@ -10003,15 +10147,286 @@ class GitOps:
                 continue
 
             onto_branch = f'{self.config.branch_prefix}{last_good_id}'
-            success = await self.rebase_onto_main(wt_path, onto=onto_branch)
-            if success:
+            tip = await self._stack_member(wt_path, member_id, onto_branch)
+            if tip is not None:
                 survivors.append(member_id)
+                pre_stack_tips.append(tip)
                 last_good_id = member_id
             else:
                 ejected.append(member_id)
                 # Do not advance last_good_id.
 
-        return TrainStackResult(survivors=survivors, ejected=ejected)
+        return TrainStackResult(
+            survivors=survivors, ejected=ejected, pre_stack_tips=tuple(pre_stack_tips),
+        )
+
+    async def _stack_member(
+        self, wt_path: Path, member_id: str, onto_branch: str,
+    ) -> PreStackTip | None:
+        """Stack *member_id*'s branch onto *onto_branch* from its own delta.
+
+        Returns its restore point, or None when the member must be ejected:
+        it could not be un-stacked from an earlier unlanded base, its tip
+        could not be read before or after the rebase, or the rebase
+        conflicted.  A member ejected after its rebase keeps its stack-base
+        record, so its solo merge un-stacks it.
+        """
+        member_branch = f'{self.config.branch_prefix}{member_id}'
+        earlier = await self.unstack_from_unlanded_base(member_branch)
+        if earlier.stops_merge:
+            logger.warning(
+                'stack_train_branches: ejecting %s — %s',
+                member_branch, earlier.merge_block_reason(),
+            )
+            return None
+        pre_stack_sha = await self.resolve_branch_sha(member_branch)
+        if pre_stack_sha is None:
+            logger.warning(
+                'stack_train_branches: ejecting %s — its tip did not resolve, '
+                'so it would have no restore point',
+                member_branch,
+            )
+            return None
+        if not await self.rebase_onto_main(wt_path, onto=onto_branch):
+            return None
+        await self._record_stack_base(member_branch, onto_branch)
+        stacked_sha = await self.resolve_branch_sha(member_branch)
+        if stacked_sha is None:
+            logger.warning(
+                'stack_train_branches: ejecting %s — its tip did not resolve '
+                'after stacking, so a restore could not tell its train\'s '
+                'commits from later ones',
+                member_branch,
+            )
+            return None
+        return PreStackTip(member_id=member_id, sha=pre_stack_sha, stacked_sha=stacked_sha)
+
+    async def _record_stack_base(self, member_branch: str, onto_branch: str) -> None:
+        base_sha = await self.resolve_branch_sha(onto_branch)
+        if base_sha is None:
+            logger.warning(
+                'stack_train_branches: %s did not resolve after stacking %s '
+                'onto it; no stack base recorded',
+                onto_branch, member_branch,
+            )
+            return
+        await self._stack_ledger().record(member_branch, base_sha)
+
+    def _stack_ledger(self) -> StackBaseLedger:
+        return StackBaseLedger(self.project_root, _run)
+
+    async def forget_stack_bases(self, task_ids: Iterable[str]) -> None:
+        """Drop the stack-base records of *task_ids*' branches, e.g. once
+        their train has landed.  A failed delete is logged, not raised."""
+        ledger = self._stack_ledger()
+        for task_id in task_ids:
+            await ledger.forget(f'{self.config.branch_prefix}{task_id}')
+
+    async def unstack_from_unlanded_base(self, full_branch: str) -> UnstackResult:
+        """Strip the commits of a never-landed stack base from *full_branch*.
+
+        Reads the base recorded when the branch was stacked
+        (``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``).
+        No record, a base already on main, a vanished branch, or no foreign
+        commits left: the record is cleared and the result is NOT_STACKED.
+        Otherwise the branch's own delta is replayed onto main with
+        ``git rebase --onto <main> <cut>`` inside the worktree that holds the
+        branch, and only when that tree is clean.
+
+        Never raises.  A failed git read, a dirty tree, no holding worktree or
+        a rebase that fails without a conflicted path (a contended lock, say)
+        is BLOCKED; a conflict in the branch's OWN delta is CONFLICT.  Both
+        keep the record, and their ``merge_block_reason()`` attributes the
+        stop to the base.
+        """
+        ledger = self._stack_ledger()
+        base = await ledger.base_of(full_branch)
+        if base is None:
+            return UnstackResult(
+                outcome=UnstackOutcome.NOT_STACKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+            )
+        try:
+            return await self._unstack_recorded(ledger, full_branch, base)
+        except (branch_stack.StackInspectionError, WorktreeMissing) as exc:
+            return UnstackResult(
+                outcome=UnstackOutcome.BLOCKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+                base=base,
+                detail=str(exc),
+            )
+
+    async def restore_pre_stack_tip(self, tip: PreStackTip) -> TipRestore:
+        """Put a stacked member's branch back on the tip it had before stacking.
+
+        A compare-and-swap on the tip observed here: ``git update-ref`` moves
+        the branch only if nothing moved it since, then the worktree holding
+        it, if any, is reset to it, and the branch's stack-base record is
+        forgotten, since it no longer carries that base.  Moves nothing when
+        the branch is gone (MISSING), already there (UNCHANGED), on main
+        (LANDED), or checked out with uncommitted changes (DIRTY); nor when it
+        carries a commit its train did not stack, was moved by someone else
+        or lost its worktree while this looked (MOVED).  A worktree that
+        cannot be reset puts the branch back on the tip it was found on
+        (RESET_FAILED).  Never raises.
+        """
+        branch = f'{self.config.branch_prefix}{tip.member_id}'
+        try:
+            return await self._swap_back_to(branch, tip)
+        except WorktreeMissing as exc:
+            return TipRestore(
+                outcome=TipRestoreOutcome.MOVED, branch=branch,
+                pre_stack_sha=tip.sha, found_sha=None, detail=str(exc),
+            )
+
+    async def _swap_back_to(self, branch: str, tip: PreStackTip) -> TipRestore:
+        found = await self.resolve_branch_sha(branch)
+        if found is None:
+            outcome, wt, detail = TipRestoreOutcome.MISSING, None, ''
+        elif found == tip.sha:
+            outcome, wt, detail = TipRestoreOutcome.UNCHANGED, None, ''
+        elif await self.is_ancestor(found, self.config.main_branch):
+            outcome, wt, detail = TipRestoreOutcome.LANDED, None, ''
+        else:
+            outcome, wt, detail = await self._swap_unlanded_back(branch, tip, found)
+        return TipRestore(
+            outcome=outcome, branch=branch, pre_stack_sha=tip.sha,
+            found_sha=found, worktree=wt, detail=detail,
+        )
+
+    async def _swap_unlanded_back(
+        self, branch: str, tip: PreStackTip, found: str,
+    ) -> tuple[TipRestoreOutcome, Path | None, str]:
+        wt = await self._worktree_holding_branch(branch)
+        refusal = await self._commits_its_train_did_not_stack(tip, found)
+        if refusal:
+            return TipRestoreOutcome.MOVED, wt, refusal
+        if wt is not None and await self.has_uncommitted_work(wt):
+            return TipRestoreOutcome.DIRTY, wt, f'worktree {wt} has uncommitted changes'
+        ref = f'refs/heads/{branch}'
+        rc, _, err = await _run(
+            ['git', 'update-ref', ref, tip.sha, found], cwd=self.project_root,
+        )
+        if rc != 0:
+            return TipRestoreOutcome.MOVED, wt, ' '.join(err.split())
+        reset_error = await self._reset_worktree(wt) if wt is not None else ''
+        if reset_error:
+            return TipRestoreOutcome.RESET_FAILED, wt, await self._swap_ref_forward(
+                ref, tip.sha, found, f'resetting worktree {wt} failed: {reset_error}',
+            )
+        await self._stack_ledger().forget(branch)
+        return TipRestoreOutcome.RESTORED, wt, ''
+
+    async def _commits_its_train_did_not_stack(self, tip: PreStackTip, found: str) -> str:
+        """Why *found* may carry work its train did not stack, or ''.
+
+        Neither main's commits nor rebased copies of the stacked ones count:
+        the lane rebases a train's tip onto main in place.  A copy whose patch
+        changed in that rebase counts as foreign, which only refuses.
+        """
+        if found == tip.stacked_sha:
+            return ''
+        rc, out, err = await _run(
+            ['git', 'rev-list', '--right-only', '--cherry-pick',
+             f'{tip.stacked_sha}...{found}', '--not', self.config.main_branch, '--'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return f'its commits since stacking could not be listed: {" ".join(err.split())}'
+        if out.split():
+            return f'carries commits its train did not stack: {", ".join(out.split())}'
+        return ''
+
+    async def _reset_worktree(self, wt: Path) -> str:
+        """Bring *wt*'s index and files to its HEAD; the failure, or ''.
+        A worktree deleted meanwhile needs no reset."""
+        try:
+            rc, _, err = await _run(['git', 'reset', '--hard'], cwd=wt)
+        except WorktreeMissing:
+            return ''
+        return '' if rc == 0 else (' '.join(err.split()) or f'exit {rc}')
+
+    async def _swap_ref_forward(self, ref: str, pre: str, found: str, why: str) -> str:
+        """Put *ref* back from *pre* on *found*, where its worktree still is."""
+        rc, _, err = await _run(['git', 'update-ref', ref, found, pre], cwd=self.project_root)
+        if rc != 0:
+            return f'{why}; putting {ref} back on {found} failed too: {" ".join(err.split())}'
+        return f'{why}; {ref} is back on {found}'
+
+    async def _unstack_recorded(
+        self, ledger: StackBaseLedger, full_branch: str, base: str,
+    ) -> UnstackResult:
+        tip = await self.resolve_branch_sha(full_branch)
+        main_sha = await self.get_main_sha()
+        cut = None
+        if tip is not None and not await self.is_ancestor(base, main_sha):
+            cut = await foreign_commit_cut(
+                _run, self.project_root, tip=tip, main_ref=main_sha, base=base,
+            )
+        if cut is None:
+            await ledger.forget(full_branch)
+            return UnstackResult(
+                outcome=UnstackOutcome.NOT_STACKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+            )
+        return await self._rebase_off_base(
+            ledger, full_branch, base=base, cut=cut, main_sha=main_sha,
+        )
+
+    async def _rebase_off_base(
+        self,
+        ledger: StackBaseLedger,
+        full_branch: str,
+        *,
+        base: str,
+        cut: str,
+        main_sha: str,
+    ) -> UnstackResult:
+        verdict = functools.partial(
+            UnstackResult,
+            branch=full_branch,
+            main_branch=self.config.main_branch,
+            base=base,
+            cut=cut,
+            base_owners=await base_owners(_run, self.project_root, base),
+        )
+        wt = await self._worktree_holding_branch(full_branch)
+        if wt is None:
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail=f'no worktree has {full_branch} checked out',
+            )
+        if await self.has_uncommitted_work(wt):
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail=f'worktree {wt} has uncommitted changes',
+            )
+        foreign_count = await self.get_rebase_distance(main_sha, cut)
+        rebased = await rebase_own_delta(_run, wt, onto=main_sha, cut=cut)
+        if rebased.conflicted_paths:
+            return verdict(
+                outcome=UnstackOutcome.CONFLICT,
+                conflicted_paths=rebased.conflicted_paths,
+                detail=rebased.stderr,
+            )
+        if not rebased.ok:
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail='git rebase --onto failed without a conflict: '
+                + ' '.join(rebased.stderr.split()),
+            )
+        await ledger.forget(full_branch)
+        result = verdict(outcome=UnstackOutcome.UNSTACKED)
+        logger.warning(
+            'Un-stacked %s from unlanded base %s (owners: %s): dropped %d '
+            'foreign commit(s), own delta replayed onto %s',
+            full_branch, base, ', '.join(result.base_owners) or 'none',
+            foreign_count, self.config.main_branch,
+        )
+        return result
 
     async def materialize_member_solo(
         self,
@@ -12267,13 +12682,24 @@ class GitOps:
         TOCTOU). A live holder makes the non-blocking acquire fail
         immediately, in which case removal is skipped
         (``'skipped_lease_held'``, logged as a single WARNING naming the
-        holder pgid) rather than deferred or retried; a dead or stale
+        holder) rather than deferred or retried; a dead or stale
         holder's flock is auto-released by the kernel, so the acquire
         simply succeeds and removal proceeds (fail-open, intrinsic to
         flock — this method never consults holder liveness directly). The
         holder-pgid rendezvous file is read ONLY to name the holder in
         that WARNING — a best-effort, fail-open diagnostic hint, never a
         removal gate.
+
+        That WARNING carries TWO attributions, and ``rendezvous pgid=None``
+        in it is EXPECTED, not a defect: this method only reaches the refusal
+        on an EPHEMERAL lane (persistent ones return ``'skipped_persistent'``
+        above), and as of task 4189 an ephemeral :meth:`merge_verify_lease`
+        deliberately does not write the global rendezvous — so the cold-shadow
+        verify / drift check / DF-2822 cross-check that most often holds the
+        lane against this reaper is invisible to it. The kernel clause
+        (:func:`_lane_lock_holder_facts` over ``/proc/locks``) is what actually
+        names such a holder, and is fail-open in the same way: an unreadable
+        ``/proc`` degrades the clause, never the outcome.
 
         **Persistent-worktree exemption**: if *path* resolves to
         :attr:`persistent_merge_worktree_path` OR
@@ -12323,16 +12749,17 @@ class GitOps:
         (``OSError`` only) so ``CancelledError`` and programmer errors stay
         loud. Together they make this method total with respect to
         ``OSError``: every other call in its body — :func:`lane_lock_path`
-        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` (which
-        swallow ``OSError`` by contract), :func:`_register_held_lane_lock`,
-        :func:`read_lock_holder_pgid` and
+        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` and
+        :meth:`is_persistent_merge_lane` (which swallow ``OSError`` by
+        contract), :func:`_register_held_lane_lock`,
+        :func:`read_lock_holder_pgid`, :func:`_lane_lock_holder_facts` and
         :func:`_release_and_forget_held_lane_lock` — already suppresses its
         own.
 
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
         """
-        if path.resolve() == self.persistent_merge_worktree_path.resolve():
+        if self.is_persistent_merge_lane(path):
             logger.debug('remove_merge_worktree_guarded: persistent merge worktree retained: %s', path)
             return 'skipped_persistent'
         if path.resolve() == self.persistent_offline_deep_worktree_path.resolve():
@@ -12370,12 +12797,40 @@ class GitOps:
             # never be reachable from a legitimate hold.
             _register_held_lane_lock(fd, lock_path)
         if fd is None:
+            # TWO attributions, because neither alone covers the holder set.
+            #
+            # The global holder-pgid rendezvous names a PERSISTENT-lane verify
+            # (and the host verify-merge CLI span, which writes the same fixed
+            # key) — but as of task 4189 an EPHEMERAL `_merge-<hash>` lease
+            # deliberately never writes it, and this method only ever reaches
+            # here on an ephemeral lane (persistent ones returned
+            # 'skipped_persistent' above). So `pgid=None` is now EXPECTED in
+            # exactly the case 4189 makes routine: a cold-shadow verify, a
+            # drift check, or the DF-2822 cross-check holding its own throwaway
+            # lane while the reaper tries to remove it. Before 4189 this log
+            # named the right pgid only ACCIDENTALLY, because the ephemeral
+            # lease wrote the global key it had no business writing.
+            #
+            # Kernel attribution replaces that accident with the real thing:
+            # /proc/locks names whoever actually holds THIS lane's flock — the
+            # gate that just refused us — for the persistent and ephemeral
+            # holder alike. This is the reaper's ONLY attribution for a refused
+            # removal, so it must not go blank on the common path.
+            #
+            # Both remain fail-open diagnostics and neither is a removal gate:
+            # read_lock_holder_pgid returns None on any read error, and
+            # lane_lock_holder_pids returns [] on an unreadable /proc, so
+            # _lane_lock_holder_facts degrades its clause rather than raising
+            # inside a method that backs cleanup_merge_worktree's never-raises
+            # contract. Unlike the two acquire-timeout sites, no settled
+            # snapshot is threaded in here: nothing downstream branches on the
+            # holder set, so a rare empty read costs a clause, not a decision.
             holder = read_lock_holder_pgid(self.worktree_base)
             logger.warning(
                 'remove_merge_worktree_guarded: merge-verify lease held by live '
-                'holder (pgid=%s); skipping removal of %s (reason=%s) -- leaving '
-                'for the merge reaper',
-                holder, path, reason,
+                'holder (rendezvous pgid=%s; %s); skipping removal of %s '
+                '(reason=%s) -- leaving for the merge reaper',
+                holder, _lane_lock_holder_facts(lock_path), path, reason,
             )
             return 'skipped_lease_held'
         # Only unlink the sibling ``.lock`` file when THIS call both acquired
@@ -12390,8 +12845,7 @@ class GitOps:
                 return 'not_present'
             try:
                 rc, _, err = await _run(
-                    ['git', 'worktree', 'remove', str(path), '--force'],
-                    cwd=self.project_root,
+                    _merge_worktree_remove_argv(path), cwd=self.project_root,
                 )
             except OSError as exc:
                 # The SECOND escape from cleanup_merge_worktree's never-raises
@@ -12468,10 +12922,10 @@ class GitOps:
         (its pinned contract — see task 2924's
         ``test_non_worktree_directory_returns_failed``). But ``'failed'`` is
         NOT proof of shape-1 specifically: it is simply *any* non-zero git
-        worktree removal — a ``git worktree lock``-ed tree or a transient
-        filesystem/I/O error yield it too. The fallback deliberately does
-        NOT try to distinguish the cause; it force-removes any unleased
-        ``_merge-`` tree git could not remove, whatever the reason. That is
+        worktree removal — a transient filesystem/I/O error yields it too.
+        The fallback deliberately does NOT try to distinguish the cause; it
+        force-removes any unleased ``_merge-`` tree git could not remove,
+        whatever the reason. That is
         safe here because merge worktrees are throwaway/ephemeral by
         construction AND ``'failed'`` already means the primitive's lease
         acquire confirmed NO live holder (a live holder yields
@@ -12492,10 +12946,10 @@ class GitOps:
         ``.lock`` (the primitive RETAINS it on ``'failed'``, so we clear the
         now-orphaned lane lock, honouring the no-leak convention); (4)
         :meth:`_prune_registrations` clears any dangling admin entry. The
-        order — remove-tree-then-prune — leaves at most the benign inverse
-        shape (admin entry without a tree) that git prune / name-reuse
-        already handle, so an interrupted teardown is always completable by
-        a later sweep.
+        order — remove-tree-then-prune — leaves at most the inverse shape
+        (admin entry without a tree), which :meth:`_prune_registrations`
+        reclaims even when git has it locked, so an interrupted teardown is
+        always completable by a later sweep.
 
         Every other outcome (``'removed'`` / ``'not_present'`` / the three
         ``'skipped_*'``, including ``'skipped_lock_error'``) returns
@@ -12541,8 +12995,8 @@ class GitOps:
         # Crash-safe fallback (task 2922): the guarded git removal returned
         # 'failed' — i.e. ANY non-zero git worktree removal. Most commonly the
         # shape-1 case (the .git/worktrees/<name> admin dir was already removed
-        # by an interrupted teardown), but a locked tree or a transient FS/I/O
-        # error too. We intentionally do NOT distinguish the cause: the
+        # by an interrupted teardown), but a transient FS/I/O error too. We
+        # intentionally do NOT distinguish the cause: the
         # primitive's lease acquire already confirmed no live holder, so we
         # force-remove this unleased throwaway _merge- tree git could no longer
         # remove, whatever the reason. The band guard is defense-in-depth over
@@ -12599,6 +13053,39 @@ class GitOps:
         when the feature is off.
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    def is_persistent_merge_lane(self, path: Path) -> bool:
+        """Does *path* name the singleton PERSISTENT merge-verify lane?
+
+        The ONE spelling of the "is this the persistent merge lane?"
+        comparison (task 4189). Several call sites answered it with
+        hand-copied ``.resolve()`` pairs whose AGREEMENT is load-bearing:
+        :meth:`merge_verify_lease` gates the global holder-pgid rendezvous on
+        it (an ephemeral lane must never write or remove that single fixed-key
+        file), and :meth:`remove_merge_worktree_guarded` gates its
+        ``'skipped_persistent'`` exemption on it (the persistent lane survives
+        across attempts and is never removed). A site that drifted — to a bare
+        ``==``, or to "was a *lane_dir* argument passed at all" — would
+        misclassify the persistent lane as ephemeral and silently stop
+        recording the rendezvous for a genuine persistent-lane verify,
+        re-opening the warm-lane clobber the lease exists to prevent.
+
+        ``.resolve()`` on BOTH sides, so a symlinked ``.worktrees`` pool mount
+        or a caller-supplied relative/``..``-bearing path still compares equal
+        to the canonical location. Non-strict :meth:`Path.resolve` swallows
+        ``OSError`` by contract, which is what lets
+        :meth:`remove_merge_worktree_guarded` keep its
+        total-with-respect-to-``OSError`` contract while calling this.
+
+        The merge lane's LOCAL-dispatch gate ("should I take a lease at
+        all?", ``merge_lane/worker.py``) calls this too (task 4575).
+
+        :attr:`persistent_offline_deep_worktree_path` is deliberately NOT
+        covered here — it is a different lane with a different owner, and only
+        :meth:`remove_merge_worktree_guarded` cares about it (as a separate,
+        separately-logged exemption).
+        """
+        return path.resolve() == self.persistent_merge_worktree_path.resolve()
 
     @property
     def persistent_offline_deep_worktree_path(self) -> Path:
@@ -13280,8 +13767,7 @@ class GitOps:
             ):
                 continue
             rc_rm, _, err = await _run(
-                ['git', 'worktree', 'remove', '--force', str(wt_path)],
-                cwd=self.project_root,
+                _merge_worktree_remove_argv(wt_path), cwd=self.project_root,
             )
             if rc_rm == 0:
                 removed.append(str(wt_path))
@@ -13311,9 +13797,11 @@ class GitOps:
         Returns the first matching :class:`~pathlib.Path`, or ``None`` if no
         match is found.
 
-        Fail-closed on git errors: a candidate whose ``git log`` fails is
-        skipped (logged at WARNING level) rather than raising — avoids
-        crashing the coalesce dispatch on a partially-written worktree.
+        Fail-closed on git errors: a candidate whose ``git log`` fails, or
+        whose directory is absent though git still lists it
+        (:class:`WorktreeMissing`), is skipped (logged at WARNING level)
+        rather than raising — avoids crashing the coalesce dispatch on a
+        partially-written or half-torn-down worktree.
 
         Crash-safety / cross-restart source of truth: even if the in-memory
         ``InFlightMergeRegistry`` was cleared by a process restart, an
@@ -13331,10 +13819,18 @@ class GitOps:
 
         async for wt_path, _ in self._iter_merge_worktrees():
             # Read HEAD commit subject of this candidate
-            rc_log, subject, err_log = await _run(
-                ['git', 'log', '-1', '--format=%s'],
-                cwd=wt_path,
-            )
+            try:
+                rc_log, subject, err_log = await _run(
+                    ['git', 'log', '-1', '--format=%s'],
+                    cwd=wt_path,
+                )
+            except WorktreeMissing:
+                logger.warning(
+                    'find_inflight_merge_worktree: registered %s is absent on '
+                    'disk — skipping',
+                    wt_path,
+                )
+                continue
             if rc_log != 0:
                 logger.warning(
                     'find_inflight_merge_worktree: git log failed for %s: %s',
@@ -15475,9 +15971,18 @@ class GitOps:
         refusal — see that method's docstring for why repeated calls from
         hot sweep sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``)
         do not multiply operator-visible escalations.
+
+        **Locked entries (task 4828)**: prune skips a locked entry forever,
+        so :func:`~orchestrator.worktree_admin_entries.unlock_dangling_locked_entries`
+        first unlocks those whose ``worktree_base`` tree is gone. It runs
+        inside the pool-storage gate above, because an unmounted
+        ``worktree_base`` makes every lane look gone.
         """
         if not self._reconcile_pool_storage_before_sweep(context):
             return
+        unlock_dangling_locked_entries(
+            self.project_root / '.git', self.worktree_base, context,
+        )
         try:
             rc, _, err = await _run(
                 ['git', 'worktree', 'prune'], cwd=self.project_root,

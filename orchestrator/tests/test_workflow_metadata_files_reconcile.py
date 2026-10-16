@@ -29,7 +29,7 @@ from shared.locking import directory_locks
 
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.scheduler import files_to_modules
+from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # The depth these tests pin on their MagicMock config, in ONE place.
@@ -696,7 +696,8 @@ class TestReplanScopeReconcile:
         wf, scheduler = _make_replan_workflow(
             tmp_path=tmp_path, initial_files=initial_files, modules=modules,
         )
-        scheduler.blast_radius_result = False  # a sibling holds the additional lock
+        # A sibling holds the additional lock.
+        scheduler.blast_radius_result = BlastRadiusResult(applied=False)
         snapshots: list[dict] = []
         wf._execute_iterations = _snapshotting_execute_iterations(scheduler, snapshots)
         wf._review = _blocking_then_pass_reviews()

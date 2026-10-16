@@ -56,9 +56,10 @@ def derive_actor_class(agent_id: str | None) -> ActorClass:
     Ordering is CRITICAL — later rules would otherwise be shadowed by an
     earlier, broader prefix:
 
-    1. ``None`` (header-less write; orchestrator pipeline/scheduler/harness
-       callbacks/deterministic_runner/crash-recovery all write without a
-       per-write ``agent_id`` today) -> HUMAN, the safe-open default (D5).
+    1. ``None`` (header-less write) -> HUMAN, the safe-open default (D5).
+       Writes through ``Scheduler.set_task_status`` now carry
+       ``'orchestrator'`` (rule 4); header-less writes that remain, such as
+       direct ``dispatch_tool`` status writes, still land here.
     2. ``recon-stage-*`` (live prefix, verified at
        fused-memory/reconciliation/stages/task_knowledge_sync.py:2787) or the
        defensive doc-convention variant ``reconciliation-stage*`` ->

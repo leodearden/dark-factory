@@ -25,6 +25,7 @@ from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
     render_end_state_brief,
 )
+from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_SUPPRESSION_KIND
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     NEGATIVE_SET_VERDICT_TEMPLATE,
     PROBE_LIMIT_LADDER,
@@ -403,18 +404,17 @@ class TestRenderMarkerLifecycleSection:
 
 
 class TestRenderSuppressionSchemaSection:
-    """render_suppression_schema_section() renders the canonical suppression
-    record schema faithful to stage1.py:498-560."""
+    """render_suppression_schema_section() describes suppression records as
+    operator-only recon_ledger rows (task 4863)."""
 
     def test_returns_non_empty_str(self):
         assert isinstance(m.render_suppression_schema_section(), str)
         assert m.render_suppression_schema_section()
 
-    def test_contains_canonical_schema_tokens(self):
+    def test_names_the_ledger_record_kind(self):
         text = m.render_suppression_schema_section()
-        assert 'stage1_flag_suppression' in text
-        assert 'metadata.task_id' in text
-        assert 'metadata.flag_types' in text
+        assert STAGE1_FLAG_SUPPRESSION_KIND in text
+        assert 'recon_ledger' in text
 
     def test_contains_scoped_vs_blanket_semantics(self):
         text = m.render_suppression_schema_section()

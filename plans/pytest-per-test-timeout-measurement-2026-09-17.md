@@ -9,6 +9,9 @@ catches, and why `timeout_method` and `--max-worker-restart=0` are deliberately
 left alone — is `shared/pyproject.toml`'s `timeout` block and is not restated
 here.
 
+**Superseded by the task 5581 addendum: the value is now 420.** The 540 derived
+below is history; see "Re-derivation addendum (task 5581, 2026-10-09)" at the end.
+
 ## What this replaces
 
 Until this measurement, every config carrying the setting said the same thing:
@@ -20,22 +23,31 @@ measurement. Three configs — the repo root, `cockpit` and `sampler` — carrie
 
 ## The derivation rule
 
-    derived = max(300, round_up_to_multiple_of_60(worst_unmarked_wall_clock * 8))
+    derived = max(_ABSOLUTE_FLOOR_SECONDS, round_up_to_multiple_of_60(worst_unmarked_wall_clock * 8))
+
+Superseded by the task 6556 addendum: the rule is now
+`round_up_to_multiple_of_60(worst_unmarked_wall_clock * 8)`, with no floor term.
 
 Adopted wholesale from what this repo already justifies, rather than invented:
 
 - The **8x headroom factor** is
-  `orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_REQUIRED_HEADROOM_FACTOR`.
+  `orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR`.
   8x rather than 2x because the xdist worker deaths the cap exists to avoid were
   observed at loadavg 250-423 — one inflation step PAST the load at which
   measurements can be taken — so the value has to clear a figure nobody has
   managed to measure directly.
-- The **300 floor** is that same file's `_ABSOLUTE_FLOOR_SECONDS`, which is
-  itself anchored to an independent measurement
-  (`_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` at loadavg 120-176, x8 = 246,
-  rounded up). It is a never-narrow term: taking the max of two measured anchors
-  can only validate or raise the number, never discard the older evidence and
-  re-open the CPU-starvation false-red that the 60 -> 300 raise closed.
+- The **floor** is
+  `orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS`,
+  which is itself anchored to an independent measurement of the whole-tree-scan
+  family. It was 300 when this sweep ran (`_MEASURED_UNDER_LOAD_WORST_CASE =
+  30.75` at loadavg 120-176, x8 = 246, rounded up); task 5572 re-anchored it to
+  **420** (51.87 x 8 = 414.96, rounded up — see the addendum at the end).
+  Re-evaluating the rule with the 420 floor leaves the ini value at 540:
+  max(420, 540) = 540 (superseded by the task 5581 addendum: the value is now
+  420). It is a never-narrow term: taking the max of two measured
+  anchors can only validate or raise the number, never discard the older
+  evidence and re-open the CPU-starvation false-red that the 60 -> 300 raise
+  closed. (Superseded by the task 6556 addendum: the floor term is dropped.)
 - **Rounding to a multiple of 60** keeps the value readable as whole minutes,
   matching how the existing 60 and 300 read.
 
@@ -236,11 +248,15 @@ this repo's existing convention for exactly this reason.
 ## The arithmetic
 
     worst unmarked wall clock, any suite, any phase, any mode  =  61.52s
-    x _REQUIRED_HEADROOM_FACTOR (8)                            = 492.16s
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                           = 492.16s
     round up to a multiple of 60                               = 540s
     max(300, 540)                                              = 540s
+      (300 was the floor on 2026-09-17; with task 5572's 420, max(420, 540) = 540s)
+      (superseded: see "Re-derivation addendum (task 5581, 2026-10-09)" below, now 420s)
 
 ## THE RESULT: 540 seconds. The measurement RAISES the value; it does not validate it.
+
+**Superseded by the task 5581 addendum: the value is now 420.**
 
 300 was too small. It is only 4.9x the worst unmarked wall clock this sweep
 measured, against the 8x the repo's own worker-death evidence demands, and a
@@ -258,7 +274,10 @@ to surface faster.
 
 ## Residue, recorded rather than left silent
 
-1. **The whole-tree-scan family's measurement anchor is stale, though its value
+1. **RESOLVED by task 5572** — the anchor is now 51.87s and the floor 420; see
+   "Re-anchoring addendum (task 5572, 2026-10-08)" below. The original record
+   follows.
+   **The whole-tree-scan family's measurement anchor is stale, though its value
    is no longer binding.** `_ABSOLUTE_FLOOR_SECONDS = 300` is justified by
    `_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` (task 4215, loadavg 120-176) times
    the same 8x factor. This sweep measured a MARKED member of that family at
@@ -283,7 +302,9 @@ to surface faster.
    rather than discovered later; the yaml knob is outside this task's scope ("every
    module pyproject.toml") and is filed as a follow-up.
 
-3. **The two governing tests are an unmarked branch of the whole-tree-scan
+3. **RESOLVED by task 5581** — see "Re-derivation addendum (task 5581,
+   2026-10-09)" below. The original record follows.
+   **The two governing tests are an unmarked branch of the whole-tree-scan
    family.** Marking them the way `orchestrator/tests/` marks its own members
    would re-derive this value as 420 rather than 540, putting ~16000 tests under
    a tighter hang-catching ceiling. The full argument for why this task derived
@@ -301,4 +322,550 @@ to surface faster.
    conservative direction — the measured member-to-root inflation factor is
    1.3-1.7x, so applying the largest of it to the next-worst unmarked figure in
    the corpus (25.27s) yields ~43s, still comfortably below the 61.52s the value
-   is derived from.
+   is derived from. (25.27s is the root dirs' figure, not a per-member one; the
+   task 5581 addendum restates the bound per member tree.)
+
+## Re-anchoring addendum (task 5572, 2026-10-08)
+
+Task 5572 re-derived two marked-test ceilings in `orchestrator/tests/` by the
+rule above: the whole-tree-scan family's floor
+(`test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS`) and
+`test_merge_queue_concurrent_verify.py::HEAVY_BARRIER_TEST_TIMEOUT`.
+
+### Method
+
+Base `057aeed7d0`, cwd `orchestrator/`, `-n auto` = 32 workers, started
+2026-10-08T04:03:50Z and finished 04:06:04Z:
+
+```
+env -u VIRTUAL_ENV uv run --project . pytest \
+  tests/test_archive_sole_locator_gate.py tests/test_cited_test_class_drift.py \
+  tests/test_eval_boundary_suite.py tests/test_event_loop_antipattern_guard.py \
+  tests/test_info_l0_mechanical_roles.py tests/test_killpg_frozen_pgid_guard.py \
+  tests/test_lane_lifecycle_gitops.py tests/test_local_repo_seeder_guard.py \
+  tests/test_lock_release_single_writer_guard.py tests/test_marker_registration_drift.py \
+  tests/test_mcp_post_transport.py tests/test_merge_lane_alias_names.py \
+  tests/test_merge_lane_ratchet.py tests/test_merge_worker_retired.py \
+  tests/test_prune_chokepoint_guard.py tests/test_raw_semaphore_access_guard.py \
+  tests/test_scheduler_hold_history.py tests/test_steward_scaffolding_guards.py \
+  tests/test_timeout_marker_inversion_guard.py tests/test_whole_tree_scan_timeout_guard.py \
+  tests/test_workflow_factory.py \
+  tests/test_merge_queue_concurrent_verify.py tests/test_merge_speculation.py \
+  tests/test_concurrent_verify_boundary.py tests/test_multihost_verify_integration.py \
+  -q --durations=0 --timeout=0 -p no:cacheprovider
+```
+
+The first 21 modules are the whole-tree-scan family; the last four carry the
+`HEAVY_BARRIER_TEST_TIMEOUT` and capstone marks.
+
+Result: **980 passed in 127.82s**.
+
+Load, 1-minute: 455.06 a few minutes before launch, 152.34 at start, 101.37 at
+end. 5-minute: 277.59 at start, 214.06 at end. This was a TARGETED run of two
+families, not the full suite, so its contention is lower than task 5442's
+full-suite run above.
+
+### Per-family worst
+
+| Family | Test | Phase / per-test total |
+|---|---|---|
+| whole-tree scan | `test_merge_lane_ratchet.py::TestLanePatchTargets::test_real_tree_union_anchor` | 37.61 setup |
+| whole-tree scan | `test_merge_lane_alias_names.py::test_no_tracked_file_reaches_a_missing_name_through_an_alias` | 34.62 call |
+| whole-tree scan | `test_steward_scaffolding_guards.py::TestAbsoluteTmpProjectRootLiteralsAreCensused::test_every_absolute_tmp_project_root_literal_is_adjudicated` | 34.07 call |
+| heavy barrier | `test_merge_speculation.py::TestSpecLaneAbortReleasesLane::test_operator_halt_releases_spec_lane` | 14.59 total / 14.15 call |
+| heavy barrier | `test_merge_speculation.py::TestSpecLaneAbortReleasesLane::test_waiter_walking_away_releases_spec_lane` | 13.05 total |
+| heavy barrier (capstone) | `test_multihost_verify_integration.py::TestUnreachableHostCapstone::test_a_cancel_against_a_down_host_parks_the_slot_and_reprobe_unparks_it` | 12.28 total |
+| heavy barrier | `test_merge_queue_concurrent_verify.py::TestRunnerUnavailableHeadCascade::test_ru_head_cascade_reruns_speculative_downstream` | 5.45 total |
+
+The heavy-barrier anchor is a per-test TOTAL (setup + call + teardown), because
+that is what a pytest-timeout mark bounds. The whole-tree anchor stays a phase
+figure, because a phase is all task 5442 recorded; it is a lower bound on that
+test's total.
+
+### Whole-tree-scan floor
+
+    anchor = max(51.87 from task 5442's full suite, 37.61 today) = 51.87s
+             (the worst run, never the freshest)
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                          = 414.96s
+    round up to a multiple of 60                              = 420s  -> _ABSOLUTE_FLOOR_SECONDS
+
+`WHOLE_TREE_SCAN_TEST_TIMEOUT` stays **540**: it clears the 420 floor, and the
+540 ini default binds through the never-narrow rule.
+
+### HEAVY_BARRIER_TEST_TIMEOUT
+
+    measured worst, per-test total                      = 14.59s
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                    = 116.72s -> rounds up to 120s
+    computed wait budget, heaviest marked class         = 255s (TestCascadeErrorContainment)
+    computed wait budget, late-arrival classes          = 245s
+    never-narrow ini default                            = 540s
+    result                                              = 540s
+
+The ini default is the binding term. The wait budgets are those
+`TestTimeoutMarkCoverage` recomputes from source, and that guard still checks
+every class against the mark. The constant was `5 * MERGE_RESULT_TIMEOUT + 75`
+(300) and is now a literal pinned by
+`test_merge_queue_concurrent_verify.py::TestHeavyBarrierTimeoutConstant`.
+
+The conclusion does not depend on today's lighter load. Task 5442's full suite
+put every MARKED orchestrator test at or below 51.87s on 2026-09-17. Used as
+the anchor, that looser bound derives only 420, still below 540.
+
+`HOST_CAPSTONE_TEST_TIMEOUT` (`test_multihost_verify_integration.py`) has a
+computed budget of 360s. It stays at **600** as a literal, rather than
+following its old `2 x HEAVY_BARRIER_TEST_TIMEOUT` to 1080.
+
+Task 5570 may raise verify's CLI `--timeout` from 300 to 540. Either way, 540
+is outside the inversion band
+`DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT`: it is above
+300 today, and at 540 it would sit on the band's open upper edge.
+
+## Re-derivation addendum (task 5581, 2026-10-09)
+
+Task 5581 resolved residue 3: it marked the two governing tests and re-derived
+the ini default from the tree that marking produced.
+
+### What changed
+
+`fused-memory/tests/test_check_bare_magicmock_config.py` binds
+`@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)` on its two repo-wide
+scan classes, `TestAllScannedTestDirsClean` and
+`TestWallClockDeadlineBaselineIntegrity`. The module-local constant
+`MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540` is ceil60(61.52 x 8 = 492.16). It is
+sized from that module's own anchor and named for it, so it does not read as
+interchangeable with orchestrator's `WHOLE_TREE_SCAN_TEST_TIMEOUT`, which is
+derived from a different anchor (51.87s).
+
+The mark is bound per class, not module-wide. The rest of the module is ~170
+fast unit tests of `find_violations`. They stay on the ini default locally and
+on verify's CLI 300, so a hang among them still surfaces at the default rather
+than at 540.
+
+A runtime test in the same module guards both halves:
+`test_only_the_repo_wide_scans_run_under_their_own_ceiling`. It reads
+`get_closest_marker('timeout')` on the scan classes' collected items, which is
+what pytest-timeout itself reads. Each item must clear max(61.52 x 8, the ini
+default). The module's other tests must not resolve a mark above the ini
+default.
+
+### The arithmetic
+
+The derivation needed no re-measurement. With the two scans marked, the worst
+unmarked figure in the corpus is 45.48s
+(`orchestrator/tests/test_hard_v2_fixture_pool.py`, root-bound):
+
+    worst unmarked wall clock                       =  45.48s
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                = 363.84s
+    round up to a multiple of 60                    = 420s
+    max(_ABSOLUTE_FLOOR_SECONDS 420, 420)           = 420s
+
+All eight configs, `CONTRIBUTING.md`'s mirror span and
+`orchestrator/tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT` carry 420.
+
+### Robustness, per member tree
+
+Any remaining unmarked figure up to 52.5s still derives 420, since
+52.5 x 8 = 420. The risk is an unmarked test measured only per-member that
+would exceed 52.5s root-bound. So each member tree is bounded by its worst
+per-member unmarked figure, excluding the marked scans, times 1.7. That is
+the largest member-to-root inflation measured (see "THE FINDING THAT DECIDES
+THE VALUE"). The root dirs need no inflation: they were measured root-bound
+directly.
+
+| tree | worst unmarked per-member, scans excluded | x 1.7 | margin to 52.5 |
+|---|---|---|---|
+| `orchestrator` | <= 27.13 call | <= 46.1 | >= 6.4 |
+| `fused-memory` | 24.48 call (2026-10-09, below) | 41.6 | 10.9 |
+| `shared` | 14.01 setup | 23.8 | 28.7 |
+| `dashboard` | 6.03 call | 10.3 | 42.2 |
+| `cockpit` | 4.85 call | 8.2 | 44.3 |
+| `escalation` | 1.59 call | 2.7 | 49.8 |
+| `sampler` | 0.66 call | 1.1 | 51.4 |
+| root dirs | 25.27 setup, root-bound | 25.27 | 27.2 |
+
+The binding row is `orchestrator`, with a margin of about 6s. Its 27.13 is the
+governing test's own per-member figure. That test was measured root-bound
+directly (45.48). The orchestrator tests below it were never root-bound
+measured, and the corpus does not record them individually, so 27.13 is an
+upper bound on them.
+
+The `fused-memory` row needed a fresh measurement. The 2026-09-17 corpus
+records only each suite's maximum, and in fused-memory that maximum was the
+two scans now marked.
+
+### Supplementary measurements (2026-10-09)
+
+Both runs used HEAD `1a73dca22d`, `--timeout=0` and `-p no:cacheprovider`.
+
+- **fused-memory, per-member.** Command:
+  `cd fused-memory && env -u VIRTUAL_ENV uv run --project . pytest tests -q --durations=80`.
+  `-n auto` resolved to 32 workers. The run went from 06:30:42Z to 06:40:50Z,
+  with 1-minute loadavg 146.38 -> 60.54. Result: 27628 passed, 12 skipped,
+  4 xfailed in 595.72s.
+  - The two scans took 42.08 and 39.31 call (the corpus recorded 41.76 and
+    42.63), so contention was comparable.
+  - Worst unmarked otherwise: 24.48 call,
+    `tests/test_bake_off_fetch_cache.py::TestDumpFetchesFlag::test_a_dumping_run_writes_the_cache_and_the_identical_report`.
+  - Next: 22.12 call,
+    `tests/test_bake_off_storage_shape.py::TestRunBakeOffWiring::test_it_never_attaches_to_the_shared_durable_write_queue`.
+  - Then 18.40 call for `TestFusedMemoryTestsDirectoryClean`, a one-package
+    sweep that the per-class mark leaves unmarked.
+  - Marked status was read with `get_closest_marker('timeout')` at collection,
+    not by grep.
+- **The governing test, re-measured.**
+  `orchestrator/tests/test_hard_v2_fixture_pool.py::TestMintedPool::test_reference_unavailable_only_when_no_landing_merge_exists`:
+  - Root-bound, serial: 33.87 call, at loadavg 99 -> 97.
+  - Per-member (`-n auto`): 42.84 call, at loadavg 182 -> 154.
+
+  Both are below the 45.48 anchor, so the worst-run rule leaves the anchor,
+  and 420, unchanged. Mind the root-bound setup. A single target under
+  `orchestrator/tests/` resolves orchestrator's own inifile, so a root-bound
+  run of it needs `-c pyproject.toml --rootdir=.` from the repo root. The
+  2026-09-17 root-bound row reached the root inifile because its targets
+  spanned two member trees.
+- **This task's own orchestrator verify** (`-n 8`, loadavg 156 -> 64, junit
+  per-test totals) agrees. The governing test took 35.79 total. The next-worst
+  unmarked test took 18.08 total:
+  `test_session_registry.py::TestStdlibOnlySelfContainment::test_forbidden_import_is_rejected`.
+
+### What did NOT move
+
+- `WHOLE_TREE_SCAN_TEST_TIMEOUT` and `HEAVY_BARRIER_TEST_TIMEOUT` stay 540. The
+  never-narrow rule requires only `>=` the ini default, and 540 >= 420. Neither
+  is forced by the ini default any longer.
+- The other nine fused-memory glob-based guard modules are not given the
+  repo-scan mark. Each sweeps one package rather than all seven `tests/`
+  directories. In the 2026-10-09 run the slowest of them was
+  `test_store_mutation_preflight_contract.py` at 17.91 call, and its sweeps
+  already carry their own 300s mark. The other eight each fell below 4.87s,
+  that run's top-80 cut-off.
+- Under verify, the two marked scan classes run at 540 instead of the CLI's
+  300, because a mark overrides the CLI `--timeout`. The rest of the module
+  keeps the CLI's 300.
+
+### Observed, not acted on
+
+**RESOLVED by task 6556 — see the addendum.**
+
+In this task's own orchestrator verify, marked members of the whole-tree-scan
+family took up to 131.93s per-test total:
+`test_steward_scaffolding_guards.py::TestAbsoluteTmpProjectRootLiteralsAreCensused::test_every_absolute_tmp_project_root_literal_is_adjudicated`,
+at `-n 8` and loadavg 156 -> 64. That is 2.5x the 51.87s anchor under
+`_ABSOLUTE_FLOOR_SECONDS`. Under this rule it would derive a family ceiling
+above 540. Re-anchoring that family is outside this task and is filed as a
+follow-up.
+
+## Re-anchoring addendum (task 6556, 2026-10-13; archive sweep 2026-10-15)
+
+Task 6556 resolved "Observed, not acted on" above. It made the steward censuses
+cheaper, re-measured the whole-tree-scan family under verify-shaped load, and
+re-anchored the family floor and ceiling. It also drops the floor term from the
+ini derivation rule.
+
+### Method
+
+Base `feede8b627`. Measurements ran on `07c267b970`, the commit that streams the
+steward censuses. Two full orchestrator suites, run one after the other, never
+concurrently, from the worktree root:
+
+```
+env -u VIRTUAL_ENV uv run --directory orchestrator pytest tests/ -n 8 --tb=short -q \
+  --timeout=0 --durations=0 -p no:cacheprovider --junitxml=<run>.junit.xml
+```
+
+`-n 8` is verify's worker count. `--timeout=0` lifts the CLI cap but not the
+module marks, so family members still ran under their 540 mark, as in tasks 5442
+and 5572.
+
+| run | started (UTC) | wall | 1-min loadavg, before -> after | result |
+|---|---|---|---|---|
+| 1 | 2026-10-13T06:46:01Z | 1223.0s | 174.06 -> 289.55 | 4 failed, 25073 passed, 18 skipped, 1 error in 1209.02s |
+| 2 | 2026-10-13T07:08:11Z | 785.8s | 482.11 -> 128.33 | 4 failed, 25073 passed, 18 skipped, 1 error in 776.97s |
+
+None of the failures or the error involve this family:
+- Each of the four failures reads the effective per-test timeout, which
+  `--timeout=0` makes 0.0s: `test_lane_lock_leak_guard.py` (two tests),
+  `test_offline_lane_integration.py` and `test_offline_lane_infra_integration.py`.
+- The error is `test_reopen_sticks_e2e.py` failing to import `graphiti_core`
+  in that worktree's venv.
+
+After the runs, the branch was rebased onto `f2f0247569`:
+- no family member's scan code changed; the one change in a family module was
+  an allowlist entry in `test_steward_scaffolding_guards.py`;
+- `orchestrator/tests` grew from 708 to 728 files and from 28.32 to 28.57 MB
+  (+0.9%), well inside the margin below.
+
+### Archive sweep
+
+Why this section exists: the first draft of this addendum kept only task 5581's
+73.47s and the two fresh runs above. The verify-log archive held 58
+marked-family per-test totals above 73.47: 34 retired steward-census figures
+(see "Retired figures") and 24 on current code.
+
+- Corpus: `data/verify-logs/*/attempt-*.orchestrator.junit-*.xml.gz` in the main
+  checkout. 361 junits, timestamps 2026-10-07T04:09:16Z to 2026-10-14T23:14:29Z,
+  read with gzip and `xml.etree`. Swept 2026-10-15 by an ad-hoc script, not
+  committed.
+- Population: every `orchestrator/tests/test_*.py` carrying
+  `pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`, i.e. the 21 below, not
+  only the 19 the detector finds. The two the detector misses are the slowest
+  member and the source of the previous anchor.
+- A `<testcase>` belongs to the family when a dot-separated part of its
+  `classname` names a member module. Names may carry an `@<xdist_group>` suffix.
+- Quantity: junit `time`, the per-test total (setup + call + teardown) that a
+  timeout mark bounds. The archive holds no phase split, because verify passes
+  no `--durations`. The fresh runs show that the ratchet's figure is
+  module-fixture setup (`live_measurement`): 62.93 total = 62.93 setup.
+- Exclusion, per figure and never by date: a figure is dropped only if the code
+  it measured has since been replaced by a change that cuts the work. Today
+  that covers only the three steward census tests on retained-tree code.
+
+### Per-module worst, archive
+
+Sorted by worst. "(retired)" marks a steward-census figure on retained-tree
+code.
+
+| module | worst total | run (task / junit) | 2nd | 3rd |
+|---|---|---|---|---|
+| `test_merge_lane_ratchet.py` | 148.65 | 3165 / 20261008T104728 | 121.07 (3814 / 20261009T203947) | 110.77 (6626 / 20261014T231429) |
+| `test_steward_scaffolding_guards.py` | 131.93 (retired) | 5581 / 20261009T051656 | 131.56 (retired) (5581 / 20261009T051656) | 117.71 (retired) (5581 / 20261009T051656) |
+| `test_merge_lane_alias_names.py` | 83.96 | 6687 / 20261010T233955 | 74.89 (4618 / 20261009T173600) | 68.20 (6733 / 20261011T235934) |
+| `test_mcp_post_transport.py` | 78.76 | 3814 / 20261009T203947 | 71.83 (4621 / 20261010T193949) | 63.66 (3310 / 20261012T015357) |
+| `test_timeout_marker_inversion_guard.py` | 74.56 | 5572 / 20261008T203002 | 73.47 (5581 / 20261009T051656) | 72.06 (5581 / 20261009T051656) |
+| `test_marker_registration_drift.py` | 70.18 | 6713 / 20261014T112832 | 56.73 (5698 / 20261011T110634) | 55.15 (5628 / 20261013T143723) |
+| `test_event_loop_antipattern_guard.py` | 66.14 | 5954 / 20261014T021639 | 47.80 (6157 / 20261008T012155) | 46.25 (5692 / 20261010T120944) |
+| `test_cited_test_class_drift.py` | 65.17 | 5928 / 20261013T175509 | 63.58 (4830 / 20261007T222310) | 62.46 (3814 / 20261009T203947) |
+| `test_scheduler_hold_history.py` | 51.05 | 4580 / 20261008T194056 | 41.02 (3910 / 20261009T164653) | 27.85 (5538 / 20261008T000757) |
+| `test_whole_tree_scan_timeout_guard.py` | 49.67 | 5916 / 20261013T192844 | 49.38 (3139 / 20261008T121124) | 47.01 (4843 / 20261007T070012) |
+| `test_local_repo_seeder_guard.py` | 44.26 | 5698 / 20261011T110634 | 42.99 (5692 / 20261010T123711) | 39.56 (5698 / 20261011T110634) |
+| `test_info_l0_mechanical_roles.py` | 41.73 | 5954 / 20261014T021639 | 41.25 (6476 / 20261014T191044) | 40.14 (6476 / 20261014T191044) |
+| `test_archive_sole_locator_gate.py` | 38.31 | 5628 / 20261013T143723 | 33.67 (3814 / 20261009T203947) | 33.39 (6626 / 20261014T231429) |
+| `test_lock_release_single_writer_guard.py` | 24.53 | 6687 / 20261010T233955 | 22.06 (6733 / 20261011T184716) | 18.90 (5628 / 20261013T143723) |
+| `test_prune_chokepoint_guard.py` | 21.48 | 5538 / 20261008T000757 | 12.30 (4580 / 20261008T194056) | 10.87 (3389 / 20261014T050236) |
+| `test_raw_semaphore_access_guard.py` | 17.78 | 5311 / 20261011T051941 | 15.78 (3389 / 20261014T225507) | 11.88 (4826 / 20261007T082947) |
+| `test_killpg_frozen_pgid_guard.py` | 16.59 | 3910 / 20261009T164653 | 13.17 (5698 / 20261011T110634) | 12.45 (5191 / 20261014T123756) |
+| `test_lane_lifecycle_gitops.py` | 7.47 | 5402 / 20261010T082538 | 7.08 (5402 / 20261010T082538) | 6.21 (5402 / 20261010T082538) |
+| `test_eval_boundary_suite.py` | 6.89 | 5730 / 20261009T182329 | 6.25 (3310 / 20261007T151108) | 5.66 (3226 / 20261011T143448) |
+| `test_merge_worker_retired.py` | 6.67 | 6734 / 20261012T163619 | 5.12 (6667 / 20261013T205049) | 2.36 (6479 / 20261008T024751) |
+| `test_workflow_factory.py` | 4.40 | 6596 / 20261010T060622 | 3.54 (3139 / 20261008T121124) | 3.39 (4843 / 20261014T015157) |
+
+- The steward module's worst current-code figure is 15.08
+  (`TestNoInlineSandboxedProjectRootAsserts::test_no_module_reimplements_the_block`,
+  6556 / 20261014T223243). That is this task's own verify, the only archived
+  run of the streamed code.
+- 20 of the 24 current-code rows counted above are
+  `test_merge_lane_ratchet.py::TestLanePatchTargets::test_real_tree_union_anchor`,
+  spread 74.00-148.65 across 20 runs.
+- No row in the archive exceeds 148.65.
+
+### Per-member worst, fresh runs
+
+The family is 21 modules:
+- the 19 that `test_whole_tree_scan_timeout_guard.py::_scans_whole_tree_py`
+  finds;
+- `test_merge_lane_ratchet.py` and `test_merge_lane_alias_names.py`, which carry
+  the mark although the detector does not find them.
+
+Each cell is the module's worst junit per-test total in that run, with that
+test's phases from `--durations=0`.
+
+| module | run 1 total (setup / call / teardown) | run 2 total (setup / call / teardown) |
+|---|---|---|
+| `test_merge_lane_ratchet.py` | 62.93 (62.93 / 0.00 / 0.00) | 54.47 (54.47 / 0.00 / 0.00) |
+| `test_timeout_marker_inversion_guard.py` | 41.46 (0.01 / 41.45 / 0.00) | 43.30 (0.01 / 43.28 / 0.01) |
+| `test_cited_test_class_drift.py` | 36.89 (36.89 / 0.00 / 0.00) | 17.20 (17.19 / 0.00 / 0.00) |
+| `test_steward_scaffolding_guards.py` | 34.30 (0.04 / 34.26 / 0.00) | 36.71 (0.02 / 36.69 / 0.00) |
+| `test_merge_lane_alias_names.py` | 32.93 (0.03 / 32.90 / 0.00) | 23.77 (0.01 / 23.77 / 0.00) |
+| `test_event_loop_antipattern_guard.py` | 31.96 (0.01 / 31.94 / 0.00) | 13.89 (0.04 / 13.85 / 0.00) |
+| `test_whole_tree_scan_timeout_guard.py` | 30.49 (0.01 / 30.48 / 0.00) | 24.22 (0.01 / 24.20 / 0.00) |
+| `test_mcp_post_transport.py` | 26.01 (0.03 / 25.98 / 0.00) | 17.81 (0.09 / 17.72 / 0.00) |
+| `test_marker_registration_drift.py` | 21.95 (21.94 / 0.00 / 0.00) | 15.37 (15.37 / 0.00 / 0.00) |
+| `test_archive_sole_locator_gate.py` | 21.25 (0.00 / 21.24 / 0.00) | 14.05 (0.00 / 14.04 / 0.00) |
+| `test_raw_semaphore_access_guard.py` | 4.74 (0.01 / 4.73 / 0.00) | 15.95 (0.01 / 15.93 / 0.00) |
+| `test_local_repo_seeder_guard.py` | 14.05 (14.05 / 0.00 / 0.00) | 11.85 (11.85 / 0.00 / 0.00) |
+| `test_info_l0_mechanical_roles.py` | 9.76 (9.76 / 0.00 / 0.00) | 6.71 (6.71 / 0.00 / 0.00) |
+| `test_prune_chokepoint_guard.py` | 8.34 (0.03 / 8.31 / 0.00) | 6.62 (0.01 / 6.60 / 0.00) |
+| `test_scheduler_hold_history.py` | 7.15 (0.01 / 7.14 / 0.00) | 7.61 (0.02 / 7.58 / 0.00) |
+| `test_lock_release_single_writer_guard.py` | 7.53 (0.03 / 7.50 / 0.00) | 4.39 (0.02 / 4.38 / 0.00) |
+| `test_killpg_frozen_pgid_guard.py` | 4.28 (0.01 / 4.27 / 0.00) | 2.70 (0.01 / 2.69 / 0.00) |
+| `test_lane_lifecycle_gitops.py` | 1.78 (0.39 / 1.37 / 0.02) | 0.59 (0.10 / 0.49 / 0.00) |
+| `test_eval_boundary_suite.py` | 1.12 (0.01 / 1.11 / 0.00) | 0.94 (0.02 / 0.92 / 0.00) |
+| `test_workflow_factory.py` | 0.93 (0.01 / 0.91 / 0.00) | 0.41 (0.01 / 0.39 / 0.01) |
+| `test_merge_worker_retired.py` | 0.87 (0.08 / 0.76 / 0.04) | 0.10 (0.01 / 0.09 / 0.00) |
+
+The three steward census tests measured:
+- run 1: 34.30, 32.61 and 24.40 per-test total;
+- run 2: 28.54, 36.71 and 19.76.
+
+### The steward censuses, streamed
+
+`test_steward_scaffolding_guards.py::_scan_tests_tree` was a `functools.cache`
+that retained every parsed `ast.Module` for the rest of the worker's session.
+Under `--dist loadgroup` the three census tests land on different workers, so
+each paid the retained parse plus its own detector anyway.
+
+They now stream: `_census_tree(root, detector)` parses one file, runs one
+detector, and drops the tree before the next file. `_tests_tree_census`
+memoises the result per detector per process.
+
+The A/B ran in fresh processes over 708 modules. It timed the tmp-literal
+census: old `_tmp_literal_census_by_module()` at `feede8b627`, new
+`_tests_tree_census(_absolute_tmp_project_root_literals)`.
+
+| order | old | new | new/old | 1-min loadavg around the pair |
+|---|---|---|---|---|
+| old, new | 23.73s | 10.05s | 0.42 | 50 -> 54 |
+| old, new | 28.31s | 16.73s | 0.59 | 61 -> 70 |
+| old, new | 32.90s | 23.37s | 0.71 | 76 -> 92 |
+| new, old | 63.55s | 19.70s | 0.31 | 132 -> 144 |
+| new, old | 36.87s | 15.30s | 0.41 | 145 -> 99 |
+| new, old | 42.39s | 16.40s | 0.39 | 100 -> 102 |
+
+- Max RSS: 810-812 MB old, 128-131 MB new.
+- Load rose through the old-first pairs, which handicaps the second-run "new"
+  side. The new-first pairs balance that. The median ratio is 0.41.
+- The architect's prototype A/B, at loadavg 86-160, agrees: old 22.52-23.66s,
+  per-detector streaming 11.14-14.80s.
+- Retention more than doubled the parse and held ~800 MB per worker.
+  Per-detector streaming roughly halves the per-test wall clock.
+- One shared streaming pass for all three detectors bought almost nothing per
+  test (prototype: 19.74-22.73s), so each census keeps its own pass.
+
+### Retired figures
+
+Every archived figure for these three tests in `test_steward_scaffolding_guards.py`
+retires:
+- `TestAbsoluteTmpProjectRootLiteralsAreCensused::test_every_absolute_tmp_project_root_literal_is_adjudicated`,
+  worst 131.93;
+- `TestNoInlineSandboxedProjectRootAsserts::test_no_module_reimplements_the_block`,
+  worst 131.56;
+- `TestStewardConstructionSitesAreCensused::test_every_steward_construction_site_is_sanctioned`,
+  worst 117.71.
+
+All three worsts come from task 5581's 2026-10-09 verify, and these tests
+account for 34 of the 58 rows counted under "Archive sweep". Every archived
+figure of theirs measured the retained-tree code, because the streaming that
+replaced it exists only on this branch. The one exception is this task's own
+verify (2026-10-14), which ran the streamed code and is kept: 15.08 / 12.19 /
+10.99. The worst-run rule exists to cover run-to-run spread on
+byte-identical input. It does not keep a figure alive for code that no longer
+exists.
+
+The retirement does not move the value: 131.93 < 148.65.
+
+Three cross-checks:
+
+1. **Scaled by the A/B ratio.** At the median 0.41 the retired figures map to
+   ~54s, at the prototype's ~0.5 to ~66s, and at the single worst pair's 0.71
+   (the most load-handicapped) to ~94s. So the retirement rests on the rule,
+   not on this scaling alone.
+2. **The same old code, re-verified.** Task 5581's re-verify on 2026-10-13
+   (`-n 8`, loadavg 398 -> 54, junit timestamp 2026-10-13T00:52Z) put the three
+   tests at 36.86 / 34.85 / 7.81. 131.93 was an outlier even for the code it
+   measured.
+3. **The streamed code, measured directly.** It reached at most 36.71s per test
+   across both fresh runs, at 1-minute loadavg up to 482. Under this task's own
+   verify (`-n 8`, loadavg 53 -> 44) it reached 15.08s.
+
+### The anchor is current code
+
+The anchor run is task 3165's verify:
+`data/verify-logs/3165/attempt-1.orchestrator.junit-20261008T104728_357006Z.xml.gz`,
+started 2026-10-08T10:25:22Z, 1326s, `-n 8`, loadavg1 64.16 -> 78.63, rc 0.
+Its summary's lint and type commands touched only
+`orchestrator/src/orchestrator/harness.py` and
+`orchestrator/tests/test_harness_store_identity_wiring.py`, so task 3165 did
+not touch the ratchet's code path.
+
+Commits to that code path since 2026-10-08, per file:
+- `orchestrator/tests/test_merge_lane_ratchet.py`: none. Last changed
+  2026-10-06 (`056ce0207e`, task 6394).
+- `orchestrator/tests/_merge_lane_ratchet_fixtures.py`: none. Last changed
+  2026-09-22.
+- `orchestrator/tests/_git_fixtures.py`: none. Last changed 2026-09-30.
+- `scripts/merge_lane_metrics.py`:
+  - `03f7657a3a` (task 6758) adds one `import _checkout as _checkout` line;
+  - `071b84b48f` (task 5736) is docstring-only.
+- `scripts/source_measures.py`: `f57054af34` and `123d7c05e6` (task 6921).
+  - They add a single-package layout to member resolution and one
+    pseudo-collision check.
+  - They also add a `_require_disjoint_members` pass, which is more work, not
+    less.
+  - Both diffs were read, and neither touches the per-file
+    read/parse/complexipy path.
+
+The swept tree has only grown since. Main as of the run's start
+(`56feb97137`) tracked 2508 `.py` files (99.58 MB), against 2784 (103.28 MB)
+at this addendum's HEAD.
+
+### The arithmetic
+
+    anchor = worst archive or fresh per-test total, current code  = 148.65s
+             (test_merge_lane_ratchet.py::TestLanePatchTargets::test_real_tree_union_anchor,
+              task 3165 verify, 2026-10-08, -n 8, loadavg 64 -> 79)
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                              = 1189.2s
+    round up to a multiple of 60                                  = 1200s -> _ABSOLUTE_FLOOR_SECONDS
+    WHOLE_TREE_SCAN_TEST_TIMEOUT                                  = 1200 (a literal)
+
+`test_timeout_marker_inversion_guard.py::_SANCTIONED_TIMEOUT_NAMES` mirrors the
+constant and moved to 1200.0.
+
+### Collisions checked
+
+- **Inversion band** (`DELIBERATE_TIGHT_BOUND_CEILING` 60,
+  `VERIFY_CLI_PER_TEST_TIMEOUT` 300): 1200 >= 300, so the family loosens under
+  both. Pinned by
+  `test_timeout_marker_inversion_guard.py::test_no_timeout_marker_sits_in_the_inversion_band`.
+- **Other sanctioned ceilings.** Nothing orders this constant against
+  `PYTEST_TIMEOUT` (960), `HEAVY_BARRIER_TEST_TIMEOUT` (540),
+  `DEEP_LANDING_SCENE_TEST_TIMEOUT` (1080) or `DEEP_GATE_SCENE_TEST_TIMEOUT`
+  (1260). Every `WHOLE_TREE_SCAN_TEST_TIMEOUT` comparison in the tree is `>=`
+  against the floor or the ini default, or `<` against a synthetic 30s mark. At
+  1200 the family is the second-largest sanctioned per-test ceiling, after
+  `DEEP_GATE_SCENE_TEST_TIMEOUT`.
+- **`faulthandler_timeout`** (240, `orchestrator/pyproject.toml`) stays below
+  `VERIFY_CLI_PER_TEST_TIMEOUT`, pinned by
+  `test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants::test_a_hung_test_dumps_its_stacks_before_any_kill_can_reach_it`.
+  It still fires first.
+- **`verify_command_timeout_secs`** (7200, `orchestrator/orchestrator.yaml`): one
+  hung family item consumes at most 1200 of it.
+- **The ini default** (420) is unaffected, because the rule change below
+  decouples it from the family floor.
+
+The cost, stated plainly: a genuinely hung family item now burns up to 20
+minutes before the kill. Its stacks still reach the verify log at
+`faulthandler_timeout`.
+
+That cost is one member's. The anchor is the ratchet's `live_measurement`
+fixture, a whole-repo complexity measurement and not an AST sweep of the tests
+tree, yet it sets the ceiling for all 21 modules. Without it the family's worst
+is `test_merge_lane_alias_names.py` at 83.96, which derives 720. Giving the
+ratchet its own constant needs an edit to `test_merge_lane_ratchet.py`, which is
+outside this task's scope. Task 6986 owns that split, or cutting the fixture
+instead.
+
+### What did NOT move
+
+- The ini default stays **420**, in all eight configs.
+- `HEAVY_BARRIER_TEST_TIMEOUT` stays 540, still >= 420.
+- fused-memory's `MAGICMOCK_REPO_SCAN_TEST_TIMEOUT` stays 540, on its own
+  61.52s anchor.
+
+### Rule change: the ini derivation drops the family floor
+
+The rule at the top of this file becomes:
+
+    derived = round_up_to_multiple_of_60(worst_unmarked_wall_clock * 8)
+
+The `_ABSOLUTE_FLOOR_SECONDS` term is gone because it imported the cost of the
+MARKED whole-tree-scan family into a default that this file defines over
+UNMARKED tests ("Marked tests are excluded from the governing set by design").
+Kept, it would have raised the ini default 420 -> 1200 for ~16000 tests with no
+unmarked evidence. Through the never-narrow rule it would also have forced
+`HEAVY_BARRIER_TEST_TIMEOUT` and `MAGICMOCK_REPO_SCAN_TEST_TIMEOUT` to 1200.
+
+The never-narrow intent the term served is still met: the worst-run rule never
+discards an older unmarked figure. `shared/pyproject.toml` no longer says the
+default is floored at the family floor. Nothing mechanical read that coupling:
+`tests/scripts/test_pytest_per_test_timeout_policy.py` does not reference the
+floor.

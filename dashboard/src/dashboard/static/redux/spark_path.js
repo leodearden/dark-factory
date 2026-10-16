@@ -82,7 +82,8 @@
 // is exactly the kind of thing that must be executed rather than grepped for.
 // It also belongs beside `plottableMax`/`axisY` specifically: those two are
 // what produce the ticks it formats, and its correctness argument is a claim
-// about their arithmetic (see its own header below).
+// about their arithmetic (see its own header below). `niceCountMax` (task 5121)
+// is its pair: the count-axis MAXIMUM rule, under which every tick is whole.
 
 // ── Is this value a real, plottable measurement? ───────────────────────────
 // Finite numbers only. `null`/`undefined` (a missing sample), `NaN`/`±Infinity`
@@ -376,28 +377,10 @@ function axisY(value, geom) {
 // axis. So this is opt-in per caller, and LineChart's default stays
 // `(v) => String(v)`.
 //
-// A THIRD OPTION EXISTS AND IS DEFERRED, NOT OVERLOOKED (esc-4232 review).
-// Blanking is the better of the two options above, but both of them take the
-// axis maximum as given. What charting libraries actually do is snap it: round
-// maxV UP to a multiple of the tick count (7 -> 8, 999 -> 1000) so every tick
-// is whole and NOTHING is either fabricated or omitted. The cost of not doing
-// that is now measured, over every integer maxV in 1..200: 100 axes label only
-// 2 of 5 ticks (floor + peak), 50 label 3, and 50 label all 5 — so on
-// arbitrary count data roughly half of all renders lose three gridline labels,
-// and maxV=999 reads `0 ... 999` with three bare gridlines.
-//
-// It is deferred because a caller cannot reach maxV from here. LineChart
-// computes `plottableMax(all, 1)` internally and this function only sees the
-// tick it is handed, so snapping means changing LineChart's OWN scale — its
-// range, its gridline positions and the height every plotted point maps to —
-// which is a chart-geometry change across all eight of its call sites and all
-// of StackedAreaChart's, not a label change. Task 4232 is scoped to labels and
-// its plan freezes LineChart's tick generator (task 4059's
-// `test_line_chart_hands_format_y_the_raw_tick` pins it). A `niceCountMax`
-// belongs with that geometry change, in its own task; blanking is strictly
-// better than today's fabricated fractions in the meantime, and is forward-
-// compatible — under a snapped maximum every tick is whole, so this function
-// labels all five and the blank branch simply stops being reached.
+// THE AXIS-MAXIMUM SNAP NOW EXISTS as `niceCountMax` below (task 5121), and a
+// chart opts into it per caller via its `snapMax` prop. Under a snapped maximum
+// every tick is whole, so this function labels all five; it stays wired at the
+// count callers as the label rule for any axis maximum that was not snapped.
 //
 // Non-finite and absent input yields '' rather than `String(v)`: this is
 // called from inside a JSX render, so `NaN`/`undefined` must never reach an
@@ -409,6 +392,27 @@ function axisY(value, geom) {
 // never diverge on any input.
 function formatCountTick(v) {
   return Number.isInteger(v) ? String(v) : '';
+}
+
+// ── Count-axis MAXIMUM: the smallest multiple of the tick count >= maxV ────
+// The `snapMax` a charts.jsx caller passes when its series is a COUNT (task
+// 5121). Taking the axis maximum as given costs real labels: over every integer
+// maxV in 1..200, 100 axes label only 2 of their 5 ticks and 50 label 3, and
+// maxV=999 reads `0 ... 999` over three bare gridlines. Snapped, 999 -> 1000
+// and every tick is labelled.
+//
+// Exact, with no tolerance: a multiple of `ticks` divided by `ticks` is an
+// exact integer in IEEE-754, so formatCountTick's `Number.isInteger` labels all
+// five ticks. spark_path_count_axis.test.mjs pins the table and the 1..200 sweep.
+//
+// OPT-IN, never a default: a fraction axis snaps 0.8 or 1 up to 4, so a ratio
+// or 100%-normalized chart would read 0%..400%.
+//
+// This runs inside a render, so bad input passes maxV through unchanged (the
+// un-snapped axis) rather than throwing or returning NaN.
+function niceCountMax(maxV, ticks) {
+  if (!isPlottable(maxV) || !Number.isInteger(ticks) || ticks <= 0) return maxV;
+  return Math.ceil(maxV / ticks) * ticks;
 }
 
 // ── Line + area path builder for a PADDED chart (charts.jsx's `LineChart`) ─
@@ -553,10 +557,16 @@ function barFractions(values, max) {
 // full column's topmost drawn top IS its total — and is stated anyway, at zero
 // cost, so "a partial sum is not a total" stays legible in the code.
 //
+// THE OPTIONAL `snapMax` maps that folded maximum to the axis maximum BEFORE
+// any band is scaled, and defaults to the identity. StackedAreaChart passes
+// niceCountMax for count axes (task 5121). It has to live here rather than at
+// the call site because the polygons are scaled inside this function: a snap
+// applied to the returned `max` would move the ticks but not the bands.
+//
 // On hole-free input this reproduces the pre-fix polygons character-for-
 // character (the scrub never fires, and clause (b) introduces no new maximum);
 // spark_path.test.mjs pins that by exact string equality.
-function stackedAreaPaths(stacks, geom) {
+function stackedAreaPaths(stacks, geom, snapMax = (foldedMax) => foldedMax) {
   const layers = (stacks || []).map(st => (st && st.values) || []);
   const count = geom.count;
   const stepX = geom.width / Math.max(count - 1, 1);
@@ -592,7 +602,7 @@ function stackedAreaPaths(stacks, geom) {
     if (plottable) axisCandidates.push(running);
   }
 
-  const max = plottableMax(axisCandidates, 1);
+  const max = snapMax(plottableMax(axisCandidates, 1));
   const valueGeom = { y0: geom.y0, height: geom.height, min: 0, range: max };
 
   const paths = layers.map((_, li) => {
@@ -638,6 +648,7 @@ const SPARK_PATH_API = {
   plottableMax,
   axisY,
   formatCountTick,
+  niceCountMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,

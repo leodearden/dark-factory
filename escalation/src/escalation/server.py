@@ -7,14 +7,16 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field, ValidationError
 from shared.branch_names import canonical_queued_branch_name
+from shared.eval_lane import eval_lane_provenance
 
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
@@ -29,7 +31,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
-from shared.merge_state import MergeState
+from shared.merge_state import MergeReason, MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
@@ -51,6 +53,13 @@ from escalation.merge_lane_resolution import (
     resolve_merge_lane,
     validate_requested_lane,
 )
+from escalation.merge_status_answer import (
+    LastOutcome,
+    MergeStatusAnswer,
+    MergeStatusSource,
+    hint_for,
+    map_terminal_state,
+)
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
@@ -66,7 +75,16 @@ from escalation.models import (
 from escalation.pins import classify_pins
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
+from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
+from escalation.store_identity import StoreIdentity
+from escalation.tool_description_block import AppendToEveryToolDescription
+
+if TYPE_CHECKING:
+    from orchestrator.merge_lane.queue_store import (
+        MergeQueueStore,
+        PersistedMergeRequest,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +123,8 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
 def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Escalation | None]:
     """Read each DISTINCT member id once — ``None`` for an id that does not resolve.
 
-    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`
-    and :func:`_sentinel_bound_task_ids` both consume it.  Through
+    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`,
+    :func:`_sentinel_bound_task_ids` and :func:`_eval_lane_members` all consume it.  Through
     ``queue.get()`` rather than the queue root directly, so a member already
     resolved and archived between the watcher's drain and its promote still
     contributes (``get`` falls back to the archive), and repeated lookups of a
@@ -223,6 +241,49 @@ def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset
     return frozenset(bound_task_ids)
 
 
+def _eval_lane_members(members: dict[str, Escalation | None]) -> dict[str, str]:
+    """Map each resolvable member that carries eval-lane provenance to its reason.
+
+    Judged from the member's OWN record (task id and worktree), so a cluster
+    promoted under a production task id still cannot carry an eval-lane record
+    into a human L2.  *members* is :func:`_read_members`' answer.
+    """
+    flagged: dict[str, str] = {}
+    for member_id, member in members.items():
+        if member is None:
+            continue
+        reason = eval_lane_provenance(member.task_id, member.worktree)
+        if reason is not None:
+            flagged[member_id] = reason
+    return flagged
+
+
+def _eval_lane_refusal(subject: str) -> dict[str, str]:
+    """The ``promote_to_l2`` refusal for an eval-lane *subject*; nothing is minted."""
+    return {
+        'error': (
+            f'{subject}; eval-lane escalations are contained to the eval harness '
+            'and never promoted to the human L2 queue. Close the eval-lane L1(s) '
+            "with resolve_issue(action='close_only', resolution_class='benign') "
+            'and re-promote only the production members, if any, under a '
+            'production task_id.'
+        ),
+        'code': 'eval_lane_contained',
+    }
+
+
+def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str]:
+    """The ``amend_escalation`` refusal for a record that exists but is *status*."""
+    return {
+        'error': (
+            f'Escalation {escalation_id} is {status}, not pending; only a pending '
+            'record can be amended. Nothing was recorded.'
+        ),
+        'code': 'not_pending',
+        'status': status,
+    }
+
+
 # The role the steward's own filings carry (orchestrator.steward
 # _auto_escalate_to_human hard-codes ``agent_role='steward'``). Level-1 is the
 # steward's documented recourse, so an L1 from this role — or from a harness
@@ -317,10 +378,10 @@ def _get_terminal_retention(harness: Any | None) -> Any | None:
     """Return the harness-mounted TerminalOutcomeRetention ring, or None.
 
     Centralises the ``getattr(harness, '_terminal_retention', None)`` probe so
-    the private attribute name lives in exactly one place, shared by the
-    merge_request write side (records dispatch outcomes and coalesce
-    aliases) and the merge_status / merge_cancel read sides
-    (``_durable_terminal_state``'s Tier 2, ``retire_cancelled_merge_request``).
+    the private attribute name lives in exactly one place.  No read side
+    remains: merge_status no longer consults the ring.  Its only users are
+    merge_request's writes (dispatch outcomes and coalesce aliases) and
+    merge_cancel's ``retire_cancelled_merge_request``.
     Returns None — rather than raising — when *harness* is None (standalone
     mode / unit tests that wire no harness) or the attribute is absent, so a
     future rename degrades gracefully.
@@ -334,6 +395,69 @@ def _get_terminal_retention(harness: Any | None) -> Any | None:
     if harness is None:
         return None
     return getattr(harness, '_terminal_retention', None)
+
+
+def _get_merge_journal(harness: Any | None) -> MergeQueueStore | None:
+    """Return the harness-mounted durable merge journal, or None.
+
+    The journal tier reads the SAME ``MergeQueueStore`` instance the merge
+    worker records to and ``recover_pending_merges`` reads, so ``load()`` is a
+    scan of its in-memory mirror: no file I/O on the event loop (INV-8).  The
+    runtime-only import and the isinstance check validate the duck-typed
+    private-attribute probe at this boundary, the ``_get_merge_worker``
+    convention plus a type.
+    """
+    if harness is None:
+        return None
+    try:
+        from orchestrator.merge_lane.queue_store import (
+            MergeQueueStore,
+        )
+    except ImportError:
+        return None
+    store = getattr(harness, '_merge_store', None)
+    return store if isinstance(store, MergeQueueStore) else None
+
+
+@dataclass(frozen=True)
+class _PollKey:
+    """One merge_status lookup: request_id outranks branch, which outranks task_id."""
+
+    request_id: str | None = None
+    branch: str | None = None
+    task_id: str | None = None
+
+    @property
+    def landing_key(self) -> str | None:
+        return self.branch if self.branch is not None else self.task_id
+
+    def matches(self, request_id: str | None, branch: str | None, task_id: str | None) -> bool:
+        if self.request_id is not None:
+            return request_id == self.request_id
+        return (self.branch is not None and branch == self.branch) or (
+            self.task_id is not None and task_id == self.task_id
+        )
+
+
+@dataclass(frozen=True)
+class _DurableHistory:
+    """The newest durable finalize row for a key, and the stale_record reason it implies."""
+
+    row: dict[str, Any]
+    reason: MergeReason
+
+
+class _ProbeFailed(Exception):
+    """A merge_status tier's probe raised: the walk ends as unknown/probe_failed."""
+
+    def __init__(self, source: MergeStatusSource) -> None:
+        super().__init__(source.value)
+        self.source = source
+
+    def answer_for(self, key: _PollKey) -> MergeStatusAnswer:
+        return MergeStatusAnswer.epistemic(
+            MergeState.unknown, MergeReason.probe_failed, key.request_id, source=self.source,
+        )
 
 
 def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
@@ -864,6 +988,19 @@ async def _annotate_pins_recovery(
         d['pins_recovery'] = [tid] if pins else []
 
 
+def _render_store_identity_block(identity: StoreIdentity) -> str:
+    """The store-identity block of ``plans/escalation-store-ambiguity-prd.md`` §6.2."""
+    project = 'n/a' if identity.project_id is None else identity.project_id
+    return (
+        f'THIS ENDPOINT SERVES: {identity.queue_dir} '
+        f'(kind={identity.kind}, project={project}).\n'
+        'It contains ONLY escalations for that store. A task id belonging to any other\n'
+        'project returns an empty result because the record is not HERE — not because it\n'
+        'does not exist. To ask whether an escalation was EVER filed for a task\n'
+        '(including resolved/archived), use get_task_escalation_history.'
+    )
+
+
 def create_server(
     queue: EscalationQueue,
     merge_queue: asyncio.Queue | None = None,
@@ -876,6 +1013,7 @@ def create_server(
     merge_inflight_registry: Any = None,
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
+    store_identity: StoreIdentity | None = None,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -930,8 +1068,19 @@ def create_server(
     ``archive.prune_archive(now=...)``.  When None, live UTC is used (production
     default).  Pass a fixed datetime in tests to make the prune cutoff
     deterministic and wall-clock-independent.
+
+    *store_identity* (default None) — which store this server serves
+    (``escalation.store_identity::StoreIdentity``), passed by both production
+    call sites.  When given, one transform appends the PRD §6.2 store-identity
+    block to every tool's description; None leaves each description exactly
+    its docstring.  ``plans/escalation-store-ambiguity-prd.md`` §6.3 specifies
+    its other consumer.
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
+    if store_identity is not None:
+        mcp.add_transform(
+            AppendToEveryToolDescription(_render_store_identity_block(store_identity))
+        )
 
     # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
     #
@@ -1286,24 +1435,26 @@ def create_server(
     async def _report_amendment_truncation_storm(l2_id: str) -> None:
         """File ONE info escalation when amendment truncation BURSTS.
 
-        ``queue.add_members_to_l2`` already counts every dropped amendment on
-        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        Called by both amendment writers' tools — a ``promote_to_l2`` fold and
+        an explicit ``amend_escalation`` — whenever their write shed entries.
+        ``queue._append_amendment_capped`` already counts every dropped
+        amendment on the record itself (``amendments_truncated``) and logs a
+        WARNING.  The
         counter stays the PRIMARY structured fact — the contract is assertable
         from the record, never by log-scrape (INV-8) — but a WARNING has no
         audience.  This is the rate-thresholded NOTIFICATION layered on top,
         which is what INV-4 asks for: a hearer, at a threshold.
 
         Deliberately lives here and not in ``queue.py``.  That module is a pure
-        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        storage leaf, and a self-file from inside a locked amendment write would
         re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
-        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
-        on its create path and runs outside that flock.
+        ``escalation_id_lock``.  Both callers await this outside that flock.
 
         PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
         ``emit_markup_storm_escalation`` and
         ``emit_residual_candidate_key_escalation``: nothing raised in here may
-        fail the promote that triggered it.  A dropped report costs a
-        notification; a raised one would cost the fold.
+        fail the write that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold or the amend.
 
         Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
         analogues, because the condition is system-scoped rather than a property
@@ -1494,6 +1645,10 @@ def create_server(
         """Auto-resolve *esc* if the target task is already terminal, else submit normally.
 
         Gate order (first match wins, all others fall through to _submit_or_dedupe):
+          0. eval-lane provenance (shared.eval_lane) → contain: file as resolved
+               with resolution_action='close_only' via submit_resolved before
+               ANY other gate or lookup, so no argument can mint it pending or
+               at L2
           1. terminal_state_is_the_bug=True  → bypass (submit normally)
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
@@ -1504,15 +1659,42 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
-        # Task 3550 — stamp the FILING incarnation, ABOVE everything else.
+        eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
+        if eval_lane_reason is not None:
+            logger.info(
+                'Eval-lane containment: filing %s as resolved (%s); task_id=%r '
+                'agent_role=%r severity=%r level=%r',
+                esc.id, eval_lane_reason, esc.task_id, esc.agent_role,
+                esc.severity, esc.level,
+            )
+            esc.resolution_action = 'close_only'
+            contained = queue.submit_resolved(
+                esc,
+                f'contained: eval-lane artifact ({eval_lane_reason}); not a '
+                'production signal, the eval measurement is scored from the '
+                'cell result artifacts',
+                resolved_by='escalation-eval-lane-containment',
+                resolution_class='benign',
+            )
+            return {
+                'id': contained.id,
+                'status': contained.status,
+                'resolution': contained.resolution,
+                'resolved_by': contained.resolved_by,
+                'level': contained.level,
+            }
+
+        # Task 3550 — stamp the FILING incarnation, ABOVE everything else that
+        # can leave a record OPEN.
         #
         # Placement is the whole design: this runs before the C4/D3 downgrade,
         # before the born-at-L2 `esc.level = 2` assignment, and before all four
-        # gates, so EVERY exit path carries the identity — the two bypass
-        # gates, the lookup-disabled gate, _submit_or_dedupe, the fail-open
-        # except branch below, and the terminal-task submit_resolved
-        # auto-resolve.  No gate can lose it, so those cases need no
-        # special-casing.
+        # numbered gates, so every exit path that can leave a record open
+        # carries the identity — the two bypass gates, the lookup-disabled
+        # gate, _submit_or_dedupe, the fail-open except branch below — and so
+        # does the terminal-task submit_resolved auto-resolve.  Only Gate 0
+        # above precedes it: a contained record is filed resolved, and
+        # `escalation.pins.classify_pins` reads only open records.
         #
         # `escalation.pins` Link 4 reads this to tell a LIVE agent handoff from
         # one filed by a dead incarnation.  None means UNKNOWN, which pins
@@ -1660,6 +1842,9 @@ def create_server(
         *severity* defaults to ``'info'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
+        Eval-lane filings (an eval fixture task id or an eval-worktree path, see
+        ``shared/src/shared/eval_lane.py``) are filed already-resolved whatever
+        the severity, and never reach L1/L2.
 
         *severity* must be one of ``models.KNOWN_SEVERITIES``
         (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
@@ -1753,6 +1938,9 @@ def create_server(
         *severity* defaults to ``'blocking'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
+        Eval-lane filings (an eval fixture task id or an eval-worktree path, see
+        ``shared/src/shared/eval_lane.py``) are filed already-resolved whatever
+        the severity or *level*, and never reach L1/L2.
 
         *severity* must be one of ``models.KNOWN_SEVERITIES``
         (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
@@ -1894,6 +2082,28 @@ def create_server(
 
     # --- Handler-side tools ---
 
+    def _attach_related_pending(
+        payload: dict[str, Any], resolved: Escalation,
+    ) -> dict[str, Any]:
+        """Add ``resolve_issue``'s sideways census to *payload*, or leave it ABSENT.
+
+        A census that cannot be computed must never fail the resolve that has
+        already happened, and must never read as ``[]`` ("no pending twins"):
+        on any failure the key stays absent, which is the contract's UNKNOWN —
+        the same seam guard as the ``pins_recovery`` annotation in
+        ``get_pending_escalations``.
+        """
+        try:
+            payload['related_pending'] = related_pending(
+                queue.get_pending(), resolved=resolved,
+            )
+        except Exception:
+            logger.exception(
+                'related_pending census failed after resolving %s; the response '
+                'reports UNKNOWN (key absent)', resolved.id,
+            )
+        return payload
+
     @mcp.tool()
     def resolve_issue(
         escalation_id: str,
@@ -1985,6 +2195,18 @@ def create_server(
         ``_COMPACT_ESCALATION_FIELDS`` is a fixed ALLOWLIST and is deliberately
         NOT widened by any of this — ``late_resolutions`` is forensic detail for
         a full-record read, not triage-facing.
+
+        **Sideways census (``related_pending``)** (task 4886).  Both success
+        returns — ``park`` and resolve/dismiss — carry ``related_pending``: the
+        PENDING records that may carry the same question, one entry per record
+        (shape: ``escalation/related_pending.py::RelatedPendingEntry``) — another
+        record on the same task, or a pending L2 sharing a member with this
+        record or clustering it.  REPORT-ONLY: nothing is closed or changed;
+        disposing of each twin is the caller's call.  PENDING-ONLY, so ``[]``
+        means "no pending twins".  Computed AFTER the mutation, so this record's
+        own cascade-closed members are not listed.  The key is ABSENT when the
+        census could not be computed — absent means UNKNOWN, never "none".
+        Error returns carry no census: they changed nothing.
 
         ``escalate_model`` (task μ, adaptive-routing trigger 3): when True and
         the action leads to a *next dispatch* (``resume`` / ``restart``), the
@@ -2255,7 +2477,7 @@ def create_server(
             )
             if esc is None:
                 return {'error': f'Escalation {escalation_id} not found'}
-            return esc.to_dict()
+            return _attach_related_pending(esc.to_dict(), esc)
 
         # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
         # this docstring.  Its POSITION is load-bearing in two ways.  It sits
@@ -2388,7 +2610,7 @@ def create_server(
                     if corrected else '.'
                 )
             )
-        return payload
+        return _attach_related_pending(payload, esc)
 
     @mcp.tool()
     async def get_pending_escalations(
@@ -2851,6 +3073,97 @@ def create_server(
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
 
+    @mcp.tool()
+    async def amend_escalation(
+        escalation_id: str,
+        summary: str = '',
+        detail: str = '',
+        options: list[str] | None = None,
+        root_cause: str = '',
+        agent_role: str = '',
+    ) -> dict[str, Any]:
+        """Append one framing amendment to a pending escalation (task 4886).
+
+        Writes a ruling made elsewhere onto the record it rules on, without
+        the side effects of the only other amendment writer, a
+        ``promote_to_l2`` fold.  APPEND-ONLY and PENDING-ONLY (parked records
+        included) via ``queue.amend``, which carries the full contract: the
+        amendment caps and repeat suppression are the fold's, but there is NO
+        severity floor, it is category-agnostic, and it never touches
+        ``status`` / ``severity`` / ``level`` / ``members``, the resolution
+        fields, the triage quad, the record's own framing or
+        ``root_cause_variants``.
+
+        Deliberately NOT gated by the connection-capability level check, for
+        ``stamp_triage``'s reason: an annotation is not a state transition, so
+        an L0/L1-capped connection may amend an L2 it cannot resolve.
+
+        *agent_role* attribution: an X-Escalation-Identity header overrides
+        the arg, mirroring ``triaged_by`` / ``resolved_by``.  Attribution only,
+        never a deny path.
+
+        A recorded amendment bumps ``updated_at``, the watcher's re-assess
+        trigger (``updated_at > triaged_at``).
+
+        Returns:
+
+        - the full record dict plus ``amendment_recorded: True``;
+        - the full record dict plus ``amendment_recorded: False`` and
+          ``no_op_reason: 'repeat_framing'`` when the framing repeats what the
+          record already says (a success: nothing new to record);
+        - ``{'error', 'code': 'empty_amendment'}`` when every framing arg is
+          empty;
+        - ``{'error', 'code': 'not_pending', 'status'}`` when the record exists
+          (archive included) but is not pending;
+        - ``{'error', 'code': 'not_found'}`` otherwise.
+
+        Queue I/O hops off the event loop: this server shares the
+        ORCHESTRATOR's loop, and ``queue.amend`` fires no loop-affine callback,
+        so the reason flock'd writes elsewhere stay inline (stated beside
+        ``dedupe.py::submit_or_dedupe_off_loop``) does not apply.
+        """
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None:
+            agent_role = identity
+
+        result = await asyncio.to_thread(
+            queue.amend, escalation_id, root_cause=root_cause, summary=summary,
+            detail=detail, options=options, agent_role=agent_role,
+        )
+        match result['status']:
+            case 'amended':
+                # An alarm whose census excluded a truncation source would
+                # under-report exactly the cap pressure it exists to detect.
+                if result['dropped'] > 0:
+                    await _report_amendment_truncation_storm(escalation_id)
+                return {**result['escalation'].to_dict(), 'amendment_recorded': True}
+            case 'repeat_framing':
+                return {
+                    **result['escalation'].to_dict(),
+                    'amendment_recorded': False,
+                    'no_op_reason': 'repeat_framing',
+                }
+            case 'not_pending':
+                return _amend_not_pending_refusal(escalation_id, result['escalation'].status)
+            case 'no_framing':
+                return {
+                    'error': (
+                        f'amend_escalation on {escalation_id} carries no framing: pass '
+                        'at least one of summary / detail / options / root_cause. '
+                        'Nothing was recorded.'
+                    ),
+                    'code': 'empty_amendment',
+                }
+            case 'not_found':
+                # queue.amend reads the queue root only, and a closed record
+                # lives in the archive.  Read-only, so it resurrects nothing.
+                archived = await asyncio.to_thread(queue.get, escalation_id)
+                if archived is not None and archived.status != 'pending':
+                    return _amend_not_pending_refusal(escalation_id, archived.status)
+                return {'error': f'Escalation {escalation_id} not found', 'code': 'not_found'}
+            case unhandled:
+                assert_never(unhandled)
+
     # --- L2 promotion tool ---
 
     @mcp.tool()
@@ -2907,13 +3220,24 @@ def create_server(
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
         explicitly by this tool.  Because that severity→level gate is bypassed
         by design, nothing else reconciles an L2's severity with the records it
-        clusters; the inherited default below is what does it.
+        clusters; the inherited default below is what does it.  The one
+        filing-provenance gate this tool does honour is the eval-lane refusal
+        below.
 
         **Identity gate** (PRD task-status-authority C8/D7): the create side
         is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
         asserting an ``X-Escalation-Identity`` not in that set is denied
         (``{'error': ..., 'code': 'level_forbidden'}``, no L2 minted); a
         header-less connection (no identity asserted) is always allowed.
+
+        **Eval-lane refusal** (task 3096): a *task_id* with eval-lane
+        provenance (``shared/src/shared/eval_lane.py``) is refused with
+        ``code: 'eval_lane_contained'`` right after the identity gate, before
+        any read; a member whose own record carries eval-lane provenance is
+        refused the same way right after the member read, whatever the
+        *task_id*.  Both precede the create AND the fold path, so an eval-lane
+        record can never be minted into, or folded into, a production L2.
+        Close the eval-lane member L1s with ``close_only`` instead.
 
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
@@ -3040,6 +3364,10 @@ def create_server(
 
             {'error': '<reason>'}
 
+        Eval-lane refusal (see **Eval-lane refusal**)::
+
+            {'error': '<reason and next action>', 'code': 'eval_lane_contained'}
+
         Sentinel-bound refusal (see **Sentinel-bound members**)::
 
             {'error': '<reason>', 'code': 'sentinel_task_id_required',
@@ -3055,6 +3383,19 @@ def create_server(
                 'error': f'identity {identity!r} is not permitted to mint L2 escalations',
                 'code': 'level_forbidden',
             }
+
+        # The caller's task_id is judged here, before any read; each member's
+        # own record is judged right after the member read below.
+        eval_lane_reason = eval_lane_provenance(task_id)
+        if eval_lane_reason is not None:
+            logger.warning(
+                'promote_to_l2 refused: eval-lane task_id=%r (%s); members=%s '
+                'root_cause=%r',
+                task_id, eval_lane_reason, member_ids, root_cause,
+            )
+            return _eval_lane_refusal(
+                f'task_id {task_id!r} is an eval-lane artifact ({eval_lane_reason})'
+            )
 
         # Validate required non-empty fields
         if not member_ids:
@@ -3123,11 +3464,24 @@ def create_server(
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
                     _sentinel_bound_task_ids(members),
+                    _eval_lane_members(members),
                 )
 
-            derived, existing_id, required_task_ids = await asyncio.to_thread(
-                _read_for_promote,
-            )
+            (
+                derived, existing_id, required_task_ids, eval_lane_members,
+            ) = await asyncio.to_thread(_read_for_promote)
+
+            if eval_lane_members:
+                logger.warning(
+                    'promote_to_l2 refused: eval-lane members %s under task_id=%r '
+                    'root_cause=%r',
+                    eval_lane_members, task_id, root_cause,
+                )
+                named = ', '.join(
+                    f'{member_id} ({reason})'
+                    for member_id, reason in eval_lane_members.items()
+                )
+                return _eval_lane_refusal(f'member(s) {named} are eval-lane artifacts')
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.
@@ -3440,8 +3794,8 @@ def create_server(
             arm: a foreign or pre-restart merger owns the tree, so there is no
             in-process entry, no retention alias, and no waiter).  The returned
             ``request_id`` was never enqueued and ``merge_status`` on it
-            resolves ``'unknown'`` — poll by branch / ``get_merge_queue``, and
-            do NOT read a first-tick ``'unknown'`` as a terminal failure.
+            resolves ``'no_record'`` — poll by branch / ``get_merge_queue``, and
+            do NOT read a first-tick ``'no_record'`` as a terminal failure.
 
           ``pollable`` is the boolean shorthand ``poll_by != 'branch'`` — i.e.
           "this response carries a handle naming the in-flight merge".  Both
@@ -3516,11 +3870,13 @@ def create_server(
         from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
             branch_is_degenerate,
         )
+        from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
+            WaiterRecord,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
             QueuedBranch,
-            WaiterRecord,
             coalesce_or_enqueue_merge_request,
             patch_content_contained,
         )
@@ -3869,9 +4225,8 @@ def create_server(
         # between req.snapshot_tip and the in-flight entry's snapshot_tip.  When
         # git_ops_for_scan is None (standalone / tests without orchestrator) the
         # classifier is also None and the recency check is a no-op (back-compat).
-        # retention: write-side counterpart of the Tier-2 reads in
-        # _durable_terminal_state (merge_status) and the
-        # retire_cancelled_merge_request call in merge_cancel — populates the
+        # retention: the ring merge_cancel's retire_cancelled_merge_request
+        # clears (merge_status no longer reads it) — populates the
         # ring via enqueue_merge_request's _on_finalized callback (dispatch
         # arm) and registers a record_alias entry for coalesced ids.  Always
         # None today (no production path yet assigns
@@ -4009,7 +4364,7 @@ def create_server(
             # disk-scan (source='worktree') arm registers no retention alias and
             # no waiter — the _waiters registration below is AFTER this early
             # return — so on that arm `request_id` is the submitting request's
-            # own never-enqueued id and merge_status on it resolves 'unknown'.
+            # own never-enqueued id and merge_status on it resolves 'no_record'.
             # Derived from the handles actually present rather than from
             # `source`, so this stays correct if a future arm gains or loses
             # alias registration, and so the legacy registry entry (no
@@ -4577,36 +4932,6 @@ def create_server(
 
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
-    _MERGE_STATUS_UNKNOWN_HINT = 'check git log main'
-
-    # Optional fields that _durable_terminal_state threads into the meta dict
-    # when present and non-None.  Add future terminal-metadata fields here so
-    # every tier stays in sync automatically.
-    _OPTIONAL_TERMINAL_META_FIELDS: tuple[str, ...] = ('superseded_by', 'reason')
-
-    def _epoch_to_iso8601(ts: float) -> str:
-        """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
-        return datetime.fromtimestamp(ts, tz=UTC).isoformat()
-
-    def _map_terminal_state(raw: str) -> MergeState:
-        """Map a raw terminal MergeOutcome.status / 'abandoned' / 'error' to coarse vocabulary.
-
-        The *input* raws are MergeSubmitStatus values (plus 'abandoned', which
-        only ever originates here); the *output* is the poll vocabulary
-        ``shared.merge_state.MergeState``.  Which raw maps where is unchanged.
-        """
-        if raw in ('done', 'done_wip_recovery', 'already_merged'):
-            return MergeState.done
-        if raw == 'conflict':
-            return MergeState.conflict
-        if raw == 'abandoned':
-            return MergeState.abandoned
-        if raw == 'superseded':
-            return MergeState.superseded
-        # blocked / wip_halted / wip_recovery_no_advance / unmerged_state /
-        # stash_failed / unknown_branch / error → blocked
-        return MergeState.blocked
-
     def _map_live_state(raw: str) -> MergeState | str:
         """Map a live snapshot state to the public merge_status vocabulary.
 
@@ -4627,78 +4952,145 @@ def create_server(
             return MergeState.finalizing
         return raw  # pass through unknown states unchanged (see docstring)
 
-    def _durable_terminal_state(
-        request_id: str | None,
-        branch: str | None = None,
-        task_id: str | None = None,
-    ) -> tuple[str, dict] | None:
-        """Consult durable terminal tiers (retention ring → event store).
+    def _live_answer(key: _PollKey) -> MergeStatusAnswer | None:
+        worker = _get_merge_worker(harness)
+        if worker is None or not hasattr(worker, 'snapshot'):
+            return None
+        try:
+            matches = [
+                e for e in worker.snapshot().get('entries', [])
+                if e.get('waiter_alive', True)
+                and key.matches(e.get('request_id'), e.get('branch'), e.get('task_id'))
+            ]
+            if not matches:
+                return None
+            entry = max(matches, key=lambda e: e.get('enqueued_at', 0))
+            state = _map_live_state(entry['state'])
+        except Exception as exc:
+            logger.warning('merge_status: snapshot() failed', exc_info=True)
+            raise _ProbeFailed(MergeStatusSource.live) from exc
+        eta = None
+        if merge_inflight_registry is not None:
+            with contextlib.suppress(Exception):
+                eta = merge_inflight_registry.eta_seconds(entry['branch'])
+        return MergeStatusAnswer.outcome(
+            source=MergeStatusSource.live,
+            fields={
+                'state': state,
+                'request_id': entry.get('request_id'),
+                'position': entry.get('position'),
+                'enqueued_at': entry.get('enqueued_at'),
+                'eta_seconds': eta,
+            },
+        )
 
-        Shared implementation of merge_status Tiers 2–3 and merge_cancel's
-        waiter-absent resolution — keeps both tools' tier ordering and state
-        vocabulary in sync.
-
-        Returns ``(coarse_state, meta)`` when a durable record is found, else
-        ``None``.  *meta* is a dict with keys:
-            request_id  — the id from the resolved record (may differ from the
-                          input request_id when resolved via branch/task_id).
-            outcome     — raw state string from the record.
-            finished_at — ISO-8601 string (ring records are normalised from their
-                          epoch-float via _epoch_to_iso8601; event-store rows are
-                          already strings).
-
-        Tier 1 (live snapshot) is intentionally omitted — callers that need it
-        handle it themselves.  merge_cancel intentionally skips Tier 1 because a
-        request absent from _waiters cannot be a live waiter of this server (a
-        live entry's future is still pending and thus still registered).
-        """
-        # Tier 2: retention ring (request_id > branch > task_id precedence).
-        # request_id lookup also resolves aliases registered via record_alias()
-        # (e.g. coalesced ids that never get their own terminal record).
-        # finished_at is stored as epoch float; normalise to ISO-8601 so the
-        # same logical merge returns the same type regardless of which tier serves it.
-        ring = _get_terminal_retention(harness)
-        if ring is not None:
-            if request_id is not None:
-                rec = ring.get(request_id)
-            elif branch is not None:
-                rec = ring.get_by_branch(branch)
-            elif task_id is not None:
-                rec = ring.get_by_task(task_id)
-            else:
-                rec = None
-            if rec is not None:
-                meta: dict = {
-                    'request_id': rec.request_id,
-                    'outcome': rec.state,
-                    'finished_at': _epoch_to_iso8601(rec.finished_at),
-                }
-                for _f in _OPTIONAL_TERMINAL_META_FIELDS:
-                    _v = getattr(rec, _f, None)
-                    if _v is not None:
-                        meta[_f] = _v
-                return _map_terminal_state(rec.state), meta
-
-        # Tier 3: event store (supports all three lookup keys).
-        if event_store is not None:
-            row = event_store.latest_merge_finalized(
-                request_id=request_id,
-                branch=branch,
-                task_id=task_id,
+    def _current_run_answer(key: _PollKey) -> MergeStatusAnswer | None:
+        if event_store is None:
+            return None
+        row = event_store.latest_merge_finalized(
+            request_id=key.request_id, branch=key.branch, task_id=key.task_id,
+        )
+        if row is None and key.request_id is not None:
+            row = event_store.merge_finalized_absorbing(key.request_id)
+        if row is None:
+            return None
+        if not row['is_current_run']:
+            raise ValueError(
+                f"D2: the current-run tier read run {row['run_id']!r}'s row for {key}"
             )
-            if row is not None:
-                es_meta: dict = {
-                    'request_id': row['request_id'],
-                    'outcome': row['state'],
-                    'finished_at': row['finished_at'],
-                }
-                for _f in _OPTIONAL_TERMINAL_META_FIELDS:
-                    _v = row.get(_f)
-                    if _v is not None:
-                        es_meta[_f] = _v
-                return _map_terminal_state(row['state']), es_meta
+        fields: dict[str, Any] = {
+            'state': map_terminal_state(row['state']),
+            'request_id': row['request_id'],
+            'outcome': row['state'],
+            'finished_at': row['finished_at'],
+        }
+        for name in ('superseded_by', 'reason'):
+            if row.get(name) is not None:
+                fields[name] = row[name]
+        return MergeStatusAnswer.outcome(source=MergeStatusSource.event_store, fields=fields)
 
+    async def _git_verdict(key: _PollKey) -> git_authority.GitAuthorityVerdict | None:
+        git_ops = getattr(harness, 'git_ops', None) if harness is not None else None
+        if git_ops is None or orch_config is None or key.landing_key is None:
+            return None
+        return await git_authority.probe_landing(
+            git_ops, key.landing_key, orch_config=orch_config, harness=harness,
+        )
+
+    def _journal_entry(key: _PollKey) -> PersistedMergeRequest | None:
+        journal = _get_merge_journal(harness)
+        if journal is None:
+            return None
+        try:
+            entries = journal.load()
+        except Exception as exc:
+            logger.warning('merge_status: merge journal load() failed', exc_info=True)
+            raise _ProbeFailed(MergeStatusSource.journal) from exc
+        matches = [e for e in entries if key.matches(e.request_id, e.branch, e.task_id)]
+        return max(matches, key=lambda e: e.enqueued_at) if matches else None
+
+    def _durable_history(key: _PollKey) -> _DurableHistory | None:
+        if event_store is None:
+            return None
+        row = event_store.latest_merge_finalized(
+            request_id=key.request_id, branch=key.branch, task_id=key.task_id,
+            cross_run=True,
+        )
+        if row is None and key.request_id is not None:
+            row = event_store.merge_finalized_absorbing(key.request_id, cross_run=True)
+        if row is not None:
+            return _DurableHistory(row, MergeReason.prior_run_terminal)
+        if key.request_id is not None:
+            members = event_store.merge_finalized_superseded_by(key.request_id, cross_run=True)
+            if members:
+                return _DurableHistory(members[-1], MergeReason.coalesce_train_id)
         return None
+
+    async def _walk_durable(
+        key: _PollKey, history: _DurableHistory | None,
+    ) -> MergeStatusAnswer:
+        current = _current_run_answer(key)
+        if current is not None:
+            return current
+        verdict = await _git_verdict(key)
+        outcome = verdict.outcome if verdict is not None else None
+        if outcome is git_authority.GitAuthorityOutcome.probe_failed:
+            raise _ProbeFailed(MergeStatusSource.git)
+        if (verdict is not None and verdict.merge_sha is not None
+                and outcome is git_authority.GitAuthorityOutcome.found_on_main):
+            return MergeStatusAnswer.outcome(
+                source=MergeStatusSource.git,
+                fields=git_authority.found_on_main_response(key.request_id, verdict.merge_sha),
+            )
+
+        def reason(own: MergeReason) -> MergeReason:
+            if outcome is git_authority.GitAuthorityOutcome.landed_unconfirmed:
+                return MergeReason.landing_unattributable
+            return own
+
+        entry = _journal_entry(key)
+        if entry is not None:
+            return MergeStatusAnswer.epistemic(
+                MergeState.journaled, reason(MergeReason.journaled_not_live),
+                entry.request_id, fields={'enqueued_at': entry.enqueued_at},
+            )
+        if history is not None:
+            return MergeStatusAnswer.epistemic(
+                MergeState.stale_record, reason(history.reason), key.request_id,
+            )
+        return MergeStatusAnswer.epistemic(
+            MergeState.no_record, reason(MergeReason.never_submitted), key.request_id,
+        )
+
+    async def _resolve(key: _PollKey) -> MergeStatusAnswer:
+        """Walk the tiers, live first; the first probe that raises ends it as unknown."""
+        history = _durable_history(key)
+        try:
+            answer = _live_answer(key) or await _walk_durable(key, history)
+        except _ProbeFailed as failure:
+            answer = failure.answer_for(key)
+        last_outcome = LastOutcome.from_row(history.row) if history is not None else None
+        return answer.with_last_outcome(last_outcome)
 
     @mcp.tool()
     async def merge_status(
@@ -4709,143 +5101,30 @@ def create_server(
         """Return the current merge state for a merge request.
 
         Accepts one of: request_id (authoritative), branch (most-recent), or
-        task_id (most-recent).  Lookup order:
+        task_id (most-recent).  Tiers, by strength of claim
+        (``plans/merge-status-durable-non-landed-prd.md`` D5):
 
-            live snapshot → retention ring → event store
-            → git-authority (is_ancestor / find_merge_marker against main)
-            → {state:'unknown', hint}
+            live snapshot → event store (this run) → git authority
+            → durable journal → event store (prior runs) → no_record
 
-        The git-authority tier (Tier-3.5) fires when the durable tiers miss,
-        and is skipped entirely when ``harness.git_ops`` or ``orch_config``
-        are absent.  Its guards, their ordering and its fire-safety live in
-        ``escalation/src/escalation/git_authority.py::probe_landing`` and are
-        NOT restated here — merge_status only RENDERS the verdict it returns:
-        a ``found_on_main`` outcome becomes the done response below, while
-        BOTH ``landed_unconfirmed`` and ``no_signal`` become the Tier-4
-        unknown.  What a returned ``merge_sha`` may be stamped as, and the
-        one config setting that weakens it, are stated once in
-        ``escalation/src/escalation/git_authority.py::found_on_main_response``.
+        The first tier that answers wins; the first probe that RAISES ends the
+        walk as ``unknown`` with ``source`` naming that tier.  The git tier
+        only consumes ``escalation/src/escalation/git_authority.py::probe_landing``'s
+        verdict and needs a branch or task_id plus ``harness.git_ops`` and
+        ``orch_config``.  The newest durable row of ANY run is attached to every
+        answer as ``last_outcome`` (D4).
 
-        Returns a dict with at minimum:
-            state, request_id, generation (always 1 in α3).
-
-        ``state`` is a member of ``shared.merge_state.MergeState`` — LIVE_STATES
-        on the Tier-1 path, TERMINAL_STATES on Tiers 2-3.5, ``unknown`` on Tier
-        4.  That module is the single source of truth for the vocabulary; no
-        enumeration is restated here.  ONE EXCEPTION: ``_map_live_state`` passes
-        an UNRECOGNISED worker state through as a bare ``str`` (deliberate
-        fail-open — see its docstring), so ``state`` is not unconditionally a
-        MergeState instance.  It is always a ``str`` either way.
-
-        Live entries also carry: position, enqueued_at, eta_seconds.
-        Terminal entries carry: outcome (raw state), finished_at.
-        git-authority terminal shape: state='done', kind='found_on_main',
-            merge_sha=<a commit ON MAIN — the discovered citation or the
-            merge marker; see
-            ``escalation/src/escalation/git_authority.py::found_on_main_response``>,
-            outcome='found_on_main'.
-        Unknown carries: hint.
+        The response shape, its ``source``/``reason``/``hint`` vocabulary and
+        the invariants every answer is checked against live in
+        ``escalation/src/escalation/merge_status_answer.py``.  A breached
+        invariant raises ValueError naming it: a server defect, surfaced as a
+        tool error, never dressed up as an answer.
         """
-        # Validation — at least one key required
         if request_id is None and branch is None and task_id is None:
             return {'error': 'At least one of request_id, branch, or task_id is required'}
 
-        # Tier 1: live snapshot — wrapped fire-safe so a transient worker-introspection
-        # failure degrades to the durable tiers rather than erroring the read-only probe.
-        worker = _get_merge_worker(harness)
-        if worker is not None and hasattr(worker, 'snapshot'):
-            try:
-                snap = worker.snapshot()
-                entries = snap.get('entries', [])
-                entry = None
-                if request_id is not None:
-                    entry = next(
-                        (e for e in entries if e.get('request_id') == request_id), None
-                    )
-                else:
-                    # Most-recent by enqueued_at for branch / task_id
-                    candidates = [
-                        e for e in entries
-                        if (branch is not None and e.get('branch') == branch)
-                        or (task_id is not None and e.get('task_id') == task_id)
-                    ]
-                    if candidates:
-                        entry = max(candidates, key=lambda e: e.get('enqueued_at', 0))
-                if entry is not None:
-                    eta = None
-                    if merge_inflight_registry is not None:
-                        with contextlib.suppress(Exception):
-                            eta = merge_inflight_registry.eta_seconds(entry['branch'])
-                    return {
-                        'state': _map_live_state(entry['state']),
-                        'request_id': entry.get('request_id'),
-                        'generation': 1,
-                        'position': entry.get('position'),
-                        'enqueued_at': entry.get('enqueued_at'),
-                        'eta_seconds': eta,
-                    }
-            except Exception:
-                logger.warning('merge_status: snapshot() failed, falling through to durable tiers',
-                               exc_info=True)
-
-        # Tiers 2–3: durable tiers (retention ring → event store).
-        # _durable_terminal_state owns the tier logic shared with merge_cancel.
-        durable = _durable_terminal_state(request_id, branch, task_id)
-        if durable is not None:
-            coarse_state, meta = durable
-            resp: dict = {
-                'state': coarse_state,
-                'request_id': meta['request_id'],
-                'generation': 1,
-                'outcome': meta['outcome'],
-                'finished_at': meta['finished_at'],
-            }
-            if meta.get('superseded_by') is not None:
-                resp['superseded_by'] = meta['superseded_by']
-            if meta.get('reason') is not None:
-                resp['reason'] = meta['reason']
-            return resp
-
-        # Tier 3.5: git-authority — probe main directly when no durable record exists.
-        # Obtain git_ops via the same accessor as the merge_request fast-path (server.py:766).
-        # Guards: git_ops present AND orch_config present AND a resolvable key (branch or
-        # task_id).  Any absent → straight to honest Tier-4 unknown (unchanged behaviour).
-        # FIRE-SAFE: the entire probe is try/except Exception so a git failure degrades to
-        # the honest unknown rather than raising.  Mirrors the Tier-1 snapshot fire-safe
-        # wrapper at server.py:1278.
-        git_ops = getattr(harness, 'git_ops', None) if harness is not None else None
-        if git_ops is not None and orch_config is not None:
-            key = branch if branch is not None else task_id
-            if key is not None:
-                verdict = await git_authority.probe_landing(
-                    git_ops, key, orch_config=orch_config, harness=harness,
-                )
-                # `merge_sha is not None` is belt-and-braces: found_on_main
-                # always carries one, but found_on_main_response's merge_sha
-                # is a hard `str`, so a contract violation must degrade to
-                # Tier-4 unknown rather than emit a `done` with a null sha.
-                if (verdict.outcome is git_authority.GitAuthorityOutcome.found_on_main
-                        and verdict.merge_sha is not None):
-                    return git_authority.found_on_main_response(
-                        request_id, verdict.merge_sha,
-                    )
-                # `landed_unconfirmed` and `no_signal` BOTH fall through to the
-                # UNCHANGED bare Tier-4 unknown below.  Collapsing them here is
-                # deliberate and is what makes this extraction
-                # behaviour-preserving: the two are genuinely different
-                # propositions (see GitAuthorityVerdict), but the merge_status
-                # response vocabulary belongs to task 4831
-                # (plans/merge-status-durable-non-landed-prd.md label β), which
-                # splits them onto its epistemic states and reason codes.  Do
-                # not add a response field here to carry the distinction.
-
-        # Tier 4: honest unknown
-        return {
-            'state': MergeState.unknown,
-            'request_id': request_id,
-            'generation': 1,
-            'hint': _MERGE_STATUS_UNKNOWN_HINT,
-        }
+        key = _PollKey(request_id=request_id, branch=branch, task_id=task_id)
+        return (await _resolve(key)).to_response()
 
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
@@ -4857,10 +5136,15 @@ def create_server(
         returned by merge_request).  Returns a dict with three fields:
 
             cancelled (bool)  — True only when a pending waiter was successfully cancelled.
-            state     (str)   — Coarse terminal state; always a member of
-                                ``shared.merge_state.MergeState``.
+            state     (str)   — A ``shared.merge_state.MergeState`` member, except
+                                that the live branch relays merge_status's live
+                                state verbatim, including its deliberate
+                                forward-compatible passthrough of an unmapped worker
+                                state (escalation/src/escalation/server.py::_map_live_state).
                                 merge-state-vocab:begin partition=CANCEL_STATES
-                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' | 'unknown'
+                                'queued' | 'verifying' | 'gate' | 'finalizing' |
+                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' |
+                                'no_record' | 'stale_record' | 'journaled' | 'unknown'
                                 merge-state-vocab:end
                                 Source of truth: shared/src/shared/merge_state.py::CANCEL_STATES.
                                 The span above is machine-pinned to it by
@@ -4869,19 +5153,25 @@ def create_server(
                                 the partition, not this list.
             reason    (str|None) — None on success; non-None string on every other path.
 
-        Branch order (all paths return — never raises):
-          1. Waiter absent from _waiters (finalized+popped, never submitted, or server
-             restarted): consult durable tiers via _durable_terminal_state (shared with
-             merge_status Tiers 2–3: retention ring → event_store) to distinguish
-             'already-terminal' from truly 'unknown'.  Note: coalesced submissions
-             (in_flight / attached paths in merge_request) do not register a separate
-             waiter — callers holding a coalesced id will resolve to 'unknown' here;
-             use the in-flight request_id (inflight_task_id / merge_status) to cancel.
+        Branch order (every path returns; the one raise is a breached
+        merge_status_answer.py invariant on path 1, which surfaces as a tool
+        error naming it — a server defect, never a cancel outcome):
+          1. Waiter absent from _waiters (finalized+popped, never submitted, server
+             restarted, a coalesced id, or a request this server never held): resolve
+             the request_id through merge_status's walk (live → current run → journal →
+             prior runs → no_record; git needs a branch, so it is skipped).  A live hit
+             means the worker holds the request but this server has no waiter for it:
+             cancelled False with the live state, not cancellable here.  A current-run
+             outcome returns that state with 'Request already finalized; cannot
+             cancel.'; an epistemic answer returns its state with the reason's hint.
+             Coalesced submissions (in_flight / attached paths in merge_request) do
+             not register a separate waiter — use the in-flight request_id
+             (inflight_task_id / merge_status) to cancel.
           2. Waiter present, future already cancelled (idempotent double-cancel):
              {cancelled: False, state: 'abandoned', reason: ...}.
           3. Waiter present, future resolved-but-not-cancelled (mid-finalize window, i.e.
              worker delivered an outcome but the _waiters.pop done-callback hasn't run yet):
-             {cancelled: False, state: <coarse terminal via _map_terminal_state>, reason: ...}.
+             {cancelled: False, state: <coarse terminal via map_terminal_state>, reason: ...}.
              Excepted futures (abnormal) map to state='blocked'.
           4. Waiter present, future pending: cancel the future, then FULLY RETIRE
              the entry (release the branch slot, reap the in-flight worktree via
@@ -4903,36 +5193,44 @@ def create_server(
         work item at its next checkpoint via the cancel→worker CancelledError seam.
         Because retirement yields the loop (the C1 removal is awaited), the
         merge_request _waiters.pop done-callback fires during the first cancel, so an
-        immediate double-cancel finds rec=None and resolves via _durable_terminal_state.
+        immediate double-cancel finds rec=None and resolves via the current-run tier:
+        the live tier ignores the worker's cancelled (waiter_alive False) entry.
 
         The tool is async so that future mutation runs on the event loop (not a FastMCP
         threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
-        contains no await, preserving loop-synchronous race-freedom (I10) — the only
-        awaits are AFTER cancel, inside retirement.
+        contains no await, preserving loop-synchronous race-freedom (I10) — on the
+        waiter-present paths the only awaits are AFTER cancel, inside retirement.
         """
         rec = _waiters.get(request_id)
 
         if rec is None:
-            # No live waiter — finalized+popped, never submitted, or server restarted.
-            # Consult durable tiers to distinguish 'already-terminal' from truly 'unknown'.
-            durable = _durable_terminal_state(request_id)
-            if durable is not None:
-                coarse_state, _ = durable
+            answer = await _resolve(_PollKey(request_id=request_id))
+            if answer.reason is not None:
                 return {
                     'cancelled': False,
-                    'state': coarse_state,
-                    'reason': 'Request already finalized; cannot cancel.',
+                    'state': answer.state,
+                    'reason': (
+                        f'No in-flight waiter for request_id {request_id!r}: '
+                        + hint_for(answer.reason)
+                    ),
+                }
+            if answer.source is MergeStatusSource.live:
+                return {
+                    'cancelled': False,
+                    'state': answer.state,
+                    'reason': (
+                        f'Request {request_id!r} is in the live merge queue, but this '
+                        'server holds no waiter for it, so it cannot be cancelled '
+                        "here: merge_cancel only cancels requests submitted through "
+                        "this server's merge_request that are still awaiting an "
+                        'outcome (for example, a workflow-enqueued or startup-'
+                        'recovered request has no such waiter).'
+                    ),
                 }
             return {
                 'cancelled': False,
-                'state': MergeState.unknown,
-                'reason': (
-                    f'No in-flight waiter for request_id {request_id!r} '
-                    '(already finalized, never submitted, server restarted, or this id '
-                    'was coalesced onto an in-flight request — coalesced requests share '
-                    "the in-flight entry's request_id and do not register a separate "
-                    'waiter; use the in-flight request_id to cancel).'
-                ),
+                'state': answer.state,
+                'reason': 'Request already finalized; cannot cancel.',
             }
 
         if rec.future.cancelled():
@@ -4950,7 +5248,7 @@ def create_server(
             if rec.future.exception() is not None:
                 state: MergeState | str = MergeState.blocked
             else:
-                state = _map_terminal_state(rec.future.result().status)
+                state = map_terminal_state(rec.future.result().status)
             return {
                 'cancelled': False,
                 'state': state,

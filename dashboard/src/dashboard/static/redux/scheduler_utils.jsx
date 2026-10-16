@@ -4,7 +4,7 @@
    consumers can destructure from the global.
 
    Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo,
-             disambiguateLabels, labelFor, lockChipState }
+             disambiguateLabels, labelFor, lockChipState, lockChipStateFor }
    (Canonical list: the window.DF_SCHED_UTILS assignment at the bottom of this file.)
 */
 
@@ -111,12 +111,13 @@ function labelFor(paths) {
   return disambiguateLabels(paths || []);
 }
 
-// Compute the visual state for a module-lock chip.
-// Encodes the holder > parked > free precedence so both LockChip (tabs.jsx)
-// and the inline Task-detail chip (tab_tasks.jsx) can call this pure helper
-// instead of duplicating the if/else-if chain.
+// The single lock classifier: the holder > parked > free precedence, read by
+// LockChip (tabs.jsx), the Task-detail chips (tab_tasks.jsx) and the Scheduler
+// heatmap's cellStateFor (scheduler_heatmap.jsx), so one lock reads the same in
+// all three.
 // Returns { cls, hint, ownerLabel } where ownerLabel is null when the chip has
 // no owner to display (lock-free or lock-mine without a counterpart label).
+// Callers holding a SCHEDULER.modules entry go through lockChipStateFor.
 function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {
   if (holder) {
     if (isMine) return { cls: 'lock-mine', hint: 'held by this task', ownerLabel: null };
@@ -129,4 +130,17 @@ function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {
   return { cls: 'lock-free', hint: 'available', ownerLabel: null };
 }
 
-window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipState };
+// lockChipState for one task's view of one SCHEDULER.modules entry (or none):
+// the one place a lock is decided to be "mine" — held by this task id in this
+// project, an entry with no holder_project read as the task's own project.
+function lockChipStateFor(module, taskId, project) {
+  const m = module || {};
+  return lockChipState({
+    holder: m.holder,
+    isMine: Boolean(m.holder) && m.holder === taskId && (m.holder_project || project) === project,
+    parkedBy: m.parked_by,
+    parkedOwnerLive: m.parked_owner_live,
+  });
+}
+
+window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipState, lockChipStateFor };

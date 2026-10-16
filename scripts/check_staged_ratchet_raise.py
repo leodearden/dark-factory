@@ -54,16 +54,18 @@ from pathlib import Path
 
 try:
     import merge_lane_metrics as metrics  # type: ignore[import-not-found]
+    import source_measures  # type: ignore[import-not-found]
 except ImportError as exc:  # pragma: no cover - exercised by the hook, not pytest
-    # LOUD, never a silent skip (INV-11). A gate that disarms itself when its
-    # environment is wrong reproduces in a new place the exact defect it exists
-    # to close: `merge_lane_metrics` imports `shared.safe_io` at module scope,
-    # so plain python3 needs `shared` importable.
+    # LOUD, never a silent skip (INV-11). The instrument binds this checkout's
+    # workspace members through scripts/_checkout.py, whose CheckoutBindingError
+    # is an ImportError, so an unbindable checkout lands here as exit 2 too.
     print(
-        'ratchet commit gate: cannot import merge_lane_metrics '
+        'ratchet commit gate: cannot import its instrument '
         f'({exc.__class__.__name__}: {exc}). This gate does not skip itself -- '
-        'run the commit from a shell whose python3 can import `shared` (the '
-        "checkout's .venv), or repair that environment.",
+        "the instrument binds this checkout's workspace members through "
+        'scripts/_checkout.py, so the fault is the file or module named above '
+        "(e.g. the checkout's pyproject.toml or a member's src/), not which "
+        'virtualenv the shell has active.',
         file=sys.stderr,
     )
     raise SystemExit(2) from exc
@@ -449,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root)
     try:
         return _audit(root)
-    except metrics.MetricsError as exc:
+    except source_measures.MetricsError as exc:
         # A named cause on one line, never a traceback: a traceback reads as a
         # broken tool and sends the committer hunting the wrong thing.
         print(f'ratchet commit gate: {exc}', file=sys.stderr)

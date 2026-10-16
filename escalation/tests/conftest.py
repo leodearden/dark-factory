@@ -21,6 +21,7 @@ everything else is loaded from the actual source files.
 
 from __future__ import annotations
 
+import ast
 import collections
 import sys
 import types
@@ -62,6 +63,31 @@ _REPO_ROOT = Path(__file__).parent.parent.parent
 _SHARED_SRC = _REPO_ROOT / 'shared' / 'src'
 _ORCH_SRC = _REPO_ROOT / 'orchestrator' / 'src'
 
+def _checkpoint_result_stub(async_base_source: Path) -> type:
+    """A namedtuple mirroring the real ``CheckpointResult`` NamedTuple, read from source.
+
+    The real module imports aiosqlite, so it cannot be imported here; parsing
+    its source keeps the stub's fields and defaults single-sourced instead of
+    hand-mirrored.  Every annotated name counts as a field, ``ClassVar``
+    included: ``NamedTuple`` never exempts one (it rejects a live ``ClassVar``
+    and, under the module's string annotations, makes it a field).
+    """
+    tree = ast.parse(async_base_source.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == 'CheckpointResult':
+            fields = [
+                (stmt.target.id, stmt.value)
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            ]
+            return collections.namedtuple(
+                'CheckpointResult',
+                [name for name, _ in fields],
+                defaults=[ast.literal_eval(value) for _, value in fields if value is not None],
+            )
+    raise RuntimeError(f'CheckpointResult not found in {async_base_source}')
+
+
 if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
     # Stub ``shared`` package before adding shared/src to sys.path so that
     # Python never executes ``shared/__init__.py`` (which imports aiosqlite,
@@ -77,7 +103,7 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
     # Provide minimal stubs so orchestrator modules that import these can load.
     if 'shared.async_sqlite_base' not in sys.modules:
         _async_base_stub = types.ModuleType('shared.async_sqlite_base')
-        _CheckpointResult = collections.namedtuple('CheckpointResult', ['log', 'checkpointed'])
+        _CheckpointResult = _checkpoint_result_stub(_SHARED_SRC / 'shared' / 'async_sqlite_base.py')
         # Populate via __dict__.update: pyright rejects attribute assignment on a
         # bare ModuleType instance (reportAttributeAccessIssue), but a module
         # namespace is a plain dict[str, Any], so this is runtime-equivalent and

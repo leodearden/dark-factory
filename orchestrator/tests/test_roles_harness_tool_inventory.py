@@ -183,6 +183,7 @@ NON_TOOL_TERMS = frozenset({
     'GitOps',
     'Hypothesis',
     'InputValidationError',
+    'Memory',
     'NotImplementedError',
 })
 

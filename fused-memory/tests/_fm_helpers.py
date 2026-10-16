@@ -1,10 +1,13 @@
-"""Non-fixture test helpers for fused-memory tests.
+"""Shared test helpers for fused-memory tests, imported by name.
 
 Lives outside conftest.py to avoid the `sys.modules['conftest']` collision
 that arises when root-level pytest loads multiple subprojects' conftests in
 the same process.  Each subproject exports its helpers under a unique
 module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
+
+An opt-in fixture defined here applies only to the modules that import it
+by name (see `lease_dir_fixture`).
 """
 
 import asyncio
@@ -16,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -25,6 +29,7 @@ import warnings
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,12 +37,12 @@ import httpx
 import pytest
 from openai import RateLimitError
 from pydantic import BaseModel
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.graphiti_client import (
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-    INCOMPLETE_STRUCTURAL_KINDS,
+    INCOMPLETE_KINDS,
     PagedRead,
+    ReadCompleteness,
 )
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
@@ -154,6 +159,7 @@ class MockEdge:
     # A restored edge keeps it with `invalid_at` cleared; the double carries it so
     # tests can express that signature (task 4714).
     expired_at: Any = None
+    created_at: Any = None
 
 
 @dataclass
@@ -322,11 +328,6 @@ def extract_params(call_args: Any) -> dict:
 # projects into stats — so the two must be settable independently.
 # ---------------------------------------------------------------------------
 
-_KNOWN_INCOMPLETE_KINDS: frozenset[str] = INCOMPLETE_STRUCTURAL_KINDS | {
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-}
-
 
 def complete_paged_read(
     *, rows_seen: int = 0, expected_rows: int | None = None
@@ -356,7 +357,7 @@ def incomplete_paged_read(
 ) -> PagedRead:
     """A PagedRead reporting an INCOMPLETE enumeration of the given kind.
 
-    `kind` is validated against the four `INCOMPLETE_*` constants rather than
+    `kind` is validated against `INCOMPLETE_KINDS` rather than
     taken on trust: a typo'd kind string matches no policy branch, so it would
     quietly behave like a complete read and the test would pass for the wrong
     reason.
@@ -365,9 +366,9 @@ def incomplete_paged_read(
     mirroring the real backend's shape closely enough that an assertion on the
     reason reaching an operator-facing message is meaningful.
     """
-    assert kind in _KNOWN_INCOMPLETE_KINDS, (
+    assert kind in INCOMPLETE_KINDS, (
         f'unknown incomplete_kind {kind!r}; expected one of '
-        f'{sorted(_KNOWN_INCOMPLETE_KINDS)}'
+        f'{sorted(INCOMPLETE_KINDS)}'
     )
     if reason is None:
         reason = (
@@ -383,6 +384,11 @@ def incomplete_paged_read(
         reason=reason,
         incomplete_kind=kind,
     )
+
+
+#: The verdict for a proven-complete read, for the StaleSummaryResult fields a
+#: test does not care about (task 4914).
+COMPLETE_READ = ReadCompleteness(complete=True, incomplete_kind=None)
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +645,12 @@ async def submit_and_resolve(
         f'submit_and_resolve: ticket {ticket!r} resolved with no result_json '
         f'(resolve_result={resolve_result!r})'
     )
+
+
+#: The documented-safe MCP tool-response size, in serialised chars. Derived in
+#: test_get_statuses_pagination.py::test_auto_page_limit_fits_documented_safe_envelope
+#: (see also server/tools.py::_STATUSES_AUTO_PAGE_LIMIT).
+MCP_SAFE_RESPONSE_CHARS = 62_000
 
 
 # ---------------------------------------------------------------------------
@@ -1590,6 +1602,60 @@ def _init_git_repo(path) -> str:
     ).stdout.strip()
 
 
+def make_db_without_claimant_columns(db_path: pathlib.Path, *, status: str = 'pending') -> None:
+    """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
+
+    Simulates a connection whose claimant columns never got ALTERed in —
+    e.g. a routine orchestrator restart racing ahead of the fused-memory
+    deploy that ships this migration. Opening it runs only the v2->v3
+    candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
+    and is skipped for an already-v2 DB), so the claimant columns stay
+    absent, exercising set_task_status's fail-safe (WARNING, no error) path.
+
+    ``status`` seeds the single row's status column (default ``'pending'``,
+    matching every pre-existing caller); pass e.g. ``'done'`` to exercise
+    the fail-safe path on an already-terminal row.
+    """
+    import sqlite3
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO tasks (tag, id, title, status, updated_at) "
+        "VALUES ('master', 1, 'stranded-shape task', ?, '2026-01-01T00:00:00.000Z')",
+        (status,),
+    )
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+
 def _make_rate_limit_error(
     message: str = 'Rate limit exceeded.',
     code: str = 'insufficient_quota',
@@ -1966,6 +2032,96 @@ def load_script_module(
     return module
 
 
+def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to, holding one task row.
+
+    This is the shape ``target_store_preflight``'s guard reads -- a ``tasks``
+    table with at least one row -- NOT the backend schema. The suites using it
+    patch ``SqliteTaskBackend`` out, so the guard is the only reader of the
+    file; agreement with the real backend is pinned once, in
+    tests/test_target_store_preflight.py.
+    """
+    db = tasks_db(project_root)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute('CREATE TABLE tasks (id INTEGER PRIMARY KEY)')
+        connection.execute('INSERT INTO tasks (id) VALUES (1)')
+        connection.commit()
+    finally:
+        connection.close()
+    return db
+
+
+def make_zero_byte_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to as an EMPTY file.
+
+    The residue shape ``target_store_preflight``'s guard must refuse, and the
+    counterpart of :func:`make_populated_task_store`.
+    """
+    db = tasks_db(project_root)
+    db.parent.mkdir(parents=True)
+    db.touch()
+    return db
+
+
+_CLEANUP_TEST_COLLECTIONS_SCRIPT = (
+    pathlib.Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
+)
+
+
+@functools.cache
+def _lease_dir_env() -> str:
+    """The env var name, read from the reaper that defines it.
+
+    Read rather than spelled out here so a rename of the constant cannot
+    leave `lease_dir_fixture` setting a variable nothing consults any more —
+    which would look exactly like isolation while every test fell through to
+    the real machine-global directory.
+
+    Loaded lazily and cached, because conftest.py and most test modules
+    import this module and an eager load would charge every pytest session.
+    Only the resulting STRING is kept: the modules that import the fixture
+    load the reaper through their own loaders, and holding a second reference
+    to a module object they may replace is a hazard with nothing to buy it.
+    """
+    return load_script_module(_CLEANUP_TEST_COLLECTIONS_SCRIPT).LEASE_DIR_ENV
+
+
+@pytest.fixture(autouse=True, name='lease_dir')
+def lease_dir_fixture(tmp_path, monkeypatch):
+    """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
+
+    A hard isolation boundary, not a convenience.  The lease directory
+    ``cleanup_test_collections.lease_dir()`` returns by default is a
+    HARDCODED machine-global absolute path (that is the property the guard's
+    correctness rests on — see the design note on that function), and it is
+    the very directory the live 6-hourly cron reads.  A test that wrote a
+    lease into it would hold a real sweep off this host; a test that reaped
+    it would unlink the lease of a live bake-off running in another checkout.
+
+    Autouse, and applied to EVERY test in an importing module rather than
+    only its lease tests, for exactly that reason: a test that forgets to
+    request the isolation must not be able to fall through silently to the
+    real directory.  Tests that need the path can still request this fixture
+    by name; the directory is not created here, because a lease-dir-absent
+    case is one of the behaviours under test.
+
+    Activation is by import, per module
+    (``from _fm_helpers import lease_dir_fixture  # noqa: F401``), and NEVER
+    from conftest.py: an autouse fixture there would apply to every test in
+    the package, redirecting the ``-m integration`` lane away from the
+    directory the live cron reads and silently disabling the guard task 4775
+    built.  The attribute is ``lease_dir_fixture`` while the fixture NAME
+    stays ``lease_dir`` because a module-level ``lease_dir`` binding would be
+    shadowed by every ``def test_x(self, lease_dir)`` parameter, which ruff
+    reports as F811 once per test.
+    """
+    directory = tmp_path / 'ephemeral-collection-leases'
+    monkeypatch.setenv(_lease_dir_env(), str(directory))
+    return directory
+
+
 def as_async_run_git(side_effect):
     """Adapt a `subprocess.run` side_effect to a `shared.git_async.run_git` fake.
 
@@ -2132,3 +2288,33 @@ class FakeMemoryLookup:
         if isinstance(verdict, BaseException):
             raise verdict
         return verdict
+
+
+async def seed_resolved_ticket(
+    store: Any,
+    db_path: pathlib.Path,
+    project_id: str,
+    *,
+    status: str,
+    latency_s: float,
+    resolved_at: datetime,
+    reason: str | None = None,
+) -> str:
+    """Submit and resolve one ticket, then pin its age and resolve latency.
+
+    The ticket goes through ``TicketStore``'s public writers, which both stamp
+    the wall clock; the timestamps are then rewritten through an independent
+    connection to *db_path*, treating the db file as the fixture.
+    """
+    import aiosqlite
+
+    ticket_id = await store.submit(project_id, '{}')
+    await store.mark_resolved(ticket_id, status=status, task_id='1', reason=reason)
+    created_at = resolved_at - timedelta(seconds=latency_s)
+    async with aiosqlite.connect(str(db_path), timeout=5) as db:
+        await db.execute(
+            'UPDATE tickets SET created_at = ?, resolved_at = ? WHERE ticket_id = ?',
+            (created_at.isoformat(), resolved_at.isoformat(), ticket_id),
+        )
+        await db.commit()
+    return ticket_id

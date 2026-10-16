@@ -351,12 +351,12 @@ class TestDefaults:
             'RELOADABLE_FIELDS'
         )
         # task 4755: how old the in-flight fleet-redeploy lease may get before
-        # its readers stop believing it. DERIVED from the drain busy-grace
-        # (worst legitimate sweep ~6270s), not picked, and deliberately far
+        # its readers stop believing it. DERIVED from the --drain verify-wait cap
+        # (worst legitimate sweep ~13,300s), not picked, and deliberately far
         # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
         # delays at most one window. Red-tier / restart-only like its
         # siblings — captured at coordinator construction.
-        assert config.orchestrator_restart_lease_max_age_secs == 7200.0
+        assert config.orchestrator_restart_lease_max_age_secs == 14400.0
         assert (
             'orchestrator_restart_lease_max_age_secs' not in RELOADABLE_FIELDS
         ), (
@@ -372,8 +372,8 @@ class TestDefaults:
         """Bare OrchestratorConfig() exposes the fused-memory force-fire default.
 
         The force-fire escape lets a pending fused-memory restart still fire
-        under chronic fleet saturation (when the run-loop idle branch is
-        starved) after a bounded owed-age window — mirroring the orchestrator
+        under chronic fleet saturation (when agents are never idle) after a
+        bounded owed-age window — mirroring the orchestrator
         coordinator's own force_fire_after_secs (task 2817). Like its
         orchestrator_restart_* siblings it is captured once at coordinator
         construction (_build_service_restart_coordinator), so it is
@@ -1255,6 +1255,7 @@ class TestParkStopConfig:
 class TestMergeVerifyStormGuardFields:
     """Defaults and overrides for the merge-verify storm-guard knobs."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_preserve_existing_behaviour(self):
         config = OrchestratorConfig()
         assert config.merge_verify_workspace is False
@@ -1578,6 +1579,7 @@ class TestVerifyRunnerConfig:
         ])
         assert config.verify_runners[0].df_checkout_path is None
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_runners_defaults_empty(self):
         """OrchestratorConfig.verify_runners defaults to [] not None."""
         config = OrchestratorConfig()
@@ -1594,6 +1596,7 @@ class TestVerifyRunnerConfig:
         assert isinstance(config.verify_runners[0], VerifyRunnerConfig)
         assert config.verify_runners[0].name == 'laptop'
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_drift_check_every_n_lands_default(self):
         """verify_drift_check_every_n_lands defaults to 20."""
         config = OrchestratorConfig()
@@ -2194,6 +2197,50 @@ class TestParkBackfillConfig:
             f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
             'alongside fairness.skip_threshold in the scheduler-tuning slice)'
         )
+
+
+class TestPinReservationConfig:
+    """The three pin reservation knobs (task 6040).
+
+    Flat ``OrchestratorConfig`` leaves beside the ``backfill_*`` block, read
+    from ``self.config`` at tick time, so green-tier membership alone makes
+    them hot-reloadable.
+    """
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_defaults(self):
+        cfg = OrchestratorConfig()
+        assert cfg.pin_reservations_enabled is True
+        assert cfg.pin_reservation_max_active == 1
+        assert cfg.pin_blocked_emit_interval_secs == 3600.0
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_max_active_rejects_below_one(self, bad):
+        """ge=1: the kill switch is the single "off" lever, not max_active=0."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_reservation_max_active=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_emit_interval_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_blocked_emit_interval_secs=bad)
+
+    @pytest.mark.parametrize('leaf', [
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
+    ])
+    def test_pin_reservation_leaves_are_green_tier_reloadable(self, leaf):
+        assert leaf in RELOADABLE_FIELDS
+
+    def test_reloading_the_kill_switch_flips_the_live_config(self):
+        live = OrchestratorConfig()
+        assert live.pin_reservations_enabled is True, 'premise: enabled before the reload'
+
+        report = apply_reload(live, OrchestratorConfig(pin_reservations_enabled=False))
+
+        assert 'pin_reservations_enabled' in report['applied']
+        assert live.pin_reservations_enabled is False
 
 
 class TestTransientRequeueBackoffConfig:
@@ -3187,7 +3234,10 @@ class TestOrchestratorConfigPrices:
     _MODEL_COSTS).
     """
 
-    _SEED_KEYS = {'gpt-5.4', 'gpt-6-astra', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
+    _SEED_KEYS = {
+        'gpt-5.4', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'o4-mini',
+        'gemini-3.1-pro-preview', 'gemini-3-flash',
+    }
 
     def test_prices_seeded_with_expected_rates(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -3198,6 +3248,10 @@ class TestOrchestratorConfigPrices:
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
         assert config.prices['gpt-6-astra'].input_per_1m == 10.00
         assert config.prices['gpt-6-astra'].output_per_1m == 50.00
+        assert config.prices['gpt-5.6-sol'].input_per_1m == 4.00
+        assert config.prices['gpt-5.6-sol'].output_per_1m == 20.00
+        assert config.prices['gpt-5.6-terra'].input_per_1m == 2.00
+        assert config.prices['gpt-5.6-terra'].output_per_1m == 12.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25
@@ -3666,6 +3720,28 @@ class TestMainTipSweepIsolatedPrefilterEnabled:
             'restart-only (same tier as the rest of the main_tip_sweep '
             'family) and must NOT be in RELOADABLE_FIELDS'
         )
+
+
+class TestMainTipSweepColdIntervalSecs:
+    """task 5812: the main-tip sweep builds warm by default, and at most once
+    per this many seconds runs a COLD control sweep as ground truth."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_defaults_to_one_day(self):
+        assert OrchestratorConfig().main_tip_sweep_cold_interval_secs == 86400.0
+
+    def test_zero_round_trips(self):
+        """Zero means every sweep cold — the pre-5812 behaviour."""
+        config = OrchestratorConfig(main_tip_sweep_cold_interval_secs=0)
+        assert config.main_tip_sweep_cold_interval_secs == 0
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(main_tip_sweep_cold_interval_secs=-1)
+
+    def test_not_in_reloadable_fields(self):
+        """Restart-only, the same tier as the rest of the main_tip_sweep family."""
+        assert 'main_tip_sweep_cold_interval_secs' not in RELOADABLE_FIELDS
 
 
 # ---------------------------------------------------------------------------
@@ -4145,3 +4221,68 @@ class TestMergeParkLockGraceSeconds:
             'RELOADABLE_FIELDS (green-tier hot-reloadable, explicitly '
             'registered beside the git.offline_lane_* leaves)'
         )
+
+
+class TestInfoL0RouterConfig:
+    """The four info-L0 disposition router knobs
+    (plans/info-l0-disposition-router-prd.md D5/D9/D12, §Contract)."""
+
+    _LEAVES = (
+        'info_l0_router_enabled',
+        'info_l0_router_ticket_timeout_secs',
+        'info_l0_router_max_conversions_per_sweep',
+        'info_l0_note_detail_chars',
+    )
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+    def test_defaults(self):
+        config = OrchestratorConfig()
+        assert config.info_l0_router_enabled is True
+        assert config.info_l0_router_ticket_timeout_secs == 900.0
+        assert config.info_l0_router_max_conversions_per_sweep == 20
+        assert config.info_l0_note_detail_chars == 1200
+
+    @pytest.mark.parametrize(
+        ('field', 'bad'),
+        [
+            # gt=0: a zero timeout would fail every D9 hold on its first tick.
+            ('info_l0_router_ticket_timeout_secs', 0),
+            ('info_l0_router_ticket_timeout_secs', -1),
+            ('info_l0_router_max_conversions_per_sweep', -1),
+            ('info_l0_note_detail_chars', -1),
+        ],
+    )
+    def test_out_of_bounds_values_rejected(self, field, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(**{field: bad})
+
+    @pytest.mark.parametrize('leaf', _LEAVES)
+    def test_leaves_are_green_tier_reloadable(self, leaf):
+        assert leaf in RELOADABLE_FIELDS
+
+    def test_apply_reload_retunes_the_live_config(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            info_l0_router_enabled=False,
+            info_l0_router_ticket_timeout_secs=60.0,
+            info_l0_router_max_conversions_per_sweep=5,
+            info_l0_note_detail_chars=400,
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['restart_required'] == {}
+        assert report['applied'] == {
+            'info_l0_router_enabled': {'old': True, 'new': False},
+            'info_l0_router_ticket_timeout_secs': {'old': 900.0, 'new': 60.0},
+            'info_l0_router_max_conversions_per_sweep': {'old': 20, 'new': 5},
+            'info_l0_note_detail_chars': {'old': 1200, 'new': 400},
+        }
+        assert live.info_l0_router_enabled is False
+        assert live.info_l0_router_ticket_timeout_secs == 60.0
+        assert live.info_l0_router_max_conversions_per_sweep == 5
+        assert live.info_l0_note_detail_chars == 400

@@ -31,7 +31,8 @@ the crash-survivable, reattachable **tmux lane** by default: spawn with `CLAUDE_
 (see `skills/spawn/spawn-claude.sh`'s header) so the session gets a `display.kind=tmux`
 session-registry record and a `tmux attach`-reattachable window whose record persists across a
 crash. Interactive one-off skills this watcher spawns (e.g. `/unblock` sessions) stay as ordinary
-WM terminal windows, unchanged.
+WM terminal windows, unchanged. tmux stays the default; running in the foreground instead is a
+self-operation, decided without asking (see "Self-operations need no permission").
 
 ## Claiming the Watcher Lease (single-owner-per-role)
 
@@ -51,7 +52,8 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 ```
 
 **Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is **optional** and
-defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
+defaults to `<--name>-$CLAUDE_PID` (or `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a
+`claude agents` host); `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
 Pass either **only** as a deliberate operator override. Both are derived rather than documented for
 one reason (tasks 3994, 4248): the token is load-bearing on *every* heartbeat and on the final
 release, and it must not depend on this document getting one shell token right — which is exactly
@@ -69,6 +71,23 @@ process is `$CLAUDE_PID`. Verify with:
 ps -o comm= -p "$CLAUDE_PID"   # prints: claude
 ```
 
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still forces
+stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
+`lease-heartbeat` is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
+the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
+`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
+reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
+`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
+
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
 message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
 match. The CLI deliberately will not invent one: a synthesized token would be identical for every
@@ -80,11 +99,22 @@ sentinel that reads as never-alive, so the lease degrades to heartbeat-only stal
 logged) rather than recording some durable-but-unrelated pid that would make it unreapable forever.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`.
+`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`, then
+`holder_record=<unlinked|absent|unreadable|active|exited>`.
 - **`slug=`** reports the identity the CLI derived for *you* (never the holder's). Quote it to the
   user when useful, and compare it against `lease-show`'s `holder_slug` if a later heartbeat comes
   back `result=refused`. It is a **diagnostic only** — do not carry it into the next call; the CLI
   re-derives it.
+- **`holder_record=`** is a second, INDEPENDENT axis beside `holder_liveness=`: the state of the
+  holder's own session-registry record (yours, on an acquired claim), looked up through the
+  `record_slug` the CLI stamps into the lease body from the claiming pid. Read the two together:
+  `orphaned` + `exited`/`absent` are two agreeing signals that the holder is gone; `orphaned` +
+  `unlinked` is the pid signal alone (a lease claimed before `record_slug` existed, or whose
+  claimant's record was unresolvable); `held` + `exited` suggests the recorded pid was reused.
+  `unlinked` means nothing was looked up — it is **not** evidence the holder is alive — and
+  `active` only means the record is not terminal (for a hand-launched holder it tracks the
+  terminal, not the `claude` process), so it never overrides `orphaned`. A faulted `proceed` prints
+  no `holder_record=` line.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop below. `proceed` is the
   fail-open outcome (see below) and is handled identically to `acquired`. An acquired claim prints
   `holder_liveness=none` — there is no contending holder, the lease is yours; a faulted (`proceed`)
@@ -101,7 +131,7 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
 
   ```bash
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-show \
-    --name watcher-<project>     # holder_slug / holder_pid / heartbeat_age_secs / reclaimable
+    --name watcher-<project>     # holder_slug / holder_pid / heartbeat_age_secs / reclaimable / holder_record
 
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
     --id watcher-lease-orphan-<project> --project <project> \
@@ -115,12 +145,12 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   DecisionRecord is strictly worse than one that files it with a degraded label.
 
   Do **not** force-release it on this evidence alone — `holder_liveness` is a single-signal
-  diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This
-  guard carries the whole weight here: a pid probe is the *only* corroboration there is. (Task 3994
-  designed a second signal — cross-checking the holder's own session-registry record — then measured
-  it structurally impossible, because a lease slug is a claimant-chosen ownership token and not a
-  record key, and withdrew it rather than ship a check that never fires.) Reclaiming is the human's
-  call, or the reaper's once the TTL expires.
+  diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. A
+  `holder_record=exited` or `absent` beside it is corroboration, not a licence: **never
+  auto-steal**. (Task 3994 withdrew an earlier record cross-check because a lease slug is a
+  claimant-chosen ownership token, not a record key; `holder_record=` instead reads the separate
+  `record_slug` the lease body now carries.) Reclaiming is the human's call, or the reaper's once
+  the TTL expires.
 
 **Reading the contention message.** It reports two INDEPENDENT axes — whether the holder's *pid* is
 running, and how fresh its *heartbeat* is — and then states the decision they imply:
@@ -185,23 +215,145 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 
 `cat` shows the holder's slug/pid and the immutable `start_ts` they claimed at — it **cannot** show
 freshness, because the heartbeat is the file's mtime. `lease-show` prints `state`, `holder_slug`,
-`holder_pid`, `holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs` and `reclaimable` as
-`key=value` lines, computed by the same reader `lease-claim` decides with. It is read-only: it never
-bumps the heartbeat.
+`holder_pid`, `holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable`,
+`holder_record` and (when the body carries one) `holder_record_slug` as `key=value` lines, computed
+by the same reader `lease-claim` decides with. It is read-only: it never bumps the heartbeat.
+
+## Session lifecycle: handover, stop, self-operations
+
+A session ends, but its knowledge should not: the next session starts from what this one knew
+(Leo's rulings of 2026-09-25 on the watcher prompting study, task 5884). The subsections run in
+session order: the file, reading it at launch, stopping, then self-operations.
+
+### The handover file (`l2-handover.md`)
+
+The handover lives at `<project_root>/data/escalations/l2-handover.md`, one per watched project,
+beside the queue it describes. It is runtime state like that queue: never committed (dark-factory
+gitignores `/data/`), and overwritten by each stop. The watcher reacts only to `esc-*.json`, so
+writing it never fires a wake. `scripts/sitting/ownership.py::HANDOVER_CANDIDATES` holds the path
+and its fallback. The sitting preparer reads only dark-factory's own handover, as ownership
+`mentions` evidence (`scripts/sitting/prepare_sitting.py::handover_file`). Another project's
+handover reaches the next watcher of that project, never the cross-project sitting.
+
+**As of writing.** A handover is written from session knowledge, without re-probing. Every figure
+in it is as of the time it was written and must be re-verified before anyone acts on it.
+
+**Header**, in this order: the UTC time written; the lease slug, from the `slug=` line `lease-claim`
+printed; why the session stopped (Leo's stop, low context, or an announced reboot); the posture at
+stop (attended, or AFK since `<time>`); the pending L2 count; the session's sitting ledger,
+`data/sitting/ledger-<lease-slug>.json`; then the as-of sentence above, stated for this file.
+
+**Sections**, in this order. The shape follows the hand-carried 2026-09-22 handover
+(`plans/l2-watcher-handover-2026-09-22.md`); that file is untracked, so the shape is complete here.
+
+1. **Pins: never close.** Declared pins and veto-pin companions, each with what it protects.
+2. **Under a Leo HOLD**, each with the HOLD's date and what would release it.
+3. **In flight.** Spawned `/unblock` and `/spawn` sessions by slug, terminals Leo has open on an
+   item, background sub-agents still running at stop, and merge requests in flight.
+4. **Untriaged — start here.** Drained but not yet dispositioned.
+5. **Decisions with Leo.** The brief numbers he has seen, the recommendation, and what is still
+   open.
+6. **Rulings this session.** What Leo ruled, and where it is recorded.
+7. **Traps.** What misled this session, each with the probe that exposes it.
+
+An empty section says "none" rather than being dropped, so a reader can tell "nothing" from
+"forgot".
+
+**One item per paragraph.** Each item is its own blank-line-separated paragraph, opening with its
+escalation id and task id. The preparer's handover probe attributes a whole blank-line-separated
+block to every id the block cites, so a bullet list without blank lines makes every item evidence
+for every other: the 2026-09-29 handover put esc-3169-1, esc-3169-2 and esc-3105-3 in one block.
+
+### Reading the predecessor's handover at launch
+
+After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
+
+1. Read the handover file, falling back in the order `HANDOVER_CANDIDATES` gives. If there is none,
+   say so in the first brief.
+2. Every claim in it is second-hand, so H1 applies (see "Disposition before briefing (H1–H6)").
+   Re-verify before acting on or briefing any of it, and never relay one of its figures as current.
+3. Reconcile it against the first drain (Main Loop step 2). For each handover item: is it still
+   pending, changed or gone, and is its named owner still live? For each drained item the handover
+   does not mention: is it new since, or missed? Pins and HOLDs go into the sitting as `standing`
+   records with their release predicates (see "Investigate before you `record`"). Traps stay in
+   mind for the session and carry into your own handover while they still hold.
+4. Open the first brief, posted unprompted at launch (see "When it runs"), with the reconciliation:
+   what carried forward, what the handover missed, and each correction where live state refutes
+   it.
+
+### Stopping
+
+These triggers are all handled the same way, and none gets a confirmation question (no "are you
+sure?", no "shall I write a handover?"):
+
+- Leo says "stop", "stop watching" or "release the lease".
+- Leo announces a reboot, or another host action that will end this session.
+- Remaining context is low: a harness context warning, or your own judgement that the session is
+  near its limit. Write the handover while the knowledge is still in context; after a compaction
+  it carries only what the summary kept.
+
+"Release the lease" means the whole stop, never a lease-only release. A session that keeps looping
+un-leased is the duplicate-watcher condition the lease exists to prevent (see the "`result=absent`
+on a heartbeat" paragraph in "Starting the watcher").
+
+Four steps, in this order:
+
+1. **Tidy.** Stop the watcher arm you started, through its background task and never by pattern
+   ("Process safety" in "Starting the watcher"). Run `reap-decisions` once (Main Loop step 6).
+   Note every background sub-agent, spawned session and merge request still in flight; they go
+   into the handover's in-flight section. A B3 `unblock-low-risk` sub-agent cut off by the stop is
+   not relaunched by a successor: its `record-launch` marker makes `check` report
+   `already_attempted`.
+2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
+   so a successor that claims the freed lease finds it complete.
+3. **Release the lease** with the `lease-release` verb under "Heartbeat + release" in "Claiming the
+   Watcher Lease". `applied` and `absent` both finish the step. Report `refused` or `faulted` in
+   the closing message, since a faulted release leaves the lease in place until it goes stale and
+   only then can a successor claim it. Never retry either with `--force`.
+4. **Run `/reflect`.**
+
+Close with one message: the handover path, the lease result and, when the session stops in AFK
+posture, that the queue is unwatched until a successor launches.
+
+### Self-operations need no permission
+
+These are the session's own mechanics: do them without asking (Leo, 2026-09-25). They are item 8
+of the self-execute tier, so report them the way that tier says.
+
+- Loop mechanism and cadence: how you arm and re-arm, and the slice length, within the Bash-tool
+  timeout contract in "Starting the watcher".
+- Releasing the lease on an announced reboot, which is a stop (see "Stopping").
+- Writing and reading handovers.
+- Running in the tmux lane or in the foreground of the terminal you were started in (see
+  "Launching this watcher (default lane: tmux)").
+
+Still forbidden, and not a self-operation: forcing a lease takeover on a pid probe, whether by
+`--force` or by treating `holder_liveness=orphaned` as yours. "Claiming the Watcher Lease
+(single-owner-per-role)" keeps that rule after the 2026-08-08 duplicate-spawn incident, and task
+4237 owns the second signal that could one day change it. Forcing a release is also on the
+always-ask list ("Bypasses" in "Always ask — keyed on record content").
 
 ## The Main Loop
 
 ```
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
-2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
-3. Handle each drained escalation
+2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up); on
+   the first pass, also reconcile the predecessor's handover (see "Reading the predecessor's
+   handover at launch")
+3. Handle each drained escalation in the current posture (attended, or AFK — see "AFK by
+   silence"): standing facts → self-execute tier → briefing disposition (see "Before an item
+   reaches Leo")
 4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if
    an auto-unblock sub-agent (B3) is in flight — that sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
    step 2 of the next pass is the authoritative source of what to handle
 6. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
-7. Go to 1 (restart watcher → confirm up → drain → handle)
+7. GET `/api/v2/dashboard/invariants` and digest this project's record (see "Reading the
+   invariants gauge" below) — once per cycle. Each `FINDING` line it prints (a chain gone
+   `overdue` or `broken` among them), and each `paused` line reading `pinned_by=[]`, is a
+   finding: handle it in step 3 of the next pass, beside the drained escalations
+8. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
 
 The fired escalation (step 5) is just the wake; you do not handle it inline. Looping back
@@ -229,6 +381,28 @@ rotation that inherits no session memory does not re-promote a cluster its prede
 promoted. `member_ids` is the projection of the record's `members` list; the raw `members` key
 stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
 of your context.
+
+**Match `root_cause` keys in canonical form, never as raw strings.** The server folds a promote
+into the pending L2 whose `root_cause` canonicalises the same under
+`escalation.canonical.canonical_root_cause`. Run that helper over the rebuilt keys and your
+candidate rather than reimplementing it; why the drain carries no canonical field is recorded at
+`escalation/src/escalation/server.py::_COMPACT_ESCALATION_FIELDS`.
+
+```bash
+uv run --directory "$DARK_FACTORY_ROOT/escalation" python -c '
+import json, sys
+from escalation.canonical import canonical_root_cause
+print(json.dumps({key: canonical_root_cause(key) for key in json.load(sys.stdin)}, indent=1))
+' <<'JSON'
+["<root_cause of each pending L2>", "<the root_cause you are about to promote under>"]
+JSON
+```
+
+Keys that map to the same canonical form are one cluster. A near-duplicate you miss is not free:
+the server still folds it (no duplicate L2), but the fold records the new spelling as an amendment
+and a `root_cause` variant and bumps `updated_at`. That makes the L2's triage-ack stale (see
+"Reading a triage-ack annotation") and counts toward the over-fold alarm (see "Reading preserved
+framing"). An unexpected `status: 'updated'` from `promote_to_l2` means your match missed.
 
 Triage from that; fetch the full record with `get_escalation(id)` **only** for
 the one item you're about to act on (and when you do, read its `amendments` —
@@ -323,7 +497,7 @@ watcher.
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess (Main Loop steps 1
-and 7), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
+and 8), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
 Watcher Lease" above):
 
 ```bash
@@ -352,6 +526,21 @@ the whole blob in context. Loop back, re-arm the watcher, and let the next compa
 authoritative list of what to handle. Fetch the full record via
 `mcp__escalation__get_escalation(escalation_id="esc-XX-N")` only for the specific item you're about
 to act on — ideally inside the handling sub-agent rather than at top level.
+
+### Reading the invariants gauge
+
+The command, what counts as a finding (the chain rule included), change-only triage, the census
+follow-up, the broken-chain journal probe, the D-4 pointer, the filing store and keys live in
+[`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
+Read them there. This skill's deltas:
+
+- **Scope.** Pass this watcher's `<project_root>` to the digest, so only this project's record is
+  read. The recon-escalation-watcher covers the whole roster.
+- **Handling.** Never inline at step 7: the watcher is down from its fire (step 5) until step 1
+  re-arms it, and handling is the step most likely to run long. A finding joins step 3 of the next
+  pass and goes through "Before an item reaches Leo" like any drained item.
+- **Stopping.** A finding still undisposed at stop goes into the handover's "Untriaged — start
+  here" section.
 
 ## Priority Hierarchy
 
@@ -403,9 +592,9 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 
 ### 3. Task progress
 
-**3a — Clear-cut decisions: act decisively.** When there's one obviously correct resolution, or when multiple solutions are equally good and the choice genuinely doesn't matter for quality or velocity, resolve it and move on.
+**3a — Clear-cut decisions: act decisively.** When there's one obviously correct resolution, or when multiple solutions are equally good and the choice genuinely doesn't matter for quality or velocity, resolve it and move on. What "act" may cover is the self-execute tier (see "Before an item reaches Leo"), and its always-ask list overrides 3a.
 
-**3b — Unclear decisions that matter: ask the human.** When the best action is ambiguous AND the choice has real consequences:
+**3b — Unclear decisions that matter: ask the human.** Before you ask, give the item its briefing disposition (see "Disposition before briefing (H1–H6)"). When the best action is ambiguous AND the choice has real consequences:
 - Leave the escalation pending on the queue
 - Tell the human about it with full context (they may be away for hours — that's OK)
 - Create a local task/todo to track the need for resolution
@@ -415,6 +604,158 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 - **File a DecisionRecord via `write-decision`** (see "Filing Parked Decisions to the Cockpit Registry" below) — IN ADDITION to the reminder above, so this item surfaces in the cockpit decision queue.
 
 It is better to stall development than to bake in a significant bad decision.
+
+## Before an item reaches Leo
+
+Every drained item passes three checks, in this order, before it may appear in the numbered brief:
+
+1. **Standing-facts register**: is this a question at all?
+2. **Self-execute tier**: may I just do it and report it under **Done**?
+3. **Disposition before briefing (H1–H6)**: brief directly, pre-investigate then brief, or ask Leo
+   directly with the readable evidence attached.
+
+These are Leo's rulings of 2026-09-25 on the watcher prompting study, carried by task 5883. They
+sharpen Priority Hierarchy 3a and 3b above.
+
+### Standing-facts register
+
+Consult this before asserting an anomaly or asking Leo a config question. An item that matches an
+entry is not a question and never enters the numbered list. Each entry gives the fact, where its
+authority lives, what not to raise, and when it was recorded. The authority holds the numbers; this
+list only points at it.
+
+- **Orchestrator restarts on the fleet redeploy cadence (about 8h) are expected, not anomalies.**
+  Authority: OPERATIONS.md §"Fleet redeploy & watchdog". Do not raise a restart until
+  `scripts/orchestrator-watchdog.py --report` (read-only) fails to explain it. Recorded 2026-09-25,
+  after it was raised on 08-22 although CLAUDE.md had carried it since 07-22.
+- **The host is never quiet.** Authority: Leo. Benchmark and measure under load. Never ask Leo to
+  wait for, or schedule, a quiet host. Recorded 2026-09-25.
+- **Backburnered projects: pump_web_ui (its hopper is empty by design) and autopilot_video.**
+  Authority: Leo; their watcher-cost question belongs to task 4001. An empty queue or an idle
+  orchestrator there is not an anomaly. Recorded 2026-09-25.
+- **Items Leo holds in another session, or in his personal backlog, are never a question.**
+  Authority: Leo. Record each as a `standing` with a `manual` release predicate (see "Investigate
+  before you `record`"), so it renders in the **Standing / no action** footer. Recorded 2026-09-25.
+
+When Leo corrects a non-anomaly you raised, add a dated entry here. That is a docs-only commit, which
+the self-execute tier below allows direct to main; CLAUDE.md "Working in the main checkout" says when
+such a commit may land.
+
+### Self-execute tier
+
+Execute these and report each under the brief's **Done** section; do not ask (Leo, 2026-09-25). An
+action that closes or moves a numbered item lands under **Done** by itself (see "The sitting and its
+numbers"). An action tied to no item gets one line under the same heading, in the message that
+carries the brief. Check "Always ask — keyed on record content" below first: it wins on any match.
+
+1. Read-only probes and log pulls.
+2. Installing an already-shipped timer or unit whose action is read-only or reporting.
+3. Filing a delayed follow-up for a gate that fired prematurely: a dependency plus a `delayed`
+   milestone. The milestone shape is in docs/task-authoring.md §"Milestone tasks (dated /
+   delayed)"; wire the dependency by CLAUDE.md's `planning_mode=True` → `add_dependency` →
+   `commit_planning` rule.
+4. Recovering a preserved payload into the task the brief names.
+5. Appending a finding to an existing owner task, ONLY while that task is `pending`, because task
+   text is never re-read after dispatch (see "Findings for another task's owner").
+6. Close-only under the carve-out in "Ruled-elsewhere check (answered-but-unrecorded)", and
+   rubber-stamp confirm-and-close gates: a record whose only ask is to confirm an
+   already-verifiable fact and close it, with no option to choose. Verify the fact yourself first.
+7. Executing a ruling Leo already gave, when the record names it and the originating session has
+   ended. The same carve-out's gates 1, 2 and 4 are the test.
+8. Watcher self-operations, listed in "Self-operations need no permission" together with the one
+   lease operation that stays forbidden.
+9. Launching a retain-and-tag, zero-deletion `/curate-fused-memories` sitting for consolidation
+   gates (ratified 2026-09-25).
+
+#### Always ask — keyed on record content
+
+The trigger is what the RECORD says, never your own "no judgement needed" label: the 08-24 brief
+put a $360 calibration spend in that bucket. If any class below matches, the item is asked, even
+when it also matches a tier line above.
+
+The floor is every human-forever gate in docs/escalation-standing-policy.md §"Human-forever
+gates"; that document defines them. Leo's classes follow, each with the record content that keys
+it, and the gate slug where one corresponds:
+
+- Milestone gates and deterministic-runner filings (`milestone_gate`,
+  `deterministic_runner_filing`).
+- Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
+  (`spend_or_eval_launch`).
+- Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
+  of an orchestrator, watchdog enables that restart units (`physical_operator_action`). **Except**
+  restarts of fused-memory and the dashboard, which are allowed but reported after the fact with
+  their root cause.
+- Irreversible or content-losing operations: entity merge or split, memory deletion, branch
+  deletion, cancelling a task with dependents (`irreversible_deletion`).
+- Bypasses: no-verify, skipping the merge queue, force lease release, widening an allowlist past a
+  guard. **Except** direct-to-main docs-only commits, which are allowed; CLAUDE.md "Working in the
+  main checkout" says when one may land.
+- Behavioural config: concurrency, timeouts, thresholds, alarm retunes, merge breadth, scheduler.
+- A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
+  other session or his personal backlog.
+- Priority, pin-queue placement, cross-cluster dependency sequencing.
+- Scope changes: acceptance criteria, cancel-and-refile or re-scope.
+
+Choosing Fable for an H3 investigation seat is your call. The "fable run" key matches a record that
+asks to launch one.
+
+### Disposition before briefing (H1–H6)
+
+Every item that is neither a standing fact nor self-executed gets exactly one of three dispositions
+before it may enter the numbered brief (Leo, 2026-09-25):
+
+1. **Brief directly.**
+2. **Pre-investigate, then brief.**
+3. **Ask Leo directly**, with the readable evidence attached.
+
+Six rules decide which. Each carries the measured cases it was drawn from, so you can recognise the
+next one.
+
+- **H1 — second-hand premise ⇒ investigate first.** The deciding claim came from the record text, a
+  handover or a prior session, not from something this session verified now. Use a verifier
+  sub-agent with a refute mandate. Exemplars: recon gate 652 ("migrate" accepted, then refuted the
+  next day); esc-5485-8 (the premise was a rebase artifact); task 4803 ("undefer" while folded into
+  5255).
+- **H2 — options you cannot write a ramification line for ⇒ investigation-shaped, never a bare
+  pick.** Exemplars: esc-5588-8 ("file a trace task or close" hid 300 prompt replays in 30 days);
+  red-tier host levers asked with no options; xdist flags proposed without ramifications when task
+  1907 held the answer.
+- **H3 — design or architectural scope, or anything adjacent to a Leo HOLD ⇒ pre-investigate to
+  "ready to discuss", never to "resolved".** Opus by default; Fable only where an Opus attempt
+  struggled or the discussion is strategy-level. Exemplars: esc-5601-7, esc-5620-6, esc-4811-3,
+  esc-3169-1.
+- **H4 — a recommendation, evidence this session verified itself, and a reversible action ⇒ brief
+  directly, one numbered line.** Exemplar: 48 such items in the month to 2026-09-23, all taken.
+- **H5 — inputs only Leo has ⇒ ask directly, do not investigate, but gather the readable
+  measurement first.** Such inputs: attention or priority, spend, risk appetite, reversal of his
+  own ruling. Exemplars: esc-3637-1; the $360 calibration; merge_verify_breadth, where the brief
+  lacked "scoped admitted reds".
+- **H6 — two or fewer options on a design-shaped item ⇒ run a cheap option-space seat first.** Its
+  brief: "what else, including nothing, deferring gated on X, questioning the premise". Exemplars:
+  over-delivery-gap; esc-4131-9 (ruled D, never offered); esc-5332-7; steward-budget-C.
+
+**When several rules fire.** H1's premise check always runs first. H6's option-space seat runs
+before or inside an H3 investigation. H5 decides "ask directly" over H2, H3 or H6 investigation,
+because investigating cannot supply an input only Leo has. H4 applies only when no other rule
+fires. Leo's own investigation template (2026-09-21), "investigate and either resolve directly if
+clear-cut, or get ready to discuss in depth", is the brief for H1 and H2 seats, within two limits:
+"resolve directly" never crosses "Always ask — keyed on record content", and an H3 seat stops at
+ready to discuss.
+
+#### Sub-agent or `/spawn` (Leo's rule, 2026-09-25)
+
+- If handling will take a multi-turn conversation with Leo, `/spawn` a session. That keeps the
+  conversation un-interleaved and out of this session's context, which is reserved for system
+  supervision. The category handlers' interactive `/unblock` spawns below are this case.
+- If it ends in a single report and a single ruling, use a sub-agent (the `Agent` tool) and deliver
+  its result into this session. That means fewer terminals; Leo has run more than 15 at once.
+
+Join a completed spawn per "Joining a completed spawn: read `result.md`, don't explore".
+
+#### No cap on items awaiting Leo
+
+The brief lists every item awaiting Leo; the queue exists to show them all. Leo ruled against the
+study's proposed cap on 2026-09-25.
 
 ## Filing Parked Decisions to the Cockpit Registry (C8)
 
@@ -439,6 +780,16 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (`esc-42-1`) is usually the natural choice. Re-filing the same id overwrites the
   prior record rather than duplicating it.
+  **`--id` is project-LOCAL (task 4835).** The verb files the record as
+  `<canonical project>-<id>` (e.g. `dark_factory-esc-42-1`) and **prints that id**: use the
+  PRINTED id for cross-links and for `close-decision` / `reopen-decision`. Keep passing
+  the bare escalation id — never hand-prefix the project. A record filed before this change under a
+  bare id is continued in place by your re-file, so do **not** change an existing `--id` template
+  (such as `watcher-lease-orphan-<project>` above): rows already filed under it would stop receiving
+  your re-files. That includes a template that already hand-prefixes the project (`df-esc-<id>`):
+  keep it as it is, and the verb continues the `df-esc-…` row in place. "Never hand-prefix"
+  governs only a template you are writing new; dropping an existing prefix moves your re-files to
+  a fresh row that ignores the old row's answered or dropped state.
   **You no longer have to pre-check before filing (task 3559).** Decision ids are fleet-global, so
   *another* watcher (notably the recon watcher, which runs its own queue) may already have filed a
   decision for the same underlying human gate under this id. The verb now handles that for you: if
@@ -480,24 +831,26 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   overwrite that re-opens it: there it may truly be an unrelated new question, and holding it
   closed would hide a live gate instead of surfacing it.
 
-  **Across *projects*, a shared id is a collision, not a shared gate.** Decision ids are
-  fleet-global while `esc-<taskid>-<n>` numbering restarts per project, so `esc-42-1` under two
-  different `--project` values names two unrelated gates. A filing whose `--project` differs from
-  the `open` record already at that id is therefore **refused** with an `ERROR` — nothing written,
-  rc still 0 — because merging would hide your ask inside the other project's cockpit row and
-  overwriting would delete that row. Your ask still reaches the human through the in-session note
-  / afk-digest line this filing accompanies; if you need the cockpit row too, re-file under an id
-  that is unique fleet-wide.
+  **Across *projects*, the same local id is two rows.** `esc-<taskid>-<n>` numbering restarts
+  per project, so `esc-42-1` under two different `--project` values names two unrelated gates, and
+  because the stored id carries the project they land on two rows (`dark_factory-esc-42-1`,
+  `reify-esc-42-1`). A refusal remains only when the qualified id is already held `open` by
+  **another** project's legacy hand-prefixed record (say a dark_factory record someone filed by
+  hand under the id `reify-esc-42-1`): an `ERROR`, nothing written, rc still 0, because merging would hide your ask
+  inside that row and overwriting would delete it. Your ask still reaches the human through the
+  in-session note / afk-digest line this filing accompanies; a different `--id` gets it a cockpit
+  row too.
 - **`--project`**: the project's **canonical token** — the `memory.project_id` its
   `dark-factory-orchestrator.yaml` declares. For dark-factory that is **`dark_factory`**, not `df`
   and not `dark-factory`. The value is normalized at the CLI boundary (case-folded, `-` and `_`
   equivalent, `df` aliased to `dark_factory`), so a stale spelling can no longer create a hidden
   partition — but pass the canonical token anyway, so what you type matches what the cockpit shows
-  and no rewrite warning is logged. **The `df-` prefix on ids like `df-esc-3524-1` is part of
-  `--id`, which YOU type**; `write-decision` never derives it from, or rewrites it because of,
-  `--project`. Conflating the two is what produced a three-way split of one project's decisions
-  (41 open dark-factory rows spread across `dark_factory`/`df`/`dark-factory`, each invisible to a
-  reap scoped to either of the others).
+  and no rewrite warning is logged. The project prefix on a stored id (`dark_factory-esc-3524-1`)
+  is added by `write-decision` from the **folded** `--project`, so never type it into `--id`;
+  hand-prefixed ids like `df-esc-3524-1` are legacy, from before the verb qualified ids. Typing a
+  project spelling into an id is what led humans to pass `--project df`, and so to a three-way
+  split of one project's decisions (41 open dark-factory rows spread across
+  `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
     `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
@@ -511,15 +864,21 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     the evidence in `PROJECT_TOKEN_ALIASES_DECLINED`. You no longer have to remember this
     unaided — `write-decision` and `reap-decisions` both **warn** if you pass
     `my_solar_challenge`, so the mismatch announces itself instead of returning a silent
-    zero-row no-op. To check your own project, list the tokens its rows actually carry:
-    ```bash
-    python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
-    ```
+    zero-row no-op. To check any other token, run
+    `reap-decisions --project <token> --escalations-dir <queue> --expect-matches` by hand: it warns
+    when no record, in any state, carries the folded `--project` token, and lists the folded tokens
+    that do. (It replaces a `collections.Counter` one-liner that listed RAW spellings,
+    which the reaper folds together, so it showed splits that were not there.) Leave the flag off
+    the per-cycle Main Loop reap: a project that has simply never filed would warn every cycle.
 - **`--text`**: the one-line question a human needs to answer — the same summary you'd otherwise
   only give in-session or in the digest.
-- **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
-  blocked task, the escalation this resolves, and this watcher's own session slug (see "Claiming
-  the Watcher Lease" above) — so the cockpit can cross-link the decision to its source.
+- **`--task-id` / `--escalation-id`**: thread through whatever you have — the blocked task and the
+  escalation this resolves — so the cockpit can cross-link the decision to its source.
+- **`--session-id`**: a **provenance label** saying which watcher filed the row — not a link, since
+  its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
+  `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
+  there is no shell token to add. If it cannot be resolved the decision is still filed, just
+  unlinked.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
@@ -535,6 +894,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   nothing filed, and pass it empty and it refuses with a loud error and prints no id — so if the id
   doesn't come back on stdout, your filing did not land. There is no watcher for which this is a
   burden: it is the same directory you already pass to `reap-decisions`.
+  It is mandatory **even for a sentinel park with no `--escalation-id`** (a lease orphan, a
+  pipeline stall): task 4835 decided against exempting them, because the same-queue custody hold
+  keys on stamp equality, so an unstamped sentinel later re-filed with a stamp would re-open a row
+  an operator had dropped.
   There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
   "this record's owning queue was investigated and could not be determined". You never write it —
   and that is now enforced, not just asked: `write-decision` **rejects**
@@ -550,11 +913,19 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   filed id still comes back on stdout — that signal is unchanged, and your filing did land, since
   your text/severity/ids were written — plus a `WARNING` on stderr naming the state it held. That
   warning means a human dealt with this gate while it sat parked, so **adjudicate** it rather than
-  re-filing blindly on your next restart. If the ask is genuinely new, **file it under a new id** —
-  that is the remedy with a shipped surface. Re-opening the row *in place* currently needs a direct
-  registry write: the cockpit's decision pane offers a drop action but no re-open, and there is no
-  `update-decision-state` CLI verb — so ask an operator for that only when a new id genuinely will
-  not do. Either way, do not try to force the row open by re-filing.
+  re-filing blindly on your next restart. If this **same** gate genuinely needs a human again,
+  re-open the row in place; the warning names the exact command:
+  ```bash
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py reopen-decision \
+    --id <printed id> --project <project> --escalations-dir <project_root>/data/escalations
+  ```
+  It clears the row's closing evidence, so a later `close-decision` can quote fresh evidence, and
+  it exits non-zero when it refuses (the record at that id is another project's or queue's) or
+  finds no record. It cannot hold open a row whose escalation is already resolved or dismissed:
+  the next reap closes it again, and the verb warns on stderr when that is the case. Such a gate
+  needs a new escalation, filed under its own id. File under a **new** id only for a genuinely
+  *different* ask. Either way, do not
+  try to force the row open by re-filing.
 - The verb prints the filed id on success for your own cross-link (e.g. into the digest line). It
   is fail-soft — a registry fault is logged and swallowed, never raised, so filing a decision can
   never crash the watch loop or block the park itself.
@@ -595,7 +966,8 @@ decision id (see the recon watcher's MODE 1 / MODE 2 taxonomy) — the stamp tha
 **first** filer's queue, since a second filing enriches rather than overwrites. The field holds one
 queue, not a list, so the other queue's reaper still skips that record; the trade is that the
 outcome is now deterministic (first filer) instead of depending on who happened to write last. The
-verb logs a warning naming both queues when it discards one.
+verb logs a warning naming both queues when it discards one. The single stamp is a **decided**
+limit, not a pending fix (task 4835; see `plans/4835-decision-plumbing-decisions.md`).
 
 A decision stamped `<unknown>` is **refused**, not closed: its owning queue was investigated and
 could not be determined, so *no* reaper may close it and it stays a visible cockpit row until a
@@ -677,8 +1049,9 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
         Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
         scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
         and this list goes red until it matches. -->
-   A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
-   snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   A timeout yields a non-terminal shape with `status: 'queued'|'attached'` and a
+   `request_id` to poll; its full key set is stated in `merge_request`'s own docstring
+   (`escalation/src/escalation/server.py::merge_request`), not restated here.
    <!-- merge-state-vocab:end -->
    Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
    intent persists even if the MCP session drops mid-bounded-wait.
@@ -717,16 +1090,32 @@ never submit a second merge for a `task_id` that already has one in flight. The 
 
 When the human will be away for an extended period (hours to days) and cannot adjudicate 3b
 decisions, switch posture from "stall and ask" to "keep the pipeline moving, defer the judgement,
-and leave a clean trail." Confirm AFK mode with the human if you can; otherwise infer it from an
-explicit "I'll be away" or a long silence after one. Three behavioural shifts:
+and leave a clean trail." The posture needs no confirmation; "AFK by silence" below says when it
+switches on and off. Three behavioural shifts:
 
 1. **Defer, don't wedge.** For a 3b item (ambiguous AND consequential), stalling the whole queue for
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
    - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
      `resolve_ticket`), and
-   - `resolve_issue(..., action='park')` so the blocking task lands `blocked`, held under an open L2
-     (no re-dispatch while the escalation is open; the stranded-blocked sweep skips a blocked task
-     that has an open escalation), and
+   - Hold the task, choosing by the record's **severity**:
+     - **Not `info`:** `resolve_issue(..., action='park')`. The task lands `blocked`, held under
+       the open L2, because a pinning escalation vetoes the stranded-blocked sweep.
+     - **`info`:** never park. An info record never pins
+       (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
+       re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
+       esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
+       1. `update_task(id, metadata={'x_deferral': {'escalation_id': '<esc-id>', 'until_condition':
+          'Leo rules <esc-id>', 'reason': '<one line>'}}, metadata_mode='merge')`;
+       2. `set_task_status(id, status='deferred')`;
+       3. confirm both with `get_task` about 30 s later.
+
+       A deferral keeps a not-yet-running task out of dispatch. It does not stop a live run, and
+       an info filer was told to keep driving, so leave an `in-progress` task alone (leave
+       pending + digest). When the ruling lands, carry it out, then re-pend the task with
+       `set_task_status(id, status='pending')` unless the ruling says otherwise, and set
+       `x_deferral` to null. Once the deferral-record gate is live (task 6525), the record goes
+       in `set_task_status(..., deferral=...)` instead. Task 6579 makes it the typed
+       `until_escalation` kind. And
    - File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
      Registry" below) — IN ADDITION to the follow-up task, so the parked decision surfaces in the
      cockpit decision queue.
@@ -759,6 +1148,31 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
    Decisions to the Cockpit Registry (C8)" below. If
    phone push is configured (`--ntfy-url` on the watcher command), a born-at-L2 `critical`/`urgent`
    still pushes immediately — those are the only items worth interrupting an AFK human for.
+
+### AFK by silence
+
+**On.** Either of two triggers switches AFK posture on, and neither needs a confirmation question:
+an explicit "I'll be away", at once; or 4 hours with no human turn. Leo can be away for up to 48
+hours, weekends included, without saying so (Leo, 2026-09-25, task 5884).
+
+**Measuring the silence.** A human turn is a message Leo types. A watcher fire, a `CEILING` tick
+and a background sub-agent completion are not human turns. At launch and at each human turn, write
+`date -u +%FT%TZ` to `<project_root>/data/escalations/l2-last-human-turn`, overwriting it. At each
+wake, compare against that file, not against a time you remember: a compaction can drop it from
+context. A quiet queue still wakes you once per slice (the Bash-tool timeout contract in "Starting
+the watcher"), so the switch lags the 4-hour mark by at most one slice.
+
+**What changes.** The three shifts above: defer, don't wedge; no unattended interactive terminals;
+a DecisionRecord and the brief instead of per-item pings. The 3b reminder cadence also stops.
+
+**What keeps running.** Pre-investigation sub-agents are not terminals. Keep launching the
+ownership and in-flight checks of "Investigate before you `record`" and the H1–H3 and H6 seats of
+"Disposition before briefing (H1–H6)", so items are ready to brief on return. A `/spawn` for a
+multi-turn conversation with Leo (see "Sub-agent or `/spawn`") waits for his return; meanwhile a
+sub-agent takes the item to "ready to discuss".
+
+**Off.** The next human turn ends AFK posture. That turn is a return: post the unprompted brief
+(see "When it runs") and say when AFK posture began.
 
 ### Low-risk auto-unblock gate (B3)
 
@@ -944,7 +1358,7 @@ re-checking a named, machine-checkable predicate.
 
 Merge-gate verify failures now carry a **disposition** — a classification of whose
 fault the failure is, orthogonal to the failure's `category` (`plans/merge-skew-attribution-prd.md`,
-task β, `orchestrator/src/orchestrator/merge_disposition.py`). It is a **closed enum**:
+task β, `orchestrator/src/orchestrator/merge_lane/disposition.py`). It is a **closed enum**:
 
 | Disposition | Meaning |
 |---|---|
@@ -998,6 +1412,14 @@ Neither the per-task steward nor the auto-watcher has seen this record. Read `su
 - **`investigate_and_retry`** — Misleading for promoted items. The item has already passed through *both* the per-task steward (L0) *and* the auto-watcher (L1) and persisted through their combined triage and retry budgets. Treat as a deeply persistent problem, not transient. Don't just retry.
 - **`triage_suggestions` / `fix_review_issues`** — Routing hints confirming what the category tells you. No new information.
 - **Free-form text** (e.g., "Restore Value::Frame from previous commits") — Valuable diagnostic context about what the escalating agent *thought* would help. Read it as a starting point for investigation, not as instructions — the agent was stuck, so its diagnosis may be incomplete.
+
+A promoted cluster's `root_cause` and `evidence` are the auto-watcher's narrative, not the record.
+Before ruling on one that joins two or more failures of a task, or restating it to the human, count
+those failures per [`skills/_shared/counting-failure-events.md`](../_shared/counting-failure-events.md).
+
+Every handler below ends in an action or a question to Leo. The self-execute tier bounds the
+action, and the question passes through its briefing disposition first (see "Before an item
+reaches Leo").
 
 **Additive-context convention for spawned `/unblock` prompts.** Several categories below spawn an
 interactive `/unblock` session with a prompt of the form `/unblock <task_id> (esc <escalation_id>,
@@ -1060,10 +1482,23 @@ esc-id-citing correction block in the cluster's task descriptions, or the subjec
 advancing while the task is blocked/parked (tip-advance on an `in-progress` subject is ordinary
 work, not a signal).
 
-`triaged_by` is server-attributed from the stamping connection's `X-Escalation-Identity` header and
-cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
-already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
-below).
+`triaged_by` is server-enforced (`escalation/src/escalation/server.py::stamp_triage`) when the
+stamping connection sends `X-Escalation-Identity` (the auto-watcher does), the same attribution
+contract this skill documents for `resolved_by` (see "Recognizing the supervised auto-watcher's
+resolutions" below); for a header-less interactive session it is a convention, not a guarantee —
+see "Shadow-mode standing-policy rulings (measurement only)".
+
+### Refuting a premise: the claim's execution context, or it is not a refutation
+
+A check that does not reproduce an escalation's premise refutes it only if it ran in the premise's
+execution context; anywhere else it is a non-reproduction. The rule covers the probes you re-run and
+the resolution text you write. It also covers spawn briefs: never hand a spawned session a premise
+marked disproved, or marked "do not re-derive", unless the refuting check ran in that context, and
+state the context each cited check ran in. Specimen: on esc-legibility-trickle-reify-3 a brief
+refuted a boot-time timer's PATH premise from a post-login interactive shell. The premise was right,
+and the auto-watcher's triage note had said its probe did not verify the job's own PATH. Single
+normative statement of the rule:
+`orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
 
 ### Reading preserved framing (`amendments`)
 
@@ -1079,13 +1514,15 @@ own framing.** The two are different things and the distinction is the whole poi
 - The record's OWN `root_cause` / `detail` / `options` / `summary` are the **original** framing,
   from the promote that minted the L2. They are immutable — a fold never overwrites them, so the
   decision context a human started reading cannot shift under them.
-- `amendments` is an append-only list of what **later folds** carried in, oldest first, each with
-  the `agent_role` that submitted it and a queue-stamped `timestamp`. The **last** entry is the
-  most recent read of the cluster; if it disagrees with the record's own framing, that disagreement
-  is the signal — either the cluster drifted, or root-cause matching folded in something that does
-  not belong.
-- Framing byte-identical to what the record already says is **not** re-recorded, so every entry
-  present is a genuine reframing rather than a re-promote echo.
+- `amendments` is an append-only list of what **later folds** carried in — or what an explicit
+  `amend_escalation` wrote (a ruling made elsewhere) — oldest first, each with the `agent_role` that
+  submitted it, which is how the two sources are told apart, and a queue-stamped `timestamp`. The
+  **last** entry is the most recent read of the record. When a fold entry disagrees with the
+  record's own framing, that disagreement is the signal — either the cluster drifted, or root-cause
+  matching folded in something that does not belong. An explicit amend that disagrees is usually a
+  ruling: read it as the answer to the question, not as drift.
+- Framing byte-identical to what the record already says is **not** re-recorded, from a fold or an
+  explicit amend alike, so every entry present is a genuine reframing rather than an echo.
 
 A set of counters says what was NOT kept — check them before treating any of these lists as
 complete. Each is a durable record field you can read straight off `get_escalation(id)`, so the
@@ -1248,14 +1685,15 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
 #### When it runs
 
 - **Nightly at 05:30**, from `return-brief.timer`: headless on Fable, recommend-only and read-only.
-  This is the *nightly form*: investigate, then `record` preparations. The render that follows
+  This is the *nightly form*: investigate, then `record` preparations, which it does through
+  batch files in its per-run inbox (`data/sitting/inbox/<run>/`). The render that follows
   writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)"). Its
   autonomous closes are windowed on `closed_at`, and a close with no `closed_at` is listed as
   undated, not dropped.
 - **On demand**, whenever Leo asks for it.
 - **Unprompted**, at three points: on watcher launch; on every return, meaning a human turn after 2h
-  or more of silence, or any status or "what do you need" question; and after each applied ruling
-  batch.
+  or more of silence, the human turn that ends AFK posture (see "AFK by silence"), or any status or
+  "what do you need" question; and after each applied ruling batch.
 
 #### The sitting and its numbers
 
@@ -1288,6 +1726,8 @@ of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` 
 - Every option carries its `ramification`. Every item carries a recommendation with its evidence
   chain, or an explicit `no_lean` with its reason.
 - Put every escalation and task id you mention in `cites`, so the brief glosses it.
+- The item's briefing disposition decides whether it is recorded now, after investigation, or as a
+  direct ask (see "Disposition before briefing (H1–H6)").
 
 #### Gate facts are yours to supply
 
@@ -1331,9 +1771,10 @@ before the registry records an answer.
 
 An L2 with no DecisionRecord is filed, then closed, under
 `scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
-id>` for the recon queue, never the bare escalation id. Decision ids are fleet-global while
-escalation numbering restarts per project; see "Across *projects*, a shared id is a collision" in
-"Filing Parked Decisions to the Cockpit Registry (C8)".
+id>` for the recon queue, which is the id `write-decision` stores for the project-local id the
+payload files. Decision ids are fleet-global while escalation numbering restarts per project; see
+"Across *projects*, the same local id is two rows" in "Filing Parked Decisions to the Cockpit
+Registry (C8)".
 
 #### Findings for another task's owner
 
@@ -1481,7 +1922,8 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 **Always escalate to the human**, except for the narrow self-close case defined in "Standing rule:
 accept verified info-level design deviations" below — check that subsection first:
-1. Present the concern with full context
+1. Present the concern with full context, after its briefing disposition — H3 and H6 usually fire
+   here (see "Disposition before briefing (H1–H6)")
 2. Leave the escalation pending — the open escalation record IS the durable record that something
    needs doing
 3. Create a local todo **for this session only** — it does not survive session end and is not the
@@ -1501,7 +1943,8 @@ rotations that revisit the parked set, re-verify with **world-facing** probes on
 triage-ack annotation" and the "Ruled-elsewhere check" above) — never a predicate about the
 record's own pending status. If a probe fires, the ask flips from "human must decide" to "human
 must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
-the record via amendment. This applies equally to `risk_identified` parks below.
+the record with `amend_escalation` (an append-only amendment; it changes no status, severity or
+level). This applies equally to `risk_identified` parks below.
 
 <!-- scope-not-delivered:begin the two closure forms and the worked example live in the policy
      document named below and are deliberately NOT copied here: that document is their authority,
@@ -1551,9 +1994,10 @@ hold**:
 **Otherwise**, meaning any condition fails, the evidence cannot be checked, or the recommendation
 is anything but accept, use the normal park procedure above.
 
-**Limits.** A second such escalation on the same task, or more than 3 qualifying in one day, goes
-to the human as a pattern instead: a stream of deviations suggests the planning itself is off. The
-human can revoke this rule at any time.
+**Limits.** A second such escalation on the same task goes to the human as a pattern instead: a
+stream of deviations on one task suggests its planning is off. There is no daily cap: Leo discarded
+it on 2026-09-26 ("Discard the cap. You can ratify these without limit."). The human can revoke
+this rule at any time.
 
 **Worked examples (2026-09-17).**
 - **Accepted: esc-4876-8.** A planner measured that of three suggested graphiti levers only
@@ -1732,13 +2176,10 @@ them is reported as `gated_stamps` and excluded from every rate.
 
 ### Two facts about attribution and timing
 
-**Attribution here is a convention, not a guarantee.**
-`escalation/src/escalation/server.py::stamp_triage` overrides `triaged_by` from the
-`X-Escalation-Identity` header **only when that header is present**. The auto-watcher sends one, so
-for it the attribution is server-enforced; this session does not, so `triaged_by` is whatever you
-pass. This NARROWS the general statement in "Reading a triage-ack annotation" above for your own
-stamps. Therefore: **pass the same identity string you resolve with**, or `triaged_by` and
-`resolved_by` never compare and the `self_resolved` check silently never fires.
+**Attribution here is a convention, not a guarantee** (see "Reading a triage-ack annotation"
+above): this session sends no identity header, so `triaged_by` is whatever you pass. **Pass the
+same identity string you resolve with**, or `triaged_by` and `resolved_by` never compare and the
+`self_resolved` check silently never fires.
 
 **Stamp before the record is resolved.** `stamp_triage` refuses anything that is not `pending`, so a
 stamp written after the close is simply not written.
@@ -1769,7 +2210,8 @@ A class adopts only when task 3346 has landed **and** it has met the threshold i
 ## Context Conservation
 
 You're in a long-running session — conserve your context window aggressively. Over a multi-day AFK
-window this is the difference between one durable session and repeated restarts.
+window this is the difference between one durable session and repeated restarts. When context runs
+low anyway, stop (see "Stopping"): the handover carries forward what the next session needs.
 
 **Read compact, expand lazily:**
 - Drain with `get_pending_escalations(level=2, compact=True)` — never pull full dicts just to triage.
@@ -1788,6 +2230,7 @@ window this is the difference between one durable session and repeated restarts.
 - ANY other merge submission (e.g. retrying the land of a done-but-unmerged task) — submit
   top-level using the bounded submit→poll protocol; see "Merge Submissions — Bounded Submit, Then Poll"
 - Creating follow-up tasks (once you've decided what to create, have a sub-agent do the MCP calls)
+- Choosing between a sub-agent and a `/spawn`ed session: see "Sub-agent or `/spawn`"
 
 **Keep in top-level context:**
 - The watch loop itself (your core job)
@@ -1803,7 +2246,7 @@ Maintain awareness of escalations waiting for human input. When the human return
 status, answer with the sitting preparer (see "Sitting preparer (`prepare-sitting` mode)" above)
 rather than a hand-assembled list: `brief --ledger <session ledger>` is the numbered list, with each
 item's options, recommendation and age, and its standing footer says what is waiting on someone
-else.
+else. The brief lists every item awaiting Leo, with no cap (see "No cap on items awaiting Leo").
 
 Remind about unresolved items roughly every 3-5 escalation handling cycles — enough to keep them visible without being noisy.
 
@@ -1855,14 +2298,14 @@ its values may be passed to `resolve_issue`.
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` will refuse it once task 6578 lands. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 
 **C1 notes:**
 - Terminal task statuses (`done`, `cancelled`) are never overwritten by any action.
 - The removed `terminate` parameter now raises a hard error naming the five actions above.
-- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1.
+- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1. That cover holds only where the member L1 pins. An `info` member never pins by itself, so treat its task as unheld (see the `park` row).
 - Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0
@@ -1900,10 +2343,17 @@ them for shared files, summaries, or task IDs and handle related ones together, 
 relationship in your resolution text.
 
 **At every resolve, look sideways before moving on.** The ruling you write reaches only the record
-you name (plus its downward member cascade — never sibling L2s). Run
-`get_pending_escalations(task_id=...)` for the subject task and scan for other pending L2s sharing
-any member id; disposition them in the same sitting — close them against the same ruling, or park
-them with a world-facing predicate naming where the ruling lives. A ruling recorded on one twin
+you name (plus its downward member cascade — never sibling L2s). The `resolve_issue` response
+carries that census as `related_pending`: the records still pending after your resolve that share
+its task, or are L2s sharing a member with it (or clustering it). If the key is ABSENT, the census
+could not be computed — fall back to running `get_pending_escalations(task_id=...)` for the subject
+task and scanning for other pending L2s sharing any member id. Either way, disposition them in the
+same sitting — close them against the same ruling, or park them with a world-facing predicate
+naming where the ruling lives. Never auto-close from the census alone: it reports candidates, and
+a pin looks exactly like an answered question on member evidence. An entry with `same_task: true`
+and `shared_member: null` under a synthetic anchor task id (a slug such as
+`l2-amendment-truncation`, not a task number) is the same KIND of alarm, not necessarily the same
+incident — read it before applying your ruling to it. A ruling recorded on one twin
 while another survives is the answered-but-unrecorded class (see "Ruled-elsewhere check" above);
 all five measured instances were minted exactly this way, in sittings that ruled the record in
 front of them and never looked sideways.

@@ -37,7 +37,8 @@ Incoming-framing amendments (default-empty; task 3997):
               entry count alone bounds nothing when one field is unbounded free
               text, so the two counters together are what make the list's size
               envelope assertable from the record.
-  SOLE WRITER: `queue.add_members_to_l2`.
+  APPEND-AND-TRIM POLICY: `queue._append_amendment_capped`, the single home
+  every writer of these three fields goes through.
 
 Over-fold evidence (default-empty; task 3998):
   root_cause_variants:
@@ -195,8 +196,11 @@ class Amendment(TypedDict):
     When `promote_to_l2` folds a new promote into an existing pending L2, the
     incoming root_cause/evidence/options/summary used to be dropped on the floor
     (measured: 336,875 characters lost).  Each such fold now appends one of these
-    to `Escalation.amendments`.  The record's OWN framing is never overwritten —
-    both the original and every incoming reframing survive, which is the point.
+    to `Escalation.amendments`.  An explicit `queue.EscalationQueue.amend`
+    (task 4886) appends one too, with no fold behind it; the two sources are
+    distinguishable by `agent_role`.  The record's OWN framing is never
+    overwritten — both the original and every incoming reframing survive, which
+    is the point.
 
     `detail` holds `promote_to_l2`'s ``evidence`` ARGUMENT — the same argument the
     create path writes into the record's own `detail` — so a reader can diff an
@@ -337,6 +341,16 @@ BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
 
+
+def normalised_severity(severity: str | None) -> str:
+    """The form every severity classifier compares against KNOWN_SEVERITIES.
+
+    Case- and whitespace-insensitive.  A null reads as ``''`` because an
+    ``Escalation`` rehydrated from JSON on disk can carry a null ``severity``
+    despite the ``str`` annotation.
+    """
+    return str(severity or '').strip().lower()
+
 # Urgency ordering over KNOWN_SEVERITIES, used by every severity FOLD in the
 # system (dedupe-child promotion, L2 member inheritance, the L2 update-path
 # floor).  Alphabetical comparison is wrong ('blocking' < 'info'), so the rank
@@ -410,9 +424,20 @@ AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 # been pending ~90s — a genuine strand and an ordinary restart artifact.  The
 # old single 'benign' stamp made the two records indistinguishable, so the
 # only durable trace of a 20h strand read as routine restart noise.
-RESOLUTION_CLASSES: frozenset[str] = frozenset(
-    {'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'}
-)
+#
+# 'addressed', 'observation-consumed', 'converted' and 'status-info' are the
+# info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14):
+# 'addressed' means a reviewer verified the note fixed; 'observation-consumed'
+# means a pure observation was closed at exit; 'converted' means a
+# curator-created task now carries the work; 'status-info' means a mechanical
+# notice was closed per class, with an aggregate L1.  Like
+# 'moot-terminal-subject' they are deliberately neither 'benign' nor
+# 'actionable'.  The decision vocabulary lives in
+# escalation/src/escalation/disposition.py.
+RESOLUTION_CLASSES: frozenset[str] = frozenset({
+    'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
+    'addressed', 'observation-consumed', 'converted', 'status-info',
+})
 
 
 @dataclass
@@ -553,9 +578,10 @@ class Escalation:
     # Preserved incoming framing (task 3997).  APPEND-ONLY: an amendment NEVER
     # overwrites this record's own root_cause / detail / options / summary — the
     # original human-facing framing is immutable and every incoming reframing is
-    # kept alongside it.  `queue.add_members_to_l2` is the SOLE writer and also
-    # the sole trimmer (it sheds the OLDEST past `queue._MAX_AMENDMENTS`,
-    # counting each drop in amendments_truncated).  Zero migration, same pattern
+    # kept alongside it.  Every writer appends through
+    # `queue._append_amendment_capped`, the single home of the append-and-trim
+    # policy (it sheds the OLDEST past `queue._MAX_AMENDMENTS`, counting each
+    # drop in amendments_truncated).  Zero migration, same pattern
     # as members / evidence / train_state / the triage quad / granted_files /
     # filing_claimant_run_id above: legacy JSON without these keys deserialises
     # to the defaults via the from_dict __dataclass_fields__ filter below,

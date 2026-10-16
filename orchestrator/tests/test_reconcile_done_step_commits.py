@@ -1131,3 +1131,163 @@ class TestReconcileViaPatchId:
         assert reconciled['steps'][0]['commit'] == wip_sha
         assert reconciled['steps'][0]['status'] == 'done'
         escalation_queue.submit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# task 3651 step-1 RED: several orphaned done steps sharing one file must NOT
+# collapse onto a single WIP tip sha
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileMultiStepCollapse:
+    """The filename-subset WIP heuristic is degenerate when several done steps
+    touch the same file(s): every orphan satisfies ``set(orphaned_files) <=
+    wip_files``, so running it FIRST stamps the one ``wip_tip_sha`` onto all of
+    them — the provenance collapse observed on reify task 5665 (four commits,
+    all touching ``crates/reify-compiler/src/geometry.rs``, steps 3/5/7 all
+    recorded the same sha) and on tasks 4050 / 4154. ``find_equivalent_commit``
+    must run first so each step keeps its own replayed sha."""
+
+    async def test_orphans_sharing_one_file_map_to_their_own_replays(
+        self, config, git_ops, task_assignment,
+    ):
+        """PRIMARY: three done steps whose commits all touch the SAME file are
+        orphaned by a real rebase and replayed as three distinct shas, with a
+        WIP safety-commit touching that same file at HEAD. Each step must be
+        re-pointed to ITS OWN replay, not all three to the WIP tip."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+        base = wt_info.base_commit
+
+        _, task_branch, _ = await _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=wt)
+        task_branch = task_branch.strip()
+
+        # Three implementation commits, all touching the SAME single file with
+        # distinct content -> three distinct patch-ids, one shared filename.
+        (wt / 'geometry.py').write_text('v1\n')
+        c3 = await git_ops.commit(wt, 'feat: GREEN — step-3 implementation')
+        (wt / 'geometry.py').write_text('v2\n')
+        c5 = await git_ops.commit(wt, 'feat: GREEN — step-5 implementation')
+        (wt / 'geometry.py').write_text('v3\n')
+        c7 = await git_ops.commit(wt, 'feat: GREEN — step-7 implementation')
+        assert c3 and c5 and c7
+        assert len({c3, c5, c7}) == 3, 'setup: the three commits must be distinct'
+
+        workflow.plan = _write_steps_plan(artifacts, [
+            {'id': 'step-3', 'type': 'impl', 'status': 'done', 'commit': c3},
+            {'id': 'step-5', 'type': 'impl', 'status': 'done', 'commit': c5},
+            {'id': 'step-7', 'type': 'impl', 'status': 'done', 'commit': c7},
+        ])
+
+        # Orphan-and-replay all three with a REAL rebase onto a new base (the
+        # idiom from test_synthetic_rebase_replay_is_remapped_not_escalated) —
+        # the different parent chain guarantees the replays get different shas
+        # rather than relying on commit-timestamp skew.
+        await _run(['git', 'switch', '-c', 'tmpbase', base], cwd=wt)
+        (wt / 'newbase.py').write_text('unrelated new-base work\n')
+        nb = await git_ops.commit(wt, 'chore: advance base')
+        assert nb
+        await _run(['git', 'switch', task_branch], cwd=wt)
+        rc, _, err = await _run(['git', 'rebase', '--onto', 'tmpbase', base], cwd=wt)
+        assert rc == 0, f'setup rebase failed: {err}'
+
+        for orphan in (c3, c5, c7):
+            rc_anc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', orphan, 'HEAD'], cwd=wt,
+            )
+            assert rc_anc != 0, f'setup: {orphan} must be orphaned'
+
+        # Land a WIP safety-commit at HEAD that ALSO touches geometry.py, so
+        # wip_files == {'geometry.py'} and today's filename-subset test at
+        # workflow.py::_reconcile_done_step_commits fires for all three steps.
+        (wt / 'geometry.py').write_text('v4\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha
+
+        # Recover the replayed shas by subject.
+        _, log_out, _ = await _run(
+            ['git', 'log', '--format=%H\x1f%s', f'{base}..HEAD'], cwd=wt,
+        )
+        by_subject = {}
+        for line in log_out.splitlines():
+            if '\x1f' in line:
+                sha, subject = line.split('\x1f', 1)
+                by_subject[subject] = sha
+        c3_prime = by_subject['feat: GREEN — step-3 implementation']
+        c5_prime = by_subject['feat: GREEN — step-5 implementation']
+        c7_prime = by_subject['feat: GREEN — step-7 implementation']
+
+        await workflow._reconcile_done_step_commits()
+
+        reconciled = artifacts.read_plan()
+        by_id = {s['id']: s for s in reconciled['steps']}
+        recorded = [by_id['step-3']['commit'], by_id['step-5']['commit'], by_id['step-7']['commit']]
+
+        # The anti-collapse assertion: three distinct shas, none of them the
+        # WIP tip.
+        assert len(set(recorded)) == 3, (
+            f'expected three DISTINCT per-step commits, got {recorded} '
+            f'(wip tip is {wip_sha})'
+        )
+        assert wip_sha not in recorded, (
+            f'steps collapsed onto the WIP tip {wip_sha}: {recorded}'
+        )
+
+        assert by_id['step-3']['commit'] == c3_prime
+        assert by_id['step-5']['commit'] == c5_prime
+        assert by_id['step-7']['commit'] == c7_prime
+
+        for step_id in ('step-3', 'step-5', 'step-7'):
+            assert by_id[step_id]['status'] == 'done'
+            assert await git_ops.is_ancestor(by_id[step_id]['commit'], await _head(wt)), (
+                f'{step_id} recorded a sha unreachable from HEAD'
+            )
+        escalation_queue.submit.assert_not_called()
+
+    async def test_wip_fallback_still_fires_when_no_equivalent_exists(
+        self, config, git_ops, task_assignment,
+    ):
+        """PRECEDENCE GUARD: the reorder must DEMOTE the filename-subset
+        heuristic, not delete it. An orphan with no patch-id equivalent and no
+        subject match in ``base..HEAD``, whose files are a strict subset of the
+        tip WIP run's, still resolves to the WIP tip."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+        base = wt_info.base_commit
+
+        (wt / 'feature.py').write_text('alpha\n')
+        s = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert s
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', s)
+
+        # Orphan S; the WIP run reintroduces feature.py with DIFFERENT content
+        # (no patch-id match) under a WIP subject (no subject match), plus an
+        # extra file -> the orphan's files are a strict subset of wip_files.
+        await _run(['git', 'reset', '--hard', base], cwd=wt)
+        (wt / 'feature.py').write_text('beta\n')
+        (wt / 'extra.py').write_text('additional WIP work\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha
+
+        await workflow._reconcile_done_step_commits()
+
+        reconciled = artifacts.read_plan()
+        assert reconciled['steps'][0]['commit'] == wip_sha, (
+            'the demoted filename-subset fallback must still resolve an orphan '
+            'that has no precise equivalent'
+        )
+        assert reconciled['steps'][0]['status'] == 'done'
+        escalation_queue.submit.assert_not_called()

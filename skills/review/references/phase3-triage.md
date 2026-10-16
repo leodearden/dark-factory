@@ -1,210 +1,174 @@
-# Phase 3: Triage and Task Creation — Detailed Guide
+# Phase 3: Triage and Routing — Detailed Guide
 
-This phase answers: **what should we do about what we found?**
+This phase answers: **what happens to each finding, and when does the next review run?**
 
-Triage requires judgment — distinguishing real bugs from noise, deciding what's a task vs an escalation, avoiding duplicate work. You (Opus) make the classification decisions. Sonnet agents can handle the mechanical task creation once you've decided what to create.
+The coordinator does all of it: it needs the task-store tools and the judgment. Every rule here is an application of `$CONTRACT` §6–§8 and §11; where this guide and the contract disagree, the contract wins.
 
-## Step 1: Load findings
+`<project_root>` and `<project_id>` are the values pinned in SKILL.md "Pin the run". Every task call passes `project_root=<project_root>`.
 
-If running all phases in sequence, you already have Phase 1 and Phase 2 results in memory.
+## Step 1: Load the report
 
-If running `--phase triage` standalone, load the most recent reports:
-- Find the latest `review/reports/phase1-*.json` and `review/reports/phase2-*.json`
-- If multiple exist, use the most recent by timestamp
-- If none exist, tell the user: "No Phase 1 or Phase 2 reports found. Run `/review --phase integration` and `/review --phase architecture` first, or run `/review` for a full review."
+When Phase 3 follows Phase 2 in one invocation, the report is in hand. `--phase triage`: load the newest `review/reports/review-*.json` whose `method.extra.phases_run` lacks `3`; none → tell the user and offer `/review` or the missing phases. Triage completes that report under its own `run_id` and `as_of_sha`.
 
-## Step 2: Classify each finding
+## Step 2: Phase 1 failures (operational, not findings)
 
-Walk through every finding from both phases. For each one, assign a classification:
+A red main, a broken gate or a dead smoke check is operational breakage (contract §4), so it never enters `findings` and never gets a finding key.
 
-| Classification | Criteria | Action |
-|---------------|----------|--------|
-| **Auto-fix** | Trivially fixable with no design decisions — missing import, lint fix, type annotation, typo | Create task, priority: medium |
-| **Clear-cut issue** | Unambiguous bug or gap with an obvious fix path — broken wiring, unintended stub, failing test | Create task, priority: high |
-| **Design question** | Multiple valid approaches, architectural implications, or unclear intent — "should this be sync or async?", "is this the right abstraction boundary?" | Escalate to user |
-| **Known/accepted** | Matches a briefing `known_gap`, a memory decision record, or a pre-existing issue baseline | Skip — log in report for audit trail |
-| **Stale task** | An existing pending task addresses a concern that's no longer relevant | Flag for user review |
+For each `phase1.failures` entry classified `new` (and each failed smoke check that is a code failure, not a stopped service):
 
-### Classification guidelines
+1. Look for an owner: the orchestrator files its own red-main fix-forward tasks, so `search_tasks(query="<test id> <error line>", project_root=…, score_threshold=0.6)`, then `get_task` on any plausible match.
+2. Owned → write the id into `owner_task`.
+3. Unowned → file it as in Step 5 with `priority: critical` when main is red, else `high`; metadata `source: "review"`, `x_finding_run: <run_id>`, no `x_finding_key`, and the R4 pair built from the test id instead of a key.
 
-**Lean toward "clear-cut" over "design question"** when the fix is obvious even if the root cause is complex. If the classifier returns a category but never calls the store, the fix is "add the store call" — that's clear-cut, not a design question, even though the bug was in complex code.
+Known flakes go to the project's flake process, not to new tasks.
 
-**Lean toward "auto-fix" over "clear-cut"** for anything a Sonnet agent could fix in one TDD cycle without architectural guidance. Lint fixes, missing imports, type annotations, docstring fixes.
+## Step 3: Class each finding
 
-**Escalate when genuinely ambiguous.** "Should smoke tests start dependent services?" is a design question — there are valid arguments both ways and the answer depends on the user's testing philosophy.
+For every finding with verdict `confirmed` or `weakened` whose disposition is not already `fixed:<sha>` or `refuted`, set `class` per contract §6:
 
-**Don't create tasks for pre-existing issues** unless they affect the current review scope. The review's job is to catch new/undetected problems, not to clean up historical tech debt (unless the user specifically asks for that).
+| Class | Test | Route |
+|---|---|---|
+| `mechanical` | one anchor, no design choice; a competent agent could fix it from the statement | curator ticket after the §8 dedup (Steps 4–5) |
+| `structural` | spans modules, chooses between designs, changes a contract — and every split-this-file or reduce-this-number proposal | deliberation with the user (Step 6); file nothing |
 
-## Step 3: Task tree health check
+Age is not a filter. A pre-existing finding is classed and routed like a new one; severity, not age, sets priority. Lean mechanical when the fix is obvious even in complex code; lean structural the moment the proposal has two credible designs.
 
-Before creating new tasks, audit the existing task tree to avoid conflicts:
+## Step 4: Dedup — contract §8
 
-### Check for duplicates
+Run step 1 for **every** finding (structural ones too, so a finding `/prd` already filed reads `filed:<id>`). Run steps 2–3 only before filing a mechanical finding. Record the deciding step in `dedup_step`.
 
-For each finding you're about to create a task for:
+### §8 step 1 — key lookup
 
+`find_tasks_by_metadata(project_root, key="x_finding_key", value=<key>)` on the fused-memory MCP. Until that tool exists, use the read-only forensic query (`CLAUDE.md` §"Forensic reads of tasks.db"): the store is `<project_root>/.taskmaster/tasks/tasks.db` — never a worktree's, never the 0-byte `.taskmaster/tasks.db` decoy — and its shape comes from `python scripts/tasks_db_schema.py --project-root <project_root>` (run from a dark-factory checkout), not from memory.
+
+```python
+import sqlite3
+db = sqlite3.connect(f"file:{project_root}/.taskmaster/tasks/tasks.db?mode=ro", uri=True)
+LOOKUP = """
+SELECT t.id, t.status, t.priority, t.title
+FROM (SELECT * FROM tasks WHERE json_valid(metadata)) AS t,
+     json_each(t.metadata, '$.x_finding_key') AS k
+WHERE k.value = ?
+"""
+rows = {key: db.execute(LOOKUP, (key,)).fetchall() for key in finding_keys}
 ```
-get_tasks(project_root="/home/leo/src/dark-factory")
-```
 
-Search the task tree for existing tasks that address the same issue. Check:
-- Title similarity
-- Same modules referenced
-- Same area of concern
+`json_each` with a path matches both a scalar `x_finding_key` and a list of keys. Then, per contract §8 step 1:
 
-If a duplicate exists and is pending/in-progress → skip task creation, note in report.
-If a duplicate exists and is done but the issue persists → the task didn't actually fix it. Create a new task referencing the prior attempt.
+- **a.** A hit in `pending`, `in-progress`, `blocked`, `deferred` or `merge-deferred` → `filed:<id>`; do not file.
+- **b.** A `cancelled` hit carrying `metadata.x_acceptance_reason` → `accepted:<id>`; do not file. A `cancelled` hit without it was abandoned, not accepted: treat it as absent and go on to step 2.
+- **c.** A `done` hit → the finding survived re-verification at `as_of_sha`, so file it (Step 5) with `x_supersedes_task: <id>` and `(supersedes #<id>)` in the title.
 
-### Flag stale tasks
+A briefing `known_gaps` entry covering the finding counts only through its `accepted_by` task: read that task and apply a/b/c to it. A gap without a pointer suppresses nothing; it is already in `method.extra.briefing_defects`.
 
-Look for pending tasks whose assumptions have been invalidated:
-- Task references a module that's been renamed or deleted
-- Task depends on a task that was cancelled
-- Task describes fixing something that's already been fixed by another task
-- Task's `description` mentions code patterns that no longer exist
+An error payload or a failed query means step 1 did not run — never read it as "no match". Neither the MCP tool nor the database usable → this run **files nothing** (contract §8). Say so in the summary and leave dispositions `open`.
 
-Flag these for user review — don't delete them yourself.
+### §8 step 2 — semantic lookup
 
-### Flag blocked tasks
+`search_tasks(project_root=…, query=<paraphrase of the statement naming the anchor>, score_threshold=0.6)`. Its corpus excludes `deferred` tasks, which is why step 1 ran first. Read each plausible match with `get_task` before deciding: the same cost at the same anchor → `filed:<id>` (and stamp the key onto that task, below); a near miss → file.
 
-Look for tasks marked as blocked where the blocker may have been resolved:
-- Blocking dependency is now done
-- The issue described in the block reason has been fixed
+Stamping a key onto an existing task: `update_task(id=<id>, project_root=…, metadata={"x_finding_key": [<existing keys…>, <key>]})` — a list write replaces, so carry the keys already there.
 
-Suggest unblocking these.
+### §8 step 3 — the curator
 
-## Step 4: Create tasks
+The curator's own `candidate_key` dedup inside `resolve_ticket` is the last net, never the first. A `combined` result means it caught one: record `filed:<task_id>` with `dedup_step: "3"`.
 
-### Skip F-infra-filed findings first
+## Step 5: File mechanical findings
 
-Before creating any task, check Phase 2's `f_infra_findings.medium.filed_task_ids`. If a finding originated from the project's `/audit` skill (Phase 2 Step 1), the audit's severity ladder already filed it as a task via `submit_task(planning_mode=True)`. Phase 3 MUST NOT re-file these — record the existing `filed_task_id` in the review summary and proceed to the next finding. High-severity F-infra findings were already escalated by `/audit` (and listed in `f_infra_findings.high`); do not re-escalate. Low-severity F-infra findings are logged-only by design.
-
-### Create tasks for the remaining findings
-
-For each finding classified as "auto-fix" or "clear-cut issue":
-
-```
-# Phase 1: submit — returns immediately with a ticket id
+```python
+import hashlib
 submit_result = submit_task(
-    project_root="/home/leo/src/dark-factory",
-    title="{concise description of the fix}",
-    description="{what's wrong, where, evidence, and what the fix should look like}",
-    priority="high",                      # or "medium" for auto-fix — see priority mapping below
+    project_root=project_root,
+    title="<imperative fix, naming the anchor>",
+    description="<the statement: what is wrong, where, the measured facts>",
+    details="<the proposal and how to verify the fix; the heuristic(s) by name>",
+    priority=finding["severity"],                 # contract §4: severity == priority
     metadata={
-        "source": "review-cycle",
-        "review_id": "{timestamp}",
-        "spawn_context": "review",
-        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
-        "files": ["{affected/file/path.py}"],
-        "memory_hints": {
-            "search_queries": ["{relevant search query}"],
-            "entity_names": ["{relevant entity}"]
-        },
+        "source": "review",
+        "x_finding_key": finding["key"],
+        "x_finding_run": run_id,
+        # "x_supersedes_task": <id>,             # only for §8 step 1c
+        "files": ["<anchor's file>"],             # files only; the architect widens scope
+        "escalation_id": f"review-{finding['key']}",
+        "suggestion_hash": hashlib.sha256(f"{finding['key']}|{run_id}".encode()).hexdigest()[:16],
     },
 )
-ticket = submit_result["ticket"]
-
-# Phase 2: block until the curator decides
-resolve = resolve_ticket(ticket=ticket, project_root="/home/leo/src/dark-factory", timeout_seconds=<see _shared/ticket-failure-handling.md>)
-
-if resolve["status"] == "created":
-    task_id = resolve["task_id"]           # new task — use for add_dependency calls
-elif resolve["status"] == "combined":
-    task_id = resolve["task_id"]           # merged into existing task — normal, not an error
-elif resolve["status"] == "refused":
-    # A deterministic guard rejected the candidate: no task was created and there
-    # is no task_id (so it can carry no add_dependency edge). Intended outcome —
-    # record resolve["reason"] in the review report. Do NOT retry.
-    note_refused(resolve["reason"])
-elif resolve["status"] == "failed":
-    # On `failed`: record the reason in the review report and skip this finding.
-    # See skills/_shared/ticket-failure-handling.md for the retryable/terminal
-    # reason matrix and R4 idempotency guidance. Review-cycle tasks don't natively
-    # set escalation_id/suggestion_hash; to opt into R4 de-duplication on retry,
-    # synthesize a stable pair per that doc's guidance.
-    log_failure(resolve["reason"])
+resolve = resolve_ticket(ticket=submit_result["ticket"], project_root=project_root,
+                         timeout_seconds=<see skills/_shared/ticket-failure-handling.md>)
 ```
 
-### Task quality checklist
+`escalation_id` + `suggestion_hash` opt the filing into the curator's R4 idempotency gate, so a retried submit cannot file twice (`skills/_shared/ticket-failure-handling.md` §"R4 idempotency gate", case B).
 
-Every created task should:
+| `resolve["status"]` | Disposition |
+|---|---|
+| `created` | `filed:<task_id>` |
+| `combined` | `filed:<task_id>`, `dedup_step: "3"` |
+| `refused` | stays `open`; record `resolve["reason"]`; do not retry |
+| `failed` | stays `open`; record the reason; retry only per the shared doc's retryable matrix |
 
-- **Have a concrete title** — "Fix Mem0 client wiring in classifier" not "Fix classifier issue"
-- **Include evidence** — the specific file, line, and what's wrong
-- **Describe the expected fix** — what the code should do after the fix
-- **Reference the review** — include `metadata.source: "review-cycle"` and `metadata.review_id: "{timestamp}"`
-- **Include memory_hints** — search queries and entity names that would help a future agent understand the context:
-  ```json
-  {
-    "memory_hints": {
-      "search_queries": ["classifier routing decision", "Mem0 client integration"],
-      "entity_names": ["classifier.py", "mem0_client"]
-    }
-  }
-  ```
-- **Set dependencies** — if fix-up tasks depend on each other (e.g., "fix wiring" before "add integration test for the wiring"), set `add_dependency`
+Every filed task has a concrete title, the evidence, the expected fix and the finding metadata. When one fix must land before another (wiring before the test of the wiring), add the edge with `add_dependency` after both resolve.
 
-### Priority mapping
+## Step 6: Structural findings — deliberation
 
-| Classification | Priority |
-|---------------|----------|
-| Clear-cut issue, severity: high | high |
-| Clear-cut issue, severity: warning | medium |
-| Auto-fix | medium |
-| Auto-fix, lint-only | low |
-
-## Step 5: Escalate ambiguous findings
-
-For each finding classified as "design question", present it to the user with:
-
-1. **The finding** — what was observed, with evidence
-2. **Why it's ambiguous** — what makes this a judgment call rather than a clear fix
-3. **Options** — 2-3 possible approaches with trade-offs
-4. **Recommendation** — your best guess, clearly labelled as such
-
-Format:
+File nothing for a structural finding (contract §6). Present each to the user:
 
 ```markdown
-**Escalation 1: Should smoke tests start dependent services?**
-
-Finding: The "Health endpoint" smoke test fails because it assumes the fused-memory server is running. Currently smoke tests don't manage service lifecycle.
-
-Options:
-  a) Add setup/teardown to smoke tests that start/stop services → more realistic but slower, risk of port conflicts
-  b) Skip smoke tests that require running services, rely on integration tests instead → simpler but loses the "does it actually start?" check
-  c) Add a pre-review step that starts all services → separates concerns but adds a manual step
-
-Recommendation: (a) — the whole point of smoke tests is "does it run?", which requires starting it.
+**R4 · fk-… · structural · high — Harness couples to the merge worker's internals (h7, h13)**
+Finding: <statement with evidence>
+Why structural: <the designs it chooses between, or the modules it spans>
+Options: a) … b) … c) …
+Recommendation: <labelled as yours>
 ```
 
-Wait for the user to respond to escalations before creating tasks for them. If the user provides direction, create the appropriate task. If they defer, note it in the report.
+The user's answer sets the disposition:
 
-## Step 6: Write review summary to memory
+- **Take it to a program doc / `/prd`** → stays `open`; `/prd` later files the tasks and stamps the key (§6, §8).
+- **It is mechanical after all** → re-class and file it through Steps 4–5.
+- **Won't fix** → an owned acceptance task (contract §7), filed now:
 
-After triage is complete, write a summary to fused-memory:
+  ```python
+  r = submit_task(project_root=project_root, planning_mode=True, priority=finding["severity"],
+                  title="Accepted: <finding title> (<key>)",
+                  description="<the statement>",
+                  details="Accepted by <who> on <date>. Reopen if <condition>.",
+                  metadata={"source": "review", "x_finding_key": finding["key"], "x_finding_run": run_id,
+                            "x_acceptance_reason": "<the reason, as the user gave it>"})
+  set_task_status(id=r["task_id"], status="cancelled", project_root=project_root)
+  ```
+
+  The reason goes in at submit because a cancelled task's metadata is frozen. Never accept by deferring: a `deferred` task is postponed work (contract §7).
+
+  Disposition `accepted:<task_id>`. If the user wants it recorded in the briefing, the `known_gaps` entry carries only `what` and `accepted_by: <task_id>` (`/review-briefing`).
+- **Deferred decision** → stays `open`; say so in the summary. The next run carries it.
+
+Interactive runs wait for the answers before Step 7. A run the user cannot attend leaves every structural finding `open`.
+
+## Step 7: Schedule the next run — contract §11
+
+Only a run that completed Phase 3 files the chain; a `--findings-only` run never reaches this step. Follow `skills/_shared/filing-the-trigger-chain.md` §§0–5 exactly; it holds the only copy of the calls, the form probe and the supersede order. The run-specific values are `skill = "review"` and `run_id = <run_id>`, with `<project_root>` and `<project_id>` as pinned.
+
+- **§0** — acceptance tasks are not "filed tasks" for the chain; the operational tasks from Step 2 and the mechanical tasks from Step 5 are. No filed tasks → no chain.
+- **§1** — the open-chain lookup keys on `json_extract(metadata, '$.trigger_chain.skill') = 'review'` in a non-terminal status.
+- **§2** — the form probe runs in the dark-factory checkout, never in `<project_root>`.
+- **§5** — an open older `/review` chain is superseded before this run files its own.
+- **§5 step 2** — when `method.extra.launched_from` names the escalation that launched this run, that is the escalation resolved with "ran as <run_id>"; there is no separate resolution step.
+
+Record the form (`final`, `interim` or `none`), the chain task ids, any superseded chain's ids and the reason for `none` in `method.extra.trigger_chain`. Verify the filed tasks with `get_task` (not `search_tasks`, which excludes uncommitted tasks). The human gate escalates at dispatch; a human runs `/review`, never the gate itself.
+
+## Step 8: Write the summary to memory
 
 ```
 add_memory(
-  content="Review cycle completed for {scope} on {date}. Found {n} issues: {n_high} high, {n_medium} medium, {n_low} low. Created {n} tasks. Key findings: {1-2 sentence summary of most important issues}. Escalated {n} design questions to user.",
+  content="Review {run_id} ({scope}, as_of {as_of_sha:10}, since {since:10|none}): {n} findings — {high} high/{medium} medium/{low} low; filed {filed}; {already} already owned; {structural} structural for deliberation; {fixed} fixed since last run. Next run: {chain form, task ids}.",
   category="observations_and_summaries",
-  project_id="dark_factory",
-  agent_id="claude-interactive"
+  project_id="<project_id>",
+  agent_id="claude-review",
+  entities=[]
 )
 ```
 
-If the review found patterns (e.g., "multiple stubs in the same module suggest the task decomposition was too coarse"), write that as a separate observation:
+A pattern across findings (several stubs from one coarse decomposition, one seam behind many `tests` findings) is a separate `observations_and_summaries` write.
 
-```
-add_memory(
-  content="{pattern observation and its implications for future work}",
-  category="observations_and_summaries",
-  project_id="dark_factory",
-  agent_id="claude-interactive"
-)
-```
+## Final output
 
-## Compile final output
-
-After all three phases, produce the combined summary (see SKILL.md output format section) and write it to `review/reports/summary-{timestamp}.md`.
-
-The summary should be self-contained — readable without the JSON reports. It's what the user will refer back to, share with others, or use to track progress on the created tasks.
+Render `review/reports/<run_id>.md` from the JSON (`references/run-record.md` §"Markdown rendering"), show the interactive summary from SKILL.md, then commit both files (SKILL.md "Committing the report"). The `.md` must read on its own: it is what the user shares and what the next run's human reads first.
