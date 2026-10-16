@@ -225,7 +225,7 @@ def timeout_marker_sites(
 
 
 def inverts(seconds: float | None, *, verify_cli_budget: int) -> bool:
-    """True iff a marker at *seconds* grants less than *verify_cli_budget* without being a deliberate tight bound.
+    """True iff *seconds* is too big for a tight bound yet grants less than *verify_cli_budget*.
 
     The band is ``(DELIBERATE_TIGHT_BOUND_CEILING, verify_cli_budget)``, open at
     both ends: a mark AT the ceiling is still a deliberate tight bound, and one

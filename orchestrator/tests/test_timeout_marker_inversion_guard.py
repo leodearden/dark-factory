@@ -522,29 +522,19 @@ def _sanctioned_bindings_in(tree: ast.Module, module: str) -> list[_Binding]:
 class TestVerifyCliBudgetConstant:
     """``VERIFY_CLI_PER_TEST_TIMEOUT`` -- the budget the whole guard is built on.
 
-    A MIRROR PIN, deliberately loud on a retune.  It resembles the live-yaml
-    pins e9d1055ed8 and 5b51fa970b removed, but those read an operational value
-    INCIDENTALLY, through the autouse ``_isolate_orch_config`` layer over
-    dark-factory-orchestrator.yaml, while their subject was a code default or
-    an unrelated premise.  This class's subject IS the constant-to-config
-    relationship: the shape
-    test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants gives
-    ``PYPROJECT_DEFAULT_TIMEOUT``.
-
-    The relationship-only alternative is already asserted from the yaml by
-    :func:`test_the_verify_budget_is_configured`.  The sweep derives its band
-    from the yaml, never from this constant, which is why fused-memory and
-    shared run the same band with no constant and no pin.  What the equality
-    adds is the CONSTANT's honesty, which other checks rest on: the
+    A MIRROR PIN, deliberately loud on a retune.  The sweep reads its band from
+    the yaml, and :func:`test_the_verify_budget_is_configured` checks that band
+    is non-empty; neither needs this constant.  What the pin protects is the
+    CONSTANT's honesty, which other checks rest on: the
     ``faulthandler_timeout`` bound in TestTimeoutConstants, the deep-scene
     ``test_the_timeout_never_inverts_the_verify_budget`` floors, and every
-    marker that spells the name.  On an upward retune the sweep goes red anyway,
-    over every site spelling this name, and its remedy names the spelling those
-    sites already use; this is the one red test whose message names the fix.
+    marker that spells the name.
 
-    Skip or xfail on disagreement was rejected as silent degradation.  The
-    ``--timeout`` lives in a tracked merge-verify config whose own verify runs
-    this test, so a retune moves the constant in the same commit.
+    Its red is deliberate.  On an upward retune the sweep goes red anyway, over
+    every site spelling this name, and its remedy names the spelling those
+    sites already use; this is the one red test whose message names the fix.
+    The ``--timeout`` lives in a tracked merge-verify config whose own verify
+    runs this test, so a retune moves the constant in the same commit.
     """
 
     def test_the_inversion_band_is_non_empty(self) -> None:
