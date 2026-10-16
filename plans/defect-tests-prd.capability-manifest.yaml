@@ -7,7 +7,7 @@ prd: plans/defect-tests-prd.md
 schema_version: 1
 tasks:
 - label: α1
-  task_id: null
+  task_id: 7043
   title: 'Defect vocabulary: shared/defects.py types, ref grammar, transition table, metadata registration'
   capabilities:
   - name: metadata-submodel-registration-api-with-list-cardinality
@@ -70,7 +70,7 @@ tasks:
       - shared/src/shared/defects.py
       expect: present
 - label: α2
-  task_id: null
+  task_id: 7044
   title: declare_defect / record_defect_outcome write path, creation floor, update_task rejection, authority drift test
   capabilities:
   - name: per-ref-merge-inside-one-write-unit
@@ -131,7 +131,7 @@ tasks:
       kind: manual
       reason: symbol names are not fixed by the PRD; B17 and the round-trip through get_task are the observable proof
 - label: β1
-  task_id: null
+  task_id: 7045
   title: Injected pytest plugin, verify-leg injection, map archiving, defect_tests config, marker registration
   capabilities:
   - name: pytest-leg-structured-injection-seam
@@ -293,7 +293,7 @@ tasks:
       kind: manual
       reason: judged by β1's fixtures including an -n 2 run and B4
 - label: β2
-  task_id: null
+  task_id: 7046
   title: 'Static defect enumerator: enumerate_source, tree walker, completeness, skip/xfail, CLI'
   capabilities:
   - name: static-mark-grammar-primitives
@@ -317,7 +317,7 @@ tasks:
       - shared/src/shared/defect_enumerator.py
       expect: present
 - label: γ
-  task_id: null
+  task_id: 7047
   title: DEFECT_TEST_RULE constant and splice into the six fixing prompts; declared defects in task briefings
   capabilities:
   - name: six-fixing-prompt-sites-exist
@@ -396,7 +396,7 @@ tasks:
       kind: manual
       reason: renderer symbol is not fixed by the PRD and a defects-word grep would be satisfied by the rule text alone; judged by the persisted-briefing test
 - label: δ1
-  task_id: null
+  task_id: 7048
   title: 'Reviewer contract: issue kind and defect_rulings, validation, legacy default, harness bump'
   capabilities:
   - name: reviewer-contract-template-and-harness-version
@@ -445,7 +445,7 @@ tasks:
     binding: producer:α1 upstream — issue_kind_of; δ1 no longer waits on 6739
     verdict: PASS
 - label: δ1b
-  task_id: null
+  task_id: 7049
   title: Route the review-payload normaliser (6739) through issue_kind_of
   capabilities:
   - name: review-payload-normaliser-for-legacy-default
@@ -461,7 +461,7 @@ tasks:
       - orchestrator/src/orchestrator/review_payload.py
       expect: present
 - label: δ2
-  task_id: null
+  task_id: 7050
   title: 'Reviewer consumption: in-task defect declaration writer, ruling application, reviewer briefing'
   capabilities:
   - name: declare-defect-operation
@@ -513,7 +513,7 @@ tasks:
       kind: manual
       reason: section heading is not fixed by the PRD; judged by the persisted reviewer briefing test
 - label: θ1
-  task_id: null
+  task_id: 7051
   title: 'Auto-filing sites declare defects: submit_only_instructions, steward and deep-reviewer templates, curator candidate and combine'
   capabilities:
   - name: submit-only-instructions-defects-parameter
@@ -556,7 +556,7 @@ tasks:
       kind: manual
       reason: B15 behaviour (pending target gains entries via declare_defect, in-progress target gets a separate task); no stable symbol is fixed by the PRD, and declare_defect may legitimately already appear in the interceptor once α2 lands
 - label: ε
-  task_id: null
+  task_id: 7052
   title: Plan tools (reproduces, declare_not_reproducible, declare_withdrawn, retire_defect_test), plan check, defect_tests config
   capabilities:
   - name: plan-site-hook-points-exist
@@ -701,7 +701,7 @@ tasks:
     binding: producer:θ1 upstream (roles.py serialization γ → δ1 → θ1 → ε)
     verdict: PASS
 - label: ζ1
-  task_id: null
+  task_id: 7053
   title: 'Proof runner: PROOF_BASE worktree, test-side overlay, injected-plugin legs, DefectProof, scripts/prove_defect.py'
   capabilities:
   - name: proof-base-worktree-kind
@@ -770,7 +770,7 @@ tasks:
       kind: manual
       reason: judged by the B1, B3, B4 fixtures on a real fixture branch, not by a grep; the cold and warm proof duration is recorded in the completion note
 - label: ζ2
-  task_id: null
+  task_id: 7054
   title: 'Workflow proof integration: hook after both VERIFY arms, typed replan, persisted counter, streak escalation, soak report'
   capabilities:
   - name: proof-hook-site-after-both-verify-arms
@@ -836,7 +836,7 @@ tasks:
     binding: capability→producer (wired) — orchestrator/src/orchestrator/harness.py constructs workflows via workflow.py::build_workflow; ζ2 constructs one KeyedStreaks there and passes it in
     verdict: PASS
 - label: η
-  task_id: null
+  task_id: 7055
   title: 'Merge presence check and keep-ratchet: merge_lane/defect_checks.py, typed DefectMergeRefusal, defect_keep_check event'
   capabilities:
   - name: merge-gate-call-site-with-candidate-and-parent-trees
@@ -897,7 +897,7 @@ tasks:
     binding: producer:ζ2 upstream — the process-level KeyedStreaks constructed in harness.py; η injects it into SpeculativeMergeWorker
     verdict: PASS
 - label: θ2
-  task_id: null
+  task_id: 7056
   title: 'Docs and skills: findings-contract pointer, hand-filing recipes, flake-ledger reciprocal sentence'
   capabilities:
   - name: findings-contract-section-8-exists
@@ -982,7 +982,7 @@ tasks:
       kind: manual
       reason: mirror-test file and name are not fixed by the PRD; the signal is a test-suite property
 - label: ι
-  task_id: null
+  task_id: 7057
   title: 'Client-feed defect display: cases[].defects and the defects_results fold'
   capabilities:
   - name: client-feed-package-contract-and-fold
@@ -1037,7 +1037,7 @@ tasks:
       kind: manual
       reason: judged by the run output; zero is legitimate before the first proven defect
 - label: κ
-  task_id: null
+  task_id: 7058
   title: 'Debugger-edit fact to the reviewer: edited_failing_tests with could_not_determine'
   capabilities:
   - name: task-verify-cost-junit-written-and-archived
@@ -1072,7 +1072,7 @@ tasks:
       - orchestrator/src/orchestrator/
       expect: present
 - label: λ1
-  task_id: null
+  task_id: 7059
   title: 'Integration gate, workflow seam: B1–B9, B15, B17–B22'
   capabilities:
   - name: workflow-seam-hooks-for-b1-to-b9
@@ -1099,7 +1099,7 @@ tasks:
       - orchestrator/tests/test_defect_tests_boundary_workflow.py
       expect: present
 - label: λ2
-  task_id: null
+  task_id: 7060
   title: 'Integration gate, merge seam: B10–B14, B16 (real train), B23'
   capabilities:
   - name: merge-seam-hooks-for-b10-to-b16-and-b23
@@ -1117,7 +1117,7 @@ tasks:
       - orchestrator/tests/test_defect_tests_boundary_merge.py
       expect: present
 - label: μ
-  task_id: null
+  task_id: 7061
   title: 'Human gate: flip defect_tests.mode to enforce'
   capabilities:
   - name: soak-report-available-to-the-decider
@@ -1133,7 +1133,7 @@ tasks:
       kind: manual
       reason: Leo decides whether to flip defect_tests.mode to enforce after the soak criteria (14 days and 10 proofs or 60 days, no unexplained PROOF_UNAVAILABLE streak, hand audit of 5 PROVEN records and every PASSES_AT_BASE); the gate has no code deliverable
 - label: ν
-  task_id: null
+  task_id: 7062
   title: 'Human gate: author the client-feed PRD revision (defect_reported inbox event and privileged filer)'
   capabilities:
   - name: client-origin-declaration-surface
@@ -1146,7 +1146,7 @@ tasks:
       kind: manual
       reason: Leo authors the client-feed PRD revision (defect_reported inbox event, privileged filer outside the publisher's read-only boundary, calling submit_task/declare_defect with origin client) and the portal PRD's one-line amendment exposing report id and criterion id; the gate has no code deliverable
 - label: ξ
-  task_id: null
+  task_id: 7063
   title: 'Human gate: restore the LDE sheet''s per-bug sentence?'
   capabilities:
   - name: soak-report-and-client-display-available-to-the-decider
