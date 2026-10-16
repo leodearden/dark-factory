@@ -838,10 +838,10 @@ _GET_STATUSES_REFUSAL = {
 
 class TestSchedulerChronicFlakeTaskClient:
     """``SchedulerChronicFlakeTaskClient``: the concrete adapter over a
-    duck-typed scheduler exposing ``dispatch_tool`` — mirrors
-    ``harness._OfflineLaneTaskClient``'s "never talk to MCP directly" scope
-    boundary, but self-contained in ``chronic_flake.py`` to avoid a
-    workflow<->harness import cycle."""
+    duck-typed scheduler exposing ``dispatch_tool`` — the machine filer the
+    harness wires, with a "never talk to MCP directly" scope boundary,
+    self-contained in ``chronic_flake.py`` to avoid a workflow<->harness
+    import cycle."""
 
     async def _client(self, return_value):
         from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient

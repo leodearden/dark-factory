@@ -392,8 +392,8 @@ async def _run_lane(
     ``orchestrator/pyproject.toml``'s ``timeout``/``timeout_method``
     comment). Multi-pass callers whose worst-case sum is at or above that
     ceiling carry their own ``@pytest.mark.timeout`` override — see
-    ``test_b5_same_set_recurrence_updates_not_duplicates``,
-    ``test_b7_stall_promotes_to_blocker``, and ``test_b3_never_a_gate``
+    ``test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once``,
+    ``test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it``, and ``test_b3_never_a_gate``
     below — a rule ``test_every_composing_caller_carries_a_timeout_override``
     now enforces rather than merely describes.
 
@@ -1102,7 +1102,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     from test_offline_lane_infra_integration import (  # noqa: PLC0415
         _SPAWNS_PER_DRIVE_ADVANCE as _infra_spawns_per_drive_advance,
     )
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _SPAWNS_PER_FIXTURE_COMMIT as _infra_spawns_per_fixture_commit,
     )
     from test_offline_lane_infra_integration import (  # noqa: PLC0415

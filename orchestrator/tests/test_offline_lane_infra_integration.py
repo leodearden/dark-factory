@@ -424,7 +424,7 @@ async def _run_lane(
     ``timeout_method`` comment). Multi-pass callers whose worst-case sum is
     at or above that ceiling carry their own ``@pytest.mark.timeout``
     override — see
-    ``test_ib4_same_infra_set_recurrence_updates_not_duplicates`` and
+    ``test_ib4_a_persistent_infra_red_under_an_open_task_files_once_and_escalates_once`` and
     ``test_ib2_infra_run_in_flight_never_gates_merge`` below — a rule
     ``test_every_composing_caller_carries_a_timeout_override`` now enforces
     rather than merely describes.

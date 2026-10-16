@@ -47,7 +47,8 @@ LEGACY_FIX_TASK_PRIORITY = 'high'
 
 PassOutcomeHook = Callable[[str, str, PassOutcome, Sequence[RunRecord]], Awaitable[Sequence[EvidenceNote]]]
 DetectSeam = Callable[[], Awaitable[tuple[int, str]]]
-ConfirmSeam = Callable[[ConfirmTarget, RunRecord | None, ConfirmRunner], Awaitable[Confirmed | Unconfirmable]]
+ConfirmOutcome = Confirmed | Unconfirmable
+ConfirmSeam = Callable[[ConfirmTarget, RunRecord | None, ConfirmRunner], Awaitable[ConfirmOutcome]]
 
 
 def lane_pass_outcome_hooks(
@@ -136,7 +137,7 @@ async def run_pass(
     returncode, _tail = await detect()
     _log_sub_run(target, head, returncode, time.monotonic() - started)
     detect_record = store.last_record(target.command, Phase.DETECT)
-    outcome: Confirmed | Unconfirmable | None = None
+    outcome: ConfirmOutcome | None = None
     notes: tuple[EvidenceNote, ...] = ()
     if returncode != 0:
         confirm_target = ConfirmTarget(target.leg, worktree, target.lane_command)
