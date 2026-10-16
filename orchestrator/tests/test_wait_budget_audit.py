@@ -7,13 +7,20 @@ case is non-vacuous and does not shift when another file is edited.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import math
 
 import pytest
 from _wait_budget_audit import (
+    AMBIENT_TEST_TIMEOUT,
+    LimitSource,
+    WaitBudgetOffender,
+    item_limit_sources,
     item_wait_budgets,
     suppressed_result_wait_methods,
     unguarded_worker_teardown_methods,
+    wait_budget_offenders,
 )
 
 
@@ -1180,3 +1187,234 @@ class TestNoStopCall:
         )
 
 
+# Synthetic wait and mark values for TestWaitBudgetOffenders, derived from the
+# ambient budget so a change to it cannot silently move a case across its
+# threshold.
+_HEAVY_WAIT = AMBIENT_TEST_TIMEOUT / 2  # two of these reach the ambient budget
+_LIGHT_WAIT = AMBIENT_TEST_TIMEOUT / 4  # one of these stays under it
+_GENEROUS_MARK = AMBIENT_TEST_TIMEOUT * 2  # clears every synthetic bill here
+_TIGHT_MARK = _LIGHT_WAIT / 2  # clears none of them
+
+_HEAVY_BODY = (
+    f'        await asyncio.wait_for(a, timeout={_HEAVY_WAIT})\n'
+    f'        await asyncio.wait_for(b, timeout={_HEAVY_WAIT})\n'
+)
+_LIGHT_BODY = f'        await asyncio.wait_for(a, timeout={_LIGHT_WAIT})\n'
+
+
+def _exec_module(source: str) -> dict[str, object]:
+    """The runtime namespace of *source* executed as a module, so its marks
+    and constants come from the very text the engine parses."""
+    namespace: dict[str, object] = {'pytest': pytest, 'asyncio': asyncio}
+    exec(compile(source, '<synthetic test module>', 'exec'), namespace)
+    return namespace
+
+
+def _offenders(source: str) -> list[WaitBudgetOffender]:
+    return wait_budget_offenders(source, _exec_module(source))
+
+
+class TestWaitBudgetOffenders:
+    """`wait_budget_offenders` judges each pytest item's bill against the
+    timeout pytest-timeout actually applies to it: the closest timeout mark
+    (the test's own, then its class's, then the module's `pytestmark`), else
+    the ambient budget. Every case runs a synthetic module whose waits are
+    defined, never awaited.
+    """
+
+    def test_an_unmarked_module_level_test_reaching_the_ambient_budget_offends(
+        self,
+    ) -> None:
+        source = 'async def test_x():\n' + _HEAVY_BODY.replace('        ', '    ')
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit_source) for o in offenders] == [
+            ('test_x', LimitSource.AMBIENT)
+        ], f'expected test_x to offend under the ambient budget, got {offenders!r}'
+        assert offenders[0].budget == AMBIENT_TEST_TIMEOUT
+        assert offenders[0].limit == AMBIENT_TEST_TIMEOUT
+
+    def test_an_unmarked_method_under_the_ambient_budget_is_covered(self) -> None:
+        source = 'class TestLight:\n    async def test_it(self):\n' + _LIGHT_BODY
+
+        assert _offenders(source) == []
+
+    def test_a_class_mark_covers_its_methods_only_when_it_clears_the_bill(
+        self,
+    ) -> None:
+        adequate = (
+            f'@pytest.mark.timeout({_GENEROUS_MARK})\n'
+            'class TestCovered:\n    async def test_it(self):\n' + _HEAVY_BODY
+        )
+        too_tight = (
+            f'@pytest.mark.timeout({_TIGHT_MARK})\n'
+            'class TestTight:\n    async def test_it(self):\n' + _LIGHT_BODY
+        )
+
+        assert _offenders(adequate) == []
+        offenders = _offenders(too_tight)
+        assert [(o.item, o.limit_source, o.limit) for o in offenders] == [
+            ('TestTight::test_it', LimitSource.CLASS_MARK, _TIGHT_MARK)
+        ], (
+            f'a class mark below the bill offends even under the ambient '
+            f'budget, because the mark replaces it; got {offenders!r}'
+        )
+
+    def test_a_method_mark_replaces_its_class_mark(self) -> None:
+        tighter_method = (
+            f'@pytest.mark.timeout({_GENEROUS_MARK})\n'
+            'class TestMixed:\n'
+            f'    @pytest.mark.timeout({_TIGHT_MARK})\n'
+            '    async def test_tight(self):\n' + _LIGHT_BODY
+            + '    async def test_inherits(self):\n' + _LIGHT_BODY
+        )
+        adequate_method = (
+            'class TestUnmarked:\n'
+            f'    @pytest.mark.timeout({_GENEROUS_MARK})\n'
+            '    async def test_heavy(self):\n' + _HEAVY_BODY
+        )
+
+        offenders = _offenders(tighter_method)
+        assert [(o.item, o.limit_source) for o in offenders] == [
+            ('TestMixed::test_tight', LimitSource.FUNCTION_MARK)
+        ], (
+            f'the method-level mark replaces the generous class mark, so only '
+            f'test_tight is short of its bill; got {offenders!r}'
+        )
+        assert _offenders(adequate_method) == []
+
+    def test_a_module_level_test_runs_under_its_own_mark(self) -> None:
+        source = (
+            f'@pytest.mark.timeout({_GENEROUS_MARK})\n'
+            'async def test_marked():\n' + _HEAVY_BODY.replace('        ', '    ')
+            + 'async def test_unmarked():\n' + _HEAVY_BODY.replace('        ', '    ')
+        )
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit_source) for o in offenders] == [
+            ('test_unmarked', LimitSource.AMBIENT)
+        ], (
+            f'the same bill clears test_marked\'s own mark but not the '
+            f'ambient budget test_unmarked runs under; got {offenders!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'pytestmark',
+        [
+            pytest.param(f'pytest.mark.timeout({_GENEROUS_MARK})', id='single'),
+            pytest.param(
+                f'[pytest.mark.asyncio, pytest.mark.timeout({_GENEROUS_MARK})]',
+                id='list',
+            ),
+        ],
+    )
+    def test_a_module_pytestmark_covers_an_unmarked_class(self, pytestmark: str) -> None:
+        source = (
+            f'pytestmark = {pytestmark}\n'
+            'class TestCovered:\n    async def test_it(self):\n' + _HEAVY_BODY
+        )
+        namespace = _exec_module(source)
+
+        assert wait_budget_offenders(source, namespace) == []
+        assert item_limit_sources(source, namespace) == {
+            'TestCovered::test_it': LimitSource.MODULE_MARK
+        }
+
+    def test_a_too_tight_module_mark_offends_under_the_ambient_budget(self) -> None:
+        source = (
+            f'pytestmark = pytest.mark.timeout({_TIGHT_MARK})\n'
+            'class TestLight:\n    async def test_it(self):\n' + _LIGHT_BODY
+        )
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit_source) for o in offenders] == [
+            ('TestLight::test_it', LimitSource.MODULE_MARK)
+        ], f'got {offenders!r}'
+
+    def test_a_tighter_class_mark_overrides_a_generous_module_mark(self) -> None:
+        source = (
+            f'pytestmark = pytest.mark.timeout({_GENEROUS_MARK})\n'
+            f'@pytest.mark.timeout({_TIGHT_MARK})\n'
+            'class TestTight:\n    async def test_it(self):\n' + _LIGHT_BODY
+        )
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit_source) for o in offenders] == [
+            ('TestTight::test_it', LimitSource.CLASS_MARK)
+        ], f'got {offenders!r}'
+
+    def test_a_module_pytestmark_without_a_timeout_leaves_the_ambient_budget(
+        self,
+    ) -> None:
+        source = (
+            'pytestmark = pytest.mark.asyncio\n'
+            'class TestHeavy:\n    async def test_it(self):\n' + _HEAVY_BODY
+        )
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit_source) for o in offenders] == [
+            ('TestHeavy::test_it', LimitSource.AMBIENT)
+        ], f'got {offenders!r}'
+
+    def test_an_unbounded_bill_offends_under_any_mark(self) -> None:
+        source = (
+            '@pytest.mark.timeout(10**6)\n'
+            'class TestUnbounded:\n'
+            '    async def test_it(self):\n'
+            '        await asyncio.wait_for(a, timeout=unknown_name)\n'
+        )
+        offenders = _offenders(source)
+
+        assert [o.item for o in offenders] == ['TestUnbounded::test_it'], f'got {offenders!r}'
+        assert math.isinf(offenders[0].budget)
+        assert 'unbounded' in offenders[0].describe(), offenders[0].describe()
+
+    def test_a_module_constant_resolves_end_to_end_through_the_namespace(self) -> None:
+        source = (
+            '_SETTLE = 30.0\n'
+            'class TestSettle:\n'
+            '    async def test_it(self):\n'
+            '        await asyncio.wait_for(a, timeout=_SETTLE)\n'
+        )
+        namespace = _exec_module(source)
+
+        assert item_wait_budgets(source, module_constants=namespace) == {
+            'TestSettle::test_it': 30.0
+        }
+        assert wait_budget_offenders(source, namespace) == [], (
+            'a namespace-resolved 30.0s bill clears the ambient budget; billed '
+            'unbounded it would offend under any timeout'
+        )
+
+    def test_a_class_missing_from_the_namespace_is_an_unresolved_offender(self) -> None:
+        source = 'class TestGone:\n    async def test_it(self):\n' + _LIGHT_BODY
+        namespace = _exec_module(source)
+        del namespace['TestGone']
+        offenders = wait_budget_offenders(source, namespace)
+
+        assert [(o.item, o.limit_source, o.limit) for o in offenders] == [
+            ('TestGone::test_it', LimitSource.UNRESOLVED, None)
+        ], f'an item whose marks cannot be read must offend loudly; got {offenders!r}'
+
+    def test_a_mark_with_unreadable_seconds_offends(self) -> None:
+        source = (
+            '@pytest.mark.timeout(timeout=None)\n'
+            'class TestUnreadable:\n    async def test_it(self):\n' + _LIGHT_BODY
+        )
+        offenders = _offenders(source)
+
+        assert [(o.item, o.limit) for o in offenders] == [
+            ('TestUnreadable::test_it', None)
+        ], f'got {offenders!r}'
+
+    def test_unparseable_source_has_no_offenders_and_does_not_raise(self) -> None:
+        assert wait_budget_offenders('def not valid python(:', {}) == []
+
+    def test_an_offender_is_frozen(self) -> None:
+        source = 'async def test_x():\n' + _HEAVY_BODY.replace('        ', '    ')
+        offender = _offenders(source)[0]
+
+        field = dataclasses.fields(offender)[0].name
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(offender, field, 'other')
