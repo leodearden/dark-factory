@@ -686,6 +686,28 @@ def _sub_run_logs(caplog: pytest.LogCaptureFixture, command: str) -> list[str]:
     ]
 
 
+_JUNIT_REPORT = '''<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest">
+<testcase classname="tests.test_q" name="test_ok"/>
+<testcase classname="tests.test_q" name="test_skip"><skipped message="no"/></testcase>
+<testcase classname="tests.test_q" name="test_bad"><failure message="boom"/></testcase>
+<testcase classname="tests.test_q.TestK" name="test_c[a b]"/>
+<testcase classname="elsewhere.test_r" name="test_unresolved"/>
+</testsuite></testsuites>
+'''
+
+
+def _child_writing_junit(report: str, output: bytes) -> Callable[..., Any]:
+    """A fake ``create_subprocess_exec`` whose ``sh -c`` child writes *report* where ``--junitxml`` points."""
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        words = shlex.split(argv[-1])
+        Path(words[words.index('--junitxml') + 1]).write_text(report)
+        return await _child_writing(output, returncode=1)(*argv, **kwargs)
+
+    return fake_exec
+
+
 def _seed_pass(tmp_path: Path, age: timedelta) -> Path:
     """Allocate a pass of the lane's generic command that started *age* ago; its directory."""
     started_at = datetime.now(UTC) - age
@@ -846,6 +868,28 @@ class TestLanePassRecords:
         assert detect.session_complete is True
 
     @pytest.mark.asyncio
+    async def test_a_junit_report_fills_outcomes_keyed_by_node_id(self, tmp_path: Path) -> None:
+        worker = _generic_worker(tmp_path, 'pytest -q tests')
+        cmd = LaneCommand(name=_LANE_COMMAND, command='pytest -q tests', cwd='.')
+        worker.records.allocate_pass(_LANE_COMMAND, Leg.GENERIC, HEAD)
+        (tmp_path / 'wt' / 'tests').mkdir()
+        (tmp_path / 'wt' / 'tests' / 'test_q.py').write_text('')
+
+        with patch(
+            'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+            side_effect=_child_writing_junit(_JUNIT_REPORT, b'1 failed, 3 passed in 0.01s\n'),
+        ):
+            await worker.command_runner(cmd, tmp_path / 'wt', HEAD)
+
+        detect = worker.records.last_record(_LANE_COMMAND, Phase.DETECT)
+        assert detect is not None
+        assert detect.outcomes == {
+            'tests/test_q.py::test_ok': 'passed',
+            'tests/test_q.py::test_skip': 'skipped',
+            'tests/test_q.py::TestK::test_c[a b]': 'passed',
+        }
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'command', ['make check', 'pytest -q tests && echo done'], ids=['opaque', 'raw-retained-pytest'],
     )
@@ -876,7 +920,12 @@ class TestLegacyLegRecords:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
-        _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, "echo '  RESULT: FAIL (test_x.sh)'\nexit 1")
+        _add_lane_script(
+            tmp_path,
+            RUN_ALL_INFRA_SCRIPT,
+            "echo '  RESULT: PASS (test_ok.sh) [flaky: passed on serial retry]'\n"
+            "echo '  RESULT: FAIL (test_x.sh)'\nexit 1",
+        )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
             await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
@@ -888,6 +937,7 @@ class TestLegacyLegRecords:
             FailureRecord('test_x.sh', 'failed', 'RESULT: FAIL (test_x.sh)'),
         )
         assert record.detect.ids_available is True
+        assert record.detect.outcomes == {'test_ok.sh': 'passed'}
         assert record.confirm is not None
         assert record.confirm.phase == Phase.CONFIRM
         assert ['ended_by=exit' in line for line in _sub_run_logs(caplog, 'infra')] == [True]

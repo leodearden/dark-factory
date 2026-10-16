@@ -11,9 +11,10 @@ import asyncio
 import os
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 from shared.verify_admission import nice_prefix
 
@@ -29,7 +30,7 @@ from orchestrator.offline_lane_records import (
     RunRecordStore,
     classify_exit,
 )
-from orchestrator.verify import parse_pytest_failures
+from orchestrator.verify import extract_test_outcomes_from_junit, parse_pytest_failures
 from orchestrator.verify_cmd import parse_config_command, render, with_junitxml
 
 if TYPE_CHECKING:
@@ -43,8 +44,12 @@ RUN_OFFLINE_DEEP_SCRIPT = 'scripts/run-offline-deep.sh'
 RUN_ALL_INFRA_SCRIPT = 'tests/infra/run_all.sh'
 INFRA_SCOPE = 'host-infra'
 
-# One H9 per-test verdict line, e.g. '  RESULT: FAIL (test_x.sh)'.
+# One H9 per-test verdict line, e.g. '  RESULT: FAIL (test_x.sh)' or
+# '  RESULT: PASS (test_y.sh) [flaky: passed on serial retry]'.
+INFRA_RESULT_RE = re.compile(r'^\s*RESULT:\s*(?P<verdict>PASS|FAIL|SKIP)\s*\((?P<name>[^)]+)\)')
 INFRA_RESULT_FAIL_RE = re.compile(r'^\s*RESULT:\s*FAIL\s*\((?P<name>.+?)\)\s*$')
+
+_INFRA_OUTCOMES = {'PASS': 'passed', 'SKIP': 'skipped'}
 
 _TAIL_CHARS = 2000
 
@@ -82,12 +87,28 @@ def _pytest_failures(text: str) -> tuple[FailureRecord, ...]:
     )
 
 
+def _infra_verdicts(text: str) -> list[tuple[str, str, str]]:
+    return [
+        (match.group('verdict'), match.group('name'), line.strip())
+        for line in text.splitlines()
+        if (match := INFRA_RESULT_RE.match(line))
+    ]
+
+
 def _infra_failures(text: str) -> tuple[FailureRecord, ...]:
     return tuple(
-        FailureRecord(match.group('name'), 'failed', line.strip()[:FIRST_LINE_MAX_CHARS])
-        for line in text.splitlines()
-        if (match := INFRA_RESULT_FAIL_RE.match(line))
+        FailureRecord(name, 'failed', line[:FIRST_LINE_MAX_CHARS])
+        for verdict, name, line in _infra_verdicts(text)
+        if verdict == 'FAIL'
     )
+
+
+def _infra_outcomes(text: str) -> dict[str, str]:
+    return {
+        name: _INFRA_OUTCOMES[verdict]
+        for verdict, name, _ in _infra_verdicts(text)
+        if verdict in _INFRA_OUTCOMES
+    }
 
 
 def _failures(text: str, output_format: OutputFormat) -> tuple[FailureRecord, ...]:
@@ -104,6 +125,50 @@ def _session_complete(text: str, output_format: OutputFormat, ended_by: EndedBy)
     if output_format is OutputFormat.PYTEST:
         return _PYTEST_FINAL_SUMMARY_RE.search(text) is not None
     return ended_by is EndedBy.EXIT
+
+
+def _node_prefix(classname: str, cwd: Path) -> str | None:
+    if '/' in classname:
+        return None
+    parts = classname.split('.')
+    for end in range(len(parts), 0, -1):
+        module = '/'.join(parts[:end]) + '.py'
+        if (cwd / module).is_file():
+            return '::'.join([module, *parts[end:]])
+    return None
+
+
+def junit_node_outcomes(junit_path: Path, cwd: Path) -> dict[str, str] | None:
+    """The junit report's per-test outcomes keyed by pytest node id, resolved against *cwd*.
+
+    A junit id is ``<dotted classname>::<name>``; the classname's longest dotted
+    prefix naming a ``.py`` file under *cwd* is the module, the rest its class
+    nesting.  A test whose classname resolves to no file has no entry.
+    ``None`` when no report could be read.
+    """
+    outcomes = extract_test_outcomes_from_junit(junit_path)
+    if outcomes is None:
+        return None
+    prefixes: dict[str, str | None] = {}
+    node_outcomes: dict[str, str] = {}
+    for junit_id, verdict in outcomes.items():
+        classname, _, name = junit_id.partition('::')
+        if classname not in prefixes:
+            prefixes[classname] = _node_prefix(classname, cwd)
+        prefix = prefixes[classname]
+        if prefix is not None:
+            node_outcomes[f'{prefix}::{name}'] = verdict
+    return node_outcomes
+
+
+def _outcomes(
+    text: str, output_format: OutputFormat, junit_path: Path | None, cwd: Path,
+) -> dict[str, str] | None:
+    if junit_path is not None and junit_path.is_file():
+        return junit_node_outcomes(junit_path, cwd)
+    if output_format is OutputFormat.INFRA:
+        return _infra_outcomes(text)
+    return None
 
 
 def _read_text(path: Path) -> str:
@@ -124,7 +189,7 @@ async def launch(
     """Run *argv* with its output streamed to *lane_pass*'s *phase* log, then record it.
 
     Nothing of the output is held in memory while the child runs; the read,
-    the parse and the record write happen in one hop off the event loop.
+    the parse, the junit read and the record write happen in one hop off the event loop.
     The whole output comes back as ``text``; ``tail`` is its last ``_TAIL_CHARS`` characters.
     """
     output_path = lane_pass.output_path(phase)
@@ -154,7 +219,7 @@ async def launch(
             junit_path=None if junit_path is None else str(junit_path),
             failures=failures,
             ids_available=bool(failures),
-            outcomes=None,
+            outcomes=_outcomes(text, output_format, junit_path, cwd),
             session_complete=_session_complete(text, output_format, ended_by),
             probe=None,
         )
@@ -166,6 +231,53 @@ async def launch(
 
 def _lane_env() -> dict[str, str]:
     return {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+
+
+class ConfirmRunner(Protocol):
+    """Runs one confirm sub-run of a bound pass; a junit-producing confirm writes to ``junit_path``."""
+
+    @property
+    def junit_path(self) -> Path: ...
+
+    async def __call__(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        output_format: OutputFormat,
+        junit_path: Path | None,
+    ) -> Launched: ...
+
+
+@dataclass(frozen=True)
+class _PassConfirmRunner:
+    store: RunRecordStore
+    lane_pass: LanePass
+    junit_path: Path
+
+    async def __call__(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        output_format: OutputFormat,
+        junit_path: Path | None,
+    ) -> Launched:
+        return await launch(
+            argv,
+            cwd=cwd,
+            env=_lane_env(),
+            store=self.store,
+            lane_pass=self.lane_pass,
+            phase=Phase.CONFIRM,
+            output_format=output_format,
+            junit_path=junit_path,
+        )
+
+
+def confirm_runner(store: RunRecordStore, lane_pass: LanePass) -> ConfirmRunner:
+    """*lane_pass*'s confirm seam: ``launch`` in the confirm phase with the lane's environment."""
+    return _PassConfirmRunner(store, lane_pass, lane_pass.junit_path(Phase.CONFIRM))
 
 
 def require_current_pass(store: RunRecordStore, command: str) -> LanePass:
