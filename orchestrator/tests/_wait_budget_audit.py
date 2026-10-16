@@ -1,12 +1,15 @@
-"""Static AST audit of the real wall clock a test's waits can consume.
+"""Static AST audit of the real wall clock a test's waits can consume,
+beside the timeout each pytest item actually runs under.
 
 Pure: source text and a module namespace in, numbers and names out -- no
 file I/O, no imports of the code it scans -- so every function here can be
-driven with foreign input.  Callers own reading files and importing modules.
+driven with foreign input. Callers own reading files and importing modules;
+``audit_module`` takes the import as a callback so it runs only when there
+is something to bill.
 
 The bill is a conservative estimate of the wall clock each pytest item's
-recognised waits can take (``_call_wait_budget``), for a coverage guard to
-compare with the timeout the item actually runs under.
+recognised waits can take (``_call_wait_budget``); the limit is the timeout
+pytest-timeout applies to the item (``_item_limit``).
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import ast
 import dataclasses
 import enum
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
@@ -355,15 +358,28 @@ class LimitSource(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class WaitBudgetOffender:
-    """A pytest item whose wait bill the timeout it runs under does not
-    clear. *limit* is None when no number could be read for it, and
-    ``math.inf`` when its mark disables the timeout."""
+class ItemWaitAudit:
+    """One pytest item's wait bill beside the timeout it runs under.
+    *limit* is None when no number could be read for it, and ``math.inf``
+    when its mark disables the timeout."""
 
     item: str
     budget: float
     limit: float | None
     limit_source: LimitSource
+
+    @property
+    def offends(self) -> bool:
+        """Whether the bill breaches the limit: under the ambient budget an
+        item offends once its bill REACHES it; under a mark, when the mark
+        is below the bill (a mark replaces the ambient budget, at any bill),
+        so never when the mark disables the timeout; with no readable limit
+        -- unresolved, or an unreadable mark -- always."""
+        if self.limit is None:
+            return True
+        if self.limit_source is LimitSource.AMBIENT:
+            return self.budget >= self.limit
+        return self.limit < self.budget
 
     def describe(self) -> str:
         bill = (
@@ -469,53 +485,31 @@ def _item_limit(
     return _mark_limit(*closest)
 
 
-def _offends(budget: float, limit: float | None, limit_source: LimitSource) -> bool:
-    """Whether *budget* breaches the limit: under the ambient budget an item
-    offends once its bill REACHES it; under a mark, when the mark is below
-    the bill (a mark replaces the ambient budget, at any bill), so never
-    when the mark disables the timeout; with no readable limit -- unresolved,
-    or an unreadable mark -- always."""
-    if limit is None:
-        return True
-    if limit_source is LimitSource.AMBIENT:
-        return budget >= limit
-    return limit < budget
+def audit_module(
+    source: str, load_namespace: Callable[[], Mapping[str, object] | None]
+) -> list[ItemWaitAudit] | None:
+    """Every item of *source* with a wait bill above zero, beside the
+    timeout it runs under, sorted by item. *source* is parsed once.
 
+    *load_namespace* returns the module's runtime globals, which resolve the
+    names its waits spell and hold the objects whose marks are read. It is
+    called only when some item has a recognised wait: an item that bills
+    nothing without the namespace bills nothing with it, since a name
+    resolves to no more than unbounded.
 
-def _billed_item_limits(
-    source: str, namespace: Mapping[str, object]
-) -> list[tuple[str, float, float | None, LimitSource]]:
-    """``(item, bill, limit, limit_source)`` for every item of *source* with
-    a bill above zero, sorted by item; [] when *source* does not parse."""
-    billed = [
-        (item_id(owner, name), budget, *_item_limit(owner, name, namespace))
-        for (owner, name), budget in _item_bills(collect_test_items(source), namespace).items()
+    None when there is nothing to audit: *source* does not parse, no item
+    bills, or *load_namespace* returns None. Never raises on its own
+    account.
+    """
+    items = collect_test_items(source)
+    if not any(_method_wait_budget(function) > 0 for _, function in items):
+        return None
+    namespace = load_namespace()
+    if namespace is None:
+        return None
+    audits = [
+        ItemWaitAudit(item_id(owner, name), budget, *_item_limit(owner, name, namespace))
+        for (owner, name), budget in _item_bills(items, namespace).items()
         if budget > 0
     ]
-    return sorted(billed, key=lambda row: row[0])
-
-
-def wait_budget_offenders(
-    source: str, namespace: Mapping[str, object]
-) -> list[WaitBudgetOffender]:
-    """Every item of *source* whose wait bill the timeout it runs under does
-    not clear, sorted by item. *namespace* is the module's runtime globals:
-    it resolves the names the waits spell and holds the objects whose marks
-    are read. Must never raise; unparseable source returns []."""
-    return [
-        WaitBudgetOffender(item, budget, limit, limit_source)
-        for item, budget, limit, limit_source in _billed_item_limits(source, namespace)
-        if _offends(budget, limit, limit_source)
-    ]
-
-
-def item_limit_sources(
-    source: str, namespace: Mapping[str, object]
-) -> dict[str, LimitSource]:
-    """Where the timeout of every item of *source* with a bill above zero
-    comes from, offending or not. Must never raise; unparseable source
-    returns {}."""
-    return {
-        item: limit_source
-        for item, _, _, limit_source in _billed_item_limits(source, namespace)
-    }
+    return sorted(audits, key=lambda audit: audit.item)

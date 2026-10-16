@@ -22,26 +22,23 @@ namespace, which needs the module imported inside this pytest session
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import importlib
-from collections.abc import Mapping
+import sys
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
-from _wait_budget_audit import (
-    WaitBudgetOffender,
-    is_module_level_item,
-    item_limit_sources,
-    item_wait_budgets,
-    wait_budget_offenders,
-)
+from _wait_budget_audit import ItemWaitAudit, audit_module, is_module_level_item
 
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
-    # One scan per worker serves all four tests, so keep them on one worker.
+    # One tree scan per worker serves every test that reads it, so keep them
+    # on one worker.
     pytest.mark.xdist_group('wait_budget_coverage_scan'),
 ]
 
@@ -94,12 +91,12 @@ class _ModuleCensus:
 
 @dataclasses.dataclass(frozen=True)
 class _TreeScan:
-    offenders: tuple[tuple[str, WaitBudgetOffender], ...]
+    offenders: tuple[tuple[str, ItemWaitAudit], ...]
     exempt_offender_counts: Mapping[str, int]
     census: Mapping[str, _ModuleCensus]
 
 
-def _node_id(module_file: str, offender: WaitBudgetOffender) -> str:
+def _node_id(module_file: str, offender: ItemWaitAudit) -> str:
     return f'{module_file}::{offender.item}'
 
 
@@ -118,46 +115,42 @@ def _module_namespace(path: Path) -> Mapping[str, object] | None:
     return vars(module)
 
 
-def _module_census(
-    source: str, namespace: Mapping[str, object], offenders: list[WaitBudgetOffender]
-) -> _ModuleCensus:
-    limit_sources = item_limit_sources(source, namespace)
-    offending = {offender.item for offender in offenders}
-    mark_limited = [item for item, source in limit_sources.items() if source.is_mark]
+def _module_census(audits: list[ItemWaitAudit]) -> _ModuleCensus:
+    mark_limited = [audit for audit in audits if audit.limit_source.is_mark]
     return _ModuleCensus(
-        billed_items=len(limit_sources),
-        module_level_billed_items=sum(map(is_module_level_item, limit_sources)),
+        billed_items=len(audits),
+        module_level_billed_items=sum(is_module_level_item(audit.item) for audit in audits),
         mark_limited_items=len(mark_limited),
-        covered_mark_limited_items=sum(item not in offending for item in mark_limited),
+        covered_mark_limited_items=sum(not audit.offends for audit in mark_limited),
     )
 
 
 @functools.cache
-def _scan_tree() -> _TreeScan:
-    """Audit every billed test module; retain extracted facts, never ASTs."""
-    offenders: list[tuple[str, WaitBudgetOffender]] = []
+def _scan_tree(tests_dir: Path) -> _TreeScan:
+    """Audit every billed test module in *tests_dir*, each importable by its
+    stem; retain extracted facts, never ASTs."""
+    offenders: list[tuple[str, ItemWaitAudit]] = []
     exempt_offender_counts: dict[str, int] = {}
     census: dict[str, _ModuleCensus] = {}
-    for path in sorted(_TESTS_DIR.glob('test_*.py')):
-        source = path.read_text(encoding='utf-8')
-        if not any(bill > 0 for bill in item_wait_budgets(source).values()):
+    for path in sorted(tests_dir.glob('test_*.py')):
+        audits = audit_module(
+            path.read_text(encoding='utf-8'), functools.partial(_module_namespace, path)
+        )
+        if audits is None:
             continue
-        namespace = _module_namespace(path)
-        if namespace is None:
-            continue
-        found = wait_budget_offenders(source, namespace)
+        found = [audit for audit in audits if audit.offends]
         if path.name in _SYNTHETIC_CLOCK_MODULES:
             exempt_offender_counts[path.name] = len(found)
         else:
             offenders.extend((path.name, offender) for offender in found)
-        census[path.name] = _module_census(source, namespace, found)
+        census[path.name] = _module_census(audits)
     return _TreeScan(tuple(offenders), exempt_offender_counts, census)
 
 
 def test_no_offender_outside_the_ledger() -> None:
     unledgered = [
         f'  - {module_file}::{offender.describe()}'
-        for module_file, offender in _scan_tree().offenders
+        for module_file, offender in _scan_tree(_TESTS_DIR).offenders
         if _node_id(module_file, offender) not in _WAIT_BUDGET_DEBT
     ]
 
@@ -180,7 +173,7 @@ def test_no_offender_outside_the_ledger() -> None:
 def test_debt_ledger_matches_live_bills() -> None:
     live = {
         _node_id(module_file, offender): offender
-        for module_file, offender in _scan_tree().offenders
+        for module_file, offender in _scan_tree(_TESTS_DIR).offenders
     }
     problems: list[str] = []
     for node_id, recorded in sorted(_WAIT_BUDGET_DEBT.items()):
@@ -207,7 +200,7 @@ def test_debt_ledger_matches_live_bills() -> None:
 
 
 def test_synthetic_clock_exemptions_are_still_needed() -> None:
-    exempt_offender_counts = _scan_tree().exempt_offender_counts
+    exempt_offender_counts = _scan_tree(_TESTS_DIR).exempt_offender_counts
     stale = [
         f'  - {module}: no longer exists -- delete the entry.'
         if not (_TESTS_DIR / module).exists()
@@ -223,7 +216,7 @@ def test_synthetic_clock_exemptions_are_still_needed() -> None:
 
 
 def test_the_scan_reaches_sibling_modules() -> None:
-    census = _scan_tree().census
+    census = _scan_tree(_TESTS_DIR).census
     totals = {
         'billed modules': (len(census), _MIN_BILLED_MODULES),
         'billed items': (
@@ -263,3 +256,64 @@ def test_the_scan_reaches_sibling_modules() -> None:
         'timeout mark, so this guard no longer holds what their retired '
         'self-scans held:\n' + '\n'.join(unheld)
     )
+
+
+_PROBE_WAITING_TEST = (
+    'import asyncio\n'
+    'async def test_waits():\n'
+    '    await asyncio.wait_for(asyncio.sleep(0), timeout=10**6)\n'
+)
+
+
+@contextlib.contextmanager
+def _probe_tests_dir(directory: Path, modules: Mapping[str, str]) -> Iterator[Path]:
+    """*directory* holding *modules* (stem -> source), importable by stem
+    while the context lasts."""
+    for stem, source in modules.items():
+        (directory / f'{stem}.py').write_text(source, encoding='utf-8')
+    sys.path.insert(0, str(directory))
+    importlib.invalidate_caches()
+    try:
+        yield directory
+    finally:
+        sys.path.remove(str(directory))
+        for stem in modules:
+            sys.modules.pop(stem, None)
+
+
+def test_the_scan_drops_a_module_that_skips_at_import(tmp_path: Path) -> None:
+    modules = {
+        'test_wbcg_probe_audited': _PROBE_WAITING_TEST,
+        'test_wbcg_probe_skips': (
+            "import pytest\npytest.importorskip('wbcg_probe_absent_module')\n"
+            + _PROBE_WAITING_TEST
+        ),
+        'test_wbcg_probe_unbilled': (
+            "raise RuntimeError('a module with nothing to bill is never imported')\n"
+            'def test_idle():\n    pass\n'
+        ),
+    }
+    with _probe_tests_dir(tmp_path, modules) as tests_dir:
+        scan = _scan_tree(tests_dir)
+
+    assert list(scan.census) == ['test_wbcg_probe_audited.py'], (
+        'only the module that imported and bills is audited; a module that '
+        f'skips at import never runs, so it cannot breach: {list(scan.census)}'
+    )
+    assert [(module, offender.item) for module, offender in scan.offenders] == [
+        ('test_wbcg_probe_audited.py', 'test_waits')
+    ]
+
+
+def test_the_scan_fails_on_a_module_that_cannot_be_imported(tmp_path: Path) -> None:
+    """A module whose marks cannot be read must fail the scan, never drop
+    out of coverage silently."""
+    modules = {
+        'test_wbcg_probe_broken': "raise RuntimeError('probe import failure')\n"
+        + _PROBE_WAITING_TEST
+    }
+    with (
+        _probe_tests_dir(tmp_path, modules) as tests_dir,
+        pytest.raises(AssertionError, match='test_wbcg_probe_broken.py failed to import'),
+    ):
+        _scan_tree(tests_dir)

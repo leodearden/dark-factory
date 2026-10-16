@@ -10,16 +10,16 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import math
+from collections.abc import Mapping
 
 import pytest
 from _wait_budget_audit import (
     AMBIENT_TEST_TIMEOUT,
+    ItemWaitAudit,
     LimitSource,
-    WaitBudgetOffender,
+    audit_module,
     is_module_level_item,
-    item_limit_sources,
     item_wait_budgets,
-    wait_budget_offenders,
 )
 
 
@@ -699,7 +699,7 @@ async def settle():
         )
 
 
-# Synthetic wait and mark values for TestWaitBudgetOffenders, derived from the
+# Synthetic wait and mark values for TestAuditModule, derived from the
 # ambient budget so a change to it cannot silently move a case across its
 # threshold.
 _HEAVY_WAIT = AMBIENT_TEST_TIMEOUT / 2  # two of these reach the ambient budget
@@ -722,12 +722,27 @@ def _exec_module(source: str) -> dict[str, object]:
     return namespace
 
 
-def _offenders(source: str) -> list[WaitBudgetOffender]:
-    return wait_budget_offenders(source, _exec_module(source))
+def _audits(
+    source: str, namespace: Mapping[str, object] | None = None
+) -> list[ItemWaitAudit]:
+    """*source*'s audit rows against *namespace*, else against the namespace
+    of *source* executed."""
+    loaded = _exec_module(source) if namespace is None else namespace
+    return audit_module(source, lambda: loaded) or []
 
 
-class TestWaitBudgetOffenders:
-    """`wait_budget_offenders` judges each pytest item's bill against the
+def _offenders(
+    source: str, namespace: Mapping[str, object] | None = None
+) -> list[ItemWaitAudit]:
+    return [audit for audit in _audits(source, namespace) if audit.offends]
+
+
+def _limit_sources(source: str) -> dict[str, LimitSource]:
+    return {audit.item: audit.limit_source for audit in _audits(source)}
+
+
+class TestAuditModule:
+    """`audit_module` judges each pytest item's bill against the
     timeout pytest-timeout actually applies to it: the closest timeout mark
     (the test's own, then its class's, then the module's `pytestmark`), else
     the ambient budget. Every case runs a synthetic module whose waits are
@@ -825,12 +840,8 @@ class TestWaitBudgetOffenders:
             f'pytestmark = {pytestmark}\n'
             'class TestCovered:\n    async def test_it(self):\n' + _HEAVY_BODY
         )
-        namespace = _exec_module(source)
-
-        assert wait_budget_offenders(source, namespace) == []
-        assert item_limit_sources(source, namespace) == {
-            'TestCovered::test_it': LimitSource.MODULE_MARK
-        }
+        assert _offenders(source) == []
+        assert _limit_sources(source) == {'TestCovered::test_it': LimitSource.MODULE_MARK}
 
     def test_a_too_tight_module_mark_offends_under_the_ambient_budget(self) -> None:
         source = (
@@ -893,7 +904,7 @@ class TestWaitBudgetOffenders:
         assert item_wait_budgets(source, module_constants=namespace) == {
             'TestSettle::test_it': 30.0
         }
-        assert wait_budget_offenders(source, namespace) == [], (
+        assert _offenders(source, namespace) == [], (
             'a namespace-resolved 30.0s bill clears the ambient budget; billed '
             'unbounded it would offend under any timeout'
         )
@@ -902,7 +913,7 @@ class TestWaitBudgetOffenders:
         source = 'class TestGone:\n    async def test_it(self):\n' + _LIGHT_BODY
         namespace = _exec_module(source)
         del namespace['TestGone']
-        offenders = wait_budget_offenders(source, namespace)
+        offenders = _offenders(source, namespace)
 
         assert [(o.item, o.limit_source, o.limit) for o in offenders] == [
             ('TestGone::test_it', LimitSource.UNRESOLVED, None)
@@ -991,12 +1002,8 @@ class TestWaitBudgetOffenders:
             '@pytest.mark.asyncio\n'
             'class TestSub(_Base):\n    async def test_it(self):\n' + _HEAVY_BODY
         )
-        namespace = _exec_module(source)
-
-        assert wait_budget_offenders(source, namespace) == []
-        assert item_limit_sources(source, namespace) == {
-            'TestSub::test_it': LimitSource.CLASS_MARK
-        }
+        assert _offenders(source) == []
+        assert _limit_sources(source) == {'TestSub::test_it': LimitSource.CLASS_MARK}
 
     def test_a_base_class_timeout_mark_wins_over_the_subclass_own_one(self) -> None:
         """pytest collects class marks base class first and takes the first
@@ -1022,14 +1029,53 @@ class TestWaitBudgetOffenders:
             LimitSource.MODULE_MARK,
         }
 
-    def test_unparseable_source_has_no_offenders_and_does_not_raise(self) -> None:
-        assert wait_budget_offenders('def not valid python(:', {}) == []
+    def test_every_billed_item_gets_a_row_offending_or_not(self) -> None:
+        source = (
+            'class TestMixed:\n'
+            '    async def test_heavy(self):\n' + _HEAVY_BODY
+            + '    async def test_light(self):\n' + _LIGHT_BODY
+            + '    async def test_idle(self):\n        pass\n'
+        )
 
-    def test_an_offender_is_frozen(self) -> None:
+        assert [(audit.item, audit.offends) for audit in _audits(source)] == [
+            ('TestMixed::test_heavy', True),
+            ('TestMixed::test_light', False),
+        ], 'an item with no recognised wait bills nothing and gets no row'
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param('def not valid python(:', id='unparseable'),
+            pytest.param('class TestIdle:\n    def test_it(self):\n        pass\n', id='no-wait'),
+            pytest.param(
+                'class TestZero:\n    async def test_it(self):\n'
+                '        await asyncio.wait_for(a, timeout=0)\n',
+                id='zero-wait',
+            ),
+        ],
+    )
+    def test_a_module_with_nothing_to_bill_is_never_loaded(self, source: str) -> None:
+        """Loading a module means importing it, so the audit skips that
+        when the parse alone shows nothing can bill."""
+        loads: list[None] = []
+
+        def load_namespace() -> Mapping[str, object]:
+            loads.append(None)
+            return {}
+
+        assert audit_module(source, load_namespace) is None
+        assert loads == [], 'the namespace must not be loaded'
+
+    def test_a_module_whose_namespace_cannot_be_loaded_is_not_audited(self) -> None:
         source = 'async def test_x():\n' + _HEAVY_BODY.replace('        ', '    ')
-        offender = _offenders(source)[0]
 
-        field = dataclasses.fields(offender)[0].name
+        assert audit_module(source, lambda: None) is None
+
+    def test_an_audit_row_is_frozen(self) -> None:
+        source = 'async def test_x():\n' + _HEAVY_BODY.replace('        ', '    ')
+        audit = _audits(source)[0]
+
+        field = dataclasses.fields(audit)[0].name
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(offender, field, 'other')
+            setattr(audit, field, 'other')
