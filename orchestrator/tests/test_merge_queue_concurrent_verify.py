@@ -289,13 +289,12 @@ HEAVY_BARRIER_TEST_TIMEOUT = 540
 _HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE = 14.59
 
 
-# task 3492: known-name table for _worst_per_method_wait_budget below. These
-# are this module's own numeric constants -- referenced directly (not
-# re-derived) so the audit helper can never drift from the values the marks
-# themselves use.
+# task 3492: known-name table for _worst_per_method_wait_budget below: the
+# shared helper constants a scanned call site may spell without importing them
+# into its own namespace, plus the hidden defaults of the helpers it bills.
+# Referenced directly (not re-derived) so the audit can never drift from them.
 _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
     'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
-    'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
     # task 3980: `wait_responsive`'s hard wall backstop and the merge-pipeline
     # gate-barrier nominal, so a scanned call site spelling either one
     # resolves to its value rather than billing as unbounded.
@@ -313,21 +312,80 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 _RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
 
-def _resolve_wait_value(node: ast.expr | None) -> float:
+def _wait_seconds(value: object) -> float | None:
+    """*value* as a wait in seconds, or None when it is not a plain number
+    (a bool is not a wait). A negative number waits no time, so 0.0."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(float(value), 0.0)
+    return None
+
+
+def _bound_names(fn: ast.AST) -> set[str]:
+    """Every name *fn* binds anywhere in its body: a parameter, an
+    assignment/for/with/walrus/del target, an except-as name, an import
+    alias, a match capture, or a nested def/class. Such a name is not the
+    module-level value of the same name."""
+    bound: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.alias):
+            bound.add(node.asname or node.name.split('.')[0])
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node is not fn
+        ):
+            bound.add(node.name)
+    return bound
+
+
+def _visible_wait_constants(
+    fn: ast.AST, module_constants: Mapping[str, object] | None
+) -> dict[str, float]:
+    """The resolvable value of every name *fn* reads and never binds: the
+    scanned module's namespace value when it is a number, else the
+    ``_KNOWN_WAIT_CONSTANTS`` value. The namespace wins because it is what
+    the module's code actually sees."""
+    namespace = module_constants or {}
+    bound = _bound_names(fn)
+    visible: dict[str, float] = {}
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Name) or node.id in bound or node.id in visible:
+            continue
+        seconds = _wait_seconds(namespace.get(node.id))
+        if seconds is None:
+            seconds = _KNOWN_WAIT_CONSTANTS.get(node.id)
+        if seconds is not None:
+            visible[node.id] = seconds
+    return visible
+
+
+def _resolve_wait_value(node: ast.expr | None, visible: Mapping[str, float]) -> float:
     """Resolve a wait-value expression to the most wall clock it can allow.
 
-    Never guesses: a numeric literal resolves to itself (a negative one
-    waits no time, so 0.0), and a name ONLY via ``_KNOWN_WAIT_CONSTANTS``.
-    Anything else -- a local variable, an attribute access, arithmetic, an
-    unknown name, the literal None, a missing value -- resolves to
+    Never guesses. In order: a numeric literal resolves to itself (a
+    negative one waits no time, so 0.0); a name resolves through *visible*
+    (``_visible_wait_constants``): the scanned module's numeric value for
+    it, else ``_KNOWN_WAIT_CONSTANTS``, and never when the method binds the
+    name itself. Anything else -- a shadowed or unknown name, an attribute
+    access, arithmetic, the literal None, a missing value -- resolves to
     ``math.inf``: the scan cannot read it, so it may allow any wall clock,
     and no timeout mark clears an unbounded bill. Failing closed is what
     keeps every recognised shape's bill an upper bound.
     """
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return max(float(node.value), 0.0)
-    if isinstance(node, ast.Name) and node.id in _KNOWN_WAIT_CONSTANTS:
-        return _KNOWN_WAIT_CONSTANTS[node.id]
+    if isinstance(node, ast.Constant):
+        seconds = _wait_seconds(node.value)
+        return math.inf if seconds is None else seconds
+    if isinstance(node, ast.Name) and node.id in visible:
+        return visible[node.id]
     return math.inf
 
 
@@ -336,7 +394,7 @@ def _keyword(call: ast.Call, name: str) -> ast.expr | None:
     return next((kw.value for kw in call.keywords if kw.arg == name), None)
 
 
-def _wait_responsive_budget(call: ast.Call) -> float:
+def _wait_responsive_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
     """Return the worst-case WALL clock a ``wait_responsive(...)`` call can
     consume -- an unconditional upper bound, not an estimate (task 3980).
 
@@ -352,13 +410,13 @@ def _wait_responsive_budget(call: ast.Call) -> float:
     max_wall = _keyword(call, 'max_wall_s')
     explicit_none = isinstance(max_wall, ast.Constant) and max_wall.value is None
     if max_wall is not None and not explicit_none:
-        return _resolve_wait_value(max_wall)
+        return _resolve_wait_value(max_wall, visible)
 
     timeout = _keyword(call, 'timeout')
     nominal = (
         _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
         if timeout is None
-        else _resolve_wait_value(timeout)
+        else _resolve_wait_value(timeout, visible)
     )
     return min(
         nominal * _RESPONSIVE_WAIT_STRETCH,
@@ -366,7 +424,7 @@ def _wait_responsive_budget(call: ast.Call) -> float:
     )
 
 
-def _call_wait_budget(call: ast.Call) -> float:
+def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
     Recognises exactly four call shapes -- ``asyncio.wait_for(..., timeout=N)``
@@ -377,8 +435,10 @@ def _call_wait_budget(call: ast.Call) -> float:
     (task 3980), billed by ``_wait_responsive_budget`` as an unconditional
     upper bound on its wall clock, and the ``_stop_worker(...)`` teardown,
     whose join is billed its ``join_timeout=`` kwarg or hidden default
-    ``_STOP_WORKER_JOIN_TIMEOUT``. Within a recognised shape, a value the
-    scan cannot read bills ``math.inf`` (``_resolve_wait_value``), so a
+    ``_STOP_WORKER_JOIN_TIMEOUT``. Within a recognised shape, a named value
+    resolves through *visible* (the scanned module's numeric constants, else
+    ``_KNOWN_WAIT_CONSTANTS``, never a name the method rebinds) and a value
+    the scan cannot read bills ``math.inf`` (``_resolve_wait_value``), so a
     recognised wait is never under-billed. Every
     other call shape -- ``asyncio.sleep``, ``.wait()``, ``.result()``,
     ``.join()``, a non-``asyncio`` ``.wait_for(...)``, attribute access,
@@ -398,24 +458,28 @@ def _call_wait_budget(call: ast.Call) -> float:
         timeout = _keyword(call, 'timeout')
         if timeout is None and len(call.args) >= 2:
             timeout = call.args[1]
-        return _resolve_wait_value(timeout)
+        return _resolve_wait_value(timeout, visible)
     if isinstance(func, ast.Name) and func.id == '_await_outcome':
         timeout = _keyword(call, 'timeout')
         if timeout is None:
             return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
-        return _resolve_wait_value(timeout)
+        return _resolve_wait_value(timeout, visible)
     if isinstance(func, ast.Name) and func.id == 'wait_responsive':
-        return _wait_responsive_budget(call)
+        return _wait_responsive_budget(call, visible)
     if isinstance(func, ast.Name) and func.id == '_stop_worker':
         join_timeout = _keyword(call, 'join_timeout')
         if join_timeout is None:
             return _STOP_WORKER_JOIN_TIMEOUT
-        return _resolve_wait_value(join_timeout)
+        return _resolve_wait_value(join_timeout, visible)
     return 0.0
 
 
-def _method_wait_budget(fn: ast.AST) -> float:
-    """Sum every recognised wait-call contribution anywhere in *fn*'s body.
+def _method_wait_budget(
+    fn: ast.AST, module_constants: Mapping[str, object] | None = None
+) -> float:
+    """Sum every recognised wait-call contribution anywhere in *fn*'s body,
+    resolving named values against *module_constants*, the scanned module's
+    namespace (see ``_visible_wait_constants``).
 
     Control-flow-BLIND by construction: ``ast.walk`` visits every call in
     the subtree regardless of branch, so waits in mutually exclusive
@@ -431,8 +495,9 @@ def _method_wait_budget(fn: ast.AST) -> float:
     same-ballpark estimate meant to catch gross under-marking, not a
     number that is exactly load-bearing.
     """
+    visible = _visible_wait_constants(fn, module_constants)
     return sum(
-        _call_wait_budget(node) for node in ast.walk(fn) if isinstance(node, ast.Call)
+        _call_wait_budget(node, visible) for node in ast.walk(fn) if isinstance(node, ast.Call)
     )
 
 
@@ -471,7 +536,9 @@ def _iter_test_methods(
     return pairs
 
 
-def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
+def _worst_per_method_wait_budget(
+    source: str, module_constants: Mapping[str, object] | None = None
+) -> dict[str, float]:
     """Statically scan *source* and compute, per top-level ``Test*`` class,
     the MAX over its ``test_*`` methods of that method's summed sequential
     real-time wait budget (task 3492's audit engine).
@@ -488,7 +555,7 @@ def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
     """
     budgets: dict[str, float] = {}
     for class_name, method in _iter_test_methods(source):
-        budget = _method_wait_budget(method)
+        budget = _method_wait_budget(method, module_constants)
         prev = budgets.get(class_name)
         budgets[class_name] = budget if prev is None else max(prev, budget)
     return budgets
@@ -7990,7 +8057,7 @@ class TestTimeoutMarkCoverage:
         the same change; the two task-3477 cascade classes already passed.
         """
         source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source)
+        budgets = _worst_per_method_wait_budget(source, module_constants=globals())
         offenders = _timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (

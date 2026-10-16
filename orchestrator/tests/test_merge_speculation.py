@@ -2935,7 +2935,7 @@ class TestTimeoutMarkCoverage:
         single source of those figures, so none is restated beside a mark.
         """
         source = Path(__file__).read_text()
-        budgets = _worst_per_method_wait_budget(source)
+        budgets = _worst_per_method_wait_budget(source, module_constants=globals())
         offenders = _timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (

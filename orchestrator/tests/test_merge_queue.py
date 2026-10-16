@@ -23633,10 +23633,10 @@ class TestTimeoutMarkCoverage:
     def test_every_test_runs_under_a_timeout_clearing_its_wait_budget(self) -> None:
         source = Path(__file__).read_text()
         budgets = {
-            f'{class_name}::{method.name}': _method_wait_budget(method)
+            f'{class_name}::{method.name}': _method_wait_budget(method, module_constants=globals())
             for class_name, method in _iter_test_methods(source)
         } | {
-            function.name: _method_wait_budget(function)
+            function.name: _method_wait_budget(function, module_constants=globals())
             for function in ast.parse(source).body
             if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
             and function.name.startswith('test_')
