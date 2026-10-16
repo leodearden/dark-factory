@@ -20,9 +20,9 @@ from typing import Any
 
 import pytest
 from _merge_lane_fakes import (
-    FakeClock,
     FakeVerifier,
     fails,
+    healthy_verify_clock,
     lane_entry,
     lane_scene_config,
     make_lane,
@@ -109,12 +109,8 @@ async def _entry_while_verifying(
     while its verify is parked in ``run_scoped``, then release the verify RED
     so no ``advance_main`` runs; return that entry and the outcome.
 
-    Each abort-poll of the parked verify charges the lane's clock a full
-    poll interval, so ``FakeClock``'s default ``wait_cap`` grants the verify
-    only ~11s of real time before the no-progress budget calls it dead -- a
-    loaded host spends that on the merge's git work alone, and the requeued
-    item then re-merges onto whatever main has become. A 1s cap keeps that
-    window far past the barrier timeouts.
+    The clock shows content progress, so the abort poll never calls the
+    parked verify dead, whatever the host load.
     """
     gate = asyncio.Event()
     verifier = FakeVerifier(
@@ -123,7 +119,7 @@ async def _entry_while_verifying(
         ),
     )
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    lane = make_lane(git_ops, queue, verifier=verifier, clock=FakeClock(wait_cap=1.0))
+    lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
 
     async with running_lane(lane) as run:
         await queue.put(req)

@@ -306,6 +306,7 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'trivial',
             'duration_secs',
             'flake_suppression',
+            'admission_legs',
         }),
         anchors=frozenset({'passed'}),
         min_field_matches=2,

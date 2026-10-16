@@ -7,9 +7,9 @@ that serialises/deserialises them as byte-identical JSON documents.
 Public API
 ----------
 Dataclasses (frozen):
-  VerifyCommand          — one module's command-bearing fields (mirrors ModuleConfig)
   UnscopedTypecheckSpec  — _run_unscoped_typechecks gate inputs
   MergeVerifySpec        — full pre-advance merge-verify bundle (PRD §A contract)
+  (both carry orchestrator.verify_spec_shared.VerifyCommand, one per module)
 
 Wire codec (module-level functions):
   spec_to_json(spec)     -> str   — canonical JSON for the spec document
@@ -21,7 +21,8 @@ Wire codec (module-level functions):
 
 Byte-identity guarantee (PRD Invariant 1)
 -----------------------------------------
-All JSON is emitted with ``json.dumps(sort_keys=True, ensure_ascii=False)``.
+All JSON is emitted with ``verify_spec_shared.canonical_json``
+(``json.dumps(sort_keys=True, ensure_ascii=False)``).
 This canonicalises dict key order so that:
   - ``to_json(from_json(s)) == s``  (re-serialisation is identical)
   - The same object always serialises to the same bytes regardless of dict
@@ -46,10 +47,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, assert_never, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    Protocol,
+    assert_never,
+    get_args,
+    runtime_checkable,
+)
 
 from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig, VerifyHostPolicy
+from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import (
     HEARTBEAT_INTERVAL_SECS,
@@ -58,13 +69,19 @@ from orchestrator.verify_cancel import (
     start_stdin_heartbeat,
 )
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
+from orchestrator.verify_spec_shared import (
+    VerifyCommand,
+    apply_spec_to_host_config,
+    canonical_json,
+    global_verify_command_for,
+    module_config_from_command,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.event_store import EventStore
 
 __all__ = [
-    "VerifyCommand",
     "UnscopedTypecheckSpec",
     "MergeVerifySpec",
     "spec_to_json",
@@ -76,7 +93,11 @@ __all__ = [
     "VerifyRunner",
     "LocalRunner",
     "RemoteRunner",
+    "RemoteVerifySubcommand",
+    "REMOTE_VERIFY_PROCESS_PATTERN",
     "RunnerUnavailable",
+    "RunnerUnavailableKind",
+    "ConcurrentDispatchError",
     "VerifyRunnerPool",
     # INV-2 (task 2884) — contract-currency auto-sync at dispatch
     "SyncOutcome",
@@ -192,43 +213,6 @@ def make_flock_contention_result(
 
 
 # ---------------------------------------------------------------------------
-# VerifyCommand
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class VerifyCommand:
-    """Frozen projection of a (scoped) ModuleConfig's command-bearing fields.
-
-    Mirrors ``ModuleConfig.prefix`` + the three command fields.  Timeouts and
-    environment variables live at ``MergeVerifySpec`` level (shared across the
-    bundle), so they are NOT duplicated here.
-    """
-
-    prefix: str
-    test_command: str | None = None
-    lint_command: str | None = None
-    type_check_command: str | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "prefix": self.prefix,
-            "test_command": self.test_command,
-            "lint_command": self.lint_command,
-            "type_check_command": self.type_check_command,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> VerifyCommand:
-        return cls(
-            prefix=d["prefix"],
-            test_command=d.get("test_command"),
-            lint_command=d.get("lint_command"),
-            type_check_command=d.get("type_check_command"),
-        )
-
-
-# ---------------------------------------------------------------------------
 # UnscopedTypecheckSpec
 # ---------------------------------------------------------------------------
 
@@ -299,22 +283,18 @@ class MergeVerifySpec:
                           project's own dark-factory-orchestrator.yaml — its single
                           home (INV-9), and the file to read before assuming what a
                           key here means.
-                          Residual risk on a REMOTE dispatch is wasted wall-clock,
-                          not a false green. The measured case is the retry env
-                          from
-                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env:
-                          its *_NEXTEST_FILTER_FILE_* values are dispatcher-absolute
-                          paths to UNTRACKED files that git push does not carry, so
-                          the remote finds them missing — and reify's consumer then
-                          refuses to narrow, loudly, and runs that profile FULL (an
-                          independent tree-OID guard refuses the same way on a
-                          drifted sidecar). The same dict's REIFY_RUN_ALL_MEMBER_SUBSET
-                          and REIFY_GUI_RETRY_SPECS DO narrow remotely, uncorroborated
-                          by that guard, and are sound here: the remote verifies the
-                          same pushed tree and consumes no dispatcher build artefacts.
-                          Making the filter files shippable needs merge_queue.py
-                          (outside task 5496's scope); follow-up ticket
-                          tkt_0RTNRCDNA8DDHVN6P8ZNV2JXXK.
+                          The failed-only retry env from
+                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env
+                          has path-valued keys that cannot resolve remotely:
+                          its nextest filter files are UNTRACKED files in the
+                          dispatching host's merge_wt, which the git-pushed merge
+                          SHA does not carry. That env is therefore never shipped:
+                          merge_lane/worker.py::_run_post_merge_verify builds it
+                          only for a LOCAL dispatch (runner is None), so a REMOTE
+                          retry runs FULL and is charged to the legacy (full)
+                          retry budget, not the narrowed one. Pinned by
+                          orchestrator/tests/test_merge_queue_verify_retry.py::test_remote_dispatch_retry_runs_full_and_writes_nothing_on_the_dispatcher
+                          (and ..._is_charged_to_the_legacy_budget).
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
     merge_verify_workspace : force-workspace profile of the merge gate (fix a,
@@ -332,6 +312,13 @@ class MergeVerifySpec:
                           config globals — the fidelity fix for INV-1 (task 2883,
                           incident 966f23a6). None when module_configs is
                           non-empty (per-module verify_commands drive the gate).
+    verify_cold_preprovision_command : the project's cold-worktree pre-provision
+                          command, which verify.py::_preprovision_shared_venv
+                          runs before the gather. Applied by
+                          verify_spec_shared.py::apply_spec_to_host_config under
+                          TaskVerifySpec's rule: non-empty replaces the host's
+                          value, '' keeps the host's own. '' is also what a
+                          pre-6127 dispatcher's spec decodes to.
 
     Note
     ----
@@ -358,6 +345,8 @@ class MergeVerifySpec:
     # project, shipped so the remote runs the SAME gate as local. Narrow default
     # None matches every existing spec (module_configs non-empty → not sourced).
     global_verify_command: VerifyCommand | None = None
+    # Task 6127 — the dispatcher's pre-provision command; '' keeps the host's.
+    verify_cold_preprovision_command: str = ''
 
     def to_dict(self) -> dict:
         return {
@@ -374,6 +363,7 @@ class MergeVerifySpec:
                 if self.global_verify_command is not None
                 else None
             ),
+            "verify_cold_preprovision_command": self.verify_cold_preprovision_command,
         }
 
     @classmethod
@@ -396,6 +386,7 @@ class MergeVerifySpec:
             global_verify_command=(
                 VerifyCommand.from_dict(_gvc) if _gvc is not None else None
             ),
+            verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
         )
 
 
@@ -470,15 +461,7 @@ def build_merge_verify_spec(
     forward-compat with γ/δ (the remote runner consumes it over the wire).
     LocalRunner does not use it to drive execution — it uses the live objects.
     """
-    verify_commands = tuple(
-        VerifyCommand(
-            prefix=mc.prefix,
-            test_command=mc.test_command,
-            lint_command=mc.lint_command,
-            type_check_command=mc.type_check_command,
-        )
-        for mc in module_configs
-    )
+    verify_commands = tuple(VerifyCommand.from_module_config(mc) for mc in module_configs)
     unscoped_commands = tuple(
         VerifyCommand(prefix=mc.prefix, type_check_command=mc.type_check_command)
         for mc in module_configs
@@ -493,22 +476,6 @@ def build_merge_verify_spec(
             else 0.0
         )
     )
-    # INV-1, task 2883 — a zero-module-config project (reify) ships verify_commands=(),
-    # so the remote would reconstruct module_configs=[] and fall back to its own
-    # (possibly stale) config globals — the fidelity hole behind 966f23a6. Ship the
-    # dispatching side's LIVE global full-gate commands so the remote runs the SAME
-    # gate. Only sourced when the scope resolves to zero modules AND a global command
-    # exists; a non-empty module_configs leaves it None (verify_commands drive the gate).
-    global_verify_command: VerifyCommand | None = None
-    if not verify_commands and (
-        config.test_command or config.lint_command or config.type_check_command
-    ):
-        global_verify_command = VerifyCommand(
-            prefix='',
-            test_command=config.test_command,
-            lint_command=config.lint_command,
-            type_check_command=config.type_check_command,
-        )
     return MergeVerifySpec(
         verify_commands=verify_commands,
         unscoped_typecheck=UnscopedTypecheckSpec(commands=unscoped_commands, block_on_timeout=True),
@@ -524,7 +491,8 @@ def build_merge_verify_spec(
         # boundary; the remote host applies these over its own (laptop) config.
         merge_verify_workspace=config.merge_verify_workspace,
         merge_verify_breadth=config.merge_verify_breadth,
-        global_verify_command=global_verify_command,
+        global_verify_command=global_verify_command_for(config, verify_commands),
+        verify_cold_preprovision_command=config.verify_cold_preprovision_command,
     )
 
 
@@ -555,15 +523,10 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
     TimeoutError.  Positive cold timeouts map verbatim.
     """
-    return ModuleConfig(
-        prefix=vc.prefix,
-        test_command=vc.test_command,
-        lint_command=vc.lint_command,
-        type_check_command=vc.type_check_command,
-        verify_env=dict(spec.verify_env),
-        verify_cold_command_timeout_secs=(
-            spec.cold_timeout_secs if spec.cold_timeout_secs > 0 else None
-        ),
+    return module_config_from_command(
+        vc,
+        verify_env=spec.verify_env,
+        cold_timeout_secs=spec.cold_timeout_secs if spec.cold_timeout_secs > 0 else None,
     )
 
 
@@ -625,145 +588,20 @@ async def run_merge_verify_on_worktree(
     module_configs = [_module_config_from_command(vc, spec) for vc in spec.verify_commands]
     task_files = tuple(spec.task_files) if spec.task_files is not None else None
 
-    # Fix (a), task 2822 — the SPEC is the single source of truth for the
-    # merge-deciding profile. Override the reconstructed (remote) config's
-    # profile from the spec so the remote runs the IDENTICAL scope/profile as
-    # the dispatching merge gate; the laptop's own --config can no longer narrow
-    # it. The local path is unaffected — its config already equals the spec's
-    # source, so this is a value-preserving no-op there. (pydantic v2 model_copy;
-    # values originate from a validated config via build_merge_verify_spec.)
-    config_update: dict[str, Any] = {
-        'merge_verify_workspace': spec.merge_verify_workspace,
-        'merge_verify_breadth': spec.merge_verify_breadth,
-    }
-    # Task 5496 — the spec's verify_env is APPLIED ONTO the reconstructed remote
-    # config: the spec wins on conflict, host keys absent from the spec are
-    # preserved. Without this the zero-module-config path (spec.verify_commands
-    # == (), e.g. reify) reconstructs no ModuleConfig at all, so spec.verify_env
-    # has NO consumer and the remote decides the merge under its own config's
-    # test-selection env — the task-2822 false-green class, since these keys
-    # select which tests run.
-    #
-    # Neither of the two simpler rules works. 'Ignore' (the pre-fix behaviour) is
-    # the defect. 'Replace' (dict(spec.verify_env)) would drop the host's own
-    # local necessities, which are by construction absent from any
-    # dispatcher-built spec: a remote runner is dispatched against its OWN
-    # --config, and a narrower verify-only host widens its per-host-measured
-    # timeout budgets there — values the dispatching workstation never measured
-    # and cannot ship, which 'replace' would silently narrow back to the
-    # workstation's. The spec is dispatcher-shaped and the host config is
-    # host-shaped; only a merge carries both.
-    #
-    # This is not a NEW rule: orchestrator/src/orchestrator/verify.py::_resolve_verify_env
-    # already computes exactly {**config.verify_env, **module_config.verify_env}
-    # on the per-module path. The merge here is therefore byte-identical there —
-    # _resolve_verify_env re-applies the same spec env from ModuleConfig.verify_env
-    # on top of it ({**{**H, **S}, **S} == {**H, **S}) — and the change simply
-    # makes the ONE existing rule uniform across both paths.
-    #
-    # Spelling constraints:
-    #  - A FRESH dict, never config.verify_env.update(...). model_copy carries
-    #    the field's VALUE over unchanged, so the copy's mapping can be the SAME
-    #    dict object as the caller's — the same hazard the task-4536 registry
-    #    comment below spells out. An in-place write would corrupt the config
-    #    cli.py loaded from disk and may still use.
-    #  - Reads effective_verify_env, the PROPERTY, mirroring the producer
-    #    (build_merge_verify_spec above) so the wire round-trip is symmetric;
-    #    writes the verify_env FIELD, because the property is read-only and
-    #    _resolve_verify_env — the sole builder of the executed env — reads the
-    #    field.
-    #  - UNCONDITIONAL. An empty spec env means "the dispatcher has no verify
-    #    env", which under this rule already leaves every host key intact, so a
-    #    guard would buy a branch with no behavioural difference.
-    config_update['verify_env'] = {**config.effective_verify_env, **spec.verify_env}
-    # INV-1, task 2883 — a zero-module-config spec ships the dispatching side's
-    # global full-gate commands; apply them onto the reconstructed remote config
-    # so the remote runs the SAME gate as local (the module_configs=[] Site-2
-    # scoping path is preserved; only the global commands it reads are overridden).
-    # None (the common per-module merge) leaves the config's globals untouched.
-    if spec.global_verify_command is not None:
-        config_update['test_command'] = spec.global_verify_command.test_command
-        config_update['lint_command'] = spec.global_verify_command.lint_command
-        config_update['type_check_command'] = spec.global_verify_command.type_check_command
-    config = config.model_copy(update=config_update)
-    # Task 4536 — the spec is authoritative for the module SET too, not just
-    # the profile above. `module_configs` (reconstructed from the wire spec a
-    # few lines up) is the DISPATCHER's set, already widened at the
-    # merge-request boundary by merge_queue._merge_boundary_module_configs
-    # before build_merge_verify_spec projected it. But
-    # `config.module_configs_or_empty` is still the REMOTE host's
-    # _discover_module_configs(config.project_root) walk, and
-    # verify_plan.effective_merge_module_configs PREFERS that registry over the
-    # passed list under merge_verify_breadth='full'. Without this line a
-    # stale/divergent/narrower remote checkout silently decides the merge: it
-    # both DROPS modules the spec named (the task-2822 false-green class — the
-    # verdict vouches for modules no gate ever ran on) and INJECTS modules the
-    # spec never named (a red attributable to a subproject the dispatching side
-    # never scoped).
-    #
-    # This makes effective_merge_module_configs' OWN documented INV-5 ordering
-    # invariant true on the remote leg: its docstring already claims the wire
-    # spec "(and hence the remote's reconstruction of it in
-    # verify_runner.run_merge_verify_on_worktree)" receives the identical set BY
-    # CONSTRUCTION. Before this line that parenthetical was aspirational.
-    #
-    # It is the natural extension of fix (a): the spec is the single source of
-    # truth for the merge-deciding profile, and the module SET is part of that
-    # profile — alongside merge_verify_workspace/merge_verify_breadth (task
-    # 2822) and the global commands (INV-1, task 2883).
-    #
-    # No conditional is needed to protect the genuinely LOCAL merge path:
-    # run_merge_verify_on_worktree is reached only from cli.py's `verify-merge`
-    # subcommand (the remote/CLI host entry), while the local path constructs
-    # LocalRunner directly in merge_queue.py — so host discovery survives there
-    # by construction.
-    #
-    # KNOWN CONSEQUENCE — reverse-dependency widening degrades to a no-op on
-    # this leg under merge_verify_breadth='scoped' (amendment, review
-    # suggestion 1). verify._reverse_dependency_module_configs (task 2607)
-    # resolves a triggered dependent's BASE ModuleConfig out of this same
-    # registry. At breadth='scoped' the installed registry is exactly the
-    # spec's set, which is exactly the set already in that call's
-    # `already_scoped` — so any dependent it would widen to is by construction
-    # absent from the registry and the lookup returns None. Previously the
-    # remote host's own walk supplied it. This is a deliberate, narrow trade:
-    # a dispatcher-authoritative registry is worth strictly more than a
-    # widening resolved from a checkout the dispatcher never vouched for (and
-    # the pre-4536 alternative was to widen using the HOST's command, which is
-    # the very infidelity this install closes). It is latent, not live —
-    # _REVERSE_TEST_DEPENDENTS maps only orchestrator→escalation; dark_factory
-    # runs breadth='full', where escalation is always already_scoped and the
-    # widening is a no-op regardless; reify registers no 'orchestrator'
-    # prefix. The real fix is to resolve the widening at the DISPATCHING
-    # boundary (beside merge_queue._merge_boundary_module_configs) so widened
-    # dependents ride the wire spec — out of scope here (merge_queue.py is not
-    # locked by this task); filed as a follow-up. The skip is no longer
-    # silent: verify._reverse_dependency_module_configs logs a warning naming
-    # the unresolvable dependent.
-    #
-    # Spelling constraints (all verified against the installed pydantic):
-    #  - DIRECT private-attribute assignment, never an entry in `config_update`.
-    #    `_module_configs` is a PrivateAttr, not a model field, so
-    #    model_copy(update=...) would write it into instance __dict__ while
-    #    __pydantic_private__ kept the stale value — it would read back only via
-    #    __dict__ shadowing, a later normal write would be silently swallowed,
-    #    and the shadow would propagate into further copies. Direct assignment
-    #    is the repo-wide blessed idiom (see config.load_config).
-    #  - REBIND the whole dict, never mutate in place. model_copy rebuilds the
-    #    __pydantic_private__ MAPPING as a fresh dict (BaseModel.__copy__), so
-    #    a rebind here cannot reach back into the source — but it carries the
-    #    VALUES over unchanged, which means the copy's `_module_configs` is
-    #    initially the SAME dict object as the caller's. Rebinding is therefore
-    #    safe; an in-place .clear()/.update() would reach through that shared
-    #    value and corrupt the CALLER's config registry — the object cli.py
-    #    loaded from disk and may still use. Pinned by
-    #    test_verify_runner.test_caller_config_registry_is_not_mutated.
-    #  - UNCONDITIONAL, including `{}` for a zero-module spec. `{}` is the
-    #    documented "discovery ran and found no subprojects" value (distinct
-    #    from the None "never ran" sentinel) — exactly the claim a zero-module
-    #    spec makes, and what routes it to the INV-1 global gate instead of the
-    #    remote host's own modules.
-    config._module_configs = {mc.prefix: mc for mc in module_configs}
+    # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
+    # host's own --config can no longer narrow it; task 6127 — nor skip the
+    # dispatcher's cold-venv pre-provision.
+    config = apply_spec_to_host_config(
+        config,
+        verify_env=spec.verify_env,
+        global_verify_command=spec.global_verify_command,
+        module_configs=module_configs,
+        field_overrides={
+            'merge_verify_workspace': spec.merge_verify_workspace,
+            'merge_verify_breadth': spec.merge_verify_breadth,
+        },
+        verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
+    )
 
     runner = LocalRunner(
         merge_wt,
@@ -778,17 +616,41 @@ async def run_merge_verify_on_worktree(
 
 
 # ---------------------------------------------------------------------------
-# RunnerUnavailable — transport failure exception
+# RunnerUnavailable — the remote host produced no usable verdict
 # ---------------------------------------------------------------------------
 
 
-class RunnerUnavailable(Exception):
-    """Raised by RemoteRunner on any transport failure.
+RunnerUnavailableKind = Literal['transport', 'unparseable', 'no_verdict', 'wire_shape']
 
-    Transport failures include: host down/closed, ssh failure, git push failure,
-    or absent/unparseable verdict on stdout.  A parseable VerifyResult is always
-    returned as a result — even passed=False or timed_out=True — and never causes
-    this exception to be raised (PRD §A Invariant 5).
+
+class RunnerUnavailable(Exception):
+    """Raised by RemoteRunner when the remote host produced no usable verdict.
+
+    ``kind`` says why: ``transport`` (host down/closed, git push or ssh
+    failure, non-zero ssh exit), ``unparseable`` (stdout is not JSON),
+    ``wire_shape`` (JSON of the wrong shape — a contract skew between the two
+    hosts), or ``no_verdict`` — the ONE parseable outcome that raises: a result
+    whose summary records no verdict (``verify.is_no_verdict_summary``).  Every
+    other parseable VerifyResult is returned — even passed=False or
+    timed_out=True (PRD §A Invariant 5).
+    """
+
+    def __init__(self, *args: object, kind: RunnerUnavailableKind = 'transport') -> None:
+        super().__init__(*args)
+        if kind not in get_args(RunnerUnavailableKind):
+            raise ValueError(
+                f'RunnerUnavailable kind must be one of {get_args(RunnerUnavailableKind)}, '
+                f'got {kind!r}'
+            )
+        self.kind: RunnerUnavailableKind = kind
+
+
+class ConcurrentDispatchError(RuntimeError):
+    """A second dispatch reached a RemoteRunner that already has one in flight.
+
+    A HostLease grants exclusive use of its RemoteRunner (PRD §4.3), so this
+    is a broken invariant — a bug, never a fallback signal, and deliberately
+    not a RunnerUnavailable, which callers read as a host outage.
     """
 
 
@@ -1001,6 +863,10 @@ class LocalRunner:
 # Microsecond precision ensures uniqueness across back-to-back ENOSPC retries for
 # the same task; the format is still lexicographically sortable.
 _STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
+
+# A merge verify carries no attempt id; its archives stem with the same
+# fallback the local merge path uses (verify.py::_archive_attempt_id).
+_MERGE_ARCHIVE_ATTEMPT_ID = 1
 
 # Shared base ssh options for all four RemoteRunner ssh argv sites (health,
 # run_merge_verify dispatch, cancel_verify, probe_clean) — kept in one place
@@ -1278,6 +1144,65 @@ def resolve_local_df_checkout(start: Path | None = None) -> Path | None:
     return None
 
 
+RemoteVerifySubcommand = Literal['verify-merge', 'verify-task']
+# The single home of the remote verify process pattern; β's verify_cancel reuses it.
+REMOTE_VERIFY_PROCESS_PATTERN: str = '|'.join(get_args(RemoteVerifySubcommand))
+
+
+@dataclass(frozen=True)
+class _DispatchOutcome:
+    result: VerifyResult
+    ssh_stderr: str
+    duration_ms: int
+
+
+def _merge_pass_summary_payload(
+    runner_name: str,
+    spec: MergeVerifySpec,
+    result: VerifyResult,
+    merge_sha: str,
+    duration_ms: int,
+) -> dict[str, Any]:
+    """A remote merge GREEN's audit record: SCOPE (read from the spec, the single
+    source of truth after task 2822 fix a — not the host config), RESULT and TIMING."""
+    return {
+        'merge_sha': merge_sha,
+        'runner': runner_name,
+        'passed': result.passed,
+        'category': result.category,
+        'duration_ms': duration_ms,
+        'scope': {
+            'task_files': list(spec.task_files) if spec.task_files is not None else None,
+            'merge_verify_workspace': spec.merge_verify_workspace,
+            'merge_verify_breadth': spec.merge_verify_breadth,
+        },
+    }
+
+
+def _task_pass_summary_payload(
+    runner_name: str,
+    spec: TaskVerifySpec,
+    result: VerifyResult,
+    duration_ms: int,
+) -> dict[str, Any]:
+    """A remote task GREEN's audit record: identity, RESULT, TIMING and the spec's SCOPE."""
+    return {
+        'tip_sha': spec.tip_sha,
+        'task_id': spec.task_id,
+        'attempt_id': spec.attempt_id,
+        'runner': runner_name,
+        'passed': result.passed,
+        'category': result.category,
+        'duration_ms': duration_ms,
+        'scope': {
+            'task_files': list(spec.task_files),
+            'force_workspace': spec.force_workspace,
+            'scope_cargo': spec.scope_cargo,
+            'modules': [vc.prefix for vc in spec.verify_commands],
+        },
+    }
+
+
 class RemoteRunner:
     """Runs a merge-verify bundle on a remote host via git push + ssh.
 
@@ -1285,10 +1210,11 @@ class RemoteRunner:
     contract).  The spec is shipped over ssh as a shlex-quoted JSON argument;
     stdout is parsed as a VerifyResult via result_from_json.
 
-    Transport failures (push fail, ssh connect failure, non-zero exit,
-    unparseable stdout) raise RunnerUnavailable.  A parseable VerifyResult on
-    stdout is always returned unchanged — even passed=False or timed_out=True
-    (PRD §A Invariant 5).
+    Every dispatch goes through ``_dispatch`` (PRD §4.3).  A host that
+    produces no usable verdict — push fail, ssh connect failure, non-zero
+    exit, unparseable or wrong-shaped stdout, a no-verdict summary — raises
+    RunnerUnavailable; any other parseable VerifyResult is returned unchanged,
+    even passed=False or timed_out=True (PRD §A Invariant 5).
 
     The pushed ref ``refs/merge-verify/<request_id>`` is pruned best-effort on
     return (step-10).
@@ -1366,8 +1292,8 @@ class RemoteRunner:
         # the per-call round-trip is acceptable at current merge cadences.
         # Filed as a follow-up: cache runners and wire deduplication.
         self._last_pushed_main_sha: str | None = None
-        # β: track the in-flight request-id so cancel_verify() can issue a targeted cancel.
-        # Set to request_id just before the load-bearing push; cleared in the finally.
+        # β: the in-flight request-id, so cancel_verify() can issue a targeted cancel.
+        # One slot: claimed by _dispatch before its push, cleared when it unwinds.
         self._inflight_request_id: str | None = None
 
     async def health(self) -> bool:
@@ -1644,9 +1570,8 @@ class RemoteRunner:
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
-        (a) git push <git_remote> <merge_sha>:refs/merge-verify/<request_id>
-        (b) ssh <ssh_host> <shlex-quoted remote argv>
-        (c) parse stdout via result_from_json
+        The best-effort main-mirror push (``_push_main_mirror``) runs first,
+        BEFORE the in-flight window opens; then ``_dispatch('verify-merge')``.
 
         *event_store* (INV-2, task 2884; None-safe, mirrors LocalRunner) receives
         a ``runner_synced`` (kind='project_main_mirror') event when the best-effort
@@ -1661,104 +1586,193 @@ class RemoteRunner:
         (task 2822 fix c) so a remote GREEN is auditable.  Any archival error is
         swallowed so the VerifyResult is always returned unchanged (PRD §A Invariant 5).
 
-        Raises RunnerUnavailable on any transport failure (step-8).
-        Returns a VerifyResult unchanged — even passed=False or timed_out=True
-        (PRD §A Invariant 5).
+        Raises RunnerUnavailable when the host produced no usable verdict.
+        Returns any other VerifyResult unchanged — even passed=False or
+        timed_out=True (PRD §A Invariant 5).
         """
         request_id = self._id_factory()
-        ref = f'refs/merge-verify/{request_id}'
+        await self._push_main_mirror(task_id=task_id, event_store=event_store)
+        outcome = await self._dispatch(
+            merge_sha, 'verify-merge', spec_to_json(spec), request_id=request_id,
+        )
+        result = outcome.result
+        if archive_root is not None and task_id is not None:
+            if not result.passed:
+                self._archive_remote_red(
+                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID, outcome, role='merge',
+                )
+            else:
+                # task-2822 fix (c): a remote GREEN is auditable beside the red archives.
+                self._archive_pass_summary(
+                    archive_root, task_id, _MERGE_ARCHIVE_ATTEMPT_ID,
+                    _merge_pass_summary_payload(
+                        self.name, spec, result, merge_sha, outcome.duration_ms,
+                    ),
+                )
+        return result
 
-        # β: Track the in-flight request-id for cancel_verify().  Cleared in the
-        # outer finally so it is always reset even when RunnerUnavailable is raised
-        # before the inner try/finally (e.g. on merge-sha push failure).
-        self._inflight_request_id = request_id
-        try:
-            # Step 0 (best-effort): if main_branch is set, push it FIRST so the remote
-            # has a fresh view of main.  A non-zero rc or OSError is logged at WARNING
-            # and swallowed — a non-fast-forward must not abort the verify.
-            #
-            # β dedup: resolve the local main tip via `git rev-parse` (network-free).
-            # When the resolved sha matches _last_pushed_main_sha the push is skipped —
-            # the remote already has this main sha, so the push is redundant.
-            if self._main_branch:
-                # Resolve local main tip (network-free)
-                resolved_main_sha: str | None = None
+    async def run_task_verify(
+        self,
+        spec: TaskVerifySpec,
+        *,
+        task_id: str,
+        archive_root: Path | None,
+    ) -> VerifyResult:
+        """Run a task-role verify of ``spec.tip_sha`` on the remote host (PRD §5.2).
+
+        ``_dispatch('verify-task')``, with no main-mirror push.  With
+        *archive_root*, a red archives the remote stderr, the
+        ``attempt-<spec.attempt_id>.remote-<name>.{test,lint,type}-<stamp>.log``
+        streams and their ``.summary-<stamp>.json`` (role 'task'); a green archives
+        one ``.pass-summary-<stamp>.json``.  The result's archive_log_paths name
+        exactly those workstation files and worktree_log_paths is emptied, since
+        laptop paths mean nothing here.  *task_id* must equal ``spec.task_id``.
+        """
+        if task_id != spec.task_id:
+            raise ValueError(
+                f'run_task_verify task_id {task_id!r} disagrees with spec.task_id '
+                f'{spec.task_id!r}'
+            )
+        outcome = await self._dispatch(
+            spec.tip_sha, 'verify-task', task_spec_to_json(spec),
+            request_id=self._id_factory(),
+        )
+        archived: list[Path] = []
+        if archive_root is not None:
+            if not outcome.result.passed:
+                archived = self._archive_remote_red(
+                    archive_root, task_id, spec.attempt_id, outcome, role='task',
+                )
+            else:
+                pass_summary = self._archive_pass_summary(
+                    archive_root, task_id, spec.attempt_id,
+                    _task_pass_summary_payload(
+                        self.name, spec, outcome.result, outcome.duration_ms,
+                    ),
+                )
+                archived = [pass_summary] if pass_summary is not None else []
+        return dataclasses.replace(
+            outcome.result,
+            worktree_log_paths=[],
+            archive_log_paths=[str(path) for path in archived],
+        )
+
+    async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
+        """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.
+
+        A non-zero rc or OSError is logged at WARNING and swallowed — a
+        non-fast-forward must not abort the verify.
+
+        β dedup: resolve the local main tip via `git rev-parse` (network-free).
+        When the resolved sha matches _last_pushed_main_sha the push is skipped —
+        the remote already has this main sha, so the push is redundant.
+        """
+        if self._main_branch:
+            # Resolve local main tip (network-free)
+            resolved_main_sha: str | None = None
+            try:
+                rev_rc, rev_stdout, _ = await self._run(
+                    ['git', 'rev-parse', self._main_branch],
+                    cwd=self._cwd,
+                )
+                if rev_rc == 0:
+                    resolved_main_sha = rev_stdout.strip() or None
+            except OSError:
+                pass  # rev-parse failed; push unconditionally below
+
+            # Skip push when sha is unchanged (dedup)
+            if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
                 try:
-                    rev_rc, rev_stdout, _ = await self._run(
-                        ['git', 'rev-parse', self._main_branch],
+                    main_rc, _, main_stderr = await self._run(
+                        ['git', 'push', self._git_remote,
+                         f'{self._main_branch}:refs/heads/{self._main_branch}'],
                         cwd=self._cwd,
                     )
-                    if rev_rc == 0:
-                        resolved_main_sha = rev_stdout.strip() or None
-                except OSError:
-                    pass  # rev-parse failed; push unconditionally below
-
-                # Skip push when sha is unchanged (dedup)
-                if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
-                    try:
-                        main_rc, _, main_stderr = await self._run(
+                    if main_rc == 0:
+                        if resolved_main_sha is not None:
+                            self._last_pushed_main_sha = resolved_main_sha
+                    else:
+                        # INV-2 mirror-semantics (task 2884, PRD §3.1): the FF
+                        # main push was rejected (typically non-fast-forward —
+                        # the remote PROJECT main diverged, e.g. the laptop
+                        # reify main since 07-20).  Retry ONCE with a force
+                        # refspec to restore mirror semantics.  The FF fast
+                        # path above is preserved — a force is attempted ONLY
+                        # on FF failure, so a healthy remote never sees one and
+                        # the divergence signal is not silently dropped.
+                        force_rc, _, force_stderr = await self._run(
                             ['git', 'push', self._git_remote,
-                             f'{self._main_branch}:refs/heads/{self._main_branch}'],
+                             f'+{self._main_branch}:refs/heads/{self._main_branch}'],
                             cwd=self._cwd,
                         )
-                        if main_rc == 0:
+                        if force_rc == 0:
+                            prior_main_sha = self._last_pushed_main_sha
                             if resolved_main_sha is not None:
                                 self._last_pushed_main_sha = resolved_main_sha
-                        else:
-                            # INV-2 mirror-semantics (task 2884, PRD §3.1): the FF
-                            # main push was rejected (typically non-fast-forward —
-                            # the remote PROJECT main diverged, e.g. the laptop
-                            # reify main since 07-20).  Retry ONCE with a force
-                            # refspec to restore mirror semantics.  The FF fast
-                            # path above is preserved — a force is attempted ONLY
-                            # on FF failure, so a healthy remote never sees one and
-                            # the divergence signal is not silently dropped.
-                            force_rc, _, force_stderr = await self._run(
-                                ['git', 'push', self._git_remote,
-                                 f'+{self._main_branch}:refs/heads/{self._main_branch}'],
-                                cwd=self._cwd,
-                            )
-                            if force_rc == 0:
-                                prior_main_sha = self._last_pushed_main_sha
-                                if resolved_main_sha is not None:
-                                    self._last_pushed_main_sha = resolved_main_sha
-                                if event_store is not None:
-                                    from orchestrator.event_store import EventType
-                                    event_store.emit(
-                                        EventType.runner_synced,
-                                        task_id=task_id,
-                                        data={
-                                            'runner': self.name,
-                                            'kind': 'project_main_mirror',
-                                            'from_head': prior_main_sha,
-                                            'to_head': resolved_main_sha,
-                                            'forced': True,
-                                        },
-                                    )
-                            else:
-                                # Force ALSO failed — keep today's best-effort
-                                # WARNING+swallow (the merge-sha push stays the
-                                # load-bearing transport; a non-fatal main push
-                                # must never abort the verify).
-                                import logging as _logging
-                                _logging.getLogger(__name__).warning(
-                                    'RemoteRunner %r: best-effort main push of %r to %r failed '
-                                    '(FF rc=%d: %s; force rc=%d: %s) — continuing with merge-sha push',
-                                    self.name, self._main_branch, self._git_remote,
-                                    main_rc, main_stderr, force_rc, force_stderr,
+                            if event_store is not None:
+                                from orchestrator.event_store import EventType
+                                event_store.emit(
+                                    EventType.runner_synced,
+                                    task_id=task_id,
+                                    data={
+                                        'runner': self.name,
+                                        'kind': 'project_main_mirror',
+                                        'from_head': prior_main_sha,
+                                        'to_head': resolved_main_sha,
+                                        'forced': True,
+                                    },
                                 )
-                    except OSError as exc:
-                        import logging as _logging
-                        _logging.getLogger(__name__).warning(
-                            'RemoteRunner %r: best-effort main push failed with OSError: %s'
-                            ' — continuing',
-                            self.name, exc,
-                        )
+                        else:
+                            # Force ALSO failed — keep today's best-effort
+                            # WARNING+swallow (the merge-sha push stays the
+                            # load-bearing transport; a non-fatal main push
+                            # must never abort the verify).
+                            import logging as _logging
+                            _logging.getLogger(__name__).warning(
+                                'RemoteRunner %r: best-effort main push of %r to %r failed '
+                                '(FF rc=%d: %s; force rc=%d: %s) — continuing with merge-sha push',
+                                self.name, self._main_branch, self._git_remote,
+                                main_rc, main_stderr, force_rc, force_stderr,
+                            )
+                except OSError as exc:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        'RemoteRunner %r: best-effort main push failed with OSError: %s'
+                        ' — continuing',
+                        self.name, exc,
+                    )
 
-            # Step 1: push the merge sha to the remote (load-bearing transport)
+    async def _dispatch(
+        self,
+        sha: str,
+        subcommand: RemoteVerifySubcommand,
+        spec_json: str,
+        *,
+        request_id: str,
+    ) -> _DispatchOutcome:
+        """Push *sha* to ``refs/merge-verify/<request_id>``, run *subcommand* over ssh, parse the verdict.
+
+        The one transport every remote verify shares (PRD §4.3).  It claims the
+        runner's single in-flight slot synchronously, before its first await,
+        and clears it on unwind; a claim while another is live breaks the
+        exclusive-use invariant and raises ConcurrentDispatchError, leaving
+        the live claim untouched.  After a successful push the ref is deleted
+        best-effort on every exit.
+
+        Raises RunnerUnavailable, whose ``kind`` says why, whenever the host
+        produced no usable verdict — a parseable no-verdict result included.
+        """
+        if self._inflight_request_id is not None:
+            raise ConcurrentDispatchError(
+                f'RemoteRunner {self.name!r} already has request '
+                f'{self._inflight_request_id!r} in flight; refused request {request_id!r}'
+            )
+        self._inflight_request_id = request_id
+        ref = f'refs/merge-verify/{request_id}'
+        try:
             try:
                 push_rc, _push_out, push_stderr = await self._run(
-                    ['git', 'push', self._git_remote, f'{merge_sha}:{ref}'],
+                    ['git', 'push', self._git_remote, f'{sha}:{ref}'],
                     cwd=self._cwd,
                 )
             except OSError as exc:
@@ -1766,72 +1780,36 @@ class RemoteRunner:
 
             if push_rc != 0:
                 raise RunnerUnavailable(
-                    f'git push {self._git_remote} {merge_sha}:{ref} failed'
+                    f'git push {self._git_remote} {sha}:{ref} failed'
                     f' (rc={push_rc}): {push_stderr}'
                 )
 
-            # Push succeeded — clean up the ref on return (best-effort, in finally)
             try:
-                # Step 2: build and issue the ssh command.
                 # --request-id is APPENDED so parsed[:4] stays back-compat.
-                argv = [
-                    'orchestrator', 'verify-merge',
-                    '--sha', merge_sha,
-                    '--spec', spec_to_json(spec),
-                ]
+                argv = ['orchestrator', subcommand, '--sha', sha, '--spec', spec_json]
                 if self._config_path:
                     argv += ['--config', self._config_path]
                 argv += ['--request-id', request_id]
                 remote_cmd = ' '.join(shlex.quote(a) for a in argv)
 
-                # Fix (c), task 2822 — measure the remote verify wall-clock so a
-                # PASSING remote verify can be archived with TIMING (mirrors the
-                # pool.dispatch monotonic timing at ~1455/1484).
-                _ssh_t0 = time.monotonic()
+                ssh_t0 = time.monotonic()
                 try:
                     ssh_rc, ssh_stdout, ssh_stderr = await self._ssh_run(
                         ['ssh', *_SSH_BASE_OPTS, self._ssh_host, remote_cmd],
                     )
                 except OSError as exc:
                     raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
-                duration_ms = round((time.monotonic() - _ssh_t0) * 1000)
+                duration_ms = round((time.monotonic() - ssh_t0) * 1000)
 
                 if ssh_rc != 0:
                     raise RunnerUnavailable(
                         f'ssh {self._ssh_host} exited {ssh_rc}: {ssh_stderr}'
                     )
-
-                # Step 3: parse the host's stdout
-                # Any parseable VerifyResult is returned unchanged (PRD §A Invariant 5).
-                # Non-zero exit or unparseable stdout → RunnerUnavailable (transport failure).
-                try:
-                    result = result_from_json(ssh_stdout)
-                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
-                    raise RunnerUnavailable(
-                        f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}'
-                    ) from exc
-
-                # task-1920: archive remote stderr on failure for operator triage.
-                # Best-effort: any error is swallowed so the VerifyResult is unchanged.
-                if not result.passed and ssh_stderr.strip() and archive_root is not None and task_id is not None:
-                    self._archive_failure_stderr(archive_root, task_id, ssh_stderr)
-
-                # task-1921: archive captured test/lint/type output streams on failure.
-                # Mirrors local _archive_merge_verify_logs; distinguishes timeout vs real failure.
-                if not result.passed and archive_root is not None and task_id is not None:
-                    self._archive_failure_streams(archive_root, task_id, result)
-
-                # task-2822 fix (c): archive a PASSING remote verify as a best-effort
-                # JSON pass-summary (scope+result+timing) so a remote GREEN is auditable
-                # side-by-side with the failure archives — closing the incident's
-                # un-auditable-laptop-scope gap.  Failure-only archiving above is unchanged.
-                if result.passed and archive_root is not None and task_id is not None:
-                    self._archive_pass_summary(
-                        archive_root, task_id, spec, result, merge_sha, duration_ms,
-                    )
-
-                return result
-
+                return _DispatchOutcome(
+                    result=self._parse_verdict(ssh_stdout),
+                    ssh_stderr=ssh_stderr,
+                    duration_ms=duration_ms,
+                )
             finally:
                 # Best-effort ref cleanup — never alters returned result nor masks exceptions
                 with contextlib.suppress(Exception):
@@ -1839,36 +1817,78 @@ class RemoteRunner:
                         ['git', 'push', self._git_remote, '--delete', ref],
                         cwd=self._cwd,
                     )
-
         finally:
-            # Always clear the in-flight tracker so cancel_verify is idempotent after return
             self._inflight_request_id = None
+
+    def _parse_verdict(self, stdout: str) -> VerifyResult:
+        try:
+            result = result_from_json(stdout)
+        except ValueError as exc:  # json.JSONDecodeError included
+            raise RunnerUnavailable(
+                f'unparseable VerifyResult from {self._ssh_host!r}: {exc!r}',
+                kind='unparseable',
+            ) from exc
+        except (TypeError, KeyError) as exc:
+            raise RunnerUnavailable(
+                f'VerifyResult of the wrong shape from {self._ssh_host!r}: {exc!r}',
+                kind='wire_shape',
+            ) from exc
+        if not isinstance(result.summary, str):
+            raise RunnerUnavailable(
+                f'VerifyResult of the wrong shape from {self._ssh_host!r}: '
+                f'summary {result.summary!r} is not a string',
+                kind='wire_shape',
+            )
+        if verify.is_no_verdict_summary(result.summary):
+            raise RunnerUnavailable(
+                f'{self.name!r} returned no verdict: {result.summary}',
+                kind='no_verdict',
+            )
+        return result
+
+    def _archive_remote_red(
+        self,
+        archive_root: Path,
+        task_id: str,
+        attempt_id: int,
+        outcome: _DispatchOutcome,
+        *,
+        role: Literal['merge', 'task'],
+    ) -> list[Path]:
+        """Archive a remote red: its ssh stderr (task 1920), then its captured streams (task 1921)."""
+        archived: list[Path] = []
+        if outcome.ssh_stderr.strip():
+            stderr_path = self._archive_failure_stderr(
+                archive_root, task_id, attempt_id, outcome.ssh_stderr,
+            )
+            if stderr_path is not None:
+                archived.append(stderr_path)
+        archived += self._archive_failure_streams(
+            archive_root, task_id, attempt_id, outcome.result, role=role,
+        )
+        return archived
 
     def _archive_failure_stderr(
         self,
         archive_root: Path,
         task_id: str,
+        attempt_id: int,
         stderr_text: str,
-    ) -> None:
+    ) -> Path | None:
         """Write *stderr_text* to a timestamped .stderr.log file under archive_root/task_id/.
 
-        Filename: ``attempt-1.remote-<safe_name>-<utc_ts>.stderr.log``
+        Filename: ``attempt-<attempt_id>.remote-<safe_name>-<utc_ts>.stderr.log``
 
-        Co-located with local merge-verify archives for side-by-side operator triage (task 1920,
+        Co-located with local verify archives for side-by-side operator triage (task 1920,
         sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
-        (verify.py:779-856) via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
-
-        The attempt number is pinned to 1, matching the local merge path's default
-        (``verify.py::_archive_attempt_id``).  Microsecond-precision timestamps already guarantee filename
-        uniqueness across back-to-back ENOSPC retries, so threading attempt_id through the call
-        chain is unnecessary and would complicate the interface for no triage benefit.
+        via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
 
         Filesystem I/O is synchronous (mkdir + write_text), matching the local-archive convention.
         Remote stderr payloads are bounded by the ssh process output buffer; the event-loop
         blocking window is negligible at current sizes.
 
-        Best-effort: any exception is swallowed with a WARNING so the caller's VerifyResult
-        is always returned unchanged (PRD §A Invariant 5).
+        Best-effort: any exception is swallowed with a WARNING (returning None) so the
+        caller's VerifyResult is always returned unchanged (PRD §A Invariant 5).
         """
         import logging as _logging
         try:
@@ -1876,40 +1896,30 @@ class RemoteRunner:
             target_dir.mkdir(parents=True, exist_ok=True)
             utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
             safe = _sanitize_runner_name(self.name)
-            (target_dir / f'attempt-1.remote-{safe}-{utc_ts}.stderr.log').write_text(
-                stderr_text, encoding='utf-8',
-            )
+            path = target_dir / f'attempt-{attempt_id}.remote-{safe}-{utc_ts}.stderr.log'
+            path.write_text(stderr_text, encoding='utf-8')
+            return path
         except Exception as exc:
             _logging.getLogger(__name__).warning(
                 'RemoteRunner %r: best-effort stderr archival failed: %s', self.name, exc,
             )
+            return None
 
     def _archive_pass_summary(
         self,
         archive_root: Path,
         task_id: str,
-        spec: MergeVerifySpec,
-        result: VerifyResult,
-        merge_sha: str,
-        duration_ms: int,
-    ) -> None:
-        """Archive a PASSING remote merge-verify as a best-effort JSON pass-summary.
+        attempt_id: int,
+        payload: dict[str, Any],
+    ) -> Path | None:
+        """Archive a PASSING remote verify's *payload* as a best-effort JSON pass-summary.
 
-        Filename: ``attempt-1.remote-<safe_name>.pass-summary-<utc_ts>.json``
+        Filename: ``attempt-<attempt_id>.remote-<safe_name>.pass-summary-<utc_ts>.json``
 
         Mirrors _archive_failure_stderr's best-effort shape (mkdir(parents,exist_ok),
         microsecond-UTC timestamp via _STDERR_ARCHIVE_TS_FMT, _sanitize_runner_name,
-        swallow-with-WARNING) so a remote GREEN is auditable side-by-side with the
-        failure archives (task 2822 fix c), closing the incident's un-auditable
-        laptop-scope gap.
-
-        The payload captures SCOPE (task_files + the merge-gate profile — all read
-        from the SPEC, the single source of truth after fix a, NOT the host config),
-        RESULT (passed, category), and TIMING (duration_ms of the remote ssh verify),
-        plus runner name and merge_sha.
-
-        Best-effort: any exception is swallowed with a WARNING so the caller's
-        VerifyResult is always returned unchanged (PRD §A Invariant 5).
+        swallow-with-WARNING returning None) so a remote GREEN is auditable
+        side-by-side with the failure archives (task 2822 fix c).
         """
         import logging as _logging
         try:
@@ -1917,32 +1927,24 @@ class RemoteRunner:
             target_dir.mkdir(parents=True, exist_ok=True)
             utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
             safe = _sanitize_runner_name(self.name)
-            payload = {
-                'merge_sha': merge_sha,
-                'runner': self.name,
-                'passed': result.passed,
-                'category': result.category,
-                'duration_ms': duration_ms,
-                'scope': {
-                    'task_files': list(spec.task_files) if spec.task_files is not None else None,
-                    'merge_verify_workspace': spec.merge_verify_workspace,
-                    'merge_verify_breadth': spec.merge_verify_breadth,
-                },
-            }
-            (target_dir / f'attempt-1.remote-{safe}.pass-summary-{utc_ts}.json').write_text(
-                json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8',
-            )
+            path = target_dir / f'attempt-{attempt_id}.remote-{safe}.pass-summary-{utc_ts}.json'
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
+            return path
         except Exception as exc:
             _logging.getLogger(__name__).warning(
                 'RemoteRunner %r: best-effort pass-summary archival failed: %s', self.name, exc,
             )
+            return None
 
     def _archive_failure_streams(
         self,
         archive_root: Path,
         task_id: str,
+        attempt_id: int,
         result: VerifyResult,
-    ) -> None:
+        *,
+        role: Literal['merge', 'task'],
+    ) -> list[Path]:
         """Archive captured test/lint/type output streams to archive_root/task_id/ on failure.
 
         Mirrors verify._archive_merge_verify_logs by projecting the three VerifyResult
@@ -1951,8 +1953,8 @@ class RemoteRunner:
         and the summary.json shape are byte-identical to local merge-verify archives.
 
         Filename convention (task 1921):
-            ``attempt-1.remote-<safe_name>.{label}-<utc_ts>.log``
-            ``attempt-1.remote-<safe_name>.summary-<utc_ts>.json``
+            ``attempt-<attempt_id>.remote-<safe_name>.{label}-<utc_ts>.log``
+            ``attempt-<attempt_id>.remote-<safe_name>.summary-<utc_ts>.json``
 
         The module_prefix ``remote-<name>`` causes _make_infix to emit the
         ``.remote-<name>`` infix, co-located with and identically shaped to local
@@ -1964,61 +1966,63 @@ class RemoteRunner:
         ``cause_hint`` — are threaded from the real VerifyResult so summary.json can
         distinguish infra_timeout from test_failure without re-running (task 1921 goal).
 
-        Early-returns when all three streams are empty (no orphan summary.json emitted).
+        Returns the written paths; ``[]`` when all three streams are empty (no
+        orphan summary.json emitted).
 
-        Best-effort: any exception is swallowed with a WARNING so the caller's
-        VerifyResult is always returned unchanged (PRD §A Invariant 5).
+        Best-effort: any exception is swallowed with a WARNING (returning ``[]``) so
+        the caller's VerifyResult is always returned unchanged (PRD §A Invariant 5).
         _archive_merge_verify_logs already swallows OSError internally; this outer
         guard additionally swallows non-OSError failures as a backstop (task 1921 step-4).
         """
         import logging as _logging
         try:
-            # Build synthetic run dicts for each non-empty stream.
-            runs = []
-            for label, output in (
-                ('test', result.test_output),
-                ('lint', result.lint_output),
-                ('type', result.type_output),
-            ):
-                if output:
-                    runs.append({
-                        'label': label,
-                        'cmd': f'<remote {label}>',
-                        'rc': 1,
-                        'output': output,
-                        'timed_out': result.timed_out,
-                        'started_at': '',
-                        'duration_secs': 0.0,
-                    })
-
-            # Early-return: no non-empty streams → nothing to archive.
+            runs = [
+                {
+                    'label': label,
+                    'cmd': f'<remote {label}>',
+                    'rc': 1,
+                    'output': output,
+                    'timed_out': result.timed_out,
+                    'started_at': '',
+                    'duration_secs': 0.0,
+                }
+                for label, output in (
+                    ('test', result.test_output),
+                    ('lint', result.lint_output),
+                    ('type', result.type_output),
+                )
+                if output
+            ]
             if not runs:
-                return
+                return []
 
             # Producer-side contract: the remote verify process is responsible for
             # populating result.category (e.g. 'infra_timeout' vs 'test_failure') and
             # result.timed_out=True when a timeout occurred.  Distinguishability in the
             # emitted summary.json depends on the remote host honouring this contract;
             # this method threads the fields through verbatim but cannot enforce them.
-            _archive_merge_verify_logs(
+            return _archive_merge_verify_logs(
                 runs,
                 Path(archive_root),
                 task_id,
-                1,  # attempt_id pinned to 1, matching the local merge path default
+                attempt_id,
                 result.category,
                 result.cause_hint,
                 module_prefix=f'remote-{self.name}',
+                role=role,
             )
         except Exception as exc:
             _logging.getLogger(__name__).warning(
                 'RemoteRunner %r: best-effort stream archival failed: %s', self.name, exc,
             )
+            return []
 
     async def cancel_verify(self) -> int:
-        """Cancel the in-flight verify-merge on the remote host.
+        """Cancel the in-flight remote verify on the remote host.
 
-        Returns 0 immediately (idempotent) when _inflight_request_id is None —
-        matches α's contract: cancel an unknown/finished id exits 0.
+        Returns 0 immediately (idempotent) when no ``_dispatch`` is in flight —
+        including during run_merge_verify's main-mirror push, which precedes
+        the claim — matching α's contract: cancel an unknown/finished id exits 0.
 
         Otherwise issues:
             ssh <_SSH_BASE_OPTS> <host>
@@ -2045,9 +2049,10 @@ class RemoteRunner:
             return 1  # non-zero → caller treats as cancel failure
 
     async def probe_clean(self) -> bool:
-        """Probe whether any verify-merge is still running on the remote host.
+        """Probe whether any remote verify (any RemoteVerifySubcommand) is still running.
 
-        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f verify-merge
+        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f 'verify-merge|verify-task'
+        (REMOTE_VERIFY_PROCESS_PATTERN, quoted: '|' is a remote-shell metacharacter)
 
         Returns:
             True  — rc == 1 (pgrep found no match; host is clean)
@@ -2056,7 +2061,10 @@ class RemoteRunner:
         """
         try:
             rc, _, _ = await self._run(
-                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, 'pgrep -f verify-merge']
+                [
+                    'ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                    f'pgrep -f {shlex.quote(REMOTE_VERIFY_PROCESS_PATTERN)}',
+                ]
             )
             return rc == 1
         except Exception:
@@ -2064,13 +2072,14 @@ class RemoteRunner:
 
     @property
     def dispatch_in_flight(self) -> bool:
-        """True while an ssh run_merge_verify dispatch is live.
+        """True while a ``_dispatch`` (ref push + ssh verify) is live.
 
-        Derived from ``_inflight_request_id`` (set at the top of
-        run_merge_verify, cleared in its finally): True == the dispatch's
-        death is owned by task 2362's ssh keepalive; False == either no
-        dispatch has started, or it has returned and the lease may still be
-        held for post-dispatch work.  Consumed by merge_queue's abort-poll
+        Derived from ``_inflight_request_id`` (claimed at the top of
+        ``_dispatch``, cleared as it unwinds): True == the dispatch's death is
+        owned by task 2362's ssh keepalive; False == either no dispatch has
+        started (run_merge_verify's main-mirror push precedes the claim), or
+        it has returned and the lease may still be held for post-dispatch
+        work such as archiving.  Consumed by merge_queue's abort-poll
         loop (task 2566) to bound that post-dispatch, remote-lease-held
         window, which nothing else watches.
         """
@@ -2500,7 +2509,7 @@ class VerifyRunnerPool:
 
 def spec_to_json(spec: MergeVerifySpec) -> str:
     """Serialise a MergeVerifySpec to canonical JSON (sort_keys=True)."""
-    return json.dumps(spec.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(spec.to_dict())
 
 
 def spec_from_json(s: str) -> MergeVerifySpec:
@@ -2510,7 +2519,7 @@ def spec_from_json(s: str) -> MergeVerifySpec:
 
 def result_to_json(vr: VerifyResult) -> str:
     """Serialise a VerifyResult to canonical JSON (sort_keys=True)."""
-    return json.dumps(result_to_dict(vr), sort_keys=True, ensure_ascii=False)
+    return canonical_json(result_to_dict(vr))
 
 
 def result_from_json(s: str) -> VerifyResult:
@@ -2564,7 +2573,7 @@ class EnvFingerprint:
 
 def fingerprint_to_json(fp: EnvFingerprint) -> str:
     """Serialise an EnvFingerprint to canonical JSON (sort_keys=True, ensure_ascii=False)."""
-    return json.dumps(fp.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(fp.to_dict())
 
 
 def fingerprint_from_json(s: str) -> EnvFingerprint:
@@ -2754,7 +2763,7 @@ class VerdictParityReport:
 
 def parity_report_to_json(report: VerdictParityReport) -> str:
     """Serialise a VerdictParityReport to canonical JSON."""
-    return json.dumps(report.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(report.to_dict())
 
 
 def parity_report_from_json(s: str) -> VerdictParityReport:
@@ -3283,7 +3292,7 @@ class ColdWarmVerifyDelta:
 
 def delta_to_json(d: ColdWarmVerifyDelta) -> str:
     """Serialize a ColdWarmVerifyDelta to a byte-canonical JSON string (sort_keys=True)."""
-    return json.dumps(d.to_dict(), sort_keys=True, ensure_ascii=False)
+    return canonical_json(d.to_dict())
 
 
 def delta_from_json(s: str) -> ColdWarmVerifyDelta:

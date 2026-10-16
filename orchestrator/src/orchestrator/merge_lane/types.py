@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from shared.branch_names import canonical_queued_branch_name
 
+from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
@@ -894,6 +895,17 @@ class MergeRequest:
 
     Default ``False`` remains a strict no-op: no payload is built, no probe is
     run, and every retry path behaves byte-identically."""
+    awaited_by_workflow: bool = field(default=False, kw_only=True)
+    """True when a TaskWorkflow awaits this request's result and parks the task
+    at merge-deferred on a 'superseded' outcome
+    (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_superseded``).
+
+    The coalescing pass absorbs only such requests: a coalesce train lands only
+    once every member is merge-deferred, and only a workflow parks a task
+    there. The default covers the MCP ``merge_request``, the stranded-branch
+    reaper and journal recovery, whose submitters never park. Not journaled: a
+    recovered request's workflow died with the process. Read only on single
+    requests; a GroupMergeRequest is never a coalesce candidate."""
 
 
 @dataclass(frozen=True)
@@ -973,6 +985,11 @@ class GroupMergeRequest(MergeRequest):
     """Optional async callback: re-drive an absorbed member still merge-deferred
     after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
     None when not wired (back-compat with existing test constructions)."""
+
+    member_pre_stack_tips: tuple[PreStackTip, ...] = field(default=(), kw_only=True)
+    """The tip each stacked member had before the coalescing pass stacked it,
+    so a train that does not land can hand its members back.  Empty on a
+    declared train, whose tip workflow re-fires it."""
 
 
 @dataclass

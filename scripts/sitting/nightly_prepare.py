@@ -8,13 +8,22 @@ writes ``data/sitting/``. The render that follows re-measures every figure
 itself, so a failed night costs thinner recommendations, never a wrong page.
 
 Recommend-only regardless of flags. The CLI runs under ``--permission-mode
-dontAsk`` with ``NIGHTLY_ALLOWED_TOOLS`` as the only tools it may use (the
-prepare script only as ``brief --json`` and ``record --from -``) and
-``NIGHTLY_DENIED_TOOLS`` naming every apply verb. The child env also carries
-``NIGHTLY_CONFINEMENT_ENV``, under which ``prepare_sitting.py`` itself refuses
-any other subcommand, a non-default ``--preparation``, ``--ledger`` and
-``--apply-closes``. A write outside ``data/sitting/`` is therefore refused in
-code rather than merely instructed against.
+dontAsk`` with ``nightly_allowed_tools`` as the only tools it may use and
+``NIGHTLY_DENIED_TOOLS`` naming every apply verb. It reads no settings file
+(``setting_sources=[]``), so no ambient allow rule widens that list. Its one
+write channel is a fresh per-run inbox, ``data/sitting/inbox/<UTC stamp>/``:
+it Writes JSON batches there and runs ``prepare_sitting.py record --from
+<file>``. The child env also carries ``NIGHTLY_CONFINEMENT_ENV``, set to the
+run's inbox, under which ``prepare_sitting.py`` itself refuses any other subcommand, ``record`` from
+stdin or from outside that inbox, a non-default ``--preparation``, ``--ledger``
+and ``--apply-closes``. Two mechanisms confine the run: the CLI allow rule with no settings files
+limits its file writes to its inbox, and ``prepare_sitting.py`` limits in code what ``record`` reads
+(a ``.json`` file directly in the run's inbox, named by ``NIGHTLY_CONFINEMENT_ENV``) and where it writes
+(the default store).
+
+The outcome is measured from structured data, not from the agent's say-so:
+``recorded`` counts the item keys whose store entry equals a preparation the
+run's inbox files offer and changed during the run. A run that records nothing exits 1.
 
 Its MCP servers are exactly ``NIGHTLY_MCP_SERVERS``, copied from the
 checkout's ``.mcp.json`` and passed with ``--strict-mcp-config``. The
@@ -28,8 +37,8 @@ to the gate. With no lease the child inherits this process's environment.
 ``ANTHROPIC_API_KEY`` is stripped on both paths (OPERATIONS.md §12,
 "Legibility trickle accounts (03:00)").
 
-Exit codes: 0 the run completed; 1 it failed, timed out or hit a usage limit,
-with both stream tails logged; 2 a configuration error. ``main`` never raises,
+Exit codes: 0 the run completed and recorded something; 1 it failed, timed out,
+hit a usage limit or recorded nothing; 2 a configuration error. ``main`` never raises,
 though the wrapper renders the page whatever this returns.
 """
 from __future__ import annotations
@@ -45,6 +54,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +70,7 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
 from legibility import account_pool  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.cli_invoke import build_claude_argv  # noqa: E402
-from sitting.preparation import NIGHTLY_CONFINEMENT_ENV  # noqa: E402
+from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
 
@@ -75,16 +85,15 @@ DEFAULT_MCP_JSON = _REPO_ROOT / '.mcp.json'
 NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
 
 PREPARE_COMMAND = 'uv run --frozen --project shared python scripts/sitting/prepare_sitting.py'
-"""The one shell spelling the run may execute; repo-relative, so the child runs in this checkout."""
+"""The one shell spelling the run may execute; repo-relative, so the child runs in the run's root."""
 
-NIGHTLY_ALLOWED_TOOLS: tuple[str, ...] = (
+NIGHTLY_READ_TOOLS: tuple[str, ...] = (
     'Read',
     'Grep',
     'Glob',
     'Bash(git show:*)',
     'Bash(git log:*)',
     f'Bash({PREPARE_COMMAND} brief --json:*)',
-    f'Bash({PREPARE_COMMAND} record --from -:*)',
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__get_task_escalations',
@@ -96,9 +105,19 @@ NIGHTLY_ALLOWED_TOOLS: tuple[str, ...] = (
     'mcp__fused-memory__get_memories_by_metadata',
 )
 
+TIMESTAMP_FORMAT = '%Y%m%dT%H%M%SZ'
+
+
+def nightly_allowed_tools(inbox: Path) -> tuple[str, ...]:
+    """The reads, plus the one write the run has: files in *inbox* (``//`` marks an absolute path; the Write tool is gated by an ``Edit`` rule) and ``record --from``.
+
+    ``record`` is allowed for any path because a Bash rule matches only at a word boundary; that it reads
+    only the inbox is ``prepare_sitting.py::nightly_confinement_breach``'s to enforce.
+    """
+    return (*NIGHTLY_READ_TOOLS, f'Bash({PREPARE_COMMAND} record --from:*)', f'Edit(/{inbox}/**)')
+
+
 NIGHTLY_DENIED_TOOLS: tuple[str, ...] = (
-    'Edit',
-    'Write',
     'NotebookEdit',
     'mcp__escalation__resolve_issue',
     'mcp__escalation__stamp_triage',
@@ -114,11 +133,13 @@ NIGHTLY_DENIED_TOOLS: tuple[str, ...] = (
 NIGHTLY_SYSTEM_PROMPT = (
     'You are the dark-factory sitting preparer, running unattended before dawn. '
     'You investigate the questions awaiting Leo and record prepared judgement for his return. '
-    'You never apply a ruling, close an escalation, stamp a task or edit a file; '
+    'You never apply a ruling, close an escalation, stamp a task or edit a file outside your inbox; '
     'every tool outside your allowlist is denied without a prompt.'
 )
 
-NIGHTLY_PROMPT = f"""\
+
+def nightly_prompt(inbox: Path, root: Path) -> str:
+    return f"""\
 Run the prepare-sitting mode in its nightly form, as `skills/escalation-watcher/SKILL.md` \
 section "Sitting preparer (`prepare-sitting` mode)" describes it.
 
@@ -126,7 +147,12 @@ section "Sitting preparer (`prepare-sitting` mode)" describes it.
 ownership probes and gate facts.
 2. For each numbered item without a current preparation, carry out that section's \
 investigation duties before recording anything.
-3. Record with `{PREPARE_COMMAND} record --from -`, passing the preparations JSON on stdin.
+3. Record in batches as you go, so a night cut short keeps what it finished. Per batch, \
+Write the preparations as a JSON array to a NEW file in `{inbox}/` (`batch-01.json`, then \
+`batch-02.json`; never reuse a name), then run \
+`{PREPARE_COMMAND} record --from {inbox.relative_to(root)}/<file>`. \
+A refused record writes nothing and says why: fix the file with Edit and record it again. \
+`record --from -` is refused for this run.
 
 This run is recommend-only: Leo applies rulings when he returns. Finish with one line, \
 `recorded <n> of <m> numbered items`.
@@ -141,10 +167,20 @@ class Settings:
     timeout_secs: float
     max_turns: int
     mcp_json: Path
+    root: Path
 
 
 class McpConfigUnusable(Exception):
     """The MCP config file cannot supply a block for every server in ``NIGHTLY_MCP_SERVERS``."""
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What the run's inbox offered against what the store holds."""
+
+    offered_keys: int
+    undecodable: int
+    recorded: int
 
 
 @dataclass(frozen=True)
@@ -167,14 +203,16 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     except McpConfigUnusable as exc:
         _log(f'no usable MCP config: {exc}')
         return EXIT_CONFIG
-    env = _child_env(gate if gate is not None else account_pool.build_pool())
+    root = settings.root.resolve()
+    inbox = _new_inbox(root)
+    env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox)
     argv, temp_files = build_claude_argv(
         model=settings.model,
         max_budget_usd=settings.budget_usd,
         system_prompt=NIGHTLY_SYSTEM_PROMPT,
         max_turns=settings.max_turns,
         permission_mode=PERMISSION_MODE,
-        allowed_tools=list(NIGHTLY_ALLOWED_TOOLS),
+        allowed_tools=list(nightly_allowed_tools(inbox)),
         disallowed_tools=list(NIGHTLY_DENIED_TOOLS),
         mcp_config=mcp_config,
         output_schema=None,
@@ -182,27 +220,36 @@ def run(settings: Settings, *, gate: Any = None) -> int:
         resume_session_id=None,
         session_id=None,
         strict_mcp_config=True,
+        setting_sources=[],
     )
     argv[0] = claude
+    store_path = root / preparation.DEFAULT_PREPARATION_PATH
+    held_before = _load_or_empty(store_path)
     try:
-        completed = _run_bounded(argv, env, settings.timeout_secs)
+        completed = _run_bounded(argv, env, settings.timeout_secs, cwd=root, prompt=nightly_prompt(inbox, root))
     except OSError as exc:
         _log(f'claude could not be started ({claude!r}): {exc}')
         return EXIT_CONFIG
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
-    return _judge(completed, settings)
+    return _judge(completed, settings, _measure(inbox, store_path, held_before))
 
 
-def main(argv: Sequence[str] | None = None, *, gate: Any = None) -> int:
+def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT) -> int:
     args = _parser().parse_args(argv)
-    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json)
+    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, root)
     try:
         return run(settings, gate=gate)
     except Exception as exc:
         _log(f'failed before the run completed: {exc!r}')
         return EXIT_FAILED
+
+
+def _new_inbox(root: Path) -> Path:
+    inbox = root / preparation.DEFAULT_INBOX_PATH / datetime.now(UTC).strftime(TIMESTAMP_FORMAT)
+    inbox.mkdir(parents=True)
+    return inbox
 
 
 def _mcp_config(path: Path) -> dict[str, Any]:
@@ -219,10 +266,10 @@ def _mcp_config(path: Path) -> dict[str, Any]:
     return {'mcpServers': {name: servers[name] for name in NIGHTLY_MCP_SERVERS}}
 
 
-def _child_env(gate: Any) -> dict[str, str]:
+def _child_env(gate: Any, inbox: Path) -> dict[str, str]:
     env = dict(os.environ)
     env.pop('ANTHROPIC_API_KEY', None)
-    env[NIGHTLY_CONFINEMENT_ENV] = '1'
+    env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
     lease = gate.try_lease(reverse=True)
     if lease is None:
         _log('no pool account available; the run inherits this environment')
@@ -234,14 +281,14 @@ def _child_env(gate: Any) -> dict[str, str]:
         gate.release_probe_slot(lease.token)
 
 
-def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float) -> Completed:
+def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float, *, cwd: Path, prompt: str) -> Completed:
     """Kill the whole process group on timeout: the CLI's own children would otherwise hold the pipes open."""
     proc = subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, cwd=_REPO_ROOT, start_new_session=True,
+        text=True, env=env, cwd=cwd, start_new_session=True,
     )
     try:
-        stdout, stderr = proc.communicate(NIGHTLY_PROMPT, timeout=timeout_secs)
+        stdout, stderr = proc.communicate(prompt, timeout=timeout_secs)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
@@ -250,8 +297,56 @@ def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float) -> C
     return Completed(proc.returncode, stdout, stderr)
 
 
-def _judge(completed: Completed, settings: Settings) -> int:
-    run_label = f'model={settings.model!r}'
+def _load_or_empty(store_path: Path) -> preparation.PreparationStore:
+    try:
+        return preparation.load(store_path)
+    except preparation.PreparationStoreCorrupt:
+        return preparation.PreparationStore()
+
+
+def _measure(inbox: Path, store_path: Path, held_before: preparation.PreparationStore) -> Outcome:
+    """The item keys whose store entry is now one of the preparations *inbox*'s files offer and was not that entry before the run.
+
+    Not a before/after diff of the whole store: a watcher may record into it concurrently, which
+    can only lower this count, never raise it.
+    """
+    offered, undecodable = _offered(inbox)
+    try:
+        held_now = preparation.load(store_path)
+    except preparation.PreparationStoreCorrupt as exc:
+        _log(f'the preparation store is unreadable, counting 0 recorded: {exc}')
+        return Outcome(len(offered), undecodable, 0)
+    recorded = sum(
+        1 for key, offers in offered.items()
+        if held_now.entries.get(key) in offers and held_now.entries.get(key) != held_before.entries.get(key)
+    )
+    return Outcome(len(offered), undecodable, recorded)
+
+
+def _offered(inbox: Path) -> tuple[dict[str, list[preparation.Preparation]], int]:
+    """Each decodable preparation in the batch files of *inbox* by item key, and how many files or entries were not."""
+    offered: dict[str, list[preparation.Preparation]] = {}
+    undecodable = 0
+    for path in sorted(inbox.iterdir()):
+        if not preparation.is_inbox_batch(inbox, path):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError, RecursionError):
+            undecodable += 1
+            continue
+        for entry in data if isinstance(data, list) else [data]:
+            try:
+                prep = preparation.from_json_payload(entry)
+            except (TypeError, ValueError):
+                undecodable += 1
+                continue
+            offered.setdefault(inventory.key_str(prep.item_key), []).append(prep)
+    return offered, undecodable
+
+
+def _judge(completed: Completed, settings: Settings, outcome: Outcome) -> int:
+    run_label = f'model={settings.model!r}, recorded={outcome.recorded}'
     if completed.returncode is None:
         _log(f'claude timed out after {settings.timeout_secs:g}s ({run_label}): {_tails(completed)}')
         return EXIT_FAILED
@@ -265,8 +360,14 @@ def _judge(completed: Completed, settings: Settings) -> int:
     if result.get('is_error'):
         _log(f'claude reported an error result (subtype={result.get("subtype")!r}, {run_label}): {_tails(completed)}')
         return EXIT_FAILED
-    print(f'nightly_prepare: done ({run_label}, turns={result.get("num_turns")}, '
-          f'cost_usd={result.get("total_cost_usd")}): {result.get("result", "")!s:.200}')
+    summary = (f'model={settings.model!r}, turns={result.get("num_turns")}, cost_usd={result.get("total_cost_usd")}, '
+               f'recorded={outcome.recorded} of {outcome.offered_keys}, undecodable={outcome.undecodable}, '
+               f'permission_denials={len(result.get("permission_denials") or [])}')
+    verdict = f'{result.get("result", "")!s:.200}'
+    if outcome.recorded == 0:
+        _log(f'recorded nothing; {outcome.offered_keys} item key(s) offered ({summary}): {verdict}')
+        return EXIT_FAILED
+    print(f'nightly_prepare: done ({summary}): {verdict}')
     return EXIT_OK
 
 

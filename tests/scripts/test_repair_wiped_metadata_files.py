@@ -892,6 +892,7 @@ _COVERAGE = AuditCoverage(
     tasks_with_lock_level_signal_only=135,
     tasks_without_plan_signal=2277,
     plan_records_without_task=6,
+    event_log_read=True,
 )
 
 

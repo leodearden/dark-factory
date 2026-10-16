@@ -41,6 +41,7 @@ from shared.task_claimant import (
     has_live_claimant,
 )
 from shared.task_metadata import RoutingState
+from shared.task_submit import SubmittedTask
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
     archive_task_transcripts,
@@ -93,6 +94,7 @@ from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
 from orchestrator.merge_queue import (
     enqueue_merge_request,
     reconcile_landed_outbox,
@@ -152,6 +154,7 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
     MERGE_REQUEST_RESUBMIT_GRACE_S,
@@ -184,6 +187,7 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.usage_gate import UsageGate
+from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import (
     ResumeFailure,
@@ -373,6 +377,16 @@ _STRANDED_MERGE_RESUBMIT_GRACE_S: float = MERGE_REQUEST_RESUBMIT_GRACE_S
 # candidate that completed/was cancelled on its own in the interim is simply
 # excluded by that re-check and left alone).
 _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES: frozenset[str] = frozenset({'pending'})
+
+# Block categories that never trigger an auto-eval redo whatever their phase:
+# they report the worktree, the host or the run's wall clock, not the plan, so
+# a full-path redo would meet the same failure. The WorktreeConflictError,
+# BranchResetError and VerifyInfraError rows of
+# orchestrator/src/orchestrator/workflow_types.py::_disposition_table route to
+# three of them; see _maybe_auto_eval.
+_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
+    {'wip_conflict', 'infra_issue', 'branch_reset'},
+)
 
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
@@ -1067,6 +1081,9 @@ class TaskReport:
     block_reason: str = ''
     block_detail: str = ''
     block_phase: str = ''
+    # ``TerminalReport.block_category``: the escalation taxonomy of a
+    # ``_mark_blocked`` exit, read by ``_maybe_auto_eval``'s trigger.
+    block_category: str = ''
     # Task 2988 (PRD ε / W3): whether a REQUEUED outcome counts against the
     # per-task requeue cap.  Mapped from ``TerminalReport.counts_against_
     # requeue_cap`` in _run_slot and passed to
@@ -1478,7 +1495,7 @@ def build_train_callback_factory(
                     mid,
                     kind='found_on_main',
                     sha=sha,
-                    note=f'coalesce-derail re-drive: branch already on main (train {train_id})',
+                    note=f'parked-member re-drive: branch already on main (train {train_id})',
                 )
                 # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow on
                 # this found_on_main done-write, mirroring mark_member_done above.
@@ -2089,6 +2106,7 @@ class Harness:
         self._last_swept_main_sha: str | None = None
         # Bound on the first sweep tick, once run() has opened runs.db (task 5812).
         self._main_sweep_cold_control: MainSweepColdControl | None = None
+        self._admission_watch = AdmissionWatch()
 
         # Deterministic-strand reconciliation sweep — task 2074.
         # Periodic recovery sweep for deterministic gate/deploy tasks stranded
@@ -2133,6 +2151,7 @@ class Harness:
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+        self._abandoned_member_sweep = AbandonedMemberSweep()
         # This unit's side of the restart drain (task 5371): steers the merge
         # worker's admission from the heartbeat pass, reports at stop.
         self._drain_participant = DrainParticipant(
@@ -2326,14 +2345,16 @@ class Harness:
         escalation-server, merge-worker, offline-lane, orphan-l0-reaper,
         terminal-status-watcher, watcher-supervisor, stranded-reconcile,
         main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
-        warm-lane-gc, stale-service-restart, merge-heartbeat.
+        warm-lane-gc, stale-service-restart, merge-heartbeat,
+        verify-admission-watch.
         escalation-server and merge-worker start first so the recovery block
         (which runs immediately after ``start_all()`` returns) can depend on
         both being live. The seven sweeps are conditionally registered on
         their own ``config.X_enabled`` gate — ``BackgroundService`` itself has
         no ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
-        absent from the registry. The last two always run: they must keep
-        their cadence whatever the dispatch loop is doing (task 5344).
+        absent from the registry. The last three always run: they must keep
+        their cadence whatever the dispatch loop is doing (task 5344; the
+        verify-admission watch, task 5628).
         """
         if self._lifecycle is not None:
             return
@@ -2443,7 +2464,29 @@ class Harness:
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
         ))
+        registry.register(BackgroundService(
+            name='verify-admission-watch',
+            pass_fn=self._run_verify_admission_watch_pass,
+            interval_secs=ADMISSION_WATCH_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
         self._lifecycle = registry
+
+    async def _run_verify_admission_watch_pass(self) -> None:
+        """One tick of the task-verify admission watch on this process's gate.
+
+        Every knob is read per tick, so a reload applies from the next one.
+        """
+        if self.event_store is None:
+            return
+        self._admission_watch.tick(
+            self.event_store,
+            slots_dir=Path(self.config.verify_admission_slots_dir),
+            alarm_secs=self.config.verify_admission_wait_alarm_secs,
+            order=self.config.verify_admission_order,
+        )
 
     async def _run_orphan_l0_reaper_pass(self) -> None:
         """Async ``pass_fn`` wrapper for the orphan-L0 pass.
@@ -2466,15 +2509,33 @@ class Harness:
         await self._scan_for_terminal_active_tasks()
 
     async def _run_stranded_reconcile_pass(self) -> None:
-        """Async ``pass_fn`` wrapper folding the two-call stranded pass.
+        """Async ``pass_fn`` wrapper folding the three-step stranded pass.
 
-        Hoisted verbatim from the deleted ``_stranded_reconcile_loop`` body
-        (task 2241, W10-η): the mid-run stranded-in-progress reconcile
-        followed by the periodic terminal-lane sweep (Diff 7 layer-A
-        backstop).
+        Hoisted from the deleted ``_stranded_reconcile_loop`` body (task 2241,
+        W10-η): the mid-run stranded-in-progress reconcile, then the periodic
+        terminal-lane sweep (Diff 7 layer-A backstop), then the abandoned
+        merge-deferred recovery (task 4737).
         """
         await self._reconcile_stranded_in_progress(mid_run=True)
         await self._reconcile_terminal_lanes()
+        await self._recover_abandoned_merge_deferred()
+
+    async def _recover_abandoned_merge_deferred(self) -> None:
+        """Re-drive merge-deferred members nothing owns any more (task 4737).
+
+        ``_reconcile_one_stranded`` never touches merge-deferred; this sweep
+        is that status's owner.  A fault is logged and swallowed so it never
+        fails the pass and starves the next stranded reconcile.
+        """
+        try:
+            await self._abandoned_member_sweep.run_pass(
+                lane=self._merge_worker,
+                tasks=self.scheduler,
+                escalations=self._escalation_queue,
+                claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+            )
+        except Exception:
+            logger.warning('Abandoned merge-deferred sweep failed', exc_info=True)
 
     async def _run_stale_service_restart_pass(self) -> None:
         """``pass_fn`` for the stale-service-restart service.
@@ -6496,6 +6557,13 @@ class Harness:
                     tid, exc_info=True,
                 )
                 return None
+            # The stamp + event naming its pins: orchestrator/src/orchestrator/strand_conversion.py.
+            await record_strand_conversion(
+                tid, report,
+                event_store=self.event_store,
+                update_task=self.scheduler.update_task,
+                now=datetime.now(UTC),
+            )
             return 'converted_to_blocked'
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
@@ -10472,6 +10540,7 @@ class Harness:
                     if terminal_report.blocked_from_phase is not None
                     else ''
                 ),
+                block_category=terminal_report.block_category,
                 # Task 2988: carry the disposition's cap-accounting policy
                 # through to _apply_retry_cap's record_requeue call.
                 counts_against_requeue_cap=terminal_report.counts_against_requeue_cap,
@@ -10958,17 +11027,24 @@ class Harness:
           Lever B or Lever C).
         - The original task is NOT itself an auto-eval redo.
         - ``report.block_phase`` is in ``config.auto_eval_phases``.
+        - ``report.block_category`` is not in
+          ``_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES``. ``auto_eval_phases``
+          excludes merge/infra failures as "unlikely to differ on the full
+          path", but a worktree conflict, a verify-infra failure or a branch
+          reset blocks from a working phase (a setup-time conflict reads as
+          ``plan``); the category is what tells them apart.
         - The 24h auto-eval USD budget has not been exhausted.
 
-        On success, the original branch + worktree are renamed with a
-        ``-skip-attempt`` suffix and a sibling task is submitted via
-        ``submit_task(planning_mode=True)`` (curator dedupe bypass) with
-        ``metadata.force_full_path=True`` to prevent the redo from taking
-        an optimistic path itself.
+        A sibling task is submitted via ``submit_task(planning_mode=True)``
+        (curator dedupe bypass) with ``metadata.force_full_path=True`` to
+        prevent the redo from taking an optimistic path itself, and flipped
+        to pending. Only once that redo exists and is released are the
+        original branch + worktree renamed with a ``-skip-attempt`` suffix,
+        so no failure path leaves the original renamed without a redo.
 
-        Once the replacement redo is confirmed created, any still-'pending'
-        prior redo siblings sharing the same ``spawned_from`` are cancelled
-        (task 2075) so at most one live redo survives per original task.
+        Then any still-'pending' prior redo siblings sharing the same
+        ``spawned_from`` are cancelled (task 2075) so at most one live redo
+        survives per original task.
         'in-progress', 'blocked', 'deferred', 'review', and 'merge-deferred'
         siblings are deliberately left alone — see
         ``_AUTO_EVAL_SUPERSEDE_SAFE_STATUSES``.
@@ -10978,6 +11054,8 @@ class Harness:
         if report.outcome != WorkflowOutcome.BLOCKED:
             return
         if report.block_phase not in self.config.auto_eval_phases:
+            return
+        if report.block_category in _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES:
             return
 
         task_metadata = (assignment.task.get('metadata') or {})
@@ -11003,29 +11081,7 @@ class Harness:
         # redo, so the not-yet-created replacement is never in this set.
         prior_redo_ids = await self._find_prior_auto_eval_redos(original_id)
 
-        # Rename the original branch + worktree so the new task can use a
-        # fresh task/<original_id>-redo branch (sibling task gets its own
-        # branch from create_worktree on dispatch).
-        old_branch = original_id
         new_branch = f'{original_id}-skip-attempt'
-        old_path = self.git_ops.worktree_base / old_branch
-        new_path = self.git_ops.worktree_base / new_branch
-        renamed = False
-        if old_path.exists():
-            try:
-                await self.git_ops.rename_worktree(
-                    old_path=old_path,
-                    new_path=new_path,
-                    old_branch=old_branch,
-                    new_branch=new_branch,
-                )
-                renamed = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    'Task %s: auto-eval rename failed (%s) — continuing '
-                    'without rename',
-                    original_id, exc,
-                )
 
         redo_metadata = {
             'auto_eval_redo': True,
@@ -11052,58 +11108,75 @@ class Harness:
         description = (
             f'Automated full-architect redo of task {original_id} '
             f'(blocked at phase={report.block_phase} via optimistic path '
-            f'{optimistic_path!r}). Original branch+worktree renamed to '
-            f'{new_branch} for forensic comparison.'
+            f'{optimistic_path!r}). Original branch+worktree are renamed to '
+            f'{new_branch} for forensic comparison once this redo is released.'
         )
 
-        try:
-            submit_result = await self.scheduler.dispatch_tool(
-                'submit_task',
-                {
-                    'project_root': str(self.config.project_root),
-                    'title': title,
-                    'description': description,
-                    'priority': str(
-                        assignment.task.get('priority') or 'medium'
-                    ),
-                    'metadata': redo_metadata,
-                    'planning_mode': True,
-                },
-                timeout=30,
-            )
-        except Exception as exc:  # noqa: BLE001
+        outcome = await self.scheduler.submit_task({
+            'project_root': str(self.config.project_root),
+            'title': title,
+            'description': description,
+            'priority': str(assignment.task.get('priority') or 'medium'),
+            'metadata': redo_metadata,
+            'planning_mode': True,
+        })
+        if isinstance(outcome, SubmittedTask) and not outcome.combined:
+            new_task_id = outcome.task_id
+        else:
             logger.warning(
-                'Task %s: auto-eval submit_task raised (%s) — aborting redo',
-                original_id, exc,
-            )
-            return
-
-        new_task_id = self._extract_task_id(submit_result)
-        if not new_task_id:
-            logger.warning(
-                'Task %s: auto-eval submit_task returned no task_id (%r)',
-                original_id, submit_result,
+                'Task %s: auto-eval submit_task produced no redo task this harness may '
+                'flip (%r) — aborting redo',
+                original_id, outcome,
             )
             return
 
         # Flip the new task from deferred → pending so the scheduler picks
-        # it up on the next tick.
+        # it up on the next tick. Scheduler.set_task_status retries transient
+        # rejections and raises on every other one; a raw dispatch_tool would
+        # return a structured ``{'error': ...}`` body without raising and let
+        # the rename below run with the redo still deferred.
         try:
-            await self.scheduler.dispatch_tool(
-                'set_task_status',
-                {
-                    'project_root': str(self.config.project_root),
-                    'id': new_task_id,
-                    'status': 'pending',
-                },
-                timeout=15,
-            )
+            await self.scheduler.set_task_status(new_task_id, 'pending')
         except Exception as exc:  # noqa: BLE001
+            # The flip may have landed despite the failure (a timeout), which
+            # would leave a live pending redo with no back-link or budget
+            # tracking; if it really failed, a deferred orphan would collide
+            # with the next trigger for this original on candidate key. Either
+            # way, cancel the redo.
+            try:
+                await self.scheduler.set_task_status(new_task_id, 'cancelled')
+                disposition = 'redo cancelled'
+            except Exception as cancel_exc:
+                disposition = (
+                    f'cancelling the redo also failed ({cancel_exc}); '
+                    'it is left deferred'
+                )
             logger.warning(
                 'Task %s: auto-eval status flip to pending failed (%s) — '
-                'redo task %s left deferred',
-                original_id, exc, new_task_id,
+                'redo task %s: %s; original not renamed',
+                original_id, exc, new_task_id, disposition,
             )
+            return
+
+        # Only now that the redo is released: set the original's worktree +
+        # branch aside under new_branch for forensic comparison.
+        old_path = self.git_ops.worktree_base / original_id
+        renamed = False
+        if old_path.exists():
+            try:
+                await self.git_ops.rename_worktree(
+                    old_path=old_path,
+                    new_path=self.git_ops.worktree_base / new_branch,
+                    old_branch=original_id,
+                    new_branch=new_branch,
+                )
+                renamed = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'Task %s: auto-eval rename failed (%s) — continuing '
+                    'without rename',
+                    original_id, exc,
+                )
 
         # Supersede prior redo siblings now that the replacement redo is
         # confirmed created — at most one live redo per spawned_from should
@@ -15037,6 +15110,7 @@ class Harness:
         # (closes the TOCTOU window — suggestion 2 from the code review).
         outcome = await verify_mod.run_main_tip_sweep(
             self.config, self.git_ops, main_sha=main_sha, seed_mode=seed_mode,
+            event_store=self.event_store,
         )
         if outcome is None:
             # Infra failure in the sweep itself — retry next tick, don't mark swept.

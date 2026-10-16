@@ -2,8 +2,9 @@
 
 Operator note on why git's background auto-gc and auto-maintenance are
 **disabled** on orchestrator-managed shared repos (e.g. the Dark Factory
-main repo at `project_root`), and why gc ownership is now the operator's /
-orchestrator's out-of-band responsibility. Applies under the OS-sandbox
+main repo at `project_root`), why gc ownership is now the operator's /
+orchestrator's out-of-band responsibility, and why rerere is off inside
+sandboxed agent sessions. Applies under the OS-sandbox
 worktree-containment model — see
 `plans/os-sandbox-worktree-containment-prd.md` task **α5** (the **D2**
 narrow-shared-`.git`-write-set corollary).
@@ -75,6 +76,29 @@ git config --get maintenance.auto # → false
 `gc.auto` reading `0` on the DF main repo after startup is the user-observable
 α5 signal.
 
+## rerere is off inside sandboxed agent sessions
+
+**What.** Every agent invocation that requests the OS sandbox runs with
+`rerere.enabled=false` and `rerere.autoupdate=false`, supplied as
+`GIT_CONFIG_COUNT` entries appended after any inherited ones. Unsandboxed git
+(the merge lane, unsandboxed roles, operator shells) keeps the repo's own
+rerere setting.
+
+**Why.** rerere records resolutions in `rr-cache/` under the common `.git`
+dir, which the sandbox write set leaves read-only. Half-on rerere wrote a
+MERGE_RR record without its rr-cache entry: the concluding commit landed and
+then died with SIGSEGV (rc 139), and the leftover `MERGE_RR.lock` made every
+later commit in that worktree exit 128.
+
+**Why not grant `rr-cache/`.** It is shared by every task. With
+`rerere.autoupdate=true`, one task's recorded resolution would be replayed and
+auto-staged into another task's merge with no conflict raised (e.g. on
+`orchestrator/tests/merge_lane_ratchet_baseline.json`).
+
+**Verify.** Inside an agent session,
+`git config --show-origin --get rerere.enabled` prints `command line:` and
+`false`.
+
 ## See also
 
 - `plans/os-sandbox-worktree-containment-prd.md` — task α5 (Shared-repo git
@@ -84,3 +108,6 @@ git config --get maintenance.auto # → false
   call site.
 - `orchestrator/src/orchestrator/harness.py` — the `Harness.run()` startup
   call.
+- `orchestrator/src/orchestrator/agents/sandbox_git_config.py` — the sandbox
+  git-config policy; `orchestrator/tests/test_landlock.py::TestLandlockSandboxedConflictedMerge`
+  — its real-kernel regression test.

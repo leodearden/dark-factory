@@ -29,6 +29,12 @@ from shared.testing_virtual_clock import virtual_clock_test
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.offline_lane import OfflineLaneWorker, _parse_confirmed_failures
+from orchestrator.offline_lane_records import (
+    LEGACY_INFRA_COMMAND,
+    LEGACY_NUMERIC_COMMAND,
+    Leg,
+    Phase,
+)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -81,6 +87,29 @@ def _make_worker(
         task_client=task_client,
         escalation_queue=escalation_queue,
     )
+
+
+def _child_writing(output: bytes, *, returncode: int):
+    """A fake ``create_subprocess_exec`` whose child writes *output* into the file it is handed."""
+
+    async def fake_exec(*argv, **kwargs):
+        kwargs['stdout'].write(output)
+        proc = AsyncMock()
+        proc.returncode = returncode
+        return proc
+
+    return fake_exec
+
+
+async def _inline(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _inline_thread_hops():
+    """Run every ``asyncio.to_thread`` hop on the loop, process-wide: the virtual clock rejects executor work."""
+    with patch('orchestrator.offline_lane.asyncio.to_thread', new=_inline):
+        yield
 
 
 # A faithful reproduction of reify scripts/verify.sh's error+usage() dump
@@ -381,6 +410,7 @@ async def test_run_once_snapshots_head_at_run_start_and_invokes_seam(tmp_path: P
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
     """Multiple dirty-sets during one run collapse into exactly one re-run.
@@ -447,6 +477,7 @@ async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
     """A missed trigger is caught by a periodic get_main_sha poll.
@@ -525,6 +556,7 @@ async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
     """A broken lane run can never wedge the process (worker leg of C7).
@@ -593,6 +625,7 @@ async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_loop_backoff_grows_and_caps_on_consecutive_failures(tmp_path: Path):
     """Consecutive run() failures back off exponentially, capped (task 2016 amendment).
@@ -700,13 +733,11 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
     worker = _make_worker(tmp_path)  # no suite_runner injected -> default seam
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'suite output\n', b''))
-    mock_proc.returncode = 0
+    lane_pass = worker.records.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'suite output\n', returncode=0),
     ) as mock_exec:
         rc, tail = await worker.suite_runner(wt_path, 'HEAD1', 6)
 
@@ -731,7 +762,7 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
             f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
             f'not replace it (missing/altered {key!r})'
         )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
 
@@ -758,13 +789,11 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
     wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory')
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'command output\n', None))
-    mock_proc.returncode = 1
+    lane_pass = worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'command output\n', returncode=1),
     ) as mock_exec:
         rc, tail = await worker.command_runner(cmd, wt_path, 'HEAD1')
 
@@ -778,7 +807,8 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
     assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3'], (
         'argv must start with the idle nice/ionice prefix (D4)'
     )
-    assert argv[-3:] == ['sh', '-c', 'pytest -m integration'], (
+    junit_path = shlex.quote(str(lane_pass.junit_path(Phase.DETECT)))
+    assert argv[-3:] == ['sh', '-c', f'pytest -m integration --junitxml {junit_path}'], (
         'argv must end with sh -c <command>'
     )
     assert kwargs['cwd'] == str(wt_path / 'fused-memory'), (
@@ -792,7 +822,7 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
             f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy '
             f'(missing/altered {key!r})'
         )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
 
@@ -805,13 +835,11 @@ async def test_default_run_command_cwd_dot_is_worktree_root(tmp_path: Path):
     wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='r', command='pytest', cwd='.')
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'', None))
-    mock_proc.returncode = 0
+    worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'', returncode=0),
     ) as mock_exec:
         await worker.command_runner(cmd, wt_path, 'HEAD1')
 
@@ -1330,15 +1358,11 @@ async def test_default_confirmation_run_builds_serial_confirm_command(tmp_path: 
     worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b'tests::test_a\ntests::test_b\n', b'')
-    )
-    mock_proc.returncode = 0
+    lane_pass = worker.records.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'tests::test_a\ntests::test_b\n', returncode=0),
     ) as mock_exec:
         confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
 
@@ -1366,7 +1390,7 @@ async def test_default_confirmation_run_builds_serial_confirm_command(tmp_path: 
             f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
             f'not replace it (missing/altered {key!r})'
         )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.CONFIRM)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
 
@@ -1382,13 +1406,11 @@ async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures
     worker = _make_worker(tmp_path)
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'\n  \n', b''))
-    mock_proc.returncode = 0
+    worker.records.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'\n  \n', returncode=0),
     ):
         confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
 
@@ -1413,13 +1435,11 @@ async def test_default_confirmation_run_rejects_verify_usage_dump(tmp_path: Path
     worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
-    mock_proc.returncode = 64
+    worker.records.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(_VERIFY_USAGE_DUMP.encode(), returncode=64),
     ):
         confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
 
@@ -1493,13 +1513,11 @@ async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path
     cmd = LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory')
 
     stdout = b'FAILED tests/test_q.py::test_a\nFAILED tests/test_q.py::test_b\n'
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(stdout, None))
-    mock_proc.returncode = 1
+    lane_pass = worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(stdout, returncode=1),
     ) as mock_exec:
         ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
 
@@ -1520,7 +1538,7 @@ async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path
     assert '-p no:xdist' in argv[-1], 'serial re-run must disable xdist'
     assert kwargs['cwd'] == str(wt_path / 'fused-memory')
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.CONFIRM)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
 
@@ -1540,13 +1558,11 @@ async def test_default_confirm_command_re_supplies_the_lane_cwds_addopts(tmp_pat
     (wt_path / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
     cmd = LaneCommand(name='w', command='pytest -m warm_lane_bash', cwd='sub')
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'all tests passed\n', None))
-    mock_proc.returncode = 0
+    worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'all tests passed\n', returncode=0),
     ) as mock_exec:
         await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
 
@@ -1564,17 +1580,34 @@ async def test_default_confirm_command_no_failures_is_flake(tmp_path: Path):
     wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='q', command='pytest -m integration')
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'all tests passed\n', None))
-    mock_proc.returncode = 0
+    worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'all tests passed\n', returncode=0),
     ):
         ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
 
     assert ids == []
+
+
+@pytest.mark.asyncio
+async def test_default_confirm_command_parses_the_whole_output_not_its_tail(tmp_path: Path):
+    """A failure line more than the 2000-char tail from the end is still extracted."""
+    from orchestrator.config import LaneCommand
+
+    worker = _make_worker(tmp_path)
+    cmd = LaneCommand(name='q', command='pytest -m integration')
+    worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
+    stdout = b'FAILED tests/t.py::test_a\n' + b'x' * 3000 + b'\n'
+
+    with patch(
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(stdout, returncode=1),
+    ):
+        ids = await worker.command_confirmation_runner(cmd, tmp_path / '_offline-deep', 'HEAD1')
+
+    assert ids == ['tests/t.py::test_a']
 
 
 @pytest.mark.asyncio
@@ -1601,15 +1634,11 @@ async def test_default_confirm_command_nonzero_exit_without_node_ids_files_senti
     wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='make-check', command='make check', cwd='fused-memory')
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b'make: *** [Makefile:12: check] Error 1\n', None)
-    )
-    mock_proc.returncode = 1
+    worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'make: *** [Makefile:12: check] Error 1\n', returncode=1),
     ):
         ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
 
@@ -1641,7 +1670,8 @@ def test_infra_seams_injected_or_default(tmp_path: Path):
     assert worker.infra_confirmation_runner is sentinel_conf
 
     worker_default = _make_worker(tmp_path)
-    assert worker_default.infra_runner == worker_default._default_run_infra
+    assert callable(worker_default.infra_runner)
+    assert worker_default.infra_runner is not sentinel_infra
     assert (
         worker_default.infra_confirmation_runner
         == worker_default._default_infra_confirmation_run
@@ -1673,13 +1703,11 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
     worker = _make_worker(tmp_path)  # no infra_runner injected -> default seam
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'infra output\n', b''))
-    mock_proc.returncode = 0
+    lane_pass = worker.records.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'infra output\n', returncode=0),
     ) as mock_exec:
         rc, tail = await worker.infra_runner(wt_path, 'HEAD1', 6)
 
@@ -1704,7 +1732,7 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
             f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
             f'not replace it (missing/altered {key!r})'
         )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
 
@@ -1731,21 +1759,17 @@ async def test_default_infra_confirmation_run_parses_result_fail_lines(tmp_path:
     worker = _make_worker(tmp_path)  # no infra_confirmation_runner injected
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(
-            b'--- Running: test_cgroup_burn.sh ---\n'
-            b'  RESULT: FAIL (test_cgroup_burn.sh)\n'
-            b'  RESULT: PASS (test_reflink_fs.sh)\n'
-            b'  RESULT: FAIL (test_cgroup_delegation.sh)\n',
-            b'',
-        )
+    output = (
+        b'--- Running: test_cgroup_burn.sh ---\n'
+        b'  RESULT: FAIL (test_cgroup_burn.sh)\n'
+        b'  RESULT: PASS (test_reflink_fs.sh)\n'
+        b'  RESULT: FAIL (test_cgroup_delegation.sh)\n'
     )
-    mock_proc.returncode = 1
+    worker.records.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(output, returncode=1),
     ) as mock_exec:
         confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
 
@@ -1780,15 +1804,11 @@ async def test_default_infra_confirmation_run_no_fail_lines_means_no_confirmed_f
     worker = _make_worker(tmp_path)
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b'  RESULT: PASS (test_reflink_fs.sh)\n', b'')
-    )
-    mock_proc.returncode = 0
+    worker.records.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'  RESULT: PASS (test_reflink_fs.sh)\n', returncode=0),
     ):
         confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
 
@@ -2050,6 +2070,7 @@ async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
     """run()'s poll backstop retries a red-handling exception (Bug #2, end-to-end).

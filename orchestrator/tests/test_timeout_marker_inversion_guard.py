@@ -80,8 +80,9 @@ from shared.testing_timeout_markers import (
 # This module is ITSELF a whole-tree AST scanner -- it rglob()s every *.py
 # under this directory and ast.parse()s each one -- so it is a member of the
 # family test_whole_tree_scan_timeout_guard.py polices and carries the mark
-# that guard demands.  WHOLE_TREE_SCAN_TEST_TIMEOUT is 300, at the inversion
-# band's OPEN upper edge, so this module does not flag its own mark.
+# that guard demands.  WHOLE_TREE_SCAN_TEST_TIMEOUT sits at or above the
+# inversion band's OPEN upper edge, VERIFY_CLI_PER_TEST_TIMEOUT, so this module
+# does not flag its own mark.
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: The per-module merge-verify config whose ``test_command`` carries the
@@ -172,7 +173,7 @@ _SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
 #: definition out of the tree and fails if the two disagree.  This map is a
 #: cache of those definitions, never a claim about them.
 _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
-    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 540.0,
+    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 1200.0,
     'HEAVY_BARRIER_TEST_TIMEOUT': 540.0,
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
@@ -1162,7 +1163,7 @@ class TestDeepLandingSceneBudget:
         and, in the same breath, recorded a LATENT GAP where it had not been
         applied -- ``HEAVY_BARRIER_TEST_TIMEOUT`` stayed at 300, below the
         default it used to equal, until task 5572 closed it by re-deriving the
-        constant to 540.  1080 clears 540 today, so this pin
+        constant to 540.  1080 clears 420 today, so this pin
         changes no number; it exists so a future re-derivation cannot land
         somewhere like 360 that satisfies the verify edge while silently
         reproducing that gap.

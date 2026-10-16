@@ -1,0 +1,234 @@
+# Machine-readable twin of client-feed-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py::CapabilityManifestDoc (schema_version 1).
+# task_id values are stamped by commit_planning; grep checks are pattern-anchored, never file:line.
+prd: plans/client-feed-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 6966
+    title: "New workspace member client-feed/ with the feed contract, fold, fixtures and validate-feed"
+    capabilities:
+      - name: "workspace-member-registered"
+        binding: "capability→producer α — absent on main: pyproject.toml members list has no client-feed"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"client-feed\""
+          paths: ["pyproject.toml"]
+          expect: present
+      - name: "feed-contract-models-exist"
+        binding: "capability→producer α — absent on main: no client-feed/ directory"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FEED_VERSION"
+          paths: ["client-feed/src/client_feed/"]
+          expect: present
+      - name: "fold-is-the-single-reducer"
+        binding: "capability→producer α; SPOT is judged by α's tests (state.json == fold(feed))"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "single-reducer property is a test property, not greppable"
+      - name: "verify-command-runs-the-package"
+        binding: "capability→producer α — absent on main: test_command names no client-feed"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cd \\.\\./client-feed && uv run pytest"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+  - label: "θ"
+    task_id: 6967
+    title: "Orchestrator records each review cycle's outcome as a review_completed event"
+    capabilities:
+      - name: "review-completed-event-type"
+        binding: "capability→producer θ — absent on main: EventType has no review_completed (verified 2026-10-14)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "review_completed"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "emitted-from-the-review-loop"
+        binding: "capability→producer θ — ReviewAggregation exists (artifacts.py::ReviewAggregation); no emit on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "EventType\\.review_completed"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "counts-only-payload"
+        binding: "rejection-style — θ's tests assert no issue description string appears in the payload"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "absence of prose in a payload is judged by θ's own tests"
+  - label: "β1"
+    task_id: 6968
+    title: "Store sources: tasks projection, events cursor, factory_state, review counts, PRD titles"
+    capabilities:
+      - name: "tasks-projection-tag-pinned"
+        binding: "capability→producer β1; substrate: tasks table PK (tag,id), one tag 'master' on the live store"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tag = \\?|tag = 'master'|tag=\\?"
+          paths: ["client-feed/src/client_feed/sources/tasks.py"]
+          expect: present
+      - name: "events-cursor-over-runs-db"
+        binding: "capability→producer β1; substrate: events.id PK, event types verified with live row counts 2026-10-14"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_finalized"
+          paths: ["client-feed/src/client_feed/sources/events.py"]
+          expect: present
+      - name: "review-counts-from-theta-else-not-recorded"
+        binding: "producer θ upstream (wired dep); β1's tests cover the not_recorded fallback"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "review_completed"
+          paths: ["client-feed/src/client_feed/sources/events.py"]
+          expect: present
+  - label: "β2"
+    task_id: 6969
+    title: "Policy, git and verify-archive sources"
+    capabilities:
+      - name: "policy-model-with-required-visible-globs"
+        binding: "capability→producer β2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "visible_globs"
+          paths: ["client-feed/src/client_feed/policy.py"]
+          expect: present
+      - name: "blob-content-via-cat-file-only"
+        binding: "capability→producer β2; the working tree is never read"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cat-file"
+          paths: ["client-feed/src/client_feed/sources/git.py"]
+          expect: present
+      - name: "junit-to-test-results"
+        binding: "capability→producer β2; substrate: junit-*.xml.gz archived per task leg (2,294 on 2026-10-14)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "junit"
+          paths: ["client-feed/src/client_feed/sources/archive.py"]
+          expect: present
+  - label: "γ"
+    task_id: 6970
+    title: "Publisher loop, feed writer, cursors, heartbeat and CLI"
+    capabilities:
+      - name: "append-only-writer-nofollow"
+        binding: "capability→producer γ"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "O_NOFOLLOW"
+          paths: ["client-feed/src/client_feed/feed_io.py"]
+          expect: present
+      - name: "snapshot-subcommand"
+        binding: "capability→producer γ; B22's entry point"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "snapshot"
+          paths: ["client-feed/src/client_feed/cli.py"]
+          expect: present
+      - name: "degraded-heartbeat"
+        binding: "capability→producer γ; INV-11/INV-13 — tested by B19"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "degraded"
+          paths: ["client-feed/src/client_feed/publisher.py"]
+          expect: present
+  - label: "δ"
+    task_id: 6971
+    title: "Reveals: engagement projection, budget, inbox, hostile-path refusal, follow-head"
+    capabilities:
+      - name: "typed-refusal-reasons"
+        binding: "rejection-style — δ's tests B11/B13/B15 observe each reason fire"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "not_in_tree"
+          paths: ["client-feed/src/client_feed/budget.py"]
+          expect: present
+      - name: "reveal-floor-applied"
+        binding: "capability→producer δ; floor from policy (β2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reveal_floor_lines"
+          paths: ["client-feed/src/client_feed/budget.py"]
+          expect: present
+  - label: "ε"
+    task_id: 6972
+    title: "Acceptance criteria format, pytest criterion plugin, junit join and staging CLI"
+    capabilities:
+      - name: "criterion-marker-plugin"
+        binding: "capability→producer ε; substrate: pytest 9.0.3 in the venv; the plugin writes a map file and must not use record_property (xunit2 warning)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "criterion"
+          paths: ["client-feed/src/client_feed/pytest_criterion.py"]
+          expect: present
+      - name: "no-record-property"
+        binding: "rejection-style — record_property warns under the default junit_family xunit2; the plugin avoids it"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an expect=absent check on a file that does not exist yet is vacuous at main; ε's own tests assert the plugin never calls record_property"
+      - name: "criteria-results-cli"
+        binding: "capability→producer ε"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "criteria-results"
+          paths: ["client-feed/src/client_feed/cli.py"]
+          expect: present
+  - label: "ζ"
+    task_id: 6973
+    title: "Isolation gate: audit-hook confinement, two-project canary, end to end"
+    capabilities:
+      - name: "audit-hook-confinement-test"
+        binding: "capability→producer ζ; B1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "addaudithook"
+          paths: ["client-feed/tests/test_isolation.py"]
+          expect: present
+      - name: "default-project-root-banned"
+        binding: "rejection-style — ζ's ban test; the helper exists at shared/src/shared/project_layout.py::default_project_root"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an expect=absent check on a directory that does not exist yet is vacuous at main; ζ's ban test (git grep default_project_root client-feed/src is empty) enforces it"
+  - label: "η"
+    task_id: 6974
+    title: "Publisher unit template, setup-host sync, operator docs and pointers"
+    capabilities:
+      - name: "unit-template-rendered-by-setup-host"
+        binding: "capability→producer η; precedent scripts/dashboard.service.template"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "client-feed\\.service\\.template"
+          paths: ["scripts/setup-host.sh"]
+          expect: present
+      - name: "operations-section"
+        binding: "capability→producer η"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "### Client feed"
+          paths: ["OPERATIONS.md"]
+          expect: present

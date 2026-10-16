@@ -44,8 +44,10 @@ from __future__ import annotations
 
 import pytest
 from shared.deploy_state import DeployPhase
+from shared.strand_conversion import StrandConverted
 from shared.task_statuses import TaskStatus
 
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.task_ground_truth import (
@@ -57,6 +59,7 @@ from orchestrator.task_ground_truth import (
     RecoveryAction,
     TruthReport,
     classify_recovery,
+    recovery_shape_str,
 )
 
 
@@ -375,6 +378,7 @@ def applier_harness(tmp_path, mock_orch_config):
     )
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.mark_done = AsyncMock()
+    h.scheduler.update_task = AsyncMock(return_value=True)
 
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
     h.git_ops.cleanup_worktree = AsyncMock(
@@ -401,6 +405,11 @@ def applier_harness(tmp_path, mock_orch_config):
 
 def _bind(harness, report: TruthReport) -> None:
     harness._get_ground_truth = lambda: _StubGroundTruth(report)
+
+
+def _strand_rows(harness) -> list[dict]:
+    """Every strand_converted row this harness wrote, oldest first."""
+    return harness.event_store.fetch_events_by_type(EventType.strand_converted)
 
 
 def _recovery_rows(harness) -> list[dict]:
@@ -905,6 +914,101 @@ class TestConvertToBlockedApplierEnforce:
         assert enforce_harness.scheduler.set_task_status.await_count == 1, (
             'a second write means the sweep is oscillating on its own output'
         )
+
+
+@pytest.mark.asyncio
+class TestConvertToBlockedRecordsTheConversion:
+    """Task 6476 — an applied conversion leaves a stamp and one event naming its pins.
+
+    This is the producer task 3546's gate step 3 verifies; the stamp and the
+    event come from orchestrator/src/orchestrator/strand_conversion.py.
+    """
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_one_row_names_the_queue_handoff_pins(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        refs = [PIN_REFS[0], PIN_REFS[1]]
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=refs))
+
+        result = await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        assert result == _CONVERTED
+        rows = _strand_rows(enforce_harness)
+        assert len(rows) == 1
+        assert rows[0]['task_id'] == _TID
+        assert rows[0]['data']['pinning_escalation_ids'] == ['esc-3539-1']
+
+    async def test_the_metadata_stamp_agrees_with_the_row(self, enforce_harness) -> None:
+        report = _pinned_in_progress()
+        _bind(enforce_harness, report)
+
+        await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        update_task = enforce_harness.scheduler.update_task
+        update_task.assert_awaited_once()
+        args, kwargs = update_task.await_args
+        assert args[0] == _TID
+        assert kwargs['metadata_mode'] == 'merge'
+        stamp = StrandConverted.model_validate(args[1]['strand_converted'])
+        row_ids = _strand_rows(enforce_harness)[0]['data']['pinning_escalation_ids']
+        assert list(stamp.pinning_escalation_ids) == row_ids
+        assert stamp.shape == recovery_shape_str(report)
+
+    async def test_nothing_is_recorded_when_the_blocked_write_fails(
+        self, enforce_harness,
+    ) -> None:
+        from orchestrator.scheduler import SetTaskStatusRejected
+
+        enforce_harness.scheduler.set_task_status.side_effect = (
+            SetTaskStatusRejected(_TID, 'rejected', 'nope')
+        )
+        _bind(enforce_harness, _pinned_in_progress())
+
+        result = await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        assert result is None
+        enforce_harness.scheduler.update_task.assert_not_awaited()
+        assert _strand_rows(enforce_harness) == []
+
+    async def test_log_mode_records_nothing(self, applier_harness) -> None:
+        _bind(applier_harness, _pinned_in_progress())
+
+        await _reconcile_stranded(applier_harness, _TID, 'in-progress')
+
+        applier_harness.scheduler.update_task.assert_not_awaited()
+        assert _strand_rows(applier_harness) == []
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_a_held_merge_remediable_pin_records_nothing(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
+
+        await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        enforce_harness.scheduler.update_task.assert_not_awaited()
+        assert _strand_rows(enforce_harness) == []
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_the_next_sweep_records_nothing_more(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        _bind(enforce_harness, _pinned_in_progress(kind))
+        assert await _reconcile_stranded(enforce_harness, _TID, 'in-progress') == _CONVERTED
+
+        _bind(enforce_harness, TruthReport(
+            db_status=TaskStatus.BLOCKED,
+            live_claimant=None,
+            branch_state=_branch(kind),
+            worktree_present=True,
+            open_escalations=[PIN_REFS[1]],
+            deploy_phase=None,
+        ))
+        await _reconcile_stranded(enforce_harness, _TID, 'blocked')
+
+        assert len(_strand_rows(enforce_harness)) == 1
+        assert enforce_harness.scheduler.update_task.await_count == 1
 
 
 # ---------------------------------------------------------------------------

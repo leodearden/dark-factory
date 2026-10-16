@@ -458,6 +458,10 @@ def render_suppression_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+ENTITY_STANDING_DECISIONS_HEADING = '## Entity Standing Decisions'
+
+
 def render_entity_standing_decision_schema_section() -> str:
     """Render the SHARED entity-standing-decision schema section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -480,7 +484,7 @@ def render_entity_standing_decision_schema_section() -> str:
       deterministic filter (γ) and reads never consult mem0 for authority.
     """
     return (
-        '## Entity Standing Decisions\n'
+        f'{ENTITY_STANDING_DECISIONS_HEADING}\n'
         f'The `{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record is the SOLE '
         'machine-consulted standing-decision form — the durable record that a prior '
         'investigation adjudicated a recurring class of complaint about an entity and '
@@ -503,6 +507,10 @@ def render_entity_standing_decision_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+INVESTIGATION_OUTCOME_RECORDS_HEADING = '## Investigation Outcome Records'
+
+
 def render_investigation_outcome_section() -> str:
     """Render the STAGE-2-ONLY investigation_outcome section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -519,7 +527,7 @@ def render_investigation_outcome_section() -> str:
     design (PRD decision 8).
     """
     return (
-        '## Investigation Outcome Records\n'
+        f'{INVESTIGATION_OUTCOME_RECORDS_HEADING}\n'
         'When you (Stage 2) conclude an investigation of a flagged entity and '
         'determine it is not actionable, write an '
         f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` mem0 record so the conclusion is durable '
@@ -771,42 +779,17 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
 
 
 def render_task_creation_accounting_section() -> str:
-    """Render the Task-Creation Accounting section (task 3046, run_id
-    507bc25b evidence).
+    """Render the Task-Creation Accounting section (tasks 3046, 4873).
 
-    Stage 2's `tasks_created` increment mandate (`## Verifying Task
-    Operations`, prompts/stage2.py) is stated once, but never declares the
-    counter's SCOPE: whether a task confirmed via a mid-cycle side quest —
-    the Proactive Task Sample, the Done-Task Completion-Memory Audit,
-    Cross-Project Routing, a Source-Completion residual, or a
-    predicate-contradiction gate — counts the same as one confirmed from a
-    Stage 1 flagged item. Run 507bc25b filed task 3045 via the
-    proactive/cross-project sample-review surface yet Stage 2 self-reported
-    `tasks_created: 0` — exactly the gap this section closes, by stating the
-    counter is path-agnostic and by giving the framework an action-record
-    list (`task_created_records`) it can repair from, modeled directly on
-    `flag_deleted_records`' established convention (see
-    `## Per-Cycle Counter Schema` in prompts/stage2.py).
-
-    That list is NOT taken as ground truth (task 3051): it is itself LLM
-    self-report, so the framework corroborates each record via `get_task`
-    against the record's own `project_id` before letting it raise the
-    counter. The closing paragraph says so, because a prompt that overstates
-    the framework's safety net lowers agent care on a counter nothing else
-    checks.
-
-    Rendered once, as a shared renderer (INV-5) — not restated in
-    `assemble_payload`'s "Your Task" block, where the Proactive Task Sample /
-    Cross-Project Routing instructions actually live, to avoid two copies of
-    the same rule drifting apart. Like `render_source_completion_section`,
-    this is new canonical text with no prior prompt precedent, and is
-    written as a plain (non-f) string so its literal `{`/`}` record-shape
-    example needs no brace-doubling when interpolated into the f-string
-    ``STAGE2_SYSTEM_PROMPT``.
+    States that ``tasks_created`` is path-agnostic, splits curator folds into
+    ``tasks_combined``, and gives the framework the ``task_created_records``
+    action list it corroborates alongside the code-side creation journal.
+    A plain (non-f) string, so its literal record-shape braces need no
+    doubling inside the f-string ``STAGE2_SYSTEM_PROMPT``.
     """
     return (
         '## Task-Creation Accounting\n'
-        '`tasks_created` is PATH-AGNOSTIC: it counts EVERY task you confirm '
+        '`tasks_created` is PATH-AGNOSTIC: it counts EVERY task you create '
         'this cycle, regardless of which surface produced the work — a '
         'Stage 1 flagged item, the **Proactive Task Sample**, the '
         '`### Done-Task Completion-Memory Audit`, Cross-Project Routing (a '
@@ -815,6 +798,11 @@ def render_task_creation_accounting_section() -> str:
         'or a predicate-contradiction gate. A creation is never exempt from '
         'the count because it was a mid-cycle side-quest rather than the '
         'finding you started from.\n\n'
+        '`tasks_created` counts ONLY `resolve_ticket` status `created`. Status '
+        '`combined` — the curator dropped, combined or idempotently matched '
+        'the candidate, or it collided with an existing candidate key — mints '
+        'no new task id: count it under `tasks_combined`, never under '
+        '`tasks_created`.\n\n'
         'Confirmation rule: see `## Verifying Task Operations` above for the '
         'full rule, including its `get_task`-verified fallback for a status '
         'other than `created`/`combined`/`failed`. Only the '
@@ -822,25 +810,51 @@ def render_task_creation_accounting_section() -> str:
         'or `combined` WITH a `task_id` — is machine-countable via the '
         'action record below; never record on the `submit_task` call '
         'attempt, and `failed` never counts. A creation you confirm via the '
-        '`get_task` fallback still counts toward your own `tasks_created` '
-        'self-report, but has no `task_created_records` entry of its own — '
-        'so under-reporting it is not auto-repaired the way an omitted '
-        '`created`/`combined` record is.\n\n'
+        '`get_task` fallback still counts toward your own self-report, but '
+        'has no `task_created_records` entry of its own — so under-reporting '
+        'it is not auto-repaired.\n\n'
         'Action record: at the moment of each confirmation, append one '
-        "entry to `stats['task_created_records']`:\n"
+        "entry to `stats['task_created_records']` (status `combined` included):\n"
         '  `{"action": "task_created", "task_id": <id>, '
         '"status": "created"|"combined", "project_id": <project the task '
         'was filed into>, "source_path": <short label of the surface that '
         'produced it>}`\n\n'
-        'The framework CORROBORATES every record before it counts for '
-        'anything: it looks each `task_id` up via `get_task` against the '
-        "root of that record's own `project_id`, and REPAIRS "
-        '`tasks_created` upward to the number of records whose task is '
-        'confirmed to EXIST (recording the pre-repair value under '
-        '`tasks_created_reported`), so a missed increment is recovered '
-        'rather than lost. A record naming a task that cannot be confirmed '
-        'to exist will NOT raise the counter — record only creations you '
-        'actually made, with the `project_id` you actually filed into.'
+        'The framework ALSO journals every curator outcome code-side, against '
+        'the `_causation_id` you put in `submit_task` metadata, so a missed '
+        'record is recovered from the journal — but ONLY when that '
+        '`submit_task` call carried `"_causation_id": <run_id>`. It repairs '
+        '`tasks_created` and `tasks_combined` UPWARD to the journaled outcomes '
+        'plus the records whose task it confirms to EXIST via `get_task` '
+        "against the root of that record's own `project_id` (recording the "
+        'pre-repair value under `tasks_created_reported` / '
+        '`tasks_combined_reported`). A record naming a task that cannot be '
+        'confirmed will NOT raise a counter — record only outcomes you '
+        'actually got, with the `project_id` you actually filed into.'
+    )
+
+
+def render_task_hints_update_accounting_section() -> str:
+    """Render the Task-Hints-Update Accounting section (task 4018).
+
+    Gives ``tasks_hints_updated`` the same action-record ground truth
+    ``tasks_created`` has. A plain (non-f) string, like
+    :func:`render_task_creation_accounting_section`.
+    """
+    return (
+        '## Task-Hints-Update Accounting\n'
+        'After the `get_task` SUPERSET confirmation in `## Verifying Task '
+        'Operations` passes for a `memory_hints` attach, append one entry to '
+        "`stats['task_hints_updated_records']` naming the entries you just "
+        'attached:\n'
+        '  `{"action": "task_hints_updated", "task_id": <id>, '
+        '"project_id": <project the task lives in>, "entities": [...], '
+        '"queries": [...]}`\n\n'
+        'The framework re-reads each recorded task via `get_task` against the '
+        "root of that record's own `project_id` and repairs "
+        '`tasks_hints_updated` UPWARD only for records whose stored '
+        '`memory_hints` really contain every recorded entity and query '
+        '(recording the pre-repair value under `tasks_hints_updated_reported`). '
+        'A record the re-read does not confirm will NOT raise the counter.'
     )
 
 

@@ -558,6 +558,12 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
+    # {anchor: int, pending_since: str}: the max_id the task's age now counts
+    # from, and the stamp whose change signalled the reset.  Emitted once per
+    # applied reset; restoring that anchor at a later process start emits
+    # nothing.
+    age_anchor_reset = 'age_anchor_reset'
     # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
     # Every emitted reservation_* event carries data.source in {pin, fairness}
     # (task 6040): an operator pin's reservation, or the automatic machinery's.
@@ -609,6 +615,13 @@ class EventType(StrEnum):
     # NOT emitted through _emit_lock_event: that chokepoint is contractually
     # the lock-event single writer and raises on any other event type.
     park_backfill_overstay = 'park_backfill_overstay'
+    # Anchor-coverage arming gate (task 3819 / scheduler-scoring PRD D12, I-6).
+    # Producer: scheduler.py::Scheduler._note_anchor_coverage, once per tick whose
+    # share of candidates carrying a parseable metadata.pending_since is below
+    # scoring.new_scoring_min_anchor_coverage — the whole tick then scores on
+    # the legacy formula.  Scheduler-scoped (task_id=None).  Payload:
+    # {coverage, threshold, candidates, with_anchor, consecutive_ticks}.
+    scoring_anchor_coverage_low = 'scoring_anchor_coverage_low'
 
     # Scheduler priority overrides
     #
@@ -919,6 +932,12 @@ class EventType(StrEnum):
     # these rows for a stranded task is therefore meaningful: nothing held it.
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
+    # strand_converted — one row per convert-to-blocked the stranded-task sweep
+    # actually applied (task 6476).  Payload:
+    # orchestrator/src/orchestrator/strand_conversion.py::strand_converted_payload.
+    # An ACTION, not a hold, so not signature-gated: one row per conversion.
+    # task_id is ALSO a first-class column.
+    strand_converted = 'strand_converted'
 
     # workflow_exit_contract — one row per run() exit whose contract verdict is
     # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
@@ -936,6 +955,34 @@ class EventType(StrEnum):
     # task_id is ALSO a first-class column.  Task mu's soak counts
     # verdict='violation' rows with mode='log' before flipping enforce on.
     workflow_exit_contract = 'workflow_exit_contract'
+
+    # Task-verify admission gate (task 5628; plans/verify-admission-fifo-prd.md).
+    # Every payload carries `order`, so before/after a policy flip is read from
+    # the rows themselves, never from dates. Wall-clock ISO times only.
+    #
+    # verify_admission_plan — one row per gated verify plan
+    #   (verify.py::run_scoped_verification / run_full_verification) that
+    #   returned with an admitted leg, or that raised while admission was on;
+    #   a cancelled plan emits none. task_id and role are also first-class
+    #   columns; phase 'verify'. Payload:
+    #   {plan_id, task_id, role,
+    #    outcome,           # 'returned' | 'raised'; a raised plan's legs never came back: []
+    #    order,             # the legs' common order; null if a reload changed it mid-plan, or no legs
+    #    plan_arrival_at, completed_at,
+    #    legs: [verify_admission_record.py::AdmissionLeg.to_dict()]}
+    verify_admission_plan = 'verify_admission_plan'
+    # verify_admission_heartbeat — from the harness watch
+    #   (verify_admission_watch.py::AdmissionWatch), once per tick and only
+    #   while any waiter is queued. Payload:
+    #   {depth, oldest_wait_secs, oldest: {task_id, module, role, plan_id},
+    #    holders: [{task_id, module, role, held_secs}], order}
+    verify_admission_heartbeat = 'verify_admission_heartbeat'
+    # verify_admission_wait_aged — from the same watch, when the oldest waiter
+    #   past the alarm age first appears, and again only when that waiter's
+    #   identity changes: one fact per change, never one per waiter per tick
+    #   (INV-4). Age surfacing only; nothing times out. Payload:
+    #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
+    verify_admission_wait_aged = 'verify_admission_wait_aged'
 
 
 class _MergeFinalizedKey(Enum):

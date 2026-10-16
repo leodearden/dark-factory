@@ -5941,8 +5941,8 @@ class TestLaneSceneVerifyIsNotCalledDead:
 
         The in-flight abort poll measures its no-progress budget off the
         FakeClock's ``monotonic()``, which the lane's own periodic loops push
-        forward at event-loop speed, so that budget buys no dependable real
-        time. What keeps a verify alive is content progress under its merge
+        forward by far more than a poll per real second, so that budget buys
+        no dependable real time. What keeps a verify alive is content progress under its merge
         worktree, as a healthy verify shows. With the budget shrunk to ten
         polls, a verify parked for a real second must still run once, not be
         called dead and requeued.
@@ -22001,16 +22001,17 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         The subject is the LOOP's cadence, so the instrument is the injected
         clock rather than wall time: ``_heartbeat_loop`` awaits
         ``self._clock.sleep(_HEARTBEAT_POLL_S)``, so a ``FakeClock`` both
-        records every tick the loop asks for and returns from it immediately.
-        "It ticked" is therefore an exact recorded sleep count rather than the
-        previous wall-clock version's race between a real 0.02 s poll, a 1 s
-        deadline and a 0.12 s "> 2× poll" margin.
+        records every tick the loop asks for and parks each one at most its
+        ``sleep_cap`` of real time. "It ticked" is therefore an exact recorded
+        sleep count rather than the previous wall-clock version's race between
+        a real 0.02 s poll, a 1 s deadline and a 0.12 s "> 2× poll" margin.
 
         "It stopped" is the un-cancelled ``asyncio.wait_for(task)`` returning:
-        the loop is never parked in a real sleep, so clearing ``_running`` is
-        the ONLY thing that can end it, and a loop that ignored the flag fails
-        here as a timeout. Sampling the clock again after that join would prove
-        nothing — the task is already finished, so no tick could follow.
+        each tick parks only ``sleep_cap``, never the 30 s poll, so clearing
+        ``_running`` is the ONLY thing that can end it within the 5 s bound,
+        and a loop that ignored the flag fails here as a timeout. Sampling the
+        clock again after that join would prove nothing — the task is already
+        finished, so no tick could follow.
 
         Nothing here patches ``_HEARTBEAT_POLL_S``: with the clock injected,
         how long a tick claims to be no longer costs the test anything.
@@ -22036,11 +22037,13 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         worker._running = True
         task = asyncio.create_task(worker._heartbeat_loop())
         try:
-            # Yield until the loop has taken a few ticks THROUGH THE CLOCK.
-            for _ in range(200):
-                if len(clock.sleeps) >= 3:
-                    break
-                await asyncio.sleep(0)
+            async def _ticked(n: int) -> None:
+                while len(clock.sleeps) < n:
+                    await asyncio.sleep(0.01)
+
+            await wait_responsive(
+                _ticked(3), label='heartbeat loop: 3 ticks through the injected clock',
+            )
             assert len(clock.sleeps) >= 3, (
                 f'heartbeat loop did not tick through the injected clock; '
                 f'recorded sleeps: {clock.sleeps}'
@@ -22051,10 +22054,10 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             )
         finally:
             worker._running = False
-            # Deliberately NO task.cancel(): with the clock injected the loop
-            # is never parked in a real sleep, so it must exit on the stop flag
-            # ALONE. Cancelling would mask a loop that ignores the flag — and
-            # measured, it does: with `while self._running` mutated to
+            # Deliberately NO task.cancel(): with the clock injected each tick
+            # parks at most sleep_cap of real time, so the loop must exit on
+            # the stop flag ALONE. Cancelling would mask a loop that ignores
+            # the flag — and measured, it does: with `while self._running` mutated to
             # `while True` the cancel-then-await version still passed.
             await asyncio.wait_for(task, timeout=5)
 

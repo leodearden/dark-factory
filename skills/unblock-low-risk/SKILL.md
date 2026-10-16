@@ -46,7 +46,11 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
    human-rehearsal mandate. This precondition turns that external kill into a self-halt.
 
    **Mechanical backstop:** precondition 6's `b3_gate check` below now *also* scans the task
-   description and proposal/block-reason text for this same phrase family and returns
+   description, the proposal text and the block reason's prose for this same phrase family
+   (captured tool output — the fenced excerpt under each `## Test Failures`, `## Lint Issues`
+   or `## Type Errors` section of the verify failure report — is excluded, so
+   pytest/lint output that merely contains a phrase like
+   'do not run' no longer aborts; task 6933) and returns
    `verdict == 'abort'` with an `'explicit stop instruction present'` reason when found — so
    even if this precondition is somehow skipped, the existing "**ONLY** `verdict == 'fresh'`
    proceeds" rule at precondition 6 already routes this class to ABORT, with the gate's
@@ -440,7 +444,7 @@ eyeballed listing.
   outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
   `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
-  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  **neither arm licenses a write** — never self-stamp on either. Read rules 2 and 2v there for the
   argument rather than restating it; the disposition here is the **same on both arms**, and it
   turns on re-reading this task's scheduler status **fresh**:
   - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed

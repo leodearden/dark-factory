@@ -116,6 +116,11 @@ class TerminalReport:
     (``config.auto_eval_phases``) keeps matching plan/execute/verify/review
     blocks instead of seeing the terminal ``'blocked'`` state (REVIEW-CYCLE-1
     fix — see that design decision).
+
+    ``block_category`` is ``_mark_blocked``'s ``category=`` argument — the
+    ESCALATION taxonomy (``'task_failure'``, ``'wip_conflict'``,
+    ``'infra_issue'``, ...), unrelated to ``category`` above — and ``''`` on
+    every exit that did not pass through ``_mark_blocked``.
     """
 
     outcome: WorkflowOutcome
@@ -124,6 +129,7 @@ class TerminalReport:
     detail: str
     category: FailureCategory | None
     blocked_from_phase: WorkflowState | None = None
+    block_category: str = ''
     # Task 2988 (PRD ε / W3): whether this terminal outcome's requeue counts
     # against the per-task requeue cap.  Set from
     # ``BlockDisposition.counts_against_requeue_cap`` at the REQUEUED

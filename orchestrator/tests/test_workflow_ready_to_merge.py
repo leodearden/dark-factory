@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -288,27 +289,32 @@ class TestReadyToMergeHappyPath:
         f.mark_blocked.assert_not_awaited()  # still no human escalation
         assert f.merge_queue.qsize() == 1
 
+    @pytest.mark.parametrize(('old_status', 'observed'), [
+        ('done', WorkflowOutcome.DONE),
+        ('cancelled', WorkflowOutcome.CANCELLED),
+    ])
     async def test_terminal_exit_rejection_is_accepted_not_forced(
-        self, tmp_path: Path,
+        self, tmp_path: Path, old_status: str, observed: WorkflowOutcome,
     ):
         """The benign already-terminal race: the merge callback or the
-        found_on_main backstop beat us to mark_done.
+        found_on_main backstop beat us to mark_done, or the task was cancelled.
 
-        That row is CORRECT — the work landed.  Dragging it back to 'blocked'
-        would undo a legitimate done, so the rejection must be swallowed, not
-        retried and not re-forced through ``update_task``.
+        That row is CORRECT.  Dragging it back to 'blocked' would undo it, so
+        the rejection must not be retried or re-forced through
+        ``update_task``, and the exit reports the terminal it observed.
         """
         from orchestrator.scheduler import TerminalExitRejection
 
         f = await self._run(
             tmp_path,
             set_task_status_side_effect=TerminalExitRejection(
-                task_id=_TASK_ID, old_status='done',
+                task_id=_TASK_ID, old_status=old_status,
                 target_status='blocked', raw='terminal_exit_rejected',
             ),
         )
 
-        assert f.outcome == WorkflowOutcome.BLOCKED
+        assert f.outcome == observed
+        assert outcome_allows_status(f.outcome, old_status)
         assert f.merge_queue.qsize() == 1  # the merge still went out
         f.scheduler.set_task_status.assert_awaited_once()  # no retry
         assert f.status_forcing_updates() == []  # and no forced re-write

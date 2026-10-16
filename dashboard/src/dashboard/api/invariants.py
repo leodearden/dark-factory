@@ -33,7 +33,7 @@ from dashboard.data.escalation_corpus import (
     pending_escalation_ids,
 )
 from dashboard.data.root_invariants import scan_root_invariants
-from dashboard.project_dbs import TASKS_DB_REL_PATH, project_roots
+from dashboard.project_dbs import TASKS_DB_REL_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ async def api_invariants(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     now = datetime.now(UTC)  # clock-exempt: single-capture route
     corpus = await _escalation_corpus(config, now=now)
-    roots = project_roots(config)
+    roots = config.all_project_roots
     db_paths = [root / TASKS_DB_REL_PATH for root in roots]
     conns = [await pool.get(db_path) for db_path in db_paths]
     records = await asyncio.gather(

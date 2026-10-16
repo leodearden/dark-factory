@@ -2673,6 +2673,270 @@
       ]
     },
     {
+      "task_id": "4953",
+      "reason": "Net-additive defect fix: the coalescing pass now refuses singles with no awaiting workflow (no_awaiting_workflow), because a coalesce train lands only once every member is merge-deferred and only a TaskWorkflow parks a task there; adds MergeRequest.awaited_by_workflow and the un-bypassable _coalesce_exclusion_reason check ahead of the injectable risk predicate.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1890,
+          "current": 1901
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22124,
+          "current": 22142
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12536,
+          "current": 12547
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57578,
+          "current": 57607
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32032,
+          "current": 32043
+        }
+      ]
+    },
+    {
+      "task_id": "4953",
+      "reason": "Net-additive defect fix: stack_train_branches now captures each member's tip immediately before the rebase that overwrites it (PreStackTip; a member with no readable tip is ejected, so none is stacked without a restore point), and GitOps.restore_pre_stack_tip adds the guarded compare-and-swap that hands a member back on that tip when its coalesce train does not land.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1424,
+          "current": 1435
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_stack_member",
+          "baseline": 3,
+          "current": 4
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15870,
+          "current": 15957
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9292,
+          "current": 9313
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4842,
+          "current": 4853
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57607,
+          "current": 57694
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32043,
+          "current": 32064
+        }
+      ]
+    },
+    {
+      "task_id": "4953",
+      "reason": "Net-additive defect fix: a coalesce train that does not land (derail, incomplete train, admission-halt dissolution) now hands every member back on its pre-stack tip before the 1867 re-drive, through one _unwind_coalesce_train policy (GroupMergeRequest.member_pre_stack_tips; status- and landed-guarded restore that never resets a branch a live agent may own); the two inline guarded re-drive blocks it replaces are gone.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2195,
+          "current": 2199
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1901,
+          "current": 1907
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22142,
+          "current": 22235
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12547,
+          "current": 12574
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4853,
+          "current": 4857
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57694,
+          "current": 57793
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32064,
+          "current": 32091
+        }
+      ]
+    },
+    {
+      "task_id": "4953",
+      "reason": "amendment (review of task 4953): restore_pre_stack_tip now refuses a branch carrying commits its train did not stack (records each member's stacked tip), rolls the ref back when the worktree reset fails (RESET_FAILED), and ejects a member whose stacked tip cannot be read; net-additive guards, not a failed refactor",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1435,
+          "current": 1444
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15957,
+          "current": 16003
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9313,
+          "current": 9322
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4857,
+          "current": 4866
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57793,
+          "current": 57839
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32091,
+          "current": 32100
+        }
+      ]
+    },
+    {
+      "task_id": "4953",
+      "reason": "amendment (review of task 4953, heuristics 9/14): the coalesce-unwind restore policy moves out of worker.py into merge_lane/coalesce_unwind.py and reads each member's status just before its restore; worker.py falls, the cluster totals rise only by the new module's docstring and imports",
+      "measures": [
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57839,
+          "current": 57860
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32100,
+          "current": 32110
+        }
+      ]
+    },
+    {
+      "task_id": "5628",
+      "reason": "net-additive call-site tests for the verify admission gate (task 5628, esc-5628-1): test_verify_admission_call_sites.py drives the three private call-site seams the plan mandates (_verify_debugfix_loop, _run_merge_phase, _run_main_tip_sweep) plus the two merge-phase preamble stubs it cannot run without, and test_verify_admission_order_integration.py injects module configs through config._module_configs as 30 other test files do",
+      "measures": [
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6647,
+          "current": 6653
+        }
+      ]
+    },
+    {
+      "task_id": "6052",
+      "reason": "Net-additive: the autouse exit-contract guard now pins its logger level and tears down after _drain_leaked_tasks, so the zero-would-violate soak signal task mu reads cannot go deaf under a raised orchestrator log level or drop a leaked run()'s verdict (conftest.py prose); and a new TestReadyToMergeDispatch pin drives run() through that class's existing stub seams (_invoke, the exit handler, the observed-terminal mapper) to prove a CANCELLED plan-phase exit ends the run instead of paying for an architect (test_workflow_ready_to_merge.py private reads)",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_workflow_ready_to_merge.py",
+          "baseline": 32,
+          "current": 35
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 778,
+          "current": 781
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6653,
+          "current": 6655
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32110,
+          "current": 32113
+        }
+      ]
+    },
+    {
+      "task_id": "4737",
+      "reason": "net-additive: abandoned merge-deferred recovery (custody query, abandoned re-drive); per-member re-drive extracted from worker.py into merge_lane/member_redrive.py",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/__init__.py",
+          "baseline": 93,
+          "current": 95
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4866,
+          "current": 4867
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57857,
+          "current": 57911
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6652,
+          "current": 6655
+        }
+      ]
+    },
+    {
       "task_id": "6160",
       "reason": "train verify threads the worker's injected VerifyPort (step-2)",
       "measures": [
@@ -2915,6 +3179,78 @@
           "key": "<cluster>",
           "baseline": 32070,
           "current": 32084
+        }
+      ]
+    },
+    {
+      "task_id": "6160",
+      "reason": "merge main into task/6160: re-absorb the train-verify VerifyPort threading and H1 leased-host verify (already authorized step-2..step-N above) onto main's 6857/4953 baseline",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2174,
+          "current": 2195
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::__init__",
+          "baseline": 10,
+          "current": 11
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_ensure_host_allocator",
+          "baseline": 2,
+          "current": 4
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_note_verify_started",
+          "baseline": 0,
+          "current": 2
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22016,
+          "current": 22205
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_train_attribution.py",
+          "baseline": 8,
+          "current": 9
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12479,
+          "current": 12531
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4863,
+          "current": 4884
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57825,
+          "current": 58014
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6652,
+          "current": 6653
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 32002,
+          "current": 32054
         }
       ]
     }

@@ -175,6 +175,16 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    Only the first-party-dependent columns can move, and only for a test that imports a
    `scripts/legibility` module by its bare name. 5414 gets no `update_task` and no
    `add_dependency`. No report-only mode is added to `merge_lane_metrics.py`.
+   *Amended 2026-10-13 (task 6921):* a root `pyproject.toml` with no `[tool.uv.workspace]`
+   table is a single-package project. Its domain is one member named by `[project].name`,
+   whose `src` root is `src/` and whose `tests` root is `tests/` (the PyPA src layout),
+   followed only by the `scripts` pseudo-member: top-level `tests/` is the package's own,
+   so a `tests` pseudo-member would claim every test file twice. `src/` must hold tracked
+   `.py`, else the run exits 2; a flat layout would otherwise measure its tests only and
+   read complete. Build-backend package-dir settings (`[tool.setuptools.packages.find]`
+   and the hatch, poetry, flit and pdm equivalents) are not read. A workspace root that
+   also carries `[project]`, as this repo's does, stays a workspace. Found by
+   `review-all-solar_challenge-20261013`, whose run-local shim this replaces.
 4. **Measure the checked-out commit, refuse a dirty domain.** `as_of_sha` is
    `git rev-parse HEAD`; if `git status --porcelain` lists any path under the domain the
    run exits 2 naming the paths. Files are read from the work tree and measured with
@@ -199,7 +209,7 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    `merge_lane_metrics.py` module docstring): a domain file that cannot be read, parsed or
    measured is skipped and named in `evidence.unreadable`, and `evidence.complete`
    becomes `false`; tool-level faults (git absent, complexipy missing or outside the pin,
-   no workspace members, dirty domain) exit 2. `--diff` against an incomplete snapshot
+   neither workspace members nor a single src-layout package, dirty domain) exit 2. `--diff` against an incomplete snapshot
    prints the unreadable paths first and reports their measures as unknown, never as
    zero.
 8. **The script writes a file; the consuming skill commits it.** The script never

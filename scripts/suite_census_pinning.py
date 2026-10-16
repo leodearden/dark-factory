@@ -433,13 +433,17 @@ def measure_python_tree(tree_root: Path) -> PythonPinningCensus:
 # Rendering.
 
 _DECLARED_TESTS_ROOT = MemberRoots.declared('<member>').tests_root
+_SINGLE_PACKAGE_TESTS_ROOT = MemberRoots.single_package('<name>').tests_root
 _PSEUDO_MEMBERS_TEXT = ', '.join(f'`{m.name}` (`{m.tests_root}/`)' for m in PSEUDO_MEMBERS)
 
 _DEFINITIONS = f"""\
 A test file is a tracked `.py` file under a workspace member's tests root, as
 `source_measures.workspace_domain` classifies it: each member listed in the root
 pyproject.toml's `[tool.uv.workspace].members` (`{_DECLARED_TESTS_ROOT}/`), plus the
-pseudo-members {_PSEUDO_MEMBERS_TEXT}. Its package is its member. First-party
+pseudo-members {_PSEUDO_MEMBERS_TEXT}. A tree with no workspace table is one
+package named by its `[project].name`, whose tests root is
+`{_SINGLE_PACKAGE_TESTS_ROOT}/`, followed only by the `scripts` pseudo-member. Its
+package is its member. First-party
 names are the import names of the domain's source files whose every dotted
 segment is an identifier, so `scripts/` is an import root and
 `scripts/legibility/x.py` is `legibility.x`. A module has no other name here:

@@ -57,6 +57,22 @@ inert (every holder reads as dead). `$PPID` is not stable across tool calls eith
 match what your own release presents. The long-lived `claude` process is `$CLAUDE_PID` — verify with
 `ps -o comm= -p "$CLAUDE_PID"`, which prints `claude`.
 
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still counts as
+held, and once its heartbeat is past the TTL the reaper reclaims it. Its heartbeat (the lease file's
+mtime) is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted `/unblock` session claimed *before* this
+change carries the bare `<--name>-$CLAUDE_PID` slug, so its re-derived release gets
+`result=refused` — nothing is damaged. Pass the original `--slug` on release (`lease-show` prints it
+as `holder_slug`), or let the lease become reclaimable once its heartbeat is past the 2h TTL.
+
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later release would fail to match; the CLI will not
 invent one, because a synthesized token would be identical for every degraded session and let each
@@ -468,9 +484,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # merge-state-vocab:end
      # merge-state-vocab:begin partition=POLL_STOP_STATES
      #   Mirrors shared/src/shared/merge_state.py::POLL_STOP_STATES (TERMINAL_STATES
-     #   plus `unknown`). Pinned by the same guard.
+     #   plus every epistemic state). Pinned by the same guard.
      else:
-         terminal = ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
+         terminal = ("done", "conflict", "blocked", "abandoned", "unknown", "superseded",
+                     "no_record", "stale_record", "journaled")
      # merge-state-vocab:end
      # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
      # terminal `done` (see accept_terminal), and a durable tier re-serves the same stale
@@ -707,7 +724,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   entirely** and go straight to **step 9** (cleanup). This is a **success** path, not an abort.
 
   **Signal (a) alone must never break the loop.** Signal (a)-landed next to a non-`done` signal (b)
-  is exactly rule 2b's veto: keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
+  is exactly rule 2v's veto (both arms): keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
   take the **landed-but-not-credited** exit stated there — citing the tip merge sha, the
   `git cherry` output and the current status; never "not landed", never resubmit, never self-stamp.
   Breaking out on signal (a) alone would fall through to step 8's
@@ -773,14 +790,14 @@ The merge procedure is iterative — don't assume one pass will be enough:
     for every absorbed member once the train lands
     (`orchestrator/src/orchestrator/harness.py::mark_member_done`).
   - **Under rc=128-with-empty-marker** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
-    **rule 2a** governs; follow it there rather than from here.
+    **rule 2a** governs (with the shared **rule 2v** veto); follow it there rather than from here.
   - **Under rc=1 on the `coalesce-*` arm** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
-    **rule 2b** governs; follow it there rather than from here. The verdict, so you know which way
+    **rule 2b** governs (with the shared **rule 2v** veto); follow it there rather than from here. The verdict, so you know which way
     the arm points before you go: rc=1 is **not** a not-landed outcome here, signal (b) is a **veto,
-    not a corroborator**, and **there is no self-stamp on this arm**. Read rule 2b there for the
+    not a corroborator**, and **there is no self-stamp on this arm**. Read rule 2v there for the
     argument — which exit each scheduler status yields, its **landed-but-not-credited** report, and
-    the `git cherry main task/<TASK_ID>` content proof including why that proof cannot discharge the
-    veto — rather than restating it.
+    why a content proof cannot discharge the veto — and rule 2b for the
+    `git cherry main task/<TASK_ID>` content proof itself, rather than restating it.
   - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
     "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
     train outcome the orchestrator re-pends the still-unlanded members for solo re-merge

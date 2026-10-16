@@ -4,8 +4,8 @@ The ACTIVE_TASKS rows no longer carry description/details, so TaskDetail
 delegates them to a TaskProse child that fetches them per selection through
 data.js's on-demand seam. This file pins only the WIRING, on comment-stripped
 code: this repo has no DOM harness (see pins_recovery.js's CANONICAL header),
-and the render DECISION is covered behaviourally by data_poll.test.mjs's
-onDemandView tests.
+and the render DECISION is covered behaviourally by
+dashboard/tests/js/data_on_demand.test.mjs's onDemandView tests.
 """
 
 from __future__ import annotations

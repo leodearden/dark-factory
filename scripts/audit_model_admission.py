@@ -41,10 +41,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-# The orchestrator's own data/ is gitignored (the `/data/` rule in .gitignore),
-# so a task worktree has no store of its own and a worktree-relative default
-# would never resolve.  The live store exists only in the main checkout.
-DEFAULT_RUNS_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
+import _checkout as _checkout
+from shared.project_layout import default_project_root, runs_db
+
+
+def default_runs_db() -> Path:
+    """The main checkout's runs.db: data/ is gitignored, so no task worktree has a live store."""
+    return runs_db(default_project_root())
+
 
 # A trailing-window spec: N hours or N days, N a POSITIVE integer. Anchored so
 # '24' and '24x' are both rejected rather than silently truncated to 24, and
@@ -1095,12 +1099,13 @@ def main(argv: Sequence[str] | None = None) -> int:
              f'defaults {DEFAULT_ROLE_CEILINGS_SECS}. A role with no ceiling is '
              'reported as unknown rather than as under one.',
     )
-    parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
+    parser.add_argument('--runs-db', default=None, type=Path,
+                        help="(default: the main checkout's runs.db)")
     parser.add_argument('--format', default='markdown', choices=('markdown', 'json'))
     args = parser.parse_args(argv)
 
     window_end = args.until or datetime.now(UTC)
-    conn = connect_ro(args.runs_db)
+    conn = connect_ro(args.runs_db if args.runs_db is not None else default_runs_db())
     try:
         result = audit(
             conn,

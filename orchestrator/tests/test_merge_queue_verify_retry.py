@@ -1410,8 +1410,9 @@ async def _run_wiring(
     max_narrowed: int = 2,
     narrowed_retries: dict[str, int] | None = None,
     enospc_retries: dict[str, int] | None = None,
+    runner: MagicMock | None = None,
 ):
-    """Drive _run_post_merge_verify on the LOCAL path with a recording pool."""
+    """Drive _run_post_merge_verify with a recording pool; LOCAL unless *runner* is given."""
     from orchestrator import merge_queue as mq
 
     pool_cls, specs = _recording_pool(results)
@@ -1433,6 +1434,7 @@ async def _run_wiring(
             max_narrowed=max_narrowed,
             narrowed_retries=narrowed_retries if narrowed_retries is not None else {},
             shadow_baseline_sink=sink,
+            runner=runner,
             verifier=FakeVerifier(),
         )
     return outcome, specs
@@ -1625,6 +1627,82 @@ async def test_a_non_narrowing_payload_keeps_the_legacy_budget(tmp_path: Path) -
     )
     assert nr == {}, f'the narrowed counter must stay untouched: {nr}'
     assert sink == {}, 'a refused narrowing must not seed the shadow baseline'
+
+
+def _remote_runner_double() -> MagicMock:
+    """A remote VerifyRunner stand-in; it flips _run_post_merge_verify onto its remote fork."""
+    runner = MagicMock()
+    runner.name = 'laptop'
+    runner.is_local = False
+    return runner
+
+
+def _remote_wiring_req(task_id: str) -> MagicMock:
+    """`_wiring_req` with the task-2822 remote-green local cross-check switched off."""
+    req = _wiring_req(task_id)
+    req.config.verify_cross_check_remote_green = False
+    return req
+
+
+@pytest.mark.asyncio
+async def test_remote_dispatch_retry_runs_full_and_writes_nothing_on_the_dispatcher(
+    tmp_path: Path,
+) -> None:
+    """A remote host cannot see the dispatcher's untracked filter files.
+
+    So a REMOTE dispatch's retry ships attempt-0's own env, runs FULL, and the
+    dispatcher's merge_wt gains no filter file.  See verify_runner.py::MergeVerifySpec.
+    """
+    _place_real_sidecar(tmp_path)
+    before = {p.relative_to(tmp_path) for p in tmp_path.rglob('*')}
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=_remote_wiring_req('t-remote-a'),
+        runner=_remote_runner_double(),
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+    )
+
+    assert outcome is None
+    assert len(specs) == 2, f'expected attempt-0 + one full retry, got {len(specs)}'
+    retry_env = specs[1].verify_env
+    for key in _RETRY_ENV_KEYS:
+        assert key not in retry_env, f'{key} shipped on a remote retry: {retry_env!r}'
+    assert retry_env == specs[0].verify_env
+    after = {p.relative_to(tmp_path) for p in tmp_path.rglob('*')}
+    assert after == before, f'dispatcher merge_wt gained {sorted(map(str, after - before))}'
+
+
+@pytest.mark.asyncio
+async def test_remote_dispatch_retry_is_charged_to_the_legacy_budget(
+    tmp_path: Path,
+) -> None:
+    """A remote retry runs FULL, so it is accounted as FULL.
+
+    It spends the legacy ENOSPC budget, leaves the narrowed one untouched, and
+    seeds no D4 warm-shadow baseline from a narrowing that never happened.
+    """
+    _place_real_sidecar(tmp_path)
+    req = _remote_wiring_req('t-remote-b')
+
+    outcome, _specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        runner=_remote_runner_double(),
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+        max_enospc=1,
+        max_narrowed=2,
+        narrowed_retries=(nr := {}),
+        enospc_retries=(er := {}),
+        sink=(sink := {}),
+    )
+
+    assert outcome is None
+    assert er == {req.task_id: 1}, f'the full retry must spend the legacy budget: {er}'
+    assert nr == {}, f'the narrowed counter must stay untouched: {nr}'
+    assert sink == {}, f'a remote retry must not seed the shadow baseline: {sink}'
 
 
 @pytest.mark.asyncio
