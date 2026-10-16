@@ -6,7 +6,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 from client_feed.contract import (
     FEED_VERSION,
@@ -202,27 +202,30 @@ def _apply_criteria_results(acc: _Accumulator, event: CriteriaResults) -> None:
     acc.criteria[event.run_kind] = event
 
 
-def _timeline_only(acc: _Accumulator, event: FeedEvent) -> None:
-    """The event's only trace in the state is its entry in `recent`."""
+def _no_state_change(acc: _Accumulator, event: FeedEvent) -> None:
+    pass
 
 
-_APPLIERS: Mapping[type, Callable[[_Accumulator, Any], None]] = {
-    Heartbeat: _apply_heartbeat,
-    FactoryState: _apply_factory_state,
-    PrdUpserted: _apply_prd_upserted,
-    TaskUpserted: _apply_task_upserted,
-    TaskPhase: _apply_task_phase,
-    VerifyRun: _timeline_only,
-    VerifyTestResults: _timeline_only,
-    MergeLanded: _timeline_only,
-    BranchSnapshot: _apply_branch_snapshot,
-    TreeSnapshot: _apply_tree_snapshot,
-    FileRevealed: _apply_file_revealed,
-    RevealRefused: _timeline_only,
-    CriteriaResults: _apply_criteria_results,
+class _Handling(NamedTuple):
+    apply: Callable[[_Accumulator, Any], None]
+    in_timeline: bool
+
+
+_HANDLING: Final[Mapping[type, _Handling]] = {
+    Heartbeat: _Handling(_apply_heartbeat, in_timeline=False),
+    FactoryState: _Handling(_apply_factory_state, in_timeline=False),
+    PrdUpserted: _Handling(_apply_prd_upserted, in_timeline=True),
+    TaskUpserted: _Handling(_apply_task_upserted, in_timeline=True),
+    TaskPhase: _Handling(_apply_task_phase, in_timeline=True),
+    VerifyRun: _Handling(_no_state_change, in_timeline=True),
+    VerifyTestResults: _Handling(_no_state_change, in_timeline=True),
+    MergeLanded: _Handling(_no_state_change, in_timeline=True),
+    BranchSnapshot: _Handling(_apply_branch_snapshot, in_timeline=False),
+    TreeSnapshot: _Handling(_apply_tree_snapshot, in_timeline=False),
+    FileRevealed: _Handling(_apply_file_revealed, in_timeline=True),
+    RevealRefused: _Handling(_no_state_change, in_timeline=True),
+    CriteriaResults: _Handling(_apply_criteria_results, in_timeline=True),
 }
-
-_NOT_IN_TIMELINE: Final = frozenset({Heartbeat, FactoryState, BranchSnapshot, TreeSnapshot})
 
 
 def _remember(acc: _Accumulator, event: FeedEvent) -> None:
@@ -236,8 +239,9 @@ def _remember(acc: _Accumulator, event: FeedEvent) -> None:
 def _apply(acc: _Accumulator, line: FeedLine) -> None:
     if isinstance(line, EventHeader):
         return
-    _APPLIERS[type(line)](acc, line)
-    if type(line) not in _NOT_IN_TIMELINE:
+    handling = _HANDLING[type(line)]
+    handling.apply(acc, line)
+    if handling.in_timeline:
         _remember(acc, line)
 
 
