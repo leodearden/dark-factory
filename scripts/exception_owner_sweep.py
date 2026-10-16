@@ -9,6 +9,7 @@ that the next night does not repeat it.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import datetime
 import enum
 import functools
@@ -549,8 +550,17 @@ def _dead_owner_body(citation: Citation, verdict: liveness.OwnerVerdict) -> _Bod
     )
 
 
-def _file_task(key: FindingKey, body: _Body, ports: Ports) -> bool:
-    """Submit *key*'s task and wait for the curator; True when it yielded a task."""
+@dataclass(frozen=True)
+class FilingOutcome:
+    """What one submit yielded; ``confirmed`` only for a live task carrying the finding's key."""
+
+    confirmed: bool
+    ticket: str
+    outcome: liveness.TicketOutcome
+    task_row: liveness.TaskRow | None
+
+
+def _submit(key: FindingKey, body: _Body, ports: Ports) -> str:
     args: dict[str, object] = {
         'project_root': str(ports.project_root),
         'title': body.summary,
@@ -563,8 +573,44 @@ def _file_task(key: FindingKey, body: _Body, ports: Ports) -> bool:
     ticket = submitted.get('ticket')
     if not isinstance(ticket, str):
         raise SweepFailure(FailureStage.FUSED_MEMORY, f'submit_task answered {submitted!r}, no ticket')
+    return ticket
+
+
+def _read_row(ports: Ports, task_id: int) -> liveness.TaskRow | None:
+    return _from_store(ports.db, lambda: liveness.read_tasks(ports.db, (task_id,))).get(task_id)
+
+
+def _file_task(key: FindingKey, body: _Body, ports: Ports) -> FilingOutcome:
+    """Submit *key*'s task, wait for the curator, and read back what it made.
+
+    The curator is not the dedup mechanism (D11): a combine or a refusal
+    yields no task carrying the key, which is not filed and must be loud.
+    """
+    ticket = _submit(key, body, ports)
     outcome = _resolve_ticket(ports, ticket, wait_secs=SUBMIT_RESOLVE_WAIT_SECS)
-    return outcome.state is liveness.TicketState.RESOLVED_TO_TASK
+    row = None if outcome.task_id is None else _read_row(ports, outcome.task_id)
+    confirmed = (
+        row is not None
+        and row.liveness() is OwnerLiveness.OPEN
+        and FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key
+    )
+    return FilingOutcome(confirmed=confirmed, ticket=ticket, outcome=outcome, task_row=row)
+
+
+def _unconfirmed_body(body: _Body, filing: FilingOutcome) -> _Body:
+    """*body* plus why its filing did not land, for the escalation that replaces it."""
+    outcome = filing.outcome
+    reason = '' if outcome.reason is None else f' ({outcome.reason})'
+    if outcome.task_id is None:
+        target = 'no task'
+    elif filing.task_row is None:
+        target = f'task {outcome.task_id}, which the store does not hold'
+    else:
+        target = f'task {outcome.task_id}, status {filing.task_row.status!r}, not carrying this finding'
+    landed = f'Filing did not land: ticket {filing.ticket} resolved {outcome.status}{reason} to {target}.'
+    return dataclasses.replace(
+        body, detail=f'{body.detail}\n{landed}', observation=f'{body.observation}; {landed}'
+    )
 
 
 def _escalate(key: FindingKey, body: _Body, ports: Ports, now: datetime.datetime) -> None:
@@ -599,11 +645,21 @@ class _Outputs:
         if action in (Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION):
             self.counts['skipped_existing'] += 1
         elif action is Action.FILE_TASK:
-            self.counts['filed'] += _file_task(key, body, self.ports)
+            self._file(key, body)
         else:
-            _escalate(key, body, self.ports, self.now)
-            self.pending.add(key.escalation_task_id())
-            self.counts['escalated'] += 1
+            self._escalate(key, body)
+
+    def _file(self, key: FindingKey, body: _Body) -> None:
+        filing = _file_task(key, body, self.ports)
+        if filing.confirmed:
+            self.counts['filed'] += 1
+        else:
+            self._escalate(key, _unconfirmed_body(body, filing))
+
+    def _escalate(self, key: FindingKey, body: _Body) -> None:
+        _escalate(key, body, self.ports, self.now)
+        self.pending.add(key.escalation_task_id())
+        self.counts['escalated'] += 1
 
 
 def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
