@@ -35,3 +35,19 @@ COUNT_READ_SQL = (
     'ON CONFLICT (hour_start, project_id, agent_id, operation) '
     'DO UPDATE SET count = count + excluded.count'
 )
+
+# Consumers of per-row search detail: leaf eta/theta (WriteJournalConfig.search_retention_days),
+# scripts/harvest_production_queries.py, and WriteJournal.get_ops_by_causation.
+READ_OPERATIONS_KEPT_PER_ROW = frozenset({'search'})
+
+
+def keeps_read_row(*, operation: str | None, success: bool) -> bool:
+    return operation in READ_OPERATIONS_KEPT_PER_ROW or not success
+
+
+_KEPT_OPERATIONS_SQL = ', '.join(f"'{op}'" for op in sorted(READ_OPERATIONS_KEPT_PER_ROW))
+
+COUNT_ONLY_READ_PREDICATE = (
+    "kind = 'read' AND success = 1 "
+    f'AND (operation IS NULL OR operation NOT IN ({_KEPT_OPERATIONS_SQL}))'
+)
