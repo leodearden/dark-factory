@@ -16,6 +16,7 @@ after the output parse truncates it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shlex
@@ -240,11 +241,11 @@ def round_trip_failure(cmd: LaneCommand, ids: Sequence[str]) -> str | None:
     return None
 
 
-def _first_not_failing_in_junit(ids: Sequence[str], detect: RunRecord, cwd: Path) -> str | None:
+async def _first_not_failing_in_junit(ids: Sequence[str], detect: RunRecord, cwd: Path) -> str | None:
     """The first of *ids* *detect*'s junit report does not name as failing; ``None`` if it names all or cannot say."""
     if detect.junit_path is None:
         return None
-    failing = junit_failing_node_ids(Path(detect.junit_path), cwd)
+    failing = await asyncio.to_thread(junit_failing_node_ids, Path(detect.junit_path), cwd)
     if failing is None:
         return None
     return next((node_id for node_id in ids if node_id not in failing), None)
@@ -319,7 +320,7 @@ async def _confirm_generic(
     ids = node_ids_of(_as_pytest_failures(detect))
     narrowed = mode is ConfirmMode.NARROWED
     if narrowed:
-        failing_id = round_trip_failure(cmd, ids) or _first_not_failing_in_junit(ids, detect, run_cwd)
+        failing_id = round_trip_failure(cmd, ids) or await _first_not_failing_in_junit(ids, detect, run_cwd)
     else:
         failing_id = _first_unbalanced(ids)
     if failing_id is not None:
