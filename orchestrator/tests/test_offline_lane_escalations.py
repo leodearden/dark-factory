@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,28 +35,28 @@ def queue(tmp_path: Path) -> EscalationQueue:
     return EscalationQueue(tmp_path / 'queue')
 
 
+RED = UnlandedRed(
+    command=COMMAND,
+    covering_task_id='7123',
+    task_status='in-progress',
+    nodes=('tests/test_a.py::test_one', 'tests/test_b.py::test_two'),
+    filed_at=FILED_AT,
+    record_dirs=('/data/orchestrator/offline-lane/nightly-deep/p1',),
+)
+STUCK = StuckFiling(
+    command=COMMAND,
+    nodes=('tests/test_a.py::test_one',),
+    due_since=DUE_SINCE,
+    reason='planning mode refused: server busy',
+)
+
+
 def _red(**overrides: object) -> UnlandedRed:
-    fields: dict[str, object] = {
-        'command': COMMAND,
-        'covering_task_id': '7123',
-        'task_status': 'in-progress',
-        'nodes': ('tests/test_a.py::test_one', 'tests/test_b.py::test_two'),
-        'filed_at': FILED_AT,
-        'record_dirs': ('/data/orchestrator/offline-lane/nightly-deep/p1',),
-    }
-    fields.update(overrides)
-    return UnlandedRed(**fields)  # type: ignore[arg-type]
+    return replace(RED, **overrides)
 
 
 def _stuck(**overrides: object) -> StuckFiling:
-    fields: dict[str, object] = {
-        'command': COMMAND,
-        'nodes': ('tests/test_a.py::test_one',),
-        'due_since': DUE_SINCE,
-        'reason': 'planning mode refused: server busy',
-    }
-    fields.update(overrides)
-    return StuckFiling(**fields)  # type: ignore[arg-type]
+    return replace(STUCK, **overrides)
 
 
 def _record(queue: EscalationQueue, escalation_id: str):
