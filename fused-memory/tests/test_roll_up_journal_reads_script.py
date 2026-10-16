@@ -267,6 +267,67 @@ class TestPanelInvariance:
         assert mismatch['observed'] == mismatch['expected'] + 1000
 
 
+class TestReadRetentionHorizon:
+    """Snapshot windows stop at the raw read horizon fused-memory actually
+    prunes to, which its config.yaml reads from WRITE_JOURNAL_READ_RETENTION_DAYS,
+    not at WriteJournalConfig's code default."""
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_retention(self, monkeypatch):
+        monkeypatch.delenv('WRITE_JOURNAL_READ_RETENTION_DAYS', raising=False)
+
+    def _week_snapshot(self, journal, capsys, out, *extra: str):
+        return _run(
+            capsys, 'snapshot', '--journal', str(journal), '--out', str(out),
+            '--window-hours', '168', '--window-end', _WINDOW_END.isoformat(), *extra,
+        )
+
+    def test_the_configured_retention_refuses_a_window_past_it(
+        self, journal, capsys, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv('WRITE_JOURNAL_READ_RETENTION_DAYS', '3')
+        out = tmp_path / 'refused.json'
+
+        code, report, err = self._week_snapshot(journal, capsys, out)
+
+        assert code == 1
+        assert report is None
+        assert 'read retention horizon' in err
+        assert not out.exists()
+
+    def test_without_config_path_the_checkouts_config_is_read_not_the_cwds(
+        self, journal, capsys, tmp_path, monkeypatch,
+    ):
+        monkeypatch.delenv('CONFIG_PATH', raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('WRITE_JOURNAL_READ_RETENTION_DAYS', '3')
+
+        code, _, err = self._week_snapshot(journal, capsys, tmp_path / 'refused.json')
+
+        assert code == 1
+        assert 'read retention horizon' in err
+
+    def test_an_explicit_retention_overrides_the_configured_one(
+        self, journal, capsys, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv('WRITE_JOURNAL_READ_RETENTION_DAYS', '3')
+
+        code, report, err = self._week_snapshot(
+            journal, capsys, tmp_path / 'accepted.json', '--read-retention-days', '30',
+        )
+
+        assert code == 0, err
+        assert report is not None and report['read_retention_days'] == 30.0
+
+    def test_the_report_names_the_configured_retention_it_used(
+        self, journal, capsys, tmp_path,
+    ):
+        code, report, err = self._week_snapshot(journal, capsys, tmp_path / 'default.json')
+
+        assert code == 0, err
+        assert report is not None and report['read_retention_days'] == 30.0
+
+
 def _twin_journals(tmp_path) -> tuple[Path, Path]:
     twins = []
     for name in ('interrupted', 'uninterrupted'):

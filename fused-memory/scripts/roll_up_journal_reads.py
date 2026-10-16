@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fused_memory.config.schema import WriteJournalConfig
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.services.read_rollup import (
     COUNT_ONLY_READ_PREDICATE,
     COUNT_READ_SQL,
@@ -32,6 +33,9 @@ from fused_memory.services.read_rollup import (
 )
 
 DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
+#: The config fused-memory reads when CONFIG_PATH is unset, as
+#: fused_memory/server/main.py::run_server defaults it.
+SERVICE_CONFIG = Path(__file__).resolve().parents[1] / 'config' / 'config.yaml'
 DEFAULT_CHUNK_ROWIDS = 5000
 DEFAULT_PAUSE_SECONDS = 0.5
 DEFAULT_DEPLOY_GRACE_MINUTES = 15.0
@@ -244,10 +248,25 @@ def require_no_recent_count_only_read(
         )
 
 
-def panel_windows(end: datetime, hours: Sequence[int], *, now: datetime) -> tuple[Window, ...]:
+def configured_read_retention_days() -> float:
+    """fused-memory's raw read horizon, loaded as the service loads it: from
+    $CONFIG_PATH, else SERVICE_CONFIG, with ${VAR:default} expanded from this
+    process's environment."""
+    previous = os.environ.get('CONFIG_PATH')
+    os.environ['CONFIG_PATH'] = previous or str(SERVICE_CONFIG)
+    try:
+        return FusedMemoryConfig().write_journal.read_retention_days
+    finally:
+        if previous is None:
+            del os.environ['CONFIG_PATH']
+
+
+def panel_windows(
+    end: datetime, hours: Sequence[int], *, now: datetime, read_retention_days: float
+) -> tuple[Window, ...]:
     """Windows ending at *end*, refused if any reaches past the raw read horizon,
     where a startup prune may delete raw reads between snapshot and verify."""
-    horizon = now - timedelta(days=WriteJournalConfig().read_retention_days)
+    horizon = now - timedelta(days=read_retention_days)
     windows = tuple(
         Window(start=(end - timedelta(hours=h)).isoformat(), end=end.isoformat(), hours=h)
         for h in hours
@@ -510,6 +529,11 @@ def build_parser() -> argparse.ArgumentParser:
         '--window-end', type=journal_hour, default=None,
         help='window end, floored to the hour (default: the hour before the current one)',
     )
+    snap.add_argument(
+        '--read-retention-days', type=float, default=None,
+        help="fused-memory's raw read horizon (default: write_journal.read_retention_days "
+        'from $CONFIG_PATH, else fused-memory/config/config.yaml, under this environment)',
+    )
 
     check = commands.add_parser('verify', parents=[common], help='compare against a snapshot')
     check.add_argument('--snapshot', type=Path, required=True)
@@ -549,11 +573,18 @@ def _run_status(args: argparse.Namespace) -> int:
 def _run_snapshot(args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     end = args.window_end or journal_hour(now.isoformat()) - timedelta(hours=1)
-    windows = panel_windows(end, args.window_hours, now=now)
+    retention = args.read_retention_days
+    if retention is None:
+        retention = configured_read_retention_days()
+    windows = panel_windows(end, args.window_hours, now=now, read_retention_days=retention)
     with closing(connect_read_only(args.journal)) as conn:
         recorded = snapshot(conn, windows)
     args.out.write_text(json.dumps(recorded, indent=2))
-    _print_json({'out': str(args.out), 'windows': [asdict(w) for w in windows]})
+    _print_json({
+        'out': str(args.out),
+        'windows': [asdict(w) for w in windows],
+        'read_retention_days': retention,
+    })
     return 0
 
 

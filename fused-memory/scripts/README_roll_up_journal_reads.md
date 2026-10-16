@@ -65,9 +65,19 @@ $RJ snapshot --out /tmp/task5405-panel-before.json
 This records the Memory panel's numbers for 1 h, 24 h and 7 d windows, keyed
 `(hour, kind, operation)`. The windows end at the hour before the current one,
 so the in-flight hour is excluded. Override that with `--window-hours` /
-`--window-end`. Windows reaching past the 30-day raw read horizon are refused,
+`--window-end`. Windows reaching past the raw read horizon are refused,
 because a fused-memory restart's prune may delete raw reads that old between
 snapshot and verify.
+
+The horizon is fused-memory's `write_journal.read_retention_days`, 30 days
+unless `WRITE_JOURNAL_READ_RETENTION_DAYS` says otherwise. The script loads
+it the way the service does: from `$CONFIG_PATH`, else
+`fused-memory/config/config.yaml`, with `${VAR:default}` expanded from YOUR
+shell's environment. The report's `read_retention_days` shows the value it
+used. If the service's environment differs from yours, pass the service's
+value with `--read-retention-days`. The service's environment is the unit's
+(`systemctl --user show fused-memory.service -p Environment`) plus
+`fused-memory/.env`.
 
 ### 3. Pilot
 
