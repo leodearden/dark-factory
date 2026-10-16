@@ -554,6 +554,14 @@ _SNAPSHOT_KEYS = frozenset({
 })
 
 
+def _arm_transient_cooldown(scheduler: Scheduler, task_id: str) -> None:
+    scheduler.record_requeue(
+        task_id, phase='execute', reason='agent API error: HTTP 529', detail='',
+        run_id=f'run-{task_id}', cost_usd=0.0, api_error_status=529,
+    )
+    scheduler.release(task_id, requeued=True)
+
+
 class TestGetStateSnapshotShape:
     """get_state_snapshot() returns a SchedulerStateSnapshot with the thirteen wire keys."""
 
@@ -649,15 +657,16 @@ class TestGetStateSnapshotShape:
     def test_snapshot_is_a_value_unaffected_by_later_scheduler_changes(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
-        scheduler._skip_count['X'] = 3
+        scheduler.lock_table.install_parks('P', ['mod/a'], 'high')
         snap = scheduler.get_state_snapshot()
 
-        scheduler._skip_count['X'] = 99
-        scheduler.lock_table.install_parks('P', ['mod/a'], 'high')
+        scheduler.lock_table.clear_parks_for('P')
+        scheduler.lock_table.install_parks('Q', ['mod/b'], 'high')
+        _arm_transient_cooldown(scheduler, 'T1')
 
-        assert snap.skip_counts == {'X': 3}
-        assert snap.parks == {}
-        assert snap.park_stacks == {}
+        assert set(snap.parks) == {'P'}
+        assert set(snap.park_stacks) == {'mod/a'}
+        assert snap.requeue_cooldowns == {}
 
     def test_snapshot_fields_cannot_be_reassigned(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
@@ -800,32 +809,28 @@ class TestWriteStateSnapshot:
             f'Expected keys {_SNAPSHOT_KEYS}, got {set(data.keys())}'
         )
 
-    def test_written_file_parses_back_to_the_producer_snapshot(self, tmp_path):
-        """I4, producer half: the file is the model's wire form, nothing more or less."""
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=3))
-        scheduler.finish_startup()
-        scheduler._skip_count['T9'] = 2
-        scheduler.lock_table.install_parks('P', ['pin/mod'], PinOrder(1))
-        path = tmp_path / 'scheduler_state.json'
-        scheduler._write_state_snapshot_raw(path)
-
-        on_disk = SchedulerStateSnapshot.from_json(json.loads(path.read_text()))
-        produced = scheduler.get_state_snapshot()
-
-        assert on_disk.snapshot_at is not None
-        assert on_disk.model_copy(update={'snapshot_at': None}) == produced.model_copy(
-            update={'snapshot_at': None}
-        )
-
     @pytest.mark.asyncio
-    async def test_flush_writes_to_the_project_layout_path(self, tmp_path):
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1, project_root=tmp_path))
+    async def test_flushed_file_parses_back_to_the_producer_snapshot(self, tmp_path):
+        """I4, producer half: the file is the model's wire form, nothing more or less."""
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1, lock_depth=3, project_root=tmp_path),
+        )
         scheduler.finish_startup()
+        scheduler.lock_table.install_parks('P', ['pin/mod'], PinOrder(1))
+        _arm_transient_cooldown(scheduler, 'T1')
 
         await scheduler.flush_state_snapshot()
 
-        written = json.loads(scheduler_state_json(tmp_path).read_text())
-        assert SchedulerStateSnapshot.from_json(written).snapshot_at is not None
+        on_disk = SchedulerStateSnapshot.from_json(
+            json.loads(scheduler_state_json(tmp_path).read_text()),
+        )
+        produced = scheduler.get_state_snapshot()
+        assert on_disk.snapshot_at is not None
+        assert set(on_disk.pin_reservations) == {'P'}
+        assert set(on_disk.requeue_cooldowns) == {'T1'}
+        assert on_disk.model_copy(update={'snapshot_at': None}) == produced.model_copy(
+            update={'snapshot_at': None}
+        )
 
     def test_write_state_snapshot_atomic_replace(self, tmp_path):
         """Second write overwrites the first; no partial writes visible."""
