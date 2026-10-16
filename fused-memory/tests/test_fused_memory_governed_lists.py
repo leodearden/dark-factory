@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from _fm_helpers import load_script_module
-from shared.governed_exceptions import governed_exceptions
+from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
 
 from fused_memory.memory_metadata import BLESSED_METADATA_KEYS
 
@@ -26,6 +26,8 @@ BLESSED_MEMORY_METADATA_KEYS = governed_exceptions(
     'A high-volume conventional memory-metadata key outside the reserved vocabulary that '
     'the metadata census accepts without an unknown-key warning.',
     sorted(BLESSED_METADATA_KEYS),
+    default=Debt(TaskRef(5603)),
+    default_covers=8,
 )
 
 WALL_CLOCK_DEADLINE_BASELINE = governed_exceptions(
@@ -33,6 +35,8 @@ WALL_CLOCK_DEADLINE_BASELINE = governed_exceptions(
     'Per-file budgets of wall-clock-deadline (Rule C) violations grandfathered when the '
     'rule was adopted; each budget may only fall.',
     ['fused-memory/scripts/check_bare_magicmock_config.py::_WALL_CLOCK_DEADLINE_DEBT'],
+    default=Debt(TaskRef(5603)),
+    default_covers=1,
 )
 
 
