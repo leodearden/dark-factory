@@ -62,13 +62,13 @@ User-observable when it lands:
 | `declare_defect` / `record_defect_outcome` write path (α2) | δ2's writer, ε's declaration copy, ζ1/ζ2's proofs, δ2's rulings, `scripts/prove_defect.py`, θ1's filers |
 | Injected pytest plugin: markers, collection map, outcome recorder (β) | The proof (ζ1), the presence check (η), the client feed (ι, and client-feed ε 6972) |
 | Static defect enumerator `shared/src/shared/defect_enumerator.py` (β) | The proof's ref → node-id resolution (ζ1), the keep-ratchet (η) |
-| `DEFECT_TEST_RULE` constant (γ) | Six dispatched role prompts; `skills/unblock`, `skills/unblock-low-risk`, `CONTRIBUTING.md` (rendered excerpts) |
+| `DEFECT_TEST_RULE` constant (γ) | The system prompts of the five fixing roles (ARCHITECT, IMPLEMENTER, SIMPLE_TASK, DEBUGGER, STEWARD); `skills/unblock`, `skills/unblock-low-risk`, `CONTRIBUTING.md` (rendered excerpts) |
 | Reviewer `kind` and `defect_rulings` contract (δ1) | δ2's writer and ruling application; θ's `review_completed.by_kind` (client-feed 6967) |
 | Plan tools for `reproduces` and declarations, and the plan predicate (ε) | The workflow plan, replan and simple paths; the `defect_plan_check` event; the architect re-prompt in enforce |
 | Proof runner, `DefectProof` and `scripts/prove_defect.py` (ζ1) | `defects[].proof`; the presence check (η); the client feed (ι); the human paths (`/unblock`, hand carries) |
 | Workflow proof integration (ζ2) | The `defect_proof` events; the typed replan; the fleet streak escalation |
 | Merge presence check and keep-ratchet (η) | The merge refusal (`DefectMergeRefusal`) in `merge_status`; the `defect_keep_check` event |
-| `defect_tests:` config group (ε) | ε, ζ2, η read it; μ flips `mode` |
+| `defect_tests:` config group (β) | β (injection off), ε, ζ1, ζ2, η read it; μ flips `mode` |
 
 ## Resolved design decisions
 
@@ -242,7 +242,12 @@ Design decisions taken in this session:
     - δ2's writer declares blocking `kind=defect` issues **before** the `max_review_cycles` cap check,
       so a final-cycle defect is still declared.
 17. **The rule text has one home.** `DEFECT_TEST_RULE` in `roles.py` is spliced by one helper into
-    each role prompt that fixes code. Skills and `CONTRIBUTING.md` carry a pointer plus a rendered
+    the system prompt of each role that fixes code: ARCHITECT (which also runs the replan),
+    IMPLEMENTER (which also runs the amender), SIMPLE_TASK, DEBUGGER and STEWARD. That is one site per
+    dispatch, never a second copy in a briefing builder. Declared defects themselves are rendered by
+    `_format_task` in the task-preamble briefings (architect, replan, simple-task, steward-initial). The
+    debugger and amender briefings carry no task record, so they get the rule, and the marker visible
+    in the code, but not the list. Skills and `CONTRIBUTING.md` carry a pointer plus a rendered
     excerpt mirrored by a test (INV-10 mirror tier). The guard asserts the splice by identity with a
     sentinel (`guards-exercise-behaviour`).
 18. **Client-facing display carries typed fields only.** The feed shows ref, test ids, outcome,
@@ -284,18 +289,17 @@ Design decisions taken in this session:
     on `PYTHONPATH` in `verify.py::_target_subprocess_env`.
   - The static enumerator `shared/src/shared/defect_enumerator.py` is built on
     `shared/src/shared/pytest_mark_grammar.py`, with per-file completeness and skip/xfail detection.
-- **γ Rule.** The `DEFECT_TEST_RULE` constant and splice helper; `_format_task` rendering of
-  declared defects into the architect, replan and simple-task briefings.
+- **γ Rule.** The `DEFECT_TEST_RULE` constant and splice helper into the five role system prompts;
+  `_format_task` rendering of declared defects into the task-preamble briefings.
 - **δ1 Reviewer contract.** `kind` and `defect_rulings`, with validation.
 - **δ2 Reviewer consumption.** The in-task declaration writer, the application of rulings, and the
   reviewer briefing showing declared defects, pending closures and retirements.
 - **ε Plan.**
   - Plan tools: `reproduces` on `add_plan_step`, plus `declare_not_reproducible`,
     `declare_withdrawn` and `retire_defect_test`.
-  - `step_type` is validated as an enum.
+  - (`step_type` enum validation is task 5752's, a prerequisite.)
   - `plan_reproduces_declared_defects(plan, defects) -> PlanCheck`, at every plan-producing site.
   - In enforce, the simple-path veto.
-  - The `defect_tests:` config group.
 - **ζ1 Proof runner.** The `PROOF_BASE` worktree kind, the overlay, the injected-plugin pytest legs,
   `DefectProof`, and `scripts/prove_defect.py`, all recording through `record_defect_outcome` (α2).
 - **ζ2 Workflow proof integration.** The hook after both VERIFY arms, the typed replan, the persisted
@@ -397,7 +401,7 @@ prose.
 | Merge checks | one call from the merge gate into `merge_lane/defect_checks.py` |
 | Reviewer briefing | `briefing.py::build_reviewer_prompt`, on the task block task 5369 adds |
 
-### Config (`config.py::OrchestratorConfig`, group `defect_tests:`, in the reload green tier)
+### Config (`config.py::OrchestratorConfig`, group `defect_tests:`, in the reload green tier; built by β)
 
 - `mode` (`shadow`)
 - `max_plan_repairs` (1)
@@ -454,8 +458,9 @@ These in-flight tasks edit the same surfaces, so the leaves named depend on them
   the map.
 - **7008** → ξ only.
 
-δ2, ε and ζ2 all edit `workflow.py::TaskWorkflow._execute_verify_review_loop`, so they are chained
-δ2 → ε → ζ2. Tier 1 (α1 → β → γ) waits on none of δ, ε or α2.
+Same-file serialization (overlay rule): `workflow.py` δ2 → ε → ζ2 → κ; `roles.py` γ → δ1 → θ1;
+`briefing.py` γ → δ2 → ζ2 → κ; `artifacts.py` δ1 → ε → ζ2; `event_store.py` ε only (it defines all three
+event types); the authorized-raises file ζ1 → η. Tier 1 (α1 → β → γ) waits on none of δ, ε or α2.
 
 No novel substrate is assumed beyond what the leaves build. Per-leaf G3 evidence goes in the
 capability manifest at decompose.
@@ -501,19 +506,27 @@ and the merge-lane ratchet where it applies.
   recorder); the `-p` injection into structured pytest legs in `verify_cmd.py` and the `PYTHONPATH`
   entry in `verify.py::_target_subprocess_env`, both skipped when mode is `off`;
   `shared/src/shared/defect_enumerator.py` on `pytest_mark_grammar.py`; dark-factory's members also
-  list the marker in pyproject, with a drift test.
+  list the marker in pyproject, with a drift test; the `defect_tests:` config group (Config section) in
+  `config.py`/`defaults.yaml` and the reload green tier, so that β, ε, ζ1, ζ2 and η all read it from an
+  upstream leaf. The `PYTHONPATH` entry is merged with any existing value, never assigned
+  (`_target_subprocess_env` gains the config it needs). `verify.py::_archive_junit_report` also
+  archives the sibling `<junit>.tests.json` beside the archived junit under the same stem, so a reader
+  of `data/verify-logs/` sees the map. β pins two contracts its consumers rely on: the outcome
+  recorder's switch and file (`--df-defect-outcomes=<path>` writing
+  `{nodeid: {side_outcome, exc_type, missing_symbol}}`), and a pure per-file enumerator entry
+  point (`enumerate_source(path, text)`) under the tree walker, so η can enumerate from git objects.
 - *Signal:* B18, B21, B22 (a non-workspace project verifies with the marker registered and its own
   modules unshadowed, and its map lists a marked test); `python -m shared.defect_enumerator <tree>`
   prints refs and completeness.
 - *Prereqs:* α1.
 
 **γ Defect-test rule in every fixing prompt (Tier 1).**
-- *Scope:* `DEFECT_TEST_RULE` and the splice helper; splices into ARCHITECT, `build_replan_prompt`,
-  SIMPLE_TASK, DEBUGGER, STEWARD and `build_amender_prompt`; `_format_task` renders declared
-  defects; rendered excerpts plus a mirror test in `skills/unblock`, `skills/unblock-low-risk` and
+- *Scope:* `DEFECT_TEST_RULE` and the splice helper; splices into the system prompts of ARCHITECT,
+  IMPLEMENTER, SIMPLE_TASK, DEBUGGER and STEWARD (decision 17: one site per dispatch);
+  `_format_task` renders declared defects in the task-preamble briefings; rendered excerpts plus a mirror test in `skills/unblock`, `skills/unblock-low-risk` and
   `CONTRIBUTING.md` (the human paths' only lever).
-- *Signal:* a persisted architect or debugger briefing for a task carrying `defects` lists them and
-  contains the rule; the sentinel identity test passes for all six builders.
+- *Signal:* a persisted architect briefing for a task carrying `defects` lists them; the persisted
+  system prompt of each of the five roles contains the rule exactly once (sentinel identity test).
 - *Prereqs:* α1, β, 5753, 5532, 5357.
 
 **δ1 Reviewer contract.**
@@ -523,7 +536,7 @@ and the merge-lane ratchet where it applies.
   validator; the legacy `kind` default in the review-payload normaliser; `_format_issue_section`
   renders `kind`.
 - *Signal:* B7.
-- *Prereqs:* α1, 5494, 6739, 5224.
+- *Prereqs:* α1, γ (roles.py serialization), 5494, 6739, 5224.
 
 **δ2 Reviewer consumption.**
 - *Scope:* the in-task declaration writer (idempotent hash refs, before the cap check, via α2's
@@ -535,12 +548,14 @@ and the merge-lane ratchet where it applies.
 **ε Plan tools, plan check and mode.**
 - *Scope:* `reproduces` on `add_plan_step` and the replace path; `declare_not_reproducible`,
   `declare_withdrawn` and `retire_defect_test` plan tools, copied to the task via `declare_defect`
-  by the workflow;
-  `step_type` enum validation; `orchestrator/src/orchestrator/defect_tests.py::plan_reproduces_declared_defects`
-  at the plan sites; the simple-path veto; the persisted `defect_plan_repairs_total`; the
-  `defect_tests:` config group in the reload green tier; the `defect_plan_check` event.
+  by the workflow (via `SchedulerFacade.dispatch_tool`);
+  `orchestrator/src/orchestrator/defect_tests.py::plan_reproduces_declared_defects` at the plan
+  sites; the simple-path veto; the persisted `defect_plan_repairs_total`; all three event types
+  (`defect_plan_check`, `defect_proof`, `defect_keep_check`) in `event_store.py`, so ζ2 and η only emit
+  them and `event_store.py` has one editor; ε emits `defect_plan_check`. Relies on 5752's `step_type`
+  validation and β's config group.
 - *Signal:* B2 in shadow and enforce; the declaration half of B8, B9 and B23.
-- *Prereqs:* α2, δ2, 5752.
+- *Prereqs:* α2, β, δ2, 5752.
 
 **ζ1 Proof runner.**
 - *Scope:* the `WorktreeKind.PROOF_BASE` and `PROTECTED_PREFIXES` entry in `git_ops.py` (a
@@ -558,8 +573,10 @@ and the merge-lane ratchet where it applies.
 - *Scope:* the hook after both VERIFY arms; the skip on a current `PROVEN`; I2 transitions via
   `record_defect_outcome`;
   `ReplanCause` and `build_replan_prompt` rendering; the persisted `defect_proof_replans_total`;
-  the `PROOF_UNAVAILABLE` retry, the info L1 and the `KeyedStreaks` L2; `scripts/defect_tests_soak_report.py`
-  (read-only, from `runs.db` events).
+  the `PROOF_UNAVAILABLE` retry, the info L1 and the `KeyedStreaks` L2 (one process-level instance
+  injected into every `TaskWorkflow`, so the streak spans tasks); `scripts/defect_tests_soak_report.py`
+  (read-only, from `runs.db` events; reads `defect_plan_check`, `defect_proof` and
+  `defect_keep_check` by event type).
 - *Signal:* B1/B3/B5 `defect_proof` events in `runs.db`; the soak report prints them.
 - *Prereqs:* ε, ζ1.
 
@@ -568,9 +585,11 @@ and the merge-lane ratchet where it applies.
   ratchet's `new_function_cognitive_ceiling`) with one gate call, its raise recorded in the
   authorized-raises file; the I8 presence check; the I6 keep-ratchet against the candidate's parent;
   the typed `DefectMergeRefusal` on the merge outcome (not the free-text `reason`); the
-  `defect_keep_check` event; soak report rows.
+  `defect_keep_check` event (ζ2's soak report reads it by its event type). Live defects are read
+  through the worker's scheduler `get_task`; a missing scheduler or a git error reports
+  `KEEP_CHECK_INCOMPLETE`, never a pass (I7).
 - *Signal:* B10–B14, B16 and B23 at the merge lane.
-- *Prereqs:* α2, β, ζ1.
+- *Prereqs:* α2, β, ε (event types), ζ1.
 
 **θ1 Auto-filing sites declare defects.**
 - *Scope:* `roles.py::submit_only_instructions` gains a structured `defects` parameter used by
@@ -579,13 +598,14 @@ and the merge-lane ratchet where it applies.
   `_execute_combine` adds them through `declare_defect` only to a `pending` target and otherwise files
   a separate task.
 - *Signal:* B15; an implementer follow-up carries `origin: agent_followup`.
-- *Prereqs:* α2.
+- *Prereqs:* α2, δ1 (roles.py serialization).
 
 **θ2 Docs and skills** (`complexity: simple` candidate).
 - *Scope:* `docs/quality-findings-contract.md` §8 (one pointer sentence: correctness findings only,
   `ref = finding:<fk>`); the `skills/review`, `skills/hotspot-survey` and `skills/review-all`
-  templates point there; `docs/task-authoring.md` hand-filing recipes for `human`, `red_main` (naming
-  the escalation field that carries `main_health_signature`, which θ2 locates) and interim `client`;
+  templates point there; `docs/task-authoring.md` hand-filing recipes for `human`, `red_main` (its ref
+  uses `metadata.main_health_signature`, which the merge lane stamps on the fix-main task, not an
+  escalation field) and interim `client`;
   `plans/flake-ledger-prd.md` §6 reciprocal sentence.
 - *Signal:* a `/review` filing per the template produces a task whose `defects` validates; the
   mirror test passes.
@@ -593,7 +613,10 @@ and the merge-lane ratchet where it applies.
 
 **ι Client-feed defect display.**
 - *Scope:* `cases[].defects` and the `defects_results` fold in `client-feed`, with the `not_recorded`
-  state and typed fields only.
+  state and typed fields only; the defects field of the archived `.tests.json` map (β) read in
+  `criteria.py`; a typed `defects` projection added to `sources/tasks.py`'s metadata allowlist (for
+  exemption or withdrawal reason and owner). `defects_results` is computed from map and junit
+  independently of the `max_cases_per_run` cap on `cases`.
 - *Signal:* the publisher run against dark-factory's own merge-run junit and map, as client-feed ε
   does, shows a real defect ref with its outcome. The row is observed, not seeded.
 - *Prereqs:* β, ζ2, 6972, 7002, 6969, 7008.
@@ -604,7 +627,7 @@ and the merge-lane ratchet where it applies.
   `could_not_determine` state to `build_reviewer_prompt`.
 - *Signal:* a review after a debugger edit of a failing test shows the fact in the persisted
   reviewer briefing.
-- *Prereqs:* δ2, 5357.
+- *Prereqs:* δ2, ζ2 (workflow.py and briefing.py serialization), 5357.
 
 **λ Integration gate.**
 - *Scope:* one boundary module implementing B1–B23 against the real seams.
