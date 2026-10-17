@@ -52,8 +52,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import sqlite3
+import threading
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
+from typing import Any, TypeVar
 
 import aiosqlite
 import pytest
@@ -81,6 +85,10 @@ STALE_RUN_AGE_SECONDS = 2000.0
 # seed, 0.93 s for the 40-iteration loop.
 FILLER_RUNS = 24_000
 COLLISION_ITERATIONS = 40
+
+# A hang guard only: never elapses on a passing run.  It turns a harness bug into
+# a legible failure instead of a wedged worker thread.
+_GATE_HANG_GUARD_SECS = 30.0
 
 CHECKPOINT_ITERATIONS = 20
 # This failure class can present as an unbounded block as well as a raise, and a
@@ -169,9 +177,105 @@ async def test_each_collision_store_runs_its_statements_on_its_injected_connecti
         await journal.close()
 
 
+class _GateState(enum.Enum):
+    ARMED = enum.auto()
+    STARTED = enum.auto()
+    PARKED = enum.auto()
+
+
+class _StatementGate:
+    """Parks the first statement to start on a connection, just after it pins its snapshot.
+
+    Progress callbacks also fire while a statement is being PREPARED, before its
+    snapshot exists, so the gate waits for the statement's own trace callback.
+    The first progress callback after that is past ``OP_Transaction``.  Both
+    callbacks run on the connection's one worker thread, so the state needs no
+    lock.
+
+    Single-use: once parked, both callbacks are inert for the rest of the
+    connection's life, so the gate is never uninstalled.  aiosqlite's
+    annotations do not admit the ``None`` that would clear them.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.parked = asyncio.Event()
+        self._loop = loop
+        self._released = threading.Event()
+        self._state = _GateState.ARMED
+
+    def on_statement(self, sql: str) -> None:
+        if self._state is _GateState.ARMED:
+            self._state = _GateState.STARTED
+
+    def on_progress(self) -> int:
+        if self._state is _GateState.STARTED:
+            self._state = _GateState.PARKED
+            self._loop.call_soon_threadsafe(self.parked.set)
+            if not self._released.wait(timeout=_GATE_HANG_GUARD_SECS):
+                raise TimeoutError('the statement gate was never released')
+        return 0
+
+    async def install(self, conn: aiosqlite.Connection) -> None:
+        await conn.set_trace_callback(self.on_statement)
+        await conn.set_progress_handler(self.on_progress, 1)
+
+    def release(self) -> None:
+        self._released.set()
+
+
+async def _sqlite_error_name(op: Callable[[], Awaitable[object]]) -> str | None:
+    """Await ``op`` and return its SQLite error name, or None if it raised nothing."""
+    try:
+        await op()
+    except sqlite3.OperationalError as exc:
+        return exc.sqlite_errorname
+    return None
+
+
+_Rows = TypeVar('_Rows')
+
+
+async def _collide_with_a_pinned_read(
+    conn: aiosqlite.Connection,
+    *,
+    read: Callable[[], Coroutine[Any, Any, _Rows]],
+    write: Callable[[], Awaitable[object]],
+    foreign_commit: Callable[[], Awaitable[None]],
+) -> tuple[_Rows, str | None]:
+    """Issue ``write`` into ``read``'s pinned-snapshot window on ``conn``, after a foreign commit.
+
+    Returns the read's result and the write's SQLite error name (None if it
+    raised nothing).  The order is constructed, not raced:
+
+    1. ``read`` parks in the gate on ``conn`` with its snapshot pinned.
+    2. The writer task is created, then the test suspends on ``foreign_commit``.
+       asyncio's FIFO ready queue runs the writer's first step during that
+       suspension, which either queues its statement behind the parked hop or
+       parks it on :class:`AtomicConnection`'s lock.
+    3. The foreign commit lands, so the pinned snapshot is now stale.
+    4. Only then is the gate released.
+    """
+    gate = _StatementGate(asyncio.get_running_loop())
+    await gate.install(conn)
+    async with asyncio.TaskGroup() as tasks:
+        reader = tasks.create_task(read())
+        try:
+            await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+            writer = tasks.create_task(_sqlite_error_name(write))
+            await foreign_commit()
+        finally:
+            gate.release()
+    return reader.result(), writer.result()
+
+
+@pytest.fixture
+def journal_tap() -> _ConnectTap:
+    return _ConnectTap()
+
+
 @pytest_asyncio.fixture
-async def journal(tmp_path):
-    store = ReconciliationJournal(tmp_path / 'recon')
+async def journal(tmp_path, journal_tap):
+    store = ReconciliationJournal(tmp_path / 'recon', connect=journal_tap)
     await store.initialize()
     try:
         yield store
@@ -202,12 +306,12 @@ async def second_connection(journal):
         await conn.close()
 
 
-async def _seed_runs(conn, *, filler: int, stale_run: bool) -> None:
-    """Insert the run rows the arms race against, in ONE ``executemany``.
+async def _seed_runs(conn, *, stale_run: bool, filler: int = 0) -> None:
+    """Insert the run rows the arms collide against, in ONE ``executemany``.
 
     ``live`` is the write target (started now, so the reaper's age filter never
-    returns it), ``r3`` is the foreign writer's target, and ``long`` — present only
-    when *stale_run* — is the one row the reaper's scan actually matches.
+    returns it), ``r3`` is the racing arms' foreign-writer target, and ``long`` —
+    present only when *stale_run* — is the one row the reaper's scan matches.
     """
     now = datetime.now(UTC)
     # completed_at is NULL for a running run, so the element type must admit None:
@@ -239,6 +343,33 @@ async def _seed_runs(conn, *, filler: int, stale_run: bool) -> None:
             )
         )
     async with conn.executemany(_INSERT_RUN, rows):
+        pass
+    await conn.commit()
+
+
+# The reaper's scan, test-owned: the legacy controls run it in the replaced
+# execute + fetchall shape on the journal's own connection.
+_LEGACY_REAPER_SCAN = "SELECT * FROM runs WHERE status = 'running' AND started_at < ?"
+
+
+async def _legacy_multi_hop_read(
+    conn: aiosqlite.Connection, sql: str, params: tuple[object, ...]
+) -> list[aiosqlite.Row]:
+    """The replaced read shape: execute and fetch as separate queued hops."""
+    async with conn.execute(sql, params) as cur:
+        return list(await cur.fetchall())
+
+
+async def _file_a_late_stale_run(conn: aiosqlite.Connection) -> None:
+    """Commit run ``late``, which the reaper's scan WOULD match, from ``conn``.
+
+    A read pinned before this commit cannot return it, which is how each journal
+    collision arm certifies that the collision really happened.
+    """
+    started = (datetime.now(UTC) - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat()
+    async with conn.execute(
+        _INSERT_RUN, ('late', PROJECT_ID, 'full', 'seed', started, None, 'running')
+    ):
         pass
     await conn.commit()
 
@@ -350,7 +481,7 @@ async def test_no_stale_run_means_no_pinned_read_and_no_failures(journal, second
 @pytest.mark.asyncio
 async def test_checkpoint_and_write_do_not_lock_each_other_out(journal, second_connection):
     """Arm C: ``checkpoint()`` concurrent with a write — neither side may raise."""
-    await _seed_runs(second_connection, filler=0, stale_run=False)
+    await _seed_runs(second_connection, stale_run=False)
 
     for i in range(CHECKPOINT_ITERATIONS):
         written, checkpointed = await asyncio.wait_for(
