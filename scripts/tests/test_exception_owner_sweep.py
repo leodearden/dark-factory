@@ -12,14 +12,21 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import shutil
+import socket
 import sqlite3
-from collections.abc import Mapping
+import subprocess
+import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import exception_register
 import pytest
 from _task_db_scan import tasks_db_path
+from exception_owner_liveness import Liveness
 from exception_owner_sweep import (
+    FAILURE_TASK_ID,
     FINDING_KEY_FIELD,
     INLINE_SCOPE,
     MAX_OUTPUTS_PER_RUN,
@@ -28,6 +35,7 @@ from exception_owner_sweep import (
     REPORT_COMMAND,
     TIGHTEN_COMMAND,
     TIGHTEN_KEY,
+    Action,
     ActOutcome,
     Citation,
     FailureStage,
@@ -35,13 +43,17 @@ from exception_owner_sweep import (
     FindingKind,
     Ports,
     RegisterView,
+    RunConfig,
     SweepFailure,
+    SweepResult,
     act,
+    escalation_url,
     parse_register,
     read_register,
+    run,
     scan,
 )
-from inline_suppression_fixtures import RUFF_CONFIG, track_fixture_tree
+from inline_suppression_fixtures import RUFF_CONFIG, SUBPROCESS_TIMEOUT_SECS, track_fixture_tree
 from shared.governed_exceptions import (
     Debt,
     Disposition,
@@ -899,3 +911,274 @@ def test_an_update_task_fault_is_a_fused_memory_failure(project_root, seed):
         sweep_once(cited_5149(INLINE_SCOPE), ports_for(project_root, stub))
 
     assert excinfo.value.stage is FailureStage.FUSED_MEMORY
+
+
+# ---------------------------------------------------------------------------
+# run(): the stamp, --dry-run and fail-loud (scenarios 21 and 23), and the CLI.
+
+T0 = NOW - datetime.timedelta(hours=20)
+
+ONE_DEAD = register_document(debt=(_site('m.py', 1, TaskRef(2733)),))
+
+
+def stamp_path(project_root: Path) -> Path:
+    return project_root / exception_register.SWEEP_STATE_PATH
+
+
+def write_prior_stamp(project_root: Path) -> Path:
+    """A stamp from a successful run at ``T0``, as the register's reader accepts it."""
+    path = stamp_path(project_root)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'last_run': T0.isoformat(), 'ok': True}), encoding='utf-8')
+    return path
+
+
+def run_once(
+    project_root: Path,
+    stub: StubMcp,
+    document: Mapping[str, object] | Callable[[], Mapping[str, object]],
+    *,
+    dry_run: bool = False,
+) -> SweepResult:
+    config = RunConfig(root=project_root, project_root=project_root, dry_run=dry_run)
+    read = document if callable(document) else lambda: document
+    return run(config, ports_for(project_root, stub), read_register=read, now=NOW)
+
+
+def stamped(project_root: Path) -> dict:
+    return json.loads(stamp_path(project_root).read_text(encoding='utf-8'))
+
+
+def test_a_clean_run_stamps_a_result_the_register_reads_as_fresh(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+
+    result = run_once(project_root, stub, ONE_DEAD)
+
+    assert result.ok
+    record = stamped(project_root)
+    assert record.keys() >= {
+        'checked', 'findings', 'filed', 'escalated', 'skipped_existing', 'overflow', 'slack', 'last_run', 'ok'
+    }
+    assert (record['ok'], record['last_run'], record['filed']) == (True, NOW.isoformat(), 1)
+    reading = exception_register.read_sweep(stamp_path(project_root), now=NOW)
+    assert (reading.status, reading.ok) == (exception_register.SweepStatus.FRESH, True)
+
+
+def test_scenario_23_a_dry_run_reports_what_it_would_do_and_writes_nothing(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}, {'id': 5149, 'status': 'pending'}]))
+    document = register_document(
+        declarations=(_declaration(LIST_SCOPE, default=Debt(TaskRef(2733))),),
+        debt=(_site('m.py', 1, TaskRef(2733)), _site('n.py', 2, TaskRef(5149))),
+        slack_total=54,
+    )
+
+    result = run_once(project_root, stub, document, dry_run=True)
+
+    assert result.ok
+    assert {tool for _, tool, _ in stub.calls} <= {'get_pending_escalations', 'resolve_ticket'}
+    assert not stamp_path(project_root).exists()
+    assert [(r.scope, r.owner, r.verdict.liveness, r.action) for r in result.reports] == [
+        (INLINE_SCOPE, TaskRef(2733), Liveness.DEAD, Action.FILE_TASK),
+        (INLINE_SCOPE, TaskRef(5149), Liveness.LIVE, None),
+        (LIST_SCOPE, TaskRef(2733), Liveness.DEAD, Action.FILE_ESCALATION),
+    ]
+    assert result.tighten is Action.FILE_TASK
+    assert (result.checked, result.findings, result.filed, result.slack) == (3, 2, 0, 54)
+
+
+def test_no_slack_plans_no_tighten(project_root, seed):
+    result = run_once(project_root, StubMcp(seed([])), register_document(slack_total=0), dry_run=True)
+
+    assert result.tighten is None
+
+
+def test_a_report_line_names_the_successor_that_keeps_an_owner_live(project_root, seed):
+    stub = StubMcp(
+        seed(
+            [
+                {'id': 11, 'status': 'done', 'metadata': {'x_coalesced_into': 12}},
+                {'id': 12, 'status': 'in-progress'},
+            ]
+        )
+    )
+    document = register_document(declarations=(_declaration(LIST_SCOPE, default=Debt(TaskRef(11))),))
+
+    (report,) = run_once(project_root, stub, document, dry_run=True).reports
+
+    line = report.line()
+    assert 'via successor' in line
+    assert '11' in line
+    assert '12' in line
+
+
+def test_scenario_21_an_unreadable_store_files_nothing_and_says_so_once(project_root):
+    prior = write_prior_stamp(project_root)
+    stub = StubMcp(tasks_db_path(project_root))
+
+    result = run_once(project_root, stub, ONE_DEAD)
+
+    assert stub.tool_calls('submit_task') == []
+    assert stub.tool_calls('update_task') == []
+    (escalated,) = stub.tool_calls('escalate_info')
+    assert (escalated['task_id'], escalated['category']) == (FAILURE_TASK_ID, 'infra_issue')
+    assert escalated['evidence'][0]['measured_at'] == NOW.isoformat()
+    assert result.ok is False
+    assert result.failure is not None
+    assert result.failure.stage is FailureStage.STORE
+    record = json.loads(prior.read_text(encoding='utf-8'))
+    assert (record['ok'], record['last_run']) == (False, T0.isoformat())
+
+
+def test_a_failure_with_no_prior_stamp_creates_none(project_root):
+    result = run_once(project_root, StubMcp(tasks_db_path(project_root)), ONE_DEAD)
+
+    assert result.ok is False
+    assert not stamp_path(project_root).exists()
+
+
+def _register_exited() -> Mapping[str, object]:
+    raise SweepFailure(FailureStage.REGISTER, 'exception_register.py exited 2')
+
+
+@pytest.mark.parametrize(
+    'document', [_register_exited, {**register_document(), 'schema_version': 2}], ids=['exited', 'unreadable']
+)
+def test_a_register_failure_fails_the_run_before_any_store_or_mcp_read(project_root, seed, document):
+    stub = StubMcp(seed([]))
+
+    result = run_once(project_root, stub, document)
+
+    assert result.ok is False
+    assert result.failure is not None
+    assert result.failure.stage is FailureStage.REGISTER
+    assert [tool for _, tool, _ in stub.calls] == ['escalate_info']
+
+
+def test_an_unreachable_escalation_server_fails_loud_without_raising(project_root, seed):
+    stub = StubMcp(
+        seed([{'id': 2733, 'status': 'done'}]),
+        fail_on=frozenset({'get_pending_escalations', 'escalate_info'}),
+    )
+
+    result = run_once(project_root, stub, ONE_DEAD)
+
+    assert result.ok is False
+    assert result.failure is not None
+    assert result.failure.stage is FailureStage.ESCALATION
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert 'escalate_info' in result.failure.detail
+    assert stub.tool_calls('submit_task') == []
+
+
+def test_a_failure_mid_act_keeps_what_landed_and_does_not_advance_the_stamp(project_root, seed):
+    prior = write_prior_stamp(project_root)
+    stub = StubMcp(
+        seed([{'id': 2733, 'status': 'done'}, {'id': 5149, 'status': 'pending'}]),
+        fail_on=frozenset({'update_task'}),
+    )
+    document = register_document(debt=(_site('m.py', 1, TaskRef(2733)), _site('n.py', 2, TaskRef(5149))))
+
+    result = run_once(project_root, stub, document)
+
+    assert result.failure is not None
+    assert (result.filed, result.ok, result.failure.stage) == (1, False, FailureStage.FUSED_MEMORY)
+    record = json.loads(prior.read_text(encoding='utf-8'))
+    assert (record['ok'], record['last_run'], record['filed']) == (False, T0.isoformat(), 1)
+
+
+@pytest.mark.parametrize('prior', [True, False], ids=['prior-stamp', 'no-stamp'])
+def test_a_failed_dry_run_still_escalates_nothing_and_writes_nothing(project_root, prior):
+    before = write_prior_stamp(project_root).read_bytes() if prior else None
+    stub = StubMcp(tasks_db_path(project_root))
+
+    result = run_once(project_root, stub, ONE_DEAD, dry_run=True)
+
+    assert result.ok is False
+    assert stub.tool_calls('escalate_info') == []
+    if before is None:
+        assert not stamp_path(project_root).exists()
+    else:
+        assert stamp_path(project_root).read_bytes() == before
+
+
+def test_the_escalation_url_is_the_projects_configured_port(tmp_path: Path):
+    root = tmp_path / 'proj'
+    root.mkdir()
+    (root / 'dark-factory-orchestrator.yaml').write_text('escalation:\n  port: 8102\n', encoding='utf-8')
+
+    assert escalation_url(root) == 'http://127.0.0.1:8102/mcp'
+
+
+def test_a_project_with_no_escalation_config_is_a_config_failure(tmp_path: Path):
+    with pytest.raises(SweepFailure) as excinfo:
+        escalation_url(tmp_path)
+
+    assert excinfo.value.stage is FailureStage.CONFIG
+
+
+SWEEP_SCRIPT = Path(__file__).resolve().parents[1] / 'exception_owner_sweep.py'
+
+
+def unbound_port() -> int:
+    """A loopback port nothing listens on: bound, read, then released."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
+
+
+def test_the_cli_dry_run_against_unreachable_servers_is_exit_two_and_writes_nothing(
+    tmp_path: Path, project_root, seed
+):
+    seed([{'id': 77, 'status': 'done'}])
+    tree = register_tree(tmp_path / 'tree', {'m.py': OWNED_MODULE})
+    port = unbound_port()
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SWEEP_SCRIPT),
+            '--dry-run',
+            '--root',
+            str(tree),
+            '--project-root',
+            str(project_root),
+            '--fused-memory-url',
+            f'http://127.0.0.1:{port}',
+            '--escalation-url',
+            f'http://127.0.0.1:{port}/mcp',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=SUBPROCESS_TIMEOUT_SECS,
+        check=False,
+    )
+
+    assert completed.returncode == 2, completed.stderr
+    assert json.loads(completed.stdout.splitlines()[-1])['ok'] is False
+    assert 'Traceback' not in completed.stderr
+    assert not stamp_path(project_root).exists()
+
+
+def test_a_missing_import_is_exit_two_and_never_a_traceback(tmp_path: Path):
+    """Only a real process can prove it: the fault happens before main exists.
+
+    The script is copied alone, so its first sibling import fails; ``-S``
+    hides the editable install, which an emptied ``PYTHONPATH`` alone cannot.
+    """
+    copy = tmp_path / SWEEP_SCRIPT.name
+    shutil.copyfile(SWEEP_SCRIPT, copy)
+    env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+
+    completed = subprocess.run(
+        [sys.executable, '-S', str(copy), '--dry-run'],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=SUBPROCESS_TIMEOUT_SECS,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 2, completed.stderr
+    assert 'uv run --project shared' in completed.stderr
+    assert 'Traceback' not in completed.stderr
