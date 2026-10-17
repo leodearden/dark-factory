@@ -384,10 +384,18 @@ async def test_a_release_that_failed_in_a_pass_is_retried_by_the_next_tick(tmp_p
     assert (record.in_outage, record.outage_escalation_id, record.probe_record_behind) == (False, outage, True)
     assert lane.escalation(outage).status == 'pending'
 
+    queue.failures = 1
     await lane.tick()
 
+    record = lane.record()
+    assert (record.outage_escalation_id, record.probe_record_behind) == (outage, True)
+    assert lane.escalation(outage).status == 'pending'
+
+    await lane.tick()
+
+    record = lane.record()
     assert lane.escalation(outage).status == 'resolved'
-    assert lane.record().outage_escalation_id is None
+    assert (record.outage_escalation_id, record.probe_record_behind) == (None, False)
 
 
 @pytest.mark.asyncio

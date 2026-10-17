@@ -456,10 +456,7 @@ class LaneEngine:
                 record, _ = await self._released(record, kind, reason)
             return record, False
         if not record.in_outage:
-            for kind in _PROBE_RECORDS:
-                if record.last_probe_result is None or kind.kind != record.last_probe_result.result:
-                    record, _ = await self._released(record, kind, _release_reason(record.last_probe_result))
-            return record, False
+            return await self._stale_records_released(record), False
         now = self._now()
         if record.last_probe_at is not None and now - record.last_probe_at < policy.recheck:
             return record, False
@@ -469,6 +466,24 @@ class LaneEngine:
         answer = await self._probe_runner(cmd, worktree)
         record, _ = await self._probe_records_kept(record, cmd, answer, _ProbeSource.TICK, None)
         return record, answer.result != ProbeKind.OUTAGE
+
+    async def _stale_records_released(self, record: CommandRecord) -> CommandRecord:
+        """The record with every stored probe record that no longer matches the last answer released.
+
+        The flag follows the releases: it stays set while any of them fails, and clears once all succeed.
+        """
+        answer = record.last_probe_result
+        stale = [
+            kind for kind in _PROBE_RECORDS
+            if kind.stored(record) is not None and (answer is None or kind.kind != answer.result)
+        ]
+        if not stale:
+            return record
+        behind = False
+        for kind in stale:
+            record, failed = await self._released(record, kind, _release_reason(answer))
+            behind = behind or failed
+        return replace(record, probe_record_behind=behind)
 
     async def _probe_records_kept(
         self,
