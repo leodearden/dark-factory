@@ -1489,12 +1489,18 @@ class TestRerunSetupErrorsOnlyIsUnconfirmable:
 
     def _run(self, verify_module, config, module_configs, failing, worktree,
              *, call_site='merge_gate', **kw):
-        return asyncio.run(
-            verify_module.confirm_isolated_rerun_verdict(
-                worktree, config, module_configs, failing,
-                call_site=call_site, **kw,
+        """Also fails if the verdict came from the fail-closed exception path,
+        which answers ``fails_in_isolation`` too."""
+        with patch.object(verify_module.logger, 'warning') as warning:
+            suppression = asyncio.run(
+                verify_module.confirm_isolated_rerun_verdict(
+                    worktree, config, module_configs, failing,
+                    call_site=call_site, **kw,
+                )
             )
-        )
+        rendered = [_fmt_log(call) for call in warning.call_args_list]
+        assert not [line for line in rendered if 'unexpected error' in line], rendered
+        return suppression
 
     def _run_one_group(self, tmp_path, rerun, *, failing=None, call_site='merge_gate'):
         from orchestrator import verify as verify_module
@@ -1510,7 +1516,7 @@ class TestRerunSetupErrorsOnlyIsUnconfirmable:
                 failing or _failing_result(), tmp_path, call_site=call_site,
             )
 
-    def _run_two_groups(self, tmp_path, output_by_prefix):
+    def _run_two_groups(self, tmp_path, rerun_by_prefix, *, failing_output=TWO_GROUP_TEST_OUTPUT):
         from orchestrator import verify as verify_module
 
         _materialize(
@@ -1519,14 +1525,14 @@ class TestRerunSetupErrorsOnlyIsUnconfirmable:
         module_configs = [_module_config('orchestrator'), _module_config('fused-memory')]
 
         def _fake(_worktree, _config, module_config, **_kw):
-            return _rerun_result(output_by_prefix[module_config.prefix])
+            return rerun_by_prefix[module_config.prefix]
 
         with patch.object(
             verify_module, 'run_verification', AsyncMock(side_effect=_fake),
         ):
             return self._run(
                 verify_module, _make_config(tmp_path), module_configs,
-                _failing_result(TWO_GROUP_TEST_OUTPUT), tmp_path,
+                _failing_result(failing_output), tmp_path,
             )
 
     def test_merge_gate_setup_errors_only_rerun_is_unconfirmable(
@@ -1586,12 +1592,14 @@ class TestRerunSetupErrorsOnlyIsUnconfirmable:
         errored = {'orchestrator': f'ERROR {FAILED_ID}\n', 'fused-memory': f'ERROR {OTHER_ID}\n'}
         failed = {'orchestrator': f'FAILED {FAILED_ID}\n', 'fused-memory': f'FAILED {OTHER_ID}\n'}
         for errored_prefix in ('orchestrator', 'fused-memory'):
-            output_by_prefix = {
-                prefix: errored[prefix] if prefix == errored_prefix else failed[prefix]
+            rerun_by_prefix = {
+                prefix: _rerun_result(
+                    errored[prefix] if prefix == errored_prefix else failed[prefix],
+                )
                 for prefix in errored
             }
 
-            s = self._run_two_groups(tmp_path, output_by_prefix)
+            s = self._run_two_groups(tmp_path, rerun_by_prefix)
 
             assert s.verdict is FlakeVerdict.fails_in_isolation, (
                 f'errored_prefix={errored_prefix!r} gave {s.verdict} '
@@ -1605,11 +1613,77 @@ class TestRerunSetupErrorsOnlyIsUnconfirmable:
 
         s = self._run_two_groups(
             tmp_path,
-            {'orchestrator': f'ERROR {FAILED_ID}\n', 'fused-memory': f'ERROR {OTHER_ID}\n'},
+            {
+                'orchestrator': _rerun_result(f'ERROR {FAILED_ID}\n'),
+                'fused-memory': _rerun_result(f'ERROR {OTHER_ID}\n'),
+            },
         )
 
         assert s.verdict is FlakeVerdict.unconfirmable, (s.verdict, s.unconfirmable_reason)
         assert s.unconfirmable_reason == _SETUP_ERRORS_ONLY_REASON, s.unconfirmable_reason
+
+    def test_another_groups_original_error_does_not_keep_this_group_red(
+        self, tmp_path: Path,
+    ) -> None:
+        """Each group is judged against its own originals only."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s = self._run_two_groups(
+            tmp_path,
+            {
+                'orchestrator': _rerun_result(f'ERROR {FAILED_ID}\n'),
+                'fused-memory': _result(True),
+            },
+            failing_output=f'FAILED {FAILED_ID}\nERROR {OTHER_ID}\n',
+        )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, (s.verdict, s.unconfirmable_reason)
+        assert s.unconfirmable_reason == _SETUP_ERRORS_ONLY_REASON, s.unconfirmable_reason
+
+    def test_an_original_error_of_another_test_does_not_confirm_this_ones(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s = self._run_one_group(
+            tmp_path, _rerun_result(f'ERROR {SECOND_FAILED_ID}\n'),
+            failing=_failing_result(f'ERROR {FAILED_ID}\nFAILED {SECOND_FAILED_ID}\n'),
+        )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, (s.verdict, s.unconfirmable_reason)
+        assert s.unconfirmable_reason == _SETUP_ERRORS_ONLY_REASON, s.unconfirmable_reason
+
+    def test_a_subproject_relative_original_error_is_reproduced_from_the_root(
+        self, tmp_path: Path,
+    ) -> None:
+        """The module ran from its own directory and the re-run from the
+        worktree root, so the two name one test by different ids."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s = self._run_one_group(
+            tmp_path, _rerun_result(f'ERROR {FAILED_ID}\n'),
+            failing=_failing_result('ERROR tests/test_x.py::test_y\n'),
+        )
+
+        assert s.verdict is FlakeVerdict.fails_in_isolation, (s.verdict, s.unconfirmable_reason)
+
+    @pytest.mark.parametrize('red_first', [True, False])
+    def test_main_probe_a_red_attempt_naming_nothing_is_not_laundered_by_setup_errors(
+        self, tmp_path: Path, red_first: bool,
+    ) -> None:
+        """A timed-out attempt names no test and is still red evidence."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        timed_out = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='fail', category='test_failure', timed_out=True,
+        )
+        setup_errors_only = _rerun_result(SETUP_ERRORS_ONLY_OUTPUT)
+        attempts = [timed_out, setup_errors_only] if red_first else [setup_errors_only, timed_out]
+
+        s = self._run_one_group(tmp_path, attempts, call_site='main_probe')
+
+        assert s.verdict is FlakeVerdict.fails_in_isolation, (s.verdict, s.unconfirmable_reason)
 
     def test_main_probe_a_genuine_failed_attempt_is_not_laundered_by_a_later_one(
         self, tmp_path: Path,

@@ -27,6 +27,7 @@ suppression was off, and every unit test in the area was green.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import sys
@@ -116,18 +117,24 @@ def _module_config() -> ModuleConfig:
     )
 
 
-def _failing_result(*, node_id: str = PROBE_NODE_ID) -> VerifyResult:
+def _failing_result(*, node_id: str = PROBE_NODE_ID, kind: str = 'FAILED') -> VerifyResult:
     """The load-shed failure the merge gate is asking the discriminator about."""
     return VerifyResult(
         passed=False,
-        test_output=f'FAILED {node_id}\n',
+        test_output=f'{kind} {node_id}\n',
         lint_output='',
         type_output='',
         summary='fail',
         category='test_failure',
-        cause_hint=f'FAILED {node_id}',
+        cause_hint=f'{kind} {node_id}',
         failing_leg_categories=['test_failure'],
     )
+
+
+def _write_worker_id_probe(worktree: Path) -> None:
+    probe = worktree / WORKER_ID_PROBE_REL
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text('def test_uses_worker_id(worker_id):\n    assert worker_id\n', encoding='utf-8')
 
 
 # Grouped so this file's real-subprocess probe lands on ONE xdist worker
@@ -188,9 +195,7 @@ def test_merge_gate_rerun_that_only_errors_at_setup_is_unconfirmable(tmp_path):
     "fixture 'worker_id' not found".  MEASURED before task 3880:
     ``fails_in_isolation``.
     """
-    probe = tmp_path / WORKER_ID_PROBE_REL
-    probe.parent.mkdir(parents=True, exist_ok=True)
-    probe.write_text('def test_uses_worker_id(worker_id):\n    assert worker_id\n', encoding='utf-8')
+    _write_worker_id_probe(tmp_path)
 
     suppression = asyncio.run(confirm_isolated_rerun_verdict(
         tmp_path, _make_config(tmp_path), [_module_config()],
@@ -202,3 +207,26 @@ def test_merge_gate_rerun_that_only_errors_at_setup_is_unconfirmable(tmp_path):
     assert suppression.verdict is FlakeVerdict.unconfirmable, rendered
     assert (suppression.unconfirmable_reason or '').startswith('rerun_setup_errors_only:'), rendered
     assert suppression.test_ids == (WORKER_ID_PROBE_NODE_ID,), suppression.test_ids
+
+
+@pytest.mark.xdist_group('merge_gate_rerun_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_merge_gate_rerun_setup_error_reproduces_an_original_error(tmp_path, caplog):
+    """The control: an original that ERRORed too is reproduced, although it
+    names the test relative to the module and the re-run relative to the root.
+    The fail-closed exception path also answers ``fails_in_isolation``, so it
+    is ruled out by its WARNING."""
+    _write_worker_id_probe(tmp_path)
+    module_relative_id = WORKER_ID_PROBE_NODE_ID.removeprefix('pkg/')
+
+    with caplog.at_level(logging.WARNING, logger=verify_module.logger.name):
+        suppression = asyncio.run(confirm_isolated_rerun_verdict(
+            tmp_path, _make_config(tmp_path), [_module_config()],
+            _failing_result(node_id=module_relative_id, kind='ERROR'),
+            call_site='merge_gate',
+        ))
+
+    rendered = f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}'
+    assert suppression.verdict is FlakeVerdict.fails_in_isolation, rendered
+    unexpected = [r.getMessage() for r in caplog.records if 'unexpected error' in r.getMessage()]
+    assert not unexpected, unexpected
