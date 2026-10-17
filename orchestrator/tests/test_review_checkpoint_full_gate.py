@@ -8,6 +8,8 @@ every idle cycle.  ``run_full()`` records both trackers so the gate re-closes.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,7 +27,10 @@ _PHASE1 = VerifyResult(
 
 
 def _make_checkpoint(
-    min_interval: float = 86400.0, min_tasks: int = 20
+    min_interval: float = 86400.0,
+    min_tasks: int = 20,
+    *,
+    time_source: Callable[[], float] = time.monotonic,
 ) -> ReviewCheckpoint:
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = Path('/tmp')
@@ -35,7 +40,7 @@ def _make_checkpoint(
     stamp_stock_routing_config(config)
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
-    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
+    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None, time_source=time_source)
     # _RecordingEventStore is a duck-typed double, not an EventStore subclass
     # (repo-wide pattern — see test_delivered_check_gate_e2e.py).
     cp.event_store = _RecordingEventStore()  # type: ignore[assignment]
@@ -86,19 +91,15 @@ class TestShouldRunFullGate:
 
 @pytest.mark.asyncio
 class TestRunFullRecordsTrackers:
-    async def test_run_full_records_time_and_merge(self, monkeypatch):
+    async def test_run_full_records_time_and_merge(self):
         """run_full() stamps both full-review trackers (separate from focused)."""
-        cp = _make_checkpoint()
+        cp = _make_checkpoint(time_source=lambda: 5000.0)
         cp._merge_count = 25
 
         cp._run_review = AsyncMock(  # type: ignore[method-assign]
             return_value=ReviewReport(
                 review_id='x', mode='full', changed_modules=[], phase1=_PHASE1,
             )
-        )
-
-        monkeypatch.setattr(
-            'orchestrator.review_checkpoint.time.monotonic', lambda: 5000.0
         )
 
         await cp.run_full()

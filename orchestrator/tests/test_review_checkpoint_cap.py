@@ -7,7 +7,10 @@ asyncio.Task with no graceful downgrade.
 
 from __future__ import annotations
 
+import itertools
 import logging
+import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,7 +24,9 @@ from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.verify import VerifyResult
 
 
-def _make_checkpoint() -> ReviewCheckpoint:
+def _make_checkpoint(
+    *, time_source: Callable[[], float] = time.monotonic
+) -> ReviewCheckpoint:
     """Construct a minimal ReviewCheckpoint with mocked config."""
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     # Use /tmp as project_root — avoids the '/tmp/pytest-' guard in _run_review
@@ -45,7 +50,7 @@ def _make_checkpoint() -> ReviewCheckpoint:
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
 
-    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
+    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None, time_source=time_source)
     # event_store is wired post-construction in the harness (task η); a
     # recording store here lets _run_review emit its routing_decision event.
     # _RecordingEventStore is a duck-typed double, not an EventStore subclass
@@ -102,6 +107,28 @@ class TestReviewCheckpointCapHandling:
         assert any(
             'all accounts capped' in t.lower() for t in warning_texts
         ), f'Expected warning with "all accounts capped", got: {warning_texts}'
+
+    async def test_capped_review_duration_is_measured_on_the_injected_clock(
+        self, monkeypatch
+    ):
+        ticks = itertools.count()
+        checkpoint = _make_checkpoint(time_source=lambda: 100.0 + 2.5 * next(ticks))
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.invoke_with_cap_retry',
+            AsyncMock(
+                side_effect=AllAccountsCappedException(
+                    retries=4, elapsed_secs=300.0, label='Review checkpoint [x]'
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification',
+            AsyncMock(return_value=_PHASE1_RESULT),
+        )
+
+        report = await checkpoint.run_focused()
+
+        assert report.duration_ms == 2500
 
 
 @pytest.mark.asyncio
