@@ -135,6 +135,26 @@ async def _finalize_in_prior_run(
     return req
 
 
+def _journal_in_prior_run(world: _World, task_id: str) -> MergeRequest:
+    """The prior run journals an owned request and dies before it finalizes."""
+    req = _request(world, task_id)
+    MergeQueueStore(world.journal_path).record(req)
+    return req
+
+
+def _live_entry(req: MergeRequest, state: str) -> dict[str, Any]:
+    """The keys merge_status reads from orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot's entries."""
+    return {
+        'task_id': req.task_id,
+        'branch': req.branch.bare_id,
+        'state': state,
+        'enqueued_at': req.enqueued_at,
+        'position': 0,
+        'waiter_alive': not req.result.cancelled(),
+        'request_id': req.request_id,
+    }
+
+
 def _restart(
     world: _World,
     *,
