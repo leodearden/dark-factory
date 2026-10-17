@@ -9956,12 +9956,15 @@ class _RerunObservation:
     ``_unconfirmable_rerun_reason`` derives from the category recorded here,
     and the ONE place that vocabulary is written — and because the merge
     gate's existing log line renders the observed ``category``/``passed`` pair
-    verbatim.
+    verbatim. ``failures`` holds what the genuinely red attempts a ``failed``
+    outcome rests on named, so the caller can judge them against the original.
     """
 
     outcome: _RerunOutcome
     category: str  # last observed VerifyResult.category ('' when none was observed)
     passed: bool  # last observed VerifyResult.passed (False when none was observed)
+    failures: tuple[PytestFailure, ...] = ()  # () unless outcome is failed
+    setup_errors_only: bool = False  # set only by _judged_against_original
 
 
 #: The categories under which an ISOLATED RE-RUN produced no verdict ABOUT THE
@@ -9996,7 +9999,43 @@ def _classify_rerun_result(result: VerifyResult) -> _RerunObservation:
         )
     if result.passed:
         return _RerunObservation(_RerunOutcome.passed, result.category, result.passed)
-    return _RerunObservation(_RerunOutcome.failed, result.category, result.passed)
+    return _RerunObservation(
+        _RerunOutcome.failed, result.category, result.passed,
+        failures=parse_pytest_failures(result.test_output),
+    )
+
+
+def _rerun_only_errored_where_original_failed(
+    original: Sequence[PytestFailure], rerun: Sequence[PytestFailure],
+) -> bool:
+    """Whether *rerun* named only setup/collection ERRORs and *original* named none.
+
+    Applies the kind half of ``verify.py::reproduced_failures``, the rule's one
+    home: a setup or collection ERROR confirms only an original ERROR.  Ids are
+    not compared, because the scoped re-run runs from the worktree root
+    (``_scope_to_keyword`` clears the module cwd), so its cwd-relative ids carry
+    a module prefix the original's lack; the re-run is already scoped to the
+    original's ids, so only the kind half applies.
+    """
+    return (
+        bool(rerun)
+        and all(failure.kind is FailureKind.ERROR for failure in rerun)
+        and not any(failure.kind is FailureKind.ERROR for failure in original)
+    )
+
+
+def _judged_against_original(
+    observation: _RerunObservation, original: Sequence[PytestFailure],
+) -> _RerunObservation:
+    """*observation*, made unconfirmable when its red only errored where *original* failed."""
+    if (
+        observation.outcome is _RerunOutcome.failed
+        and _rerun_only_errored_where_original_failed(original, observation.failures)
+    ):
+        return replace(
+            observation, outcome=_RerunOutcome.unconfirmable, setup_errors_only=True,
+        )
+    return observation
 
 
 async def _run_isolated_confirm_group_observation(
@@ -10025,6 +10064,7 @@ async def _run_isolated_confirm_group_observation(
     Never raises.
     """
     saw_genuine_failure = False
+    genuine_failures: list[PytestFailure] = []
     last_category = ''
     last_passed = False
     for attempt in range(_SWEEP_CONFIRM_MAX_ATTEMPTS):
@@ -10061,10 +10101,12 @@ async def _run_isolated_confirm_group_observation(
         # red — the one thing an exhausted loop must not report as "we could
         # not tell".
         saw_genuine_failure = True
+        genuine_failures.extend(parse_pytest_failures(result.test_output))
     return _RerunObservation(
         _RerunOutcome.failed if saw_genuine_failure else _RerunOutcome.unconfirmable,
         last_category,
         last_passed,
+        failures=tuple(genuine_failures) if saw_genuine_failure else (),
     )
 
 
@@ -10917,18 +10959,23 @@ def _unmeasured_session_reason(failing_result: VerifyResult) -> str | None:
 def _unconfirmable_rerun_reason(observation: _RerunObservation) -> str:
     """Name WHY an isolated re-run produced no verdict, for the ledger row.
 
-    Two prefixes, because a triager acts on them differently.
+    Three prefixes, because a triager acts on them differently.
     ``infra_transient_rerun`` says the HOST was unusable and the response is
     to wait or look at the box; ``rerun_command_rejected`` says OUR OWN argv
     was malformed and the response is to read the rendered command. Folding
     the second into the first would file a code defect as host pressure —
     which is how 350 merge-gate observations came to read as real reds with
     nothing anywhere saying the command had been refused (task 5580).
+    ``rerun_setup_errors_only`` says our serial re-run errored at setup where
+    the original had run the test, so the response is to read the re-run's
+    ERRORS section, e.g. for ``fixture 'worker_id' not found`` (task 3880).
 
     Every category that produced the existing string before still produces it
     BYTE-for-byte: θ's class-1 rate and any operator grep keyed on it are
     unaffected.
     """
+    if observation.setup_errors_only:
+        return f'rerun_setup_errors_only:{observation.category or "unknown"}'
     if observation.category == FailureCategory.PYTEST_USAGE_ERROR:
         return f'rerun_command_rejected:{observation.category}'
     return f'infra_transient_rerun:{observation.category or "unknown"}'
@@ -11015,7 +11062,10 @@ async def confirm_isolated_rerun_verdict(
     _scope_to_keyword(...), invocation_dir=worktree), policy.timeout_secs)``
     with ``lint_command`` and ``type_check_command`` nulled, so only the named
     tests run, serially, under the governing pyproject ``addopts`` minus xdist
-    and an explicit ``--timeout`` in place of its ini per-test default.
+    and an explicit ``--timeout`` in place of its ini per-test default. A group
+    whose re-run named only setup/collection ERRORs the original did not have
+    is ``unconfirmable``, not red: the serial form can cause those ERRORs
+    itself (see ``verify_cmd.py::serial_pytest``).
 
     At the merge gate (``policy.refuses_partially_measured_sessions``) no
     re-run is attempted when the failing session left tests unmeasured: a
@@ -11133,6 +11183,7 @@ async def confirm_isolated_rerun_verdict(
             )
 
         node_ids = _extract_failing_test_ids(failing_result.test_output)
+        original_failures = parse_pytest_failures(failing_result.test_output)
         # PRECONDITION, merge_gate only: a leg that reached no test verdict, or
         # a worker death, means the named failures are not the only unmeasured
         # tests. At the merge gate a passes_in_isolation LANDS the tree, and no
@@ -11241,7 +11292,9 @@ async def confirm_isolated_rerun_verdict(
             scoped_mc = replace(
                 mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
             )
-            observation = await policy.engine(worktree, config, scoped_mc)
+            observation = _judged_against_original(
+                await policy.engine(worktree, config, scoped_mc), original_failures,
+            )
             if observation.outcome is _RerunOutcome.passed:
                 continue
             if policy.log_group_not_confirmed is not None:
