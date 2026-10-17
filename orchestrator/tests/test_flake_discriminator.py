@@ -1688,8 +1688,8 @@ class TestRerunSetupErrorsOnlyIsUnconfirmable:
     def test_main_probe_a_genuine_failed_attempt_is_not_laundered_by_a_later_one(
         self, tmp_path: Path,
     ) -> None:
-        """Only the attempts a ``failed`` outcome rests on are judged: a later
-        non-verdict attempt's ERROR lines are not evidence about the code."""
+        """A later non-verdict attempt's ERROR lines are not evidence about the
+        code, so they cannot outrank an earlier genuine red."""
         from orchestrator.flake_ledger import FlakeVerdict
 
         s = self._run_one_group(
