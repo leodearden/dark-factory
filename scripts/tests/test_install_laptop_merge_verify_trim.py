@@ -183,6 +183,22 @@ def test_apply_repoints_a_crontab_longer_than_a_pipe_buffer(world):
     assert differing_lines((lib(world) / "crontab.bak-testlabel").read_text(), seeded) == []
 
 
+def test_apply_leaves_an_already_repointed_long_crontab_alone(world):
+    crontab_file = world["state"] / "crontab"
+    seeded = (
+        f"0 */2 * * * {lib(world)}/gc-worktree-targets.sh >> /tmp/gc-worktree-targets.log 2>&1\n"
+        + cron_filler()
+    )
+    crontab_file.write_text(seeded)
+
+    result = run(world)
+
+    assert result.returncode == 0, result.stderr
+    assert differing_lines(crontab_file.read_text(), seeded) == []
+    assert not (lib(world) / "crontab.bak-testlabel").exists()
+    assert "already runs" in result.stdout
+
+
 def test_second_apply_is_a_no_op_for_the_crontab(world):
     assert run(world).returncode == 0
     crontab_after_first = (world["state"] / "crontab").read_text()
