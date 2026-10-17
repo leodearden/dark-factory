@@ -27,7 +27,15 @@ from shared.locking import (
     normalize_lock,
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
+from shared.project_layout import scheduler_state_json
 from shared.psi import PsiSample, read_psi_sample
+from shared.scheduler_state import (
+    OverrideRecord,
+    ParkRecord,
+    PinQueueEntry,
+    RequeueCooldown,
+    SchedulerStateSnapshot,
+)
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
@@ -2170,6 +2178,10 @@ def _reject_contradictory_metadata_mode(
         )
 
 
+def _park_records(parks_by_owner: Mapping[str, Mapping[str, Any]]) -> dict[str, ParkRecord]:
+    return {owner: ParkRecord.model_validate(rec) for owner, rec in parks_by_owner.items()}
+
+
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
@@ -2391,7 +2403,7 @@ class Scheduler:
         # popped in lockstep by `_gc_expired_cooldowns` so an entry can never
         # outlive its deadline, and EARLIER by `clear_requeue_count` when the
         # task reaches a terminal outcome and is no longer waiting to retry.
-        self._requeue_cooldown_meta: dict[str, dict] = {}
+        self._requeue_cooldown_meta: dict[str, RequeueCooldown] = {}
         # Per-task dispatch timestamps (monotonic) for the dispatch-cooldown
         # gate.  Set immediately after a successful dispatch; cleared when the
         # task transitions to a terminal status.  Process-local — an
@@ -8359,78 +8371,18 @@ class Scheduler:
         except Exception:
             logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
 
-    def get_state_snapshot(self) -> dict:
-        """Return a deep-copy snapshot of current in-memory scheduler state.
+    def get_state_snapshot(self) -> SchedulerStateSnapshot:
+        """Return a frozen copy of the scheduler's current state.
 
-        Contains thirteen top-level keys:
-        - skip_counts: {task_id: int}
-        - parks: {task_id: {modules: [...], installed_at: str}} — every active
-          top, pin reservations included
-        - park_stacks: {module: [entry, ...]} — full LIFO stack bottom→top
-          per module (active top + shadowed owners); additive sibling to the
-          INV-7 top-only ``parks`` key.  Entry fields:
-          :meth:`ModuleLockTable.snapshot_park_stacks`
-        - pin_reservations: {task_id: {modules: [...], installed_at: str}} —
-          the park entries held at a pin rank (task 6040), top or buried,
-          shown apart from fairness parks
-        - effective_priorities: {task_id: str}
-        - pin_queue: [{task_id: str, order: int}, ...]
-        - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
-        - current_holders: {module: task_id}
-        - lock_depth: int — top-level normalization depth for lock keys, so
-          consumers (e.g. the dashboard) can normalize file footprints the
-          same way before matching against current_holders.
-        - is_paused: bool — True when the scheduler is park-stop paused
-        - pause_reason: str | None — human-readable reason, or None when not paused
-        - requeue_cooldowns: {task_id: {armed_secs, envelope_secs, transient,
-          transient_count, armed_at, expires_at}} — the per-task requeue
-          cooldown currently gating re-dispatch, as armed (task 3317 / PRD
-          contract C3).  ``armed_secs``
-          GROWS across successive transient (5xx) requeues — 30/60/120/240/480,
-          capped at 900 — and stays FLAT at ``requeue_cooldown_secs`` for a
-          genuine one; ``envelope_secs`` is the un-jittered ceiling the armed
-          value was drawn from (``armed`` always lies in
-          ``[envelope/2, envelope]``).  Entries appear at arming and are
-          dropped either by ``clear_requeue_count`` (the task reached a
-          terminal outcome — DONE, or blocked by cap exhaust) or by
-          ``_gc_expired_cooldowns`` once the deadline passes.  The key
-          therefore answers "which tasks are cooling, and for how long",
-          with ONE bounded imprecision: the GC runs once per tick from
-          ``acquire_next``, so an expired entry can linger until the next
-          tick.  Compare ``expires_at`` against now rather than treating
-          mere presence as proof a task is still cooling.
-          ``armed_at``/``expires_at`` are ISO-8601 WALL-clock strings —
-          restart-comparable and operator-readable, answering "when does this
-          task come back" — while the internal ``_requeue_until`` deadline
-          they describe stays MONOTONIC (no epoch relation, resets across a
-          process restart).  That is the same split ``_resolve_wall_time_source``
-          documents; a monotonic float alone is meaningless to a cross-process
-          reader.
-          NO wall-clock-relative "remaining" field is emitted, deliberately:
-          every value here is fixed at arming, because
-          ``_build_snapshot_payload`` content-dedups this snapshot to throttle
-          disk writes and a per-tick-recomputed field would defeat it.
-        - snapshot_at: ISO8601 timestamp
+        Field shapes live in shared/src/shared/scheduler_state.py::SchedulerStateSnapshot.
+        ``parks`` reports every active top, pin reservations included;
+        ``pin_reservations`` lists the pin-ranked park entries, top or buried.
         """
-        # skip_counts — plain int values, safe to copy.
-        skip_counts = dict(self._skip_count)
-
-        # parks — delegate to the public accessor so ModuleLockTable owns its
-        # own representation (no private-attribute access from Scheduler).
-        parks = self.lock_table.snapshot_parks()
-
-        # park_stacks — full LIFO stack per module (additive sibling to parks).
-        park_stacks = self.lock_table.snapshot_park_stacks()
-
-        # effective_priorities — already a shallow dict of str→str.
-        effective_priorities = dict(self._last_effective_priorities)
-
-        # pin_queue — read from the override store if available.
-        pin_queue: list[dict] = []
+        pin_queue: list[PinQueueEntry] = []
         if self._override_store:
             try:
                 for tid, row in self._override_store.get_pin_queue(self._project_root):
-                    pin_queue.append({'task_id': tid, 'order': row.pin_order})
+                    pin_queue.append(PinQueueEntry(task_id=tid, order=row.pin_order))
             except Exception:
                 if not self._override_store_warned:
                     self._override_store_warned = True
@@ -8439,19 +8391,18 @@ class Scheduler:
                         exc_info=True,
                     )
 
-        # overrides — convert OverrideRow dataclasses to plain dicts.
-        overrides: dict[str, dict] = {}
+        overrides: dict[str, OverrideRecord] = {}
         if self._override_store:
             try:
                 for tid, row in self._override_store.get_overrides(
                     self._project_root
                 ).items():
-                    overrides[tid] = {
-                        'boost_tier': row.boost_tier,
-                        'pinned': row.pinned,
-                        'reserve_now': row.reserve_now,
-                        'ttl_until': row.ttl_until.isoformat() if row.ttl_until else None,
-                    }
+                    overrides[tid] = OverrideRecord(
+                        boost_tier=row.boost_tier,
+                        pinned=row.pinned,
+                        reserve_now=row.reserve_now,
+                        ttl_until=row.ttl_until.isoformat() if row.ttl_until else None,
+                    )
             except Exception:
                 if not self._override_store_warned:
                     self._override_store_warned = True
@@ -8460,58 +8411,42 @@ class Scheduler:
                         exc_info=True,
                     )
 
-        # current_holders — delegate to the public accessor.
-        current_holders = self.lock_table.snapshot_holders()
-
-        return {
-            'skip_counts': skip_counts,
-            'parks': parks,
-            'park_stacks': park_stacks,
-            'pin_reservations': self.lock_table.snapshot_pin_reservations(),
-            'effective_priorities': effective_priorities,
-            'pin_queue': pin_queue,
-            'overrides': overrides,
-            'current_holders': current_holders,
-            'lock_depth': self.config.lock_depth,
-            'is_paused': self.is_paused,
-            'pause_reason': self.pause_reason,
-            # Per-entry copy — honours this method's deep-copy contract, so a
-            # caller mutating the returned dict cannot corrupt scheduler state.
-            'requeue_cooldowns': {
-                tid: dict(meta) for tid, meta in self._requeue_cooldown_meta.items()
+        return SchedulerStateSnapshot(
+            skip_counts=dict(self._skip_count),
+            parks=_park_records(self.lock_table.snapshot_parks()),
+            park_stacks={
+                module: tuple(entries)
+                for module, entries in self.lock_table.snapshot_park_stacks().items()
             },
-            'snapshot_at': datetime.now(UTC).isoformat(),
-        }
+            pin_reservations=_park_records(self.lock_table.snapshot_pin_reservations()),
+            effective_priorities=dict(self._last_effective_priorities),
+            pin_queue=tuple(pin_queue),
+            overrides=overrides,
+            current_holders=self.lock_table.snapshot_holders(),
+            lock_depth=self.config.lock_depth,
+            is_paused=self.is_paused,
+            pause_reason=self.pause_reason,
+            requeue_cooldowns=dict(self._requeue_cooldown_meta),
+            snapshot_at=datetime.now(UTC),
+        )
 
-    def _build_snapshot_payload(self, state: dict | None = None) -> str:
+    def _build_snapshot_payload(self, state: SchedulerStateSnapshot | None = None) -> str:
         """Serialise the scheduler business state to a stable JSON string for dedup.
 
-        Excludes ``snapshot_at`` from the output because that field is derived
-        from ``datetime.now()`` and changes on every call — including it would
-        make two consecutive calls with identical business state byte-different,
-        defeating the content-dedup check in ``_write_snapshot_best_effort``.
-
-        The ``snapshot_at`` field is included in the separate disk payload
-        built by ``_write_snapshot_best_effort`` (via ``json.dumps(state, ...)``)
-        or by ``_write_state_snapshot_raw`` when called directly without a pre-built
-        payload.
+        The ``snapshot_at`` stamp is blanked because it changes on every call:
+        keeping it would make two snapshots of identical business state
+        byte-different, defeating the content-dedup check in
+        ``_write_snapshot_best_effort``.  The disk payload keeps the stamp.
 
         Args:
-            state: Pre-fetched snapshot dict from ``get_state_snapshot()``.
-                When provided, avoids a redundant ``get_state_snapshot()``
-                call (the caller already has the state and will build the disk
-                payload from it).  When ``None``, calls ``get_state_snapshot()``
-                internally.
-
-        Returns a sorted-keys JSON string of the snapshot minus ``snapshot_at``.
-        Sorted keys ensure deterministic output regardless of insertion order.
-        Does not mutate the passed-in ``state`` dict.
+            state: Pre-fetched snapshot from ``get_state_snapshot()``, so the
+                caller that also builds the disk payload takes one snapshot.
+                When ``None``, takes the current snapshot.
         """
         if state is None:
             state = self.get_state_snapshot()
-        # Exclude snapshot_at without mutating the caller's dict.
-        dedup_state = {k: v for k, v in state.items() if k != 'snapshot_at'}
-        return json.dumps(dedup_state, default=str, sort_keys=True)
+        unstamped = state.model_copy(update={'snapshot_at': None})
+        return json.dumps(unstamped.to_json(), sort_keys=True)
 
     def _write_state_snapshot_raw(self, path: Path, payload: str | None = None) -> None:
         """Atomically write the current state snapshot to *path* as JSON.
@@ -8546,7 +8481,7 @@ class Scheduler:
         # _write_snapshot_best_effort; when a pre-built payload is passed,
         # no second get_state_snapshot() call is needed.
         if payload is None:
-            payload = json.dumps(self.get_state_snapshot(), default=str)
+            payload = json.dumps(self.get_state_snapshot().to_json())
         safe_io.atomic_write_text(path, payload, encoding='utf-8', mkdir=True)
 
     async def _write_snapshot_best_effort(self, force: bool = False) -> None:
@@ -8667,14 +8602,11 @@ class Scheduler:
                 # after the dedup check — avoids serialising when a dedup skip
                 # applies.  Passed directly to _write_state_snapshot_raw to avoid a
                 # second get_state_snapshot() call on the actual write path.
-                disk_payload = json.dumps(state, default=str)
+                disk_payload = json.dumps(state.to_json())
                 path = (
                     Path(self._state_snapshot_path)
                     if self._state_snapshot_path is not None
-                    else Path(self._project_root)
-                    / 'data'
-                    / 'orchestrator'
-                    / 'scheduler_state.json'
+                    else scheduler_state_json(self._project_root)
                 )
                 await asyncio.to_thread(self._write_state_snapshot_raw, path, disk_payload)
                 # Bookkeeping advanced only after a confirmed successful write.
@@ -8959,27 +8891,16 @@ class Scheduler:
                     cap_secs=self.config.transient_requeue_backoff_cap_secs,
                     rng=self._jitter_source,
                 )
-            # Operator-facing record of what was just armed.  JSON-native
-            # primitives ONLY (float/bool/int/str) and nothing derived from
-            # "now" — see the _requeue_cooldown_meta declaration for why.
-            #
-            # armed_at/expires_at are ISO-8601 STRINGS, never datetime
-            # objects: the production writer serialises with
-            # `json.dumps(state, default=str)`, which would silently
-            # stringify a datetime into a shape `read_scheduler_state`
-            # cannot round-trip — a loud TypeError is what the strings buy.
-            # The wall clock is read ONCE and expires_at derived from that
-            # same value, so `expires_at - armed_at` is exactly armed_secs;
-            # two _wall_now() calls would let the pair drift apart.
+            # One wall-clock read, so expires_at - armed_at is exactly armed_secs.
             armed_at = self._wall_now()
-            meta = {
-                'armed_secs': round(cooldown, 3),
-                'envelope_secs': round(envelope, 3),
-                'transient': armed_n is not None,
-                'transient_count': armed_n or 0,
-                'armed_at': armed_at.isoformat(),
-                'expires_at': (armed_at + timedelta(seconds=cooldown)).isoformat(),
-            }
+            meta = RequeueCooldown(
+                armed_secs=round(cooldown, 3),
+                envelope_secs=round(envelope, 3),
+                transient=armed_n is not None,
+                transient_count=armed_n or 0,
+                armed_at=armed_at.isoformat(),
+                expires_at=(armed_at + timedelta(seconds=cooldown)).isoformat(),
+            )
         except Exception:
             logger.exception(
                 'Task %s: transient requeue cooldown arming failed '

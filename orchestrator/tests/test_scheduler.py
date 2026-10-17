@@ -8319,32 +8319,32 @@ class TestSchedulerPause:
         """
         # Fresh scheduler — not paused.
         snap = scheduler.get_state_snapshot()
-        assert snap['is_paused'] is False, (
-            f"Expected is_paused=False on fresh scheduler; got {snap['is_paused']!r}"
+        assert snap.is_paused is False, (
+            f"Expected is_paused=False on fresh scheduler; got {snap.is_paused!r}"
         )
-        assert snap['pause_reason'] is None, (
-            f"Expected pause_reason=None on fresh scheduler; got {snap['pause_reason']!r}"
+        assert snap.pause_reason is None, (
+            f"Expected pause_reason=None on fresh scheduler; got {snap.pause_reason!r}"
         )
 
         # After pause — snapshot must reflect the paused state.
         reason = 'park-stop: 3 tasks parked in 1h'
         scheduler.pause(reason)
         snap_paused = scheduler.get_state_snapshot()
-        assert snap_paused['is_paused'] is True, (
-            f"Expected is_paused=True after pause; got {snap_paused['is_paused']!r}"
+        assert snap_paused.is_paused is True, (
+            f"Expected is_paused=True after pause; got {snap_paused.is_paused!r}"
         )
-        assert snap_paused['pause_reason'] == reason, (
-            f"Expected pause_reason={reason!r}; got {snap_paused['pause_reason']!r}"
+        assert snap_paused.pause_reason == reason, (
+            f"Expected pause_reason={reason!r}; got {snap_paused.pause_reason!r}"
         )
 
         # After resume — snapshot must return to unpaused state.
         scheduler.resume()
         snap_resumed = scheduler.get_state_snapshot()
-        assert snap_resumed['is_paused'] is False, (
-            f"Expected is_paused=False after resume; got {snap_resumed['is_paused']!r}"
+        assert snap_resumed.is_paused is False, (
+            f"Expected is_paused=False after resume; got {snap_resumed.is_paused!r}"
         )
-        assert snap_resumed['pause_reason'] is None, (
-            f"Expected pause_reason=None after resume; got {snap_resumed['pause_reason']!r}"
+        assert snap_resumed.pause_reason is None, (
+            f"Expected pause_reason=None after resume; got {snap_resumed.pause_reason!r}"
         )
 
 
