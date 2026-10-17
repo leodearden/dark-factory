@@ -620,23 +620,35 @@ async def _heartbeat_failures_under_a_pinned_read(buffer, journal) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
-    journal, event_buffer, second_connection
+    journal, event_buffer, buffer_tap, second_connection
 ):
     """Arm D: a buffer write must survive a buffer read that is still in flight.
+
+    Constructed, not raced: the production ``peek_buffered`` is parked with its
+    snapshot pinned, a foreign connection buffers ``late``, and the heartbeat is
+    queued into that window.
 
     ``heartbeat`` is the probe because its unit is a SINGLE ``UPDATE`` with no
     preceding SELECT — the same property that makes ``record_run_session`` the
     right probe for the journal arm.  Do not substitute another write method
     without re-checking it.
     """
-    await _seed_buffered_events(second_connection, count=BUFFERED_EVENTS)
+    await _seed_buffered_events(second_connection, count=SEEDED_EVENTS)
 
-    failures = await _heartbeat_failures_under_a_pinned_read(event_buffer, journal)
+    peeked, error = await _collide_with_a_pinned_read(
+        buffer_tap.connection,
+        read=lambda: event_buffer.peek_buffered(PROJECT_ID, 1_000_000),
+        write=lambda: event_buffer.heartbeat(PROJECT_ID),
+        foreign_commit=lambda: _buffer_a_late_event(second_connection),
+    )
 
-    assert not failures, (
-        f'{len(failures)}/{BUFFER_COLLISION_ITERATIONS} heartbeats died while '
-        f'peek_buffered held a read snapshot on the same connection: '
-        f'{sorted(set(failures))}'
+    assert error is None, (
+        f'the heartbeat died while peek_buffered held a read snapshot on the same '
+        f'connection: {error}'
+    )
+    assert [event.id for event in peeked] == _seeded_event_ids(), (
+        f'the peek returned {[event.id for event in peeked]!r}: it was not pinned '
+        "before the foreign commit buffered 'late', so this run did not collide at all"
     )
 
 
