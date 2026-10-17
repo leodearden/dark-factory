@@ -1161,6 +1161,7 @@ SECTION_MATRIX = "matrix"
 SECTION_SYNTHESIS = "synthesis"
 SECTION_FINDINGS = "findings"
 SECTION_FILED_TASKS = "filed-tasks"
+SECTION_STRUCTURAL = "structural"
 SECTION_WITHHELD = "withheld-clusters"
 SECTION_COST = "cost"
 """Stable machine keys for the blocks :func:`census_report_sections` emits.
@@ -1588,6 +1589,7 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
         disposition.filed_tasks_lines(record["filing"], observed_root=record["project_root"])
     )
     emit(SECTION_FILED_TASKS, filed_tasks)
+    emit(SECTION_STRUCTURAL, disposition.structural_lines(record["filing"]))
 
     if withheld:
         recorded_not_filed = [
@@ -2546,11 +2548,14 @@ def run_census(
     and at a verdict-bearing rejection (``census_findings``, areas from
     ``finding_area.load_area_map``), and every entry sighted this run has the
     run appended to its ``last_seen_runs`` -> ``codebook.validate`` (raises and aborts BEFORE
-    anything is written, on an invalid merge) -> the singleton filing gate
-    (``_split_fileable``: a verified cluster files only with an in-tree
-    remediation or a recurrence, counted in the merged codebook; a withheld
-    one stays promoted, is marked withheld on its entry and is listed in the
-    report, while one whose verdict was dropped is neither filed nor listed)
+    anything is written, on an invalid merge) -> the route gate
+    (``disposition.files``, contract §6: a structural verdict stays promoted
+    and is listed under ## Structural, never filed) -> the singleton filing
+    gate over the mechanical rest (``_split_fileable``: a verified cluster
+    files only with an in-tree remediation or a recurrence, counted in the
+    merged codebook; a withheld one stays promoted, is marked withheld on its
+    entry and is listed in the report, while one whose verdict was dropped is
+    neither filed nor listed)
     -> ``_filing_queue``, which adds every earlier-withheld entry that
     has since recurred -> ``build_task_payloads`` over that queue ->
     ``disposition.dispose``, contract §8 over *task_store*: a finding whose
@@ -2925,7 +2930,11 @@ def run_census(
     # Split BEFORE promotion so a withheld cluster's entry is marked as it is
     # created. Promotion cannot change the count: it only copies a candidate's
     # sightings into its entry, and _sighting_counts_by_title dedups by session.
-    fileable, held_back = _split_fileable(verified, updated_codebook)
+    # A structural cluster (contract §6, D6) is promoted but never split: it
+    # is recorded, not filed.
+    fileable, held_back = _split_fileable(
+        [cluster for cluster in verified if disposition.files(cluster["verdict"])], updated_codebook,
+    )
     marked_withheld: list[filing_policy.WithheldCluster] = []
     promoted: list[census_findings.Adjudication] = []
     refuted: list[census_findings.Adjudication] = []
@@ -2973,6 +2982,10 @@ def run_census(
         promoted.append(census_findings.Adjudication(entry_fields["id"], found, cluster.get("cause")))
 
     withheld = tuple(marked_withheld)
+    structural = disposition.structural_findings(
+        updated_codebook,
+        [adjudication.record_id for adjudication in promoted if not disposition.files(adjudication.found)],
+    )
     if withheld:
         logger.info(
             "census: %d verified cluster(s) recorded but not filed (no in-tree "
@@ -3067,7 +3080,7 @@ def run_census(
     updated_codebook, resolutions = disposition.resolve_tickets(
         updated_codebook, store=task_store, run_id=run_id,
     )
-    filing_report = disposition.FilingReport(disposal, resolutions, disposition.Backfill())
+    filing_report = disposition.FilingReport(disposal, resolutions, disposition.Backfill(), structural)
     filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
     cross_project_tickets = tuple(
         CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
