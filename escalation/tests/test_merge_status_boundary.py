@@ -14,12 +14,13 @@ over the prior run's files.  The unit-scope tier tests are
 from __future__ import annotations
 
 import asyncio
+import functools
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType, ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -642,12 +643,78 @@ async def test_branch_key_in_the_skills_full_ref_form_resolves_a_prior_run_row(
     world: _World,
 ) -> None:
     _unmerged_branch(world, '110')
-    prior = await _finalize_in_prior_run(
-        world, '110', MergeOutcome('blocked', reason='post-merge verify failed'),
-    )
+    prior = await _finalize_in_prior_run(world, '110', _VERIFY_FAILED)
 
     response = await _poll(_restart(world), branch='task/110')
 
     assert response['state'] == MergeState.stale_record
     assert response['last_outcome'] is not None
     assert response['last_outcome']['request_id'] == prior.request_id
+
+
+_SEED_MEMBER = 'seeded_drift'
+
+
+@dataclass(frozen=True)
+class _VocabularySeed:
+    """A MergeState member added to *target*, by *assignment* ('' lands it by complement)."""
+
+    target: str
+    assignment: str
+
+
+_SEEDS: Mapping[str, _VocabularySeed] = MappingProxyType({
+    'epistemic_by_default': _VocabularySeed('EPISTEMIC_STATES', ''),
+    'terminal': _VocabularySeed(
+        'TERMINAL_STATES', f'TERMINAL_STATES = TERMINAL_STATES | {{MergeState.{_SEED_MEMBER}}}\n',
+    ),
+    'live': _VocabularySeed(
+        'LIVE_STATES', f'LIVE_STATES = LIVE_STATES | {{MergeState.{_SEED_MEMBER}}}\n',
+    ),
+})
+
+_CONSUMER_SKILLS = frozenset({
+    'skills/merge-queue/SKILL.md',
+    'skills/unblock/SKILL.md',
+    'skills/unblock-low-risk/SKILL.md',
+})
+
+
+def _failing_sites(guard: ModuleType) -> dict[str, str]:
+    """Run alpha's per-site drift assertion over every pinned site; the failures, by site."""
+    failures: dict[str, str] = {}
+    for site in guard.PINNED_SITES:
+        try:
+            guard.test_every_span_matches_its_partition(site)
+        except AssertionError as exc:
+            failures[site] = str(exc)
+    return failures
+
+
+async def test_b9_control_alphas_guard_passes_on_the_unseeded_vocabulary() -> None:
+    assert _failing_sites(_load_alpha_guard()) == {}
+
+
+async def test_b9_a_member_added_without_updating_the_skill_lists_fails_alphas_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = _load_alpha_guard()
+    load_vocabulary = guard.load_vocabulary
+    failed: set[str] = set()
+    for seed, spec in _SEEDS.items():
+        seeded = _seeded_vocabulary(tmp_path, seed)
+        partitions = load_vocabulary(path=seeded)
+        assert _SEED_MEMBER in partitions[spec.target], (seed, sorted(partitions[spec.target]))
+        monkeypatch.setattr(guard, 'load_vocabulary', functools.partial(load_vocabulary, path=seeded))
+
+        failures = _failing_sites(guard)
+
+        expected = {
+            site for site, (declared, _) in guard.PINNED_SITES.items()
+            if any(_SEED_MEMBER in partitions[name] for name in declared)
+        }
+        assert expected, seed
+        assert set(failures) == expected, (seed, sorted(failures), sorted(expected))
+        assert all(_SEED_MEMBER in message for message in failures.values()), (seed, failures)
+        failed |= set(failures)
+    assert _CONSUMER_SKILLS <= failed, sorted(failed)
