@@ -1043,11 +1043,11 @@ def _gated_verify(
 ):
     """A ``run_scoped_verification``-shaped gate wrapping :func:`_first_verify_gated`.
 
-    For the two callers that must still patch the module global rather than
-    inject the port: the TRAIN scene below (see its comment — _do_train_merge
-    does not forward the worker's verifier) and out-of-group
-    test_coalesce_integration_gate.py, which imports this name. One gate
-    implementation, two ways of installing it.
+    For the callers that patch the module global rather than inject the port:
+    the TRAIN scene below and out-of-group test_coalesce_integration_gate.py,
+    which imports this name. Their workers are built WITHOUT ``verifier=``,
+    so they run the production verifier, which resolves the patched name.
+    One gate implementation, two ways of installing it.
     """
     return AsyncMock(side_effect=_first_verify_gated(gate_release, gate_entered).run_scoped)
 
@@ -1135,12 +1135,10 @@ class TestEndToEndWiring:
         await queue.put(req2)
         await queue.put(req3)
 
-        # The TRAIN path is the one place the injected verify port does not
-        # reach: _do_train_merge calls _run_post_merge_verify WITHOUT
-        # forwarding worker's verifier (merge_queue.py:7297-7307), so it always
-        # resolves PRODUCTION_VERIFIER. Until that gap closes, the train's gate
-        # has to be installed on the module global — but it is the SAME gate
-        # object the port-injected scenes use, not a second implementation.
+        # This worker is built WITHOUT verifier=, so the train verify runs the
+        # production verifier, which resolves the patched module global: the
+        # train's gate is installed there. It is the SAME gate object the
+        # port-injected scenes use, not a second implementation.
         async with running_merge_worker(worker):
             with patch(
                 'orchestrator.merge_queue.run_scoped_verification',

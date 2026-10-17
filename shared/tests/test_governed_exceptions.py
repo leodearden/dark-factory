@@ -27,10 +27,12 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
 
+import shared.governed_exceptions as governed_module
 from shared.governed_exceptions import (
     DECLARATION_FORMS,
     INLINE_MARKER_FORMS,
@@ -42,7 +44,9 @@ from shared.governed_exceptions import (
     TaskRef,
     TicketRef,
     UndisposedException,
+    disposition_record,
     governed_exceptions,
+    owner_record,
     parse_disposition_marker,
 )
 
@@ -201,6 +205,64 @@ class TestDispositionUnion:
     def test_rejects_anything_else(self, value):
         """A bare ref is NOT a disposition — D2's states are Debt and Policy."""
         assert not isinstance(value, Disposition)
+
+
+class TestWireFormat:
+    """The one JSON shape every report, register and sweep speaks for the vocabulary."""
+
+    @pytest.mark.parametrize(
+        ('ref', 'expected'),
+        [
+            (TaskRef(5601), {'type': 'task', 'id': 5601}),
+            (TicketRef(TICKET_ID), {'type': 'ticket', 'id': TICKET_ID}),
+        ],
+    )
+    def test_owner_record_tags_each_ref_type(self, ref, expected):
+        assert owner_record(ref) == expected
+
+    @pytest.mark.parametrize(
+        ('disposition', 'expected'),
+        [
+            (Debt(TaskRef(5601)), {'type': 'debt', 'owner': {'type': 'task', 'id': 5601}}),
+            (
+                Debt(TicketRef(TICKET_ID)),
+                {'type': 'debt', 'owner': {'type': 'ticket', 'id': TICKET_ID}},
+            ),
+            (Policy('inv12-x'), {'type': 'policy', 'ratified': 'inv12-x'}),
+        ],
+    )
+    def test_disposition_record_tags_each_state(self, disposition, expected):
+        assert disposition_record(disposition) == expected
+
+    @pytest.mark.parametrize(
+        ('render', 'value'),
+        [
+            (owner_record, TaskRef(5601)),
+            (owner_record, TicketRef(TICKET_ID)),
+            (disposition_record, Debt(TaskRef(5601))),
+            (disposition_record, Debt(TicketRef(TICKET_ID))),
+            (disposition_record, Policy('inv12-x')),
+        ],
+    )
+    def test_every_record_survives_a_json_round_trip(self, render, value):
+        record = render(value)
+        assert json.loads(json.dumps(record)) == record
+
+    @pytest.mark.parametrize('bad', [TaskRef(5601), TicketRef(TICKET_ID), 'debt: task 5601', None])
+    def test_disposition_record_refuses_what_is_not_a_disposition(self, bad):
+        with pytest.raises(MalformedDisposition) as excinfo:
+            disposition_record(bad)
+        assert repr(bad) in str(excinfo.value)
+
+    @pytest.mark.parametrize('bad', [Debt(TaskRef(5601)), Policy('inv12-x'), 'task 5601', 5601])
+    def test_owner_record_refuses_what_is_not_a_ref(self, bad):
+        with pytest.raises(MalformedDisposition) as excinfo:
+            owner_record(bad)
+        assert repr(bad) in str(excinfo.value)
+
+    def test_both_are_published(self):
+        assert 'owner_record' in governed_module.__all__
+        assert 'disposition_record' in governed_module.__all__
 
 
 class TestModuleStructure:

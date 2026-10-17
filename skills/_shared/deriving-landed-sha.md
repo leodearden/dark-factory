@@ -105,7 +105,7 @@ restricted to merge commits, matches any commit merely *mentioning* the task, an
 returns any ordinary commit whose *body* happens to quote the marker string — a documentation
 commit describing this very mechanism, a revert, a commit message citing another task's merge.
 That is a live hazard in this repo, not a hypothetical: measured 2026-09-22,
-`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H`
+`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H` <!-- marker-search-guard: counterexample -->
 returns `d0d67f0c53`, a **non-merge** docs commit from task 4612 whose body quotes the subject,
 rather than the true train merge `d25b24468c` — which the command above does return. The
 substring-safety argument covers only the `task/1`-inside-`task/10` collision; it says nothing
@@ -135,9 +135,13 @@ walk. Measured 2026-09-22 over main's ~68k commits, against a marker a few hundr
 ~2.1s (range 1.3–3.0s). On a query with **no** match the two are indistinguishable — both walk
 everything — so benchmarking a missing marker will wrongly suggest the flag is free to restore.
 Roughly two seconds, once, at the moment a task is stamped, is the price of not recording a
-documentation commit as a merge. Note that **nothing enforces this mechanically** — no test greps
-these snippets for the flag, so this paragraph is the only thing standing between a plausible-looking
-optimization and a wrong `done_provenance`.
+documentation commit as a merge. `tests/scripts/test_merge_marker_search_snippets.py` enforces
+this: it runs every marker search in `skills/` — any `git log` or `git rev-list` that greps for
+`$S` or a merge subject, with or without `--fixed-strings` — against a history where a newer body
+match shadows the genuine marker, so putting the flag back — or any other take-the-newest-hit
+shortcut — turns it red. A snippet that quotes a bare form on purpose, like the measured one above,
+carries `<!-- marker-search-guard: counterexample -->` right after its closing backtick and is not
+run.
 
 The shadowing is common and it is *growing*, because this repo's own commits about this mechanism
 quote the subject they document. Measured 2026-09-22 over all 68,279 commits on main: 12 branches

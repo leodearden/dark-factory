@@ -31,16 +31,6 @@ import pytest
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
 
-# The C1 fallback harness, imported rather than re-derived: reaching
-# `add_memory`'s SECOND service call site needs write triage enabled with a
-# calibrated high-cosine candidate, and a private copy would drift the moment
-# those bands are retuned. The bare `server.` import resolves because
-# fused-memory/tests/conftest.py inserts the tests dir onto sys.path and
-# tests/server/ is a package (see the same note in
-# test_add_memory_near_duplicate_gate.py, which imports test_config_schema the
-# same way).
-from server.test_add_memory_write_triage_gate import _candidate, _configure_config
-
 # The malformed-shape corpus, IMPORTED rather than re-spelled. The unit tests
 # pin what the pure gate answers for each shape; this module pins what an agent
 # actually receives for the same shape. Two copies of the list would let those
@@ -48,6 +38,16 @@ from server.test_add_memory_write_triage_gate import _candidate, _configure_conf
 # unchecked at the seam that matters — which is the whole point of the
 # single-list amendment (see `_MALFORMED_SHAPES`' own comment).
 from server.test_entities_gate import _MALFORMED_SHAPES
+
+# The shared write-triage harness, imported rather than re-derived: reaching
+# `add_memory`'s SECOND service call site needs write triage enabled with a
+# calibrated high-cosine candidate, and a private copy would drift the moment
+# those bands are retuned. The bare `server.` import resolves because
+# fused-memory/tests/conftest.py inserts the tests dir onto sys.path and
+# tests/server/ is a package (see the same note in
+# test_add_memory_near_duplicate_gate.py, which imports test_config_schema the
+# same way).
+from server.write_triage_harness import configure_triage_config, search_candidate
 
 _PROJECT_ID = 'dark_factory'
 
@@ -262,19 +262,19 @@ class TestAddMemoryForwardsTheDeclaration:
         so. The fallback deliberately drops the failed parent link; it must
         NOT drop this, for the same reason it keeps the full content.
 
-        Harness reused from `test_add_memory_write_triage_gate.py`'s C1 suite
-        rather than re-derived, so a retune of its bands or its candidate shape
-        carries this test with it.
+        Harness reused from `tests/server/write_triage_harness.py` rather than
+        re-derived, so a retune of its bands or its candidate shape carries
+        this test with it.
         """
         mock_service = AsyncMock()
-        _configure_config(mock_service, enabled=True)
+        configure_triage_config(mock_service, enabled=True)
         mem_result = MagicMock()
         mem_result.model_dump.return_value = {'id': 'fallback-id'}
         mock_service.add_memory.side_effect = [
             RuntimeError('parent_id rejected by the write seam'),
             mem_result,
         ]
-        mock_service.search.return_value = [_candidate('m1', 0.97, content=_CONTENT)]
+        mock_service.search.return_value = [search_candidate('m1', 0.97, content=_CONTENT)]
         server = create_mcp_server(mock_service)
 
         result = await _call(

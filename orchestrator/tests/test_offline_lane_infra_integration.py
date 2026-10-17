@@ -17,9 +17,10 @@ every scenario asserts already-landed behaviour from:
   when ``config.git.offline_lane_infra_enabled`` is True; the infra red leg
   reuses ``_handle_red_run(wt, head,
   confirmation_runner=self.infra_confirmation_runner)``; the default seams
-  ``_default_run_infra``/``_default_infra_confirmation_run`` shell out to
-  ``tests/infra/run_all.sh --scope host-infra`` (reify H9) and parse
-  ``RESULT: FAIL (<name>)`` lines via module-level ``_parse_infra_failures``.
+  ``offline_lane_runs.py::infra_runner``/``_default_infra_confirmation_run``
+  shell out to ``tests/infra/run_all.sh --scope host-infra`` (reify H9) and
+  parse ``RESULT: FAIL (<name>)`` lines into the run record
+  (``offline_lane_runs.py::INFRA_RESULT_RE``).
 * β3 (task 1954) — ``OfflineLaneWorker._handle_red_run`` (confirmation,
   fingerprinting, dedup'd fix-task file/update, L0/L2 escalation staging) —
   content-agnostic, so infra test-file-names dedup exactly like numeric IDs.
@@ -56,8 +57,9 @@ Scenario map:
   IB5 - FLAKE FILTER — infra fail-then-pass on confirmation is intermittent
         nondeterminism: no task, no escalation, no open fingerprint
   IB6 - REAL H9 WIRE-FORMAT — the REAL default infra seams shell out to a
-        committed stub ``tests/infra/run_all.sh``, exercising
-        ``_parse_infra_failures`` end-to-end into a filed fix task
+        committed stub ``tests/infra/run_all.sh``, exercising the
+        ``RESULT:`` line parse (``offline_lane_runs.py::INFRA_RESULT_RE``)
+        end-to-end into a filed fix task
 
 Each scenario is framed as a negative control: it would RED if IE1's infra
 wiring were reverted, and is expected GREEN against landed IE1.
@@ -332,7 +334,7 @@ def _build_infra_worker(
     ``infra_runner``/``infra_confirmation_runner`` default to ``None`` and
     are passed straight through to ``OfflineLaneWorker`` — when left
     unset, the worker falls back to its OWN real default seams
-    (``_default_run_infra``/``_default_infra_confirmation_run``), which is
+    (``offline_lane_runs.py::infra_runner``/``_default_infra_confirmation_run``), which is
     exactly what IB6 needs to drive the real H9 wire-format parse over a
     committed stub script.
     """
@@ -1515,7 +1517,7 @@ async def _add_infra_run_all_stub(repo: Path) -> None:
     pattern (``_add_all_warm_lane_scripts``): the script is chmod'd 0o755
     and committed so any worktree checked out from main — including a real
     ``_offline-deep`` reset — carries it at ``<wt>/tests/infra/run_all.sh``,
-    letting the REAL default ``_default_run_infra`` /
+    letting the REAL default ``offline_lane_runs.py::infra_runner`` /
     ``_default_infra_confirmation_run`` seams shell out to it (rather than
     the injected-callable seam every other IB scenario uses). The stub
     ignores its ``--scope host-infra`` argv beyond presence — it always
@@ -1545,11 +1547,11 @@ async def test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task(
     repo,
     tmp_path,
 ):
-    """IB6 — the REAL default infra seams (``_default_run_infra`` /
+    """IB6 — the REAL default infra seams (``offline_lane_runs.py::infra_runner`` /
     ``_default_infra_confirmation_run``) shell out to a committed stub
-    ``tests/infra/run_all.sh`` emitting reify H9's wire format, and
-    ``_parse_infra_failures`` extracts the failing test-file-name into a
-    filed fix task end-to-end.
+    ``tests/infra/run_all.sh`` emitting reify H9's wire format, and the
+    ``RESULT:`` line parse (``offline_lane_runs.py::INFRA_RESULT_RE``)
+    extracts the failing test-file-name into a filed fix task end-to-end.
 
     ``infra_runner``/``infra_confirmation_runner`` are deliberately left
     uninjected (unlike IB1-IB5) so :class:`OfflineLaneWorker` falls back to

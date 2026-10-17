@@ -14,6 +14,8 @@ from itertools import combinations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.cli_invoke import no_mcp_servers_config
+
 from orchestrator.agents.invoke import invoke_agent
 
 from .elo import (
@@ -142,6 +144,11 @@ Output JSON: {{"winner": "A" or "B" or "tie", "confidence": 0.0-1.0, "reasoning"
         backend='claude',
         max_budget_usd=5.0,
         output_schema=JUDGE_SCHEMA,
+        # The judge needs no MCP: it answers through output_schema. The truthy
+        # zero-server config is what makes the strict flag bite (task 4757);
+        # mcp_config=None would leave the cwd's ambient .mcp.json merged.
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
     )
 
     # Parse verdict
@@ -504,6 +511,8 @@ async def judge_plan_quality(
         effort='max',
         max_budget_usd=5.0,
         output_schema=PLAN_QUALITY_SCHEMA,
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
     )
 
 

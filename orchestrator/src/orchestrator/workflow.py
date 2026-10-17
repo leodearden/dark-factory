@@ -39,6 +39,7 @@ from shared.cli_invoke import (
     is_server_error_status,
     is_timed_out_with_progress,
     is_zero_output_timeout,
+    no_mcp_servers_config,
     read_transcript_records,
     transcript_exists,
 )
@@ -13634,6 +13635,12 @@ class TaskWorkflow:
         if 'verdict_tools' in role.mcp_families and cwd:
             mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
+        # Strict scoping (EVAL_PROFILE, task 4757) is a no-op without a truthy
+        # --mcp-config, so a role whose families composed none gets the
+        # zero-server one rather than keeping the worktree's ambient .mcp.json.
+        if self.config.strict_mcp_config and not mcp_config:
+            mcp_config = no_mcp_servers_config()
+
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
         # by passing resume_session_id to invoke_with_cap_retry.  Otherwise,
@@ -13927,6 +13934,7 @@ class TaskWorkflow:
                 allowed_tools=role.allowed_tools or None,
                 disallowed_tools=role.disallowed_tools or None,
                 mcp_config=mcp_config,
+                strict_mcp_config=self.config.strict_mcp_config,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
                 sandbox_extras=sandbox_extras,

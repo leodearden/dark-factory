@@ -62,6 +62,7 @@ from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
+    ample_disk_usage,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -636,6 +637,18 @@ def _hermetic_psi_reader(monkeypatch, request):
     if request.node.get_closest_marker('real_psi_reader'):
         return
     monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_disk_usage(monkeypatch):
+    """Every ``shutil.disk_usage`` reads ``_orch_helpers.py::ample_disk_usage`` (task 7032).
+
+    The free-space guards read the host's disk, so a verify host under the 10 GiB
+    floor of ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
+    failed lane and workflow tests on every branch (esc-5509-2). A test of a guard
+    patches ``shutil.disk_usage`` over this one with its own numbers.
+    """
+    monkeypatch.setattr(shutil, 'disk_usage', ample_disk_usage)
 
 
 @pytest.fixture
@@ -1251,4 +1264,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
+    # read a truthy Mock and run every mock-config workflow test strictly scoped.
+    config.strict_mcp_config = False
     return config
