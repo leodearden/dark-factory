@@ -6,9 +6,10 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Final, NamedTuple
+from typing import Final, NamedTuple, TypeVar
 
 from client_feed.contract import (
+    EVENT_MODELS,
     FEED_VERSION,
     BranchSnapshot,
     CriteriaResults,
@@ -207,25 +208,51 @@ def _no_state_change(acc: _Accumulator, event: FeedEvent) -> None:
 
 
 class _Handling(NamedTuple):
-    apply: Callable[[_Accumulator, Any], None]
+    apply: Callable[[_Accumulator, FeedEvent], None]
     in_timeline: bool
 
 
-_HANDLING: Final[Mapping[type, _Handling]] = {
-    Heartbeat: _Handling(_apply_heartbeat, in_timeline=False),
-    FactoryState: _Handling(_apply_factory_state, in_timeline=False),
-    PrdUpserted: _Handling(_apply_prd_upserted, in_timeline=True),
-    TaskUpserted: _Handling(_apply_task_upserted, in_timeline=True),
-    TaskPhase: _Handling(_apply_task_phase, in_timeline=True),
-    VerifyRun: _Handling(_no_state_change, in_timeline=True),
-    VerifyTestResults: _Handling(_no_state_change, in_timeline=True),
-    MergeLanded: _Handling(_no_state_change, in_timeline=True),
-    BranchSnapshot: _Handling(_apply_branch_snapshot, in_timeline=False),
-    TreeSnapshot: _Handling(_apply_tree_snapshot, in_timeline=False),
-    FileRevealed: _Handling(_apply_file_revealed, in_timeline=True),
-    RevealRefused: _Handling(_no_state_change, in_timeline=True),
-    CriteriaResults: _Handling(_apply_criteria_results, in_timeline=True),
-}
+_E = TypeVar('_E', bound=FeedEvent)
+
+
+def _handled(
+    event_type: type[_E], apply: Callable[[_Accumulator, _E], None], *, in_timeline: bool
+) -> tuple[type[_E], _Handling]:
+    def apply_to_its_type(acc: _Accumulator, event: FeedEvent) -> None:
+        if not isinstance(event, event_type):
+            raise TypeError(f'{event_type.__name__} handler given a {type(event).__name__}')
+        apply(acc, event)
+
+    return event_type, _Handling(apply_to_its_type, in_timeline)
+
+
+def _covering_every_event_model(
+    rows: Iterable[tuple[type[FeedEvent], _Handling]],
+) -> Mapping[type[FeedEvent], _Handling]:
+    table = dict(rows)
+    unhandled = sorted(
+        model.__name__ for model in EVENT_MODELS.values() if model not in table
+    )
+    if unhandled:
+        raise TypeError(f'fold has no handling for event types: {", ".join(unhandled)}')
+    return table
+
+
+_HANDLING: Final = _covering_every_event_model([
+    _handled(Heartbeat, _apply_heartbeat, in_timeline=False),
+    _handled(FactoryState, _apply_factory_state, in_timeline=False),
+    _handled(PrdUpserted, _apply_prd_upserted, in_timeline=True),
+    _handled(TaskUpserted, _apply_task_upserted, in_timeline=True),
+    _handled(TaskPhase, _apply_task_phase, in_timeline=True),
+    _handled(VerifyRun, _no_state_change, in_timeline=True),
+    _handled(VerifyTestResults, _no_state_change, in_timeline=True),
+    _handled(MergeLanded, _no_state_change, in_timeline=True),
+    _handled(BranchSnapshot, _apply_branch_snapshot, in_timeline=False),
+    _handled(TreeSnapshot, _apply_tree_snapshot, in_timeline=False),
+    _handled(FileRevealed, _apply_file_revealed, in_timeline=True),
+    _handled(RevealRefused, _no_state_change, in_timeline=True),
+    _handled(CriteriaResults, _apply_criteria_results, in_timeline=True),
+])
 
 
 def _remember(acc: _Accumulator, event: FeedEvent) -> None:
