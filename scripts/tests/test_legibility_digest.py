@@ -1037,16 +1037,16 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 4
 
-    def test_frontmatter_names_a_generation_that_excludes_steward_continuation_prompts(
-        self, tmp_path,
+    def test_frontmatter_instrument_version_is_at_or_past_the_steward_continuation_generation(
+        self,
     ):
-        """Generation 6 is the first whose gold section excludes the steward
-        continuation prompt, so a census can tell a pre-fix '# New Escalation
-        for Task' User Correction from a live regression. A floor, not a
-        freeze, like its siblings above."""
+        """A version floor only. Generation 6 is the first whose gold section
+        excludes the steward continuation prompt, so a census can tell a
+        pre-fix '# New Escalation for Task' User Correction from a live
+        regression. The exclusion itself is pinned by
+        TestHarnessInjectedTurnFilter.test_render_digest_steward_continuation_session_has_no_gold_section."""
         digest = mod.render_digest(
-            [_with_session_meta(_sdk_prompt(steward_continuation_prompt(tmp_path)))],
-            agent_class='orchestrated-task',
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
         )
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
