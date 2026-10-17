@@ -34,6 +34,12 @@ class RelocatedVenv:
     disposition: Disposition
 
 
+@dataclass(frozen=True)
+class _RelocationEvidence:
+    built_at: tuple[Path, ...]
+    scripts: tuple[str, ...]
+
+
 def retire_relocated_venvs(
     root: Path, run_dirs: Iterable[str] = (), *, running_prefix: Path | None = None,
 ) -> tuple[RelocatedVenv, ...]:
@@ -41,11 +47,12 @@ def retire_relocated_venvs(
     prefix = (running_prefix if running_prefix is not None else Path(sys.prefix)).resolve()
     found: list[RelocatedVenv] = []
     for venv in _candidates(root, run_dirs):
-        relocation = _find(venv)
-        if relocation is None:
+        evidence = _relocation_evidence(venv)
+        if evidence is None:
             continue
-        built_at, scripts = relocation
-        finding = RelocatedVenv(venv, built_at, scripts, _dispose(venv, prefix))
+        finding = RelocatedVenv(
+            venv, evidence.built_at, evidence.scripts, _dispose(venv, prefix),
+        )
         _report(finding)
         found.append(finding)
     return tuple(found)
@@ -94,7 +101,7 @@ def _moved_from(venv: Path, interpreter: Path) -> Path | None:
     return None
 
 
-def _find(venv: Path) -> tuple[tuple[Path, ...], tuple[str, ...]] | None:
+def _relocation_evidence(venv: Path) -> _RelocationEvidence | None:
     built_at: set[Path] = set()
     scripts: list[str] = []
     try:
@@ -108,7 +115,7 @@ def _find(venv: Path) -> tuple[tuple[Path, ...], tuple[str, ...]] | None:
         return None
     if not scripts:
         return None
-    return tuple(sorted(built_at)), tuple(sorted(scripts))
+    return _RelocationEvidence(tuple(sorted(built_at)), tuple(sorted(scripts)))
 
 
 def _is_uv_managed(venv: Path) -> bool:
