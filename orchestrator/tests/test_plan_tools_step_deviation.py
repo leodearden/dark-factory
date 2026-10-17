@@ -12,14 +12,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import _plan_markup_fixtures
 import pytest
 from _markup_helpers import INVOKE_CLOSER, closer
-from _plan_markup_fixtures import (
-    corrupt_plan,
-    isolate_the_refusal_memo,  # noqa: F401 — autouse; pytest resolves it by name
-    on_disk,
-    plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
-)
+from _plan_markup_fixtures import corrupt_plan, on_disk
 from shared.plan_deviation import DEVIATION_KINDS
 
 from orchestrator.artifacts import TaskArtifacts
@@ -31,6 +27,10 @@ from orchestrator.mcp.plan_tools import (
     _mark_step_done,
     _record_step_deviation,
 )
+
+#: pytest finds a fixture by its name in the requesting module's namespace.
+plan_artifacts = _plan_markup_fixtures.plan_artifacts
+isolate_the_refusal_memo = _plan_markup_fixtures.isolate_the_refusal_memo
 
 _RECORD_KEYS = {
     'kind',
