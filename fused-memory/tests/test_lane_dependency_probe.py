@@ -23,7 +23,6 @@ from _fm_helpers import (
     FALKOR_PORT,
     QDRANT_URL,
     falkor_skipif,
-    lease_dir_fixture,  # noqa: F401
     qdrant_skipif,
 )
 from shared.lane_probe import OUTAGE_EXIT_STATUS
