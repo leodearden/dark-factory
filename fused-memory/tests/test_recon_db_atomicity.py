@@ -106,6 +106,8 @@ CHECKPOINT_TIMEOUT_SECONDS = 10
 BUFFERED_EVENTS = 4_000
 BUFFER_COLLISION_ITERATIONS = 20
 
+SEEDED_EVENTS = 3
+
 _INSERT_RUN = """INSERT INTO runs
     (id, project_id, run_type, trigger_reason, started_at, completed_at, status)
     VALUES (?, ?, ?, ?, ?, ?, ?)"""
@@ -499,16 +501,23 @@ async def test_checkpoint_and_write_do_not_lock_each_other_out(journal, second_c
     )
 
 
+@pytest.fixture
+def buffer_tap() -> _ConnectTap:
+    return _ConnectTap()
+
+
 @pytest_asyncio.fixture
-async def event_buffer(journal):
+async def event_buffer(journal, buffer_tap):
     """An EventBuffer on the journal's OWN ``reconciliation.db`` file.
 
-    Two stores, two connections, one file — production's exact shape, which is
-    what makes the journal a genuine foreign writer rather than a stand-in.  Both
-    open via ``connect_daemon``, so neither carries the shutdown hazard that
+    Several stores, several connections, one file — production's shape.  The
+    collision arms' foreign writer is nonetheless ``second_connection``, not the
+    journal: the pin proof needs the foreign commit to land a row the peek would
+    match, and the journal writes no ``event_buffer`` rows.  Both stores open via
+    ``connect_daemon``, so neither carries the shutdown hazard that
     ``second_connection`` documents.
     """
-    buffer = EventBuffer(db_path=journal.data_dir / 'reconciliation.db')
+    buffer = EventBuffer(db_path=journal.data_dir / 'reconciliation.db', connect=buffer_tap)
     await buffer.initialize()
     try:
         yield buffer
@@ -526,16 +535,20 @@ def _event(index: int) -> ReconciliationEvent:
     )
 
 
+def _seeded_event_ids(count: int = SEEDED_EVENTS) -> list[str]:
+    return [f'seeded-{i}' for i in range(count)]
+
+
 async def _seed_buffered_events(conn, *, count: int) -> None:
     """Fill the buffer with ``count`` ``status='buffered'`` rows, in ONE executemany.
 
-    Distinct descending-age timestamps, so ``peek_buffered``'s ``ORDER BY
-    timestamp`` has real work to do rather than reading an already-ordered heap.
+    Distinct, increasing timestamps, so ``peek_buffered``'s ``ORDER BY
+    timestamp`` returns them in ``_seeded_event_ids`` order.
     """
     now = datetime.now(UTC)
     rows = [
         (
-            f'seeded-{i}',
+            event_id,
             PROJECT_ID,
             'memory_added',
             'agent',
@@ -544,9 +557,39 @@ async def _seed_buffered_events(conn, *, count: int) -> None:
             '{}',
             'buffered',
         )
-        for i in range(count)
+        for i, event_id in enumerate(_seeded_event_ids(count))
     ]
     async with conn.executemany(_INSERT_EVENT, rows):
+        pass
+    await conn.commit()
+
+
+# The peek's scan, test-owned: the legacy control runs it in the replaced
+# execute + fetchall shape on the buffer's own connection.
+_LEGACY_PEEK = """SELECT * FROM event_buffer
+    WHERE project_id = ? AND status = 'buffered'
+    ORDER BY timestamp ASC LIMIT ?"""
+
+
+async def _buffer_a_late_event(conn: aiosqlite.Connection) -> None:
+    """Commit buffered event ``late``, which the peek WOULD match, from ``conn``.
+
+    A peek pinned before this commit cannot return it, which is how each buffer
+    collision arm certifies that the collision really happened.
+    """
+    async with conn.execute(
+        _INSERT_EVENT,
+        (
+            'late',
+            PROJECT_ID,
+            'memory_added',
+            'agent',
+            None,
+            datetime.now(UTC).isoformat(),
+            '{}',
+            'buffered',
+        ),
+    ):
         pass
     await conn.commit()
 
