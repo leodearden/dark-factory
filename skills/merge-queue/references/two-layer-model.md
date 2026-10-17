@@ -403,7 +403,8 @@ The shared pipeline pieces the serial worker used were never worker-specific, an
 `classify_and_merge()` (§7, task κ/1995), `_do_train_merge()` with its `_TrainMergeHost`
 Protocol (the narrow statement of what the train pipeline touches), `_run_post_merge_verify()`,
 `_finalize_advanced_merge()`, `_map_advance_failure()`, `_emit_merge_queued()`,
-`_HALT_ADVANCE_RESULTS` and `_WipHaltMixin`.
+`_HALT_ADVANCE_RESULTS` and the lane halt state, now `HaltState` in `merge_lane/halt.py`, which the
+worker composes (task 5305).
 
 ---
 
