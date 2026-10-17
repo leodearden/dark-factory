@@ -14,7 +14,6 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from shared.lane_probe import OUTAGE_EXIT_STATUS
 from _lane_episode_fakes import (
     COMMAND,
     HEAD0,
@@ -37,6 +36,7 @@ from _lane_episode_fakes import (
     _red,
     _run,
 )
+from shared.lane_probe import OUTAGE_EXIT_STATUS
 
 from orchestrator.guard_state import PersistentMap
 from orchestrator.offline_lane_confirm import (
