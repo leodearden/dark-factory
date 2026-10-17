@@ -1011,10 +1011,22 @@ def render_markdown(result: AuditResult) -> str:
 
 
 def _merge_cell(outcome: MergeOutcome | None) -> str:
+    """*outcome* as a one-line summary; the full reason is in `--format json`."""
     if outcome is None:
         return '-'
-    detail = outcome.merge_sha or outcome.reason or ''
+    detail = outcome.merge_sha or _first_line(outcome.reason or '')
     return f'{outcome.state} ({detail})' if detail else outcome.state
+
+
+def _first_line(text: str) -> str:
+    """The first line of *text*, marked with how many lines after it were dropped."""
+    lines = text.strip().splitlines()
+    if not lines:
+        return ''
+    dropped = len(lines) - 1
+    if not dropped:
+        return lines[0]
+    return f"{lines[0]} \N{HORIZONTAL ELLIPSIS} +{dropped} line{'' if dropped == 1 else 's'}"
 
 
 def _parse_window(spec: str) -> timedelta:
