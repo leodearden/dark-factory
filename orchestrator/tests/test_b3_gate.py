@@ -1789,7 +1789,8 @@ class TestStopScanExcludesCapturedOutput:
     """check_proposal's step-1c scan skips the fenced captured output of each
     verify failure-report section in block_reason, and still scans every
     authored text: proposal_text, extra_texts, and the rest of block_reason
-    (task 6933).
+    (task 6933). The failure-report stream cases cover every captured section
+    shape failure_report emits (task 5357).
     """
 
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
@@ -1913,7 +1914,12 @@ class TestStopScanExcludesCapturedOutput:
         )},
         {'lint_output': 'x.py:1:1: E501 do not run this by hand'},
         {'type_output': 'x.py:1: error: do not run this by hand'},
-    ], ids=['test_output', 'lint_output', 'type_output'])
+        {'test_output': 'collected 3 items\nsetup note: do not run this by hand\n3 errors in 1.2s'},
+        {'type_output': 'x.py:1: warning: do not run this by hand'},
+    ], ids=[
+        'test_output', 'lint_output', 'type_output',
+        'test_output_without_marker', 'type_output_without_error',
+    ])
     def test_verify_failure_report_streams_are_fenced_and_skipped(self, stream):
         from orchestrator.b3_gate import FRESH, check_proposal
         from orchestrator.stop_instruction import detect_stop_instruction
