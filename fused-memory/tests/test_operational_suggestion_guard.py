@@ -768,3 +768,39 @@ class TestProvenanceStampRecognizerParityWithRoutingIntentGuard:
             'The two _strip_provenance_stamps copies disagree on this input; '
             'they are deliberate duplicates and must stay equivalent.'
         )
+
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=operational_suggestion_guard'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
+
+def _finding_for(metadata):
+    return operational_suggestion_finding(
+        title=None,
+        description='Restart the fused-memory service and confirm it is back up.',
+        details=None,
+        task_kind='normal',
+        metadata=metadata,
+    )
+
+
+class TestUnreadableMetadataIsDiscardedLoudly:
+    """Unreadable metadata reads as empty under the shared wire rule, and is logged."""
+
+    def test_malformed_string_behaves_as_absent_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            finding = _finding_for('{not json')
+        assert finding is not None
+        assert finding == _finding_for(None)
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [None, ''])
+    def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            _finding_for(metadata)
+        assert _discard_lines(caplog) == []
