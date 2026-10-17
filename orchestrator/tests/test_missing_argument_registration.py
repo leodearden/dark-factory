@@ -12,12 +12,13 @@ import json
 from typing import Any
 
 import pytest
+from _markup_helpers import closer, param_opener
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from shared.mcp_missing_arguments import MISSING_ARGUMENT_CODE, MissingArgumentMiddleware
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_tools, verdict_tools
 
 
 @pytest.fixture
@@ -73,3 +74,71 @@ async def test_create_plan_without_files_keeps_its_in_body_answer(artifacts):
     assert result.structured_content is not None
     assert result.structured_content['status'] == 'error'
     assert artifacts.read_plan() == {}
+
+
+# --- verdict-tools ---
+
+REVIEWER = 'test_analyst'
+
+ROLE_CALLS: dict[str, tuple[str, dict[str, Any], str]] = {
+    'judge': (
+        'submit_completion_verdict',
+        {'complete': True, 'reasoning': 'r', 'uncovered_plan_steps': []},
+        'substantive_work',
+    ),
+    'triage': (
+        'submit_triage',
+        {'accepted': [], 'skipped': []},
+        'proposed_task_groups',
+    ),
+    'merger': (
+        'submit_merge_disposition',
+        {'blocked': False},
+        'reason',
+    ),
+    REVIEWER: (
+        'submit_review_verdict',
+        {'reviewer': REVIEWER, 'verdict': 'PASS', 'summary': 's'},
+        'issues',
+    ),
+}
+
+
+@pytest.mark.parametrize('role', list(ROLE_CALLS))
+def test_verdict_tools_registers_the_guard_exactly_once(artifacts, role):
+    assert len(guards_on(verdict_tools.create_server(artifacts, role))) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('role', list(ROLE_CALLS))
+async def test_a_missing_argument_is_refused_structurally_on_every_branch(artifacts, role):
+    tool, arguments, omitted = ROLE_CALLS[role]
+
+    payload = await refusal(verdict_tools.create_server(artifacts, role), tool, arguments)
+
+    assert payload['code'] == MISSING_ARGUMENT_CODE
+    assert payload['tool'] == tool
+    assert [m['name'] for m in payload['missing']] == [omitted]
+    assert artifacts.read_verdict(role) is None
+
+
+@pytest.mark.asyncio
+async def test_a_partially_repaired_leak_is_refused_for_what_is_still_missing(artifacts):
+    leaked_summary = (
+        'The change is covered.'
+        + closer('parameter')
+        + '\n'
+        + param_opener('issues')
+        + '[{"severity": "low", "suggested_fix": "add a test"}]'
+    )
+
+    payload = await refusal(
+        verdict_tools.create_server(artifacts, REVIEWER),
+        'submit_review_verdict',
+        {'reviewer': REVIEWER, 'summary': leaked_summary},
+    )
+
+    assert payload['code'] == MISSING_ARGUMENT_CODE
+    assert [m['name'] for m in payload['missing']] == ['verdict']
+    assert 'issues' in payload['provided']
+    assert artifacts.read_verdict(REVIEWER) is None
