@@ -1305,3 +1305,50 @@ def test_the_invocations_section_renders_tier_and_subtype(runs_db):
     section = body.split('### 2.')[1].split('### 3.')[0]
     assert '| tier | subtype |' in section
     assert '| 1 | error_max_turns |' in section
+
+
+MULTI_LINE_REASON = '\n'.join([
+    'Post-merge verification failed: ruff | pytest [category: test_failure]',
+    '',
+    'Failures: tests failed',
+    '```',
+    'FAILED scripts/tests/test_x.py::test_y | AssertionError',
+    '```',
+    'Re-run with -x',
+])
+
+
+def _merger_run_blocked_by_a_multi_line_reason(conn):
+    _fable_merger_run(conn, task_id='4782')
+    conn.seed_event(
+        _at(hours=2, minutes=30), 'merge_finalized', task_id='4782',
+        data=_merge_finalized_payload(branch='4782', state='blocked', reason=MULTI_LINE_REASON),
+    )
+
+
+def test_a_multi_line_merge_reason_renders_as_one_table_row_with_its_first_line(runs_db):
+    _merger_run_blocked_by_a_multi_line_reason(runs_db)
+
+    body = audit_model_admission.render_markdown(_audit(runs_db))
+
+    section = body.split('### 2.')[1].split('### 3.')[0]
+    rows = [line for line in section.splitlines() if line.startswith('|')]
+    assert len(rows) == 3
+    assert [line for line in section.splitlines()[1:] if line.strip()] == rows
+    assert all(len(_row_cells(line)) == 14 for line in rows)
+    assert _row_cells(rows[2])[-1] == (
+        r'blocked (Post-merge verification failed: ruff \| pytest [category: test_failure]'
+        ' \N{HORIZONTAL ELLIPSIS} +6 lines)'
+    )
+    assert 'AssertionError' not in body
+    assert 'Re-run with -x' not in body
+    assert not any(line.lstrip().startswith('```') for line in body.splitlines())
+    assert sum(line.startswith('### ') for line in body.splitlines()) == 6
+
+
+def test_render_json_keeps_the_full_multi_line_merge_reason(runs_db):
+    _merger_run_blocked_by_a_multi_line_reason(runs_db)
+
+    payload = json.loads(audit_model_admission.render_json(_audit(runs_db)))
+
+    assert payload['invocations'][0]['merge_outcome']['reason'] == MULTI_LINE_REASON
