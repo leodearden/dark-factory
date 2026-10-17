@@ -3313,6 +3313,30 @@
           "current": 31945
         }
       ]
+    },
+    {
+      "task_id": "6861",
+      "reason": "GitOps.is_ancestor_checked: the ancestry read tells a git error (None) from a no (False), so the lane engine's D10 'no decision' row and \u03b50's drain can read it; is_ancestor delegates to it (net-additive: +10 lines, +2 cognitive, +1 prose in git_ops.py; every other measure fell or held \u2014 offline_lane.py 957->381 lines)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1444,
+          "current": 1446
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15997,
+          "current": 16007
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9318,
+          "current": 9319
+        }
+      ]
     }
   ]
 }
