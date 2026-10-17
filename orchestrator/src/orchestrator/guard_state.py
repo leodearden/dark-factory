@@ -438,8 +438,8 @@ class PersistentMap(MutableMapping[str, Any]):
 
     Backs the guards that count ("this escalation has burnt N attempts") or that remember a
     record: ``orchestrator/src/orchestrator/offline_lane_episode_state.py::
-    EpisodeStore`` keeps one ``CommandRecord`` per lane command, with a 14-day
-    TTL.
+    EpisodeStore`` keeps one ``CommandRecord`` per lane command, with an
+    ``EPISODE_RETENTION`` TTL.
 
     Unlike :class:`PersistentSet`'s ``add``, ``__setitem__`` ALWAYS refreshes
     the timestamp: a counter that is still being bumped has a subject that is

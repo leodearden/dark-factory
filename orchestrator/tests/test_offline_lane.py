@@ -183,6 +183,7 @@ def test_git_config_offline_lane_knobs_validation():
         GitConfig(offline_lane_poll_interval_secs=0.0)
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_persist_passes=0)
+    assert GitConfig(offline_lane_persist_passes=1).offline_lane_persist_passes == 1
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_recheck_secs=0.0)
     with pytest.raises(ValidationError):

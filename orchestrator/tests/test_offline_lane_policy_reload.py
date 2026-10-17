@@ -29,7 +29,7 @@ POLICY_KNOBS = (
     'git.offline_lane_recheck_secs',
     'git.offline_lane_red_unlanded_hours',
 )
-RETIRED_KNOB = 'git.offline_lane_red_' + 'advances_before_blocker'
+RETIRED_KNOB = 'git.offline_lane_red_advances_before_blocker'
 COMMAND = LaneCommand(name='q', command='pytest -m integration', fix_task_priority='low')
 HELD = Confirmed(ConfirmMode.NARROWED, ('tests/t.py::test_x',), (), ())
 

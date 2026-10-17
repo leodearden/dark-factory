@@ -752,7 +752,6 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     return None, _response_error('get_task response carries no task', envelope)
 
 
-# Per-call timeout for submit_task.
 _SUBMIT_TASK_TIMEOUT_SECS = 30
 
 

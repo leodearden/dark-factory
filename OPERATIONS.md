@@ -215,9 +215,11 @@ turned into `-`; the legacy legs use `legacy_numeric` and `legacy_infra`),
 next to the per-phase `detect.log`, `confirm.log` and `*.junit.xml`.
 `record.json` names the command, leg, head, pass id, the `detect` and
 `confirm` run blocks (`null` for a phase that did not run), the `outcome`,
-and `effect`: the lists `tests_counted`, `episodes_started`,
-`episodes_extended`, `episodes_ended`, `tasks_filed` and
-`escalations_raised`. A pass whose `effect` is still `null` was cut short.
+and `effect`: `tests_counted`, `episodes_started`,
+`episodes_extended`, `episodes_ended`, `threshold_reached`, `stale_heads`,
+`no_decision`, `tasks_filed` and `escalations_raised`. `effect` is `null` while
+a pass is still running, and stays `null` if the pass was cut short (it is
+written after the engine observes).
 
 **Where a held red is remembered.** `data/orchestrator/guards/offline_lane_episodes.json`
 holds one record per command, with one `episodes[]` element per failing
@@ -226,7 +228,8 @@ test. A red held at 1 of 2 looks like an element with one entry in
 `ended_at: null`. Once the test has been reproduced on enough counted
 passes, the same element has `covering_task_id` and `filed_at` set; a
 cleared test gets `ended_at`. A filing that could not be made is kept as
-`filing_due: true` (with `filing_failure`) and retried on the poll tick.
+`filing_due: true` (with `filing_failure`) and retried at the start of every
+pass as well as on the poll tick.
 
 **The three knobs**, all under `git:` and all hot-reloadable with
 `mcp__escalation__reload_config` (read `applied` in the reply):
@@ -235,8 +238,10 @@ cleared test gets `ended_at`. A filing that could not be made is kept as
   reproduced on before one fix task is filed for it. `1` restores filing on
   the first reproduced pass.
 - `git.offline_lane_recheck_secs` (1800): the least spacing between two counted
-  passes, and how long a held red waits before the lane re-runs the command;
-  also how long a filing may stay due before it is escalated.
+  passes, and how long a held red waits before the lane re-runs the command
+  (that recheck applies to generic commands only; the legacy numeric and infra
+  legs do not recheck); also how long a filing may stay due before it is
+  escalated.
 - `git.offline_lane_red_unlanded_hours` (24): how long a held episode may go
   unextended before it expires, and how long after a fix task was filed a
   still-red test counts as unlanded.

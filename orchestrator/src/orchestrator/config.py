@@ -2079,7 +2079,7 @@ class GitConfig(BaseModel):
         description=(
             'Minimum start-to-start spacing (seconds, default 1800.0) of '
             'counted offline-lane passes, and the delay before a held red is '
-            're-observed (PRD D5, D12); also the outage probe loop period. '
+            're-observed (PRD D5, D12). '
             'Read by ``offline_lane_episodes.lane_policy`` at every pass and '
             'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
             'hot-reloaded by ``reload_config`` and read on the next pass.'
