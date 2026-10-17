@@ -883,6 +883,66 @@ def test_an_absent_ceiling_renders_as_a_dash_rather_than_as_a_breach(live_shaped
     assert '| 2 | 9.94 | - | - | - |' in section
 
 
+def _section_4_lines(conn):
+    body = audit_model_admission.render_markdown(_audit(conn))
+    return body.split('### 4.')[1].split('### 5.')[0].splitlines()
+
+
+def test_section_4_renders_each_orchestrator_startup_and_the_first_startup_after_each_reload(
+    runs_db,
+):
+    reload_ts, startup_ts = _at(minutes=17, seconds=35), _at(hours=2, minutes=56)
+    _reload(runs_db, reload_ts, restart_required={SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE})
+    runs_db.seed_run(run_id='run-b756e05f8ff0', started_at=_at(hours=-15))
+    runs_db.seed_run(run_id='run-063e9795fcf6', started_at=startup_ts)
+    runs_db.seed_run(run_id='run-5352d42ce5fa', started_at=_at(days=2, hours=5, minutes=48))
+
+    lines = _section_4_lines(runs_db)
+
+    assert f'| {startup_ts} | run-063e9795fcf6 |' in lines
+    assert not any('run-b756e05f8ff0' in line for line in lines)
+    assert (
+        f'| {reload_ts} | {SCOPED_CAP_LEAF} | {startup_ts} | run-063e9795fcf6 |' in lines
+    )
+
+
+def test_a_reload_with_no_startup_after_it_renders_as_none_in_window(runs_db):
+    reload_ts = _at(hours=1)
+    _reload(runs_db, reload_ts, restart_required={SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE})
+
+    lines = _section_4_lines(runs_db)
+
+    assert f'| {reload_ts} | {SCOPED_CAP_LEAF} | none in window | - |' in lines
+
+
+def test_a_reload_with_two_restart_required_leaves_renders_them_in_one_cell(runs_db):
+    reload_ts = _at(hours=1)
+    _reload(runs_db, reload_ts, restart_required={
+        'max_concurrent_tasks': {'old': 8, 'new': 10},
+        SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE,
+    })
+
+    lines = _section_4_lines(runs_db)
+
+    assert (
+        f'| {reload_ts} | max_concurrent_tasks, {SCOPED_CAP_LEAF} | none in window | - |'
+        in lines
+    )
+
+
+def test_section_4_still_renders_the_service_restart_table_beside_the_startups(runs_db):
+    runs_db.seed_event(
+        _at(hours=3), 'service_restart',
+        data={'service': 'fused-memory', 'reason': 'post_merge_fused_memory_code_change'},
+    )
+    runs_db.seed_run(run_id='run-063e9795fcf6', started_at=_at(hours=2, minutes=56))
+
+    lines = _section_4_lines(runs_db)
+
+    assert f'| {_at(hours=3)} | fused-memory | post_merge_fused_memory_code_change |' in lines
+    assert f'| {_at(hours=2, minutes=56)} | run-063e9795fcf6 |' in lines
+
+
 def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
     payload = json.loads(audit_model_admission.render_json(_audit(live_shaped_db)))
 
