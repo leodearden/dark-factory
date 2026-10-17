@@ -132,9 +132,10 @@ async def test_fm_session_identifies_as_the_orchestrator():
 
 
 @pytest.mark.asyncio
-async def test_mcp_call_one_shot_lands_a_write_through_the_shared_session():
-    """With no McpLifecycle singleton (the unit-test default), mcp_call builds a
-    one-shot fm_session and the write reaches the server."""
+async def test_mcp_call_one_shot_lands_a_write_through_the_shared_session(monkeypatch):
+    """With no McpLifecycle singleton, mcp_call builds a one-shot fm_session and
+    the write reaches the server."""
+    monkeypatch.setattr(orchestrator.mcp_lifecycle, '_session', None)
     with pytest.raises(RuntimeError):
         get_session()
     arguments = {'content': 'a fact', 'project_id': 'dark_factory'}

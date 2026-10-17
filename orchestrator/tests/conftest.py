@@ -673,11 +673,10 @@ def forbid_live_mcp(monkeypatch):
     ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
     network I/O through ``McpSession.initialize`` -> ``call`` (``call_tool``
-    delegates to ``call``; the one-shot fallback path inside ``mcp_call``
-    applies, since the module-global ``_session`` is ``None`` in unit
-    tests) — patching the class methods is
-    the single binding-independent network chokepoint every alias funnels
-    through.
+    delegates to ``call``; the one-shot fallback inside ``mcp_call`` applies,
+    as the module-global ``_session`` is ``None`` in unit tests) — patching
+    the class methods is the single binding-independent network chokepoint
+    every alias funnels through.
 
     RECORDS each attempt into the yielded list (rather than only raising)
     because the two dominant live seams here swallow exceptions:
