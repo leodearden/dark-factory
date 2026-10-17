@@ -2013,7 +2013,9 @@ def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str |
     *ini_addopts*: those of the config pytest reads for *cmd* run from
     *invocation_dir* (``verify_plan.py::governing_addopts``). Every caller
     must name that directory; ``None`` resolves no config, so addopts are
-    blanked.
+    blanked. The result is not a faithful replay: ``verify_cmd.py::serial_pytest``
+    names the fixtures ``-p no:xdist`` removes, and how a confirming caller
+    must judge the ERRORs that follow.
 
     Returns *cmd* unchanged when it is ``None`` or does not parse/chain into
     a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
