@@ -598,6 +598,37 @@ async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
 
 
 @pytest.mark.asyncio
+async def test_a_legacy_multi_hop_peek_kills_the_heartbeat(
+    journal, event_buffer, buffer_tap, second_connection
+):
+    """CONTROL: the replaced read shape loses arm D's exact collision.
+
+    Same collision, same production heartbeat, same foreign commit; only the
+    peek's shape is replaced, by an execute + fetchall on the buffer's own
+    connection.  That it kills the heartbeat is what proves arm D discriminates.
+    """
+    await _seed_buffered_events(second_connection, count=SEEDED_EVENTS)
+
+    rows, error = await _collide_with_a_pinned_read(
+        buffer_tap.connection,
+        read=lambda: _legacy_multi_hop_read(
+            buffer_tap.connection, _LEGACY_PEEK, (PROJECT_ID, 1_000_000)
+        ),
+        write=lambda: event_buffer.heartbeat(PROJECT_ID),
+        foreign_commit=lambda: _buffer_a_late_event(second_connection),
+    )
+
+    assert error == 'SQLITE_BUSY_SNAPSHOT', (
+        f'the replaced peek did not kill the heartbeat ({error!r}), so this '
+        'collision no longer reproduces the defect arm D guards'
+    )
+    assert [row['id'] for row in rows] == _seeded_event_ids(), (
+        f"the parked peek saw {[row['id'] for row in rows]!r}: it was not pinned "
+        "before the foreign commit buffered 'late'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_event_buffer_checkpoint_and_push_do_not_lock_each_other_out(event_buffer):
     """Arm E: the journal's arm C, at the second of the three shared connections."""
     for i in range(CHECKPOINT_ITERATIONS):
