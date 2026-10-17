@@ -3744,7 +3744,7 @@ var/default -- submit_task lives on the same fused-memory MCP server this
 project's get_statuses call already targets."""
 
 
-def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
+def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
     """Call MCP tool *tool_name* at *url*, returning its unwrapped result.
 
     A thin delegate to ``census_trigger.post_mcp_tool_call``, which
@@ -3776,18 +3776,23 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
     Being the single boundary is also why the pytest guard lives here:
     :func:`_refuse_real_post_under_test` covers both consumers in one call,
     and a caller entitled to post for real under pytest declares that by
-    wrapping the call in :func:`own_endpoint`.
+    wrapping the call in :func:`own_endpoint`. The census's task store
+    (``task_store.McpTaskStore``) posts through it too, with *timeout* sized
+    to a ``resolve_ticket`` wait.
     """
     _refuse_real_post_under_test(url, tool_name)
-    return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=30.0)
+    return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=timeout)
+
+
+def _fused_memory_mcp_url() -> str:
+    return os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL) + "/mcp"
 
 
 def default_submit_fn(**kwargs) -> dict:
     """Real curator-path ``submit_task`` poster (fused-memory MCP server) --
     build_task_payloads' payloads are forwarded verbatim as this call's
     arguments."""
-    url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL) + "/mcp"
-    return _post_mcp_tool_call(url, "submit_task", kwargs)
+    return _post_mcp_tool_call(_fused_memory_mcp_url(), "submit_task", kwargs)
 
 
 def _build_default_escalate_fn(cfg):
@@ -4236,6 +4241,7 @@ def _run_configured_census(
             ),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
+            task_store=task_store.McpTaskStore(url=_fused_memory_mcp_url(), post=_post_mcp_tool_call),
             escalate_fn=escalate_fn,
             status_fetcher=status_fetcher,
             commit=functools.partial(unlanded.commit_only, project_root),
@@ -4295,6 +4301,8 @@ def _run_configured_census(
         f" ledger_write_failed: {outcome.ledger_write_error}"
         if outcome.ledger_write_error else ""
     )
+    unreachable = None if outcome.filing is None else outcome.filing.disposal.unreachable
+    dedup_unreachable = f" dedup_unreachable: {unreachable}" if unreachable else ""
     if outcome.dry_run is not None:
         # A bare filed_tickets=0 here would read as "a normal run that had
         # nothing to file" -- name the review file and the count instead.
@@ -4302,7 +4310,7 @@ def _run_configured_census(
             f"census: done -- report={outcome.report_path} "
             f"dry-run-filing: {outcome.dry_run.payload_count} payload(s) -> "
             f"{outcome.dry_run.path} (nothing filed) "
-            f"stop_reason={outcome.stop_reason}{ledger_failed}"
+            f"stop_reason={outcome.stop_reason}{ledger_failed}{dedup_unreachable}"
         )
         return 0
 
@@ -4317,7 +4325,7 @@ def _run_configured_census(
     print(
         f"census: done -- report={outcome.report_path} "
         f"filed_tickets={len(outcome.filed_ticket_ids)} "
-        f"stop_reason={outcome.stop_reason}{unresolved}{skipped}{ledger_failed}"
+        f"stop_reason={outcome.stop_reason}{unresolved}{skipped}{ledger_failed}{dedup_unreachable}"
     )
     return 0
 

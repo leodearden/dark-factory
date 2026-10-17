@@ -9723,8 +9723,8 @@ _LEGACY_TITLE = "Some confusion cluster"
 _EARLIER_RUN = "census-dark_factory-20260701"
 
 
-def _census_hits(*hits):
-    return {(disposition.SOURCE_METADATA, disposition.CENSUS_SOURCE): tuple(hits)}
+def _census_hits(*hits: task_store.TaskHit) -> dict[tuple[str, str | int], tuple[task_store.TaskHit, ...]]:
+    return {(disposition.SOURCE_METADATA, disposition.CENSUS_SOURCE): hits}
 
 
 def _duplicate_only_kwargs(tmp_path, store, **overrides):
@@ -9906,8 +9906,8 @@ def test_main_hands_run_census_a_task_store_on_the_fused_memory_endpoint(tmp_pat
         posts.append((url, tool_name, arguments))
         return _EMPTY_FIND_PAGE
 
-    store = _main_task_store(tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "_post_mcp_tool_call", rec)
+    store = _main_task_store(tmp_path, monkeypatch)
 
     assert store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000") == ()
 
