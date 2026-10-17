@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib.util
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
@@ -680,6 +681,34 @@ _CONSUMER_SKILLS = frozenset({
 })
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_MEMBER_ANCHOR = "    unknown = 'unknown'\n"
+_PARTITION_ANCHOR = 'OUTCOME_STATES = LIVE_STATES | TERMINAL_STATES\n'
+
+
+def _load_alpha_guard() -> ModuleType:
+    """A private copy of alpha's guard module, never registered in sys.modules."""
+    path = _REPO_ROOT / 'scripts' / 'tests' / 'test_merge_state_vocabulary_consistency.py'
+    spec = importlib.util.spec_from_file_location('_merge_state_guard_for_b9', path)
+    assert spec is not None and spec.loader is not None, path
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _seeded_vocabulary(tmp_path: Path, seed: str) -> Path:
+    """This tree's merge_state.py with a member added and assigned as *seed* says, written beside the test."""
+    source = _REPO_ROOT / 'shared' / 'src' / 'shared' / 'merge_state.py'
+    text = source.read_text(encoding='utf-8')
+    for anchor in (_MEMBER_ANCHOR, _PARTITION_ANCHOR):
+        assert text.count(anchor) == 1, f'seed anchor {anchor!r} must occur exactly once in {source}'
+    text = text.replace(_MEMBER_ANCHOR, f"{_MEMBER_ANCHOR}    {_SEED_MEMBER} = '{_SEED_MEMBER}'\n")
+    text = text.replace(_PARTITION_ANCHOR, _SEEDS[seed].assignment + _PARTITION_ANCHOR)
+    seeded = tmp_path / f'merge_state_{seed}.py'
+    seeded.write_text(text, encoding='utf-8')
+    return seeded
+
+
 def _failing_sites(guard: ModuleType) -> dict[str, str]:
     """Run alpha's per-site drift assertion over every pinned site; the failures, by site."""
     failures: dict[str, str] = {}
@@ -717,4 +746,4 @@ async def test_b9_a_member_added_without_updating_the_skill_lists_fails_alphas_g
         assert set(failures) == expected, (seed, sorted(failures), sorted(expected))
         assert all(_SEED_MEMBER in message for message in failures.values()), (seed, failures)
         failed |= set(failures)
-    assert _CONSUMER_SKILLS <= failed, sorted(failed)
+    assert not _CONSUMER_SKILLS - failed, sorted(_CONSUMER_SKILLS - failed)
