@@ -31,6 +31,11 @@ from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     MEM0_MANAGED_METADATA_KEYS,
 )
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    InvalidMetadataLookupError,
+    validate_metadata_lookup,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
@@ -508,6 +513,7 @@ Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
+- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -1197,14 +1203,16 @@ def _status_page(
     return {k: statuses[k] for k in page_keys}, len(ordered)
 
 
-def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
+def _validate_paging(
+    page_size: Any, offset: Any, *, size_arg: str = 'page_size',
+) -> dict[str, Any] | None:
     """Validate shared ``page_size``/``offset`` paging inputs.
 
     Returns a ValidationError payload dict when an input is malformed, or None
-    when both are acceptable.  Shared by ``get_tasks`` and ``get_statuses`` so
-    both tools reject identical inputs identically and a future fix to the
-    bool/int guard lands in ONE place (it was previously copy-pasted, so it
-    had to be fixed twice).
+    when both are acceptable.  Shared by ``get_tasks``, ``get_statuses`` and
+    ``find_tasks_by_metadata`` so they reject identical inputs identically and
+    a future fix to the bool/int guard lands in ONE place (it was previously
+    copy-pasted, so it had to be fixed twice).
 
     ``bool`` is rejected explicitly because it is an ``int`` subclass:
     ``page_size=True`` would otherwise silently mean a 1-entry page.
@@ -1212,21 +1220,42 @@ def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
     would spin a paging caller forever.
 
     Callers must invoke this BEFORE touching the interceptor, so a malformed
-    request costs no backend work.
+    request costs no backend work. ``size_arg`` is the page-size argument's
+    name in the calling tool, so the error names what the caller passed.
     """
     if page_size is not None and (
         not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0
     ):
         return {
-            'error': 'page_size must be a positive integer',
+            'error': f'{size_arg} must be a positive integer; got {page_size!r}',
             'error_type': 'ValidationError',
         }
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         return {
-            'error': 'offset must be a non-negative integer',
+            'error': f'offset must be a non-negative integer; got {offset!r}',
             'error_type': 'ValidationError',
         }
     return None
+
+
+def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
+    """Return a ValidationError payload unless ``statuses`` is None or a list of str.
+
+    ``[]`` is valid and matches nothing. Shared by ``get_tasks`` and
+    ``find_tasks_by_metadata``, so a bare string is rejected identically by both.
+    """
+    if statuses is None or (
+        isinstance(statuses, list) and all(isinstance(s, str) for s in statuses)
+    ):
+        return None
+    return {
+        'error': f'statuses must be a list of status strings; got {statuses!r}',
+        'error_type': 'ValidationError',
+    }
+
+
+# find_tasks_by_metadata's page-size cap (plans/task-metadata-lookup-prd.md decision 6).
+METADATA_LOOKUP_LIMIT_CAP = 100
 
 
 def _pagination_meta(
@@ -8463,16 +8492,9 @@ def create_mcp_server(
         _paging_error = _validate_paging(page_size, offset)
         if _paging_error is not None:
             return _paging_error
-        if statuses is not None and not isinstance(statuses, list):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
-        if statuses is not None and any(not isinstance(s, str) for s in statuses):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
+        _statuses_error = _validate_statuses(statuses)
+        if _statuses_error is not None:
+            return _statuses_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -9629,6 +9651,92 @@ def create_mcp_server(
             limit=limit,
             score_threshold=score_threshold,
         )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def find_tasks_by_metadata(
+        project_root: str,
+        key: str,
+        value: Any = None,
+        statuses: Any = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: Any = False,
+    ) -> dict[str, Any]:
+        """Exact lookup of the tasks whose top-level ``metadata[key]`` matches ``value``.
+
+        Searches every status, including ``deferred`` and ``cancelled``, which
+        ``search_tasks`` does not. Semantics: plans/task-metadata-lookup-prd.md.
+
+        Args:
+            project_root: Absolute path to project root.
+            key: One top-level metadata key matching ``[A-Za-z0-9_][A-Za-z0-9_-]*``.
+            value: Omit to match every task carrying ``key`` (even as JSON null).
+                A str or int matches a scalar by equality or a list by
+                membership, type-strictly: 40 does not match "40". bool, float,
+                dict and list values are rejected.
+            statuses: Optional list of statuses to search within (default: all).
+            limit: Page size, clamped to [1, 100] (default 50).
+            offset: Zero-based index into the matches, ordered by task id.
+            tag: Tag context (optional).
+            include_value: True adds ``matched_value``, the whole ``metadata[key]``.
+
+        Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
+        ``updated_at``), ``tasks_with_key`` (how many tasks carry ``key`` at
+        all; 0 means none does), ``pagination`` (page on ``has_more`` with
+        ``offset += returned``), ``malformed_metadata_ids`` when some task's
+        metadata is not a JSON object, and the echoed arguments. An ``error``
+        payload means the lookup failed; it never means "no match".
+        """
+        paging_error = _validate_paging(limit, offset, size_arg='limit')
+        if paging_error is not None:
+            return paging_error
+        statuses_error = _validate_statuses(statuses)
+        if statuses_error is not None:
+            return statuses_error
+        page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
+        try:
+            validate_metadata_lookup(
+                key=key, value=value, include_value=include_value,
+                limit=page_size, offset=offset,
+            )
+        except InvalidMetadataLookupError as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        normalized = _normalize_project_root(project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        found = await task_interceptor.find_tasks_by_metadata(
+            normalized, key, value,
+            statuses=statuses, limit=page_size, offset=offset, tag=tag,
+            include_value=include_value,
+        )
+        results = found['results']
+        pid = resolve_project_id(normalized)
+        response: dict[str, Any] = {
+            'project_id': pid,
+            'project_root': normalized,
+            'key': key,
+            'value': value,
+            'statuses': statuses,
+            'results': results,
+            'tasks_with_key': found['tasks_with_key'],
+            'pagination': _pagination_meta(
+                total=found['total'], offset=offset, page_size=page_size,
+                returned=len(results),
+            ),
+        }
+        if found['malformed_metadata_ids']:
+            response['malformed_metadata_ids'] = found['malformed_metadata_ids']
+        await _log_read(
+            'find_tasks_by_metadata',
+            project_id=pid,
+            result_summary={
+                'project_id': pid, 'key': key,
+                'total': found['total'], 'returned': len(results),
+            },
+        )
+        return response
 
     @mcp.tool()
     @mcp_tool_errors()
