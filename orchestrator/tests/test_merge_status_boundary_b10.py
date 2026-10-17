@@ -6,7 +6,9 @@ merge_finalized rows, is kept as written by Leo's ruling on esc-4834-2 and is
 met by task 6927's partial indexes.  It is WALL time because INV-8
 (``docs/legibility/design-invariants.md``) bounds event-loop wall time, and
 merge_status's cross-run reads run synchronously inside its async resolver.
-Git is deliberately not touched: B10 is scoped to the cross-run read.
+The timed reads are the ones the real merge_status issues for each poll,
+recorded off the store and replayed.  Git is deliberately not touched: B10 is
+scoped to the cross-run read.
 """
 from __future__ import annotations
 
@@ -14,11 +16,18 @@ import json
 import math
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any
 
 import pytest
+from escalation.queue import EscalationQueue
+from escalation.server import create_server
+from fastmcp.tools.function_tool import FunctionTool
+from shared.merge_state import MergeState
 
 from orchestrator.event_store import EventStore, EventType
 
@@ -31,7 +40,9 @@ _ABSENT = 'absent-from-every-run'
 
 _EVENTS = 300_000
 _RUNS = 228
+_TASKS = 1000
 _MERGE_FINALIZED_EVERY = 115
+_MERGE_FINALIZED_ROWS = len(range(0, _EVENTS, _MERGE_FINALIZED_EVERY))
 _TRAIN_MEMBER_EVERY = 40
 _ABSORBING_EVERY = 64
 _NOISE_DATA = json.dumps({'phase': 'verify', 'detail': 'x' * 170})
@@ -44,18 +55,15 @@ _INSERT = (
 
 @dataclass(frozen=True)
 class _SeededStore:
-    """A restarted run's view of the seeded store, and the ids its hit shapes look up."""
+    """A restarted run's view of the seeded store, with the sizes B10's premise names."""
 
     store: EventStore
     events: int
     merge_finalized: int
-    oldest_request_id: str
-    absorbed_loser_id: str
-    train_id: str
 
 
 def _task_id(n: int) -> str:
-    return str(1000 + n % 4000)
+    return str(1000 + n % _TASKS)
 
 
 def _request_id(n: int) -> str:
@@ -131,68 +139,125 @@ def production_sized_store(tmp_path_factory: pytest.TempPathFactory) -> _SeededS
         f'B10 needs >= 300,000 events and >= 2,500 merge_finalized rows; '
         f'seeded {events} and {merge_finalized}'
     )
+    assert merge_finalized == _MERGE_FINALIZED_ROWS, (merge_finalized, _MERGE_FINALIZED_ROWS)
     return _SeededStore(
-        store=EventStore(db, 'run-current'),
-        events=events,
-        merge_finalized=merge_finalized,
-        oldest_request_id=_request_id(0),
-        absorbed_loser_id=_loser_id(_ABSORBING_EVERY - 1),
-        train_id=_train_id(_TRAIN_MEMBER_EVERY - 1),
-    )
-
-
-def _durable_history_reads(store: EventStore, key: str, value: str) -> object:
-    """The cross-run reads escalation/src/escalation/server.py::merge_status's ``_durable_history`` issues for one key."""
-    if key != 'request_id':
-        return store.latest_merge_finalized(**{key: value}, cross_run=True)
-    return (
-        store.latest_merge_finalized(request_id=value, cross_run=True)
-        or store.merge_finalized_absorbing(value, cross_run=True)
-        or store.merge_finalized_superseded_by(value, cross_run=True)
+        store=EventStore(db, 'run-current'), events=events, merge_finalized=merge_finalized,
     )
 
 
 @dataclass(frozen=True)
+class _Read:
+    """One EventStore call, replayable against the store it was recorded on."""
+
+    method: str
+    args: tuple[Any, ...]
+    kwargs: Mapping[str, Any]
+
+    def issue(self, store: EventStore) -> object:
+        return getattr(store, self.method)(*self.args, **self.kwargs)
+
+
+class _CrossRunReadRecorder:
+    """Stands in for an EventStore: forwards every attribute, recording each cross_run=True call."""
+
+    def __init__(self, store: EventStore) -> None:
+        self._store = store
+        self.reads: list[_Read] = []
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._store, name)
+        if not callable(attribute):
+            return attribute
+
+        def forwarded(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get('cross_run') is True:
+                self.reads.append(_Read(name, args, MappingProxyType(dict(kwargs))))
+            return attribute(*args, **kwargs)
+
+        return forwarded
+
+
+async def _poll_recording_cross_run_reads(
+    store: EventStore, escalations: Path, key: Mapping[str, str],
+) -> tuple[dict[str, Any], tuple[_Read, ...]]:
+    """The real merge_status's answer to *key* over *store*, and the cross-run reads it issued."""
+    recorder = _CrossRunReadRecorder(store)
+    server = create_server(
+        EscalationQueue(escalations), event_store=recorder, startup_sweep=False,
+    )
+    tool = await server.get_tool('merge_status')
+    assert isinstance(tool, FunctionTool), tool
+    response = await tool.fn(**key)
+    return response, tuple(recorder.reads)
+
+
+def _newest_row_of_task(n: int) -> str:
+    return _request_id(max(m for m in range(_MERGE_FINALIZED_ROWS) if _task_id(m) == _task_id(n)))
+
+
+@dataclass(frozen=True)
 class _Shape:
+    """One poll, and the request id its last_outcome carries (None: the poll misses every run)."""
+
     key: str
-    value: Callable[[_SeededStore], str]
-    hit: bool
+    value: str
+    last_outcome_request_id: str | None
 
 
-_SHAPES = {
-    'request_id_miss': _Shape('request_id', lambda seeded: _ABSENT, hit=False),
-    'branch_miss': _Shape('branch', lambda seeded: _ABSENT, hit=False),
-    'task_id_miss': _Shape('task_id', lambda seeded: _ABSENT, hit=False),
-    'oldest_row_hit': _Shape('request_id', lambda seeded: seeded.oldest_request_id, hit=True),
-    'absorbed_loser_hit': _Shape('request_id', lambda seeded: seeded.absorbed_loser_id, hit=True),
-    'train_id_hit': _Shape('request_id', lambda seeded: seeded.train_id, hit=True),
-}
+_FIRST_ABSORBING = _ABSORBING_EVERY - 1
+_FIRST_TRAIN_MEMBER = _TRAIN_MEMBER_EVERY - 1
+
+_SHAPES: Mapping[str, _Shape] = MappingProxyType({
+    'request_id_miss': _Shape('request_id', _ABSENT, None),
+    'branch_miss': _Shape('branch', _ABSENT, None),
+    'task_id_miss': _Shape('task_id', _ABSENT, None),
+    'oldest_row_hit': _Shape('request_id', _request_id(0), _request_id(0)),
+    'absorbed_loser_hit': _Shape(
+        'request_id', _loser_id(_FIRST_ABSORBING), _request_id(_FIRST_ABSORBING),
+    ),
+    'train_id_hit': _Shape(
+        'request_id', _train_id(_FIRST_TRAIN_MEMBER), _request_id(_FIRST_TRAIN_MEMBER),
+    ),
+    'branch_hit': _Shape('branch', _task_id(0), _newest_row_of_task(0)),
+    'task_id_hit': _Shape('task_id', _task_id(1), _newest_row_of_task(1)),
+})
 
 
 def _nearest_rank(ordered: list[float], percentile: float) -> float:
     return ordered[math.ceil(percentile * len(ordered)) - 1]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize('shape', sorted(_SHAPES))
-def test_b10_cross_run_lookup_p99_is_under_50_ms(
-    production_sized_store: _SeededStore, shape: str,
+async def test_b10_cross_run_lookup_p99_is_under_50_ms(
+    production_sized_store: _SeededStore, shape: str, tmp_path: Path,
 ) -> None:
     spec = _SHAPES[shape]
     seeded = production_sized_store
-    value = spec.value(seeded)
-    assert bool(_durable_history_reads(seeded.store, spec.key, value)) is spec.hit, shape
+    hit = spec.last_outcome_request_id is not None
+    response, reads = await _poll_recording_cross_run_reads(
+        seeded.store, tmp_path / 'escalations', {spec.key: spec.value},
+    )
+    assert reads, f'{shape}: merge_status issued no cross-run read: {response}'
+    assert response['state'] == (MergeState.stale_record if hit else MergeState.no_record), (
+        shape, response,
+    )
+    last = response['last_outcome']
+    assert (None if last is None else last['request_id']) == spec.last_outcome_request_id, (
+        shape, response,
+    )
 
     samples: list[float] = []
     for _ in range(_SAMPLES):
         start = time.perf_counter()
-        result = _durable_history_reads(seeded.store, spec.key, value)
+        results = [read.issue(seeded.store) for read in reads]
         samples.append((time.perf_counter() - start) * 1000.0)
-        assert bool(result) is spec.hit, (shape, result)
+        assert any(results) is hit, (shape, results)
 
     ordered = sorted(samples)
     p99 = _nearest_rank(ordered, 0.99)
     assert p99 < _BOUND_MS, (
         f'{shape}: p50={_nearest_rank(ordered, 0.50):.2f} ms p99={p99:.2f} ms '
-        f'max={ordered[-1]:.2f} ms over {len(ordered)} reads on a store of '
-        f'{seeded.events} events / {seeded.merge_finalized} merge_finalized rows'
+        f'max={ordered[-1]:.2f} ms over {len(ordered)} replays of {len(reads)} read(s) '
+        f'on a store of {seeded.events} events / {seeded.merge_finalized} merge_finalized rows'
     )
