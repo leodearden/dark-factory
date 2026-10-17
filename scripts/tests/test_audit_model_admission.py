@@ -6,6 +6,7 @@ against the 181 MB live store the script defaults to.
 """
 import argparse
 import json
+import re
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -727,6 +728,25 @@ def _audit(conn, **overrides):
         'window': WINDOW, 'ceiling_usd': 150.0,
     }
     return audit_model_admission.audit(conn, **{**kwargs, **overrides})
+
+
+def _row_cells(line):
+    """A markdown table row's cells, split on UNESCAPED pipes only."""
+    return [cell.strip() for cell in re.split(r'(?<!\\)\|', line.strip())[1:-1]]
+
+
+def test_a_multi_line_piped_cell_stays_one_row_line_with_the_headers_cell_count():
+    lines = audit_model_admission.markdown_table(
+        ['state', 'detail'],
+        [('blocked', 'first | line\n\nsecond line\n```\ncode | here\n```'), ('done', 'abc123')],
+    )
+
+    assert len(lines) == 4
+    assert not any('\n' in line for line in lines)
+    for line in (lines[0], lines[2], lines[3]):
+        assert len(_row_cells(line)) == 2
+    assert _row_cells(lines[2])[1] == r'first \| line second line ``` code \| here ```'
+    assert lines[3] == '| done | abc123 |'
 
 
 def test_the_markdown_body_carries_the_measured_values_not_a_summary(live_shaped_db):
