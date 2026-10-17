@@ -210,8 +210,10 @@ class DashboardConfig:
     known_project_roots: list[Path] = field(default_factory=list)
     escalation_urls: dict[str, str] = field(default_factory=dict)
     # Whether lifespan starts the two background samplers
-    # (dashboard/src/dashboard/loops.py::_burndown_loop / ::_metrics_loop).
-    # Env DASHBOARD_SAMPLERS sets it; off is how the test suite's
+    # (dashboard/src/dashboard/loops.py::_burndown_loop / ::_metrics_loop), the
+    # only writers of the burndown and metrics history the charts read.
+    # Env DASHBOARD_SAMPLERS=on|off, default on. Under off that history stops
+    # accruing while every page still serves; that is how the test suite's
     # function-scoped clients run (dashboard/tests/conftest.py::samplers_off).
     samplers_enabled: bool = True
 

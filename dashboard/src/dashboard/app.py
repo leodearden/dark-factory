@@ -362,8 +362,9 @@ async def lifespan(app: FastAPI):
     # here and the yield. Startup has no try/except, so a task created above an
     # `await ...store.open()` is stranded — still ticking against a client
     # nobody will close — if that open raises. One site also makes them read as
-    # the set the teardown below cancels as a set. The two samplers are gated on
-    # the LOCAL config (task 3771), never app.state.config.
+    # the set the teardown below cancels as a set. The two samplers' gate (task
+    # 5826) reads the LOCAL config, never app.state.config, for the reason task
+    # 3771 binds the loops themselves to it.
     #
     # The reaper reclaims pool connections a cancelled request orphaned, which
     # httpcore itself cannot: dashboard/src/dashboard/http_pool.py states the
