@@ -27,8 +27,8 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import DeliveredChecksConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_queue import reconcile_landed_outbox
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.worker import reconcile_landed_outbox
 from orchestrator.scheduler import SetTaskStatusRejected
 from orchestrator.workflow import WorkflowOutcome, WorkflowState
 

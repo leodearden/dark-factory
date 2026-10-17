@@ -10576,13 +10576,23 @@ class GitOps:
         else:
             logger.debug('delete_solo_branch: deleted %s', solo_branch)
 
-    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        """Return True if *ancestor* is an ancestor of *descendant*."""
+    async def is_ancestor_checked(
+        self, ancestor: str, descendant: str,
+    ) -> bool | None:
+        """True if *ancestor* is an ancestor of *descendant*, False if not, None on a git error."""
         rc, _, _ = await _run(
             ['git', 'merge-base', '--is-ancestor', ancestor, descendant],
             cwd=self.project_root,
         )
-        return rc == 0
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        return None
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return True if *ancestor* is an ancestor of *descendant*."""
+        return (await self.is_ancestor_checked(ancestor, descendant)) is True
 
     async def merge_base_with_main(self, ref: str) -> str | None:
         """Return *ref*'s FORK POINT from ``config.main_branch``, or None.
@@ -10592,7 +10602,7 @@ class GitOps:
         the branch's own previous work commit, so a differential anchored on
         it asks whether the branch's LAST commit delivered a capability rather
         than whether the BRANCH did.  See
-        :func:`~orchestrator.landing_evidence._delivered_checks_differential`,
+        :func:`~orchestrator.merge_lane.landing_evidence._delivered_checks_differential`,
         the caller this exists for (amendment pass, review finding).
 
         None on any git failure or an unresolvable ref — callers must treat it
@@ -10782,7 +10792,7 @@ class GitOps:
 
         The oldest merge commit on the ANCESTRY PATH from *head* to
         *upstream* — i.e. the first merge that has *head* as an ancestor.
-        Exists for one caller: :func:`~orchestrator.landing_evidence.
+        Exists for one caller: :func:`~orchestrator.merge_lane.landing_evidence.
         branch_work_landed`'s no-op guard, in the case where *head* is ALREADY
         an ancestor of *upstream*.
 
@@ -12167,7 +12177,7 @@ class GitOps:
           from the subprocess helper.
 
         Used by the merge-skew pipeline-landing tripwire
-        (:mod:`orchestrator.merge_skew_tripwire`) to compute each in-flight
+        (:mod:`orchestrator.merge_lane.skew_tripwire`) to compute each in-flight
         task's own changed-file set for overlap against a landing's
         changed files.
         """
@@ -12370,7 +12380,7 @@ class GitOps:
         ``find_merge_marker`` idempotency is preserved), same
         :meth:`resolve_queued_branch_ref` source resolution, same
         :class:`MergeResult` return type — but the worktree comes from the
-        caller.  Used by :func:`orchestrator.merge_queue.build_chain` to merge
+        caller.  Used by :func:`orchestrator.merge_lane.worker.build_chain` to merge
         k queued items sequentially into ONE scratch lane.
 
         The shared core — branch-name resolution
@@ -13216,7 +13226,7 @@ class GitOps:
 
         The non-atomic read / modify / write is safe because the per-host
         serial invariant enforced by
-        :func:`~orchestrator.merge_queue.enforce_persistent_worktree_serial_lane`
+        :func:`~orchestrator.merge_lane.worker.enforce_persistent_worktree_serial_lane`
         guarantees that at most one ``verify-merge`` process runs at a time on
         this host for this project.
 
@@ -13238,7 +13248,7 @@ class GitOps:
     async def acquire_host_verify_worktree(self, merge_sha: str) -> Path:
         """Acquire a verify worktree for the laptop (host-side) verify-merge CLI.
 
-        Mirrors :func:`~orchestrator.merge_queue._acquire_warm_verify_worktree`
+        Mirrors :func:`~orchestrator.merge_lane.worker._acquire_warm_verify_worktree`
         for the off-host CLI path (PRD §8 η / §A invariant 4).  Picks between
         the warm fixed-path worktree and a fresh ephemeral worktree based on
         the ``git.persistent_merge_worktree`` knob and the per-host safety
@@ -13252,7 +13262,7 @@ class GitOps:
         **Ephemeral path** (knob OFF or safety valve due):
             Calls :meth:`_create_merge_worktree` for a fresh ``_merge-<uuid>``
             worktree.  The valve fires on ``attempt % every_n == 0`` (1-based,
-            every_n > 0), mirroring :func:`~orchestrator.merge_queue._safety_valve_due`
+            every_n > 0), mirroring :func:`~orchestrator.merge_lane.worker._safety_valve_due`
             but inlined to avoid a git_ops→merge_queue import cycle.  Returns
             the ephemeral path; ``cleanup_merge_worktree`` will remove it in
             the caller's finally block (invariant 6: cold verify, target NOT

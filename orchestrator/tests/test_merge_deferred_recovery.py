@@ -42,7 +42,8 @@ from orchestrator.merge_deferred_recovery import (
     owner_of,
     recovery_targets,
 )
-from orchestrator.merge_lane import MemberRedriveOutcome, SpeculativeMergeWorker
+from orchestrator.merge_lane import MemberRedriveOutcome
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.scheduler import train_order_key
 
 NOW = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)

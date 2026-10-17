@@ -62,6 +62,7 @@ from orchestrator.background_service import (
     LifecycleRegistry,
     ManagedService,
 )
+from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import (
     OrchestratorConfig,
     apply_reload,
@@ -82,27 +83,27 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
-from orchestrator.landed_outbox import MergeProvenance
-from orchestrator.landing_evidence import (
+from orchestrator.lane_lifecycle import LaneRecord
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
+from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     branch_is_degenerate,
     file_unattributed_landing_escalation,
     is_valid_sha_40,
     validate_landing_evidence,
 )
-from orchestrator.lane_lifecycle import LaneRecord
-from orchestrator.lane_lifecycle import LaneState as DurableLaneState
-from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
-from orchestrator.mcp_lifecycle import McpLifecycle
-from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
+from orchestrator.merge_lane.worker import (
     enqueue_merge_request,
     reconcile_landed_outbox,
     reconcile_landed_task,
     select_recovery_winner,
 )
-from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (
     TAGGER_SCHEMA,
@@ -110,6 +111,7 @@ from orchestrator.module_tagger_prompt import (
     build_tagger_prompt,
 )
 from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_pass import lane_pass_outcome_hooks
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
@@ -205,7 +207,7 @@ from orchestrator.zero_progress_requeue import (
 if TYPE_CHECKING:
     from escalation.models import Escalation
 
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
         TrainCallbackFactory,
@@ -1551,62 +1553,6 @@ def build_train_callback_factory(
 _TRAIN_MEMBER_READY_STATUS: str = 'merge-deferred'
 
 
-class _OfflineLaneTaskClient:
-    """Concrete ``offline_lane.OfflineLaneTaskClient`` adapter over the scheduler.
-
-    Structurally satisfies the ``OfflineLaneTaskClient`` Protocol
-    (``offline_lane.py``) so ``OfflineLaneWorker`` never talks to the
-    fused-memory MCP directly (task 2016, closing Bug #1) — mirrors that
-    module's ``SuiteRunner``/cross-project scope boundary. Delegates
-    entirely to existing, tested ``Scheduler`` helpers; no new MCP plumbing.
-    Module-level (not nested in ``Harness``) so it stays trivially
-    constructible in isolation, e.g. ``_OfflineLaneTaskClient(scheduler)``.
-    """
-
-    def __init__(self, scheduler: Scheduler) -> None:
-        self._scheduler = scheduler
-
-    async def submit_fix_task(self, arguments: dict) -> str:
-        """Submit a new fix task and return its id.
-
-        Reuses ``Harness._extract_task_id`` to normalise the task_id out of
-        the MCP ``tools/call`` response envelope, whatever shape it arrives
-        in (``{'task_id': ...}``, ``structuredContent``, or a ``content``
-        text block).
-        """
-        result = await self._scheduler.dispatch_tool('submit_task', arguments, timeout=30)
-        return Harness._extract_task_id(result) or ''
-
-    async def append_suspect_range(self, task_id: str, suspect_range: str) -> None:
-        """Append a suspect commit range to an already-open fix task.
-
-        Uses ``metadata_mode='additive'`` — a recursive list-union performed
-        server-side — so the range is appended (and dedup'd) atomically with
-        no read-modify-write round-trip.
-        """
-        await self._scheduler.update_task(
-            task_id, {'suspect_ranges': [suspect_range]}, metadata_mode='additive',
-        )
-
-    async def get_status(self, task_id: str) -> str:
-        """Return a previously filed fix task's current status.
-
-        Logs (rather than silently swallows) a non-``None`` error half from
-        ``get_statuses`` — e.g. a transient MCP outage — so it stays
-        observable; the caller (``_maybe_promote_blocker``) still degrades
-        to treating the empty status as "not done, not terminal" either way
-        (task 2016 amendment).
-        """
-        statuses, err = await self._scheduler.get_statuses([task_id])
-        if err is not None:
-            logger.warning(
-                'offline-lane: get_statuses failed for task %s: %s — '
-                'treating status as unknown this check',
-                task_id, err,
-            )
-        return statuses.get(task_id, '')
-
-
 def _extract_tagger_entries(payload: Any) -> list:
     """Peel known StructuredOutput wrapper keys and return the entries list.
 
@@ -2122,7 +2068,9 @@ class Harness:
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
         # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
         # here, in a periodic loop mirroring the main-tip-sweep lifecycle.
-        from orchestrator.merge_queue import NoLandingsCircuitBreaker as _NLCB  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
+            NoLandingsCircuitBreaker as _NLCB,
+        )
         self._no_landings_breaker: _NLCB = _NLCB(
             window_samples=config.no_landings_breaker_window_samples,
             disk_free_floor_bytes=config.no_landings_breaker_disk_free_floor_bytes,
@@ -2147,7 +2095,7 @@ class Harness:
         self._merge_queue: asyncio.Queue = asyncio.Queue()
         # Single shared registry injected into both the escalation server and
         # every TaskWorkflow so the MCP coalesce gate sees workflow-path merges.
-        from orchestrator.merge_queue import InFlightMergeRegistry
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
@@ -5874,7 +5822,7 @@ class Harness:
             )
             return True
 
-        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         # Build + enqueue + stamp the durable race-guard marker (PRD leaf α §7)
         # via the shared submit primitive — the architect-desync exit (task
@@ -6030,7 +5978,7 @@ class Harness:
         propagated (mirrors ``enqueue_merge_request._on_finalized``).
         """
         try:
-            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 return  # abandoned/superseded — transient, no-op
@@ -6167,7 +6115,7 @@ class Harness:
         infra-held guard, which share this same degeneracy signal.
 
         The predicate itself now lives in
-        :func:`orchestrator.landing_evidence.branch_is_degenerate` (task 3103)
+        :func:`orchestrator.merge_lane.landing_evidence.branch_is_degenerate` (task 3103)
         so the escalation server's merge_status Tier-3.5 and merge_request
         fast-path guard this class with the SAME implementation rather than a
         divergent copy.  See that function for the full fail-open contract
@@ -11376,34 +11324,6 @@ class Harness:
             )
             await self.pause_scheduler('cost_ceiling_orch_exceeded')
 
-    @staticmethod
-    def _extract_task_id(submit_result: Any) -> str | None:
-        """Pull the task_id out of an MCP tools/call response wrapper.
-
-        ``dispatch_tool`` returns the raw MCP result envelope. The shape may
-        be ``{'task_id': ...}``, ``{'content': [{'text': '{...}'}], ...}``,
-        or ``{'structuredContent': {...}}`` depending on transport. Normalise.
-        """
-        if not isinstance(submit_result, dict):
-            return None
-        if submit_result.get('task_id'):
-            return str(submit_result['task_id'])
-        for key in ('structuredContent', 'result'):
-            inner = submit_result.get(key)
-            if isinstance(inner, dict) and inner.get('task_id'):
-                return str(inner['task_id'])
-        content = submit_result.get('content')
-        if isinstance(content, list):
-            for chunk in content:
-                if isinstance(chunk, dict) and chunk.get('type') == 'text':
-                    try:
-                        parsed = json.loads(str(chunk.get('text') or ''))
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(parsed, dict) and parsed.get('task_id'):
-                        return str(parsed['task_id'])
-        return None
-
     async def _apply_retry_cap(
         self, task_id: str, report: TaskReport, requeued: bool,
     ) -> bool:
@@ -12151,7 +12071,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # K = 1 (local trust-anchor) + number of enabled remote verify runners.
         # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
@@ -12342,7 +12262,7 @@ class Harness:
     ) -> None:
         """Advisory pipeline-landing tripwire adapter (task 2382, merge-skew δ).
 
-        Thin fail-open wiring over ``orchestrator.merge_skew_tripwire
+        Thin fail-open wiring over ``orchestrator.merge_lane.skew_tripwire
         .emit_pipeline_landing_tripwire``: reads the per-project
         ``config.git.load_bearing_oracle_cmd`` knob (``None`` disables the
         tripwire — logged no-op), enumerates in-flight tasks (excluding the
@@ -12471,8 +12391,9 @@ class Harness:
             self.git_ops,
             self.config,
             lock_path=lock_path,
-            task_client=_OfflineLaneTaskClient(self.scheduler),
+            task_client=SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root),
             escalation_queue=self._escalation_queue,
+            pass_outcome_hooks=lane_pass_outcome_hooks(self.config, self._escalation_queue),
         )
         if not worker.acquire_lock():
             logger.warning(
@@ -13614,7 +13535,7 @@ class Harness:
         ancestors of main (squashed/rebased/manually-applied) by comparing
         the branch's actual changed files against main
         (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        delegates to :func:`~orchestrator.landing_evidence.validate_landing_evidence`
+        delegates to :func:`~orchestrator.merge_lane.landing_evidence.validate_landing_evidence`
         (DISCOVERY mode, task 2678) to discover and attribute the citation
         commit and anchors on it; a content-equivalent landing that carries
         no task-citing commit (or whose citation's effect is no longer
@@ -13885,7 +13806,7 @@ class Harness:
                 return False
             # Delegates FIX 2 citation-lineage + FIX 1' effect-present to the
             # shared helper (task 2678, INV-5) — see
-            # orchestrator.landing_evidence's module docstring for the full
+            # orchestrator.merge_lane.landing_evidence's module docstring for the full
             # DISCOVERY-mode contract (citation discovery, both-direction
             # lineage guard, branch-tip-or-citation effect anchor).
             verdict = await validate_landing_evidence(
@@ -14005,7 +13926,7 @@ class Harness:
 
         Delegates the actual filing (queue-None guard, dedup, ``Escalation``
         construction, submit/log/except shape) to the shared
-        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
+        :func:`~orchestrator.merge_lane.landing_evidence.file_unattributed_landing_escalation`
         (task 2678 amendment, INV-5) — this method now only supplies
         ``agent_role``, the one thing that distinguishes it from
         ``SpeculativeMergeWorker``'s equivalent method.

@@ -56,9 +56,9 @@ from orchestrator.flake_ledger import (
     read_occurrences,
 )
 from orchestrator.git_ops import GitOps, MergeResult
-from orchestrator.merge_gates import PostMergePyrightResult
+from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     PRODUCTION_VERIFIER,
     GroupMergeRequest,
     MergeOutcome,
@@ -141,7 +141,7 @@ class _ScriptedRed:
     ``ProductionVerifier`` holds one zero-argument RESOLVER per leg, so
     replacing ``scoped`` and ``unscoped`` states this file's scene through the
     port ``_run_post_merge_verify`` already takes — and no wider.  That pair is
-    leg-for-leg what the two ``orchestrator.merge_queue`` patches
+    leg-for-leg what the two ``orchestrator.merge_lane.worker`` patches
     (``run_scoped_verification``, ``_run_unscoped_typechecks``) did before the
     port existed, so the other five legs — the disk guard, post-merge pyright,
     post-merge equivalence, cold shadow and dry-run — stay genuinely
@@ -892,7 +892,7 @@ class TestWorkerBuildsTheFlakeTaskClient:
 
         worker = _worker(_make_git_ops(tmp_path), scheduler=MagicMock())
 
-        with patch('orchestrator.merge_queue._run_post_merge_verify', _capture):
+        with patch('orchestrator.merge_lane.worker._run_post_merge_verify', _capture):
             await worker._run_inflight_verify(item, lease, depth=0)
 
         assert 'task_client' in captured, (
@@ -941,7 +941,7 @@ class TestWorkerBuildsTheFlakeTaskClient:
             # tagging branch.
             return MergeOutcome('blocked', reason='verify red (test short-circuit)')
 
-        with patch('orchestrator.merge_queue._run_post_merge_verify', _capture):
+        with patch('orchestrator.merge_lane.worker._run_post_merge_verify', _capture):
             outcome = await _do_train_merge(worker, req)
 
         assert outcome.status == 'blocked', (

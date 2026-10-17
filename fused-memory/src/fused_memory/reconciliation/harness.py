@@ -21,6 +21,7 @@ from uuid import uuid4
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
 from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
@@ -5986,11 +5987,14 @@ class ReconciliationHarness:
                 # None inputs and never raises on them), which leaves the verdict
                 # biased toward "not corroborated" — the direction that lets a
                 # stranded escalation through only when nothing at all vouches for
-                # the task. read_scheduler_state already returns an empty skeleton
-                # for an absent/invalid file; orchestrator_started_at returns None
-                # for an absent or unparseable lock.
+                # the task. read_scheduler_state already returns
+                # SchedulerStateSnapshot.empty() for an absent/invalid file;
+                # orchestrator_started_at returns None for an absent or
+                # unparseable lock.
                 try:
-                    _sched_state: dict | None = read_scheduler_state(Path(project_root))
+                    _sched_state: SchedulerStateSnapshot | None = read_scheduler_state(
+                        Path(project_root)
+                    )
                 except Exception:
                     _sched_state = None
                 try:

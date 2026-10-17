@@ -10661,15 +10661,15 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Snapshot dict with keys: skip_counts, parks, effective_priorities,
-            pin_queue, overrides, current_holders, snapshot_at.
-            Returns the empty skeleton when no snapshot file exists yet.
+            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        snapshot = await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        return snapshot.to_json()
 
     @mcp.tool()
     @mcp_tool_errors()

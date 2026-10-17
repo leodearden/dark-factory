@@ -65,6 +65,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
@@ -593,8 +594,8 @@ def _corroboration_verdict(
     corroborates the workflow, ``False`` when none does.
 
     The two on-disk reads are per-project constants for this call, each wrapped
-    fail-safe to ``None``: ``read_scheduler_state`` (which already returns an
-    empty skeleton for an absent/invalid file) and ``orchestrator_started_at``
+    fail-safe to ``None``: ``read_scheduler_state`` (which already returns
+    ``SchedulerStateSnapshot.empty()`` for an absent/invalid file) and ``orchestrator_started_at``
     (the restart boundary parsed from the lock's ``started <ISO>`` token). Both
     are blocking, which is why :func:`check` dispatches this function through
     ``asyncio.to_thread`` (task 3778). It deliberately stays SYNCHRONOUS: an
@@ -611,7 +612,7 @@ def _corroboration_verdict(
         return None
 
     try:
-        scheduler_state: dict | None = read_scheduler_state(Path(project_root))
+        scheduler_state: SchedulerStateSnapshot | None = read_scheduler_state(Path(project_root))
     except Exception:
         scheduler_state = None
     try:

@@ -890,18 +890,26 @@ def render_json(result: AuditResult) -> str:
     }, indent=2)
 
 
+def _table_cell(value: Any) -> str:
+    """*value* as one markdown table cell: a single line, with every pipe escaped."""
+    return ' '.join(str(value).split()).replace('|', r'\|')
+
+
 def markdown_table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
     """A markdown table, or a single italic line when there are no rows.
+
+    Each row is one line whose cell count matches the header's, whatever the
+    cell text holds.
 
     The empty case is spelled out rather than emitted as a headed table with no
     body, because an empty table reads as a rendering glitch while "none" reads
     as a measurement.
     """
-    body = [f"| {' | '.join(str(cell) for cell in row)} |" for row in rows]
+    body = [f"| {' | '.join(_table_cell(cell) for cell in row)} |" for row in rows]
     if not body:
         return ['_none_']
     return [
-        f"| {' | '.join(header)} |",
+        f"| {' | '.join(_table_cell(h) for h in header)} |",
         f"|{'|'.join('---' for _ in header)}|",
         *body,
     ]
@@ -1003,10 +1011,22 @@ def render_markdown(result: AuditResult) -> str:
 
 
 def _merge_cell(outcome: MergeOutcome | None) -> str:
+    """*outcome* as a one-line summary; the full reason is in `--format json`."""
     if outcome is None:
         return '-'
-    detail = outcome.merge_sha or outcome.reason or ''
+    detail = outcome.merge_sha or _first_line(outcome.reason or '')
     return f'{outcome.state} ({detail})' if detail else outcome.state
+
+
+def _first_line(text: str) -> str:
+    """The first line of *text*, marked with how many lines after it were dropped."""
+    lines = text.strip().splitlines()
+    if not lines:
+        return ''
+    dropped = len(lines) - 1
+    if not dropped:
+        return lines[0]
+    return f"{lines[0]} \N{HORIZONTAL ELLIPSIS} +{dropped} line{'' if dropped == 1 else 's'}"
 
 
 def _parse_window(spec: str) -> timedelta:

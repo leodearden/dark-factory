@@ -356,6 +356,10 @@ class AccountState:
     near_cap: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+    # Serialises `UsageGate._reprobe_account` per account (task 5946): SIGHUP
+    # probes an AUTH_FAILED account while its re-probe loop may be mid-probe,
+    # and two overlapping spawn faults would count one host fault twice.
+    reprobe_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     # CONSECUTIVE probe-spawn failures (task 4512), reset to 0 by any probe
     # that actually RAN — whatever its verdict — and by this account leaving
     # the CAPPED/AUTH_FAILED set, after which it spawns no probes at all and
@@ -747,7 +751,8 @@ class UsageGate:
     ``_account_resume_probe_loop`` has no such deadline and will keep
     re-probing indefinitely at the ``max_probe_interval_secs`` backoff
     ceiling — recovery then requires an operator token refresh + SIGHUP
-    (``_on_sighup_async`` force-resets every account to AVAILABLE). See
+    (``_on_sighup_async`` force-resets every account except an AUTH_FAILED
+    one, so every CAPPED account, to AVAILABLE). See
     PRD §7.3 (task W4-γ) for the full transition table.
     """
 
@@ -1024,10 +1029,10 @@ class UsageGate:
             acct.probe_count = 0
             acct.resets_at = None
             # Covers the AVAILABLE -> AVAILABLE self-loop the blocked-set
-            # block above cannot see (task 4512 review): SIGHUP discards every
-            # account's cap/auth evidence, so it must discard the spawn-fault
-            # evidence with it rather than stay latched on counts it has just
-            # invalidated.
+            # block above cannot see (task 4512 review): SIGHUP discards the
+            # cap/auth evidence of every account it resets, so it must discard
+            # the spawn-fault evidence with it rather than stay latched on
+            # counts it has just invalidated.
             self._reset_probe_spawn_failures(acct, reason='operator hard reset (SIGHUP)')
 
         # --- Centralized _open recompute (DD-5) ---------------------------
@@ -2050,54 +2055,60 @@ class UsageGate:
           fault, carrying no evidence about this token at all. Recorded on the
           gate's shared spawn-fault accounting and the account left
           ``AUTH_FAILED``.
-        """
-        load_dotenv(override=True)
-        token_env = self._token_env_for(acct)
-        if token_env:
-            fresh = os.environ.get(token_env)
-            if fresh and fresh != acct.token:
-                logger.info(f'Account {acct.name}: env token changed — refreshing')
-                acct.token = fresh
 
-        logger.info(f'Account {acct.name}: firing auth re-probe')
-        try:
-            ok = await self._run_probe(acct)
-        except ProbeSpawnError as exc:
-            # The probe could not be spawned — a host fault, not evidence
-            # about this token. Record it and stay AUTH_FAILED: an account we
-            # could not VERIFY must not be read as recovered.
-            #
-            # Caught HERE rather than left to _auth_reprobe_loop's broad
-            # `except Exception`, which would downgrade it to a WARNING
-            # ('auth re-probe raised') and re-hide the one signal that says
-            # this is not an auth problem. Returning early also skips the
-            # 'auth re-probe failed — staying auth_failed' line below, which
-            # asserts a probe that ran.
-            self._note_probe_spawn_failure(acct, exc)
-            return
-        self._clear_probe_spawn_failures(acct)
-        if ok:
-            if acct.phase == AccountPhase.AUTH_FAILED:
-                # _transition owns: the phase write, clearing auth_failed_at,
-                # and the centralized _open recompute. A phase mismatch here
-                # (e.g. SIGHUP's fan-out reprobing an account that was never
-                # auth_failed) is a pure no-op — mirrors the idempotency
-                # guards on _handle_cap_detected/_handle_auth_failure. The
-                # old unconditional field writes + event fire re-ran (and
-                # re-fired 'auth_resumed') on every successful call
-                # regardless of the account's current phase.
-                self._transition(acct, AccountPhase.AVAILABLE)
-                logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
-                if self._cost_store:
-                    self._fire_cost_event(
-                        acct.name,
-                        'auth_resumed',
-                        json.dumps({}),
-                    )
-        else:
-            logger.info(
-                f'Account {acct.name}: auth re-probe failed — staying auth_failed',
-            )
+        Calls for one account run one at a time (``acct.reprobe_lock``): a
+        caller that arrives mid-probe waits, then probes with the env as it
+        is by then.
+        """
+        async with acct.reprobe_lock:
+            load_dotenv(override=True)
+            token_env = self._token_env_for(acct)
+            if token_env:
+                fresh = os.environ.get(token_env)
+                if fresh and fresh != acct.token:
+                    logger.info(f'Account {acct.name}: env token changed — refreshing')
+                    acct.token = fresh
+
+            logger.info(f'Account {acct.name}: firing auth re-probe')
+            try:
+                ok = await self._run_probe(acct)
+            except ProbeSpawnError as exc:
+                # The probe could not be spawned — a host fault, not evidence
+                # about this token. Record it and stay AUTH_FAILED: an account
+                # we could not VERIFY must not be read as recovered.
+                #
+                # Caught HERE rather than left to _auth_reprobe_loop's broad
+                # `except Exception`, which would downgrade it to a WARNING
+                # ('auth re-probe raised') and re-hide the one signal that says
+                # this is not an auth problem. Returning early also skips the
+                # 'auth re-probe failed — staying auth_failed' line below,
+                # which asserts a probe that ran.
+                self._note_probe_spawn_failure(acct, exc)
+                return
+            self._clear_probe_spawn_failures(acct)
+            if ok:
+                if acct.phase == AccountPhase.AUTH_FAILED:
+                    # _transition owns: the phase write, clearing
+                    # auth_failed_at, and the centralized _open recompute. A
+                    # phase mismatch here (e.g. SIGHUP's fan-out reprobing an
+                    # account that was never auth_failed) is a pure no-op —
+                    # mirrors the idempotency guards on
+                    # _handle_cap_detected/_handle_auth_failure. The old
+                    # unconditional field writes + event fire re-ran (and
+                    # re-fired 'auth_resumed') on every successful call
+                    # regardless of the account's current phase.
+                    self._transition(acct, AccountPhase.AVAILABLE)
+                    logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
+                    if self._cost_store:
+                        self._fire_cost_event(
+                            acct.name,
+                            'auth_resumed',
+                            json.dumps({}),
+                        )
+            else:
+                logger.info(
+                    f'Account {acct.name}: auth re-probe failed — staying auth_failed',
+                )
 
     def _token_env_for(self, acct: AccountState) -> str | None:
         """Look up the env-var name that sourced *acct*'s token."""
@@ -2157,9 +2168,11 @@ class UsageGate:
         Treats SIGHUP as an operator-driven "refresh everything" signal:
         - reload .env (override existing env vars)
         - refresh each account's token from its env var if it changed
-        - force every account to AVAILABLE so it is probe-worthy
+        - force every account except an AUTH_FAILED one to AVAILABLE; an
+          AUTH_FAILED account stays blocked until its probe confirms the token
         - reopen the global gate
         - fire a probe per account in parallel
+        - clear the pause reason once the pool is no longer paused
 
         ``cumulative_cost`` is intentionally NOT reset — it is a budget
         counter, unrelated to token state.
@@ -2178,13 +2191,18 @@ class UsageGate:
             # centralized _open recompute. force=True is required because
             # CAPPED/AUTH_FAILED -> AVAILABLE is not a legal edge outside
             # this operator-driven hard reset.
-            self._transition(acct, AccountPhase.AVAILABLE, force=True)
-        self._paused_reason = ''
+            #
+            # An AUTH_FAILED account is left to _reprobe_account, which
+            # un-blocks it only on a probe that ran and succeeded (task 5946).
+            if acct.phase != AccountPhase.AUTH_FAILED:
+                self._transition(acct, AccountPhase.AVAILABLE, force=True)
         logger.info(f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes')
         await asyncio.gather(
             *(self._reprobe_account(a) for a in self._accounts),
             return_exceptions=True,
         )
+        if not self.is_paused:
+            self._paused_reason = ''
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
@@ -2331,9 +2349,10 @@ class UsageGate:
         # cadence (`_account_resume_probe_loop` / `_auth_reprobe_loop`), so
         # only they can ever produce the probe that zeroes the count again.
         #
-        # `_on_sighup_async` is the path that proved it: it force-resets EVERY
-        # account to AVAILABLE (which zeroes the counter via `_transition`)
-        # and only THEN fans out `_reprobe_account` over all of them. On a
+        # `_on_sighup_async` is the path that proved it: it force-resets every
+        # account except an AUTH_FAILED one to AVAILABLE (which zeroes the
+        # counter via `_transition`) and only THEN fans out `_reprobe_account`
+        # over all of them. On a
         # broken host that left every AVAILABLE account holding a count of 1
         # that nothing would ever clear — `_transition`'s reset fires on
         # LEAVING the blocked set, and AVAILABLE -> CAPPED is an ENTRY — so a

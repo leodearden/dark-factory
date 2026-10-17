@@ -359,7 +359,7 @@ class TestHappyPath:
         Fails until _submit_to_merge_queue stores merge_sha on self._merge_sha (step-15)
         and workflow.py:554 passes it as done_provenance.
         """
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         stub = AgentStub()
         scheduler = FakeScheduler()
@@ -3042,7 +3042,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3077,7 +3077,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3117,7 +3117,7 @@ class TestMarkBlockedFalseDoneGuard:
         from unittest.mock import AsyncMock, patch
 
         from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3147,7 +3147,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3184,7 +3184,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRANSIENT_INFRA_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3214,7 +3214,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,

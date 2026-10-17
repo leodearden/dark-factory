@@ -18378,6 +18378,29 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
 
     @pytest.mark.asyncio
+    async def test_a_novel_flag_type_is_suppressed_through_the_action_channel(self, mock_deps):
+        """A naming with no 'strand' stem is still caught by its prose.
+
+        The fixture is this class's realistic finding verbatim apart from
+        flag_type: the status sits in description, the reset in suggested_action.
+        """
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+
+        specimen = self._stranded_flag(flag_type='liveness_anomaly_unattended_workflow')
+        base_report = self._make_base_report([specimen])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5463-action-channel',
+            )
+
+        assert specimen not in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 1
+        assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
+
+    @pytest.mark.asyncio
     async def test_remediation_pass_suppresses_too(self, mock_deps):
         """(b) THE regression this task exists for.
 

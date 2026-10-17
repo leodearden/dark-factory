@@ -3012,7 +3012,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
     """When no callables are injected, the real merge-path globals are used (production path)."""
 
     async def test_defaults_to_real_callables(self, monkeypatch):
-        import orchestrator.merge_queue as mq_mod
+        import orchestrator.merge_lane.worker as mq_mod
         import orchestrator.verify as verify_mod
         from orchestrator.verify_runner import run_merge_verify_on_worktree
 

@@ -419,3 +419,5 @@ tasks:
       reason: the task IS the check suite; its signal is all 14 rows of PRD §9 green
         end-to-end, which is what a delivered_check would otherwise be asserting about
         itself
+signal_leaves:
+- λ
