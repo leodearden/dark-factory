@@ -1049,20 +1049,7 @@ def render_markdown(result: AuditResult) -> str:
                 f'failure of the rule; it means the rule has not been reached._']
     out += ['']
 
-    out += [f'### 4. Scoped cap posture for `{model}` {span}', '']
-    out += markdown_table(
-        ['created_at', 'account', 'reason'],
-        [(h.created_at, h.account_name, h.reason) for h in result.scoped_cap.scoped_hits],
-    )
-    out += ['', f'Account-level (unscoped) cap hits in the same period: '
-                f'{result.scoped_cap.unscoped_cap_hit_count}', '',
-            'Service restarts since then (only an orchestrator restart reloads a '
-            'restart-tier leaf):', '']
-    out += markdown_table(
-        ['timestamp', 'service', 'reason'],
-        [(r.timestamp, r.service, r.reason or '-') for r in result.scoped_cap.restarts],
-    )
-    out += ['']
+    out += _scoped_cap_section(result.scoped_cap, model, span)
 
     spend = result.spend
     # '-' for the three ceiling cells when no ceiling was supplied: there is no
@@ -1091,6 +1078,46 @@ def render_markdown(result: AuditResult) -> str:
     out += ['', f'Roles outside the admitted set: '
                 f'{", ".join(containment.unexpected_roles) or "none"}', '']
     return '\n'.join(out)
+
+
+def _scoped_cap_section(scan: ScopedCapScan, model: str, span: str) -> list[str]:
+    """Section 4: the scope's cap hits, then whether its restart-tier leaf is loaded yet."""
+    out = [f'### 4. Scoped cap posture for `{model}` {span}', '']
+    out += markdown_table(
+        ['created_at', 'account', 'reason'],
+        [(h.created_at, h.account_name, h.reason) for h in scan.scoped_hits],
+    )
+    out += ['', f'Account-level (unscoped) cap hits in the same period: '
+                f'{scan.unscoped_cap_hit_count}', '',
+            f'Orchestrator startups {span}, from the `runs` table (only an '
+            'orchestrator startup loads a restart-tier leaf):', '']
+    out += markdown_table(
+        ['started_at', 'run_id'],
+        [(s.started_at, s.run_id) for s in scan.orchestrator_startups],
+    )
+    out += ['', f'Config reloads {span} that left a leaf restart-required, with the '
+                'first orchestrator startup after each:', '']
+    out += markdown_table(
+        ['reloaded at', 'restart-required leaves', 'first startup after', 'run_id'],
+        [_reload_row(r) for r in scan.restart_required_reloads],
+    )
+    out += ['', f'`service_restart` events {span}: backing-service restarts, and the '
+                "merge-landed coordinator's orchestrator restart requests rather than "
+                'orchestrator startups:', '']
+    out += markdown_table(
+        ['timestamp', 'service', 'reason'],
+        [(r.timestamp, r.service, r.reason or '-') for r in scan.restarts],
+    )
+    out += ['']
+    return out
+
+
+def _reload_row(reload: RestartRequiredReload) -> tuple[str, str, str, str]:
+    """*reload* as one row of section 4's reload table."""
+    after = reload.first_startup_after
+    if after is None:
+        return reload.timestamp, ', '.join(reload.leaves), 'none in window', '-'
+    return reload.timestamp, ', '.join(reload.leaves), after.started_at, after.run_id
 
 
 def _merge_cell(outcome: MergeOutcome | None) -> str:
