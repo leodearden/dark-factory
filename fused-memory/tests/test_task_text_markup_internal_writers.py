@@ -35,7 +35,7 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import ProjectRoot
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    _queue_briefing_refresh_tasks,
+    queue_briefing_refresh_tasks,
 )
 
 # Task 4358: the description closer swallowed priority='low'.
@@ -142,7 +142,7 @@ async def test_briefing_refresh_refuses_a_leaked_gap_and_reports_it_as_a_markup_
     }
 
     with caplog.at_level(logging.WARNING):
-        summary = await _queue_briefing_refresh_tasks(
+        summary = await queue_briefing_refresh_tasks(
             backend, ProjectRoot(project_root), [mismatch], existing_tasks=[],
         )
 
