@@ -812,17 +812,19 @@ class TestGcArchivesBeforeDelete:
         assert not config_dir.exists()
         assert not archive_root.exists()
 
-    def test_archive_root_is_a_required_keyword(self):
-        """A default would silently pick the non-archiving rmtree for a caller
-        that forgot it; every caller must say which branch it means."""
-        import inspect
-
+    def test_a_call_that_omits_archive_root_destroys_nothing(self, tmp_path):
+        """Omitting or positionally passing archive_root is refused before any rmtree."""
         from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
 
-        param = inspect.signature(gc_run_config_dir).parameters['archive_root']
+        data_dir, config_dir, transcript = self._plant(tmp_path)
 
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY
-        assert param.default is inspect.Parameter.empty
+        with pytest.raises(TypeError):
+            gc_run_config_dir(data_dir, self.RUN_ID)  # pyright: ignore[reportCallIssue]
+        with pytest.raises(TypeError):
+            gc_run_config_dir(data_dir, self.RUN_ID, None)  # pyright: ignore[reportCallIssue]
+
+        assert transcript.read_bytes() == self.TRANSCRIPT
+        assert config_dir.is_dir()
 
     def test_is_still_a_noop_when_the_dir_is_absent(self, tmp_path):
         from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
