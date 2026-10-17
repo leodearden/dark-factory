@@ -7,17 +7,13 @@ live container, so a container that grows an entry fails this suite at
 collection until the new entry has a disposition.
 """
 
-from pathlib import Path
-
 import check_dashboard_unit_parity
-import exception_register
+import governed_list_agreement
 import inline_suppressions
 import merge_lane_metrics
 import test_design_invariants_consistency as design_invariants_consistency
 import test_merge_state_vocabulary_consistency as merge_state_vocabulary_consistency
-from shared.governed_exceptions import Debt, GovernedList, TaskRef, governed_exceptions
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
 
 SIZE_CEILING_EXEMPT_LIST = governed_exceptions(
     'scripts.merge_lane_metrics.SIZE_CEILING_EXEMPT',
@@ -70,23 +66,4 @@ INLINE_SUPPRESSION_BASELINE = governed_exceptions(
 
 
 def test_the_register_reads_every_declaration_here_as_it_evaluates() -> None:
-    relpath = Path(__file__).resolve().relative_to(REPO_ROOT).as_posix()
-    discovery = exception_register.declarations_in(
-        exception_register.Corpus(files={relpath: Path(__file__).read_bytes()}, enumerated=1)
-    )
-    assert discovery.faults == ()
-    static = {
-        d.list_id: (d.rule, d.default, d.default_covers, dict(d.overrides))
-        for d in discovery.declarations
-    }
-    runtime = {
-        g.list_id: (g.rule, g.default, g.default_covers, dict(g.overrides))
-        for g in globals().values()
-        if isinstance(g, GovernedList)
-    }
-    assert static == runtime, (
-        'exception_register reads a different set of declarations from this file '
-        'than the module evaluates. A declaration the register cannot read '
-        'statically (one inside a function, or with a non-literal list_id, rule or '
-        'disposition) drops out of `exception_register.py --report`.'
-    )
+    governed_list_agreement.assert_register_reads_as_evaluated(__file__, globals())

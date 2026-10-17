@@ -7,27 +7,26 @@ disposition. The call is evaluated when this module is collected, so an entry
 with no disposition fails this suite before any test runs.
 """
 
+import sys
 from pathlib import Path
 
 from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+
+import governed_list_agreement
+import merge_lane_metrics
 
 MERGE_LANE_RATCHET_BASELINE = governed_exceptions(
     'orchestrator.tests.merge_lane_ratchet_baseline.json',
     'Merge-lane quality measures frozen at their seeded values: each may fall and '
     'none may rise without an authorized raise, and a path or function absent from '
     'the baseline must meet the file-size and new-function complexity ceilings.',
-    ['orchestrator/tests/merge_lane_ratchet_baseline.json'],
+    [merge_lane_metrics.BASELINE_RELPATH],
     default=Debt(TaskRef(5603)),
     default_covers=1,
 )
 
 
-def test_the_baseline_unit_names_a_file_in_the_checkout() -> None:
-    (path,) = MERGE_LANE_RATCHET_BASELINE.keys
-    assert (REPO_ROOT / path).is_file(), (
-        f'{path} is not a file: the merge-lane ratchet baseline was moved or renamed, '
-        'so this declaration\'s key and list_id must follow '
-        'scripts/merge_lane_metrics.py::BASELINE_RELPATH.'
-    )
+def test_the_register_reads_every_declaration_here_as_it_evaluates() -> None:
+    governed_list_agreement.assert_register_reads_as_evaluated(__file__, globals())
