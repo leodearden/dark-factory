@@ -1524,23 +1524,31 @@ _NO_FAILURE_MARKER_NOTE = (
 
 def _render_output_section(
     heading: str, output: str, *, cap: int, note: str | None = None,
+    logs_listed: bool = False,
 ) -> str:
     """Render one leg's captured output as a failure-report section.
 
     Serves failure_report's invariant that a non-empty leg output is never
     silently dropped: every leg goes through this one renderer, which excerpts
-    with :func:`_failure_anchored_excerpt` and labels what it shows. Shape
-    contract: the fence sits directly under the heading and every annotation
-    follows the closing fence, because
+    with :func:`_failure_anchored_excerpt` and labels what it shows, including
+    when the excerpt is shorter than the output. Shape contract: the fence
+    sits directly under the heading and every annotation follows the closing
+    fence, because
     ``orchestrator/src/orchestrator/b3_gate.py::_strip_captured_output`` strips
     only a fence opened directly under a heading listed in
     ``_FAILURE_REPORT_CAPTURED_HEADINGS``, which must name every heading this
     helper renders.
     """
     excerpt = _failure_anchored_excerpt(output, cap=cap)
+    annotations = [note] if note else []
+    if len(excerpt) < len(output):
+        truncation = f'Excerpt: {len(excerpt):,} of {len(output):,} characters shown.'
+        if logs_listed:
+            truncation += ' Full output: the log files listed under Verify Logs.'
+        annotations.append(truncation)
     section = f'{heading}\n\n```\n{excerpt}\n```'
-    if note:
-        section += f'\n\n{note}'
+    if annotations:
+        section += '\n\n' + '\n'.join(annotations)
     return section
 
 
@@ -4658,24 +4666,30 @@ class VerifyResult:
                 for p in self.archive_log_paths:
                     log_lines.append(f'- {p}')
             sections.append('\n'.join(log_lines))
+        logs_listed = bool(self.worktree_log_paths or self.archive_log_paths)
         if self.test_output.strip():
             if _FAILURE_MARKER_RE.search(self.test_output):
                 sections.append(_render_output_section(
                     '## Test Failures', self.test_output, cap=3000,
+                    logs_listed=logs_listed,
                 ))
             else:
                 sections.append(_render_output_section(
                     '## Test Output', self.test_output, cap=3000,
-                    note=_NO_FAILURE_MARKER_NOTE,
+                    note=_NO_FAILURE_MARKER_NOTE, logs_listed=logs_listed,
                 ))
-        if self.lint_output and self.lint_output.strip():
-            sections.append(f'## Lint Issues\n\n```\n{self.lint_output[-2000:]}\n```')
-        if self.type_output and 'error' in self.type_output.lower():
-            sections.append(f'## Type Errors\n\n```\n{self.type_output[-2000:]}\n```')
+        if self.lint_output.strip():
+            sections.append(_render_output_section(
+                '## Lint Issues', self.lint_output, cap=2000, logs_listed=logs_listed,
+            ))
+        if 'error' in self.type_output.lower():
+            sections.append(_render_output_section(
+                '## Type Errors', self.type_output, cap=2000, logs_listed=logs_listed,
+            ))
         elif self.type_output.strip():
             sections.append(_render_output_section(
                 '## Type Check Output', self.type_output, cap=2000,
-                note=_NO_FAILURE_MARKER_NOTE,
+                note=_NO_FAILURE_MARKER_NOTE, logs_listed=logs_listed,
             ))
         return '\n\n'.join(sections) if sections else self.summary
 
