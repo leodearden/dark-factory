@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid as uuid_mod
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -241,8 +242,18 @@ def _extract_target(op: dict) -> str:
 class ReconciliationJournal:
     """Persistent journal backed by SQLite — one database per project directory."""
 
-    def __init__(self, data_dir: Path):
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        connect: Callable[[str], Awaitable[aiosqlite.Connection]] = connect_daemon,
+    ):
         """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
+
+        *connect* is how ``initialize`` opens the journal's one connection, given
+        the ``reconciliation.db`` path; it defaults to ``connect_daemon``.
+        ``fused-memory/tests/test_recon_db_atomicity.py`` passes its own to reach
+        that connection.
 
         Nothing coerces it here, and nothing upstream does either (task 4592;
         why, and the deployment story behind it, at ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
@@ -262,6 +273,7 @@ class ReconciliationJournal:
         fails closed if anything bypasses it.
         """
         self.data_dir = data_dir
+        self._connect = connect
         self._access: AtomicConnection | None = None
         self._write_journal: WriteJournal | None = None
 
@@ -277,7 +289,7 @@ class ReconciliationJournal:
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.data_dir / 'reconciliation.db'
-        conn = await connect_daemon(str(db_path))
+        conn = await self._connect(str(db_path))
         conn.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
         self._access = AtomicConnection(conn)

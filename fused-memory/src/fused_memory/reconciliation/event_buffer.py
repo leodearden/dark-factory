@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -117,7 +117,15 @@ class EventBuffer:
         stale_lock_seconds: float = 7200.0,
         queue_stats_fn: Callable[[], Any] | None = None,
         instance_id: str | None = None,
+        *,
+        connect: Callable[[str], Awaitable[aiosqlite.Connection]] = connect_daemon,
     ):
+        """*connect* is how ``initialize`` opens the buffer's one connection.
+
+        It is given the database path and defaults to ``connect_daemon``;
+        ``fused-memory/tests/test_recon_db_atomicity.py`` passes its own to
+        reach that connection.
+        """
         # _in_memory is derived from the caller's intent (db_path is None),
         # not from the resolved string ':memory:'.  This means explicitly
         # passing db_path=Path(':memory:') is treated as a file path and
@@ -133,12 +141,13 @@ class EventBuffer:
         self.stale_lock_seconds = stale_lock_seconds
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
+        self._connect = connect
         self._access: AtomicConnection | None = None
         self._manual_triggers: set[str] = set()
 
     async def initialize(self) -> None:
         """Open SQLite connection and ensure schema exists."""
-        conn = await connect_daemon(self._db_path)
+        conn = await self._connect(self._db_path)
         conn.row_factory = aiosqlite.Row
         # WAL mode cannot be enabled on in-memory SQLite DBs — SQLite
         # returns 'memory' from PRAGMA journal_mode=WAL which would trigger
