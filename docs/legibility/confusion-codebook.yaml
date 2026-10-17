@@ -192,6 +192,15 @@ entries:
     manifested_phase: verify
     invariant_violated: contracts-machine-checked
     note: A claim-verification one-shot agent was given a prose contract naming grep_search, git_log and verification_complete. All three calls failed with 'No such tool available' (turns 17, 19 and 75). The agent fell back to Grep/Read, then tried to submit its verdict through the nonexistent verification_complete tool, so the verdict could not be delivered.
+  - date: '2026-10-04'
+    project: dark_factory
+    session: 05f4a772-081c-4d46-8a7c-928994135ca7
+    origin_phase: unknown
+    manifested_phase: verify
+    invariant_violated: contracts-machine-checked
+    note: The claim-verification sub-agent called grep_search twice and read_file once, which are the JSON tool-shim names the verifier prompt describes. Each call returned 'No such tool available'. The prompt's tool contract does not match the tools the runtime provides.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: watcher-capability-envelope
   title: Autonomous watcher rotations never told their capability envelope — level-{0,1} cap, disabled Write/Edit, and git-write denials rediscovered by failure every rotation
   severity: high
@@ -1549,6 +1558,14 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: 'Turn 798: `.venv/bin/python` not found (exit 127) in project_root. Turn 944: same binary succeeds, suggesting venv state was mutated between turns by machine processes (merge worker, orchestrator) operating on the shared main checkout.'
+  - date: '2026-09-20'
+    project: dark_factory
+    session: d5db36cd-6d9c-4bab-969f-b9786ab5a401
+    origin_phase: ops
+    manifested_phase: merge
+    note: At turn 540 the user said uncommitted changes in the main checkout had jammed the merge queue. They told the agent never to leave uncommitted changes in the main checkout and to work in a worktree instead.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: investigator-context-and-budget
   title: 'Block-time investigators and retried planners launch cold and die silent: no feed-forward of prior analysis, no partial-output protocol, wrong default diff'
   severity: high
@@ -2876,6 +2893,8 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Weak match. A single StructuredOutput call failed because its raw input was not parseable JSON (1208 bytes, retried after an InputValidationError). This is a StructuredOutput protocol failure, but not the double-wrap or turn-contract shape the entry describes. One occurrence, no further cost shown.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: prose-routing-intent
   title: Execution-routing intent lives only in description prose — no-code deploys, gates, operator actions, and design decisions dispatch into the TDD architect pipeline
   severity: medium
@@ -4165,6 +4184,8 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: ModuleNotFoundError and 'does not exist' errors (5 instances at turns 34, 46, 91) occur despite supervisor explicitly injecting DARK_FACTORY_ROOT=/home/leo/src/dark-factory in rotation context; watcher-rearm.sh command retried 3x, indicating environment variable or script dependencies not actually available at runtime
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260722-4
   title: Session-start memory search returns generically high-scored but task-irrelevant context
   severity: medium
@@ -4884,6 +4905,14 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: 'Turn 866: resolve_ticket timeout with no outcome signal; followed by retry loops on merge_status (x4) and get_merge_queue (x3), indicating fallback to manual state polling after ticket resolution fails'
+  - date: '2026-09-22'
+    project: dark_factory
+    session: fbd19b60-b314-4ad4-a153-042f2b7ed661
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: mcp__fused-memory__resolve_ticket with timeout_seconds=110 returned only 'The operation timed out.' (turn 455), with no outcome signal for the ticket.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260722-9
   title: Recon action-provenance logger records target='?' for write_journal add/delete ops
   severity: medium
@@ -5981,6 +6010,14 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Session digest 'User Corrections' bucket captured the trickle-coder periodic-census-verifier task prompt ('You are the periodic-census verifier...') from turn 3 as a corrective user action, when it is task instruction injected by orchestrator
+  - date: '2026-09-20'
+    project: dark_factory
+    session: ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket holds the periodic-census verifier's own scripted task prompt (turn 3), which is not a corrective user message.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260722-18
   title: Periodic-census verifier sessions blocked by per-command interactive Bash approval on read-only forensic commands
   severity: medium
@@ -6170,6 +6207,14 @@ entries:
 
       All seven is_error results are permission refusals, so none of those commands ran: 29 and 42 `This Bash command contains multiple operations` (parts require approval); 46 and 83 `Contains ansi_c_string`; 50 a Write to /tmp not granted; 54 `This command requires approval`; 97 `Contains simple_expansion`. 83 and 97 were read-only forensic greps; 42/46/50/54 were attempts to run a probe script.'
     evidence_quote: 'Bash({"command": "grep -rlI $''\\xe2\\x80\\x94'' /home/leo/src/dark-factory --include=*.py 2>/dev/null | wc -l"}) -> Contains ansi_c_string'
+  - date: '2026-09-20'
+    project: dark_factory
+    session: 7b9a73e9-257d-4aa7-bc15-0e48752c4f10
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Census-verifier session. Both tool_errors are 'This command requires approval' on a read-only `find /home/leo/src/dark-factory -name test_bake_off_storage_shape.py`, issued twice (turns 22 and 30) with identical text.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260719-5
   title: Graphiti search returns decontextualized single-sentence fragments — high relevance score, zero actionable content
   severity: medium
@@ -8176,6 +8221,26 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Repeated ModuleNotFoundError inside a task worktree (turns 28, 49, 319, 619, 644, 828) matches the explore-phase import/command failure pattern. The digest does not establish the phase, so both phases are unknown.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: ae701193-5aa7-4fa3-bc86-d77d4cd97b50
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The only signal is a single ModuleNotFoundError at turn 122 in an orchestrated-task session in worktree 6713. This fits the known ModuleNotFoundError-in-task-worktree pattern, which may come from a worktree with no synced .venv or from an inherited main-checkout VIRTUAL_ENV. The digest does not show which role or phase was running, so the phase is left as unknown.
+  - date: '2026-09-20'
+    project: dark_factory
+    session: a4121d96-67a3-4f87-9805-e350f27165e7
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'A bare `python` in the task worktree inherited the main checkout''s venv. `from orchestrator import rebase_recovery` resolved to main''s editable source, which lacks the module the task just added (ImportError at turn 137). The agent then side-loaded the file with importlib `spec_from_file_location` without registering it in sys.modules. That produced a second failure: the @dataclass decorator raised `''NoneType'' object has no attribute ''__dict__''` (turn 142). The `__file__` provenance probe was available but not used. Evidence is thin and the worktree-venv resolution cause is inferred, so this is a loose match to the architect-phase worktree import/command-not-found entry.'
+  - date: '2026-09-23'
+    project: dark_factory
+    session: cf3b79bd-62dd-4a0f-b39e-29ab5ee77829
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Bash `ruff check` on two changed files returned exit 1 with "'ruff' not found" in a task worktree. This matches the command-not-found-in-worktree family, where the shell's PATH or venv does not resolve the tool. The digest does not show whether the worktree had its own .venv, so the origin phase stays unknown.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -8286,6 +8351,44 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: The supervisor-injected watcher task-framing prompt (rotation limits, DARK_FACTORY_ROOT, re-arm instructions) is filed under 'User Corrections' as a turn-3 item, though the session has one user turn and no correction.
+  - date: '2026-10-04'
+    project: dark_factory
+    session: 169fa0e7-2464-427d-8937-8c8efbc97c41
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'User Corrections' bucket holds the supervisor's injected initial watcher framing prompt (rotation limits, queue path, re-arm instructions) at turn 3. The session has only one user turn, so this is not a correction.
+  - date: '2026-10-03'
+    project: dark_factory
+    session: b5d4ad81-7d1b-4458-a5eb-26673eb5873a
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'User Corrections' bucket (turn 3) holds the supervisor-injected watcher rotation prompt (ROTATION_ESCALATIONS, ROTATION_HOURS, re-arm instructions), which is task framing and not a user correction.
+  - date: '2026-09-22'
+    project: dark_factory
+    session: fbd19b60-b314-4ad4-a153-042f2b7ed661
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The first 'User Corrections' item (turn 7) is the injected /team task-framing prompt with its spawn-brief and result.md boilerplate. It is not corrective feedback.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: d3a35ddf-43b5-412b-899d-0d2a27bb09fa
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The 'User Corrections' bucket holds the watcher's injected initial task-framing prompt (rotation limits, queue dir, DARK_FACTORY_ROOT). It is not a user correction.
+  - date: '2026-09-21'
+    project: dark_factory
+    session: d18be7a4-0132-4e27-972e-f6779d57a8f4
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest files the injected /team slash-command framing prompt (turn 7) under 'User Corrections'. That prompt is task framing, not corrective feedback.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 349f6bf4-a3c4-4d51-a944-4bd903c4000d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket holds the watcher's injected initial task-framing prompt (rotation limits, project root, re-arm command) rather than a correction.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260713-3
   title: Recon category labels applied by surface keyword match, not guard definition
   severity: medium
@@ -8821,6 +8924,68 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The 'User Corrections' bucket holds the injected /team spawn-brief command wrapper (a task-dispatch prompt, not user feedback), matching the digest generator's known mislabeling of injected task prompts as corrections. The session's signal_counts show no correction-type signal, and the digest was still scored.
+  - date: '2026-10-08'
+    project: dark_factory
+    session: 7b8a73da-fa49-4593-b596-02dd023fec41
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The 'User Corrections' bucket holds the watcher's injected rotation-limits/startup prompt (turn 3), not a corrective user message.
+  - date: '2026-09-21'
+    project: dark_factory
+    session: 72343baf-24a9-494d-8df1-91fb855aa6ed
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' item is the injected /team task-framing prompt, not feedback from the user. It is a dispatch prompt mislabeled as a correction.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 9c2115f6-1e9f-4f86-8be8-979cabe1be4d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' item at turn 7 is the spawn-time /prd command-args prompt, which is the task-framing brief plus the result.md boilerplate. It is not corrective user feedback. This is the same mislabeling of an injected task prompt as a User Correction.
+  - date: '2026-09-20'
+    project: dark_factory
+    session: 7b9a73e9-257d-4aa7-bc15-0e48752c4f10
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The 'User Corrections' bucket holds the injected census-verifier task prompt (turn 3) with its CLUSTER JSON. That is the dispatched task framing, not corrective user feedback. The score of 7.0 also comes only from the two approval-gate tool_errors.
+  - date: '2026-09-24'
+    project: dark_factory
+    session: 89846705-ddff-4399-9f56-7a5e9e4ab2c5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The injected watcher task-framing prompt (rotation limits, DARK_FACTORY_ROOT, re-arm instructions) is captured under 'User Corrections' even though it is not a correction.
+  - date: '2026-10-01'
+    project: dark_factory
+    session: 16d7ef65-5b8f-480d-b422-c986684a63b8
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'User Corrections' bucket holds the supervisor-injected watcher task prompt (rotation limits, re-arm instructions), not user feedback.
+  - date: '2026-09-30'
+    project: dark_factory
+    session: 036062fb-4b1e-4348-a424-661f7f914ba9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The watcher's injected supervisor prompt (rotation limits, DARK_FACTORY_ROOT, re-arm command) is labeled a 'User Correction' at turn 3 although it is not corrective user feedback.
+  - date: '2026-09-23'
+    project: dark_factory
+    session: 2bd0252b-d765-4515-9317-6d35424380eb
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The supervisor's injected watcher-rotation prompt (ROTATION_ESCALATIONS, DARK_FACTORY_ROOT, re-arm instructions) appears under 'User Corrections' at turn 3, although it is the initial task framing and not a correction.
+  - date: '2026-09-23'
+    project: dark_factory
+    session: 814f659c-4eca-47d4-9d34-523293294936
+    origin_phase: ops
+    manifested_phase: ops
+    note: The supervisor-injected watcher rotation prompt ('You are running as an autonomous escalation watcher...') is captured as a 'User Correction' at turn 3. It is the task-framing prompt, not corrective feedback.
+  - date: '2026-09-29'
+    project: dark_factory
+    session: 7f3e2ea8-d50f-4de6-ad68-01e0eca3ed4c
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'User Corrections' bucket holds the supervisor-injected watcher rotation prompt (ROTATION_ESCALATIONS, DARK_FACTORY_ROOT, re-arm instructions), which is not a user correction.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -9965,6 +10130,62 @@ entries:
     manifested_phase: unknown
     invariant_violated: structured-facts-at-failure
     note: Both guard trips render as bare 'blocked:' with the matched reason missing, and the not_found lines carry only the template text. This matches the bare-template rendering defect; the digest does not show the phase.
+  - date: '2026-10-04'
+    project: dark_factory
+    session: 169fa0e7-2464-427d-8937-8c8efbc97c41
+    origin_phase: ops
+    manifested_phase: ops
+    note: The Not Found bucket shows bare templates ('modulenotfounderror', 'does not exist') at turn 34 with no path, module or command. The reader cannot tell what was missing.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: d3a35ddf-43b5-412b-899d-0d2a27bb09fa
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The Guard Trips entry reads '(turn 37) blocked:' with nothing after the colon. The matched substring was dropped, so the guard cannot be identified from the digest.
+  - date: '2026-09-24'
+    project: dark_factory
+    session: 89846705-ddff-4399-9f56-7a5e9e4ab2c5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard Trips lists nine entries as a bare 'blocked:' with no matched substring or reason, so the cause of df_guard=9 can't be recovered from the digest.
+  - date: '2026-10-01'
+    project: dark_factory
+    session: 16d7ef65-5b8f-480d-b422-c986684a63b8
+    origin_phase: ops
+    manifested_phase: ops
+    note: The Guard Trips section shows only 'blocked:' and the Not Found section only 'does not exist'. In both, the matched substring (which path or command) is dropped, so the digest cannot be interpreted.
+  - date: '2026-09-30'
+    project: dark_factory
+    session: 036062fb-4b1e-4348-a424-661f7f914ba9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The Not Found section shows only the bare template 'does not exist' (turn 34). The matched path or substring is dropped, so the signal cannot be diagnosed.
+  - date: '2026-09-23'
+    project: dark_factory
+    session: 2bd0252b-d765-4515-9317-6d35424380eb
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Seven 'Guard Trips' entries render only as bare 'blocked:' with no matched substring or reason, so the guard cause cannot be determined from the digest.
+  - date: '2026-09-23'
+    project: dark_factory
+    session: 814f659c-4eca-47d4-9d34-523293294936
+    origin_phase: ops
+    manifested_phase: ops
+    note: Guard Trips shows three bare 'blocked:' entries (turns 156, 192, 218) with no matched substring or reason, so the guard trips cannot be diagnosed from the digest. df_guard=3 is the only evidence.
+  - date: '2026-10-14'
+    project: dark_factory
+    session: 551ac724-ee54-49e2-914c-86a30dbfda66
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The Guard Trips entry reads only 'blocked:' with no guard text, and the Not Found entries read as bare 'does not exist' with no path or matched substring. This is the digest generator rendering signals as bare templates, so the substance is lost.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 349f6bf4-a3c4-4d51-a944-4bd903c4000d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard Trips shows two 'blocked:' entries (turns 39 and 68) with the matched substring dropped, so the guard cause cannot be seen.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -10515,6 +10736,14 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Designed bounded-wait ceiling (exit 124, WATCHER_REARM_OUTCOME: CEILING) is counted under tool_error (tool_error: 2) and surfaces in the Designed Outcomes bucket, so the scorer double-counts it.'
+  - date: '2026-10-08'
+    project: dark_factory
+    session: 7b8a73da-fa49-4593-b596-02dd023fec41
+    origin_phase: unknown
+    manifested_phase: ops
+    note: One of the 2 tool_error counts is the turn-135 exit 1 from the watcher's own `[ $t -gt 0 ]` guard, which fires once the rotation budget is spent (remaining=-65). That is the designed end-of-rotation path, so it is not a real tool error. The exit-124 re-arm waits were correctly counted as designed_outcome here.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260730-25
   title: Digest generator mislabels an ordinary task-dispatch '# Context' briefing block as a 'User Correction'
   severity: medium
@@ -11266,6 +11495,8 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The digest's 'User Corrections' bucket holds a block-reason and verify-log dump from an orchestrated-task session with n_user_turns=1 and no correcting user message. This is the same pattern of non-corrective report content being captured as a correction.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -17837,6 +18068,8 @@ entries:
     manifested_phase: unknown
     invariant_violated: structured-facts-at-failure
     note: Orchestrated worktree task (cwd .worktrees/3774) logs three not_found signals (no such file or directory; does not exist; modulenotfounderror) with no accompanying diagnostic detail. The digest does not show which phase the task was in, so phase is unknown.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -17948,6 +18181,14 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: 'Partial match on the malformed-tool-JSON family. An MCP get_task_escalations call was emitted with an empty-valued field ("status": ,) and failed InputValidationError. The original candidate concerns the Read tool and identical retries, and this digest shows a different tool and no identical retry, so the match is only in kind.'
+  - date: '2026-09-30'
+    project: dark_factory
+    session: 036062fb-4b1e-4348-a424-661f7f914ba9
+    origin_phase: unknown
+    manifested_phase: ops
+    note: A tool call was emitted with malformed JSON (an empty value after "status":) to get_task_escalations and failed InputValidationError. It is the same family as the stray-comma Read JSON syntax error. There is only one occurrence here, with no retry evidence.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260811-6
   title: Sub-agent resumed after weekly usage-limit hit has no persisted partial progress to resume from
   severity: medium
@@ -18310,6 +18551,68 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Retry Loops bucket flags the watcher's designed re-arm calls (13x watcher-rearm.sh with run_in_background) and repeated get_pending_escalations polls as retry loops. This is the designed once-per-rotation watcher behaviour, not a retry defect.
+  - date: '2026-10-04'
+    project: dark_factory
+    session: 169fa0e7-2464-427d-8937-8c8efbc97c41
+    origin_phase: ops
+    manifested_phase: ops
+    note: The Retry Loops bucket flags three identical watcher-rearm.sh calls that each ended with the designed CEILING exit 124 ([watcher-rearm-declared]). These are the designed once-per-wait re-arms, not retries.
+  - date: '2026-10-03'
+    project: dark_factory
+    session: b5d4ad81-7d1b-4458-a5eb-26673eb5873a
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'Retry Loops' bucket shows Bash x3 of the identical scripts/watcher-rearm.sh --timeout 3600 call. That is the watcher's designed once-per-wait re-arm and not a retry loop.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: d3a35ddf-43b5-412b-899d-0d2a27bb09fa
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'The ''Retry Loops'' bucket lists the watcher''s designed calls as retries. These are 3x watcher-rearm.sh bounded waits that each ended in exit 124 with WATCHER_REARM_OUTCOME: CEILING, and 3x date/remaining-time checks.'
+  - date: '2026-09-24'
+    project: dark_factory
+    session: 89846705-ddff-4399-9f56-7a5e9e4ab2c5
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'The Retry Loops bucket flags the watcher''s designed bounded-wait re-arm calls (Bash x7, with exit 124 and WATCHER_REARM_OUTCOME: CEILING) and the per-rotation `date +%s` checks (x6) as retry loops.'
+  - date: '2026-10-01'
+    project: dark_factory
+    session: 16d7ef65-5b8f-480d-b422-c986684a63b8
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'The Retry Loops bucket flags ''Bash x4'' for the identical watcher-rearm.sh calls. Exit 124 is the script''s designed bounded-wait ceiling, and the output even carries WATCHER_REARM_OUTCOME: CEILING.'
+  - date: '2026-09-30'
+    project: dark_factory
+    session: 036062fb-4b1e-4348-a424-661f7f914ba9
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The 'Retry Loops' bucket flags Bash x4 of the identical scripts/watcher-rearm.sh --timeout 3600 call. That is the watcher's designed bounded-wait re-arm cycle, not a retry loop.
+  - date: '2026-09-23'
+    project: dark_factory
+    session: 2bd0252b-d765-4515-9317-6d35424380eb
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'The ''Retry Loops'' bucket flags the watcher''s designed repeated calls as retries: watcher-rearm.sh ending in the exit 124 CEILING outcome, the date/remaining-time recompute, and the get_pending_escalations polls.'
+  - date: '2026-09-23'
+    project: dark_factory
+    session: 814f659c-4eca-47d4-9d34-523293294936
+    origin_phase: ops
+    manifested_phase: ops
+    note: The Retry Loops bucket flags the watcher's designed bounded-wait re-arm (Bash x5, watcher-rearm.sh, exit 124 marked [watcher-rearm-declared]) as a retry loop. The 'CEILING exit=124' outcome is the intended bounded-wait result.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 349f6bf4-a3c4-4d51-a944-4bd903c4000d
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The Retry Loops bucket flags the watcher's designed repeated watcher-rearm.sh bounded-wait calls (Bash x4, with a declared exit 124 CEILING outcome) as a retry loop.
+  - date: '2026-09-29'
+    project: dark_factory
+    session: 7f3e2ea8-d50f-4de6-ad68-01e0eca3ed4c
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'Retry Loops' bucket flags Bash x3 on the watcher-rearm.sh wait plus date check. This is the watcher's designed once-per-rotation re-arm, and its exit 124 is the designed CEILING outcome.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260827-23
   title: Edit's multi-match error hint gets invoked as a nonexistent standalone 'replace_all' tool
   severity: medium
@@ -18490,6 +18793,14 @@ entries:
     origin_phase: implement
     manifested_phase: implement
     note: 'Turn 76: add_design_decision rejected because the ''decision'' field payload contained leaked MCP envelope markup (''</decision>''). The tool result shows error_type=''mcp_markup_detected'' with the misclose tag. Recovery succeeded after the markup was removed.'
+  - date: '2026-09-20'
+    project: dark_factory
+    session: d5db36cd-6d9c-4bab-969f-b9786ab5a401
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Three submit_task calls (turns 288, 731, 748, 791) were rejected with mcp_markup_detected on the '</description>' misclose. The caller serialized part of its own tool-call envelope into the description, and the 'details' parameter was recovered from the misclosed text. This is the same leaked-envelope-markup family, now seen on submit_task.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260907-21
   title: Agent busy-polls a long-running background pytest run via repeated foreground Bash ps/pgrep instead of a blocking wait primitive
   severity: medium
@@ -18551,6 +18862,14 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: At turn 313 the agent chained 'sleep 45; cat <bg task output>; wc; tail' in a foreground Bash call to wait on a background job. The harness blocked it and said to use Monitor with an until-loop or run_in_background. This is the same family as busy-polling a long-running background job with foreground waits instead of a blocking primitive. The phase can't be supported from the digest, so it is left as unknown.
+  - date: '2026-09-21'
+    project: dark_factory
+    session: 72343baf-24a9-494d-8df1-91fb855aa6ed
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: At turn 170 the agent ran 'sleep 45; tail' on a background task's output file and a host guard blocked it. The guard said to use Monitor with an until-loop or run_in_background. This is the same pattern of waiting on a background job by polling in the foreground. It is a weaker match because the digest does not show the job was a pytest run.
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260912-25
   title: Implementer guesses an undocumented plan.json per-step 'step_type' field, causing a KeyError
   severity: medium
@@ -18861,6 +19180,8 @@ entries:
 
 
     SCOPE. No agent-facing prompt rule is filed from this entry: that surface is held by sibling task 5683.'
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260919-3
   title: fused-memory MCP calls fail within a second with the harness's `Unable to connect` while fused-memory.service restarts with port 8002 unbound -- not a backing-store timeout and not worktree-specific
   severity: medium
@@ -18886,7 +19207,21 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'CORRECTION (task 5688). This entry''s prior title -- "add_memory fails twice with an opaque connectivity error inside a task worktree, threatening loss of a verified finding" -- and its founding candidate''s cause (cand-20260919-3: "no indication of which backing store timed out", "no retry/backoff or local fallback path to preserve the finding") carry three framings, all WITHDRAWN as refuted by the journal: (1) not worktree-specific -- port 8002 is host-global and every client''s .mcp.json points at it; (2) no backing store timed out -- the request never reached the server process; (3) nothing was at risk of loss -- the payload never left the client, and the string is emitted by the harness''s MCP HTTP client, so no retry/backoff is implementable in this repository. Call times were read from the founding session''s own transcript (archived at data/orchestrator/agent-transcripts/5650/), journal times from `journalctl --user`. Status set to fixed because landed, deployed changes removed the cause, verified first-hand 2026-10-09: `systemctl --user is-active`/`is-enabled fused-memory.socket` = active/enabled; `systemctl --user show fused-memory.service -p TriggeredBy` = `TriggeredBy=fused-memory.socket`; the socket''s journal ends at `Listening on fused-memory.socket` 2026-09-29 23:13:51 with no close since. A recurrence of `Unable to connect` from fused-memory after 2026-09-29 means a deliberate stop/disable, the port-change path, or a missing socket: check `TriggeredBy` and the socket''s journal for `Closed fused-memory.socket` before reopening. This ANNOTATES rather than retracts the existing sightings. The 2026-09-20 sighting (session ae321fc6-719d-419f-aee0-6aa233f712d8, archived at data/orchestrator/agent-transcripts/5238/) was checked against the journal and is a DIFFERENT mechanism, measured: its add_memory was issued 23:42:11 BST and failed at 23:43:41 with `The operation timed out.` -- not `Unable to connect`, and not a connectivity error -- entirely inside a 183s self-recovered event-loop stall (fused-memory''s journal silent 23:41:21 -> 23:44:24 with no systemd lifecycle line; orchestrator-watchdog logged liveness verdict ''wedged'' streak 1/3 at 23:42:25 and 2/3 at 23:43:26, and never restarted it). The port stayed bound throughout, so socket activation does NOT fix that sighting''s cause; it shares its harness string with pending cand-20260909-11. The four pending candidates carrying this entry''s `Unable to connect` string (cand-20260730-13, cand-20260802-5, cand-20260805-2, cand-20260910-4) and cand-20260909-11 are NOT adjudicated here: disposition is census-owned.'
+  - date: '2026-09-21'
+    project: dark_factory
+    session: 72343baf-24a9-494d-8df1-91fb855aa6ed
+    origin_phase: ops
+    manifested_phase: ops
+    note: Two mcp__fused-memory__submit_task calls (turns 326 and 345) failed with 'Unable to connect. Is the computer able to access the url?'. This is the same signature as the fused-memory connect-refused entry. The digest does not show the cause (such as a service restart), so the match rests on the error text and the date.
+  - date: '2026-09-20'
+    project: dark_factory
+    session: d5db36cd-6d9c-4bab-969f-b9786ab5a401
+    origin_phase: ops
+    manifested_phase: ops
+    note: From turn 293 on, submit_task and resolve_ticket calls timed out. At turn 823 get_queue_stats returned 'Unable to connect'. The probe at turn 838 showed port 8002 not listening (http=000, exit 7) while .mcp.json points fused-memory at http://127.0.0.1:8002/mcp. This is a fused-memory service outage, not a backing-store timeout.
   cause: 'Port 8002 was CLOSED: the watchdog''s liveness revive restarted fused-memory.service with the old stop/start path, which left 8002 unbound until `Started`, so each connect was refused and the harness''s MCP HTTP client reported `Unable to connect. Is the computer able to access the url?` within a second. Measured 2026-09-19 (BST) from `journalctl --user -u fused-memory.service` and `-u orchestrator-watchdog.service`: 19:26:54 watchdog liveness verdict ''wedged'' (streak 3/3) and systemd `Stopping`; 19:27:41 SIGTERM serviced; 19:27:50 the session''s last successful fused-memory call (a search) answered; 19:27:56 `Consumed` then `Starting`, with no `Stopped` line; 19:28:07 and 19:28:17 the two failed add_memory calls, returning in 0.3s and 0.7s; 19:28:36 `Started` -- both failures inside the 40s start. The request never reached the server process, so no backing store was involved, and 8002 is host-global, so nothing about it is worktree-specific. Since 2026-09-29 socket activation (commits 8ac33458c4, a1548f5c64, b481d598aa) holds 8002 in fused-memory.socket across a restart, a watchdog revive (now `reset-failed` + `restart --no-block`, never `stop`) or a crash, so a mid-restart client waits in the kernel backlog instead of being refused. The port still closes on a deliberate `systemctl --user stop`/`disable` of fused-memory.service (its ExecStopPost stops the socket), on the port-change stop-then-start in scripts/setup-host.sh section 4, and on a host where fused-memory.socket is not installed. scripts/fm_wedge_forensics.py measures such an episode''s stall, teardown and startup from a `journalctl --user -u fused-memory.service -o short-iso` capture.'
+  last_seen_runs:
+  - census-dark_factory-20261017
 - id: entry-cand-20260916-17
   title: Script-loader routing guard's _module_key mixes absolute TESTS_ROOT with a relative scratch-probe path, crashing on relative_to
   severity: medium
@@ -18951,6 +19286,56 @@ entries:
     origin_phase: implement
     manifested_phase: review
     note: 'Verified confusion finding from prior session 2c2152de-db4e-4b21-bd7f-403fb1ef649c: Task branch 4880 rebased onto sibling task/5800 carried 18 foreign commits through implementation, only detected at review (4,900+ of 5,050 changed lines from another task). Orchestrator branch workflow lacks validation that diff touches only planned files.'
+- id: entry-cand-20260921-26
+  title: Spawned /team session hands the human a brief without enough context to follow the questions
+  severity: low
+  severity_reason: 'The cost is contained: the human gets confused and asks for a restatement. The handoff itself still works.'
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  first_seen_run: census-dark_factory-20261017
+  last_seen_runs:
+  - census-dark_factory-20261017
+  finding_key: fk-c1df06e83aa5
+  finding_area: repo
+  finding_anchor: skills/spawn/SKILL.md
+  finding_tags:
+  - h6
+  - h13
+  - kind:confusion
+  supersedes: []
+  sightings:
+  - date: '2026-09-21'
+    project: dark_factory
+    session: d18be7a4-0132-4e27-972e-f6779d57a8f4
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: This session was spawned by another session rather than directly by me, so I don't know what was in the original prompt, nor what was in any prompt files. ... I appear to be missing the context required in order to make sense of the questions you're asking.
+- id: entry-cand-20260929-1
+  title: 'Escalation watcher emits get_task_escalations calls with an empty-valued optional parameter (`"status": ,`), producing unparseable JSON that recurs across tasks'
+  severity: low
+  severity_reason: Each occurrence wastes one turn and the agent recovers by retrying. It recurs across tasks, but it causes no wrong state.
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  first_seen_run: census-dark_factory-20261017
+  last_seen_runs:
+  - census-dark_factory-20261017
+  finding_key: fk-282c6e761d54
+  finding_area: repo
+  finding_anchor: skills/escalation-watcher-auto/SKILL.md
+  finding_tags:
+  - h12
+  - h11
+  - kind:confusion
+  supersedes: []
+  sightings:
+  - date: '2026-09-29'
+    project: dark_factory
+    session: 7f3e2ea8-d50f-4de6-ad68-01e0eca3ed4c
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: '{"task_id": "5813", "level": 2, "status": , "compact": true}'
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -34345,3 +34730,45 @@ candidates:
     origin_phase: implement
     manifested_phase: ops
     evidence_quote: '`run_architect_eval` injects only plan-tools (orchestrator/src/orchestrator/evals/runner.py::run_architect_eval, the mcp_config it builds), but leaves `strict_mcp_config` FALSE, so the Claude CLI MERGES the eval worktree''s own checked-in `.mcp.json` — which points at the live production escalation server (8102) and live fused-memory (8002).'
+- id: cand-20260921-26
+  title: Spawned /team session hands the human a brief without enough context to follow the questions
+  cause: A session spawned by another session carries a dense framing prompt that assumes context the user never saw, such as prompt files, the original request and unexplained task IDs. The user could not interpret the agent's questions and asked for the sections to be restated with more context. The handoff has no self-contained summary for the human to read.
+  area: agent handoff / spawned-session context
+  first_seen: '2026-09-21'
+  disposition: promoted
+  sightings:
+  - date: '2026-09-21'
+    project: dark_factory
+    session: d18be7a4-0132-4e27-972e-f6779d57a8f4
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: This session was spawned by another session rather than directly by me, so I don't know what was in the original prompt, nor what was in any prompt files. ... I appear to be missing the context required in order to make sense of the questions you're asking.
+  finding_key: fk-c1df06e83aa5
+  finding_area: repo
+  finding_anchor: skills/spawn/SKILL.md
+  finding_tags:
+  - h6
+  - h13
+  - kind:confusion
+  promoted_to: entry-cand-20260921-26
+- id: cand-20260929-1
+  title: 'Escalation watcher emits get_task_escalations calls with an empty-valued optional parameter (`"status": ,`), producing unparseable JSON that recurs across tasks'
+  cause: When the watcher wants to omit the optional status filter, it writes the key with no value instead of dropping it. The harness then rejects the whole call with InputValidationError, wasting a turn. The same malformed shape recurred for tasks 6060 and 5813, 63 turns apart, so nothing carries the lesson forward. The tool's parameter docs or the watcher prompt could state that optional filters must be omitted, not left blank.
+  area: escalation-watcher tool-call construction
+  first_seen: '2026-09-29'
+  disposition: promoted
+  sightings:
+  - date: '2026-09-29'
+    project: dark_factory
+    session: 7f3e2ea8-d50f-4de6-ad68-01e0eca3ed4c
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: '{"task_id": "5813", "level": 2, "status": , "compact": true}'
+  finding_key: fk-282c6e761d54
+  finding_area: repo
+  finding_anchor: skills/escalation-watcher-auto/SKILL.md
+  finding_tags:
+  - h12
+  - h11
+  - kind:confusion
+  promoted_to: entry-cand-20260929-1
