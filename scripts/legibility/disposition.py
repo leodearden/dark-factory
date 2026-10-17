@@ -5,11 +5,13 @@ dedup protocol before filing) and the C1 ``filed_tickets`` back-links
 """
 from __future__ import annotations
 
+import copy
 import enum
 import logging
 import sys
+import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,8 @@ CENSUS_SOURCE = "legibility_census"
 FINDING_KEY_METADATA = "x_finding_key"
 ACCEPTANCE_REASON_METADATA = "x_acceptance_reason"
 SEMANTIC_SCORE_THRESHOLD = 0.6
+RESOLVE_BUDGET_SECS = 300.0
+RESOLVE_CALL_CAP_SECS = 115.0
 LIVE_STATUSES = frozenset({"pending", "in-progress", "blocked", "deferred", "merge-deferred"})
 _DONE_STATUS = "done"
 _CANCELLED_STATUS = "cancelled"
@@ -67,6 +71,13 @@ def _require_the_codebook_vocabulary(name: str, stated: Iterable[str], required:
             f"disposition.{name} must state exactly codebook's {sorted(required)}, got {sorted(stated)}"
         )
 
+
+_RESOLUTION_OF = {
+    task_store.TicketStatus.CREATED: Resolution.CREATED,
+    task_store.TicketStatus.COMBINED: Resolution.COMBINED,
+    task_store.TicketStatus.REFUSED: Resolution.REFUSED,
+    task_store.TicketStatus.FAILED: Resolution.FAILED,
+}
 
 _require_the_codebook_vocabulary("Step", (step.value for step in Step), codebook.FILED_TICKET_STEPS)
 _require_the_codebook_vocabulary(
@@ -169,6 +180,18 @@ class Decision:
             return f"open (ticket {self.ticket} pending)"
         return "open"
 
+    def with_outcome(self, outcome: task_store.TicketOutcome) -> Decision:
+        """This decision once its curator ticket reached *outcome*."""
+        resolution = _RESOLUTION_OF[outcome.status]
+        unfiled_reason = None if outcome.task_id is not None else f"{resolution.value}: {outcome.reason}"
+        return replace(
+            self,
+            resolution=resolution,
+            task_id=outcome.task_id,
+            standing=None if outcome.task_id is None else Standing.FILED,
+            note=_notes(self.note, unfiled_reason),
+        )
+
     def back_link(self, run_id: str) -> BackLink | None:
         if self.filing.entry_id is None or not self.routed:
             return None
@@ -208,6 +231,14 @@ class Disposal:
     decisions: tuple[Decision, ...]
     unfiled: tuple[Filing, ...]
     unreachable: str | None = None
+
+    def resolved(self, resolutions: Resolutions) -> Disposal:
+        """This disposal with each decision whose ticket resolved carrying its outcome."""
+        outcomes = {resolved.ticket: resolved.outcome for resolved in resolutions.resolved}
+        return replace(self, decisions=tuple(
+            decision.with_outcome(outcomes[decision.ticket]) if decision.ticket in outcomes else decision
+            for decision in self.decisions
+        ))
 
 
 @dataclass(frozen=True)
@@ -325,3 +356,103 @@ def dispose(
             decisions.append(decision)
     return Disposal(tuple(decisions), tuple(unfiled))
 
+
+
+def _row_identity(row: Mapping[str, Any]) -> tuple[Any, Any, Any]:
+    return row.get("ticket"), row.get("task_id"), row.get("step")
+
+
+def with_back_links(cb: dict, links: Iterable[BackLink]) -> dict:
+    """A new codebook with each link's C1 row on its entry; a row already
+    there is not added twice."""
+    result = copy.deepcopy(cb)
+    entries = {entry.get("id"): entry for entry in result.get("entries") or []}
+    for link in links:
+        entry = entries.get(link.entry_id)
+        if entry is None:
+            raise ValueError(f"with_back_links: no codebook entry {link.entry_id!r} to link to")
+        row = link.to_row()
+        rows = entry.setdefault("filed_tickets", [])
+        if all(_row_identity(existing) != _row_identity(row) for existing in rows):
+            rows.append(row)
+    codebook.assert_no_deletion(cb, result)
+    return result
+
+
+@dataclass(frozen=True)
+class ResolvedTicket:
+    entry_id: str
+    ticket: str
+    project_root: str
+    outcome: task_store.TicketOutcome
+    carried: bool
+
+
+@dataclass(frozen=True)
+class Resolutions:
+    """One resolve_tickets pass. *pending* names the tickets still undecided,
+    including any the budget left unsent; they resolve on a later run."""
+
+    resolved: tuple[ResolvedTicket, ...] = ()
+    pending: tuple[str, ...] = ()
+    budget_exhausted: bool = False
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _OpenTicket:
+    entry_id: str
+    row: dict[str, Any]
+    carried: bool
+
+
+def _open_tickets(cb: dict, run_id: str) -> list[_OpenTicket]:
+    """Every row of *cb* holding a ticket with no resolution, carried-over rows first."""
+    open_tickets = [
+        _OpenTicket(entry["id"], row, carried=row.get("run_id") != run_id)
+        for entry in cb.get("entries") or []
+        for row in entry.get("filed_tickets") or []
+        if row.get("ticket") is not None and row.get("resolution") is None
+    ]
+    return sorted(open_tickets, key=lambda open_ticket: not open_ticket.carried)
+
+
+def resolve_tickets(
+    cb: dict,
+    *,
+    store: task_store.TaskStore,
+    run_id: str,
+    budget_secs: float = RESOLVE_BUDGET_SECS,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[dict, Resolutions]:
+    """Resolve every unresolved ticket row in *cb* within *budget_secs* in
+    total (D7), writing each decided outcome onto its row of a new codebook.
+    It never writes task metadata (T4)."""
+    result = copy.deepcopy(cb)
+    deadline = clock() + budget_secs
+    open_tickets = _open_tickets(result, run_id)
+    resolved: list[ResolvedTicket] = []
+    pending: list[str] = []
+    errors: list[str] = []
+    budget_exhausted = False
+    for index, open_ticket in enumerate(open_tickets):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            budget_exhausted = True
+            pending.extend(unsent.row["ticket"] for unsent in open_tickets[index:])
+            break
+        row = open_ticket.row
+        try:
+            outcome = store.resolve_ticket(
+                row["project_root"], row["ticket"], timeout_secs=min(remaining, RESOLVE_CALL_CAP_SECS),
+            )
+        except task_store.StoreUnreachable as exc:
+            errors.append(f"{row['ticket']}: {exc}")
+            continue
+        if outcome.undecided:
+            pending.append(row["ticket"])
+            continue
+        row.update(resolution=_RESOLUTION_OF[outcome.status].value, task_id=outcome.task_id)
+        resolved.append(ResolvedTicket(open_ticket.entry_id, row["ticket"], row["project_root"], outcome, open_ticket.carried))
+    codebook.assert_no_deletion(cb, result)
+    return result, Resolutions(tuple(resolved), tuple(pending), budget_exhausted, tuple(errors))
