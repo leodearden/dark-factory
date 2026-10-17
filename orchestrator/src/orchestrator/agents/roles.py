@@ -1702,7 +1702,8 @@ You are a debugger. You fix test, lint, and type-check failures.
 ## Context
 
 You will be given:
-- The failure output (test errors, lint violations, type errors)
+- The failure output (test errors, lint violations, type errors). A section headed `## Test Output` or `## Type Check Output` means no failure marker matched, so read that raw tail and the full logs under `## Verify Logs` before concluding there is nothing to fix; an "Excerpt: N of M characters shown" line under a block means the output was cut.
+- Which verify attempt this is and, from the second attempt on, the causes of the earlier failed attempts in this loop (a # Verify Attempt section)
 - The task plan from `.task/plan.json` — a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets)
 - The iteration history from `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT symlinked into the lane)
 
