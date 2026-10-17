@@ -4998,15 +4998,16 @@ class TestRunScheduledNight:
     def test_run_nightly_refuses_a_pass_of_unstated_kind(self, tmp_path):
         """The kind decides whether the schedule cursor moves, so no caller
         may get one by omission."""
+        every_argument_but_the_kind: dict[str, Any] = dict(
+            config_path=_write_config(tmp_path, project_id='proj_a'),
+            projects_root=tmp_path / 'projects',
+            target_date=date(2026, 7, 13),
+            invoke=lambda prompt, model: '{"proposals": []}',
+            status_fetcher=lambda: {'statuses': {}},
+            poster=lambda url, envelope: None,
+        )
         with pytest.raises(TypeError, match='pass_kind'):
-            nightly.run_nightly(
-                config_path=_write_config(tmp_path, project_id='proj_a'),
-                projects_root=tmp_path / 'projects',
-                target_date=date(2026, 7, 13),
-                invoke=lambda prompt, model: '{"proposals": []}',
-                status_fetcher=lambda: {'statuses': {}},
-                poster=lambda url, envelope: None,
-            )
+            nightly.run_nightly(**every_argument_but_the_kind)
 
     def test_a_scheduled_pass_that_raises_propagates_and_runs_no_retry(self, monkeypatch):
         fake, calls = _scripted_run_nightly(FileNotFoundError('no legibility.yaml'))
