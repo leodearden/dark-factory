@@ -364,7 +364,7 @@ def classify_pins(
     ``orchestrator.deterministic_runner`` (all six sites ``level=2`` /
     ``severity='critical'``) and the other level-1/2-only filers — where link
     3 makes the identity moot.  The L0 ``severity='info'`` filers (e.g.
-    ``orchestrator.merge_skew_tripwire``, ``orchestrator.offline_lane``'s
+    ``orchestrator.merge_lane.skew_tripwire``, ``orchestrator.offline_lane``'s
     risk notice, the ``_AMENDMENT_TRUNCATION``/``_ROOT_CAUSE_OVERFOLD``
     anchors in ``escalation.server``) do not stamp either, but they are moot
     via link 1, not link 3.

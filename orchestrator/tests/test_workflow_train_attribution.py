@@ -25,8 +25,8 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.worker import (
     TRAIN_VERIFY_FAILED_REASON_PREFIX,
     MergeOutcome,
     SoloVerifyResult,
@@ -176,7 +176,7 @@ class TestDetectionWiring:
 
     async def test_tagged_outcome_calls_attribute_train_failure(self) -> None:
         """Tagged blocked outcome → _attribute_train_failure is called; _mark_blocked is NOT."""
-        from orchestrator.merge_queue import TRAIN_VERIFY_FAILED_REASON_PREFIX
+        from orchestrator.merge_lane.worker import TRAIN_VERIFY_FAILED_REASON_PREFIX
 
         members = _train_members(train_id='T-attr', tip_id='103')
         f = _make(
@@ -248,7 +248,7 @@ class TestDetectionWiring:
 
     async def test_train_incomplete_path_unaffected(self) -> None:
         """train_incomplete blocked outcome still returns None (park) — unaffected."""
-        from orchestrator.merge_queue import TRAIN_INCOMPLETE_REASON_PREFIX
+        from orchestrator.merge_lane.worker import TRAIN_INCOMPLETE_REASON_PREFIX
 
         members = _train_members(train_id='T-incomplete', tip_id='103')
         f = _make(

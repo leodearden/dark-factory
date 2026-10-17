@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
     from orchestrator.verify import VerifyResult
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 # ---------------------------------------------------------------------------

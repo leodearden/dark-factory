@@ -1,5 +1,5 @@
-"""Unit tests for orchestrator.merge_types.ItemLifecycleState and
-orchestrator.merge_queue.ItemLifecycle (merge-queue-reliability PRD scope-4
+"""Unit tests for orchestrator.merge_lane.types.ItemLifecycleState and
+orchestrator.merge_lane.worker.ItemLifecycle (merge-queue-reliability PRD scope-4
 iota / task 2164, L-1).
 
 Steps covered:
@@ -18,7 +18,7 @@ Amendments (post-verification reviewer_comprehensive pass):
     AWAITING_VERIFY -> REDISPATCH_PARKED and MERGING -> REDISPATCH_PARKED
     edges dedicated standalone happy-path coverage (test_coverage finding).
 
-This module imports orchestrator.merge_queue.ItemLifecycle (and friends)
+This module imports orchestrator.merge_lane.worker.ItemLifecycle (and friends)
 LOCALLY inside each test that needs them — those symbols do not exist until
 their GREEN step lands — so a not-yet-implemented symbol never breaks
 collection of the rest of the file during the RED steps (mirrors
@@ -58,18 +58,18 @@ class TestItemLifecycleStateEnum:
     def test_is_a_strenum(self) -> None:
         from enum import StrEnum
 
-        from orchestrator.merge_types import ItemLifecycleState
+        from orchestrator.merge_lane.types import ItemLifecycleState
 
         assert issubclass(ItemLifecycleState, StrEnum)
 
     def test_members_are_exactly_the_ten_lifecycle_states(self) -> None:
-        from orchestrator.merge_types import ItemLifecycleState
+        from orchestrator.merge_lane.types import ItemLifecycleState
 
         assert {m.name for m in ItemLifecycleState} == self._MEMBER_NAMES
         assert len(ItemLifecycleState) == 10
 
     def test_members_are_str_instances_with_lowercase_wire_values(self) -> None:
-        from orchestrator.merge_types import ItemLifecycleState
+        from orchestrator.merge_lane.types import ItemLifecycleState
 
         assert isinstance(ItemLifecycleState.VERIFYING, str)
         assert ItemLifecycleState.VERIFYING == 'verifying'
@@ -77,8 +77,8 @@ class TestItemLifecycleStateEnum:
         assert ItemLifecycleState.GATE_REVERIFY == 'gate_reverify'
 
     def test_importable_from_merge_queue_reexport_shim(self) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState as MQState
-        from orchestrator.merge_types import ItemLifecycleState as MTState
+        from orchestrator.merge_lane.types import ItemLifecycleState as MTState
+        from orchestrator.merge_lane.worker import ItemLifecycleState as MQState
 
         assert MQState is MTState
 
@@ -97,7 +97,7 @@ class TestItemLifecycleRegistry:
     """
 
     def test_register_seeds_queued_state(self) -> None:
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
 
@@ -106,14 +106,14 @@ class TestItemLifecycleRegistry:
         assert registry.current('mr-aaaaaaaa') == ItemLifecycleState.QUEUED
 
     def test_current_of_unknown_rid_is_none(self) -> None:
-        from orchestrator.merge_queue import ItemLifecycle
+        from orchestrator.merge_lane.worker import ItemLifecycle
 
         registry = ItemLifecycle()
 
         assert registry.current('mr-unknown0') is None
 
     def test_two_distinct_request_ids_are_tracked_independently(self) -> None:
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         registry.register('mr-aaaaaaaa')
@@ -123,7 +123,7 @@ class TestItemLifecycleRegistry:
         assert registry.current('mr-bbbbbbbb') == ItemLifecycleState.MERGING
 
     def test_duplicate_register_raises_and_leaves_state_unchanged(self) -> None:
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         registry.register('mr-aaaaaaaa')
@@ -151,7 +151,7 @@ class TestItemLifecycleTransitionHappyPath:
     def test_full_canonical_sequence_ends_at_terminal(self) -> None:
         from itertools import pairwise
 
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         rid = 'mr-aaaaaaaa'
@@ -179,7 +179,7 @@ class TestItemLifecycleTransitionHappyPath:
         """A representative in-place retry branch: DISPATCHING ->
         REDISPATCH_PARKED -> DISPATCHING (the redispatch bounce evidenced
         by ``_redispatch``)."""
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         rid = 'mr-bbbbbbbb'
@@ -202,7 +202,7 @@ class TestItemLifecycleTransitionHappyPath:
         ``test_redispatch_bounce_is_a_legal_in_place_retry`` (task 2164
         step-9; fixes the GATE_REVERIFY out-set asymmetry with VERIFYING/
         FINALIZING, both of which already legally reach MERGING)."""
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         rid = 'mr-cccccccc'
@@ -242,12 +242,12 @@ class TestItemLifecycleIllegalTransitions:
         and break broader `except RuntimeError` handlers at kappa's wired
         call sites (task 2164 amendment; reviewer_comprehensive
         test_coverage finding)."""
-        from orchestrator.merge_queue import IllegalLifecycleTransition
+        from orchestrator.merge_lane.worker import IllegalLifecycleTransition
 
         assert issubclass(IllegalLifecycleTransition, RuntimeError)
 
     def test_skip_stage_move_raises(self) -> None:
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             IllegalLifecycleTransition,
             ItemLifecycle,
             ItemLifecycleState,
@@ -263,7 +263,7 @@ class TestItemLifecycleIllegalTransitions:
         assert registry.current(rid) == ItemLifecycleState.QUEUED
 
     def test_move_out_of_terminal_raises(self) -> None:
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             IllegalLifecycleTransition,
             ItemLifecycle,
             ItemLifecycleState,
@@ -283,7 +283,7 @@ class TestItemLifecycleIllegalTransitions:
         default); the caller wrongly believes it is VERIFYING. Even though
         VERIFYING -> GATE_REVERIFY is itself a legal edge, the mismatch
         against the registry's real state must reject the call."""
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             IllegalLifecycleTransition,
             ItemLifecycle,
             ItemLifecycleState,
@@ -301,7 +301,7 @@ class TestItemLifecycleIllegalTransitions:
         assert registry.current(rid) == ItemLifecycleState.QUEUED
 
     def test_unregistered_rid_raises(self) -> None:
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             IllegalLifecycleTransition,
             ItemLifecycle,
             ItemLifecycleState,
@@ -334,7 +334,7 @@ class TestItemLifecycleTransitionRedispatchParkedEntryEdges:
     def test_awaiting_verify_to_redispatch_parked_is_legal(self) -> None:
         """An item parked back onto ``_redispatch`` before a verify runner
         ever picks it up from ``_verifier_queue``."""
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         rid = 'mr-dddddddd'
@@ -352,7 +352,7 @@ class TestItemLifecycleTransitionRedispatchParkedEntryEdges:
         of ``test_cascade_remerge_from_gate_reverify_is_a_legal_in_place_retry``
         above -- exercised here standalone so this edge has its own explicit
         regression signal."""
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         rid = 'mr-eeeeeeee'
@@ -379,14 +379,14 @@ class TestItemLifecycleBulkAccessor:
     """
 
     def test_empty_registry_returns_empty_dict(self) -> None:
-        from orchestrator.merge_queue import ItemLifecycle
+        from orchestrator.merge_lane.worker import ItemLifecycle
 
         registry = ItemLifecycle()
 
         assert registry.non_terminal_items() == {}
 
     def test_returns_exactly_the_non_terminal_state_mapping(self) -> None:
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         registry.register('mr-aaaaaaaa')  # defaults to QUEUED
@@ -402,7 +402,7 @@ class TestItemLifecycleBulkAccessor:
     def test_terminal_rid_is_excluded(self) -> None:
         """A rid transitioned to TERMINAL does not leak into the view --
         retired items must not appear to still be in flight."""
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         registry.register('mr-aaaaaaaa')
@@ -420,7 +420,7 @@ class TestItemLifecycleBulkAccessor:
         """Mutating the returned mapping must never corrupt the registry --
         callers (snapshot(), B8) take ``set(non_terminal_items())`` freely
         without risking a side effect on the live registry state."""
-        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
         registry.register('mr-aaaaaaaa')

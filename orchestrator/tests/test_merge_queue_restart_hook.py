@@ -34,15 +34,16 @@ from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, make_placeholder_future, 
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
+    enqueue_merge_request,
+    select_recovery_winner,
 )
-from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures — mirror test_merge_queue.py

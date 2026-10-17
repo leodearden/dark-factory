@@ -39,7 +39,7 @@ from escalation.models import Escalation
 
 from orchestrator import guard_state
 from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.offline_lane_episode_state import (
     EPISODES_FILE,
@@ -356,7 +356,7 @@ def _merge_config(project_root: Path):
 
 
 def _merge_request(task_id: str, config):
-    from orchestrator.merge_queue import MergeRequest
+    from orchestrator.merge_lane.worker import MergeRequest
     return MergeRequest(
         task_id=task_id,
         branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
@@ -380,7 +380,7 @@ def _merge_worker(project_root: Path | None, config):
     ``_no_mock_derived_stray_dirs`` fence exists for.
     """
     from orchestrator.merge_lane.types import TrainCallbacks
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
     git_ops = MagicMock()
     git_ops.config = config

@@ -38,7 +38,7 @@ from shared.deploy_state import DeployPhase
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, compose_claimant_run_id
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,

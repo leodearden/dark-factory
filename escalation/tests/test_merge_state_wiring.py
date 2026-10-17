@@ -48,10 +48,10 @@ try:
         GitConfig,
         OrchestratorConfig,
     )
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import MergeOutcome
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
-    from orchestrator.merge_types import MergeOutcome  # type: ignore[reportMissingImports]
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False

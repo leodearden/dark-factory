@@ -83,27 +83,27 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
-from orchestrator.landed_outbox import MergeProvenance
-from orchestrator.landing_evidence import (
+from orchestrator.lane_lifecycle import LaneRecord
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
+from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     branch_is_degenerate,
     file_unattributed_landing_escalation,
     is_valid_sha_40,
     validate_landing_evidence,
 )
-from orchestrator.lane_lifecycle import LaneRecord
-from orchestrator.lane_lifecycle import LaneState as DurableLaneState
-from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
-from orchestrator.mcp_lifecycle import McpLifecycle
-from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
+from orchestrator.merge_lane.worker import (
     enqueue_merge_request,
     reconcile_landed_outbox,
     reconcile_landed_task,
     select_recovery_winner,
 )
-from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (
     TAGGER_SCHEMA,
@@ -207,7 +207,7 @@ from orchestrator.zero_progress_requeue import (
 if TYPE_CHECKING:
     from escalation.models import Escalation
 
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
         TrainCallbackFactory,
@@ -2068,7 +2068,9 @@ class Harness:
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
         # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
         # here, in a periodic loop mirroring the main-tip-sweep lifecycle.
-        from orchestrator.merge_queue import NoLandingsCircuitBreaker as _NLCB  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
+            NoLandingsCircuitBreaker as _NLCB,
+        )
         self._no_landings_breaker: _NLCB = _NLCB(
             window_samples=config.no_landings_breaker_window_samples,
             disk_free_floor_bytes=config.no_landings_breaker_disk_free_floor_bytes,
@@ -2093,7 +2095,7 @@ class Harness:
         self._merge_queue: asyncio.Queue = asyncio.Queue()
         # Single shared registry injected into both the escalation server and
         # every TaskWorkflow so the MCP coalesce gate sees workflow-path merges.
-        from orchestrator.merge_queue import InFlightMergeRegistry
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
@@ -5820,7 +5822,7 @@ class Harness:
             )
             return True
 
-        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         # Build + enqueue + stamp the durable race-guard marker (PRD leaf α §7)
         # via the shared submit primitive — the architect-desync exit (task
@@ -5976,7 +5978,7 @@ class Harness:
         propagated (mirrors ``enqueue_merge_request._on_finalized``).
         """
         try:
-            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 return  # abandoned/superseded — transient, no-op
@@ -6113,7 +6115,7 @@ class Harness:
         infra-held guard, which share this same degeneracy signal.
 
         The predicate itself now lives in
-        :func:`orchestrator.landing_evidence.branch_is_degenerate` (task 3103)
+        :func:`orchestrator.merge_lane.landing_evidence.branch_is_degenerate` (task 3103)
         so the escalation server's merge_status Tier-3.5 and merge_request
         fast-path guard this class with the SAME implementation rather than a
         divergent copy.  See that function for the full fail-open contract
@@ -12069,7 +12071,7 @@ class Harness:
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # K = 1 (local trust-anchor) + number of enabled remote verify runners.
         # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
@@ -12260,7 +12262,7 @@ class Harness:
     ) -> None:
         """Advisory pipeline-landing tripwire adapter (task 2382, merge-skew δ).
 
-        Thin fail-open wiring over ``orchestrator.merge_skew_tripwire
+        Thin fail-open wiring over ``orchestrator.merge_lane.skew_tripwire
         .emit_pipeline_landing_tripwire``: reads the per-project
         ``config.git.load_bearing_oracle_cmd`` knob (``None`` disables the
         tripwire — logged no-op), enumerates in-flight tasks (excluding the
@@ -13533,7 +13535,7 @@ class Harness:
         ancestors of main (squashed/rebased/manually-applied) by comparing
         the branch's actual changed files against main
         (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        delegates to :func:`~orchestrator.landing_evidence.validate_landing_evidence`
+        delegates to :func:`~orchestrator.merge_lane.landing_evidence.validate_landing_evidence`
         (DISCOVERY mode, task 2678) to discover and attribute the citation
         commit and anchors on it; a content-equivalent landing that carries
         no task-citing commit (or whose citation's effect is no longer
@@ -13804,7 +13806,7 @@ class Harness:
                 return False
             # Delegates FIX 2 citation-lineage + FIX 1' effect-present to the
             # shared helper (task 2678, INV-5) — see
-            # orchestrator.landing_evidence's module docstring for the full
+            # orchestrator.merge_lane.landing_evidence's module docstring for the full
             # DISCOVERY-mode contract (citation discovery, both-direction
             # lineage guard, branch-tip-or-citation effect anchor).
             verdict = await validate_landing_evidence(
@@ -13924,7 +13926,7 @@ class Harness:
 
         Delegates the actual filing (queue-None guard, dedup, ``Escalation``
         construction, submit/log/except shape) to the shared
-        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
+        :func:`~orchestrator.merge_lane.landing_evidence.file_unattributed_landing_escalation`
         (task 2678 amendment, INV-5) — this method now only supplies
         ``agent_role``, the one thing that distinguishes it from
         ``SpeculativeMergeWorker``'s equivalent method.
