@@ -751,3 +751,151 @@ def test_the_tighten_task_comes_after_findings_and_inside_the_bound(project_root
     assert (outcome.filed, outcome.overflow) == (10, 1)
     (roll_up,) = stub.tool_calls('escalate_info')
     assert roll_up['task_id'] == OVERFLOW_KEY.escalation_task_id()
+
+
+# ---------------------------------------------------------------------------
+# INV-9: the x_inv12_owns pointer note.  The declarations and markers are the
+# home of who-cites-what; the note on each live cited owner only points there,
+# and every run reconciles it.
+
+LATER = NOW + datetime.timedelta(days=1)
+
+
+def stored_metadata(db: Path, task_id: int) -> dict:
+    with sqlite3.connect(db) as conn:
+        (raw,) = conn.execute(
+            "SELECT metadata FROM tasks WHERE tag = 'master' AND id = ?", (task_id,)
+        ).fetchone()
+    return json.loads(raw or '{}')
+
+
+def note(*scopes: str, on: datetime.datetime = NOW) -> dict[str, object]:
+    return {'scopes': list(scopes), 'as_of': on.date().isoformat(), 'report': REPORT_COMMAND}
+
+
+def note_updates(stub: StubMcp) -> list[tuple[str, object]]:
+    """Each ``update_task`` as (id, the note it merges); every one must be a shallow merge."""
+    updates = stub.tool_calls('update_task')
+    for args in updates:
+        assert args.get('metadata_mode', 'merge') == 'merge'
+        assert set(args['metadata']) == {OWNS_NOTE_FIELD}
+    return [(args['id'], args['metadata'][OWNS_NOTE_FIELD]) for args in updates]
+
+
+def cited_5149(*scopes: str) -> RegisterView:
+    return view(*(Citation(scope, TaskRef(5149), ('a.py:1',)) for scope in scopes))
+
+
+def test_a_live_cited_owner_carries_a_note_naming_every_citing_scope(project_root, seed):
+    db = seed([{'id': 5149, 'status': 'pending', 'metadata': {'source': 'kept'}}])
+    stub = StubMcp(db)
+
+    sweep_once(cited_5149(LIST_SCOPE, INLINE_SCOPE), ports_for(project_root, stub))
+
+    assert note_updates(stub) == [('5149', note(INLINE_SCOPE, LIST_SCOPE))]
+    (update,) = stub.tool_calls('update_task')
+    assert update['project_root'] == str(project_root)
+    assert stored_metadata(db, 5149) == {'source': 'kept', OWNS_NOTE_FIELD: note(INLINE_SCOPE, LIST_SCOPE)}
+
+
+def test_the_note_is_a_pointer_holding_no_disposition_or_verdict(project_root, seed):
+    db = seed([{'id': 5149, 'status': 'pending'}])
+
+    sweep_once(cited_5149(INLINE_SCOPE), ports_for(project_root, StubMcp(db)))
+
+    assert set(stored_metadata(db, 5149)[OWNS_NOTE_FIELD]) == {'scopes', 'as_of', 'report'}
+
+
+def test_an_unchanged_note_is_not_rewritten_nor_its_date_refreshed(project_root, seed):
+    db = seed([{'id': 5149, 'status': 'pending'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+
+    sweep_once(cited_5149(INLINE_SCOPE), ports)
+    act(scan(cited_5149(INLINE_SCOPE), ports, now=LATER), ports, now=LATER)
+
+    assert len(stub.tool_calls('update_task')) == 1
+    assert stored_metadata(db, 5149)[OWNS_NOTE_FIELD] == note(INLINE_SCOPE)
+
+
+def test_a_scope_added_rewrites_the_note_once(project_root, seed):
+    db = seed([{'id': 5149, 'status': 'pending'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    sweep_once(cited_5149(INLINE_SCOPE), ports)
+
+    widened = cited_5149(INLINE_SCOPE, LIST_SCOPE)
+    act(scan(widened, ports, now=LATER), ports, now=LATER)
+
+    assert note_updates(stub) == [
+        ('5149', note(INLINE_SCOPE)),
+        ('5149', note(INLINE_SCOPE, LIST_SCOPE, on=LATER)),
+    ]
+
+
+@pytest.mark.parametrize('status', ['pending', 'done'])
+def test_a_note_nothing_cites_any_more_is_cleared_once(project_root, seed, status):
+    db = seed([{'id': 6000, 'status': status, 'metadata': {OWNS_NOTE_FIELD: note(INLINE_SCOPE)}}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+
+    sweep_once(view(), ports)
+    sweep_once(view(), ports)
+
+    assert note_updates(stub) == [('6000', None)]
+    assert stored_metadata(db, 6000)[OWNS_NOTE_FIELD] is None
+
+
+def test_a_dead_cited_owners_note_is_left_as_it_is(project_root, seed):
+    stale = note(INLINE_SCOPE, LIST_SCOPE)
+    db = seed([{'id': 2733, 'status': 'done', 'metadata': {OWNS_NOTE_FIELD: stale}}])
+    stub = StubMcp(db)
+
+    outcome = sweep_once(INLINE_2733, ports_for(project_root, stub))
+
+    assert outcome.filed == 1
+    assert stub.tool_calls('update_task') == []
+    assert stored_metadata(db, 2733)[OWNS_NOTE_FIELD] == stale
+
+
+def test_the_note_lands_on_a_tickets_task_and_never_on_a_successor(project_root, seed):
+    created = TicketRef('tkt_0C')
+    db = seed(
+        [
+            {'id': 7001, 'status': 'pending'},
+            {'id': 11, 'status': 'done', 'metadata': {'x_coalesced_into': 12}},
+            {'id': 12, 'status': 'in-progress'},
+        ]
+    )
+    stub = StubMcp(db, owner_tickets={created.id: {'status': 'created', 'task_id': '7001'}})
+    register = view(
+        Citation(INLINE_SCOPE, created, ('c.py:1',)),
+        Citation(LIST_SCOPE, TaskRef(11), ('default',)),
+    )
+
+    sweep_once(register, ports_for(project_root, stub))
+
+    assert note_updates(stub) == [('7001', note(INLINE_SCOPE))]
+
+
+def test_note_writes_never_consume_the_output_budget(project_root, seed):
+    live = [{'id': 100 + index, 'status': 'pending'} for index in range(3)]
+    stub = StubMcp(seed(live + dead_owners(3001, 10)))
+    register = view(
+        *(Citation(INLINE_SCOPE, TaskRef(100 + index), (f'l{index}.py:1',)) for index in range(3)),
+        *inline_citations(3001, 10),
+    )
+
+    outcome = sweep_once(register, ports_for(project_root, stub))
+
+    assert (outcome.filed, outcome.overflow) == (10, 0)
+    assert [task_id for task_id, _ in note_updates(stub)] == ['100', '101', '102']
+
+
+def test_an_update_task_fault_is_a_fused_memory_failure(project_root, seed):
+    stub = StubMcp(seed([{'id': 5149, 'status': 'pending'}]), fail_on=frozenset({'update_task'}))
+
+    with pytest.raises(SweepFailure) as excinfo:
+        sweep_once(cited_5149(INLINE_SCOPE), ports_for(project_root, stub))
+
+    assert excinfo.value.stage is FailureStage.FUSED_MEMORY
