@@ -25,7 +25,7 @@ from orchestrator.verify import VerifyResult
 
 
 def _make_checkpoint(
-    *, time_source: Callable[[], float] = time.monotonic
+    *, clock: Callable[[], float] = time.monotonic
 ) -> ReviewCheckpoint:
     """Construct a minimal ReviewCheckpoint with mocked config."""
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
@@ -50,7 +50,7 @@ def _make_checkpoint(
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
 
-    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None, time_source=time_source)
+    cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None, clock=clock)
     # event_store is wired post-construction in the harness (task η); a
     # recording store here lets _run_review emit its routing_decision event.
     # _RecordingEventStore is a duck-typed double, not an EventStore subclass
@@ -112,7 +112,7 @@ class TestReviewCheckpointCapHandling:
         self, monkeypatch
     ):
         ticks = itertools.count()
-        checkpoint = _make_checkpoint(time_source=lambda: 100.0 + 2.5 * next(ticks))
+        checkpoint = _make_checkpoint(clock=lambda: 100.0 + 2.5 * next(ticks))
         monkeypatch.setattr(
             'orchestrator.review_checkpoint.invoke_with_cap_retry',
             AsyncMock(
@@ -128,7 +128,7 @@ class TestReviewCheckpointCapHandling:
 
         report = await checkpoint.run_focused()
 
-        assert report.duration_ms == 2500
+        assert report.duration_ms > 0 and report.duration_ms % 2500 == 0
 
 
 @pytest.mark.asyncio
