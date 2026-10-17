@@ -576,6 +576,95 @@ def test_orchestrator_startups_come_from_the_runs_table_not_from_service_restart
     assert [r.service for r in scan.restarts] == ['fused-memory']
 
 
+SCOPED_CAP_LEAF = 'usage_cap.scoped_cap_models'
+SCOPED_CAP_CHANGE = {'old': ['claude-fable-5'], 'new': ['claude-fable-5', FABLE]}
+
+
+def _config_reload_payload(*, restart_required, applied=None):
+    """The exact 8-key `config_reload` payload the producer emits.
+
+    Key set taken from orchestrator/src/orchestrator/harness.py::
+    Harness.reload_config and corroborated against the live D6 reload row.
+    Both ``applied`` and ``restart_required`` map a leaf to ``{old, new}``.
+    """
+    return {
+        'reloaded': True,
+        'applied': {} if applied is None else applied,
+        'restart_required': restart_required,
+        'unchanged': 387,
+        'error': None,
+        'config_path': '/srv/dark-factory/dark-factory-orchestrator.yaml',
+        'unknown_config_keys': [],
+        'ignored_config_keys': [],
+    }
+
+
+def _reload(conn, timestamp, *, restart_required, applied=None):
+    conn.seed_event(
+        timestamp, 'config_reload',
+        data=_config_reload_payload(restart_required=restart_required, applied=applied),
+    )
+
+
+def test_a_reload_that_left_a_leaf_restart_required_names_the_first_startup_after_it(runs_db):
+    """D6 replayed: the scoped_cap_models leaf, flagged restart_required under
+    the run already live at the reload, was loaded by the next startup."""
+    _reload(
+        runs_db, _at(minutes=17, seconds=35),
+        restart_required={SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE},
+        applied={'recovery_emission.streak_escalation_enabled': {'old': True, 'new': False}},
+    )
+    runs_db.seed_run(run_id='run-b756e05f8ff0', started_at=_at(hours=-15))
+    runs_db.seed_run(run_id='run-063e9795fcf6', started_at=_at(hours=2, minutes=56))
+    runs_db.seed_run(run_id='run-5352d42ce5fa', started_at=_at(days=2, hours=5, minutes=48))
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.restart_required_reloads == (
+        audit_model_admission.RestartRequiredReload(
+            timestamp=_at(minutes=17, seconds=35),
+            leaves=(SCOPED_CAP_LEAF,),
+            first_startup_after=audit_model_admission.OrchestratorStartup(
+                started_at=_at(hours=2, minutes=56), run_id='run-063e9795fcf6',
+            ),
+        ),
+    )
+
+
+def test_a_hot_applied_reload_with_nothing_restart_required_is_not_listed(runs_db):
+    _reload(
+        runs_db, _at(hours=1), restart_required={},
+        applied={'review.max_rounds': {'old': 3, 'new': 4}},
+    )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.restart_required_reloads == ()
+
+
+def test_a_startup_before_the_reload_is_not_credited_with_loading_it(runs_db):
+    """Only a process that started AFTER the reload read the changed yaml."""
+    runs_db.seed_run(run_id='run-earlier', started_at=_at(hours=1))
+    _reload(runs_db, _at(hours=2), restart_required={SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE})
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert [r.first_startup_after for r in scan.restart_required_reloads] == [None]
+
+
+def test_every_restart_required_leaf_is_named_in_payload_order(runs_db):
+    _reload(runs_db, _at(hours=1), restart_required={
+        'max_concurrent_tasks': {'old': 8, 'new': 10},
+        SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE,
+    })
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert [r.leaves for r in scan.restart_required_reloads] == [
+        ('max_concurrent_tasks', SCOPED_CAP_LEAF),
+    ]
+
+
 # --- spend_in_window (check 5) and roles_on_model (check 6) ---
 
 
@@ -806,6 +895,26 @@ def test_render_json_round_trips_to_one_key_per_section(live_shaped_db):
     assert {'subtype', 'escalation_id', 'routing_tier', 'dispatch_max_turns'} <= set(
         payload['invocations'][0]
     )
+
+
+def test_render_json_carries_startups_and_reloads_under_scoped_cap(live_shaped_db):
+    _reload(
+        live_shaped_db, _at(minutes=17, seconds=35),
+        restart_required={SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE},
+    )
+    live_shaped_db.seed_run(run_id='run-063e9795fcf6', started_at=_at(hours=2, minutes=56))
+
+    payload = json.loads(audit_model_admission.render_json(_audit(live_shaped_db)))
+
+    assert set(payload) == {
+        'meta', 'routing_decisions', 'invocations', 'tier_escalation',
+        'scoped_cap', 'spend', 'role_containment',
+    }
+    scoped_cap = payload['scoped_cap']
+    assert scoped_cap['orchestrator_startups'][0]['run_id'] == 'run-063e9795fcf6'
+    reload = scoped_cap['restart_required_reloads'][0]
+    assert reload['leaves'] == [SCOPED_CAP_LEAF]
+    assert reload['first_startup_after']['run_id'] == 'run-063e9795fcf6'
 
 
 def _tier_section(result):
@@ -1092,6 +1201,34 @@ def test_orchestrator_startups_are_half_open_on_since_and_until(runs_db):
     assert [s.run_id for s in open_ended.orchestrator_startups] == [
         'run-at-since', 'run-inside', 'run-at-until',
     ]
+
+
+def test_a_startup_at_or_after_until_is_not_credited(runs_db):
+    """A re-run over a fixed --until must reproduce the same table; the later
+    startup shows up by re-running with a later --until."""
+    _reload(runs_db, _at(hours=1), restart_required={SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE})
+    runs_db.seed_run(run_id='run-at-until', started_at=UNTIL.isoformat())
+
+    bounded = audit_model_admission.scan_scoped_cap(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+    open_ended = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert [r.first_startup_after for r in bounded.restart_required_reloads] == [None]
+    assert [r.first_startup_after for r in open_ended.restart_required_reloads] == [
+        audit_model_admission.OrchestratorStartup(
+            started_at=UNTIL.isoformat(), run_id='run-at-until',
+        ),
+    ]
+
+
+def test_reloads_before_since_and_at_or_after_until_are_excluded(runs_db):
+    for timestamp in (_at(hours=-1), _at(hours=11), UNTIL.isoformat()):
+        _reload(runs_db, timestamp, restart_required={SCOPED_CAP_LEAF: SCOPED_CAP_CHANGE})
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY, until=UNTIL)
+
+    assert [r.timestamp for r in scan.restart_required_reloads] == [_at(hours=11)]
 
 
 def test_roles_on_model_does_not_count_runs_completed_at_or_after_until(runs_db):
