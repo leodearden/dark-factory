@@ -219,6 +219,47 @@ class TestB1PriorRunBlockedAfterRestart:
         assert last['request_id'] == prior.request_id
 
 
+class TestB2CurrentRunOnlySetsState:
+    async def test_b2_a_live_resubmission_sets_state_and_the_prior_conflict_stays_history(
+        self, world: _World,
+    ) -> None:
+        await _finalize_in_prior_run(
+            world, '102', MergeOutcome('conflict', reason='rebase conflict'),
+        )
+        resubmitted = _request(world, '102')
+        MergeQueueStore(world.journal_path).record(resubmitted)
+        server = _restart(world, live_entries=[_live_entry(resubmitted, 'queued')])
+
+        response = await _poll(server, task_id='102')
+
+        assert response['state'] != 'conflict'
+        assert response['state'] == MergeState.queued
+        assert response['source'] == 'live'
+        assert response['request_id'] == resubmitted.request_id
+        last = response['last_outcome']
+        assert last['state'] == 'conflict'
+        assert last['run_id'] == _RUN_PRIOR
+        assert last['is_current_run'] is False
+
+
+class TestB3JournaledNotYetRecovered:
+    @pytest.mark.parametrize('key', ['task_id', 'request_id'])
+    async def test_b3_a_journaled_request_with_no_live_entry_answers_journaled(
+        self, world: _World, key: str,
+    ) -> None:
+        _unmerged_branch(world, '103')
+        journaled = _journal_in_prior_run(world, '103')
+        poll_key = {'task_id': '103', 'request_id': journaled.request_id}[key]
+
+        response = await _poll(_restart(world), **{key: poll_key})
+
+        assert response['state'] == MergeState.journaled
+        assert response['source'] == 'journal'
+        assert response['reason'] == MergeReason.journaled_not_live
+        assert response['request_id'] == journaled.request_id
+        assert response['last_outcome'] is None
+
+
 class TestB4NeverSubmitted:
     async def test_b4_nothing_anywhere_answers_no_record_never_submitted(
         self, world: _World,
