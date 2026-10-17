@@ -4,13 +4,33 @@
 halted, who owns each halt, whether the operator halt is up, and how often
 it asks the worker to wake. The lane tuple and the resume callback are
 injected, exactly as the worker's composition root hands them over.
+
+Boundary row 7 then drives the same contract through a real ``MergeLane``
+on a real repository: an operator halt aborts the in-flight verify and
+requeues its merge, and un-halting lands it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
 
 import pytest
+from _merge_lane_fakes import (
+    FakeVerifier,
+    hangs_until,
+    healthy_verify_clock,
+    lane_scene_config,
+    lane_state,
+    make_lane,
+    passes,
+    running_lane,
+)
+from _orch_helpers import wait_responsive
 
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import MergeLane, MergeOutcome, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.halt import HaltState
 
 LANES = ('high', 'normal')
@@ -183,3 +203,110 @@ def test_halt_log_lines_are_unchanged(
         "Merge queue lane 'normal' halted: wip conflict",
         'Merge queue operator-halted: operator says stop',
     ]
+
+
+# ---------------------------------------------------------------------------
+# Boundary row 7: the operator halt through a running lane
+# ---------------------------------------------------------------------------
+
+
+async def _init_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main', branch_prefix='task/', remote='origin',
+        worktree_dir='.worktrees', push_after_advance=False,
+    )
+
+
+@pytest.fixture
+def git_ops(git_config: GitConfig, tmp_path: Path) -> GitOps:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    return GitOps(git_config, repo)
+
+
+@pytest.fixture
+def config(git_ops: GitOps, git_config: GitConfig) -> OrchestratorConfig:
+    return lane_scene_config(git_ops.project_root, git_config)
+
+
+async def branch_with_file(git_ops: GitOps, branch: str, filename: str) -> Path:
+    worktree = (await git_ops.create_worktree(branch)).path
+    (worktree / filename).write_text(f'{branch}\n')
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
+
+
+def merge_request(task_id: str, worktree: Path, config: OrchestratorConfig) -> MergeRequest:
+    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(task_id, config.git.branch_prefix),
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=future,
+    )
+
+
+async def main_tip(git_ops: GitOps) -> str:
+    _, out, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_ops.project_root)
+    return out.strip()
+
+
+async def left_verifying(lane: MergeLane, request_id: str) -> str | None:
+    """Wait until the lane stops reporting *request_id* as verifying; return its state."""
+    while lane_state(lane, request_id) == 'verifying':
+        await asyncio.sleep(0.01)
+    return lane_state(lane, request_id)
+
+
+@pytest.mark.asyncio
+async def test_an_operator_halt_requeues_the_verify_and_unhalting_lands_it(
+    git_ops: GitOps, config: OrchestratorConfig,
+) -> None:
+    worktree = await branch_with_file(git_ops, 'row7', 'row7.py')
+    first_verify = asyncio.Event()
+    verifier = FakeVerifier(sequence=[hangs_until(first_verify), passes()])
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+    before = await main_tip(git_ops)
+
+    async with running_lane(lane) as run:
+        request = merge_request('row7', worktree, config)
+        await queue.put(request)
+        await wait_responsive(verifier.await_entry(1), label='first verify entered')
+        assert lane_state(lane, request.request_id) == 'verifying'
+
+        lane.operator_halt('row 7')
+
+        assert lane.is_operator_halted is True
+        assert lane.is_wip_halted is True
+        assert lane.halt_owner_esc_id is None
+        requeued = await wait_responsive(
+            left_verifying(lane, request.request_id), label='verify aborted by the halt',
+        )
+        assert requeued == 'queued'
+        assert not request.result.done()
+
+        lane.unhalt_wip()
+
+        outcome = await run.outcome(request)
+        await wait_responsive(verifier.await_entry(2), label='second verify entered')
+
+    assert outcome.status == 'done', outcome
+    assert lane.is_operator_halted is False
+    assert await main_tip(git_ops) == outcome.merge_sha != before
+    assert verifier.verified == ['row7', 'row7']

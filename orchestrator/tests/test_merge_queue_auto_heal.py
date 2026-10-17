@@ -773,7 +773,7 @@ class TestAutoHealOwnerTiedResume:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL lane so _WipHaltMixin state is exercised, with the ports
+        # Use a REAL lane so its real halt state is exercised, with the ports
         # faked: nothing in this scene may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
         real_worker = MergeLane(
@@ -985,7 +985,7 @@ class TestAutoHealHaltOwnerIsDedupeParent:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL lane so _WipHaltMixin lane-owner state is exercised, with
+        # Use a REAL lane so its real lane-owner state is exercised, with
         # the ports faked: nothing here may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
         real_worker = MergeLane(

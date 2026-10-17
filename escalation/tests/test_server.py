@@ -5674,12 +5674,12 @@ class TestGetMergeQueue:
             f'wip_overlap, got: {bad_states}'
         )
 
-        # (5) The halt reverses cleanly — retirement did not corrupt
-        # _lane_halt.
+        # (5) The halt reverses cleanly — retirement did not corrupt the
+        # lane halt state.
         worker.unhalt_wip()
         assert not worker.is_wip_halted, (
             'Expected is_wip_halted False after unhalt_wip() — retirement '
-            'must not have corrupted _lane_halt'
+            'must not have corrupted the lane halt state'
         )
 
 

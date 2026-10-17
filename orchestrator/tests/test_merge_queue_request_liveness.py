@@ -300,7 +300,7 @@ class TestCheckRequestLiveness:
         # Both halt mechanisms, because they are independently reachable: a
         # per-lane halt (is_wip_halted) and the separate operator halt Event.
         assert not worker.is_wip_halted
-        assert not worker._operator_halt.is_set()
+        assert not worker.is_operator_halted
 
     async def test_resolved_request_does_not_alarm(
         self,
@@ -524,7 +524,7 @@ class TestWedgedVerifyIntegration:
             # of the two independently reachable halt mechanisms engaged.
             assert not req.result.done()
             assert not worker.is_wip_halted
-            assert not worker._operator_halt.is_set()
+            assert not worker.is_operator_halted
 
             # ── Release the gate and confirm clean resolution ──────────────
             gate_release.set()
@@ -4159,7 +4159,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         # `_operator_halt` is a separate Event raised only by operator_halt()
         # and cleared only by unhalt_all_lanes(). A per-lane resume that left
         # the operator halt set reads as not-wip-halted with a live halt.
-        assert not worker._operator_halt.is_set(), (
+        assert not worker.is_operator_halted, (
             'recovery must not depend on (or leave behind) an operator halt'
         )
         assert not worker.is_wip_halted, (

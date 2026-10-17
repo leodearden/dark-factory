@@ -91,7 +91,7 @@ class _FakeMergeWorker:
         ``_owner`` said only "reached inside".
 
         Deliberately a METHOD and not a writable public owner attribute: the
-        real ``_WipHaltMixin`` exposes ``halt_owner_esc_id`` read-only, and a
+        real worker exposes ``halt_owner_esc_id`` read-only, and a
         double carrying a public owner slot would model a surface production
         does not have.
         """

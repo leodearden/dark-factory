@@ -3318,7 +3318,7 @@ class TestHaltAndUnavailable:
     ) -> None:
         """OPERATOR-HALT aborts both in-flight verifies and requeues both requests.
 
-        After halt each _run_inflight_verify abort-poll detects _operator_halt
+        After halt each _run_inflight_verify abort-poll detects the operator halt
         and returns REQUEUED (req already back on _queue).  The head-failure
         cascade MUST NOT re-merge REQUEUED items — they are already handled.
 
@@ -3384,8 +3384,8 @@ class TestHaltAndUnavailable:
         await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
         await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
-        # Set operator halt — both abort-polls fire within 0.01s
-        worker._operator_halt.set()
+        # Operator halt — both abort-polls fire within 0.01s
+        worker.operator_halt('test: concurrent abort')
 
         # Give abort-polls time to fire and requeue
         await asyncio.sleep(0.15)

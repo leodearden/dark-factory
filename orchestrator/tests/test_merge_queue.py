@@ -6481,7 +6481,7 @@ class TestHaltOwnerMechanics:
 
         assert not worker.is_wip_halted
         assert worker.is_halt_owner('any-id') is False
-        assert worker._halt_owner_esc_id is None
+        assert worker.halt_owner_esc_id is None
 
     def test_halt_for_wip_clears_owner(
         self, git_ops: GitOps,
@@ -6492,7 +6492,7 @@ class TestHaltOwnerMechanics:
 
         worker.halt_for_wip('test reason')
         assert worker.is_wip_halted
-        assert worker._halt_owner_esc_id is None
+        assert worker.halt_owner_esc_id is None
         assert worker.is_halt_owner('any-id') is False
 
     def test_set_halt_owner_registers_id(
@@ -6534,7 +6534,7 @@ class TestHaltOwnerMechanics:
         worker.unhalt_wip()
 
         assert not worker.is_wip_halted
-        assert worker._halt_owner_esc_id is None
+        assert worker.halt_owner_esc_id is None
         assert worker.is_halt_owner('esc-42-1') is False
 
     def test_halt_cycle_allows_reuse(
@@ -15506,7 +15506,7 @@ class TestMapAdvanceFailure:
         """
         from orchestrator.merge_lane.worker import _map_advance_failure
 
-        # The production lane, for its genuine _WipHaltMixin halt machinery.
+        # The production lane, for its genuine halt machinery.
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(MagicMock(), queue)
         assert not worker.is_wip_halted, 'precondition: worker starts un-halted'
@@ -15536,30 +15536,17 @@ class TestMapAdvanceFailure:
 
 
 # ---------------------------------------------------------------------------
-# TestWipHaltMixin — unit tests pinning the _WipHaltMixin shared contract
+# TestWorkerHaltApi — the halt contract through the merge worker's public API
 # ---------------------------------------------------------------------------
 
 
-def test_speculative_worker_inherits_the_halt_mixin() -> None:
-    """The production worker INHERITS the halt state machine, not a copy of it.
-
-    Deliberately not part of the parametrized class below: that one exercises
-    halt BEHAVIOUR through the public methods, which a copy-pasted second
-    state machine on ``SpeculativeMergeWorker`` would satisfy just as well
-    while quietly duplicating the single source. The matching fact for the
-    retired serial fixture is pinned by
-    ``orchestrator/tests/test_merge_worker_retired.py::test_serial_reference_fixture_available``.
-    """
-    from orchestrator.merge_lane.worker import _WipHaltMixin
-
-    assert issubclass(SpeculativeMergeWorker, _WipHaltMixin), (
-        'SpeculativeMergeWorker must inherit the shared halt-state-machine mixin'
-    )
-
-
 @pytest.mark.asyncio
-class TestWipHaltMixin:
-    """Pin the _WipHaltMixin contract as seen through the merge worker."""
+class TestWorkerHaltApi:
+    """Pin the halt contract as seen through the merge worker.
+
+    The worker delegates every call to the ``HaltState`` it composes, whose
+    own contract is pinned by ``orchestrator/tests/test_merge_lane_halt.py``.
+    """
 
     def _make_worker(self) -> Any:
         git_ops = MagicMock()
@@ -17543,7 +17530,7 @@ class TestDetachProceedDrop:
         loop = asyncio.get_running_loop()
         dummy_future: asyncio.Future = loop.create_future()
         dummy_future.cancel()
-        # _request_abandoned is a _WipHaltMixin instance method
+        # _request_abandoned is a merge-worker instance method
         # We can test the logic directly since we know it checks req.result.cancelled()
         assert dummy_future.cancelled() is True  # same check as _request_abandoned
 
@@ -20797,7 +20784,7 @@ class TestOperatorHalt:
             assert not task.done(), 'halt_for_wip must NOT abort the in-flight verify'
             assert not completed, 'verify still blocked, not cancelled'
             assert not req.result.done(), 'req.result must still be pending'
-            assert worker._operator_halt.is_set() is False, (  # noqa: SLF001
+            assert worker.is_operator_halted is False, (
                 'halt_for_wip must NOT raise the operator-halt signal'
             )
 
