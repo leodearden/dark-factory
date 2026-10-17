@@ -1080,6 +1080,8 @@ async def test_build_report_carries_every_section(recon_db):
 
     assert isinstance(report['retention_note'], str) and report['retention_note']
 
+    assert report['concentration'] == inflow_concentration(db, 'reify')
+
     # The whole thing must survive a JSON round-trip — it is a CLI payload.
     assert json.loads(json.dumps(report)) == report
 
@@ -1201,6 +1203,25 @@ async def test_build_report_threads_since_into_both_halves(recon_db):
 
 
 @pytest.mark.asyncio
+async def test_build_report_threads_since_into_the_concentration_half(recon_db):
+    """The ONE floored instant reaches per-task attribution too, not just inflow and drain."""
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_modified, 3)
+    await _push_task_events(
+        recon_db, '636', EventType.task_modified, 2, timestamp=_H14)
+
+    floored = build_report(db, 'reify', since='2026-07-25T14:00:00+00:00')
+    unfloored = build_report(db, 'reify')
+
+    assert floored['concentration'] == inflow_concentration(
+        db, 'reify', since=floored['since_effective'])
+    assert floored['concentration']['live_events'] == 2
+    assert unfloored['concentration']['live_events'] == 5
+    assert [entry['task_id'] for entry in floored['concentration']['top_tasks']] == [
+        '636']
+
+
+@pytest.mark.asyncio
 async def test_build_report_since_covers_one_window_off_the_hour(recon_db):
     """An off-the-hour `since` must not give the two halves different windows.
 
@@ -1292,6 +1313,28 @@ async def test_main_without_json_prints_a_readable_summary(recon_db, capsys):
     assert 'reify' in out
     assert 'remediation' in out.lower()
     assert out.strip(), 'the default output must not be empty'
+
+
+@pytest.mark.asyncio
+async def test_main_without_json_names_the_dominant_task(recon_db, capsys):
+    """The readable summary names the task driving the inflow, with its share.
+
+    6 of 11 live rows come from task 644, so its line must read 54.5%.  The
+    section must also say it covers live rows, so nobody reads it as history.
+    """
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 6)
+    await _push_task_events(recon_db, '636', EventType.task_modified, 3)
+    for _ in range(2):
+        await recon_db.push(_make_event(
+            timestamp=_H13, event_type=EventType.memory_added))
+
+    rc = main(['--db', str(db), '--project', 'reify'])
+    assert rc == 0
+
+    out = capsys.readouterr().out.replace(str(db), '<db>')
+    assert any('644' in line and '54.5%' in line for line in out.splitlines()), out
+    assert 'live' in out.lower()
 
 
 @pytest.mark.asyncio
