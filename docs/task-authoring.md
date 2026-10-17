@@ -1655,7 +1655,8 @@ One-off, timestamped, or id-suffixed annotation keys (e.g.
 metadata key — that just adds another `code=unknown_key` census line. Use
 the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
-value into a single `annotations` field.
+value into a single `annotations` field. An `x_` key is findable like any
+other top-level key through `find_tasks_by_metadata` (§9).
 
 `x_inv12_finding` and `x_inv12_owns` are the Tier-C keys of the INV-12
 sweep (exceptions are owned or ratified; PRD
@@ -1894,6 +1895,22 @@ corpus, which is only populated by tasks the curator has actually indexed
 a batch you just planned will not show up in `search_tasks` results even
 though it exists. Confirm a specific id landed with `get_task(id=...)`
 directly.
+
+**Look a task up by a metadata key with `find_tasks_by_metadata`, not a
+forensic sqlite read.** `find_tasks_by_metadata(project_root=...,
+key="x_finding_key", value="fk-…")` returns every task whose top-level
+`metadata[key]` matches, in every status including `deferred` and
+`cancelled` (unlike `search_tasks`, above). Omit `value` to match every task
+that carries the key at all. A str or int matches a scalar by equality and a
+list by membership, type-strictly, so `40` does not match `"40"`. Results
+are paged: follow `pagination.has_more` with `offset += returned`.
+`include_value=True` adds `matched_value`, the whole stored value, under a
+48,000 B page budget; a single row over that budget comes back alone with
+`truncated_value: true` and its value elided, so read that task with
+`get_task`. `tasks_with_key == 0` means no task carries the key at all (a
+misspelt key, or no producer has written it yet). An error payload means
+the lookup failed, never "no match". Semantics:
+`plans/task-metadata-lookup-prd.md`.
 
 **Change a filed task's kind in place with `update_task`, not
 remove+refile.** If a task's `task_kind`, `before_done`, or other metadata
