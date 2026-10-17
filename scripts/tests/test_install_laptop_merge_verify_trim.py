@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from itertools import zip_longest
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,9 @@ GOOD_SERVICE = (
     f"ExecStart=%h/{LIB_REL}/prune-unconsulted-target.sh --window-days 3\n"
 )
 GOOD_TIMER = "[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n"
+
+# Mirrors tests/scripts/shell_sections.py::SIGPIPE_BULK_BYTES, where the measurements live; scripts/tests cannot import tests/scripts.
+CRON_FILLER_BYTES = 262144
 
 SHIMS = {
     "ssh": 'shift\ncd "$HOME"\nexec bash -c "$*"\n',
@@ -119,6 +123,18 @@ def unit_dir(world):
     return world["home"] / ".config/systemd/user"
 
 
+def cron_filler():
+    entry = "15 3 * * * /usr/bin/true\n"
+    return entry * (CRON_FILLER_BYTES // len(entry) + 1)
+
+
+def differing_lines(actual, expected):
+    """(line number, actual, expected) for each mismatch. pytest's own diff of two
+    filler-sized texts runs past the per-test timeout instead of failing."""
+    pairs = zip_longest(actual.splitlines(keepends=True), expected.splitlines(keepends=True))
+    return [(n, a, e) for n, (a, e) in enumerate(pairs, 1) if a != e]
+
+
 def systemctl_calls(world):
     log = world["state"] / "systemctl.log"
     return log.read_text().splitlines() if log.exists() else []
@@ -152,6 +168,19 @@ def test_apply_installs_repoints_cron_enables_and_runs_once(world):
     assert "--user daemon-reload" in calls
     assert f"--user enable --now {UNIT}.timer" in calls
     assert calls.index(f"--user enable --now {UNIT}.timer") < calls.index(f"--user start {UNIT}.service")
+
+
+def test_apply_repoints_a_crontab_longer_than_a_pipe_buffer(world):
+    crontab_file = world["state"] / "crontab"
+    seeded = crontab_file.read_text() + cron_filler()
+    crontab_file.write_text(seeded)
+
+    result = run(world)
+
+    assert result.returncode == 0, result.stderr
+    repointed = seeded.replace(str(world["cron_old"]), f"{lib(world)}/gc-worktree-targets.sh")
+    assert differing_lines(crontab_file.read_text(), repointed) == []
+    assert differing_lines((lib(world) / "crontab.bak-testlabel").read_text(), seeded) == []
 
 
 def test_second_apply_is_a_no_op_for_the_crontab(world):
