@@ -121,16 +121,21 @@ _FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
 
 _RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
 
+FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "existing")
+
+FILED_TICKET_STEPS = ("key", "semantic", "curator")
+
 _FILED_TICKET_SCHEMA = {
     "type": "object",
     "properties": {
         "ticket": {"type": ["string", "null"]},
         "project_root": {"type": "string"},
         "run_id": _RUN_ID_SCHEMA,
-        "finding_key": _FINDING_KEY_SCHEMA,
+        # null: filed before finding keys existed (plans/census-incremental-prd.md L4 backfill)
+        "finding_key": {"type": ["string", "null"], "pattern": KEY_PATTERN},
         "task_id": {"type": ["integer", "null"]},
-        "resolution": {"enum": ["created", "combined", "refused", "failed", "existing", None]},
-        "step": {"enum": ["key", "semantic", "curator"]},
+        "resolution": {"enum": [*FILED_TICKET_RESOLUTIONS, None]},
+        "step": {"enum": list(FILED_TICKET_STEPS)},
     },
     "required": ["ticket", "project_root", "run_id", "finding_key", "task_id", "resolution", "step"],
 }
@@ -350,6 +355,12 @@ def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
 
 def _schema_errors(instance: dict, schema: dict) -> list[str]:
     return _validate_node(instance, schema, [])
+
+
+def filed_ticket_errors(row: Mapping[str, object]) -> list[str]:
+    """The one statement of the C1 ``filed_tickets`` row invariant: validate()
+    applies it to every entry's rows, and disposition.BackLink to itself."""
+    return _validate_node(row, _FILED_TICKET_SCHEMA, ["filed_ticket"])
 
 
 FINDING_IDENTITY_FIELDS = ("finding_key", "finding_area", "finding_anchor", "finding_tags")
