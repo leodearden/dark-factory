@@ -1916,9 +1916,14 @@ class TestStopScanExcludesCapturedOutput:
         {'type_output': 'x.py:1: error: do not run this by hand'},
         {'test_output': 'collected 3 items\nsetup note: do not run this by hand\n3 errors in 1.2s'},
         {'type_output': 'x.py:1: warning: do not run this by hand'},
+        {'lint_output': '\n'.join(
+            [f'x.py:{i}:1: E501 line too long' for i in range(80)]
+            + ['x.py:999:1: E501 do not run this by hand']
+        )},
     ], ids=[
         'test_output', 'lint_output', 'type_output',
         'test_output_without_marker', 'type_output_without_error',
+        'truncated_lint_output',
     ])
     def test_verify_failure_report_streams_are_fenced_and_skipped(self, stream):
         from orchestrator.b3_gate import FRESH, check_proposal
