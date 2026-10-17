@@ -1661,6 +1661,7 @@ def _run_single_eval(
                     )
                 )
 
+    _require_zai_coding_plan(configs)
     asyncio.run(_run())
 
 
@@ -1704,6 +1705,19 @@ def _resolve_eval_task_paths(base_config, tasks_dir: Path | None) -> list[Path]:
         click.echo(f'No eval fixtures found in {tasks_dir}', err=True)
         sys.exit(1)
     return sorted(tasks_dir.glob('*.json'))
+
+
+def _require_zai_coding_plan(configs) -> None:
+    """Probe the Z.ai Coding Plan once if any candidate targets it; an unusable plan fails the command."""
+    from orchestrator.evals.zai_probe import (
+        ZaiCodingPlanUnavailable,
+        require_zai_coding_endpoint_for,
+    )
+
+    try:
+        require_zai_coding_endpoint_for(configs)
+    except ZaiCodingPlanUnavailable as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _eval_prices(base_config) -> dict[str, Any]:
@@ -1765,6 +1779,7 @@ def _run_ofat_driver(
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
     candidates = ofat_candidates()
+    _require_zai_coding_plan(candidates)
     results = asyncio.run(run_ofat_stage(
         task_paths, candidates, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
@@ -1791,6 +1806,7 @@ def _run_matrix_driver(
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
     candidates = ofat_candidates()
+    _require_zai_coding_plan(candidates)
     arch_cfgs = [c for c in candidates if c.role == 'architect']
     impl_cfgs = [c for c in candidates if c.role == 'implementer']
     results = asyncio.run(run_matrix_stage(
@@ -1840,6 +1856,7 @@ def _run_confirm_driver(
         sys.exit(1)
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
+    _require_zai_coding_plan([arch_cfg, impl_cfg])
     results = asyncio.run(run_confirm_stage(
         task_paths, arch_cfg, impl_cfg, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
