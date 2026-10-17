@@ -1,7 +1,7 @@
 # signal_leaves backfill, tranche ε3 (task 6590)
 
 Task 6590 is tranche ε3 of `plans/dashboard-prd-lanes-prd.md` §9.
-Rule applied: a leaf is named only where the PRD's own text, including its `.capability-manifest.md` twin, names the integration gate or goal-signal leaf. A leaf is never inferred from the dependency graph.
+Rule: `plans/dashboard-prd-lanes-prd.md` §9, ε1–ε4, "The rule." Each PRD's `.capability-manifest.md` twin was read alongside its goal and decomposition-plan sections.
 
 | Key | Result | Leaf (label → task) | Named by (section heading) / Why unnamed |
 |---|---|---|---|
