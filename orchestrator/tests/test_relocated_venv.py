@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -103,6 +105,31 @@ def test_run_dir_venvs_are_inspected_alongside_the_root_venv(
     assert [(f.path, f.disposition) for f in found] == [(pkg_venv, Disposition.RETIRED)]
     assert not pkg_venv.exists()
     assert (root_venv / 'bin' / 'pytest').exists()
+
+
+@pytest.fixture
+def unremovable_relocated_venv(root: Path, old_build: Path) -> Iterator[Path]:
+    venv = make_venv(root / '.venv', built_at=old_build)
+    bin_dir = venv / 'bin'
+    bin_dir.chmod(0o555)
+    yield venv
+    bin_dir.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root ignores the read-only bin dir')
+def test_failed_removal_is_reported_not_raised(
+    root: Path, unremovable_relocated_venv: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    venv = unremovable_relocated_venv
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        found = retire_relocated_venvs(root)
+
+    assert [(f.path, f.disposition) for f in found] == [(venv, Disposition.RETIRE_FAILED)]
+    assert (venv / 'bin' / 'pytest').exists()
+    assert any(
+        str(venv) in m and f'[Errno {errno.EACCES}]' in m for m in _warnings(caplog)
+    )
 
 
 def test_symlinked_venv_is_ignored(root: Path, tmp_path: Path, old_build: Path) -> None:
