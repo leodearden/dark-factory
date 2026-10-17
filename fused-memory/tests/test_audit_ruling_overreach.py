@@ -15,11 +15,11 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-from fused_memory.services.overreach_guard import is_guarded_category
 
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation import task_filter
 from fused_memory.services import completion_claim_gate, overreach_guard
+from fused_memory.services.overreach_guard import is_guarded_category
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_ruling_overreach.py'
 

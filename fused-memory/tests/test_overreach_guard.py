@@ -6,6 +6,8 @@ docs/ruling-overreach-guard-design-2026-10-01/design.md §4 and §8.
 from __future__ import annotations
 
 import pytest
+
+from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.overreach_guard import (
     CLASSIFIER_NAMES,
     EPISODE_CLASSIFIERS,
@@ -16,8 +18,6 @@ from fused_memory.services.overreach_guard import (
     is_guarded_category,
     matching_classifiers,
 )
-
-from fused_memory.models.enums import MemoryCategory
 
 RULING_HEADED = 'RULING (Leo, 2026-09-01, esc-1-2): x'
 PLAIN_DECISION = 'Task 848 (stale merge-lane cleanup) is done as of 2026-04-20 with commit bb7101'
