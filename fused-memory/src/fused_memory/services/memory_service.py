@@ -83,11 +83,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
 )
-from fused_memory.models.scope import (
-    Scope,
-    build_known_projects_map,
-    known_project_roots_from_env,
-)
+from fused_memory.models.scope import Scope, build_known_projects_map
 from fused_memory.reconciliation.flag_record_contract import (
     enforce_flag_record_write_contract,
 )
@@ -2331,7 +2327,9 @@ class MemoryService:
         self.recon_journal: ReconciliationJournal | None = None
         # {project_id: project_root}, seeded below from DASHBOARD_KNOWN_PROJECT_ROOTS
         # alone, never config.taskmaster.project_root (see the module docstring of
-        # middleware/mem0_update_storm_escalator.py); startup replaces it.
+        # middleware/mem0_update_storm_escalator.py); startup replaces it. The
+        # seed reaches EVERY `_known_projects` consumer, not only the storm
+        # alarm — see `set_known_projects`.
         self._known_projects: dict[str, str] = {}
         # INV-4 storm escape for update_memory's silent-rewrite primitive (task
         # 3088). Both are constructed UNCONDITIONALLY — never obtained from
@@ -2344,9 +2342,7 @@ class MemoryService:
             KeyedStormCounters()
         )
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
-        self.set_known_projects(build_known_projects_map(
-            primary_root='', extra_roots=known_project_roots_from_env(),
-        ))
+        self.set_known_projects(build_known_projects_map(primary_root=''))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
         # keyed per `agent_id` for the same attribution reason as the registry
         # above.
@@ -2545,6 +2541,15 @@ class MemoryService:
         must keep working with reconciliation disabled, which is exactly the
         degraded configuration where an unattended rewrite loop is least likely
         to be noticed.
+
+        The seed deliberately widens EVERY ``_known_projects`` consumer, not
+        only the ``update_memory`` storm alarm. A never-wired service built with
+        ``DASHBOARD_KNOWN_PROJECT_ROOTS`` set already has active producer
+        referent narrowing, a resolvable dead-letter and entity-mint root and an
+        exact-match ``_project_id_from_queue_group_id`` arm. That holds for an
+        operator script that builds a ``MemoryService`` with no startup wiring
+        too, which therefore also pays the seed's path I/O and logs this
+        method's INFO line (and a WARNING per phantom root) at construction.
 
         Copied on entry so a later mutation of the caller's map cannot change
         resolution out from under an in-flight escalation.
@@ -2838,8 +2843,10 @@ class MemoryService:
         A BOUND METHOD for the same call-time-resolution reason
         ``_record_queue_terminal_outcome``'s docstring gives: ``server/main.py``
         calls ``initialize()`` (which constructs the queue) BEFORE
-        ``set_known_projects()``, so ``_known_projects`` is still empty when the
-        hook is wired and must be read at call time.
+        ``set_known_projects()``, so when the hook is wired ``_known_projects``
+        holds only the ``__init__`` seed (empty when
+        ``DASHBOARD_KNOWN_PROJECT_ROOTS`` is unset) and must be read at call
+        time to see the startup snapshot.
 
         PROJECT ROOT resolution has NO FALLBACK, exactly as in
         ``_record_entity_mint``. Falling back to
@@ -4197,13 +4204,14 @@ class MemoryService:
                         # is prerequisite to that narrowing.
                         #
                         # FAIL-CLOSED ON AN EMPTY REGISTRY, on purpose, matching
-                        # `ReferentFinding.resolvable` defaulting to False:
-                        # MemoryService is constructed before
-                        # `build_known_projects_map` runs, so `{}` is a real
+                        # `ReferentFinding.resolvable` defaulting to False: with
+                        # DASHBOARD_KNOWN_PROJECT_ROOTS unset, the `__init__`
+                        # seed is `{}` until startup wiring, so `{}` is a real
                         # window, and "permissive until populated" would leave
-                        # exactly that window open. The registry arrives via
-                        # `set_known_projects`, which is the injection point to
-                        # look at if this ever skips more than expected.
+                        # exactly that window open. Both the seed and the
+                        # startup snapshot arrive via `set_known_projects`,
+                        # which is the injection point to look at if this ever
+                        # skips more than expected.
                         #
                         # CONFINED TO THE MEMBERSHIP ARM. The pairing arm fires
                         # only when the endpoint IS declared, where the write

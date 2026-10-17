@@ -14868,6 +14868,22 @@ class TestReferentScanNarrowsWithTheProjectRegistry:
         assert self._enqueued_refs(service) == [self.EVIL_REF]
 
     @pytest.mark.asyncio
+    async def test_a_never_wired_service_narrows_with_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The constructor's env seed reaches this consumer, not only the storm alarm."""
+        root = tmp_path / 'reify'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+
+        assert self._enqueued_refs(service) == []
+
+    @pytest.mark.asyncio
     async def test_add_memory_preserves_a_genuine_in_registry_foreign_ref(self, service):
         service.set_known_projects(self.REGISTRY)
         await service.add_memory(
