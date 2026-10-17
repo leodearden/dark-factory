@@ -2134,7 +2134,8 @@ class SqliteTaskBackend:
         ``plans/task-metadata-lookup-prd.md`` decisions 5-7.
         """
         validate_metadata_lookup(
-            key=key, value=value, include_value=include_value, limit=limit, offset=offset,
+            key=key, value=value, statuses=statuses, include_value=include_value,
+            limit=limit, offset=offset,
         )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG

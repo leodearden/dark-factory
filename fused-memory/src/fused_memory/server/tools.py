@@ -35,7 +35,7 @@ from fused_memory.backends.mem0_client import (
 from fused_memory.backends.metadata_lookup import (
     DEFAULT_LOOKUP_LIMIT,
     InvalidMetadataLookupError,
-    validate_metadata_lookup,
+    validate_metadata_query,
 )
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
@@ -9704,15 +9704,16 @@ def create_mcp_server(
                 A str or int matches a scalar by equality or a list by
                 membership, type-strictly: 40 does not match "40". bool, float,
                 dict and list values are rejected.
-            statuses: Optional list of statuses to search within (default: all).
-            limit: Page size, clamped to [1, 100] (default 50).
+            statuses: Optional list of task statuses to search within
+                (default: all); an unknown status is a ValidationError.
+            limit: Page size >= 1; values above 100 are clamped to 100 (default 50).
             offset: Zero-based index into the matches, ordered by task id.
             tag: Tag context (optional).
             include_value: True adds ``matched_value``, the whole ``metadata[key]``.
 
         Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
-        ``updated_at``), ``tasks_with_key`` (how many tasks carry ``key`` at
-        all; 0 means none does), ``pagination`` (page on ``has_more`` with
+        ``updated_at``), ``tasks_with_key`` (how many tasks in the searched
+        statuses carry ``key``), ``pagination`` (page on ``has_more`` with
         ``offset += returned``), ``malformed_metadata_ids`` when some task's
         metadata is not a JSON object, and the echoed arguments. An ``error``
         payload means the lookup failed; it never means "no match".
@@ -9725,9 +9726,8 @@ def create_mcp_server(
             return statuses_error
         page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
         try:
-            validate_metadata_lookup(
-                key=key, value=value, include_value=include_value,
-                limit=page_size, offset=offset,
+            validate_metadata_query(
+                key=key, value=value, statuses=statuses, include_value=include_value,
             )
         except InvalidMetadataLookupError as e:
             return {'error': str(e), 'error_type': 'ValidationError'}

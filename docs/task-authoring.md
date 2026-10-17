@@ -1905,12 +1905,15 @@ that carries the key at all. A str or int matches a scalar by equality and a
 list by membership, type-strictly, so `40` does not match `"40"`. Results
 are paged: follow `pagination.has_more` with `offset += returned`.
 `include_value=True` adds `matched_value`, the whole stored value, under a
-48,000 B page budget; a single row over that budget comes back alone with
-`truncated_value: true` and its value elided, so read that task with
-`get_task`. `tasks_with_key == 0` means no task carries the key at all (a
-misspelt key, or no producer has written it yet). An error payload means
-the lookup failed, never "no match". Semantics:
-`plans/task-metadata-lookup-prd.md`.
+48,000 B page budget
+(`fused-memory/src/fused_memory/server/tools.py::RESULT_BYTE_BUDGET`);
+a single row over that budget comes back alone with `truncated_value: true`
+and its value elided, so read that task with `get_task`. `tasks_with_key`
+counts the tasks in the searched statuses that carry the key, so without a
+`statuses` filter `tasks_with_key == 0` means no task carries it at all (a
+misspelt key, or no producer has written it yet). An unknown status is
+rejected rather than searched. An error payload means the lookup failed,
+never "no match". Semantics: `plans/task-metadata-lookup-prd.md`.
 
 **Change a filed task's kind in place with `update_task`, not
 remove+refile.** If a task's `task_kind`, `before_done`, or other metadata

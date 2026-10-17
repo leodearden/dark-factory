@@ -29,9 +29,8 @@ from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.server.tools import create_mcp_server
+from fused_memory.server.tools import RESULT_BYTE_BUDGET, create_mcp_server
 
-_OVER_BUDGET_BYTES = 48_000
 _SLIM_ROW_KEYS = {'task_id', 'title', 'status', 'priority', 'updated_at'}
 _TOOL = 'find_tasks_by_metadata'
 
@@ -121,7 +120,7 @@ async def test_presence_query_over_active_statuses_returns_whole_values(lookup_s
 @pytest.mark.asyncio
 async def test_in_process_lookup_applies_no_byte_budget(lookup_stack):
     blob = 'a' * 60_000
-    assert len(json.dumps(blob).encode('utf-8')) > _OVER_BUDGET_BYTES
+    assert len(json.dumps(blob).encode('utf-8')) > RESULT_BYTE_BUDGET
     task_id = await lookup_stack.seed('pending', {'x_blob': blob})
 
     found = await lookup_stack.interceptor.find_tasks_by_metadata(
@@ -169,6 +168,10 @@ async def test_in_process_paging_tiles_the_match_set(lookup_stack):
         ('value', {'value': True}),
         ('include_value', {'include_value': 'yes'}),
         ('limit', {'limit': 0}),
+        ('offset', {'offset': -1}),
+        ('value', {'value': 2**63}),
+        ('statuses', {'statuses': 'cancelled'}),
+        ('statuses', {'statuses': ['canceled']}),
     ],
 )
 async def test_in_process_lookup_enforces_its_own_preconditions(lookup_stack, arg, overrides):
@@ -333,6 +336,21 @@ async def test_statuses_must_be_a_list_of_strings(lookup_stack, unbacked_call, s
 
 
 @pytest.mark.asyncio
+async def test_an_unknown_status_is_named_rather_than_read_as_a_dead_key(
+    lookup_stack, unbacked_call,
+):
+    await lookup_stack.seed('cancelled', {'x_k': 'v'})
+    misspelt = ['pending', 'canceled']
+
+    _assert_validation_error(
+        await lookup_stack.call(key='x_k', statuses=misspelt), 'statuses', ['canceled'],
+    )
+    _assert_validation_error(
+        await unbacked_call(key='x_k', statuses=misspelt), 'statuses', ['canceled'],
+    )
+
+
+@pytest.mark.asyncio
 async def test_pages_tile_a_large_match_set(lookup_stack):
     ids = [await lookup_stack.seed('pending', {'x_k': 'v'}) for _ in range(120)]
 
@@ -396,7 +414,7 @@ async def test_a_key_nobody_carries_says_so(lookup_stack):
 @pytest.mark.asyncio
 async def test_the_default_omits_values_and_applies_no_byte_cut(lookup_stack):
     big = 'a' * 60_000
-    assert len(json.dumps(big).encode('utf-8')) > _OVER_BUDGET_BYTES
+    assert len(json.dumps(big).encode('utf-8')) > RESULT_BYTE_BUDGET
     await lookup_stack.seed('pending', {'x_blob': big})
     await lookup_stack.seed('pending', {'x_blob': 'small'})
 
@@ -454,7 +472,7 @@ async def test_the_budget_cuts_a_page_and_pages_still_tile(lookup_stack):
     assert first['pagination']['returned'] < 10
     assert first['pagination']['has_more'] is True
     assert first['pagination']['page_size'] == 10
-    assert _serialized_bytes(first['results']) <= _OVER_BUDGET_BYTES
+    assert _serialized_bytes(first['results']) <= RESULT_BYTE_BUDGET
     assert [row['task_id'] for row in rows] == sorted(values)
     assert {row['task_id']: row['matched_value'] for row in rows} == values
     assert not any('truncated_value' in row for row in rows)
