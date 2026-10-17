@@ -3,16 +3,19 @@ becomes work and how its task links back (plans/census-incremental-prd.md L4;
 docs/quality-findings-contract.md §6, §7, §8)."""
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
 import pytest
-from legibility import codebook, disposition, task_store
+from legibility import codebook, disposition, task_store, verdict
 from legibility_task_store_fake import FakeTaskStore
 
 _ROOT = "/abs/observed"
 _RUN = "census-dark_factory-20261017"
 _KEY_A = "fk-00000000000a"
 _KEY_B = "fk-00000000000b"
+_KEY_C = "fk-00000000000c"
 
 Step = disposition.Step
 Resolution = disposition.Resolution
@@ -612,3 +615,177 @@ def test_an_unreachable_backfill_changes_nothing_and_never_raises() -> None:
     assert backfill.linked == ()
     assert backfill.error is not None
     assert "find_tasks_by_metadata" in backfill.error
+
+
+# ---------------------------------------------------------------------------
+# Rendering the Filed Tasks body and ## Structural from the JSON-safe record
+# ---------------------------------------------------------------------------
+
+_HARNESS_ROOT = "/abs/harness"
+
+
+def _record(
+    disposal: disposition.Disposal | None = None,
+    resolutions: disposition.Resolutions | None = None,
+    backfill: disposition.Backfill | None = None,
+    structural: tuple[disposition.StructuralFinding, ...] = (),
+) -> dict:
+    report = disposition.FilingReport(
+        disposal=disposal or disposition.Disposal((), ()),
+        resolutions=resolutions or disposition.Resolutions(),
+        backfill=backfill or disposition.Backfill(),
+        structural=structural,
+    )
+    return json.loads(json.dumps(report.to_record()))
+
+
+def _cells(row: str) -> list[str]:
+    return [cell.replace("\\|", "|") for cell in re.split(r" \| ", row[2:-2])]
+
+
+def _table(lines: list[str]) -> list[dict[str, str]]:
+    header, _separator, *body = [line for line in lines if line.startswith("| ")]
+    names = _cells(header)
+    return [dict(zip(names, _cells(row), strict=True)) for row in body]
+
+
+def _filed(record: dict) -> list[str]:
+    return disposition.filed_tasks_lines(record, observed_root=_ROOT)
+
+
+def _disposed_and_resolved(
+    filings: list[disposition.Filing], store: FakeTaskStore, *, submit: _Submit | None = None,
+) -> tuple[disposition.Disposal, disposition.Resolutions]:
+    disposal = disposition.dispose(filings, store=store, submit=submit or _Submit())
+    entries = [_entry(filing.entry_id) for filing in filings if filing.entry_id is not None]
+    links = [link for decision in disposal.decisions if (link := decision.back_link(_RUN)) is not None]
+    cb = disposition.with_back_links(_codebook(*entries), links)
+    _, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+    return disposal, resolutions
+
+
+def test_filed_tasks_names_each_finding_its_step_task_ticket_and_disposition() -> None:
+    store = FakeTaskStore(
+        metadata_hits={**_key_hits(_hit(42, "pending")), **_key_hits(_hit(5120, "cancelled"), key=_KEY_B)},
+        tasks={5120: _accepting(5120)},
+        resolve_outcomes={"tkt_1": _outcome(task_store.TicketStatus.CREATED, 77)},
+    )
+    filings = [
+        _filing(_KEY_A, "live one", entry_id="entry-a"),
+        _filing(_KEY_B, "accepted one", entry_id="entry-b"),
+        _filing(_KEY_C, "fresh | one", entry_id="entry-c"),
+    ]
+
+    rows = {row["finding_key"]: row for row in _table(_filed(_record(*_disposed_and_resolved(filings, store))))}
+
+    assert {key: (row["step"], row["resolution"], row["task_id"], row["ticket"], row["disposition"])
+            for key, row in rows.items()} == {
+        _KEY_A: ("key", "existing", "42", "", "filed:42"),
+        _KEY_B: ("key", "existing", "5120", "", "accepted:5120"),
+        _KEY_C: ("curator", "created", "77", "tkt_1", "filed:77"),
+    }
+    assert rows[_KEY_C]["title"] == "fresh | one"
+
+
+def test_a_pending_ticket_is_named_and_said_to_resolve_next_run() -> None:
+    store = FakeTaskStore(resolve_outcomes={"tkt_1": _outcome(task_store.TicketStatus.FAILED, reason="timeout")})
+
+    (row,) = _table(_filed(_record(*_disposed_and_resolved([_filing()], store))))
+
+    assert row["ticket"] == "tkt_1"
+    assert row["resolution"] == ""
+    assert "next run" in row["note"]
+
+
+def test_a_refused_ticket_says_so_with_the_reason() -> None:
+    store = FakeTaskStore(resolve_outcomes={"tkt_1": _outcome(task_store.TicketStatus.REFUSED, reason="premise")})
+
+    (row,) = _table(_filed(_record(*_disposed_and_resolved([_filing()], store))))
+
+    assert row["resolution"] == "refused"
+    assert "premise" in row["note"]
+
+
+def test_a_finding_filed_into_another_project_names_that_project() -> None:
+    filings = [_filing(_KEY_A, "observed", entry_id="entry-a"), _filing(_KEY_B, "harness", entry_id="entry-b",
+                                                                      project_root=_HARNESS_ROOT)]
+
+    rows = {row["finding_key"]: row for row in _table(_filed(_record(*_disposed_and_resolved(filings, FakeTaskStore()))))}
+
+    assert rows[_KEY_A]["project_root"] == ""
+    assert rows[_KEY_B]["project_root"] == _HARNESS_ROOT
+
+
+def test_an_unreachable_step_one_says_nothing_was_filed_and_lists_every_finding() -> None:
+    filings = (_filing(_KEY_A, "first"), _filing(_KEY_B, "second"))
+    disposal = disposition.Disposal((), filings, "find_tasks_by_metadata: ConnectionError: down")
+
+    lines = _filed(_record(disposal))
+
+    (statement_at,) = [index for index, line in enumerate(lines) if "step 1" in line]
+    assert "NOTHING was filed" in lines[statement_at]
+    assert "ConnectionError: down" in lines[statement_at]
+    listed = "\n".join(lines[statement_at + 1:])
+    for filing in filings:
+        assert filing.title in listed
+        assert str(filing.finding_key) in listed
+
+
+def test_carried_resolutions_budget_and_backfill_each_render_only_when_present() -> None:
+    carried = disposition.ResolvedTicket(
+        "entry-b", "tkt_old", _ROOT, _outcome(task_store.TicketStatus.CREATED, 88), carried=True,
+    )
+    resolutions = disposition.Resolutions(resolved=(carried,), pending=("tkt_late",), budget_exhausted=True)
+    backfill = disposition.Backfill(linked=((101, "entry-plain"),), unmatched=(_UNMATCHED,))
+
+    text = "\n".join(_filed(_record(resolutions=resolutions, backfill=backfill)))
+
+    assert "tkt_old" in text and "88" in text
+    assert "budget" in text and "tkt_late" in text
+    assert "101" in text and "entry-plain" in text
+    assert str(_UNMATCHED.task_id) in text
+
+
+def test_an_empty_record_renders_none_filed() -> None:
+    assert _filed(_record()) == ["_none filed._"]
+
+
+def test_structural_always_renders_its_heading_with_a_placeholder_when_empty() -> None:
+    lines = disposition.structural_lines(_record())
+
+    assert lines[:3] == ["", "## Structural", ""]
+    assert len(lines) == 4
+
+
+def test_structural_lists_each_finding_recorded_and_not_filed() -> None:
+    cb = _codebook(_entry("entry-keyed", "a structural shape", **_IDENTITY), _entry("entry-other"))
+    structural = disposition.structural_findings(cb, ["entry-keyed"])
+
+    lines = disposition.structural_lines(_record(structural=structural))
+
+    assert lines[:3] == ["", "## Structural", ""]
+    assert any("NOT filed" in line and "§6" in line for line in lines)
+    assert _table(lines) == [{
+        "finding_key": _KEY_A,
+        "entry_id": "entry-keyed",
+        "title": "a structural shape",
+        "anchor": _IDENTITY["finding_anchor"],
+    }]
+
+
+def _verdict(route: verdict.Route) -> verdict.Verdict:
+    return verdict.Verdict(
+        verified=True,
+        reason="seen",
+        anchor="orchestrator/x.py::f",
+        tags=("h13", verdict.KIND_TAG),
+        severity="medium",
+        severity_reason="r",
+        route=route,
+        remediation=None,
+    )
+
+
+def test_only_a_mechanical_finding_files() -> None:
+    assert disposition.files(_verdict(verdict.Route.MECHANICAL)) is True
+    assert disposition.files(_verdict(verdict.Route.STRUCTURAL)) is False
