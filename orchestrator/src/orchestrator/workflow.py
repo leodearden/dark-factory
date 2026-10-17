@@ -69,6 +69,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import chronic_flake
+from orchestrator.agents.briefing import VerifyAttemptContext
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
@@ -579,6 +580,7 @@ class _BriefingLike(Protocol):
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
+        *, attempt_context: VerifyAttemptContext | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...,

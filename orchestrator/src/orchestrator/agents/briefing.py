@@ -267,6 +267,43 @@ def _plan_scope(plan: dict, task_id: str | None) -> BriefingScope:
     return replace(scope, task_id=str(task_id)) if task_id else scope
 
 
+@dataclass(frozen=True)
+class VerifyAttemptContext:
+    """Where a debugger dispatch sits in its verify/debug loop.
+
+    ``attempt`` is the 1-based number of the verify attempt that just failed.
+    ``prior_causes`` holds one display line per earlier failed attempt in the
+    same loop, oldest first.
+    """
+
+    attempt: int
+    max_attempts: int
+    prior_causes: tuple[str, ...] = ()
+
+
+def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
+    lines = [
+        f'Verify attempt {ctx.attempt} of {ctx.max_attempts} failed; '
+        'the failures below are from that run.',
+    ]
+    if not ctx.prior_causes:
+        lines.append('This is the first failed attempt in this verify/debug loop.')
+    else:
+        lines.append(
+            'Earlier attempts in this loop also failed, and a debugger pass '
+            'followed each one:'
+        )
+        lines.extend(
+            f'- attempt {i}: {cause}' for i, cause in enumerate(ctx.prior_causes, start=1)
+        )
+        lines.append('')
+        lines.append(
+            'If the current failure matches one of these, the earlier fix did '
+            'not work — find a different root cause instead of repeating it.'
+        )
+    return '# Verify Attempt\n\n' + '\n'.join(lines) + '\n\n'
+
+
 @dataclass
 class CompletionJudgeVerdict:
     """Structured verdict returned by the completion judge agent.
@@ -1063,13 +1100,20 @@ This task holds locks for the following modules:
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
+        *, attempt_context: VerifyAttemptContext | None = None,
     ) -> str:
-        """Build prompt for the debugger agent."""
+        """Build prompt for the debugger agent.
+
+        *attempt_context* adds a ``# Verify Attempt`` section naming the
+        failed attempt and the causes of earlier ones in the same loop; with
+        ``None`` the prompt is byte-identical to the attempt-less form.
+        """
         scope = _plan_scope(plan, task_id)
         if context is None:
             context = await self._get_memory_context(scope, 'debugger')
 
         identity = self._agent_identity(scope.task_id, 'debugger')
+        verify_attempt = _format_verify_attempt(attempt_context) if attempt_context else ''
 
         return f"""\
 {context}
@@ -1081,7 +1125,7 @@ This task holds locks for the following modules:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-# Failures
+{verify_attempt}# Failures
 
 ```
 {failures}
