@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,11 +32,15 @@ from orchestrator.merge_lane import (
     MergeRequest,
     QueuedBranch,
     enqueue_merge_request,
+    landing_evidence,
 )
+from orchestrator.merge_lane import worker as merge_worker
 from orchestrator.merge_lane.queue_store import MergeQueueStore
 from shared.merge_state import EPISTEMIC_STATES, OUTCOME_STATES, MergeReason, MergeState
+from shared.merge_subject import format_merge_subject
 
-from escalation.git_authority import GitAuthorityOutcome
+from escalation import git_authority
+from escalation.git_authority import GitAuthorityOutcome, GitAuthorityVerdict
 from escalation.merge_status_answer import hint_for
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -61,6 +66,10 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ['git', *args], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.strip()
+
+
+def _git_succeeds(repo: Path, *args: str) -> bool:
+    return subprocess.run(['git', *args], cwd=repo, capture_output=True).returncode == 0
 
 
 @dataclass(frozen=True)
@@ -110,6 +119,97 @@ def _unmerged_branch(world: _World, task_id: str) -> None:
     _git(world.repo, 'add', '-A')
     _git(world.repo, 'commit', '-q', '-m', f'work for {task_id}')
     _git(world.repo, 'checkout', '-q', 'main')
+
+
+def _rebase_landing(world: _World, task_id: str) -> str:
+    """Land task/<task_id>'s work as a rebased copy under a merge marker, delete the ref, return the original tip."""
+    _unmerged_branch(world, task_id)
+    original_tip = _git(world.repo, 'rev-parse', f'task/{task_id}')
+    (world.repo / 'main-moved.txt').write_text(f'main moved past task/{task_id}\n')
+    _git(world.repo, 'add', '-A')
+    _git(world.repo, 'commit', '-q', '-m', 'main moves on')
+    rebased = f'rebased-{task_id}'
+    _git(world.repo, 'checkout', '-q', '-b', rebased, 'main')
+    _git(world.repo, 'cherry-pick', original_tip)
+    _git(world.repo, 'checkout', '-q', 'main')
+    _git(
+        world.repo, 'merge', '-q', '--no-ff', rebased,
+        '-m', format_merge_subject(f'task/{task_id}', 'main'),
+    )
+    _git(world.repo, 'branch', '-q', '-D', rebased, f'task/{task_id}')
+    return original_tip
+
+
+_INSIDE_PROBE: ContextVar[bool] = ContextVar('inside_probe_landing', default=False)
+
+_GIT_OPS_LANDING_PRIMITIVES = (
+    'is_ancestor',
+    'find_merge_marker',
+    'find_equivalent_commit',
+    'find_task_citation_commit',
+    'commit_effect_present_in_main',
+    'branch_content_in_main',
+)
+
+_MODULE_LANDING_PRIMITIVES = (
+    (landing_evidence, 'patch_content_contained'),
+    (landing_evidence, 'branch_work_landed'),
+    (merge_worker, 'patch_content_contained'),
+)
+
+
+@dataclass(frozen=True)
+class _LandingPrimitiveSpy:
+    """Passthrough wrappers recording whether each landing-primitive call ran inside probe_landing (I5)."""
+
+    calls: list[tuple[str, bool]] = field(default_factory=list)
+    verdicts: list[GitAuthorityVerdict] = field(default_factory=list)
+
+    @classmethod
+    def install(cls, monkeypatch: pytest.MonkeyPatch, git_ops: GitOps) -> _LandingPrimitiveSpy:
+        spy = cls()
+        monkeypatch.setattr(
+            git_authority, 'probe_landing', spy._attributing(git_authority.probe_landing),
+        )
+        for name in _GIT_OPS_LANDING_PRIMITIVES:
+            monkeypatch.setattr(
+                git_ops, name, spy._recording(f'GitOps.{name}', getattr(git_ops, name)),
+            )
+        for module, name in _MODULE_LANDING_PRIMITIVES:
+            label = f'{module.__name__}.{name}'
+            monkeypatch.setattr(module, name, spy._recording(label, getattr(module, name)))
+        return spy
+
+    def _attributing(
+        self, probe: Callable[..., Awaitable[GitAuthorityVerdict]],
+    ) -> Callable[..., Awaitable[GitAuthorityVerdict]]:
+        async def probe_landing(*args: Any, **kwargs: Any) -> GitAuthorityVerdict:
+            token = _INSIDE_PROBE.set(True)
+            try:
+                verdict = await probe(*args, **kwargs)
+            finally:
+                _INSIDE_PROBE.reset(token)
+            self.verdicts.append(verdict)
+            return verdict
+
+        return probe_landing
+
+    def _recording(
+        self, label: str, primitive: Callable[..., Awaitable[Any]],
+    ) -> Callable[..., Awaitable[Any]]:
+        async def recorded(*args: Any, **kwargs: Any) -> Any:
+            self.calls.append((label, _INSIDE_PROBE.get()))
+            return await primitive(*args, **kwargs)
+
+        return recorded
+
+    @property
+    def calls_inside_probe(self) -> list[str]:
+        return [label for label, inside in self.calls if inside]
+
+    @property
+    def calls_outside_probe(self) -> list[str]:
+        return [label for label, inside in self.calls if not inside]
 
 
 def _request(world: _World, task_id: str) -> MergeRequest:
