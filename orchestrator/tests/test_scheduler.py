@@ -9739,83 +9739,6 @@ class TestGetExternalStatusesPartialResult:
 
 
 # ---------------------------------------------------------------------------
-# TestTaskExternalDeps (task 2167 — W3-δ: shared TaskMetadata seam, SEAM A)
-# ---------------------------------------------------------------------------
-
-class TestTaskExternalDeps:
-    """Unit tests for the ``_task_external_deps`` helper (SEAM A).
-
-    ``_task_external_deps`` is the single seam every scheduler
-    ``metadata.external_deps`` read routes through:
-    ``parse_metadata(task.get('metadata'), direction='read')[0].external_deps``.
-    ``direction='read'`` is best-effort (never raises) so a corrupt
-    historical metadata row cannot break a scheduler dispatch tick — matching
-    the scheduler's existing fail-safe philosophy.  The return value stays
-    the canonical "project_id:task_id" wire STRING form (PRD Open Question
-    #4) — it is never converted to ``list[ExternalDep]``.
-
-    Plain dict task fixtures only — no Scheduler construction needed.
-    """
-
-    def test_no_metadata_key_returns_empty_list(self):
-        """A task dict with no 'metadata' key at all -> []."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '1'}
-        assert _task_external_deps(task) == []
-
-    def test_metadata_none_returns_empty_list(self):
-        """metadata=None -> [] (benign-absent, same as a missing key)."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '2', 'metadata': None}
-        assert _task_external_deps(task) == []
-
-    def test_dict_metadata_returns_external_deps(self):
-        """dict metadata {'external_deps': [...]} -> the list, unchanged."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '3',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        assert _task_external_deps(task) == ['dark_factory:42', 'p:9']
-
-    def test_json_string_metadata_is_parsed(self):
-        """metadata as a JSON *string* is parsed through the shared parser.
-
-        The old inline idiom ``(task.get('metadata') or {}).get(...)`` would
-        ``AttributeError`` on a str (``str`` has no ``.get``) — the shared
-        parser handles a JSON string natively.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '4', 'metadata': '{"external_deps": ["a:1"]}'}
-        assert _task_external_deps(task) == ['a:1']
-
-    def test_corrupt_metadata_string_returns_empty_list_no_raise(self):
-        """Unparseable metadata string -> [] with no exception raised.
-
-        ``direction='read'`` is best-effort: a corrupt historical metadata
-        row must not break a scheduler dispatch tick.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '5', 'metadata': 'not json{'}
-        assert _task_external_deps(task) == []
-
-    def test_returned_elements_stay_string_wire_form(self):
-        """Every returned element is a str — NOT converted to ExternalDep.
-
-        Resolves PRD Open Question #4 for task W3-δ: the scheduler keeps
-        consuming the canonical "project_id:task_id" STRING wire form fed to
-        ``get_external_statuses`` / the external-status cache.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '6',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        result = _task_external_deps(task)
-        assert all(isinstance(dep, str) for dep in result)
-
-
-# ---------------------------------------------------------------------------
 # TestExternalDepFlatShapeSeam (task 1854 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -12046,7 +11969,11 @@ class TestDrainParkEvictionRequests:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's parks gone.
         assert not scheduler.lock_table.has_parks('T')
@@ -12081,7 +12008,11 @@ class TestDrainParkEvictionRequests:
         status_map = {}
         tasks_by_id = {}
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # No eviction event.
         evicted_events = [
@@ -12133,7 +12064,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be INTACT.
         assert scheduler.lock_table.has_parks('T'), (
@@ -12175,7 +12110,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be gone — unsatisfied deps → not live-dispatchable → evict.
         assert not scheduler.lock_table.has_parks('T'), (
@@ -12321,8 +12260,8 @@ class TestDrainFiresWithNoActiveTasks:
 class TestAcquireNextFmReadFailureFailSafe:
     """acquire_next() must NOT drain park-evictions when get_tasks signals a
     read FAILURE (get_tasks(distinguish_failure=True) returns None) — draining
-    with empty status_map/tasks_by_id would make _owner_is_live_dispatchable
-    return False for every id, bypassing the D4 live-owner guard and
+    with empty status_map/tasks_by_id would make _park_hold_refusal name a
+    refusal ('missing') for every id, bypassing the D4 live-owner guard and
     force-evicting still-live owners during an fm outage/restart.
 
     A genuine empty result ([]) is NOT a failure and still drains exactly as
@@ -12603,7 +12542,11 @@ class TestDrainBuriedOwnerRestoredEvents:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # B's park on m2 is gone.
         assert not scheduler.lock_table.has_parks('B')

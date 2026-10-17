@@ -37,8 +37,8 @@ from shared.scheduler_state import (
     SchedulerStateSnapshot,
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
-from shared.task_metadata import parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
+from shared.task_statuses import TaskStatus
 from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
@@ -53,6 +53,7 @@ from orchestrator.config import (
     coerce_tier,
 )
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
+from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentMap, guard_path
@@ -2077,31 +2078,6 @@ def _iter_pending_deps_in(
                 yield tid, dep_id
 
 
-def _task_external_deps(task: dict) -> list[str]:
-    """Return *task*'s ``metadata.external_deps`` as canonical wire strings.
-
-    THE single seam every scheduler external_deps read routes through
-    (task 2167 — W3-δ SEAM A).  Delegates to the shared, versioned
-    ``shared.task_metadata.parse_metadata`` parser instead of the old untyped
-    ``(task.get('metadata') or {}).get('external_deps') or []`` idiom, which
-    ``AttributeError``s on JSON-string metadata (str has no ``.get``).
-
-    ``direction='read'`` makes this best-effort — it never raises, even on
-    corrupt/unparseable metadata — so a bad historical metadata row cannot
-    break a scheduler dispatch tick (matches the scheduler's existing
-    fail-safe philosophy).
-
-    The return value stays ``list[str]`` — the canonical "project_id:task_id"
-    wire form fed to ``get_external_statuses`` / the external-status cache —
-    and is intentionally NOT converted to ``list[ExternalDep]`` (PRD Open
-    Question #4): a malformed dep must still reach ``get_external_statuses``
-    so it can resolve to the ``malformed`` sentinel and escalate, which
-    pre-filtering with ``ExternalDep.parse`` would silently prevent.
-    """
-    metadata, _warnings = parse_metadata(task.get('metadata'), direction='read')
-    return metadata.external_deps
-
-
 def train_order_key(task: Mapping[str, Any]) -> tuple[int, int]:
     """A declared-train member's place in its train, root to tip: ascending
     ``metadata.train.order``, with a missing or non-integer order last.  A
@@ -2196,13 +2172,13 @@ class Scheduler:
     _TICK_PHASE_ORDER: tuple[str, ...] = (
         'backfill_dep_status',
         'backfill_terminal_dep_records',
-        'drain_park_eviction',
-        'park_gc',
         'stale_sweep',
         'cooldown_gc',
         'redispatch_stranded_blocked',
         'external_dep_policy',
         'delivered_check_gate',
+        'drain_park_eviction',
+        'park_gc',
         'stamp_milestone',
         'override_snapshot_gc',
         'compute_priorities',
@@ -3776,7 +3752,7 @@ class Scheduler:
             # tolerance window should raise max_external_dep_unresolved_cycles.
             for task in pending_tasks:
                 task_id = str(task.get('id', '?'))
-                external_deps: list = _task_external_deps(task)
+                external_deps: list = task_external_deps(task)
                 if not external_deps:
                     continue
                 count = self._streak_resolver_degraded.bump(task_id)
@@ -3829,7 +3805,7 @@ class Scheduler:
 
         for task in pending_tasks:
             task_id = str(task.get('id', '?'))
-            external_deps: list = _task_external_deps(task)
+            external_deps: list = task_external_deps(task)
             # Resolver succeeded this tick → reset the resolver-degraded
             # consecutive-tick streak so only CONSECUTIVE degraded ticks count
             # toward escalation.  A transient blip that self-heals never
@@ -4891,191 +4867,18 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
     ) -> bool:
-        """Return True if every dependency of *task* is in a terminal status.
+        """The boolean view of ``dependency_verdict.py::deps_verdict``: True iff SATISFIED.
 
-        A dep is satisfied when its status is in :data:`TERMINAL_STATUSES`
-        (``done`` or ``cancelled``).  ``cancelled`` represents an obsolete
-        or duplicate task and should not block its dependents — the
-        dependent re-architects against current main and either finds the
-        work already merged or escalates for a different reason.
-
-        **Intra-train allowance (PRD § 9.3):** when *tasks_by_id* is supplied,
-        a dep in status ``merge-deferred`` is also treated as satisfied provided
-        that BOTH the dependent (*task*) and the dep carry ``metadata.train.id``
-        AND their train IDs match.  This allows the next member of an atomic
-        train to dispatch as soon as its predecessor has been parked by the
-        merge-deferred gate, without waiting for a full ``done`` transition.
-
-        When *tasks_by_id* is ``None`` (the default), the allowance is disabled
-        and behaviour is byte-identical to today — ``merge-deferred`` blocks like
-        any other non-terminal status.  This preserves backward compatibility for
-        the existing unit tests (TestDepsSatisfied, TestDepsSatisfiedLogging) and
-        any external callers that don't pass the new parameter.
-
-        The allowance also requires the dep record to be present in *tasks_by_id*.
-        A missing dep (stale snapshot) is treated conservatively as blocking.
-
-        **Cross-project external dep gate:** when *external_status_cache* is not
-        ``None``, after all local deps are satisfied the method checks
-        ``task.metadata.external_deps``.  An external dep is satisfied iff its
-        status in the cache is exactly ``'done'``.  Any other value (live status,
-        sentinel, missing from cache) is NOT satisfied.  When
-        *external_resolver_failed* is ``True``, all external deps are treated as
-        not satisfied regardless of the cache (fail-safe wait).
-
-        **Delivered-check gate (capability-delivered-checks PRD, task delta):**
-        when *delivered_check_cache* is not ``None`` AND *tasks_by_id* is
-        supplied, each TERMINAL (done/cancelled) local dep whose record in
-        *tasks_by_id* carries a truthy ``metadata.delivered_checks`` must
-        also resolve to exactly ``True`` in *delivered_check_cache* (keyed by
-        dep task id) to count as satisfied — this applies to a ``cancelled``
-        dep just as much as a ``done`` one, since the check trusts the state
-        of ``main``, not the status label.  A dep absent from the cache
-        (errored, over budget, or not yet evaluated this tick) is NOT
-        satisfied (fail-safe wait).  A dep whose record carries no
-        ``metadata.delivered_checks`` is never consulted — byte-identical.
-
-        **``terminal_dep_records`` fallback (task 2692, δ/ε follow-up):**
-        the active-only ``get_tasks`` fetch that seeds *tasks_by_id*
-        excludes DONE/CANCELLED tasks, so a just-completed dep is often
-        genuinely ABSENT from *tasks_by_id* even though its TERMINAL
-        status is already in *status_map*.  When the delivered-check arm's
-        ``tasks_by_id.get(dep_id)`` misses (``None``) and
-        *terminal_dep_records* is not ``None``, the dep record is looked up
-        there instead — a purely ADDITIVE fallback consulted ONLY in this
-        arm (never the intra-train merge-deferred allowance above, which
-        deals exclusively with non-terminal deps already present in
-        *tasks_by_id*).  If the dep is present in *tasks_by_id*,
-        *terminal_dep_records* is never consulted (*tasks_by_id* wins).  If
-        the dep is absent from BOTH, the arm skips it exactly as before —
-        byte-identical when *terminal_dep_records* is ``None``/omitted.
-
-        Defaulting all four new parameters to ``None``/``False`` makes the
-        legacy 3-arg call from ``_park_gc`` and all existing tests
-        byte-identical. Side effects (escalation, counter increments) MUST
-        NOT live here — this method is a pure predicate called from
-        multiple sites.
-
-        Handles three dependency formats:
-          - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
-          - integer: ``1``
-          - string: ``'1'``
-
-        Emits a DEBUG log when a dependency blocks dispatch, naming the dep
-        ID and its current status to aid diagnosis of premature-dispatch issues.
-        Emits a separate DEBUG log when the intra-train allowance fires.
+        Dispatch reads this view, so an UNKNOWN dependency waits exactly as an
+        UNSATISFIED one does.
         """
-        deps = task.get('dependencies', [])
-        task_id = str(task.get('id', '?'))
-        # Resolve this task's train id once (None if not a train member).
-        # Coerce empty string to None so that '' does not accidentally match
-        # another task whose id is also '' (ill-formed but defensively handled).
-        task_train = (task.get('metadata') or {}).get('train')
-        task_train_id: str | None = (
-            task_train.get('id') or None if isinstance(task_train, dict) else None
-        )
-        for d in deps:
-            dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
-            dep_status = status_map.get(dep_id, 'unknown')
-            if dep_status in TERMINAL_STATUSES:
-                continue
-            # Intra-train allowance: merge-deferred predecessor in same train.
-            if (
-                dep_status == 'merge-deferred'
-                and task_train_id is not None
-                and tasks_by_id is not None
-            ):
-                dep_task = tasks_by_id.get(dep_id)
-                if dep_task is not None:
-                    dep_train = (dep_task.get('metadata') or {}).get('train')
-                    # Coerce empty string to None (see task_train_id note above).
-                    dep_train_id: str | None = (
-                        dep_train.get('id') or None if isinstance(dep_train, dict) else None
-                    )
-                    if dep_train_id == task_train_id:
-                        logger.debug(
-                            'Task %s: intra-train dep satisfied: dep=%s train_id=%s',
-                            task_id,
-                            dep_id,
-                            task_train_id,
-                        )
-                        continue
-            logger.debug(
-                'Task %s blocked: dep %s has status %s, '
-                'need done or cancelled',
-                task_id,
-                dep_id,
-                dep_status,
-            )
-            return False
-
-        # External-dep gate (cross-project).  Only active when the cache is
-        # supplied (not None) — defaults reproduce byte-identical legacy behaviour.
-        if external_status_cache is not None:
-            external_deps: list = _task_external_deps(task)
-            for ext_dep in external_deps:
-                if external_resolver_failed:
-                    logger.debug(
-                        'Task %s blocked: external dep %r not checked '
-                        '(resolver failed — fail-safe wait)',
-                        task_id,
-                        ext_dep,
-                    )
-                    return False
-                ext_status = external_status_cache.get(ext_dep)
-                if ext_status != 'done':
-                    logger.debug(
-                        'Task %s blocked: external dep %r has status %r, '
-                        'need done',
-                        task_id,
-                        ext_dep,
-                        ext_status,
-                    )
-                    return False
-
-        # Delivered-check gate (capability-delivered-checks PRD, task delta).
-        # Only active when the cache is supplied (not None) AND tasks_by_id
-        # is available to look up each dep's metadata — defaults reproduce
-        # byte-identical legacy behaviour.  Only a TERMINAL local dep that
-        # itself carries a truthy metadata.delivered_checks is consulted; a
-        # dep without the metadata is never looked up in the cache.
-        if delivered_check_cache is not None and tasks_by_id is not None:
-            for d in deps:
-                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
-                dep_status = status_map.get(dep_id, 'unknown')
-                if dep_status not in TERMINAL_STATUSES:
-                    continue
-                dep_task = tasks_by_id.get(dep_id)
-                if dep_task is None and terminal_dep_records is not None:
-                    # Fallback (task 2692): the active-only get_tasks fetch
-                    # excludes this TERMINAL dep from tasks_by_id — consult
-                    # the per-tick backfilled record instead. Only reached
-                    # when tasks_by_id genuinely misses (tasks_by_id wins).
-                    dep_task = terminal_dep_records.get(dep_id)
-                if dep_task is None:
-                    # Conscious fail-OPEN, not a gap: see the identical
-                    # skip site in _compute_delivered_check_cache (task
-                    # 2692, reviewer_comprehensive robustness amendment)
-                    # for the full rationale. In short — an unreadable
-                    # record (fetch failed in
-                    # _phase_backfill_terminal_dep_records, which logs a
-                    # bounded WARNING for it) means this dep is simply
-                    # never gated here, rather than fail-safe-blocking a
-                    # dependent whose dep record may never be fetchable.
-                    continue
-                dep_checks = (dep_task.get('metadata') or {}).get('delivered_checks')
-                if not dep_checks:
-                    continue
-                if delivered_check_cache.get(dep_id) is not True:
-                    logger.debug(
-                        'Task %s blocked: dep %s delivered_checks not confirmed on '
-                        'main (cache=%r)',
-                        task_id,
-                        dep_id,
-                        delivered_check_cache.get(dep_id),
-                    )
-                    return False
-        return True
+        return deps_verdict(
+            task, status_map, tasks_by_id,
+            external_status_cache=external_status_cache,
+            external_resolver_failed=external_resolver_failed,
+            delivered_check_cache=delivered_check_cache,
+            terminal_dep_records=terminal_dep_records,
+        ).satisfied
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
         """Return the signal label if *task* carries a dispatch-cooldown signal.
@@ -5256,9 +5059,9 @@ class Scheduler:
         Pure predicate — sibling to :meth:`_deferred_watch_gated`.  Reads the
         RAW ``metadata.milestone`` dict directly, NOT the heavier
         :func:`~shared.task_metadata.parse_metadata` pipeline used by
-        :func:`_task_external_deps`: the α ``Milestone`` model-validator and
-        δ's submit guard already validate at write time, so this gate is
-        defense-in-depth, not the primary validation path.
+        ``dependency_verdict.py::task_external_deps``: the α ``Milestone``
+        model-validator and δ's submit guard already validate at write time,
+        so this gate is defense-in-depth, not the primary validation path.
 
         Modes (``metadata.milestone['mode']``):
         - ``'dated'``: withhold while ``now_wall < milestone['at']``.
@@ -5463,23 +5266,22 @@ class Scheduler:
         to :meth:`_deps_satisfied` for the cross-project external dep gate.
         When both default (``None``/``False``), the external gate is skipped —
         behaviour is byte-identical to the pre-external-dep implementation.
-        The ``_park_gc`` call site does NOT pass these params (preserving
-        park-GC semantics, scope containment per design decision 4).
 
         *delivered_check_cache* is forwarded to :meth:`_deps_satisfied` for
         the delivered-check dep-gate (capability-delivered-checks PRD, task
         delta).  When ``None`` (the default), the gate is skipped —
-        byte-identical to the pre-delivered-check implementation.  The
-        ``_park_gc`` call site does NOT pass this param either (same scope
-        containment as the external cache).
+        byte-identical to the pre-delivered-check implementation.
 
         *terminal_dep_records* is forwarded to :meth:`_deps_satisfied` as the
         additive fallback source for a TERMINAL dep missing from
         *tasks_by_id* (task 2692, δ/ε follow-up — the active-only
         ``get_tasks`` fetch excludes done/cancelled producers). When ``None``
         (the default), the fallback is inert — byte-identical to before this
-        param existed. The ``_park_gc`` call site does NOT pass this param
-        either (same scope containment as the external cache).
+        param existed.
+
+        Park GC evaluates the same three caches through
+        ``dependency_verdict.py::deps_verdict`` (task 6518), so it and
+        dispatch read one dependency predicate.
 
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
@@ -5598,7 +5400,7 @@ class Scheduler:
         block same-tier installs (INV-3) until release, which is where
         partial installs came from.  ``Scheduler.release`` keeps its
         defensive clear only for parks installed AFTER dispatch, e.g. a
-        reserve_now armed on a running task.
+        park rehydrated at startup for a task that is already running.
         """
         self._skip_count.pop(task_id, None)
         self._streak_park_install_blocked.clear(task_id)
@@ -6129,7 +5931,7 @@ class Scheduler:
                     pin_queue_changed = True
 
             # --- reserve_now diffs (False→True only; True→False is handled by
-            # --- reserve_now_consumed at the short-circuit emit site)
+            # --- reserve_now_consumed / reserve_now_refused at the short-circuit)
             prev_rn = prev_row.reserve_now if prev_row else False
             cur_rn = cur_row.reserve_now if cur_row else False
             if not prev_rn and cur_rn:
@@ -6155,44 +5957,18 @@ class Scheduler:
                 data={'new_order': new_order},
             )
 
-    def _owner_is_live_dispatchable(
-        self,
-        task_id: str,
-        status_map: dict[str, str],
-        tasks_by_id: dict[str, Any],
-    ) -> bool:
-        """Return True iff *task_id* is a live, dispatchable task.
-
-        Logical INVERSE of the _park_gc reclaimability predicate
-        (scheduler.py:2996-3002): an owner is live-dispatchable iff
-        its status is not terminal AND it is present in tasks_by_id AND
-        all its deps are satisfied.
-
-        Used by the D4 guard in _drain_park_eviction_requests to refuse
-        force_clear on an owner the scheduler still considers legitimately
-        held — preventing re-introduction of the df-1865 destructive-eviction
-        starvation.
-        """
-        if status_map.get(task_id) in TERMINAL_STATUSES:
-            return False
-        if task_id not in tasks_by_id:
-            return False
-        return self._deps_satisfied(tasks_by_id[task_id], status_map, tasks_by_id)
-
-    def _drain_park_eviction_requests(
-        self,
-        status_map: dict[str, str],
-        tasks_by_id: dict[str, Any],
-    ) -> None:
+    def _drain_park_eviction_requests(self, ctx: TickContext) -> None:
         """Drain queued park-eviction requests and apply force_clear for dead owners.
 
-        Called once per acquire_next tick BEFORE the owner-state park-GC sweep
-        so the operator audit event (reservation_force_evicted) wins over
-        park-GC's reservation_expired for the same dead owner.
+        Called once per acquire_next tick immediately ahead of the owner-state
+        park-GC sweep so the operator audit event (reservation_force_evicted)
+        wins over park-GC's reservation_expired for the same dead owner.
 
-        D4 guard: if the owner is still a live dispatchable task, the row is
-        consumed (one-shot) but force_clear is NOT applied — a
-        reservation_force_evict_refused event is emitted instead.
+        D4 guard (df-1865 destructive-eviction starvation): if the owner may
+        still hold parks (:meth:`_park_hold_refusal` names no refusal), the
+        row is consumed (one-shot) but force_clear is NOT applied — a
+        reservation_force_evict_refused event is emitted instead.  The lever
+        is therefore refused for exactly the owners park GC keeps.
 
         For each drained task_id (dead owner):
           - force_clear + pop _skip_count
@@ -6202,9 +5978,8 @@ class Scheduler:
         if not self._park_eviction_store:
             return
         for task_id in self._park_eviction_store.drain(self._project_root):
-            # D4 guard: refuse eviction of a live, dispatchable owner.
             source = self.lock_table.reservation_source(task_id)
-            if self._owner_is_live_dispatchable(task_id, status_map, tasks_by_id):
+            if self._park_hold_refusal(ctx, task_id) is None:
                 self._emit_reservation(
                     EventType.reservation_force_evict_refused,
                     task_id,
@@ -6713,45 +6488,79 @@ class Scheduler:
     async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
         """Hygiene: drain queued operator force-evict requests.
 
-        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
-        ctx (mutates the park-eviction store + lock table directly via
-        ``_drain_park_eviction_requests``). Runs BEFORE the automatic
-        park-GC sweep so operator-lever evictions emit
-        reservation_force_evicted (not reservation_expired) for the same
-        dead owner. Always continues.
+        Reads: the same ctx fields as ``park_gc``, through the park-hold
+        predicate. Writes: none on ctx (mutates the park-eviction store +
+        lock table directly via ``_drain_park_eviction_requests``). Runs
+        immediately ahead of ``park_gc``, so an operator eviction emits
+        reservation_force_evicted rather than being pre-empted by
+        reservation_expired for the same owner. Always continues.
         """
-        self._drain_park_eviction_requests(ctx.status_map, ctx.tasks_by_id)
+        self._drain_park_eviction_requests(ctx)
         return _CONTINUE
 
     async def _phase_park_gc(self, ctx: TickContext) -> object:
         """Hygiene: owner-state park-GC sweep.
 
-        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
-        ctx (mutates ``self.lock_table``/``self._skip_count`` and emits
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``, ``ctx.external_cache``,
+        ``ctx.external_resolver_failed``, ``ctx.delivered_check_cache``,
+        ``ctx.terminal_dep_records``. Writes: none on ctx (mutates
+        ``self.lock_table``/``self._skip_count`` and emits
         reservation_expired/reservation_restored events). Replaces the
-        wall-clock lease mechanic: a park whose owner is terminal /
-        missing / deps-unsatisfied has no reason to keep blocking other
-        tasks, so it's evicted now. Always continues.
+        wall-clock lease mechanic: every park whose owner fails the
+        park-hold predicate (:meth:`_park_hold_refusal`) is expired now, and
+        the owner's skip count goes with it. Runs after
+        ``external_dep_policy`` and ``delivered_check_gate``, so the
+        dependency arm sees this tick's caches, and before ``reserve_now``
+        and the dispatch loops, so neither builds on a dead park. Always
+        continues.
         """
-        for owner in self._expire_parks(partial(self._park_gc_reason, ctx)):
+        for owner in self._expire_parks(partial(self._park_hold_refusal, ctx)):
             self._skip_count.pop(owner, None)
         return _CONTINUE
 
-    def _park_gc_reason(self, ctx: TickContext, owner: str) -> str | None:
-        """Why park GC expires *owner*'s parks, or None to keep them.
+    def _park_hold_refusal(self, ctx: TickContext, owner: str) -> str | None:
+        """The park-hold predicate: why *owner* may not hold parks, or None if it may.
 
-        ``'terminal:<status>'``, ``'missing'`` (absent from the task read) or
-        ``'deps_unsatisfied'`` — an owner in any of these has no reason to keep
-        blocking other tasks.
+        An owner may hold parks, pin reservations included, iff it is pending
+        and its dependencies are not known to be unsatisfied (esc-6040-7
+        D1/D2).  The status test is an allowlist, so any status other than
+        pending fails closed.  This is THE home of the owner-state
+        ``reservation_expired`` reason vocabulary, first match wins:
+
+        - ``'terminal:<status>'`` — done or cancelled;
+        - ``'missing'`` — absent from this tick's task read;
+        - ``'not_pending:<status>'`` — any other non-pending status;
+        - ``'deps_unsatisfied'`` — a local dependency is unsatisfied;
+        - ``'deps_unsatisfied:external'`` — the resolver reports a
+          cross-project dependency other than done;
+        - ``'deps_unsatisfied:delivered_check'`` — a dependency's delivered
+          check ran and failed.
+
+        A dependency that is merely UNKNOWN this tick keeps the parks:
+        expiry needs affirmative evidence
+        (``dependency_verdict.py::deps_verdict``).  Park GC expires on this
+        predicate; the operator eviction drain and ``reserve_now`` consult
+        the same one.
         """
         status = ctx.status_map.get(owner)
         if status in TERMINAL_STATUSES:
             return f'terminal:{status}'
         if owner not in ctx.tasks_by_id:
             return 'missing'
-        if not self._deps_satisfied(ctx.tasks_by_id[owner], ctx.status_map, ctx.tasks_by_id):
+        if status != TaskStatus.PENDING:
+            return f'not_pending:{status}'
+        verdict = deps_verdict(
+            ctx.tasks_by_id[owner], ctx.status_map, ctx.tasks_by_id,
+            external_status_cache=ctx.external_cache,
+            external_resolver_failed=ctx.external_resolver_failed,
+            delivered_check_cache=ctx.delivered_check_cache,
+            terminal_dep_records=ctx.terminal_dep_records,
+        )
+        if verdict.state is not DepState.UNSATISFIED:
+            return None
+        if verdict.kind is DepKind.LOCAL:
             return 'deps_unsatisfied'
-        return None
+        return f'deps_unsatisfied:{verdict.kind}'
 
     def _expire_parks(
         self,
@@ -7309,7 +7118,8 @@ class Scheduler:
         issues ONE ``get_external_statuses`` call (zero deps → zero
         calls). The per-tick cache is forwarded to ``_eligible_for_dispatch``
         at both call sites below (``_phase_build_candidates`` /
-        ``_phase_select_pins``); ``_apply_external_dep_policy`` runs the
+        ``_phase_select_pins``) and read by park GC and the park-eviction
+        drain through ``_park_hold_refusal``; ``_apply_external_dep_policy`` runs the
         side-effecting pass (counter increments, escalation callbacks)
         exactly once per tick, wrapped in try/except so a policy-pass
         failure degrades to fail-safe-wait instead of aborting the tick.
@@ -7319,7 +7129,7 @@ class Scheduler:
             (t, deps)
             for t in ctx.tasks
             if t.get('status') == 'pending'
-            and (deps := _task_external_deps(t))
+            and (deps := task_external_deps(t))
         ]
         _pending_tasks_with_ext: list[dict] = [t for t, _ in _pending_ext_deps]
         _ext_dep_union: list[str] = list({
@@ -7356,7 +7166,8 @@ class Scheduler:
         Writes: ``ctx.delivered_check_cache``. Runs immediately after
         ``external_dep_policy`` and before either candidate-dispatch loop
         (``build_candidates`` / ``select_pins``), both of which forward the
-        cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``.
+        cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``; park GC
+        and the park-eviction drain read it through ``_park_hold_refusal``.
         ``_compute_delivered_check_cache`` already collects the relevant
         (terminal, checked) deps internally — a dep-free or check-free
         pending task is a no-op for it — so this phase simply forwards all
@@ -7458,91 +7269,90 @@ class Scheduler:
     async def _phase_reserve_now(self, ctx: TickContext) -> object:
         """Snapshot pre-short-circuit overrides, then reserve-now.
 
-        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
-        ``ctx.effective_priorities`` (parks install at, or an owner's
-        lower-tier park is raised to, the effective tier).
-        Writes: ``ctx.overrides_for_diff`` (snapshot BEFORE the
-        short-circuit below), then mutates ``ctx.overrides`` in place via
-        the reserve-now short-circuit: for any task with reserve_now=1,
-        eagerly install parks on its modules then clear the flag. This is
-        single-tick fire-and-forget — the parks survive until the owner-GC
-        sweep evicts them (owner goes terminal/missing or its deps lapse).
-        Always continues.
+        Reads: ``ctx.overrides``, the ctx fields the park-hold predicate
+        (:meth:`_park_hold_refusal`) reads, and ``ctx.effective_priorities``
+        (parks install at, or an owner's lower-tier park is raised to, the
+        effective tier).  Writes: ``ctx.overrides_for_diff`` (snapshot
+        BEFORE the short-circuit below), then mutates ``ctx.overrides`` in
+        place via the reserve-now short-circuit: every armed flag is
+        consumed this tick.  reserve_now installs parks only for an owner
+        the park-hold predicate accepts; any other owner is refused with
+        ``reserve_now_refused`` {reason} and nothing installs (esc-6040-7
+        D6, restoring task 1229's stated intent).  The parks then live as
+        long as that predicate holds.  Always continues.
         """
         ctx.overrides_for_diff = dict(ctx.overrides)
+        store = self._override_store
+        if store is None:
+            return _CONTINUE
 
-        if self._override_store:
-            for rid, rrow in list(ctx.overrides.items()):
-                if not rrow.reserve_now:
-                    continue
-                if rid not in ctx.tasks_by_id:
-                    continue
-                if ctx.status_map.get(rid) in TERMINAL_STATUSES:
-                    continue
-                r_task = ctx.tasks_by_id[rid]
-                r_modules = self._get_modules(r_task)
-                r_tier = ctx.effective_priorities.get(
-                    rid, coerce_tier(r_task.get('priority'))
+        for rid, rrow in list(ctx.overrides.items()):
+            if not rrow.reserve_now:
+                continue
+            refusal = self._park_hold_refusal(ctx, rid)
+            if refusal is not None:
+                self._consume_reserve_now(store, ctx, rid)
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.reserve_now_refused,
+                        task_id=rid,
+                        data={'reason': refusal},
+                    )
+                continue
+            r_task = ctx.tasks_by_id[rid]
+            r_modules = self._get_modules(r_task)
+            r_tier = ctx.effective_priorities.get(
+                rid, coerce_tier(r_task.get('priority'))
+            )
+            # Consume the flag BEFORE installing parks.  The opposite order
+            # risks a duplicate reserve_now_consumed event if the clear
+            # fails after a successful install, whereas a re-run install
+            # is harmless: ModuleLockTable.install_parks is idempotent per
+            # owner.
+            #
+            # In-process exceptions from install_parks are handled separately:
+            # the flag is restored via set_override so the next tick retries.
+            self._consume_reserve_now(store, ctx, rid)
+            try:
+                installed, _evicted = self.lock_table.install_parks(
+                    rid, r_modules, r_tier
                 )
-                # Clear the flag BEFORE installing parks.  The opposite order
-                # risks a duplicate reserve_now_consumed event if the clear
-                # fails after a successful install, whereas a re-run install
-                # is harmless: ModuleLockTable.install_parks is idempotent per
-                # owner.
-                #
-                # In-process exceptions from install_parks are handled separately:
-                # the flag is restored via set_override so the next tick retries.
-                self._override_store.clear_override(
-                    self._project_root, rid, field='reserve_now'
+                if self.event_store and installed:
+                    self.event_store.emit(
+                        EventType.reserve_now_consumed,
+                        task_id=rid,
+                        data={'modules': installed, 'priority': r_tier},
+                    )
+            except Exception:
+                logger.warning(
+                    'reserve_now: install_parks failed for task %s; restoring reserve_now flag',
+                    rid,
+                    exc_info=True,
                 )
                 try:
-                    installed, _evicted = self.lock_table.install_parks(
-                        rid, r_modules, r_tier
-                    )
-                    if self.event_store and installed:
-                        self.event_store.emit(
-                            EventType.reserve_now_consumed,
-                            task_id=rid,
-                            data={'modules': installed, 'priority': r_tier},
-                        )
-                    # Reflect the cleared flag in the in-memory snapshot so
-                    # downstream diff-detection doesn't spuriously re-emit for
-                    # this tick.
-                    ctx.overrides[rid] = OverrideRow(
-                        boost_tier=rrow.boost_tier,
-                        pinned=rrow.pinned,
-                        pin_order=rrow.pin_order,
-                        reserve_now=False,
-                        ttl_until=rrow.ttl_until,
-                    )
+                    store.set_override(self._project_root, rid, reserve_now=True)
                 except Exception:
+                    # Restore failed — the store still holds the consumed
+                    # flag, and so does ctx.overrides, so the diff-layer
+                    # does not fabricate a spurious priority_override_cleared
+                    # event next tick.
                     logger.warning(
-                        'reserve_now: install_parks failed for task %s; restoring reserve_now flag',
+                        'reserve_now: failed to restore reserve_now flag for task %s',
                         rid,
                         exc_info=True,
                     )
-                    try:
-                        self._override_store.set_override(
-                            self._project_root, rid, reserve_now=True
-                        )
-                    except Exception:
-                        logger.warning(
-                            'reserve_now: failed to restore reserve_now flag for task %s',
-                            rid,
-                            exc_info=True,
-                        )
-                        # Restore failed — DB still holds reserve_now=False (cleared
-                        # above).  Mirror that in memory so the diff-layer doesn't
-                        # fabricate a spurious priority_override_cleared event next tick.
-                        ctx.overrides[rid] = OverrideRow(
-                            boost_tier=rrow.boost_tier,
-                            pinned=rrow.pinned,
-                            pin_order=rrow.pin_order,
-                            reserve_now=False,
-                            ttl_until=rrow.ttl_until,
-                        )
-                    continue
+                else:
+                    ctx.overrides[rid] = rrow
         return _CONTINUE
+
+    def _consume_reserve_now(self, store: OverrideStore, ctx: TickContext, rid: str) -> None:
+        """Clear *rid*'s stored reserve_now flag and mirror it in ``ctx.overrides``.
+
+        The in-memory mirror keeps this tick's diff-detection from re-emitting
+        for the consumed flag.
+        """
+        store.clear_override(self._project_root, rid, field='reserve_now')
+        ctx.overrides[rid] = replace(ctx.overrides[rid], reserve_now=False)
 
     async def _phase_override_diff(self, ctx: TickContext) -> object:
         """Diff-detect override changes and emit events.
@@ -7901,8 +7711,10 @@ class Scheduler:
         cap keeps this tick's heads first, and a displaced pin is outranked by
         the head's pin rank on every key they share.  (Pins with no stored
         pin_order tie at one rank, so there the shared key waits for the
-        head's next completion.)  Terminal, missing and deps-unsatisfied
-        owners are park GC's, earlier in the tick.
+        head's next completion.)  Owners that fail the park-hold predicate
+        (:meth:`_park_hold_refusal`) lost every park, pin entries included, in
+        park GC earlier in the tick; completion runs only for an owner that
+        is still a dispatch candidate.
         """
         owners = self.lock_table.snapshot_pin_reservations()
         if not owners:
@@ -7937,51 +7749,72 @@ class Scheduler:
         While a pin reservation covered a module, the owner's top-skips parked
         nothing more there: the pin entry already covered it
         (:meth:`ModuleLockTable.unparked_modules`).  Once the pin reservation
-        is gone, an owner whose skip count has reached its tier's threshold
-        completes those fairness parks now, through the ordinary rule, rather
-        than leaving the modules open until it is next top-skipped.  An owner
-        below the threshold, or absent from this tick's tasks, is left alone.
+        is gone, an owner that is still a dispatch candidate this tick
+        (:meth:`_dispatch_candidacy`) and whose skip count has reached its
+        tier's threshold completes those fairness parks now, through the
+        ordinary rule, rather than leaving the modules open until it is next
+        top-skipped.  An owner below the threshold, or no dispatch candidate,
+        is left alone: no later skip would park for a non-candidate either
+        (esc-6040-7 D5).  The gate is candidacy, not the release reason,
+        which is first-match and can read ``unpinned`` or
+        ``pin_reservations_disabled`` for an ineligible owner.
         """
-        task = ctx.tasks_by_id.get(task_id)
-        if task is None:
+        candidate, _signal = self._dispatch_candidacy(ctx, task_id)
+        if not candidate:
             return
+        task = ctx.tasks_by_id[task_id]
         tier = ctx.effective_priorities.get(task_id, coerce_tier(task.get('priority')))
         skip_count = self._skip_count.get(task_id, 0)
         if skip_count < self.config.fairness.skip_threshold_for(tier):
             return
         self._complete_parks(task_id, self._get_modules(task), tier, skip_count=skip_count)
 
+    def _dispatch_candidacy(self, ctx: TickContext, tid: str) -> tuple[bool, str | None]:
+        """Whether *tid* is a dispatch candidate this tick, with its cooldown signal.
+
+        A candidate is in ``ctx.tasks_by_id``, passes
+        :meth:`_eligible_for_dispatch` with this tick's caches (the same
+        helper as the scored loop, so a new gate reaches every path) and is
+        not landed-outbox gated.
+        """
+        task = ctx.tasks_by_id.get(tid)
+        if task is None:
+            return False, None
+        eligible, signal = self._eligible_for_dispatch(
+            task, tid, ctx.status_map, ctx.tasks_by_id,
+            external_status_cache=ctx.external_cache,
+            external_resolver_failed=ctx.external_resolver_failed,
+            delivered_check_cache=ctx.delivered_check_cache,
+            terminal_dep_records=ctx.terminal_dep_records,
+        )
+        if not eligible:
+            return False, None
+        if tid in ctx.gated_ids:
+            # Landed-outbox gate (task 2156, SD-1/B5): this task's merge
+            # already landed on main and is being driven to done inline —
+            # skip it here too so the pin paths and the scored loop share
+            # the one gated_ids source of truth.
+            return False, None
+        return True, signal
+
     def _pin_queue(self, ctx: TickContext) -> list[_PinCandidate]:
         """Pinned tasks that may dispatch this tick, in pin_order ASC.
 
-        A pin is queued when its override row is pinned, its task is in
-        ``ctx.tasks_by_id``, it passes :meth:`_eligible_for_dispatch` (the
-        same helper as the scored loop, so a new gate reaches both paths)
-        and it is not landed-outbox gated.  A row with no stored pin_order
-        counts as 0; ties keep the override store's row order, as they did
-        before task 6040.  This order is the only one the pin phase uses:
-        it picks the heads and the reservations the cap keeps.
+        A pin is queued when its override row is pinned and its task is a
+        dispatch candidate (:meth:`_dispatch_candidacy`).  A row with no
+        stored pin_order counts as 0; ties keep the override store's row
+        order, as they did before task 6040.  This order is the only one the
+        pin phase uses: it picks the heads and the reservations the cap
+        keeps.
         """
         queue: list[_PinCandidate] = []
         for tid, row in ctx.overrides.items():
-            if not row.pinned or tid not in ctx.tasks_by_id:
+            if not row.pinned:
+                continue
+            candidate, signal = self._dispatch_candidacy(ctx, tid)
+            if not candidate:
                 continue
             task = ctx.tasks_by_id[tid]
-            eligible, signal = self._eligible_for_dispatch(
-                task, tid, ctx.status_map, ctx.tasks_by_id,
-                external_status_cache=ctx.external_cache,
-                external_resolver_failed=ctx.external_resolver_failed,
-                delivered_check_cache=ctx.delivered_check_cache,
-                terminal_dep_records=ctx.terminal_dep_records,
-            )
-            if not eligible:
-                continue
-            if tid in ctx.gated_ids:
-                # Landed-outbox gate (task 2156, SD-1/B5): this pinned
-                # task's merge already landed on main and is being driven
-                # to done inline — skip it here too so the pin loop and
-                # the scored loop share the one gated_ids source of truth.
-                continue
             queue.append(_PinCandidate(
                 task_id=tid,
                 task=task,
@@ -8239,11 +8072,10 @@ class Scheduler:
         )
         if tasks is None:
             # fm read FAILURE (survey finding C3) — do NOT drain.  Draining
-            # here would call _drain_park_eviction_requests({}, {}), and with
-            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
-            # returns False for EVERY task_id (not in tasks_by_id), bypassing
-            # the D4 live-owner guard and force-evicting still-live owners
-            # during exactly an fm outage/restart.  Defer instead — the next
+            # here would run on an empty TickContext, where the park-hold
+            # predicate reads EVERY owner as 'missing', bypassing the D4
+            # live-owner guard and force-evicting still-live owners during
+            # exactly an fm outage/restart.  Defer instead — the next
             # successful tick will drain any still-queued requests safely.
             self._note_fm_read_failure()
             self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None)
@@ -8251,13 +8083,15 @@ class Scheduler:
         self._reset_fm_read_failure_streak()
         if not tasks:
             # Genuine EMPTY project (not a failure) — drain queued
-            # park-eviction requests even though no active tasks exist. With
-            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
-            # returns False for all task_ids (not in tasks_by_id) — all queued
-            # evictions are processed.  Without this, an operator-enqueued
-            # eviction for a stranded park sits in the table indefinitely until
-            # some active task happens to appear and trigger a normal tick.
-            self._drain_park_eviction_requests({}, {})
+            # park-eviction requests even though no active tasks exist. On an
+            # empty TickContext the park-hold predicate reads every owner as
+            # 'missing' — all queued evictions are processed.  Without this,
+            # an operator-enqueued eviction for a stranded park sits in the
+            # table indefinitely until some active task happens to appear and
+            # trigger a normal tick.
+            self._drain_park_eviction_requests(
+                TickContext(tasks=[], status_map={}, tasks_by_id={})
+            )
             self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None)
             return None
 
@@ -8974,8 +8808,8 @@ class Scheduler:
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: dispatch already settled this task's parks, so this only
-        # clears parks installed after dispatch (e.g. a reserve_now armed on
-        # a running task).
+        # clears parks installed after dispatch (e.g. a park rehydrated at
+        # startup for a task that is already running).
         restored_pairs = self.lock_table.clear_parks_for(task_id)
         if modules:
             self._emit_lock_event(
