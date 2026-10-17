@@ -47,6 +47,10 @@ from orchestrator.verify import VerifyResult, confirm_isolated_rerun_verdict
 PROBE_REL = 'pkg/tests/test_probe.py'
 PROBE_NODE_ID = f'{PROBE_REL}::test_ok'
 
+#: A probe that requests xdist's ``worker_id`` fixture.
+WORKER_ID_PROBE_REL = 'pkg/tests/test_probe_worker_id.py'
+WORKER_ID_PROBE_NODE_ID = f'{WORKER_ID_PROBE_REL}::test_uses_worker_id'
+
 
 def _make_worktree(tmp_path: Path) -> Path:
     """A minimal on-disk worktree carrying one PASSING test.
@@ -112,16 +116,16 @@ def _module_config() -> ModuleConfig:
     )
 
 
-def _failing_result() -> VerifyResult:
+def _failing_result(*, node_id: str = PROBE_NODE_ID) -> VerifyResult:
     """The load-shed failure the merge gate is asking the discriminator about."""
     return VerifyResult(
         passed=False,
-        test_output=f'FAILED {PROBE_NODE_ID}\n',
+        test_output=f'FAILED {node_id}\n',
         lint_output='',
         type_output='',
         summary='fail',
         category='test_failure',
-        cause_hint=f'FAILED {PROBE_NODE_ID}',
+        cause_hint=f'FAILED {node_id}',
         failing_leg_categories=['test_failure'],
     )
 
@@ -174,3 +178,27 @@ def test_merge_gate_isolated_rerun_actually_runs_the_test(tmp_path):
     assert tokens[tokens.index('--timeout') + 1].isdigit(), (
         f'--timeout was severed from its value by the junitxml rewrite: {rendered!r}'
     )
+
+
+@pytest.mark.xdist_group('merge_gate_rerun_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_merge_gate_rerun_that_only_errors_at_setup_is_unconfirmable(tmp_path):
+    """Under xdist this body runs and ``worker_id`` is ``'gw<N>'``; the re-run's
+    ``-p no:xdist`` unregisters the fixture, so it ERRORs at setup with
+    "fixture 'worker_id' not found".  MEASURED before task 3880:
+    ``fails_in_isolation``.
+    """
+    probe = tmp_path / WORKER_ID_PROBE_REL
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text('def test_uses_worker_id(worker_id):\n    assert worker_id\n', encoding='utf-8')
+
+    suppression = asyncio.run(confirm_isolated_rerun_verdict(
+        tmp_path, _make_config(tmp_path), [_module_config()],
+        _failing_result(node_id=WORKER_ID_PROBE_NODE_ID),
+        call_site='merge_gate',
+    ))
+
+    rendered = f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}'
+    assert suppression.verdict is FlakeVerdict.unconfirmable, rendered
+    assert (suppression.unconfirmable_reason or '').startswith('rerun_setup_errors_only:'), rendered
+    assert suppression.test_ids == (WORKER_ID_PROBE_NODE_ID,), suppression.test_ids
