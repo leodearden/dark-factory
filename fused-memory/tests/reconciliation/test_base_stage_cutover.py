@@ -1166,8 +1166,8 @@ class TestStageTranscriptArchival:
         journal.clear_run_session.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_archival_runs_when_clear_run_session_raises(self, tmp_path):
-        """Archival is the first act of the teardown, ahead of the await that can raise."""
+    async def test_archival_runs_when_clear_run_session_fails(self, tmp_path):
+        """A failing session-snapshot clear does not cost the run its archive."""
         stage, journal = self._make_archiving_stage(tmp_path)
         journal.clear_run_session = AsyncMock(side_effect=RuntimeError('journal down'))
         captured: dict = {}
@@ -1175,7 +1175,7 @@ class TestStageTranscriptArchival:
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
             new=self._transcript_writing_runner(captured),
-        ), pytest.raises(RuntimeError, match='journal down'):
+        ):
             await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a4')
 
         archived = self._archived(tmp_path, 'run-a4', captured['session_id'])
