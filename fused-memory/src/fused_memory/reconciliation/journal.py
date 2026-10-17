@@ -250,11 +250,6 @@ class ReconciliationJournal:
     ):
         """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
 
-        *connect* is how ``initialize`` opens the journal's one connection, given
-        the ``reconciliation.db`` path; it defaults to ``connect_daemon``.
-        ``fused-memory/tests/test_recon_db_atomicity.py`` passes its own to reach
-        that connection.
-
         Nothing coerces it here, and nothing upstream does either (task 4592;
         why, and the deployment story behind it, at ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
 
@@ -271,6 +266,11 @@ class ReconciliationJournal:
         the ``CLAUDE_CONFIG_DIR`` chain, and
         ``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``
         fails closed if anything bypasses it.
+
+        *connect* is how ``initialize`` opens the journal's one connection, given
+        the ``reconciliation.db`` path; it defaults to ``connect_daemon``.
+        ``fused-memory/tests/test_recon_db_atomicity.py`` passes its own to reach
+        that connection.
         """
         self.data_dir = data_dir
         self._connect = connect

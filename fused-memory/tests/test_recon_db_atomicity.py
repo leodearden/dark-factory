@@ -11,13 +11,17 @@ These are cross-store concurrency regressions, not per-store unit tests — each
 needs a SECOND connection to the same file — so they live in one module instead of
 being split across test_journal.py / test_event_buffer.py / test_recon_ledger.py.
 
+The COLLISION arms, a write queued into a read's pinned snapshot, are
+CONSTRUCTED rather than raced.  ``_StatementGate`` parks the store's own read just
+after it pins its snapshot, so each arm is one deterministic run.  Each arm's
+read certifies the pin by not seeing the row the foreign connection committed
+while it was parked, and each positive arm has a legacy control through the same
+helper: the replaced execute + fetchall read, which the same collision kills.
+
 MEASURED BASELINES, taken on this task's base commit (2026-09-17), recorded so the
 next reader does not re-derive them:
 
-    journal: reaper read vs. write       39/40 SQLITE_BUSY_SNAPSHOT  ->  0/40
-    journal: same loop, nothing stale     0/40                       ->  0/40
     journal: checkpoint vs. write        20/20 SQLITE_LOCKED         ->  0/20
-    EventBuffer: peek vs. heartbeat      ~70% of iterations (28/40)  ->  0/20
     EventBuffer: checkpoint vs. push     20/20 SQLITE_LOCKED         ->  0/20
     ledger: checkpoint vs. upsert        20/20 SQLITE_LOCKED         ->  0/20
     ledger: cancel vs. concurrent write  survivor's row LOST, 3/3   ->  survives
@@ -68,7 +72,6 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    Watermark,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -80,8 +83,9 @@ PROJECT_ID = 'atomicity'
 STALE_CUTOFF_SECONDS = 1800.0
 STALE_RUN_AGE_SECONDS = 2000.0
 
-# A hang guard only: never elapses on a passing run.  It turns a harness bug into
-# a legible failure instead of a wedged worker thread.
+# How long a parked statement waits to be released.  A hang guard only: never
+# elapses on a passing run.  It turns a harness bug into a legible failure
+# instead of a wedged worker thread.
 _GATE_HANG_GUARD_SECS = 30.0
 
 CHECKPOINT_ITERATIONS = 20
@@ -89,22 +93,6 @@ CHECKPOINT_ITERATIONS = 20
 # hang at ``-n 8`` kills the whole xdist worker at the 300 s suite timeout instead
 # of failing in seconds.  The bound turns that into a legible TimeoutError.
 CHECKPOINT_TIMEOUT_SECONDS = 10
-
-# Enough buffered rows that peek_buffered's ORDER BY timestamp scan is still in the
-# worker thread when the write is queued behind it.  Do NOT tune these counts down:
-# below the reproducing size the arm passes for the wrong reason.  verify appends
-# ``-n 8`` to every pytest leg, so this runs 8-way parallel on a loaded machine,
-# which WIDENS the window rather than narrowing it.
-#
-# Two measurements of the pre-fix failure rate at 4,000 rows, both worth keeping
-# because they bracket what a future tuner should expect: planning measured 28/40
-# iterations (~70%, and 39/40 at 8,000 rows); re-measured here while writing the
-# arm, 28 of 80 iterations across four runs (~35%), worst run 4/20 and never a
-# clean one.  The cause of the spread was not established.  What the second
-# measurement does establish is that 4,000 is comfortably above the reproducing
-# size on this tree, which is the property the count has to have.
-BUFFERED_EVENTS = 4_000
-BUFFER_COLLISION_ITERATIONS = 20
 
 SEEDED_EVENTS = 3
 
@@ -228,6 +216,21 @@ async def _sqlite_error_name(op: Callable[[], Awaitable[object]]) -> str | None:
     return None
 
 
+async def _until_parked(gate: _StatementGate, reader: asyncio.Task[Any]) -> None:
+    """Return once ``reader`` is parked in ``gate``; fail if it finished without parking.
+
+    No deadline: a read that neither parks nor finishes is a genuine hang, which
+    pytest-timeout reports.
+    """
+    parked = asyncio.create_task(gate.parked.wait())
+    try:
+        await asyncio.wait({parked, reader}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        parked.cancel()
+    if not gate.parked.is_set():
+        raise AssertionError('the read finished without the gate parking it: nothing collided')
+
+
 _Rows = TypeVar('_Rows')
 
 
@@ -256,7 +259,7 @@ async def _collide_with_a_pinned_read(
     async with asyncio.TaskGroup() as tasks:
         reader = tasks.create_task(read())
         try:
-            await asyncio.wait_for(gate.parked.wait(), timeout=_GATE_HANG_GUARD_SECS)
+            await _until_parked(gate, reader)
             writer = tasks.create_task(_sqlite_error_name(write))
             await foreign_commit()
         finally:
@@ -592,30 +595,6 @@ async def _buffer_a_late_event(conn: aiosqlite.Connection) -> None:
     ):
         pass
     await conn.commit()
-
-
-async def _heartbeat_failures_under_a_pinned_read(buffer, journal) -> list[str]:
-    """Race the buffer's heartbeat against its own peek, with the journal writing.
-
-    The journal is the foreign connection here: its ``update_watermark`` commit —
-    a CHANGING value each iteration, so the WAL really advances — lands while
-    ``peek_buffered`` still holds a read snapshot on the buffer's connection.
-    """
-    failures: list[str] = []
-    for i in range(BUFFER_COLLISION_ITERATIONS):
-        reader = asyncio.create_task(buffer.peek_buffered(PROJECT_ID, 1_000_000))
-        try:
-            await asyncio.sleep(0)
-            await journal.update_watermark(
-                Watermark(project_id=PROJECT_ID, last_full_run_id=f'run-{i}')
-            )
-            try:
-                await buffer.heartbeat(PROJECT_ID)
-            except sqlite3.OperationalError as exc:
-                failures.append(exc.sqlite_errorname)
-        finally:
-            await reader
-    return failures
 
 
 @pytest.mark.asyncio
