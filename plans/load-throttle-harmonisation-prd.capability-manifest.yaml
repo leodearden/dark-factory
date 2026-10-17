@@ -704,5 +704,3 @@ tasks:
     report at all and copied no metadata.delivered_checks. The checks below are authoring-time
     evidence for a human reader and are reify-repo-relative; they are NOT a live dispatch
     gate, unlike the seven dark_factory labels above. '
-signal_leaves:
-- β

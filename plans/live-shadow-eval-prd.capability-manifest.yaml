@@ -769,5 +769,3 @@ tasks:
       kind: manual
       reason: a restatement is a review-time judgement, not a grep
   task_id: 5395
-signal_leaves:
-- ε2
