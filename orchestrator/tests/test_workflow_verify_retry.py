@@ -1,4 +1,6 @@
-"""Tests for the opaque-infra-timeout fast-fail path in ``_verify_debugfix_loop``.
+"""Tests for the retry behaviour of ``_verify_debugfix_loop``: the
+opaque-infra-timeout fast-fail, plus what each debugger dispatch is told about
+its attempt.
 
 When the verifier's own injected ``Command timed out after Ns: …`` wrapper
 string is the only cause hint, retrying gives the debugger nothing to act
@@ -20,6 +22,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from orchestrator.agents.briefing import VerifyAttemptContext
+from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -290,3 +294,83 @@ class TestPerTaskVerifyRole:
         assert verify_mock.call_args.kwargs.get('role') == 'task', (
             f"expected role='task' kwarg; got call_args={verify_mock.call_args}"
         )
+
+
+async def _invoke_building_twice(role, build_prompt, cwd, output_schema=None):
+    """An _invoke double standing in for a re-dispatch after a cap wait."""
+    await build_prompt()
+    await build_prompt()
+    return AgentResult(success=True, output='')
+
+
+def _test_failure_a() -> VerifyResult:
+    return VerifyResult(
+        passed=False,
+        test_output='FAILED tests/test_x.py::test_a\n',
+        lint_output='',
+        type_output='',
+        summary='Failures: tests failed',
+        cause_hint='FAILED tests/test_x.py::test_a',
+        category='test_failure',
+    )
+
+
+def _lint_failure_without_cause_hint() -> VerifyResult:
+    return VerifyResult(
+        passed=False,
+        test_output='',
+        lint_output='x.py:1:1: F401',
+        type_output='',
+        summary='Failures: lint issues',
+        cause_hint='',
+        category='lint_failure',
+    )
+
+
+@pytest.mark.asyncio
+class TestDebuggerReceivesAttemptContext:
+    async def _drive(self, config, git_ops, task_assignment, monkeypatch, results):
+        wt = (await git_ops.create_worktree(task_assignment.task_id)).path
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        debugger_prompt = AsyncMock(return_value='debug')
+        monkeypatch.setattr(workflow.briefing, 'build_debugger_prompt', debugger_prompt)
+        monkeypatch.setattr(workflow, '_inter_iteration_rebase', AsyncMock(return_value=None))
+        monkeypatch.setattr(workflow, '_invoke', _invoke_building_twice)
+        monkeypatch.setattr(workflow.config, 'escalate_preexisting_main_break', False)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', AsyncMock(side_effect=results),
+        )
+
+        outcome = await workflow._verify_debugfix_loop()
+        contexts = [call.kwargs['attempt_context'] for call in debugger_prompt.await_args_list]
+        return outcome, contexts
+
+    async def test_each_dispatch_is_numbered_and_never_lists_itself_as_prior(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        outcome, contexts = await self._drive(
+            config, git_ops, task_assignment, monkeypatch,
+            [_test_failure_a(), _lint_failure_without_cause_hint(), _passing_result()],
+        )
+
+        ctx1 = VerifyAttemptContext(attempt=1, max_attempts=5, prior_causes=())
+        ctx2 = VerifyAttemptContext(
+            attempt=2, max_attempts=5,
+            prior_causes=('test_failure: FAILED tests/test_x.py::test_a',),
+        )
+        assert outcome == WorkflowOutcome.DONE
+        assert contexts == [ctx1, ctx1, ctx2, ctx2]
+
+    async def test_prior_without_cause_hint_falls_back_to_summary(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        _outcome, contexts = await self._drive(
+            config, git_ops, task_assignment, monkeypatch,
+            [
+                _test_failure_a(), _lint_failure_without_cause_hint(),
+                _test_failure_a(), _passing_result(),
+            ],
+        )
+
+        third_dispatch = contexts[4]
+        assert third_dispatch.prior_causes[1] == 'lint_failure: Failures: lint issues'
