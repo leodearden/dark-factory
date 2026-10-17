@@ -10,8 +10,8 @@ import enum
 import logging
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from typing import Any
 if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
     sys.path.insert(0, _SHARED_SRC)
 
-from legibility import codebook, task_store
+from legibility import codebook, task_store, verdict
 from shared.toolcall_markup import escape_envelope_literals
 
 logger = logging.getLogger("legibility.disposition")
@@ -84,6 +84,12 @@ _require_the_codebook_vocabulary("Step", (step.value for step in Step), codebook
 _require_the_codebook_vocabulary(
     "Resolution", (resolution.value for resolution in Resolution), codebook.FILED_TICKET_RESOLUTIONS,
 )
+
+
+def files(found: verdict.Verdict) -> bool:
+    """Contract §6 (D6): only a mechanical finding is filed; a structural one
+    is recorded in the codebook and goes to deliberation."""
+    return found.route is verdict.Route.MECHANICAL
 
 
 def ticket_id_from_submit_result(result: object) -> str | None:
@@ -530,3 +536,199 @@ def backfill(
             ))
     linked = tuple((link.task_id, link.entry_id) for link in links if link.task_id is not None)
     return with_back_links(cb, links), Backfill(linked, tuple(unmatched))
+
+
+@dataclass(frozen=True)
+class StructuralFinding:
+    entry_id: str
+    title: str
+    finding_key: str | None
+    anchor: str | None
+
+
+def structural_findings(cb: Mapping[str, Any], entry_ids: Iterable[str]) -> tuple[StructuralFinding, ...]:
+    """The structural findings promoted to *entry_ids*, read from their entries."""
+    entries = {entry.get("id"): entry for entry in cb.get("entries") or []}
+    found: list[StructuralFinding] = []
+    for entry_id in entry_ids:
+        entry = entries.get(entry_id)
+        if entry is None:
+            raise ValueError(f"structural_findings: no codebook entry {entry_id!r}")
+        found.append(StructuralFinding(entry_id, entry["title"], entry.get("finding_key"), entry.get("finding_anchor")))
+    return tuple(found)
+
+
+def _filing_record(filing: Filing) -> dict[str, Any]:
+    return {
+        "entry_id": filing.entry_id,
+        "finding_key": filing.finding_key,
+        "title": filing.title,
+        "project_root": filing.project_root,
+    }
+
+
+def _resolved_record(resolved: ResolvedTicket) -> dict[str, Any]:
+    return {
+        "entry_id": resolved.entry_id,
+        "ticket": resolved.ticket,
+        "project_root": resolved.project_root,
+        "status": resolved.outcome.status.value,
+        "task_id": resolved.outcome.task_id,
+        "reason": resolved.outcome.reason,
+    }
+
+
+@dataclass(frozen=True)
+class FilingReport:
+    """Everything one run's filing produced, for the run record: the
+    *disposal* as dispose returned it, the ticket pass's *resolutions*, the
+    *backfill*, and the *structural* findings recorded but not filed."""
+
+    disposal: Disposal
+    resolutions: Resolutions
+    backfill: Backfill
+    structural: tuple[StructuralFinding, ...] = ()
+
+    def to_record(self) -> dict[str, Any]:
+        resolved = self.disposal.resolved(self.resolutions)
+        return {
+            "decisions": [decision.to_record() for decision in resolved.decisions],
+            "unfiled": [_filing_record(filing) for filing in resolved.unfiled],
+            "unreachable": resolved.unreachable,
+            "carried": [_resolved_record(each) for each in self.resolutions.resolved if each.carried],
+            "pending_tickets": list(self.resolutions.pending),
+            "budget_exhausted": self.resolutions.budget_exhausted,
+            "errors": list(self.resolutions.errors),
+            "backfill": self.backfill.to_record(),
+            "structural": [asdict(finding) for finding in self.structural],
+        }
+
+
+FILED_TASK_COLUMNS = (
+    "finding_key", "title", "step", "resolution", "task_id", "ticket", "disposition", "project_root", "note",
+)
+STRUCTURAL_COLUMNS = ("finding_key", "entry_id", "title", "anchor")
+_PENDING_NOTE = "pending with the curator; resolves on the next run"
+
+
+def _cell(value: Any) -> str:
+    return "" if value is None else " ".join(str(value).split()).replace("|", "\\|")
+
+
+def _table(columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> list[str]:
+    return [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+        *("| " + " | ".join(_cell(row[column]) for column in columns) + " |" for row in rows),
+    ]
+
+
+def _finding_label(item: Mapping[str, Any]) -> str:
+    return f"{item['title']} (`{item['finding_key'] or 'unkeyed'}`)"
+
+
+def _decision_row(decision: Mapping[str, Any], observed_root: str) -> dict[str, Any]:
+    pending = decision["ticket"] is not None and decision["resolution"] is None
+    return {
+        **decision,
+        "project_root": None if decision["project_root"] == observed_root else decision["project_root"],
+        "note": _notes(decision["note"], _PENDING_NOTE if pending else None),
+    }
+
+
+def _decision_lines(record: Mapping[str, Any], observed_root: str) -> list[str]:
+    decisions = record["decisions"]
+    if not decisions:
+        return []
+    return _table(FILED_TASK_COLUMNS, (_decision_row(decision, observed_root) for decision in decisions))
+
+
+def _unfiled_lines(record: Mapping[str, Any]) -> list[str]:
+    unfiled = record["unfiled"]
+    if record["unreachable"] is not None:
+        return [
+            "- Contract §8 step 1 (key lookup) could not run, so NOTHING was filed: "
+            f"{record['unreachable']}",
+            *(f"  - {_finding_label(item)}" for item in unfiled),
+        ]
+    if not unfiled:
+        return []
+    return [
+        f"- {len(unfiled)} finding(s) stopped before the curator (§8 step 3) and were not filed:",
+        *(f"  - {_finding_label(item)}" for item in unfiled),
+    ]
+
+
+def _resolution_lines(record: Mapping[str, Any]) -> list[str]:
+    lines = []
+    if record["carried"]:
+        lines.append("- Tickets from earlier runs resolved this run:")
+        lines.extend(
+            f"  - {item['ticket']} (entry {item['entry_id']}): {item['status']}"
+            + (f" task {item['task_id']}" if item["task_id"] is not None else "")
+            + (f" ({item['reason']})" if item["reason"] else "")
+            for item in record["carried"]
+        )
+    if record["budget_exhausted"]:
+        lines.append(
+            f"- The {RESOLVE_BUDGET_SECS:g} s resolve budget ran out; these tickets resolve on the next run: "
+            + ", ".join(record["pending_tickets"])
+        )
+    if record["errors"]:
+        lines.append("- resolve_ticket could not answer for: " + "; ".join(record["errors"]))
+    return lines
+
+
+def _backfill_lines(record: Mapping[str, Any]) -> list[str]:
+    backfill = record["backfill"]
+    lines = []
+    if backfill["linked"]:
+        lines.append(
+            f"- Backfill linked {len(backfill['linked'])} historical census task(s): "
+            + ", ".join(f"{item['task_id']} -> {item['entry_id']}" for item in backfill["linked"])
+        )
+    if backfill["unmatched"]:
+        lines.append(
+            f"- Backfill matched no entry for {len(backfill['unmatched'])} census task(s): "
+            + "; ".join(f"{item['task_id']} {item['title']}" for item in backfill["unmatched"])
+        )
+    if backfill["error"]:
+        lines.append(f"- Backfill could not run: {backfill['error']}")
+    return lines
+
+
+def filed_tasks_lines(record: Mapping[str, Any], *, observed_root: str) -> list[str]:
+    """The ``## Filed Tasks`` body, without its heading, rendered from
+    :meth:`FilingReport.to_record`: each finding's deciding step (contract
+    §8), its task, ticket and contract §7 disposition."""
+    blocks = [
+        block
+        for block in (
+            _decision_lines(record, observed_root),
+            _unfiled_lines(record),
+            _resolution_lines(record),
+            _backfill_lines(record),
+        )
+        if block
+    ]
+    if not blocks:
+        return ["_none filed._"]
+    lines = list(blocks[0])
+    for block in blocks[1:]:
+        lines.extend(["", *block])
+    return lines
+
+
+def structural_lines(record: Mapping[str, Any]) -> list[str]:
+    """The report's ``## Structural`` section, always present (contract §6, D6)."""
+    heading = ["", "## Structural", ""]
+    structural = record["structural"]
+    if not structural:
+        return [*heading, "_no structural findings this run._"]
+    return [
+        *heading,
+        "These verified findings are structural (contract §6, D6): recorded in the codebook and NOT filed; "
+        "each goes to deliberation with the human, then a program doc and /prd.",
+        "",
+        *_table(STRUCTURAL_COLUMNS, structural),
+    ]
