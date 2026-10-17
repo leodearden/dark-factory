@@ -450,6 +450,22 @@ async def test_inflow_concentration_counts_a_malformed_payload_as_unattributed(r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('odd_id', [7.0, True, ['7']])
+async def test_inflow_concentration_counts_a_non_int_non_str_task_id_as_unattributed(
+    recon_db, odd_id,
+):
+    """(d) Only int/str ids are attributed: str(7.0) or str(True) would mint a key no writer uses."""
+    await _push_task_events(recon_db, '7', EventType.task_modified, 1)
+    await recon_db.push(_make_event(timestamp=_H13, payload={'task_id': odd_id}))
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section['live_events'] == 2
+    assert section['unattributed_events'] == 1
+    assert [entry['task_id'] for entry in section['top_tasks']] == ['7']
+
+
+@pytest.mark.asyncio
 async def test_inflow_concentration_scopes_by_project_and_since(recon_db):
     """(e) Another project's rows never appear; `since` floors by UTC hour."""
     db = recon_db._db_path
@@ -1333,8 +1349,12 @@ async def test_main_without_json_names_the_dominant_task(recon_db, capsys):
     assert rc == 0
 
     out = capsys.readouterr().out.replace(str(db), '<db>')
-    assert any('644' in line and '54.5%' in line for line in out.splitlines()), out
-    assert 'live' in out.lower()
+    lines = out.splitlines()
+    assert any('644' in line and '54.5%' in line for line in lines), out
+    assert any(
+        line.startswith('by task:') and 'live event_buffer row' in line
+        for line in lines
+    ), out
 
 
 @pytest.mark.asyncio
@@ -1357,8 +1377,8 @@ async def test_main_reports_an_unparseable_since_as_a_since_error(recon_db, caps
 async def test_main_reports_a_corrupt_row_as_a_database_error(recon_db, capsys):
     """A malformed stored timestamp must not be misreported as a --since failure.
 
-    build_report raises ValueError from utc_hour_bucket on a corrupt
-    event_buffer.timestamp, exactly as it does for an unparseable --since.  A
+    build_report raises ValueError parsing a corrupt event_buffer.timestamp,
+    exactly as it does for an unparseable --since.  A
     blanket `except ValueError` blamed --since for both, so an operator who
     never passed --since was told `could not parse --since None` and never saw
     the corrupt-row diagnosis.

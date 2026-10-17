@@ -32,9 +32,10 @@ hour.  This is not hypothetical — it is the trap the task's METHOD NOTE calls
 out.
 
 The rule this module enforces: **bucket by parsing, never by SQL string
-comparison against a ``datetime('now')`` literal.**  ``utc_hour_bucket`` is the
-single place that bucketing happens, on top of ``_parse_utc``; every reader in
-this module and the rollup in ``event_buffer.cleanup_drained`` route through it.
+comparison against a ``datetime('now')`` literal.**  Bucketing happens in one
+place, ``_hour_key`` over an instant from ``_parse_utc``, which
+``utc_hour_bucket`` composes; every reader in this module and the rollup in
+``event_buffer.cleanup_drained`` route through them.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ from collections import Counter
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 __all__ = [
     'FITTED_CYCLE_FIXED_SECONDS',
@@ -90,7 +91,12 @@ def utc_hour_bucket(ts: str) -> str:
             garbage into a plausible-looking wrong hour would silently corrupt
             the measurement, so this fails loudly instead.
     """
-    return _parse_utc(ts).strftime('%Y-%m-%dT%H')
+    return _hour_key(_parse_utc(ts))
+
+
+def _hour_key(instant: datetime) -> str:
+    """An aware UTC instant's hour key, ``'YYYY-MM-DDTHH'``."""
+    return instant.strftime('%Y-%m-%dT%H')
 
 
 def _parse_utc(ts: str) -> datetime:
@@ -205,17 +211,8 @@ def _arrival_counts(
                     continue
                 counts[(row['hour_bucket'], row['event_type'])] += row['event_count']
 
-        if _table_exists(conn, 'event_buffer'):
-            for row in conn.execute(
-                'SELECT timestamp, event_type FROM event_buffer WHERE project_id = ?',
-                (project_id,),
-            ):
-                # Bucket in Python.  Never filter these by a SQL comparison
-                # against a datetime('now') literal — see the METHOD NOTE.
-                bucket = utc_hour_bucket(row['timestamp'])
-                if floor is not None and bucket < floor:
-                    continue
-                counts[(bucket, row['event_type'])] += 1
+        for live in _live_rows(conn, project_id, floor):
+            counts[(live.hour_bucket, live.event_type)] += 1
     finally:
         conn.close()
 
@@ -291,30 +288,59 @@ def _payload_task_id(payload: str) -> str | None:
 
     A payload that is not JSON names no task: attribution is advisory, so one
     bad row is counted as unattributed rather than taking the report down.
+    Writers emit int or str ids, so only those are attributed: ``str()`` of a
+    float or a bool would mint a key ('7.0', 'True') that never merges with
+    the task's real id.
     """
     try:
         decoded = json.loads(payload)
     except json.JSONDecodeError:
         return None
-    if not isinstance(decoded, dict) or decoded.get('task_id') is None:
+    task_id = decoded.get('task_id') if isinstance(decoded, dict) else None
+    if isinstance(task_id, bool) or not isinstance(task_id, int | str):
         return None
-    return str(decoded['task_id'])
+    return str(task_id)
+
+
+class _LiveRow(NamedTuple):
+    """One live ``event_buffer`` row, its timestamp parsed once."""
+
+    instant: datetime
+    hour_bucket: str
+    event_type: str
+    payload: str
 
 
 def _live_rows(
     conn: sqlite3.Connection,
     project_id: str,
     floor: str | None,
-) -> Iterator[sqlite3.Row]:
-    """Every live ``event_buffer`` row for the project, of ANY status, at or after ``floor``."""
+) -> Iterator[_LiveRow]:
+    """Every live ``event_buffer`` row for the project, of ANY status, at or after ``floor``.
+
+    The one reader of live rows.  It buckets in Python and never filters by a
+    SQL comparison against a ``datetime('now')`` literal (the METHOD NOTE).
+    """
     if not _table_exists(conn, 'event_buffer'):
         return
-    for row in conn.execute(
+    for timestamp, event_type, payload in conn.execute(
         'SELECT timestamp, event_type, payload FROM event_buffer WHERE project_id = ?',
         (project_id,),
     ):
-        if floor is None or utc_hour_bucket(row['timestamp']) >= floor:
-            yield row
+        instant = _parse_utc(timestamp)
+        bucket = _hour_key(instant)
+        if floor is None or bucket >= floor:
+            yield _LiveRow(instant, bucket, event_type, payload)
+
+
+def _widen(
+    window: tuple[datetime, datetime] | None,
+    instant: datetime,
+) -> tuple[datetime, datetime]:
+    """``window`` stretched to cover ``instant``; no window yet starts at it."""
+    if window is None:
+        return (instant, instant)
+    return (min(window[0], instant), max(window[1], instant))
 
 
 def inflow_concentration(
@@ -348,33 +374,35 @@ def inflow_concentration(
     Raises:
         ValueError: On a malformed stored timestamp, like every reader here.
     """
-    instants: list[datetime] = []
-    per_task: dict[str, Counter[str]] = {}
+    window: tuple[datetime, datetime] | None = None
+    live_events = 0
     unattributed = 0
+    per_task: dict[str, Counter[str]] = {}
 
     conn = _connect_ro(db_path)
     try:
-        for row in _live_rows(conn, project_id, _normalise_since(since)):
-            instants.append(_parse_utc(row['timestamp']))
-            task_id = _payload_task_id(row['payload'])
+        for live in _live_rows(conn, project_id, _normalise_since(since)):
+            window = _widen(window, live.instant)
+            live_events += 1
+            task_id = _payload_task_id(live.payload)
             if task_id is None:
                 unattributed += 1
                 continue
-            per_task.setdefault(task_id, Counter())[row['event_type']] += 1
+            per_task.setdefault(task_id, Counter())[live.event_type] += 1
     finally:
         conn.close()
 
     ranked = sorted(per_task.items(), key=lambda item: (-item[1].total(), item[0]))
     return {
-        'window_start': min(instants).isoformat() if instants else None,
-        'window_end': max(instants).isoformat() if instants else None,
-        'live_events': len(instants),
+        'window_start': window[0].isoformat() if window else None,
+        'window_end': window[1].isoformat() if window else None,
+        'live_events': live_events,
         'unattributed_events': unattributed,
         'top_tasks': [
             {
                 'task_id': task_id,
                 'events': types.total(),
-                'share': types.total() / len(instants),
+                'share': types.total() / live_events,
                 'composition': _ranked_counts(types),
             }
             for task_id, types in ranked[:top_n]
