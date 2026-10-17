@@ -179,7 +179,7 @@ class OverreachShadowStore:
         cls, data_dir: str | Path, *, clock: Callable[[], datetime] = _utc_now,
     ) -> OverreachShadowStore:
         directory = Path(data_dir)
-        directory.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
         conn = await connect_daemon(str(directory / SIDECAR_FILENAME))
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
         access = AtomicConnection(conn)
@@ -192,7 +192,7 @@ class OverreachShadowStore:
     async def open_read_only(cls, db_path: str | Path) -> OverreachShadowStore:
         """A read-only view for the eval script; it never creates the file."""
         path = Path(db_path)
-        if not path.is_file():
+        if not await asyncio.to_thread(path.is_file):
             raise FileNotFoundError(f'no overreach shadow sidecar at {path}')
         conn = await connect_daemon(f'file:{path}?mode=ro', uri=True)
         return cls(AtomicConnection(conn))
@@ -357,7 +357,8 @@ class OverreachShadow:
 
     async def drain(self) -> None:
         """Wait for every job submitted so far."""
-        await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+        if self._tasks:
+            await asyncio.wait(tuple(self._tasks))
 
     async def overreach_flags_since(
         self, graph: str, since: datetime | None, limit: int,
@@ -377,7 +378,8 @@ class OverreachShadow:
         pending = tuple(self._tasks)
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        if pending:
+            await asyncio.wait(pending)
         await self._store.close()
 
     async def _run(self, job: ShadowJob) -> None:
