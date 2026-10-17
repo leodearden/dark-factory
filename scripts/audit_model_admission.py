@@ -890,18 +890,26 @@ def render_json(result: AuditResult) -> str:
     }, indent=2)
 
 
+def _table_cell(value: Any) -> str:
+    """*value* as one markdown table cell: a single line, with every pipe escaped."""
+    return ' '.join(str(value).split()).replace('|', r'\|')
+
+
 def markdown_table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
     """A markdown table, or a single italic line when there are no rows.
+
+    Each row is one line whose cell count matches the header's, whatever the
+    cell text holds.
 
     The empty case is spelled out rather than emitted as a headed table with no
     body, because an empty table reads as a rendering glitch while "none" reads
     as a measurement.
     """
-    body = [f"| {' | '.join(str(cell) for cell in row)} |" for row in rows]
+    body = [f"| {' | '.join(_table_cell(cell) for cell in row)} |" for row in rows]
     if not body:
         return ['_none_']
     return [
-        f"| {' | '.join(header)} |",
+        f"| {' | '.join(_table_cell(h) for h in header)} |",
         f"|{'|'.join('---' for _ in header)}|",
         *body,
     ]
