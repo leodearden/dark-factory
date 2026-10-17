@@ -422,6 +422,96 @@ class TestB5RebaseLandingIsConsumedFromGit:
         assert spy.calls_inside_probe
 
 
+async def test_b6_a_coalesce_train_id_resolves_through_the_reverse_index(world: _World) -> None:
+    scene = await _scene_b6(world)
+
+    response = await _poll(scene.server, **scene.key)
+
+    assert response['state'] != MergeState.no_record
+    assert response['state'] == MergeState.stale_record
+    assert response['reason'] == MergeReason.coalesce_train_id
+    assert response['request_id'] == scene.facts['train_id']
+    last = response['last_outcome']
+    assert last['state'] == 'superseded'
+    assert last['superseded_by'] == scene.facts['train_id']
+    assert last['request_id'] == scene.facts['newest_member_request_id']
+
+
+@pytest.mark.parametrize('mode', ['attach', 'door_coalesce'])
+async def test_b7_an_absorbed_loser_resolves_to_its_primary_after_restart(
+    world: _World, mode: str,
+) -> None:
+    scene = await _scene_b7(world, mode=mode)
+
+    response = await _poll(scene.server, **scene.key)
+
+    assert response['state'] == MergeState.stale_record
+    assert response['reason'] == MergeReason.prior_run_terminal
+    last = response['last_outcome']
+    assert last['request_id'] == scene.facts['primary_request_id']
+    assert last['state'] == 'conflict'
+    assert last['is_current_run'] is False
+    assert last['run_id'] == _RUN_PRIOR
+
+
+async def test_b8_a_raising_git_probe_is_the_only_unknown(world: _World) -> None:
+    scene = await _scene_b8(world)
+
+    response = await _poll(scene.server, **scene.key)
+
+    assert response['state'] != MergeState.stale_record
+    assert response['state'] == MergeState.unknown
+    assert response['reason'] == MergeReason.probe_failed
+    assert response['source'] == 'git'
+    assert response['hint'] == hint_for(MergeReason.probe_failed)
+    assert response['last_outcome']['run_id'] == _RUN_PRIOR
+
+
+@pytest.mark.parametrize('row', sorted(_SCENES))
+async def test_unknown_is_produced_by_b8_alone(world: _World, row: str) -> None:
+    scene = await _SCENES[row](world)
+
+    response = await _poll(scene.server, **scene.key)
+
+    assert (response['state'] == MergeState.unknown) == (row == 'B8'), (row, response)
+
+
+_CONSUMER_HALF_DEFERRED = (
+    'The consuming-skill half of rows B1-B8 is OUT until PRD task delta (4832) '
+    "lands: Leo's ruling of 2026-10-07 (task 4834 amendment). Delta rewrites "
+    'skills/merge-queue, unblock and unblock-low-risk SKILL.md to branch on '
+    '`reason`, which is what this half asserts; follow-up ticket '
+    'tkt_0RVWJQW34EP6CKTRG37TMAW247.'
+)
+
+_CONSUMER_BRANCHES = (
+    ('B1', MergeState.stale_record, MergeReason.prior_run_terminal),
+    ('B2', MergeState.queued, None),
+    ('B3', MergeState.journaled, MergeReason.journaled_not_live),
+    ('B4', MergeState.no_record, MergeReason.never_submitted),
+    ('B5', MergeState.done, None),
+    ('B6', MergeState.stale_record, MergeReason.coalesce_train_id),
+    ('B7', MergeState.stale_record, MergeReason.prior_run_terminal),
+    ('B8', MergeState.unknown, MergeReason.probe_failed),
+)
+
+
+@pytest.mark.parametrize(
+    ('row', 'state', 'reason'),
+    [
+        pytest.param(*branch, id=branch[0], marks=pytest.mark.skip(reason=_CONSUMER_HALF_DEFERRED))
+        for branch in _CONSUMER_BRANCHES
+    ],
+)
+async def test_consumer_skill_branches_on_the_server_answer(
+    row: str, state: MergeState, reason: MergeReason | None,
+) -> None:
+    pytest.fail(
+        f'{row}: the skip was removed without an implementation; assert each '
+        f'consuming skill branches on state={state!r}, reason={reason!r}.'
+    )
+
+
 @pytest.mark.xfail(strict=True, reason=_BRANCH_KEY_DEFECT)
 async def test_branch_key_in_the_skills_full_ref_form_resolves_a_prior_run_row(
     world: _World,
