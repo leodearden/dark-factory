@@ -212,7 +212,7 @@ class TestSubmitToMergeQueuePlanTightening:
         # resolves it with a 'done' outcome, so this test exercises the real
         # register-and-enqueue path.  We only assert the recorded events / no-L1,
         # not the post-merge SHA pipeline.
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         real_queue: asyncio.Queue = asyncio.Queue()
         wf.merge_queue = real_queue
@@ -409,7 +409,7 @@ class TestSubmitToMergeQueueCrossRepo:
         return events, narrow, mark_blocked
 
     def _assert_cross_repo(self, outcome, events, narrow, mark_blocked):
-        from orchestrator.merge_gates import CROSS_REPO_DELIVERABLE_REASON_PREFIX
+        from orchestrator.merge_lane.gates import CROSS_REPO_DELIVERABLE_REASON_PREFIX
 
         assert outcome == WorkflowOutcome.BLOCKED
         outcomes = _merge_attempt_outcomes(events)
@@ -509,7 +509,7 @@ class TestSubmitToMergeQueueStalePathMessage:
         self, tmp_path: Path, monkeypatch,
     ):
         """(a) Every flagged entry is a stale PATH → no branch-blame wording."""
-        from orchestrator.merge_gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
 
         stale = 'crates/tests/topo_e2e.rs'
         resolved = 'crates/tests/harness_topo/topo_e2e.rs'
@@ -837,7 +837,7 @@ class TestWorkflowMergeInflightRegistry:
 
     def test_registry_stored_when_provided(self, tmp_path: Path):
         """Constructor stores the injected registry on self.merge_inflight_registry."""
-        from orchestrator.merge_queue import InFlightMergeRegistry
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
         sentinel = InFlightMergeRegistry()
         _make_workflow(tmp_path=tmp_path)
         # Directly re-construct with the kwarg to check storage
@@ -888,7 +888,7 @@ class TestSubmitToMergeQueueRegistersInRegistry:
         """
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -960,7 +960,7 @@ class TestMergePhaseGraceStampLifecycle:
         line)."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -1098,7 +1098,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         """Workflow attaches as peer, primary resolve flows through, no enqueue."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -1157,7 +1157,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         """SUPERSET new tip → re_snapshot before attach; no classify → RED."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         OLD = 'oldtip000000000001'
         NEW = 'newtip000000000001'
@@ -1224,7 +1224,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         """
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         OLD = 'oldtip000000000002'
         NEW = 'newtip000000000002'
@@ -1296,7 +1296,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         """DIVERGENT tip → resolve_divergent yields SUBSET → attach without re_snapshot."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         # A REAL repo: `old` and `new` diverge topologically but carry the
         # same patch-id, so the `git cherry` behind resolve_divergent really
@@ -1366,7 +1366,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         """attach() returning False (entry released mid-await) → enqueue fallback."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         TIP = 'racetip00000000001'
         real_queue: asyncio.Queue = asyncio.Queue()
@@ -1412,7 +1412,7 @@ class TestAttachedWaiterOutcomeMapping:
     async def _setup_attached_workflow(self, tmp_path, monkeypatch):
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -1473,7 +1473,7 @@ class TestAttachedWaiterOutcomeMapping:
         """Conflict from primary → _resolve_and_resubmit (as if own merge failed)."""
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wf, P, registry = await self._setup_attached_workflow(tmp_path, monkeypatch)
 
@@ -1501,7 +1501,7 @@ class TestAttachedWaiterOutcomeMapping:
         """Blocked from primary → _mark_blocked (as if own merge failed)."""
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wf, P, registry = await self._setup_attached_workflow(tmp_path, monkeypatch)
 
@@ -1595,7 +1595,7 @@ class TestGroupMergePathUnchangedByGamma3:
         """GroupMergeRequest future is cancelled on soft-cancel; attach/detach never called."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -1732,7 +1732,7 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         soft-cancel routes through detach() → count-0 → primary_future.cancel()."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
 
         registry = InFlightMergeRegistry()
         wf, real_queue = self._make_wf(tmp_path, registry=registry)
@@ -1762,7 +1762,7 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         workflow enqueues independently rather than attaching blind."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         registry = InFlightMergeRegistry()
 
@@ -1820,11 +1820,6 @@ class TestBoundaryTableWorkflow:
 
     def _make_wf_with_peer(self, tmp_path, real_queue, registry, *, tip: str):
         """Build a workflow and pre-seed branch B with mcp-source primary P."""
-        from orchestrator.merge_queue import (  # noqa: F401 (local)
-            InFlightMergeRegistry,
-            MergeOutcome,
-        )
-
         assignment = MagicMock()
         assignment.task_id = 'B'
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
@@ -1878,7 +1873,7 @@ class TestBoundaryTableWorkflow:
         """
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -2044,7 +2039,7 @@ class TestGroupMergeUnionScope:
         import asyncio
 
         from orchestrator.config import ModuleConfig
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             InFlightMergeRegistry,
             MergeOutcome,
@@ -2163,7 +2158,7 @@ class TestSpawnDryRunUnblockBlockClass:
     ):
         import asyncio
 
-        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane.gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         from orchestrator.unblock_types import BlockClass
 
         wf = _make_workflow(tmp_path=tmp_path)

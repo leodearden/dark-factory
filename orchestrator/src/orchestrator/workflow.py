@@ -39,6 +39,7 @@ from shared.cli_invoke import (
     is_server_error_status,
     is_timed_out_with_progress,
     is_zero_output_timeout,
+    no_mcp_servers_config,
     read_transcript_records,
     transcript_exists,
 )
@@ -104,8 +105,8 @@ from orchestrator.git_ops import (
     _run,
     is_wip_safety_commit,
 )
-from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
     LandingVerdict,
@@ -427,7 +428,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
-    from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
+    from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
     from orchestrator.scheduler import SchedulerFacade
     from orchestrator.usage_gate import UsageGate
 
@@ -674,86 +675,6 @@ def compute_preexisting_main_break_fingerprint(
         )
     except Exception:
         return ''
-
-
-def compute_failing_test_set_fingerprint(failing_test_ids: list[str]) -> str:
-    """Dedup key for the offline-deep lane's confirmed-red fix-task spawn (β3).
-
-    Keyed on the sorted CONFIRMED failing-test ID SET — NEVER ``main_sha``
-    (DB3/C3). The model helper above (``compute_preexisting_main_break_fingerprint``)
-    keys on a probe/main_sha, which advances every merge; reusing that shape
-    here would spawn a fresh fix task + escalation on EVERY offline-lane
-    advance while red — the exact flood PRD §7/§10/§11 forbids. Keying on the
-    failing-test SET instead means one open fix task absorbs the same red
-    across advances (via an appended suspect range), while a genuinely
-    different failing set gets its own task.
-
-    ``compute_content_fingerprint`` already sorts ``affected_ids`` and ignores
-    ``description``, so the result is order-independent over the input list.
-
-    Returns '' on any exception (fail-safe — an empty fingerprint degrades to
-    the log-only path, never a crash).
-    """
-    try:
-        from escalation.dedupe import compute_content_fingerprint
-        return compute_content_fingerprint(
-            'offline_lane_red', '', sorted(failing_test_ids),
-        )
-    except Exception:
-        return ''
-
-
-def build_offline_lane_fix_task_arguments(
-    failing_test_ids: list[str],
-    suspect_range: str,
-    fingerprint: str,
-    project_root: str | Path,
-    head: str,
-    priority: str = 'high',
-) -> dict:
-    """Build the ``submit_task`` argument block for an offline-lane fix task (β3).
-
-    Modeled on :meth:`TaskWorkflow._spawn_main_health_fix_task`'s argument
-    block (title/description/priority/project_root/metadata), but routed
-    THROUGH the standard TDD→PR→merge gate rather than the high/red-main
-    lane: ``status='pending'`` and ``metadata.merge_lane='normal'`` (never
-    the B3 red-main fix-forward path — that class hard-aborts to a human;
-    D1/§10 "the fix goes through the gate").
-
-    ``metadata.failing_tests`` is stored sorted (matching the fingerprint's
-    own sort) and ``metadata.suspect_ranges`` is seeded as a single-element
-    list so the caller can append further ranges as the same fingerprint
-    recurs across advances (C3) without restructuring the field.
-
-    *priority* is the filed fix task's priority (task 2789, D3). Defaults to
-    ``'high'`` so the legacy numeric/infra call sites in
-    :meth:`OfflineLaneWorker._file_new_fix_task` stay byte-identical; a
-    generic per-project command supplies its own ``LaneCommand.fix_task_priority``.
-    """
-    sorted_ids = sorted(failing_test_ids)
-    test_list = ', '.join(sorted_ids)
-    title = f'offline-lane: fix {len(sorted_ids)} failing test(s) ({test_list})'
-    description = (
-        f'The offline-deep lane confirmed a red run with failing tests: '
-        f'{test_list}.\n\nSuspect commit range: {suspect_range}\n'
-        f'Head at detection: {head}\n\n'
-        f'This task was auto-filed by the offline-deep lane worker (β3). It '
-        f'merges via the standard gate, never the red-main fix-forward path.'
-    )
-    return {
-        'title': title,
-        'description': description,
-        'status': 'pending',
-        'priority': priority,
-        'project_root': str(project_root),
-        'metadata': {
-            'merge_lane': 'normal',
-            'spawn_context': 'offline_lane_red',
-            'offline_lane_fingerprint': fingerprint,
-            'failing_tests': sorted_ids,
-            'suspect_ranges': [suspect_range],
-        },
-    }
 
 
 def _line_ranges_stackable(
@@ -1731,7 +1652,7 @@ class TaskWorkflow:
         Called immediately after ``_enter_merge_deferred`` writes the
         merge-deferred status.  Evaluates whether this task is the tip of a
         complete train and, if so, builds and enqueues a
-        :class:`~orchestrator.merge_queue.GroupMergeRequest` from self's
+        :class:`~orchestrator.merge_lane.worker.GroupMergeRequest` from self's
         context (branch/worktree/task_files/module_configs/config).
 
         Gating (step-6 adds full guards; initial impl fires unconditionally
@@ -1757,7 +1678,7 @@ class TaskWorkflow:
         Returns the mapped ``WorkflowOutcome``, or ``None`` to signal the caller
         to park the workflow as ``MERGE_DEFERRED``.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRAIN_INCOMPLETE_REASON_PREFIX,
             TRAIN_VERIFY_FAILED_REASON_PREFIX,
             GroupMergeRequest,
@@ -7201,7 +7122,7 @@ class TaskWorkflow:
             'verify is the gate)',
             self.task_id, tip[:12],
         )
-        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         req = await submit_verified_green_merge_request(
             task_id=self.task_id,
@@ -7365,7 +7286,7 @@ class TaskWorkflow:
         reconciler still marks it done on the next sweep.
         """
         try:
-            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 logger.info(
@@ -11083,13 +11004,13 @@ class TaskWorkflow:
         paths suppress task-status transitions — the caller retries
         the merge in-place instead of requeueing via the scheduler.
         """
-        from orchestrator.merge_disposition import MergeFailureDisposition
         from orchestrator.merge_lane import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             WaiterRecord,
         )
+        from orchestrator.merge_lane.disposition import MergeFailureDisposition
         from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             AttachAction,
             MergeRequest,
             OutcomeKind,
@@ -11124,7 +11045,7 @@ class TaskWorkflow:
             # outcome on the NORMAL ladder (no forced ``escalate_to_human``).
             # Import directly from merge_gates (NOT the merge_queue shim) to keep
             # hot merge_queue.py out of this task's lock scope.
-            from orchestrator.merge_gates import (
+            from orchestrator.merge_lane.gates import (
                 CROSS_REPO_DELIVERABLE_REASON_PREFIX,
                 is_cross_repo_task,
             )
@@ -11231,7 +11152,7 @@ class TaskWorkflow:
                     # shim) for the same reason recorded on the cross-repo
                     # import above: keep hot merge_queue.py out of this task's
                     # lock scope.
-                    from orchestrator import merge_gates as _merge_gates
+                    from orchestrator.merge_lane import gates as _merge_gates
                     already_landed = await _merge_gates.resolve_already_landed_branch(
                         list(self._task_files),
                         self._base_commit,
@@ -11375,7 +11296,7 @@ class TaskWorkflow:
         first_enqueued_at = await self._stamp_first_merge_enqueue()
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
-        from orchestrator.merge_queue import QueuedBranch, lane_for_task_metadata
+        from orchestrator.merge_lane.worker import QueuedBranch, lane_for_task_metadata
         merge_request = MergeRequest(
             task_id=self.task_id,
             branch=QueuedBranch.parse(branch_name, self.config.git.branch_prefix),
@@ -11555,7 +11476,7 @@ class TaskWorkflow:
         # exit cleanly without creating an escalation, reporting WHICH terminal
         # it was (γ3 / boundary #14b — collapsing both onto DONE reported a
         # cancellation as a completion and tripped run()'s SM-2 check).
-        from orchestrator.merge_queue import WORKTREE_MISSING_REASON_PREFIX
+        from orchestrator.merge_lane.worker import WORKTREE_MISSING_REASON_PREFIX
         if result.reason.startswith(WORKTREE_MISSING_REASON_PREFIX):
             try:
                 status = await self.scheduler.get_status(self.task_id)
@@ -11577,7 +11498,7 @@ class TaskWorkflow:
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
         from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
@@ -11711,7 +11632,7 @@ class TaskWorkflow:
         """Schedule a high-lane fix task for a confirmed main-health break.
 
         Builds a submit_task argument block with:
-        - title/description from :func:`~orchestrator.merge_queue.compose_fix_main_brief`
+        - title/description from :func:`~orchestrator.merge_lane.worker.compose_fix_main_brief`
         - ``merge_lane='high'`` so the fix merges via the HIGH lane
         - Correlation keys so the auto-watcher can link it to its escalation:
           ``spawn_context``, ``main_health_signature``, ``main_health_escalation_id``
@@ -11719,7 +11640,7 @@ class TaskWorkflow:
         Delegates the actual POST to :meth:`_post_submit_tasks` via
         ``asyncio.create_task`` so the caller is not blocked.
         """
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.merge_lane.worker import compose_fix_main_brief
 
         title, description = compose_fix_main_brief(category, cause_hint, detail)
         arguments = {
@@ -11767,7 +11688,7 @@ class TaskWorkflow:
         from escalation.dedupe import DedupeConfig, content_fingerprint_key
         from escalation.models import Escalation
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS,
             is_auto_heal_eligible,
         )
@@ -12376,7 +12297,7 @@ class TaskWorkflow:
         3. Otherwise call ``merge_queue.reverify_member_solo`` (verify-only;
            never advances main) and return its result.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             SoloVerifyResult,
             reverify_member_solo,
         )
@@ -13634,6 +13555,12 @@ class TaskWorkflow:
         if 'verdict_tools' in role.mcp_families and cwd:
             mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
+        # Strict scoping (EVAL_PROFILE, task 4757) is a no-op without a truthy
+        # --mcp-config, so a role whose families composed none gets the
+        # zero-server one rather than keeping the worktree's ambient .mcp.json.
+        if self.config.strict_mcp_config and not mcp_config:
+            mcp_config = no_mcp_servers_config()
+
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
         # by passing resume_session_id to invoke_with_cap_retry.  Otherwise,
@@ -13927,6 +13854,7 @@ class TaskWorkflow:
                 allowed_tools=role.allowed_tools or None,
                 disallowed_tools=role.disallowed_tools or None,
                 mcp_config=mcp_config,
+                strict_mcp_config=self.config.strict_mcp_config,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
                 sandbox_extras=sandbox_extras,
@@ -15065,7 +14993,7 @@ class TaskWorkflow:
         guard's only route to a recovery-DONE goes through this method, so a
         recovery-DONE always carries an explicit provenance ``basis`` — either
         ``'journal'`` (a caller's :meth:`MergeProvenance.lookup` call found a
-        :class:`~orchestrator.landed_outbox.LandedRow`) or ``'fallback'`` (the
+        :class:`~orchestrator.merge_lane.landed_outbox.LandedRow`) or ``'fallback'`` (the
         legacy :meth:`_has_prior_implementation` heuristic). Extracted and
         generalized from the pre-PLAN guard's original DONE tail.
 

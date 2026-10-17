@@ -27,8 +27,8 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.stranded_verified_green import (
     VerifiedGreenMatch,
@@ -1103,7 +1103,7 @@ def test_status_sets_exhaust_merge_outcome_vocabulary() -> None:
     """
     from typing import get_args, get_type_hints
 
-    from orchestrator.merge_types import MergeOutcome
+    from orchestrator.merge_lane.types import MergeOutcome
 
     vocabulary = set(get_args(get_type_hints(MergeOutcome)['status']))
     assert vocabulary, 'MergeOutcome.status is not a Literal — cannot derive vocabulary'
@@ -1206,7 +1206,7 @@ class TestStrandedMergeFailedL2:
     async def test_durable_failure_files_born_at_l2(
         self, harness: Harness, tmp_path: Path, status: str,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1230,7 +1230,7 @@ class TestStrandedMergeFailedL2:
     async def test_success_transient_files_no_l2(
         self, harness: Harness, tmp_path: Path, status: str,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1245,7 +1245,7 @@ class TestStrandedMergeFailedL2:
     async def test_second_durable_failure_no_duplicate_l2(
         self, harness: Harness, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req1 = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1275,7 +1275,7 @@ class TestStrandedMergeFailedL2:
         """
         import logging
 
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1482,7 +1482,7 @@ class TestSubmitVerifiedGreenMergeRequest:
         merge_queue: asyncio.Queue | None = None,
         config: Any = None,
     ):
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         queue = merge_queue if merge_queue is not None else asyncio.Queue()
         cfg = config
@@ -1523,7 +1523,7 @@ class TestSubmitVerifiedGreenMergeRequest:
     async def test_registers_done_callback_on_the_future(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         seen: list[Any] = []
         req, _queue = await self._submit(

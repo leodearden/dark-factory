@@ -763,8 +763,15 @@ class TestTickPhaseOrderLiteral:
         assert isinstance(order, tuple)
         assert all(isinstance(label, str) for label in order)
 
-        # (1) drain_park_eviction before park_gc.
-        assert order.index('drain_park_eviction') < order.index('park_gc')
+        # (1) drain_park_eviction immediately before park_gc, so an operator
+        # eviction is not pre-empted by an automatic expiry; park_gc after
+        # both dependency-cache phases (its dependency arm reads their
+        # caches) and before every phase that installs parks or dispatches.
+        assert order.index('park_gc') == order.index('drain_park_eviction') + 1
+        assert order.index('external_dep_policy') < order.index('park_gc')
+        assert order.index('delivered_check_gate') < order.index('park_gc')
+        for later in ('reserve_now', 'empty_candidate_gate', 'select_pins', 'select_scored'):
+            assert order.index('park_gc') < order.index(later), later
         # (2) cooldown_gc before BOTH candidate-dispatch loops.
         assert order.index('cooldown_gc') < order.index('select_pins')
         assert order.index('cooldown_gc') < order.index('select_scored')

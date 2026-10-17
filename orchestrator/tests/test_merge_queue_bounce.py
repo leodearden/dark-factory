@@ -59,14 +59,14 @@ from shared.task_metadata import RetryLedger
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     MergeBounceRegistry,
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
 from orchestrator.workflow import _evaluate_merge_thrash
 
@@ -368,7 +368,7 @@ class TestBouncePrimitives:
     def test_needs_rebase_reason_prefix_is_distinct(self) -> None:
         """NEEDS_REBASE_REASON_PREFIX differs from the other *_REASON_PREFIX constants."""
         from orchestrator.merge_lane import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
         )

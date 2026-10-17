@@ -691,7 +691,7 @@ class LocalRunner:
     """Wraps the current local verify path (run_scoped_verification + _run_unscoped_typechecks).
 
     The verify callables are injected at construction time so that:
-    1. Existing test patches on 'orchestrator.merge_queue.run_scoped_verification'
+    1. Existing test patches on 'orchestrator.merge_lane.worker.run_scoped_verification'
        keep intercepting (call-time resolution, not import-time binding).
     2. There is no verify_runner → merge_queue module-level import cycle.
 
@@ -3575,7 +3575,7 @@ class HostAllocator:
           internal ``_SLOT_*`` constants so a consumer can never come to depend
           on the internal spelling.
         - This is the sanctioned read path for
-          :meth:`~orchestrator.merge_queue.SpeculativeMergeWorker.snapshot`
+          :meth:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker.snapshot`
           (task 3275), which must NOT reach into ``_slots`` / ``_quarantine``
           directly.  Pure read — no mutation, no I/O, no await — so it is safe
           to call from that synchronous method.

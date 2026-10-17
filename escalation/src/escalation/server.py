@@ -1329,7 +1329,7 @@ def create_server(
     # process where orchestrator is always importable.
     _registry = merge_inflight_registry
     if merge_queue is not None and _registry is None:
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import (
             InFlightMergeRegistry,
         )
         _registry = InFlightMergeRegistry()
@@ -3242,8 +3242,8 @@ def create_server(
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
         ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (today the
-        recovery-veto-streak alarm), a new L2 must be minted under one of
-        those members' own task ids.  Any other *task_id* is refused with
+        recovery-veto-streak alarm and the offline lane's escalations), a new
+        L2 must be minted under one of those members' own task ids.  Any other *task_id* is refused with
         ``code: 'sentinel_task_id_required'`` and ``required_task_ids`` —
         re-issue with one of them — and nothing is minted, for header-less
         callers too.  Why: see
@@ -3865,20 +3865,17 @@ def create_server(
         # Runtime-only reverse import: orchestrator depends on escalation, not
         # vice versa, so this lazy import deliberately avoids a static cycle. It
         # resolves at runtime because the escalation server is hosted inside the
-        # orchestrator process; it is unresolvable in escalation's standalone
-        # typecheck env (orchestrator is not on its path), hence the suppression.
-        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
-            branch_is_degenerate,
-        )
-        from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
-            WaiterRecord,
-        )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        # orchestrator process.
+        from orchestrator.merge_lane import (
             MergeOutcome,
             MergeRequest,
             QueuedBranch,
+            WaiterRecord,
             coalesce_or_enqueue_merge_request,
             patch_content_contained,
+        )
+        from orchestrator.merge_lane.landing_evidence import (
+            branch_is_degenerate,
         )
 
         # Single git_ops handle reused for both the already_merged fast-path
@@ -4184,16 +4181,16 @@ def create_server(
         # classifier ignores it).  event_store is None for a standalone
         # server (no orchestrator wired) — guarded so this degrades to no
         # attribution instead of raising (fail-open, mirrors the git-error
-        # None-degrade inside _resolve_dispatch_time_merge_base).
+        # None-degrade inside resolve_dispatch_time_merge_base).
         if verified_green and event_store is not None:
-            from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            from orchestrator.event_store import (
                 EventType,
             )
-            from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-                _resolve_dispatch_time_merge_base,
+            from orchestrator.merge_lane import (
+                resolve_dispatch_time_merge_base,
             )
             base_sha = (
-                await _resolve_dispatch_time_merge_base(
+                await resolve_dispatch_time_merge_base(
                     orch_config.project_root, orch_config.git.main_branch, resolved_tip,
                 )
                 if resolved_tip is not None
@@ -4798,10 +4795,9 @@ def create_server(
             return {'error': mismatch}
 
         # Runtime-only reverse import: orchestrator depends on escalation, not
-        # vice versa (mirrors merge_request's lazy orchestrator.merge_queue
-        # import above) — unresolvable in escalation's standalone typecheck
-        # env, hence the suppression.
-        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+        # vice versa (mirrors merge_request's lazy orchestrator.merge_lane
+        # import above).
+        from orchestrator.git_ops import (
             InteractiveWorktreeLimitError,
         )
 
@@ -4900,7 +4896,7 @@ def create_server(
             path = gops.worktree_base / f'{gops.config.iact_prefix}{slug}'
 
         # Runtime-only reverse import — mirrors claim_warm_worktree above.
-        from orchestrator.git_ops import _run  # type: ignore[reportMissingImports]
+        from orchestrator.git_ops import _run
 
         rc, _, remove_stderr = await _run(
             ['git', 'worktree', 'remove', '--force', str(path)], cwd=gops.project_root,
@@ -5261,7 +5257,7 @@ def create_server(
         # immediate resubmit gets a FRESH entry.  lookup→cancel above stays
         # await-free (I10); the only awaits are here, after cancel.
         rec.future.cancel()
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import (
             retire_cancelled_merge_request,
         )
         await retire_cancelled_merge_request(

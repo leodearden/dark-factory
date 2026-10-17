@@ -400,8 +400,8 @@ Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
 Add `--report-only` to inspect without changing anything; it detects and reports, moves nothing,
 and returns `blocked` rather than `clean` when it finds damage it deliberately left in place.
 
-**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to a
-`MERGE_RR.quarantined-<timestamp>` sibling — **moved, never deleted**, because a *successful*
+**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to
+`<git-common-dir>/rerere-specimens/MERGE_RR.<worktree>-<stamp>` — **moved, never deleted**, because a *successful*
 abort deletes that file and it is the only record of which conflict ids the worktree was carrying.
 It also removes `*.lock` files that are both older than an hour **and** held open by no running
 process; a lock with a live holder is retained at any age.
@@ -534,7 +534,7 @@ On any ABORT:
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
   return, exactly as the normal `task_failure`/`review_issues` path does.
 - Leave the worktree intact (do not remove it) so the human can inspect your partial work.
-  That includes any `MERGE_RR.quarantined-*` file the rebase-recovery preflight left behind: it is
+  That includes any `<git-common-dir>/rerere-specimens/MERGE_RR.<worktree>-*` file the rebase-recovery preflight left behind: it is
   preserved evidence of what the worktree was carrying when it wedged, and the human inspecting
   your partial work is the reader it was preserved for. Do not tidy it away.
 - Return a structured result so the watcher can log it to the digest.

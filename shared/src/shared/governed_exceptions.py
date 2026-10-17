@@ -69,7 +69,10 @@ __all__ = [
     'TaskRef',
     'TicketRef',
     'UndisposedException',
+    'disposition_record',
     'governed_exceptions',
+    'owner_from_record',
+    'owner_record',
     'parse_disposition_marker',
 ]
 
@@ -300,6 +303,63 @@ Disposition = Debt | Policy
 """D2's three legal states, as two types: ``Debt(TaskRef | TicketRef)`` and
 ``Policy(row id)``.  A bare ref is not a disposition — it answers "who", not
 "why this entry is legal"."""
+
+
+def owner_record(ref: TaskRef | TicketRef) -> dict[str, object]:
+    """*ref* as the vocabulary's JSON wire format: ``{'type', 'id'}``.
+
+    The one shape the inline scanner's report, the register's ``--json`` and
+    the owner sweep all speak, so no consumer parses a ``task 5601``-style
+    string back into a ref (heuristic 12).
+
+    Raises:
+        MalformedDisposition: *ref* is not a :class:`TaskRef` or :class:`TicketRef`.
+    """
+    if isinstance(ref, TaskRef):
+        return {'type': 'task', 'id': ref.id}
+    if isinstance(ref, TicketRef):
+        return {'type': 'ticket', 'id': ref.id}
+    raise MalformedDisposition(
+        f'owner_record: {ref!r} is not a TaskRef or a TicketRef.', value=ref
+    )
+
+
+def owner_from_record(record: object) -> TaskRef | TicketRef:
+    """The reader twin of :func:`owner_record`, consumed by the owner sweep.
+
+    Raises:
+        MalformedDisposition: *record* is not a ``{'type': 'task'|'ticket', 'id'}``
+            mapping, or its id fails the ref constructor's own operand check.
+    """
+    if isinstance(record, Mapping) and 'id' in record:
+        if record.get('type') == 'task':
+            return TaskRef(record['id'])
+        if record.get('type') == 'ticket':
+            return TicketRef(record['id'])
+    raise MalformedDisposition(
+        f"owner_from_record: {record!r} is not an owner record — expected "
+        f"{{'type': 'task' | 'ticket', 'id': <id>}}.",
+        value=record,
+    )
+
+
+def disposition_record(disposition: Disposition) -> dict[str, object]:
+    """*disposition* as the vocabulary's JSON wire format.
+
+    ``{'type': 'debt', 'owner': <owner_record>}`` or
+    ``{'type': 'policy', 'ratified': <row id>}`` — the twin of
+    :func:`owner_record`, and spoken by the same consumers.
+
+    Raises:
+        MalformedDisposition: *disposition* is not a :class:`Debt` or :class:`Policy`.
+    """
+    if isinstance(disposition, Debt):
+        return {'type': 'debt', 'owner': owner_record(disposition.owner)}
+    if isinstance(disposition, Policy):
+        return {'type': 'policy', 'ratified': disposition.ratified}
+    raise MalformedDisposition(
+        f'disposition_record: {disposition!r} is not a Debt or a Policy.', value=disposition
+    )
 
 
 def parse_disposition_marker(comment: str) -> Disposition | None:
@@ -537,7 +597,9 @@ def governed_exceptions(
     literals.  Only this runtime call also sees the KEY SET — the container's
     actual contents, which no AST can enumerate — so this is the one place keys
     and dispositions are reconciled, and the only place that can notice a list
-    has quietly grown an entry.
+    has quietly grown an entry.  Call it by its own name, bare or as
+    ``<module>.governed_exceptions``: the static register refuses an
+    import-time alias with exit 2.
 
     ``dispositions`` defaults to an empty ``MappingProxyType`` rather than
     ``{}``: ruff's B006 forbids a mutable default, and the immutable proxy is

@@ -93,7 +93,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.module_charter import derive_modules
 from orchestrator.scheduler import BlastRadiusResult, SetTaskStatusRejected, TaskAssignment
 from orchestrator.unblock_types import BlockClass

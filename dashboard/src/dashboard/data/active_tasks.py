@@ -229,14 +229,12 @@ _TASKS_TOTAL_BUDGET = 20.0
 # already spent``). At width W the worst case becomes roughly
 # ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
 #
-# WHY BOUNDED rather than a plain unbounded ``gather``: ``burndown.py``
-# records the measurement (see ``_SNAPSHOT_PAGE_SIZE`` and
-# ``_fetch_snapshot_tasks``). A full fan-out over every root goes against a
-# SINGLE fused-memory server where the requests serialise SERVER-side anyway,
-# on the SAME shared httpx client the 3 s render polls use — "a live
-# httpx.PoolTimeout risk for request-path handlers". Unbounded concurrency
-# would therefore buy this endpoint nothing (the server is the bottleneck)
-# while spending every other endpoint's connections.
+# WHY BOUNDED rather than a plain unbounded ``gather``: a full fan-out over
+# every root goes against a SINGLE fused-memory server where the requests
+# serialise SERVER-side anyway, on the SAME shared httpx client the 3 s render
+# polls use — a live httpx.PoolTimeout risk for request-path handlers.
+# Unbounded concurrency would therefore buy this endpoint nothing (the server
+# is the bottleneck) while spending every other endpoint's connections.
 #
 # NOTE that ``app._build_http_limits`` scales ``max_connections`` with the
 # fleet size, which makes the POOL look like the constraint it is not. Raising

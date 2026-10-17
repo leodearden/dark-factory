@@ -72,6 +72,7 @@ PURE_STDLIB_LEAVES = (
     'mcp_idempotency',
     'merge_subject',
     'neutral_cwd',
+    'plan_deviation',
     'proc_group',
     'process_identity',
     'project_id',

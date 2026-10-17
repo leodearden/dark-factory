@@ -33,7 +33,7 @@ import pytest
 from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
-from shared.proc_group import process_group_members, read_stat_fields
+from shared.proc_group import pid_running, process_group_members, read_stat_fields
 
 
 @pytest.fixture
@@ -365,8 +365,7 @@ def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
     """
     deadline = time.monotonic() + timeout
     while True:
-        fields = read_stat_fields(Path('/proc') / str(pid))
-        if fields is None or fields.state in ('Z', 'X'):
+        if not pid_running(pid):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -394,7 +393,7 @@ def _spawned_child(marker: str) -> int | None:
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
-        fields = read_stat_fields(entry)
+        fields = read_stat_fields(entry, skip_malformed=True)
         if fields is None or fields.ppid != os.getpid():
             continue
         with contextlib.suppress(OSError):
