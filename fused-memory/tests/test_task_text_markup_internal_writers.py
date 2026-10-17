@@ -8,11 +8,11 @@ backend, with no MCP call anywhere in the loop, and require that each one
 reports the refusal as a markup leak with its structured facts rather than
 as an opaque generic failure.
 
-Both writers are called through private entry points because neither has a
-public seam that isolates it. The combine is reachable publicly only through
-the ticket worker with the private ``_get_curator`` patched, and the briefing
-refresh only through Stage 2's ``run()``, which also runs the LLM stage. That
-is a missing seam, filed as a follow-up of task 4419, not a pattern to copy.
+The combine is driven through ``TaskInterceptor.submit_task`` and
+``resolve_ticket``, with the curator injected through the constructor, so the
+refused combine is observed as callers see it: degraded to a clean create.
+The briefing refresh is driven through
+``fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::queue_briefing_refresh_tasks``.
 
 Specimens are composed from ``shared.toolcall_markup``'s spellings, never
 written raw (the Sentinel-literal hazard in ``shared/src/shared/toolcall_markup.py``).
