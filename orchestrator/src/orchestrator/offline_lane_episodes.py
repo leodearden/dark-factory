@@ -447,7 +447,7 @@ class LaneEngine:
     ) -> tuple[CommandRecord, bool]:
         """D7's probe loop and its two hold exits; true when the command is due a pass."""
         probe_ids = [kind.stored(record) for kind in _PROBE_RECORDS]
-        if cmd is None or not cmd.enabled or cmd.outage_probe is None:
+        if cmd is None or not cmd.enabled or not cmd.outage_probe:
             if not record.in_outage and not any(probe_ids):
                 return record, False
             reason = _NO_PROBE_DECLARED if cmd is not None and cmd.enabled else _NOT_CONFIGURED
