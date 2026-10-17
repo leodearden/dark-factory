@@ -2556,6 +2556,8 @@ def run_census(
     merged codebook; a withheld one stays promoted, is marked withheld on its
     entry and is listed in the report, while one whose verdict was dropped is
     neither filed nor listed)
+    -> ``disposition.backfill``, which links every historical
+    ``source=legibility_census`` task to the entry its title was filed under
     -> ``_filing_queue``, which adds every earlier-withheld entry that
     has since recurred -> ``build_task_payloads`` over that queue ->
     ``disposition.dispose``, contract §8 over *task_store*: a finding whose
@@ -3033,6 +3035,14 @@ def run_census(
 
     _require_valid(updated_codebook, "merge")
 
+    # Historical census tasks link to their entries before this run files
+    # anything (plans/census-incremental-prd.md L4), in dry runs too: it is a
+    # read plus a codebook update. disposition.backfill never raises and logs
+    # its own failure.
+    updated_codebook, backfilled = disposition.backfill(
+        updated_codebook, store=task_store, project_root=project_root, run_id=run_id,
+    )
+
     # Positioned BEFORE codebook.dump()/advance_census_state() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
@@ -3080,7 +3090,7 @@ def run_census(
     updated_codebook, resolutions = disposition.resolve_tickets(
         updated_codebook, store=task_store, run_id=run_id,
     )
-    filing_report = disposition.FilingReport(disposal, resolutions, disposition.Backfill(), structural)
+    filing_report = disposition.FilingReport(disposal, resolutions, backfilled, structural)
     filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
     cross_project_tickets = tuple(
         CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
