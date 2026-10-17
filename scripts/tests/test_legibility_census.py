@@ -9873,3 +9873,99 @@ def test_run_census_dry_run_with_an_unreachable_store_writes_every_payload(tmp_p
     section = _filed_tasks_text(kwargs)
     assert "_dry-run:" in section
     assert "NOTHING was filed" in section
+
+
+# ---------------------------------------------------------------------------
+# task 6403 step-19: RED — main() hands run_census a task store over the
+# fused-memory MCP endpoint, through the one guarded MCP boundary.
+# ---------------------------------------------------------------------------
+
+_EMPTY_FIND_PAGE = {
+    "results": [],
+    "tasks_with_key": 0,
+    "pagination": {"total": 0, "offset": 0, "page_size": 100, "returned": 0, "has_more": False},
+}
+
+
+def _main_task_store(tmp_path, monkeypatch, *, outcome=None):
+    """Run main() --force over a faked run_census; return the task_store it was handed."""
+    _census_project(tmp_path)
+    fake_run_census = _make_fake_main_run_census(outcome=outcome)
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+    [kwargs] = fake_run_census.calls
+    return kwargs["task_store"]
+
+
+def test_main_hands_run_census_a_task_store_on_the_fused_memory_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", "http://fused-memory.test:9999")
+    posts = []
+
+    def rec(url, tool_name, arguments, *, timeout=None):
+        posts.append((url, tool_name, arguments))
+        return _EMPTY_FIND_PAGE
+
+    store = _main_task_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_post_mcp_tool_call", rec)
+
+    assert store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000") == ()
+
+    [(url, tool_name, arguments)] = posts
+    assert (url, tool_name) == ("http://fused-memory.test:9999/mcp", "find_tasks_by_metadata")
+    assert {key: arguments[key] for key in ("project_root", "key", "value")} == {
+        "project_root": "/abs/root", "key": "x_finding_key", "value": "fk-000000000000",
+    }
+
+
+def test_post_mcp_tool_call_forwards_its_timeout_to_the_transport(install_fake_httpx):
+    captured = {}
+
+    def _fake_post(url, **kwargs):
+        captured.update(kwargs)
+        return _FakeHttpxResponse({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}})
+
+    install_fake_httpx(_fake_post)
+
+    # ENTITLED: install_fake_httpx stubs httpx below the transport, so this
+    # test owns the endpoint it posts to.
+    with mod.own_endpoint():
+        mod._post_mcp_tool_call("http://localhost:8002/mcp", "resolve_ticket", {"ticket": "t"}, timeout=130.0)
+
+    assert captured["timeout"] == 130.0
+
+
+def test_main_task_store_refuses_a_real_post_under_pytest(tmp_path, monkeypatch):
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    store = _main_task_store(tmp_path, monkeypatch)
+
+    with pytest.raises(task_store.StoreUnreachable, match="CensusPostRefusedUnderTest"):
+        store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000")
+
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize("unreachable", [None, "find_tasks_by_metadata: ConnectionError: down"])
+def test_main_done_line_names_an_unreachable_dedup_store_only_when_there_was_one(
+    tmp_path, monkeypatch, capsys, unreachable,
+):
+    _census_project(tmp_path)
+    filing = disposition.FilingReport(
+        disposition.Disposal((), (), unreachable), disposition.Resolutions(), disposition.Backfill(),
+    )
+    monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="done", report_path="plans/confusion-census-2026-01-02.md",
+        filed_ticket_ids=[], stop_reason="exhausted", filing=filing,
+    )))
+
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+
+    [done_line] = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("census: done")
+    ]
+    plain = "census: done -- report=plans/confusion-census-2026-01-02.md filed_tickets=0 stop_reason=exhausted"
+    if unreachable is None:
+        assert done_line == plain
+    else:
+        assert done_line == f"{plain} dedup_unreachable: {unreachable}"
