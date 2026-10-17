@@ -177,8 +177,12 @@ _T = TypeVar('_T')
 # backend can consume the whole shutdown budget or starve the durable-flush
 # SQLite closes (_write_journal/_event_buffer) that run after it. The paired
 # outer step budget lives in server/main.py as _MEMORY_CLOSE_STEP_TIMEOUT and
-# must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
+# must dominate MemoryService.close_budget_secs() (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
+
+# SDK connection-pool releases (classifier, router) only close local idle sockets: httpx opens its TLS streams with standard_compatible=False, so no close waits on the peer.
+# They run after every durable-flush close and lose nothing if cut short.
+_POOL_RELEASE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes
 # from its Graphiti ones, whose group_id is the bare project_id
@@ -2618,15 +2622,12 @@ class MemoryService:
 
         logger.info('MemoryService initialized')
 
-    async def _safe_close(
-        self, label: str, resource: Any, timeout: float | None = None
-    ) -> None:
+    async def _safe_close(self, label: str, resource: Any, timeout: float) -> None:
         """Close one resource, time-boxed and logging any failure without re-raising.
 
-        Each close is bounded by ``timeout`` (default: the module-level
-        ``_SUBCLOSE_TIMEOUT``, read at call time so it can be monkeypatched) so a
-        hung network-driver teardown can neither consume the whole shutdown budget
-        nor starve the durable-flush closes that run after it. The bound applies
+        Each close is bounded by ``timeout`` so a hung network-driver teardown
+        can neither consume the whole shutdown budget nor starve the
+        durable-flush closes that run after it. The bound applies
         UNIFORMLY to every resource, including the durable-flush SQLite closes
         (durable_queue/write_journal/event_buffer), not just the graphiti/mem0
         network drivers — see the cancel-branch comment below for why hard-bounding
@@ -2634,8 +2635,6 @@ class MemoryService:
         Both the timeout and the generic-failure paths swallow the error so close()
         continues through every resource.
         """
-        if timeout is None:
-            timeout = _SUBCLOSE_TIMEOUT
         start = time.monotonic()
         try:
             close_task = asyncio.ensure_future(resource.close())
@@ -2692,17 +2691,27 @@ class MemoryService:
                 time.monotonic() - start,
             )
 
+    def _bounded_closes(self) -> tuple[tuple[str, Any, float], ...]:
+        """Each sub-close close() runs, in order, with its time budget."""
+        return (
+            ('durable_queue', self.durable_queue, _SUBCLOSE_TIMEOUT),
+            ('graphiti', self.graphiti, _SUBCLOSE_TIMEOUT),
+            ('mem0', self.mem0, _SUBCLOSE_TIMEOUT),
+            ('write_journal', self._write_journal, _SUBCLOSE_TIMEOUT),
+            ('event_buffer', self._event_buffer, _SUBCLOSE_TIMEOUT),
+            ('planned_episode_registry', self.planned_episode_registry, _SUBCLOSE_TIMEOUT),
+            ('classifier', self.classifier, _POOL_RELEASE_TIMEOUT),
+            ('router', self.router, _POOL_RELEASE_TIMEOUT),
+        )
+
+    def close_budget_secs(self) -> float:
+        """Worst-case seconds close() can take: every sub-close's budget, summed."""
+        return sum(timeout for _, _, timeout in self._bounded_closes())
+
     async def close(self) -> None:
-        if self.durable_queue:
-            await self._safe_close('durable_queue', self.durable_queue)
-        await self._safe_close('graphiti', self.graphiti)
-        await self._safe_close('mem0', self.mem0)
-        if self._write_journal:
-            await self._safe_close('write_journal', self._write_journal)
-        if self._event_buffer:
-            await self._safe_close('event_buffer', self._event_buffer)
-        if self.planned_episode_registry:
-            await self._safe_close('planned_episode_registry', self.planned_episode_registry)
+        for label, resource, timeout in self._bounded_closes():
+            if resource is not None:
+                await self._safe_close(label, resource, timeout)
 
     # ------------------------------------------------------------------
     # Journal helper

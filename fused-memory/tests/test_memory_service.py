@@ -3181,6 +3181,48 @@ class TestClose:
         mock_journal.close.assert_called_once()
         mock_buffer.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_close_closes_router_and_classifier(self, service):
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+        service.router.close = AsyncMock()
+        service.classifier.close = AsyncMock()
+
+        await service.close()
+
+        service.router.close.assert_awaited_once()
+        service.classifier.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_flush_closes_run_before_sdk_pool_releases(self, service):
+        service._write_journal = MagicMock()
+        service._event_buffer = MagicMock()
+        service.planned_episode_registry = MagicMock()
+        order: list[str] = []
+        for label, resource in (
+            ('durable_queue', service.durable_queue),
+            ('graphiti', service.graphiti),
+            ('mem0', service.mem0),
+            ('write_journal', service._write_journal),
+            ('event_buffer', service._event_buffer),
+            ('planned_episode_registry', service.planned_episode_registry),
+            ('classifier', service.classifier),
+            ('router', service.router),
+        ):
+            resource.close = AsyncMock(side_effect=lambda label=label: order.append(label))
+
+        await service.close()
+
+        assert sorted(order) == sorted(
+            [
+                'durable_queue', 'graphiti', 'mem0', 'write_journal',
+                'event_buffer', 'planned_episode_registry', 'classifier', 'router',
+            ]
+        )
+        for durable in ('write_journal', 'event_buffer', 'planned_episode_registry'):
+            for pool in ('classifier', 'router'):
+                assert order.index(durable) < order.index(pool), order
+
 
 # The logger MemoryService.close() reports sub-close failures on. Single-sourced
 # so the caplog LEVEL scope (`at_level(logger=...)`) and the record FILTER below
@@ -3316,9 +3358,10 @@ class TestCloseBoundsSlowSubclose:
     shutdown budget or starve the durable-flush closes that follow it."""
 
     def _wire_resources(self, service):
-        """Wire all six sub-resources with AsyncMock close() methods and
-        return a name->mock mapping (mirrors
-        TestCloseLogsExceptions._make_resource_mocks)."""
+        """Wire the six storage sub-resources with AsyncMock close() methods
+        and return a name->mock mapping (mirrors
+        TestCloseLogsExceptions._make_resource_mocks). The classifier and
+        router SDK-pool releases are left real."""
         service.graphiti.close = AsyncMock()
         service.mem0.close = AsyncMock()
 
@@ -3463,6 +3506,35 @@ class TestCloseBoundsSlowSubclose:
         resources['durable_queue'].close.assert_awaited_once()
         for name in ('_write_journal', '_event_buffer', 'planned_episode_registry'):
             resources[name].close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hung_sdk_pool_release_is_bounded_below_the_backend_budget(
+        self, service, caplog
+    ):
+        """An SDK connection-pool release only drops local idle sockets, so its
+        real budget is far tighter than a storage backend's: a hung classifier
+        release lets close() return inside 2.0s with no timeout monkeypatched,
+        and the router release after it still runs."""
+        resources = self._wire_resources(service)
+        service.router.close = AsyncMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        service.classifier.close = AsyncMock(side_effect=_hang)
+
+        with caplog.at_level(logging.WARNING, logger=_CLOSE_LOGGER):
+            await asyncio.wait_for(service.close(), timeout=2.0)
+
+        service.router.close.assert_awaited_once()
+        for resource in resources.values():
+            resource.close.assert_awaited_once()
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == _CLOSE_LOGGER
+        ]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert 'classifier' in warnings[0].getMessage()
 
 
 class TestGraphitiBackendRemoveEdge:

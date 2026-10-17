@@ -85,11 +85,12 @@ _HARNESS_CANCEL_TIMEOUT = 25.0
 _CLEANUP_STEP_TIMEOUT = 5.0
 
 # Per-step budget for the memory_service.close step specifically (task 2701).
-# MemoryService.close() runs six sub-closes sequentially, each individually
-# time-boxed at memory_service._SUBCLOSE_TIMEOUT (3.0s), so this outer step
-# budget must dominate 6 * _SUBCLOSE_TIMEOUT (=18s) with margin. 20s does and
-# fits inside _FORCE_EXIT_BUDGET's existing headroom (the worst-case step sum
-# below rises to 70s <= 75s) while leaving graceful+force<systemd untouched —
+# MemoryService.close() runs its sub-closes sequentially, each individually
+# time-boxed, so this outer step budget must dominate their sum,
+# services/memory_service.py::MemoryService.close_budget_secs, with margin.
+# 20s does and fits inside _FORCE_EXIT_BUDGET's existing headroom (the
+# worst-case step sum below rises to 70s <= 75s) while leaving
+# graceful+force<systemd untouched —
 # so the schema.py _MIRROR_* mirror and the systemd-template parity test stay
 # valid. Guarded by TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
 _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
