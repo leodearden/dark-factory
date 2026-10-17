@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.scheduler_state import SchedulerStateSnapshot
 
 import fused_memory.reconciliation.harness as harness_module
 from fused_memory.models.reconciliation import (
@@ -309,12 +310,7 @@ async def _prepare_pass(
     # pytest-unmanaged /tmp/test-project root.
     monkeypatch.setattr(
         harness_module, 'read_scheduler_state',
-        lambda _root: {
-            'queue': [], 'parks': {}, 'park_stacks': {},
-            'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-            'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-            'snapshot_at': None,
-        },
+        lambda _root: SchedulerStateSnapshot.empty(),
     )
     monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 

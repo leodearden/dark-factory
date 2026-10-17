@@ -58,6 +58,7 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
@@ -1815,7 +1816,8 @@ class GraphitiBackend:
         llm_client, embedder: when given, used instead of
         ``build_llm_client(cfg)`` and ``build_embedder(cfg)`` respectively, so a
         per-arm caller (e.g. the arm-runner harness) can wrap the client the
-        builder built before this backend shares it.
+        builder built before this backend shares it. The backend takes
+        ownership of an injected client: ``close()`` releases it.
         """
         cfg = self.config
 
@@ -5885,7 +5887,7 @@ class GraphitiBackend:
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
-        """Shut down the driver."""
+        """Shut down the drivers, then release the SDK clients every Graphiti holds."""
         for cloned in self._cloned_drivers.values():
             with contextlib.suppress(Exception):
                 await cloned.close()
@@ -5893,13 +5895,28 @@ class GraphitiBackend:
         if self._driver is not None:
             with contextlib.suppress(Exception):
                 await self._driver.close()
+        await close_wrapped_sdk_clients(self._sdk_client_wrappers())
         self.client = None
         self._driver = None
         # Per-group clients each hold a driver that aliases an entry already
-        # closed above via the _cloned_drivers loop (or self._driver itself) —
-        # drop the references only; do NOT call .close() per-client, which
-        # would double-close the single shared FalkorDB connection.
+        # closed above via the _cloned_drivers loop (or self._driver itself), so
+        # Graphiti.close() is never called: it would double-close the single
+        # shared FalkorDB connection. Their SDK sub-clients were released above.
         self._group_clients.clear()
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
+
+    def _sdk_client_wrappers(self) -> list[object | None]:
+        """The backend's sub-clients, then those of every Graphiti it holds.
+
+        ``Graphiti.__init__`` mints its own client for any sub-client passed as
+        None, so the shared three alone would miss those.
+        """
+        graphitis = [g for g in (self.client, *self._group_clients.values()) if g is not None]
+        return [
+            self._llm_client,
+            self._embedder,
+            self._cross_encoder,
+            *(sub for g in graphitis for sub in (g.llm_client, g.embedder, g.cross_encoder)),
+        ]

@@ -105,7 +105,7 @@ client-feed/src/client_feed/
   sources/prds.py    PRD title and excerpt from metadata.prd_path, path-redacted
   budget.py          counted set, spent, allowed; reveal identity; hostile-path refusal reasons
   criteria.py        criteria.yaml model, the {nodeid: criterion} map, junit join, results events
-  pytest_criterion.py  pytest plugin: @pytest.mark.criterion("C-12") → the map file beside the junit report
+  (no pytest plugin of its own: the collection map is written by the defect-tests PRD's injected plugin, see §12)
   publisher.py       the loop: sources → events → feed; heartbeat with degraded reasons
   cli.py             publish, snapshot (one pass), criteria-results, dump-state, validate-feed
 client-feed/tests/   contract fixtures, source tests over fixture stores, audit-hook isolation, canary, end-to-end on this repo
@@ -186,9 +186,10 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
     `TaskWorkflow._execute_verify_review_loop` where the aggregation is decided (both the PASS exit
     and the `review_cycle += 1` branch). `merge_landed.review` carries the last cycle's counts; until θ
     has written a row in production the feed says `not_recorded` (INV-13).
-17. **Criteria data is pytest-only and never written into the checkout** (§7.7). The plugin writes a
-    `{nodeid: criterion}` map beside the junit report; the publisher joins by nodeid; a staging run's
-    results are produced by the CLI into `out/`.
+17. **Criteria data is pytest-only and never written into the checkout** (§7.7). The defect-tests
+    PRD's injected plugin (`plans/defect-tests-prd.md` β) writes the collection map
+    `{nodeid: {defects, criterion}}` beside the junit report; the publisher joins by nodeid; a staging
+    run's results are produced by the CLI into `out/`. (Amended 2026-10-16, §12.)
 18. **Naming:** package `client-feed/`, module `client_feed`, CLI `client-feed`, unit
     `client-feed@<name>.service`. The portal's name is the other repo's decision.
 
@@ -276,10 +277,14 @@ repository, or an `out_dir` not owned by the running user, refuses to start.
 
 - `acceptance/criteria.yaml` in the client project:
   `{format: 1, criteria: [{id: "C-12", prd: "plans/x-prd.md", capability, statement, kind: success|failure}]}`.
-- `@pytest.mark.criterion("C-12")` via the plugin `client_feed.pytest_criterion` (loaded with
-  `pytest_plugins` in the project's `conftest.py`); at collection it writes
-  `<junit path>.criteria.json` = `{nodeid: criterion}` beside the `--junitxml` target when one is
-  given, so the archived junit has its map beside it. No results file is written into the checkout.
+- `@pytest.mark.criterion("C-12")`. The marker is registered, and the map written, by the
+  defect-tests PRD's single-file plugin `_df_defect_plugin` (`plans/defect-tests-prd.md` β,
+  decision 19), which the orchestrator injects into every structured pytest verify leg with `-p`;
+  a client project needs no conftest edit. At collection it writes
+  `<junit path>.tests.json` = `{nodeid: {"defects": [ref, ...], "criterion": str | null}}` beside
+  the `--junitxml` target when one is given, so the archived junit has its map beside it. A staging
+  run loads the same plugin with `-p _df_defect_plugin` on `PYTHONPATH`. No results file is written
+  into the checkout.
 - The publisher joins junit and map by nodeid into `criteria_results {run_kind: verify}`.
 - `client-feed criteria-results --junit <xml|xml.gz> --map <json> --criteria acceptance/criteria.yaml
   --run-kind staging --commit <sha> --out <out_dir>` writes `out/criteria-staging.json` and the
@@ -339,7 +344,7 @@ assigned at decompose.
 | β2 | Policy, git and archive sources | `client_feed/policy.py`, `sources/git.py`, `sources/archive.py`, tests | a visible-set tree snapshot of this repo with kinds and counted lines (B11's listing half); junit → `test_results` with counts and exception types (B7, B8) | α |
 | γ | Publisher loop, feed writer, cursors, heartbeat, CLI | `client_feed/publisher.py`, `feed_io.py`, `cli.py` (publish, snapshot, dump-state), tests | `client-feed snapshot` on this repo writes a valid feed whose `state.json` equals `fold(feed)` (B22 minus reveals); restart and torn tail (B18); degraded heartbeat (B19) | β1, β2 |
 | δ | Reveals: engagement projection, budget, inbox, hostile-path refusal, follow-head | `client_feed/budget.py`, `feed_io.py` (inbox tail), `publisher.py`, tests | B11's refusal half, B12–B17 | γ |
-| ε | Acceptance criteria format, pytest plugin, map join, staging CLI | `client_feed/criteria.py`, `pytest_criterion.py`, `cli.py` (criteria-results), `publisher.py`, tests, `acceptance/criteria.yaml` exemplar | B20; `client-feed criteria-results` on a junit and map from this repo's own suite with one marked test | γ |
+| ε | Acceptance criteria format, map join (reading the defect-tests β map), staging CLI | `client_feed/criteria.py`, `cli.py` (criteria-results), `publisher.py`, tests, `acceptance/criteria.yaml` exemplar | B20; `client-feed criteria-results` on a junit and map from this repo's own suite with one marked test | γ |
 | ζ | Isolation gate: audit hook, canary, end to end | `client-feed/tests/test_isolation.py`, the two-project fixture builder | B1, B2, B15 and B22 pass on this checkout | δ, ε |
 | η | Publisher unit template, operator docs, README and ARCHITECTURE pointers | `scripts/client-feed.service.template`, `scripts/setup-host.sh` (sync the member; render only, no enable), `OPERATIONS.md` §"Client feed", `README.md`, `ARCHITECTURE.md` §2.3 | `systemctl --user cat client-feed@demo.service` renders from the template with the config path substituted; OPERATIONS names the install steps, the directory ownership and the isolation check | γ |
 
@@ -369,6 +374,14 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
 ## 12. Amendments
 
 - 2026-10-15, from the portal PRD session (`~/src/scoping-intake/docs/prds/client-portal.md`, tasks 45–56, with 54 → `dark_factory:6966` and 56 → `dark_factory:6973`): `criteria_declared` event (α, ε); `stage` as `str` (α); out/ files group-readable 0640 (γ, task 6970); the portal's `in-v1` fixture vendored by δ (6971); a committed B22 snapshot fixture for the portal's κ (ζ, 6973). Task details amended accordingly.
+
+- 2026-10-16, from the defect-tests PRD session (`plans/defect-tests-prd.md`, Leo's go): the pytest
+  collection map moves to that PRD's injected plugin (β), which owns the `criterion` and `defect`
+  markers and writes `<junit path>.tests.json` = `{nodeid: {defects, criterion}}`; client-feed ships
+  no pytest plugin (§3, decision 17, §7.7, ε row). Task 6972 (ε) amended to consume it and made to
+  depend on β (7002's contract work does not touch the map, so it is unchanged); θ 6967 adds
+  `by_kind` counts to `review_completed`; the ε sidecar block's plugin check is replaced. The defect display
+  (`cases[].defects`, `defects_results`) is that PRD's ι, not a task of this one.
 
 ## 13. Open questions (tactical)
 

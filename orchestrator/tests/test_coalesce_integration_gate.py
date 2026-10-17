@@ -59,11 +59,9 @@ def _solo_gate(target_task_id: str, gate_release: asyncio.Event) -> FakeVerifier
     wrong request (train instead of solo → train never lands → mark_done never
     fires → all_done/train_done never set → the release never triggers).
 
-    The TRAIN's own verify does not pass through here at all:
-    ``merge_queue.py::_do_train_merge`` calls ``_run_post_merge_verify``
-    without a ``verifier=``, so it takes the production verifier — bound by
-    conftest's autouse ``_mock_merge_queue_verification`` to passed=True — and
-    lands while the gate is still held.
+    The TRAIN's own verify passes through here too, under its tip's task id,
+    which the script does not hold: it verifies green and lands while the gate
+    is still held.
     """
     return FakeVerifier(scripts={target_task_id: hangs_until(gate_release)})
 

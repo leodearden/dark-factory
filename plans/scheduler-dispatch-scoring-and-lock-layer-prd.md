@@ -529,6 +529,17 @@ footprint, and C7 backfill borrows through it exactly as through a fairness park
 never preempts a held lock, so the preemption row above stands unchanged. See
 `orchestrator/src/orchestrator/pin_reservation.py`.
 
+**Amendment (task 6518, esc-6040-7).** A park, pin reservation or fairness, lives only
+while its owner may hold parks: status `pending` AND no dependency (local, cross-project
+`metadata.external_deps`, delivered check) known to be unsatisfied. A dependency that is
+merely unknown this tick keeps the park (INV-3, corroborate before acting). This narrows
+6040 D5(b). The ineligibility release still goes through park GC, and the pin phase's
+earned-fairness completion now runs only for an owner that is still a dispatch
+candidate that tick, so a blocked or deferred pin head drops its whole footprint instead
+of re-parking it. Hand-carries (deferred owners) get no park protection (D8). The rule
+has one home, `orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`,
+which park GC, the operator eviction guard and `reserve_now` all consult.
+
 ## 8. Pre-conditions and substrate verification (G3)
 
 Verified against `main` on 2026-08-06. No assumed capability is unresolved.

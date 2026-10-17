@@ -8612,12 +8612,32 @@ class TestVerifyHitEnospc:
         )
         assert _verify_hit_enospc(v) is True
 
-    def test_detects_bare_enospc_token_in_type_output(self):
+    def test_bare_enospc_token_is_not_evidence(self):
+        """Task 7037: a bare ENOSPC token names the condition; only an OS
+        error rendering reports it."""
         v = VerifyResult(
             passed=False, test_output='', lint_output='',
             type_output='write failed: ENOSPC', summary='',
         )
-        assert _verify_hit_enospc(v) is True
+        assert _verify_hit_enospc(v) is False
+
+    @pytest.mark.parametrize('test_output', [
+        'E   AssertionError: expected the BOUNDED shared enospc/infra retry budget '
+        '(one in-place retry) to exhaust rather than retry silently forever; '
+        'got 0 call(s)',
+        'FAILED tests/test_merge_queue.py::TestEnospcTransientInfraRetry::'
+        'test_persistent_enospc_prunes_retries_once_then_blocks',
+        'post-merge verify hit ENOSPC; pruned 0 stale merge worktree(s), '
+        'retrying verify once',
+    ], ids=['row6-assertion', 'failed-summary-line', 'worker-log-line'])
+    def test_text_naming_enospc_is_not_disk_full(self, test_output):
+        """Task 7037: text observed in the 2026-10-16 logs that were held as
+        disk pressure while a test had genuinely failed."""
+        v = VerifyResult(
+            passed=False, test_output=test_output, lint_output='',
+            type_output='', summary='Failures: tests failed',
+        )
+        assert _verify_hit_enospc(v) is False
 
     def test_ordinary_test_failure_is_not_enospc(self):
         v = VerifyResult(

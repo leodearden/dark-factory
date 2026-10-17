@@ -170,22 +170,23 @@ tasks:
           expect: present
   - label: "ε"
     task_id: 6972
-    title: "Acceptance criteria format, pytest criterion plugin, junit join and staging CLI"
+    title: "Acceptance criteria format, junit join over the defect-tests collection map, staging CLI"
+    note: "Amended 2026-10-16 (PRD §12): the pytest plugin and its map writer moved to plans/defect-tests-prd.md β (_df_defect_plugin); ε reads <junit path>.tests.json"
     capabilities:
-      - name: "criterion-marker-plugin"
-        binding: "capability→producer ε; substrate: pytest 9.0.3 in the venv; the plugin writes a map file and must not use record_property (xunit2 warning)"
+      - name: "criteria-map-reader"
+        binding: "capability→producer ε reads the {nodeid: {defects, criterion}} map; the map's producer is defect-tests β (upstream via add_dependency)"
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "criterion"
-          paths: ["client-feed/src/client_feed/pytest_criterion.py"]
+          pattern: "tests\\.json"
+          paths: ["client-feed/src/client_feed/criteria.py"]
           expect: present
       - name: "no-record-property"
-        binding: "rejection-style — record_property warns under the default junit_family xunit2; the plugin avoids it"
+        binding: "rejection-style — record_property warns under the default junit_family xunit2; now owned by defect-tests β's plugin, not ε"
         verdict: PASS
         delivered_check:
           kind: manual
-          reason: "an expect=absent check on a file that does not exist yet is vacuous at main; ε's own tests assert the plugin never calls record_property"
+          reason: "client-feed ships no pytest plugin since the 2026-10-16 amendment; defect-tests β's own tests assert its plugin never calls record_property"
       - name: "criteria-results-cli"
         binding: "capability→producer ε"
         verdict: PASS

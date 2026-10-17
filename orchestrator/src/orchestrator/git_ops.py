@@ -105,7 +105,7 @@ from orchestrator.verify_cancel import (
     remove_lock_holder_pgid,
     write_lock_holder_pgid,
 )
-from orchestrator.verify_classify import _ENOSPC_MARKERS
+from orchestrator.verify_classify import reports_disk_full
 from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus
 from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -252,11 +252,6 @@ _INDEX_LOCK_STALE_FLOOR_S = 300.0
 # that RETRY one, via git_ops.py::GitOps._worktree_add_with_retry.
 _WORKTREE_ADD_MAX_ATTEMPTS = 3
 
-# `_ENOSPC_MARKERS` is imported from verify_classify (see the import block
-# above) rather than re-declared here; extend that constant when a new
-# grounded ENOSPC sample appears. merge_queue.py::_ENOSPC_MARKERS is still a
-# separate verbatim copy — consolidating all three is not this module's call.
-
 
 def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
     """Is a failed ``git worktree add`` worth retrying?
@@ -273,8 +268,7 @@ def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
     ENOSPC is the counter-case: a full disk does not heal in 1.5s of
     backoff, so retrying there only delays the operator signal.
     """
-    haystack = f'{out}\n{err}'.lower()
-    return not any(marker in haystack for marker in _ENOSPC_MARKERS)
+    return not reports_disk_full(f'{out}\n{err}')
 
 
 class MergeParkError(Exception):
@@ -10582,13 +10576,23 @@ class GitOps:
         else:
             logger.debug('delete_solo_branch: deleted %s', solo_branch)
 
-    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
-        """Return True if *ancestor* is an ancestor of *descendant*."""
+    async def is_ancestor_checked(
+        self, ancestor: str, descendant: str,
+    ) -> bool | None:
+        """True if *ancestor* is an ancestor of *descendant*, False if not, None on a git error."""
         rc, _, _ = await _run(
             ['git', 'merge-base', '--is-ancestor', ancestor, descendant],
             cwd=self.project_root,
         )
-        return rc == 0
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        return None
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return True if *ancestor* is an ancestor of *descendant*."""
+        return (await self.is_ancestor_checked(ancestor, descendant)) is True
 
     async def merge_base_with_main(self, ref: str) -> str | None:
         """Return *ref*'s FORK POINT from ``config.main_branch``, or None.

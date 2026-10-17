@@ -247,6 +247,30 @@ def _invariant_slugs_block(invariant_slugs: Sequence[str]) -> str:
     )
 
 
+_MATCHES_KEY = "matches"
+_CANDIDATES_KEY = "candidates"
+
+
+def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
+    """The reply build_prompt prescribes, one placeholder finding per key; a
+    fresh dict per call. Tied to the §7.3 record contract by
+    ``scripts/tests/test_legibility_coder.py::test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger``."""
+    return {
+        _MATCHES_KEY: [{
+            "entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
+            "invariant_violated": None, "note": "...",
+        }],
+        _CANDIDATES_KEY: [{
+            "title": "...", "cause": "...", "area": "...", "origin_phase": "...",
+            "manifested_phase": "...", "evidence_quote": "...",
+        }],
+    }
+
+
+_REPLY_KEYS = tuple(_prescribed_reply())
+"""The reply schema code_digest reads: exactly the keys build_prompt prescribes."""
+
+
 def build_prompt(
     digest_text: str, codebook_index: str, *, invariant_slugs: Sequence[str]
 ) -> str:
@@ -271,14 +295,9 @@ def build_prompt(
         '"unknown" instead. Legal phase values: ' + phases + ".\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
         "exactly this shape:\n"
-        '{"matches": [{"entry_id": "...", "origin_phase": "...", '
-        '"manifested_phase": "...", "invariant_violated": null, '
-        '"note": "..."}], '
-        '"candidates": [{"title": "...", "cause": "...", "area": "...", '
-        '"origin_phase": "...", "manifested_phase": "...", '
-        '"evidence_quote": "..."}]}\n'
-        'If nothing matches and nothing is novel, respond with '
-        '{"matches": [], "candidates": []}.\n\n'
+        + json.dumps(_prescribed_reply()) + "\n"
+        "If nothing matches and nothing is novel, respond with "
+        + json.dumps({key: [] for key in _REPLY_KEYS}) + ".\n\n"
         "=== QUALITY DEFINITION ===\n"
         "Mint a candidate only for a confusion that meets this definition, "
         "that is, one that shows a cost or risk to the next change. "
@@ -407,7 +426,8 @@ def code_digest(
     via codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
-    invocation error, a usage/auth CAP, unparseable LLM output, or a
+    invocation error, a usage/auth CAP, unparseable LLM output, a reply
+    missing a key build_prompt prescribes, or a
     schema-invalid assembled record all come back as ``ok=False`` with
     ``record=None`` and ``reason`` set — never partially applied, never
     fabricated. The cap case additionally sets ``capped=True``: it is the
@@ -486,13 +506,22 @@ def code_digest(
             )
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
+    missing = [key for key in _REPLY_KEYS if key not in judgment]
+    if missing:
+        return CodingResult(
+            ok=False, record=None, session=session,
+            reason=(
+                f"coder reply lacks the prescribed key(s) {missing}; "
+                f"it carried {sorted(judgment)}"
+            ),
+        )
+
     record = {
         "session": session,
         "date": meta.get("date"),
         "project": project,
         "agent_class": meta.get("agent_class"),
-        "matches": judgment.get("matches") or [],
-        "candidates": judgment.get("candidates") or [],
+        **{key: judgment[key] for key in _REPLY_KEYS},
     }
 
     errors = codebook_mod.validate_coding_record(record)
@@ -800,8 +829,8 @@ def main(argv: list[str] | None = None) -> int:
             invoke=runner.invoker(TRICKLE_CODER_STAGE),
         )
 
-    matched = sum(len(r.get("matches") or []) for r in result.records)
-    candidates = sum(len(r.get("candidates") or []) for r in result.records)
+    matched = sum(len(r[_MATCHES_KEY]) for r in result.records)
+    candidates = sum(len(r[_CANDIDATES_KEY]) for r in result.records)
 
     if result.status == "failure":
         deferred = is_cap_deferral(result)
