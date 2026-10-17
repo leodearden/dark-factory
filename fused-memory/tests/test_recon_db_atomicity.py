@@ -80,12 +80,6 @@ PROJECT_ID = 'atomicity'
 STALE_CUTOFF_SECONDS = 1800.0
 STALE_RUN_AGE_SECONDS = 2000.0
 
-# Enough completed rows that the reaper's full scan of ``runs`` is still in the
-# worker thread when the next statement is queued behind it.  Measured: 0.25 s to
-# seed, 0.93 s for the 40-iteration loop.
-FILLER_RUNS = 24_000
-COLLISION_ITERATIONS = 40
-
 # A hang guard only: never elapses on a passing run.  It turns a harness bug into
 # a legible failure instead of a wedged worker thread.
 _GATE_HANG_GUARD_SECS = 30.0
@@ -287,7 +281,7 @@ async def journal(tmp_path, journal_tap):
 async def second_connection(journal):
     """A second raw connection to the journal's own ``reconciliation.db`` file.
 
-    Both the seeder and the foreign writer: the collisions these arms provoke need
+    Both the seeder and the foreign writer: the collisions these arms construct need
     a commit from a DIFFERENT connection to the same file, and seeding through it
     keeps a bulk-insert method off ``ReconciliationJournal``'s public interface.
 
@@ -306,42 +300,18 @@ async def second_connection(journal):
         await conn.close()
 
 
-async def _seed_runs(conn, *, stale_run: bool, filler: int = 0) -> None:
+async def _seed_runs(conn, *, stale_run: bool) -> None:
     """Insert the run rows the arms collide against, in ONE ``executemany``.
 
     ``live`` is the write target (started now, so the reaper's age filter never
-    returns it), ``r3`` is the racing arms' foreign-writer target, and ``long`` —
-    present only when *stale_run* — is the one row the reaper's scan matches.
+    returns it), and ``long`` — present only when *stale_run* — is the one row
+    the reaper's scan matches.
     """
     now = datetime.now(UTC)
-    # completed_at is NULL for a running run, so the element type must admit None:
-    # inferred from the all-`str` filler comprehension alone it would not.
-    rows: list[tuple[str, str, str, str, str, str | None, str]] = [
-        (
-            f'filler-{i}',
-            PROJECT_ID,
-            'full',
-            'seed',
-            (now - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat(),
-            now.isoformat(),
-            'completed',
-        )
-        for i in range(filler)
-    ]
-    rows.append(('live', PROJECT_ID, 'full', 'seed', now.isoformat(), None, 'running'))
-    rows.append(('r3', PROJECT_ID, 'full', 'seed', now.isoformat(), now.isoformat(), 'completed'))
+    rows = [('live', PROJECT_ID, 'full', 'seed', now.isoformat(), None, 'running')]
     if stale_run:
-        rows.append(
-            (
-                'long',
-                PROJECT_ID,
-                'full',
-                'seed',
-                (now - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat(),
-                None,
-                'running',
-            )
-        )
+        started = (now - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat()
+        rows.append(('long', PROJECT_ID, 'full', 'seed', started, None, 'running'))
     async with conn.executemany(_INSERT_RUN, rows):
         pass
     await conn.commit()
@@ -372,35 +342,6 @@ async def _file_a_late_stale_run(conn: aiosqlite.Connection) -> None:
     ):
         pass
     await conn.commit()
-
-
-async def _write_failures_under_a_pinned_read(journal, foreign) -> list[str]:
-    """Race a write against the reaper's read, and report what killed the writes.
-
-    Each iteration puts ``get_stale_runs`` into the connection's worker thread,
-    commits on the *foreign* connection so the file's snapshot moves, then queues a
-    write behind the pinned read.  The foreign UPDATE writes a CHANGING value —
-    a no-op UPDATE does not advance the WAL and the arm would pass vacuously.
-    """
-    failures: list[str] = []
-    for i in range(COLLISION_ITERATIONS):
-        reaper = asyncio.create_task(journal.get_stale_runs(STALE_CUTOFF_SECONDS))
-        try:
-            await asyncio.sleep(0)
-            async with foreign.execute(
-                'UPDATE runs SET trigger_reason = ? WHERE id = ?', (f'rotate-{i}', 'r3')
-            ):
-                pass
-            await foreign.commit()
-            try:
-                await journal.record_run_session(
-                    'live', session_id=f'session-{i}', stage_cursor=f'stage-{i}'
-                )
-            except sqlite3.OperationalError as exc:
-                failures.append(exc.sqlite_errorname)
-        finally:
-            await reaper
-    return failures
 
 
 _COLLIDED_SESSION = 'session-collided'
