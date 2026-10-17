@@ -9622,12 +9622,12 @@ def _routed_verdict(route, anchor):
     )
 
 
-def _routed_verify_fn():
+def _routed_verify_fn(*, second_route=verdict.Route.STRUCTURAL):
     """Verifies both _happy_invoke_response titles, each with an in-tree
-    remediation: _PROMOTED_TITLE mechanical, _STRUCTURAL_TITLE structural."""
+    remediation: _PROMOTED_TITLE mechanical, _STRUCTURAL_TITLE *second_route*."""
     verdicts = {
         _PROMOTED_TITLE: _routed_verdict(verdict.Route.MECHANICAL, "docs/mechanical.md"),
-        _STRUCTURAL_TITLE: _routed_verdict(verdict.Route.STRUCTURAL, _STRUCTURAL_ANCHOR),
+        _STRUCTURAL_TITLE: _routed_verdict(second_route, _STRUCTURAL_ANCHOR),
     }
 
     def verify_fn(clusters, *, model):
@@ -9711,3 +9711,165 @@ def test_run_census_records_a_verdictless_unremediated_cluster_as_structural(tmp
     entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
     assert mod.ENTRY_FILING_KEY not in entry
     assert [item["entry_id"] for item in _run_record(kwargs)["filing"]["structural"]] == [entry["id"]]
+
+
+# ---------------------------------------------------------------------------
+# task 6403 step-17: RED — the one-shot backfill of historical census tasks,
+# tickets carried over from an earlier run, and §8 under --dry-run-filing,
+# all through run_census.
+# ---------------------------------------------------------------------------
+
+_LEGACY_TITLE = "Some confusion cluster"
+_EARLIER_RUN = "census-dark_factory-20260701"
+
+
+def _census_hits(*hits):
+    return {(disposition.SOURCE_METADATA, disposition.CENSUS_SOURCE): tuple(hits)}
+
+
+def _duplicate_only_kwargs(tmp_path, store, **overrides):
+    """A run that only re-sights entry-a, so it files nothing new."""
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        task_store=store,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _backfill_store():
+    return FakeTaskStore(metadata_hits=_census_hits(
+        task_store.TaskHit(5120, disposition.task_title(_LEGACY_TITLE), "done"),
+        task_store.TaskHit(5330, "[legibility census] a title no entry carries", "cancelled"),
+    ))
+
+
+def _filed_tasks_text(kwargs) -> str:
+    return _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Filed Tasks")
+
+
+def test_run_census_backfills_a_historical_census_task_onto_its_entry_once(tmp_path):
+    first = _duplicate_only_kwargs(tmp_path, _backfill_store())
+
+    mod.run_census(**first)
+
+    [entry] = [e for e in codebook.load(first["codebook_path"])["entries"] if e["id"] == "entry-a"]
+    assert entry["filed_tickets"] == [{
+        "ticket": None,
+        "project_root": str(tmp_path),
+        "run_id": first["run_id"],
+        "finding_key": None,
+        "task_id": 5120,
+        "resolution": "created",
+        "step": "curator",
+    }]
+    backfill = _run_record(first)["filing"]["backfill"]
+    assert backfill["linked"] == [{"task_id": 5120, "entry_id": "entry-a"}]
+    assert [item["task_id"] for item in backfill["unmatched"]] == [5330]
+    section = _filed_tasks_text(first)
+    assert "5120 -> entry-a" in section
+    assert "5330" in section
+
+    second = _duplicate_only_kwargs(
+        tmp_path, _backfill_store(),
+        codebook_dict=codebook.load(first["codebook_path"]),
+        date="2026-07-21",
+        run_id="census-dark_factory-20260721",
+        report_path=tmp_path / "confusion-census-2026-07-21.md",
+    )
+
+    mod.run_census(**second)
+
+    [entry] = [e for e in codebook.load(second["codebook_path"])["entries"] if e["id"] == "entry-a"]
+    assert len(entry["filed_tickets"]) == 1
+    assert _run_record(second)["filing"]["backfill"]["linked"] == []
+    assert "5120 -> entry-a" not in _filed_tasks_text(second)
+
+
+def test_run_census_resolves_a_ticket_carried_over_from_an_earlier_run(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"][0]["filed_tickets"] = [{
+        "ticket": "tkt_old",
+        "project_root": str(tmp_path),
+        "run_id": _EARLIER_RUN,
+        "finding_key": None,
+        "task_id": None,
+        "resolution": None,
+        "step": "curator",
+    }]
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_old": task_store.TicketOutcome(task_store.TicketStatus.CREATED, 88, None),
+    })
+    kwargs = _duplicate_only_kwargs(tmp_path, store, codebook_dict=cb)
+
+    mod.run_census(**kwargs)
+
+    assert kwargs["submit_fn"].calls == []
+    [entry] = [e for e in codebook.load(kwargs["codebook_path"])["entries"] if e["id"] == "entry-a"]
+    [row] = entry["filed_tickets"]
+    assert (row["ticket"], row["task_id"], row["resolution"]) == ("tkt_old", 88, "created")
+    [carried] = _run_record(kwargs)["filing"]["carried"]
+    assert (carried["ticket"], carried["task_id"], carried["entry_id"]) == ("tkt_old", 88, "entry-a")
+    assert any("tkt_old" in line and "88" in line for line in _filed_tasks_text(kwargs).splitlines())
+
+
+def _key_of(tmp_path, anchor) -> str:
+    found = _routed_verdict(verdict.Route.MECHANICAL, anchor)
+    return census_findings.identity_of(found, finding_area.load_area_map(tmp_path)).key
+
+
+def _two_mechanical_dry_run_kwargs(tmp_path, store):
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=_routed_verify_fn(second_route=verdict.Route.MECHANICAL),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_poison("submit_fn"),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+        task_store=store,
+        dry_run_payloads_path=tmp_path / "confusion-census-2026-07-14-payloads.json",
+    )
+
+
+def test_run_census_dry_run_writes_only_the_payloads_bound_for_the_curator(tmp_path):
+    store = FakeTaskStore(metadata_hits={
+        (disposition.FINDING_KEY_METADATA, _key_of(tmp_path, _STRUCTURAL_ANCHOR)): (
+            task_store.TaskHit(600, disposition.task_title(_STRUCTURAL_TITLE), "in-progress"),
+        ),
+    })
+    kwargs = _two_mechanical_dry_run_kwargs(tmp_path, store)
+
+    outcome = mod.run_census(**kwargs)
+
+    payloads = json.loads(kwargs["dry_run_payloads_path"].read_text(encoding="utf-8"))
+    assert [payload["title"] for payload in payloads] == [disposition.task_title(_PROMOTED_TITLE)]
+    assert outcome.dry_run is not None and outcome.dry_run.payload_count == 1
+    section = _filed_tasks_text(kwargs)
+    preface = next(line for line in section.splitlines() if line.startswith("_dry-run:"))
+    table_at = section.index("| finding_key")
+    assert section.index(preface) < table_at
+    [row] = _filed_table(section)
+    assert (row["task_id"], row["step"], row["title"]) == ("600", "key", _STRUCTURAL_TITLE)
+
+
+def test_run_census_dry_run_with_an_unreachable_store_writes_every_payload(tmp_path):
+    store = task_store.McpTaskStore(url="http://fused-memory.invalid/mcp", post=_unreachable_post("raises"))
+    kwargs = _two_mechanical_dry_run_kwargs(tmp_path, store)
+
+    outcome = mod.run_census(**kwargs)
+
+    payloads = json.loads(kwargs["dry_run_payloads_path"].read_text(encoding="utf-8"))
+    assert sorted(payload["title"] for payload in payloads) == sorted(
+        disposition.task_title(title) for title in (_PROMOTED_TITLE, _STRUCTURAL_TITLE)
+    )
+    assert outcome.dry_run is not None and outcome.dry_run.payload_count == 2
+    section = _filed_tasks_text(kwargs)
+    assert "_dry-run:" in section
+    assert "NOTHING was filed" in section
