@@ -168,3 +168,96 @@ class TestRequireZaiCodingEndpointFailsLoudly:
         from orchestrator.evals.zai_probe import ZaiCodingPlanUnavailable
 
         assert issubclass(ZaiCodingPlanUnavailable, RuntimeError)
+
+
+def _named(name: str):
+    """The eval config registered under *name*; a missing one fails the test that asked."""
+    from orchestrator.evals.configs import get_config_by_name
+
+    cfg = get_config_by_name(name)
+    assert cfg is not None, f'no eval config named {name!r}'
+    return cfg
+
+
+class TestRequireZaiCodingEndpointFor:
+    """The campaign-level entry point: probe once, and only when a config targets Z.ai."""
+
+    @staticmethod
+    def _for(configs, handler, **kwargs):
+        from orchestrator.evals.zai_probe import require_zai_coding_endpoint_for
+
+        with httpx.Client(transport=httpx.MockTransport(handler), timeout=None) as client:
+            return require_zai_coding_endpoint_for(configs, client=client, **kwargs)
+
+    def test_targets_zai_coding_plan_is_exactly_the_glm_base_url_bundles(self):
+        """One comparison over every registered config, so a mismatch diff names each config."""
+        from orchestrator.evals import configs, zai_probe
+
+        every_config = [
+            *configs.EVAL_CONFIGS, *configs.ARCHITECT_EVAL_CONFIGS,
+            *configs.claude_endpoint_candidates(), *configs.codex_pi_candidates(),
+        ]
+        verdicts = {cfg.name: zai_probe.targets_zai_coding_plan(cfg) for cfg in every_config}
+        expected = {
+            cfg.name: cfg.env_overrides.get('ANTHROPIC_BASE_URL') == configs.GLM_BASE_URL
+            for cfg in every_config
+        }
+
+        assert verdicts == expected
+        zai_names = {name for name, targets in verdicts.items() if targets}
+        assert zai_names == {'glm-5.3-endpoint', 'glm-5.3-flash-endpoint'}
+        assert all(zai_probe.targets_zai_coding_plan(_named(name)) for name in zai_names)
+
+    @pytest.mark.parametrize('names', [
+        [],
+        ['claude-opus-high', 'minimax-m3-endpoint', 'codex-gpt5.6-terra'],
+    ], ids=['empty', 'non-zai'])
+    def test_no_zai_config_sends_no_probe_and_returns_none(
+        self, names: list[str], monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.delenv('ZAI_API_KEY', raising=False)
+        recorder = _Recorder(200)
+
+        outcome = self._for([_named(name) for name in names], recorder)
+
+        assert outcome is None
+        assert recorder.requests == []
+
+    def test_several_zai_configs_probe_exactly_once(self):
+        from orchestrator.evals import configs, zai_probe
+
+        cfgs = [
+            _named(name)
+            for name in ('glm-5.3-endpoint', 'claude-opus-high', 'glm-5.3-flash-endpoint')
+        ]
+        recorder = _Recorder(200)
+
+        outcome = self._for(cfgs, recorder, auth_token='tk-test')
+
+        assert isinstance(outcome, zai_probe.ZaiProbeOutcome)
+        assert outcome.ok is True
+        assert outcome.base_url == configs.ZAI_CODING_BASE_URL
+        assert len(recorder.requests) == 1
+
+    def test_a_failing_endpoint_propagates_unavailable(self):
+        from orchestrator.evals.zai_probe import ZaiCodingPlanUnavailable
+
+        with pytest.raises(ZaiCodingPlanUnavailable) as excinfo:
+            self._for([_named('glm-5.3-endpoint')], _Recorder(401, text='denied'), auth_token='tk-test')
+
+        assert excinfo.value.outcome is not None
+        assert excinfo.value.outcome.status_code == 401
+
+    def test_a_missing_key_for_a_zai_config_raises_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals.zai_probe import ZaiCodingPlanUnavailable
+
+        monkeypatch.delenv('ZAI_API_KEY', raising=False)
+        recorder = _Recorder(200)
+
+        with pytest.raises(ZaiCodingPlanUnavailable) as excinfo:
+            self._for([_named('glm-5.3-flash-endpoint')], recorder)
+
+        assert excinfo.value.outcome is None
+        assert recorder.requests == []
