@@ -165,3 +165,5 @@ tasks:
       kind: manual
       reason: docs-diff signal (the merge_deep.chain_cap knob name + halving policy
         appear in the docs)
+signal_leaves:
+- ι
