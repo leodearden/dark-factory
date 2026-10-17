@@ -26,12 +26,14 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _curator_helpers import curator_returning
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.models.scope import ProjectRoot
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
@@ -66,11 +68,31 @@ def project_root(tmp_path) -> str:
 
 
 @pytest_asyncio.fixture
-async def interceptor(backend, tmp_path, monkeypatch):
+async def ticket_store(tmp_path):
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    yield store
+    await store.close()
+
+
+@pytest_asyncio.fixture
+async def build_interceptor(backend, ticket_store, tmp_path, monkeypatch):
+    """Build TaskInterceptors around an injected curator; each is closed at teardown."""
     monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
     buffer = EventBuffer(db_path=tmp_path / 'events.db', buffer_size_threshold=100)
     await buffer.initialize()
-    yield TaskInterceptor(backend, None, buffer)
+    built: list[TaskInterceptor] = []
+
+    def _build(curator) -> TaskInterceptor:
+        interceptor = TaskInterceptor(
+            backend, None, buffer, ticket_store=ticket_store, curator=curator,
+        )
+        built.append(interceptor)
+        return interceptor
+
+    yield _build
+    for interceptor in built:
+        await interceptor.close()
     await buffer.close()
 
 
@@ -98,13 +120,12 @@ def _leak_reports(caplog) -> list[tuple[str, dict]]:
 
 @pytest.mark.asyncio
 async def test_combine_refuses_a_leaked_rewrite_and_reports_it_as_a_markup_leak(
-    interceptor, backend, project_root, caplog,
+    build_interceptor, backend, project_root, caplog,
 ):
     seeded = await backend.add_task(
         project_root, title='Live task', description='original description',
         details='original details',
     )
-    before = _stored_rows(project_root)
     decision = CuratorDecision(
         action='combine',
         target_id=seeded['id'],
@@ -115,12 +136,25 @@ async def test_combine_refuses_a_leaked_rewrite_and_reports_it_as_a_markup_leak(
         ),
         justification='duplicate of the live task',
     )
+    interceptor = build_interceptor(curator_returning(decision))
+    [target_before] = _stored_rows(project_root)
 
     with caplog.at_level(logging.WARNING):
-        result = await interceptor._execute_combine(project_root, decision)
+        submitted = await interceptor.submit_task(
+            project_root=project_root, title='Candidate duplicate',
+            description='candidate description',
+        )
+        resolved = await interceptor.resolve_ticket(
+            submitted['ticket'], project_root, timeout_seconds=10,
+        )
 
-    assert result is None
-    assert _stored_rows(project_root) == before
+    assert resolved['status'] == 'created'
+    assert resolved['reason'].startswith('create: combine-failed')
+    rows = _stored_rows(project_root)
+    assert rows[0] == target_before
+    assert [(r['id'], r['title'], r['description']) for r in rows[1:]] == [
+        (int(resolved['task_id']), 'Candidate duplicate', 'candidate description'),
+    ]
     [(message, facts)] = _leak_reports(caplog)
     assert 'markup' in message
     assert facts == {
