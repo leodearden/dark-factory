@@ -35,6 +35,7 @@ from orchestrator.merge_lane import (
 from orchestrator.merge_lane.queue_store import MergeQueueStore
 from shared.merge_state import EPISTEMIC_STATES, OUTCOME_STATES, MergeReason, MergeState
 
+from escalation.git_authority import GitAuthorityOutcome
 from escalation.merge_status_answer import hint_for
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -291,6 +292,34 @@ class TestB4NeverSubmitted:
         assert response['source'] == 'none'
         assert response['last_outcome'] is None
         assert response['hint'] == hint_for(MergeReason.never_submitted)
+
+
+class TestB5RebaseLandingIsConsumedFromGit:
+    async def test_b5_a_rebase_landing_answers_done_from_git_with_no_landing_call_of_its_own(
+        self, world: _World, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        original_tip = _rebase_landing(world, '105')
+        await _finalize_in_prior_run(
+            world, '105', MergeOutcome('blocked', reason='post-merge verify failed'),
+        )
+        assert not _git_succeeds(world.repo, 'merge-base', '--is-ancestor', original_tip, 'main')
+        assert _git(world.repo, 'show', 'main:105.txt') == 'work for 105'
+        assert not _git_succeeds(world.repo, 'rev-parse', '--verify', '--quiet', 'refs/heads/task/105')
+        spy = _LandingPrimitiveSpy.install(monkeypatch, world.git_ops)
+
+        response = await _poll(_restart(world), task_id='105')
+
+        assert response['state'] == MergeState.done
+        assert response['kind'] == 'found_on_main'
+        assert response['source'] == 'git'
+        (verdict,) = spy.verdicts
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        assert response['merge_sha'] == verdict.merge_sha
+        last = response['last_outcome']
+        assert last['state'] == 'blocked'
+        assert last['is_current_run'] is False
+        assert spy.calls_outside_probe == []
+        assert spy.calls_inside_probe
 
 
 @pytest.mark.xfail(strict=True, reason=_BRANCH_KEY_DEFECT)
