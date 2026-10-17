@@ -26,6 +26,7 @@ from shared.toolcall_markup import escape_envelope_literals
 logger = logging.getLogger("legibility.disposition")
 
 CENSUS_SOURCE = "legibility_census"
+SOURCE_METADATA = "source"
 FINDING_KEY_METADATA = "x_finding_key"
 ACCEPTANCE_REASON_METADATA = "x_acceptance_reason"
 SEMANTIC_SCORE_THRESHOLD = 0.6
@@ -456,3 +457,76 @@ def resolve_tickets(
         resolved.append(ResolvedTicket(open_ticket.entry_id, row["ticket"], row["project_root"], outcome, open_ticket.carried))
     codebook.assert_no_deletion(cb, result)
     return result, Resolutions(tuple(resolved), tuple(pending), budget_exhausted, tuple(errors))
+
+
+@dataclass(frozen=True)
+class Backfill:
+    """The historical census tasks one backfill linked, as (task id, entry id),
+    and those whose title matched no entry."""
+
+    linked: tuple[tuple[int, str], ...] = ()
+    unmatched: tuple[task_store.TaskHit, ...] = ()
+    error: str | None = None
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "linked": [{"task_id": task_id, "entry_id": entry_id} for task_id, entry_id in self.linked],
+            "unmatched": [{"task_id": hit.task_id, "title": hit.title} for hit in self.unmatched],
+            "error": self.error,
+        }
+
+
+def _entry_ids_by_filed_title(cb: Mapping[str, Any]) -> dict[str, str]:
+    """Each entry under the task title its own title files as, and under that
+    of any candidate promoted to it, which a later correction may have
+    retitled away from. Where titles collide the last entry wins, as in
+    census._find_adjudicated_candidate."""
+    promoted_titles: dict[str, list[str]] = {}
+    for candidate in cb.get("candidates") or []:
+        if isinstance(candidate.get("promoted_to"), str) and isinstance(candidate.get("title"), str):
+            promoted_titles.setdefault(candidate["promoted_to"], []).append(candidate["title"])
+    by_title: dict[str, str] = {}
+    for entry in cb.get("entries") or []:
+        for title in (*promoted_titles.get(entry["id"], ()), entry.get("title")):
+            if isinstance(title, str):
+                by_title[task_title(title)] = entry["id"]
+    return by_title
+
+
+def _rows_of(cb: Mapping[str, Any]) -> Iterable[tuple[str, Mapping[str, Any]]]:
+    for entry in cb.get("entries") or []:
+        for row in entry.get("filed_tickets") or []:
+            yield entry["id"], row
+
+
+def backfill(
+    cb: dict, *, store: task_store.TaskStore, project_root: str, run_id: str,
+) -> tuple[dict, Backfill]:
+    """Link every ``source=legibility_census`` task to the entry its title was
+    filed under (plans/census-incremental-prd.md L4). Idempotent: a task
+    linked anywhere is skipped, and so is an entry whose open ticket row the
+    ticket pass owns. An unreachable store links nothing and never raises."""
+    try:
+        hits = store.find_tasks_by_metadata(project_root, key=SOURCE_METADATA, value=CENSUS_SOURCE)
+    except task_store.StoreUnreachable as exc:
+        logger.warning("disposition: backfill skipped: %s", exc)
+        return cb, Backfill(error=str(exc))
+    by_title = _entry_ids_by_filed_title(cb)
+    linked_task_ids = {row.get("task_id") for _, row in _rows_of(cb)}
+    ticketed = {entry_id for entry_id, row in _rows_of(cb) if row.get("ticket") is not None and row.get("resolution") is None}
+    keys = {entry["id"]: entry.get("finding_key") for entry in cb.get("entries") or []}
+    links: list[BackLink] = []
+    unmatched: list[task_store.TaskHit] = []
+    for hit in hits:
+        entry_id = by_title.get(hit.title)
+        if entry_id is None:
+            unmatched.append(hit)
+        elif hit.task_id not in linked_task_ids and entry_id not in ticketed:
+            linked_task_ids.add(hit.task_id)
+            links.append(BackLink(
+                entry_id=entry_id, ticket=None, project_root=project_root, run_id=run_id,
+                finding_key=keys[entry_id], task_id=hit.task_id,
+                resolution=Resolution.CREATED, step=Step.CURATOR,
+            ))
+    linked = tuple((link.task_id, link.entry_id) for link in links if link.task_id is not None)
+    return with_back_links(cb, links), Backfill(linked, tuple(unmatched))
