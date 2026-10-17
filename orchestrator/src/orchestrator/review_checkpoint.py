@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -94,10 +95,13 @@ class ReviewCheckpoint:
         config: OrchestratorConfig,
         mcp: McpLifecycle,
         usage_gate: UsageGate | None,
+        *,
+        time_source: Callable[[], float] = time.monotonic,
     ):
         self.config = config
         self.mcp = mcp
         self.usage_gate = usage_gate
+        self._time_source = time_source
         self.cost_store: CostStore | None = None
         self.escalation_queue: EscalationQueue | None = None
         self.run_id: str = ''
@@ -155,7 +159,8 @@ class ReviewCheckpoint:
         ``full_review_min_interval_secs`` since the last full review (the very
         first review is unconstrained on time — ``_last_full_review_time`` is
         None) AND at least ``full_review_min_tasks`` merges since the last full
-        review.  ``now`` is a ``time.monotonic()`` reading supplied by the
+        review.  ``now`` must be a reading of this checkpoint's
+        ``time_source`` (``time.monotonic`` in production), supplied by the
         caller so it shares a clock with the timestamp ``run_full()`` records.
 
         Only consulted on the run-forever idle path; the exit / --until-idle
@@ -177,7 +182,7 @@ class ReviewCheckpoint:
         report = await self._run_review('full', [])
         self._last_review_at_merge = self._merge_count
         # Record full-review trackers so should_run_full() re-closes the gate.
-        self._last_full_review_time = time.monotonic()
+        self._last_full_review_time = self._time_source()
         self._last_full_review_at_merge = self._merge_count
         self._merged_modules.clear()
         self._reports.append(report)
@@ -193,7 +198,7 @@ class ReviewCheckpoint:
             )
 
         review_id = datetime.now(UTC).strftime('%Y%m%dT%H%M%S')
-        start = time.monotonic()
+        start = self._time_source()
 
         logger.info(
             'Review checkpoint [%s] starting — mode=%s, modules=%s',
@@ -285,12 +290,12 @@ class ReviewCheckpoint:
                 tasks_created=[],
                 escalated_findings=0,
                 cost_usd=0.0,
-                duration_ms=int((time.monotonic() - start) * 1000),
+                duration_ms=int((self._time_source() - start) * 1000),
                 phase1_working_tree=working_tree,
             )
         completed_at = datetime.now(UTC).isoformat()
 
-        elapsed_ms = int((time.monotonic() - start) * 1000)
+        elapsed_ms = int((self._time_source() - start) * 1000)
 
         if self.cost_store:
             try:
