@@ -1855,6 +1855,43 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestStripXdistGroupSuffix:
+    """``strip_xdist_group_suffix`` removes the ``@<group>`` xdist adds under ``--dist loadgroup``."""
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            pytest.param('x.py::t@grp', 'x.py::t', id='plain-test'),
+            pytest.param('x.py::t[p]@grp', 'x.py::t[p]', id='parametrised'),
+            pytest.param('x.py::C::t[p]@grp', 'x.py::C::t[p]', id='class-qualified'),
+            pytest.param('x.py::t@g1_g2', 'x.py::t', id='several-groups-joined'),
+            pytest.param('x.py::t[a@b]@grp', 'x.py::t[a@b]', id='at-inside-params-kept'),
+            pytest.param('x.py::t[a::b]@grp', 'x.py::t[a::b]', id='double-colon-inside-params'),
+            pytest.param(
+                'pkg.tests.test_probe.TestBox::test_inner@probe_group',
+                'pkg.tests.test_probe.TestBox::test_inner',
+                id='junit-classname-spelling',
+            ),
+        ],
+    )
+    def test_group_suffix_is_stripped(self, raw: str, expected: str):
+        assert verify.strip_xdist_group_suffix(raw) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param('x.py::t', id='no-suffix'),
+            pytest.param('x.py::t[a@b]', id='at-only-inside-params'),
+            pytest.param('x.py', id='bare-file-of-collection-error'),
+            pytest.param('dir@v2/x.py::t', id='at-in-path'),
+            pytest.param('x.py::t[a@b', id='unclosed-params-truncated-id'),
+            pytest.param('tests.t', id='bare-junit-module-id'),
+        ],
+    )
+    def test_id_without_a_group_suffix_is_unchanged(self, raw: str):
+        assert verify.strip_xdist_group_suffix(raw) == raw
+
+
 class TestParsePytestFailures:
     """``parse_pytest_failures`` types each failing test by kind and first failure line."""
 
