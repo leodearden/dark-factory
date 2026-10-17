@@ -403,24 +403,61 @@ async def _write_failures_under_a_pinned_read(journal, foreign) -> list[str]:
     return failures
 
 
+_COLLIDED_SESSION = 'session-collided'
+
+
+async def _record_the_collided_session(journal: ReconciliationJournal) -> None:
+    await journal.record_run_session(
+        'live', session_id=_COLLIDED_SESSION, stage_cursor='stage-collided'
+    )
+
+
+def _reaper_cutoff() -> str:
+    return (datetime.now(UTC) - timedelta(seconds=STALE_CUTOFF_SECONDS)).isoformat()
+
+
+async def _assert_the_collided_write_landed(journal: ReconciliationJournal) -> None:
+    live = await journal.get_run('live')
+    assert live is not None and live.session_id == _COLLIDED_SESSION, (
+        f"the collided write did not land: run 'live' carries "
+        f'{None if live is None else live.session_id!r}'
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_write_survives_the_stale_run_reapers_read(journal, second_connection):
+async def test_a_write_survives_the_stale_run_reapers_read(
+    journal, journal_tap, second_connection
+):
     """Arm A: the reaper's pinned read snapshot must not kill a concurrent write.
+
+    Constructed, not raced: the production ``get_stale_runs`` is parked with its
+    snapshot pinned, a foreign connection files ``late``, and the write is
+    queued into that window.
 
     ``record_run_session`` is the probe because its unit is a SINGLE ``UPDATE`` with
     no preceding SELECT — a pure write opens no read snapshot of its own, so the
-    "expect zero" assertion is structurally sound rather than merely lucky.  A
+    "expect no error" assertion is structurally sound rather than merely lucky.  A
     SELECT-then-write method would be a flaky probe here (see ``AtomicConnection.
     write``'s stated residual).
     """
-    await _seed_runs(second_connection, filler=FILLER_RUNS, stale_run=True)
+    await _seed_runs(second_connection, stale_run=True)
 
-    failures = await _write_failures_under_a_pinned_read(journal, second_connection)
-
-    assert not failures, (
-        f'{len(failures)}/{COLLISION_ITERATIONS} writes died while the stale-run '
-        f'reaper held a read snapshot on the same connection: {sorted(set(failures))}'
+    stale, error = await _collide_with_a_pinned_read(
+        journal_tap.connection,
+        read=lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS),
+        write=lambda: _record_the_collided_session(journal),
+        foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
+
+    assert error is None, (
+        f'the write died while the stale-run reaper held a read snapshot on the '
+        f'same connection: {error}'
+    )
+    assert [run.id for run in stale] == ['long'], (
+        f"the reaper returned {[run.id for run in stale]!r}: it was not pinned before "
+        "the foreign commit filed 'late', so this run did not collide at all"
+    )
+    await _assert_the_collided_write_landed(journal)
 
 
 @pytest.mark.asyncio
@@ -435,16 +472,13 @@ async def test_a_legacy_multi_hop_reaper_read_kills_the_write(
     passing vacuously.
     """
     await _seed_runs(second_connection, stale_run=True)
-    cutoff = (datetime.now(UTC) - timedelta(seconds=STALE_CUTOFF_SECONDS)).isoformat()
 
     rows, error = await _collide_with_a_pinned_read(
         journal_tap.connection,
         read=lambda: _legacy_multi_hop_read(
-            journal_tap.connection, _LEGACY_REAPER_SCAN, (cutoff,)
+            journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
         ),
-        write=lambda: journal.record_run_session(
-            'live', session_id='session-collided', stage_cursor='stage-collided'
-        ),
+        write=lambda: _record_the_collided_session(journal),
         foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
 
@@ -459,23 +493,37 @@ async def test_a_legacy_multi_hop_reaper_read_kills_the_write(
 
 
 @pytest.mark.asyncio
-async def test_no_stale_run_means_no_pinned_read_and_no_failures(journal, second_connection):
-    """Arm B, a permanent control: the same loop, with nothing past the cutoff.
+async def test_no_stale_run_means_no_pinned_read_and_no_failures(
+    journal, journal_tap, second_connection
+):
+    """Arm B, a permanent control: the replaced read shape, with nothing past the cutoff.
 
-    Measured at 0/40 before the fix as well as after.  It is what distinguishes
-    "arm A is keyed to the reaper's pinned snapshot" from "arm A is keyed to the
-    shape of the loop" — without it, a future regression that broke the seeding
-    would turn arm A green and look like a pass.
+    With no row matched, the replaced shape's first step runs to completion and
+    releases its snapshot before the write runs, so nothing is held across hops.
+    Paired with the legacy reaper control, which matches ``long`` and kills the
+    write, this shows SQLITE_BUSY_SNAPSHOT is caused by the HELD row, not by
+    the gate or the foreign commit.
     """
-    await _seed_runs(second_connection, filler=FILLER_RUNS, stale_run=False)
+    await _seed_runs(second_connection, stale_run=False)
 
-    failures = await _write_failures_under_a_pinned_read(journal, second_connection)
-
-    assert not failures, (
-        f'{len(failures)}/{COLLISION_ITERATIONS} writes failed with no run past the '
-        f'cutoff, so this loop collides for a reason arm A does not describe: '
-        f'{sorted(set(failures))}'
+    rows, error = await _collide_with_a_pinned_read(
+        journal_tap.connection,
+        read=lambda: _legacy_multi_hop_read(
+            journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
+        ),
+        write=lambda: _record_the_collided_session(journal),
+        foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
+
+    assert error is None, (
+        f'the write failed with no run past the cutoff, so this collision fails for '
+        f'a reason the held-row control does not describe: {error}'
+    )
+    assert rows == [], (
+        f"the parked read saw {[row['id'] for row in rows]!r}: it was not pinned "
+        "before the foreign commit filed 'late'"
+    )
+    await _assert_the_collided_write_landed(journal)
 
 
 @pytest.mark.asyncio
