@@ -821,7 +821,10 @@ def _retention_note() -> str:
         'that delete transaction, so from then on arrival history is durable '
         'and exact. Inflow from before the rollup landed was destroyed by that '
         'delete and is unrecoverable — treat any window extending back past '
-        'the rollup as truncated, not as a period of low inflow.'
+        'the rollup as truncated, not as a period of low inflow. Per-task '
+        'concentration reads payloads, which only live event_buffer rows '
+        'carry, so it covers the window printed with it (the current backlog '
+        'plus drained rows not yet swept), never the rolled-up history.'
     )
 
 
@@ -850,7 +853,9 @@ def build_report(
         (the :func:`drain_stats` payload), ``remediation_duty_cycle``,
         ``sustainable_events_per_day``, ``capacity_verdict``,
         ``remediation_free_events_per_day``,
-        ``remediation_free_capacity_verdict`` and ``retention_note``.
+        ``remediation_free_capacity_verdict``, ``concentration`` (the
+        :func:`inflow_concentration` payload, live rows only) and
+        ``retention_note``.
 
         TWO capacity figures, each with its own verdict:
 
@@ -919,6 +924,7 @@ def build_report(
         'capacity_verdict': verdict,
         'remediation_free_events_per_day': remediation_free,
         'remediation_free_capacity_verdict': remediation_free_verdict,
+        'concentration': inflow_concentration(db_path, project_id, effective_since),
         'retention_note': _retention_note(),
     }
 
@@ -943,6 +949,7 @@ def _format_report(report: dict[str, Any]) -> str:
                  f'{len(inflow["hourly"])} hour(s)')
     for etype, n in inflow['composition'].items():
         lines.append(f'           {etype}: {n}')
+    lines.extend(_format_concentration(report['concentration']))
 
     lines.append('drain:')
     for mode in DRAIN_MODES:
@@ -989,6 +996,23 @@ def _format_report(report: dict[str, Any]) -> str:
     lines.append('')
     lines.append(report['retention_note'])
     return '\n'.join(lines)
+
+
+def _format_concentration(section: dict[str, Any]) -> list[str]:
+    """The readable per-task lines, headed by the live-row window they cover."""
+    if section['live_events'] == 0:
+        return ['by task: no live event_buffer rows to attribute']
+    lines = [
+        f'by task: {section["live_events"]} live event_buffer row(s), '
+        f'{section["window_start"]} .. {section["window_end"]}',
+    ]
+    for entry in section['top_tasks']:
+        lines.append(
+            f'           task {entry["task_id"]}: {entry["events"]} '
+            f'({entry["share"]:.1%})')
+    if section['unattributed_events']:
+        lines.append(f'           unattributed: {section["unattributed_events"]}')
+    return lines
 
 
 def _build_parser() -> argparse.ArgumentParser:
