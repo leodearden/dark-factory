@@ -692,8 +692,13 @@ async def run_server():
     # pattern ReconciliationHarness and TicketJanitor already use.
     #
     # MemoryService already seeds this registry from DASHBOARD_KNOWN_PROJECT_ROOTS,
-    # so this call adds the primary root rather than enabling the alarm. Pinned by
-    # tests/test_memory_service.py::TestUpdateMemoryStormFilesIntoTheProjectQueue.
+    # so this call adds the primary root rather than enabling the alarm. Tests pin
+    # the seed and set_known_projects' replace-on-set behaviour, but NO test
+    # exercises this call site: deleting or reordering it leaves every test
+    # green while a primary root the env var does not list loses its storm,
+    # dead-letter and entity-mint alarms. Do NOT "cover" it with a grep- or
+    # ast-based meta-test: that shape was deleted from this repo in fb3c47dccf
+    # on a CONFIRMED review finding.
     memory_service.set_known_projects(_known_projects_map)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
