@@ -58,7 +58,7 @@ from datetime import UTC, datetime, timedelta
 import aiosqlite
 import pytest
 import pytest_asyncio
-from shared.async_sqlite_base import CheckpointResult
+from shared.async_sqlite_base import CheckpointResult, connect_daemon
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -111,6 +111,62 @@ _INSERT_RUN = """INSERT INTO runs
 _INSERT_EVENT = """INSERT INTO event_buffer
     (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+class _ConnectTap:
+    """A store's ``connect``: opens through ``connect_daemon`` and keeps the connection.
+
+    The collision arms install their gate on, and issue the legacy controls'
+    reads through, the store's OWN connection; this is how they reach it.
+    """
+
+    def __init__(self) -> None:
+        self.database: str | None = None
+        self._connection: aiosqlite.Connection | None = None
+
+    async def __call__(self, database: str) -> aiosqlite.Connection:
+        self.database = database
+        self._connection = await connect_daemon(database)
+        return self._connection
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        if self._connection is None:
+            raise RuntimeError('the store has not opened its connection through this tap')
+        return self._connection
+
+
+@pytest.mark.asyncio
+async def test_each_collision_store_runs_its_statements_on_its_injected_connection(tmp_path):
+    """Each store opens through its ``connect`` and runs its statements on that connection.
+
+    Every collision arm relies on this: a gate installed on the tapped
+    connection parks the store's own read, not some other connection's.
+    """
+    data_dir = tmp_path / 'recon'
+    db_path = str(data_dir / 'reconciliation.db')
+    journal_tap, buffer_tap = _ConnectTap(), _ConnectTap()
+    journal = ReconciliationJournal(data_dir, connect=journal_tap)
+    buffer = EventBuffer(db_path=data_dir / 'reconciliation.db', connect=buffer_tap)
+    try:
+        for name, store, tap, public_read in (
+            ('ReconciliationJournal', journal, journal_tap,
+             lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS)),
+            ('EventBuffer', buffer, buffer_tap, lambda: buffer.peek_buffered(PROJECT_ID, 10)),
+        ):
+            await store.initialize()
+            traced: list[str] = []
+            await tap.connection.set_trace_callback(traced.append)
+
+            await public_read()
+
+            assert tap.database == db_path, (
+                f'{name} asked its connect for {tap.database!r}, not {db_path!r}'
+            )
+            assert traced, f"{name}'s read did not run on the connection its connect opened"
+    finally:
+        await buffer.close()
+        await journal.close()
 
 
 @pytest_asyncio.fixture
