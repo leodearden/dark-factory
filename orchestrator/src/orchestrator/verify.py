@@ -941,6 +941,23 @@ _XDIST_NODE_DOWN_PRECEDING_NODEID_RE = re.compile(
 )
 
 
+def strip_xdist_group_suffix(node_id: str) -> str:
+    """*node_id* without the ``@<groups>`` suffix xdist appends under ``--dist loadgroup``.
+
+    The suffix comes from ``xdist/remote.py::WorkerInteractor.pytest_collection_modifyitems``
+    and is not an id plain pytest accepts.  An id with no ``::`` or with an unclosed
+    ``[`` in its final segment is returned unchanged.
+    """
+    head, sep, name = node_id.rpartition('::')
+    if not sep:
+        return node_id
+    params_end = name.rfind(']')
+    if name.rfind('[') > params_end:
+        return node_id
+    at = name.find('@', params_end + 1)
+    return node_id if at < 0 else f'{head}{sep}{name[:at]}'
+
+
 class FailureKind(StrEnum):
     FAILED = 'failed'
     ERROR = 'error'
