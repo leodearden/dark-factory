@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import re
 import subprocess
 from importlib import resources as pkg_resources
 from pathlib import Path
@@ -26,6 +27,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
+from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
 from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
@@ -2550,6 +2552,8 @@ _TASK_DOC = {
     },
 }
 
+_CONTENTLESS_TASK_DOC = {'id': '42', 'status': 'blocked'}
+
 
 class _TaskDocScheduler:
     """Scheduler fake whose ``get_task`` returns a FULL task document.
@@ -2579,8 +2583,8 @@ class _TaskDocScheduler:
         return dict(self._task_doc)
 
 
-async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
-    """Run one investigation and return the prompt handed to the agent."""
+async def _capture_investigation_call(tmp_path, scheduler) -> dict:
+    """Run one investigation and return the kwargs handed to the agent."""
     from orchestrator.dry_run_unblock import run_dry_run_unblock
 
     agent_result = _make_agent_result(structured_output={
@@ -2599,7 +2603,12 @@ async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
             mcp=MagicMock(),
             config=_make_config(),
         )
-    return mock_invoke.call_args.kwargs['prompt']
+    return dict(mock_invoke.call_args.kwargs)
+
+
+async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
+    """Run one investigation and return the prompt handed to the agent."""
+    return (await _capture_investigation_call(tmp_path, scheduler))['prompt']
 
 
 class TestPromptCarriesTaskContext:
@@ -2885,8 +2894,6 @@ class TestContentlessTaskRecordIsAlsoDegraded:
     `TestFalsyFetchIsAlsoLoud` exists to eliminate, one level in.
     """
 
-    _CONTENTLESS = {'id': '42', 'status': 'blocked'}
-
     @pytest.mark.asyncio
     async def test_prompt_and_entry_agree_when_the_record_is_empty(self, tmp_path):
         """The coherence invariant, extended to the third state."""
@@ -2895,7 +2902,7 @@ class TestContentlessTaskRecordIsAlsoDegraded:
             _TASK_UNAVAILABLE_MARKER,
         )
 
-        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+        scheduler = _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC)
         prompt = await _capture_investigation_prompt(tmp_path, scheduler)
         entry = _persisted_entry(scheduler)
 
@@ -2909,7 +2916,7 @@ class TestContentlessTaskRecordIsAlsoDegraded:
     async def test_empty_record_warns_once_without_claiming_a_failed_fetch(
         self, tmp_path, caplog,
     ):
-        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+        scheduler = _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
             await _run_with_scheduler(tmp_path, scheduler)
@@ -2935,3 +2942,45 @@ class TestContentlessTaskRecordIsAlsoDegraded:
         assert 'Rebase the verify lane' in prompt, prompt
         assert entry.get('status') != 'investigation_failed', entry
         assert entry['task_context_unavailable'] is False, entry
+
+
+class TestSkillPromptExplainsEveryTaskBlockState:
+    """The investigator reads ``skills/unblock-auto/SKILL.md`` — its system
+    prompt — to interpret the task block ``dry_run_unblock.py::_task_context``
+    renders into its user prompt, so the two must stay aligned.  This guard is
+    that alignment mechanism.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('make_scheduler', 'state_phrases'), [
+        pytest.param(
+            _TaskDocScheduler,
+            {'**Title:**', '**Description:**', '**Details:**', '**Declared files:**'},
+            id='healthy',
+        ),
+        pytest.param(
+            lambda: _TaskDocScheduler(returns_none=True),
+            {_TASK_UNAVAILABLE_STATE},
+            id='fetch_failed',
+        ),
+        pytest.param(
+            lambda: _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC),
+            {_TASK_EMPTY_STATE},
+            id='record_empty',
+        ),
+    ])
+    async def test_system_prompt_explains_the_task_block(
+        self, tmp_path, make_scheduler, state_phrases,
+    ):
+        kwargs = await _capture_investigation_call(tmp_path, make_scheduler())
+        user, system = kwargs['prompt'], kwargs['system_prompt']
+
+        unrendered = sorted(p for p in state_phrases if p not in user)
+        assert not unrendered, f'the renderer no longer emits {unrendered}\n{user}'
+
+        labels = set(re.findall(r'\*\*[^*\n]+?:\*\*', user))
+        unexplained = sorted(p for p in labels | state_phrases if p not in system)
+        assert not unexplained, (
+            f'the user prompt carries {unexplained} but the unblock-auto '
+            f'system prompt never explains them'
+        )

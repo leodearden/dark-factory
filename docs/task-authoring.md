@@ -570,7 +570,7 @@ unguarded. The opposite failure is worse — a check that can *never* go green
 blocks its dependent forever, and at runtime that is indistinguishable from a
 genuinely undelivered capability.
 
-**Reject codes** (all five block; the `_self_referential` and `_comment_only`
+**Reject codes** (all seven block; the `_self_referential` and `_comment_only`
 entries are diagnostic refinements of `vacuous_present` for grep, not separate
 gates):
 
@@ -581,6 +581,8 @@ gates):
 | `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
 | `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
 | `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
+| `shim_path` | a `kind: grep`, `expect: present` check whose `paths` names a `.py` file that rebinds `sys.modules[__name__]`: an alias shim, so the code it asserts lives elsewhere | task **5036** left `orchestrator/src/orchestrator/merge_queue.py`, `landing_evidence.py`, `merge_gates.py` and others as 12-line shims over `orchestrator/merge_lane/`, stranding checks of 2886, 2887, 4033, 4646–4648, 4651, 4652, 4830 and 5388 |
+| `removed_path` | an `expect: present` grep or path check naming a path a mainline (first-parent) commit deleted or moved away; the message names that commit | the move-shaped twin of `shim_path`: the path can never reappear unless someone re-creates it |
 
 **Warn code** (reported, never blocking):
 
@@ -595,6 +597,20 @@ files this task actually writes. That is the shape all three measured repairs
 took, and it is the only shape the gate can observe going green. When the
 capability IS a file's existence, use `kind: "path"` naming the file the task
 creates (or, with `expect: absent`, deletes).
+
+**Stale scope paths.** Every `paths` entry of an `expect: present` check must
+name live code at `main`. A path that never existed is the normal
+forward-looking state and is not flagged; only a `sys.modules` shim or a path
+the mainline removed is (`shared/src/shared/delivered_check_scope.py`). A path
+check on a shim is not stale, since the file exists. `expect: absent` checks are
+left to the 2x2 and the audit's `vacuous_live_gate`: a dead scope makes them
+pass, not wedge. Three enforcement points: the authoring lint (reject, also
+named in the runtime `AUTHORING DIAGNOSIS`); the audit's STALE PATHS section
+(below); and `scripts/tests/test_sidecar_delivered_check_scope.py`, a tripwire
+over every tracked sidecar at `HEAD` that fails the mover's own verify. The
+tripwire sees sidecars only; metadata-only descriptors are the audit's. Repair:
+repath BOTH halves (sidecar and task record), or drop the descriptor; a task
+that genuinely re-creates a removed file scopes a grep to its parent directory.
 
 **Two enforcement points, deliberately different contracts:**
 
@@ -636,10 +652,13 @@ evaluating a descriptor against main yields a *bit*, not a verdict —
 "`expect: present` and it matches" is the success state of a landed producer
 *and* a never-fires gate on a live one, and a status-blind rule flags 313 of
 548 descriptors (57%), overwhelmingly correctly delivered work. Exit 1 keys
-only on `broken` (a done producer whose capability is nowhere on main) and
-`vacuous_live_gate` (an open producer whose check already passes);
-`superseded` — a correct descriptor that later work legitimately undid — is
-reported and never actionable. A separate report-only section lists sidecar
+only on `broken` (a done producer whose capability is nowhere on main),
+`vacuous_live_gate` (an open producer whose check already passes),
+`unwired_live_gate` (an open producer never stamped with its sound sidecar
+check) and an actionable stale path (a live producer, or a done one with open
+dependents; the rest are listed report-only); `superseded` — a correct
+descriptor that later work legitimately undid — is reported and never
+actionable. A separate report-only section lists sidecar
 descriptors carrying a structural code (`vacuous_present_self_referential`,
 `vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
 against today's tree, and a reworded comment or a later file flips them, so
@@ -823,6 +842,13 @@ dependency gate as every other task (§3).
   kind: "deploy",                   # "deploy" | "predicate"; default "deploy" — see §6 for "predicate"
 }
 ```
+
+A relative `script` (even when `cwd` is set) and a relative `cwd` resolve
+against the orchestrator's **configured** `project_root` — the `project_root` in its
+`dark-factory-orchestrator.yaml`, the same root `submit_task`'s guard
+validates the script under — never against the orchestrator process's
+working directory. See
+`shared/src/shared/before_done_paths.py::resolve_before_done_paths`.
 
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
@@ -1196,13 +1222,27 @@ same-files successor would be refused as a duplicate of its own predecessor
 (`fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title`).
 `cancelled` ends the chain, and an existing non-terminal link with the same
 `key` suppresses the mint. A mint failure never fails the status write: it
-logs `recurrence_mint_failed:` and leaves the link `done` with no successor,
-the *broken* state the chain-state gauge (a separate PRD task, not yet live)
-will surface. A request cancelled after its `done` write committed does not
-abandon the mint, which runs on to completion; a mint that is itself cancelled
-logs that same line. A link completed inside the same wall-clock second as its
-predecessor would give its successor its own run label, so that mint fails
-the same way.
+logs `recurrence_mint_failed:`. A request cancelled after its `done` write
+committed does not abandon the mint, which runs on to completion; a mint that
+is itself cancelled logs that same line. A link completed inside the same
+wall-clock second as its predecessor would give its successor its own run
+label, so that mint fails the same way.
+
+A failed mint, or a crash between the `done` write and the mint, leaves the
+chain *broken*: its current link is `done` and no live link exists
+(`shared/src/shared/recurrence_chains.py::current_links` is the one
+definition of a chain's current link). It stays broken until fused-memory's
+re-mint sweep
+(`fused-memory/src/fused_memory/middleware/recurrence_mint.py::run_remint_sweep_loop`)
+repairs it. The sweep runs at startup and then hourly. Under the write lock it
+re-reads each chain it found and leaves alone one that is no longer broken,
+then mints through the same C-2-checked path, so a re-run never double-mints
+and a chain ended since the sweep looked stays ended. It anchors the
+successor's `at` on the predecessor's stored terminal time. Each repair logs a
+`recurrence_remint:` WARNING and journals a `task_created` event with
+`trigger='remint_sweep'`. A chain that still cannot be minted, such as the
+same-second run-label collision or a carrier that no longer verifies, logs
+`recurrence_mint_failed:` on every sweep.
 
 ---
 
@@ -1616,6 +1656,20 @@ metadata key — that just adds another `code=unknown_key` census line. Use
 the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
+
+`x_inv12_finding` and `x_inv12_owns` are the Tier-C keys of the INV-12
+sweep (exceptions are owned or ratified; PRD
+`plans/inv12-exceptions-owned-or-ratified-prd.md`, D11).
+`x_inv12_finding` is the sweep's idempotence key, one per
+`(scope, dead owner)` where scope is a governed `list_id` or `inline`; the
+sweep skips filing while a live task or pending escalation carries it.
+`x_inv12_owns` is a note the sweep merges into a live owner task, saying
+which exception entries cite it. A sweep-filed task asks the implementer to
+re-dispose each entry whose owner is dead: fix the underlying type or code so
+the suppression can go, or cite a live follow-up ticket on the marker. The
+accepted marker and declaration spellings are
+`shared.governed_exceptions.INLINE_MARKER_FORMS` and `DECLARATION_FORMS`;
+read them there rather than from a copy here.
 
 ### `allow_mcp_markup`: a write-time flag, not a metadata key
 

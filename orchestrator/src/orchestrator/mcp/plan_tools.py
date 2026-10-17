@@ -2,7 +2,8 @@
 
 Spawned per-agent invocation by the orchestrator.  The architect agent
 builds plans via ``create_plan`` / ``add_plan_step`` / etc., and the
-implementer marks steps done via ``mark_step_done``.  On revalidation
+implementer marks steps done via ``mark_step_done`` and records where a
+step's text proved wrong via ``record_step_deviation``.  On revalidation
 (blast-radius requeue), the architect uses ``update_plan_metadata``,
 ``remove_plan_step``, ``replace_plan_step``, and ``confirm_plan`` to
 update an existing plan without recreating it from scratch.  All writes
@@ -97,6 +98,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
     accepts_markup_override,
 )
+from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator.artifacts import TaskArtifacts
@@ -1007,6 +1009,25 @@ def _with_markup_repairs(
 # ---------------------------------------------------------------------------
 
 
+STEP_TYPES: frozenset[str] = frozenset({'test', 'impl'})
+
+
+def _step_type_refusal(step_type: str) -> dict[str, Any] | None:
+    """The one enforcement of :data:`STEP_TYPES`: ``None`` for a member, else the refusal."""
+    if step_type in STEP_TYPES:
+        return None
+    allowed = sorted(STEP_TYPES)
+    return {
+        'status': 'error',
+        'message': (
+            f'step_type must be one of {allowed}; got {step_type!r}. '
+            "The plan stores this value under the key 'type'."
+        ),
+        'step_type': step_type,
+        'allowed_step_types': allowed,
+    }
+
+
 def _create_plan(
     artifacts: TaskArtifacts,
     task_id: str,
@@ -1111,6 +1132,10 @@ def _add_plan_step(
     plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
+
+    refusal = _step_type_refusal(step_type)
+    if refusal is not None:
+        return _with_markup_repairs(refusal, markup_facts)
 
     # Reject duplicate step IDs
     existing_ids = {
@@ -1384,6 +1409,64 @@ def _mark_step_done(
     )
 
 
+def _session_identity_in_hand(artifacts: TaskArtifacts, plan: dict) -> str | None:
+    """The agent sidecar's session id, else the planner's ``_session_id``, else None."""
+    session = artifacts.read_agent_session()
+    if session is not None and session.session_id:
+        return session.session_id
+    plan_session = plan.get('_session_id')
+    if isinstance(plan_session, str) and plan_session:
+        return plan_session
+    return None
+
+
+def _record_step_deviation(
+    artifacts: TaskArtifacts,
+    step_id: str,
+    kind: str,
+    observed: str,
+    expected: str,
+    action_taken: str,
+    prose_only: bool = False,
+    note: str = '',
+) -> dict[str, Any]:
+    plan, markup_facts = _read_plan_repaired(artifacts)
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    try:
+        record = DeviationRecord(
+            kind=kind,
+            observed=observed,
+            expected=expected,
+            action_taken=action_taken,
+            prose_only=prose_only,
+            note=note,
+            recorded_at=datetime.now(UTC).isoformat(),
+            recorded_by=_session_identity_in_hand(artifacts, plan),
+        )
+    except UnknownDeviationKind as exc:
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': str(exc),
+                'kind': exc.kind,
+                'allowed_kinds': list(exc.allowed),
+            },
+            markup_facts,
+        )
+
+    count = artifacts.append_step_deviation(step_id, record)
+    if count is None:
+        return _with_markup_repairs(
+            {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'},
+            markup_facts,
+        )
+    return _with_markup_repairs(
+        {'status': 'ok', 'step_id': step_id, 'deviations': count}, markup_facts
+    )
+
+
 # ---------------------------------------------------------------------------
 # Revalidation helpers
 # ---------------------------------------------------------------------------
@@ -1470,6 +1553,10 @@ def _replace_plan_step(
     plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
+
+    refusal = _step_type_refusal(step_type)
+    if refusal is not None:
+        return _with_markup_repairs(refusal, markup_facts)
 
     for collection in ('prerequisites', 'steps'):
         for item in plan.get(collection, []):
@@ -1570,6 +1657,12 @@ def _confirm_plan(
     # mid-build — the workflow routes that partial to a completion pass instead
     # of discarding it.  ``_revalidated_at`` is retained for revalidation-age
     # checks (see workflow._can_skip_revalidation).
+    #
+    # ``_finalized_at`` dates the LAST confirm: every re-confirm, revalidation
+    # and amendment re-confirms included, overwrites it.  ``_created_at``,
+    # stamped by ``orchestrator/artifacts.py::TaskArtifacts.stamp_plan_provenance``,
+    # is a post-hoc provenance stamp and is always later.  Neither dates the
+    # moment the plan was first frozen.
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
     artifacts.write_plan(plan)
@@ -2228,8 +2321,11 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
         Args:
             step_id: Unique step ID (e.g. "step-1", "step-2").
-            step_type: Either "test" or "impl".
-            description: What this step does.
+            step_type: One of ``STEP_TYPES``: "test" or "impl". Anything else
+                is refused. The plan stores this value under the key ``type``.
+            description: What the step changes and which test it greens. Not
+                suite-state forecasts such as exact counts, error types or
+                "must stay green".
         """
         return _add_plan_step(artifacts, step_id, step_type, description)
 
@@ -2348,6 +2444,43 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     @mcp.tool()
     @accepts_markup_override
+    def record_step_deviation(
+        step_id: str,
+        kind: str,
+        observed: str,
+        expected: str,
+        action_taken: str,
+        prose_only: bool = False,
+        note: str = '',
+    ) -> dict[str, Any]:
+        """Record that a plan step's text proved wrong at execution time.
+
+        State what you observed, what the step expected, and what you did.
+        Allowed on a step or prerequisite in any status, including after
+        ``mark_step_done``. Never changes the step's status, commit or
+        description.
+
+        Args:
+            step_id: The step or prerequisite ID (e.g. "step-1", "pre-1").
+            kind: One of the closed vocabulary
+                ``shared.plan_deviation.DEVIATION_KINDS``. An unknown kind is
+                refused, and the refusal lists every valid kind.
+            observed: What you actually found.
+            expected: What the step's text said or assumed.
+            action_taken: What you did about it.
+            prose_only: True when the claim is destined for a docstring,
+                CHANGELOG or SKILL.md.
+            note: Anything else a later reader needs.
+        """
+        # Flat str/bool parameters DELIBERATELY, as drop_plan_file: only flat
+        # strings get MarkupGuardMiddleware's inbound coverage.
+        return _record_step_deviation(
+            artifacts, step_id, kind, observed, expected, action_taken,
+            prose_only, note,
+        )
+
+    @mcp.tool()
+    @accepts_markup_override
     def mark_step_committed(
         step_id: str,
         sha: str,
@@ -2430,7 +2563,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
         Args:
             step_id: The step ID to replace (e.g. "step-2").
-            step_type: New step type — either "test" or "impl".
+            step_type: New step type — either "test" or "impl". An
+                out-of-vocabulary value is refused.
             description: New description of what this step does.
         """
         return _replace_plan_step(artifacts, step_id, step_type, description)
@@ -2450,7 +2584,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         Stamps a durable completeness marker on the plan. A plan WITHOUT this
         marker is treated as incomplete: it will not advance to execution, and
         a later session may resume and finish it. Requires a non-empty steps
-        and files list.
+        and files list. The stamp records the time of the most recent confirm,
+        overwritten by every re-confirm, not when the plan was first frozen.
         """
         return _confirm_plan(artifacts)
 

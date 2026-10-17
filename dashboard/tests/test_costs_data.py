@@ -2399,3 +2399,133 @@ class TestCostsAPIShapeRegression:
                 f"extra={actual_tokens - self._TOKEN_KEYS}, "
                 f"missing={self._TOKEN_KEYS - actual_tokens}"
             )
+
+
+# ---------------------------------------------------------------------------
+# The fused-memory curator's invocation ledger as an additional cost source
+# ---------------------------------------------------------------------------
+
+_LEDGER_NOW = datetime(2026, 10, 9, 12, 0, 0, tzinfo=UTC)
+
+
+async def _write_curator_ledger_row(db_path) -> None:
+    """One curator invocation, written through the ledger's own writer."""
+    from shared.cost_store import CostStore
+
+    store = CostStore(db_path)
+    await store.open()
+    try:
+        await store.save_invocation(
+            run_id='fused-memory-x',
+            task_id=None,
+            project_id='dark_factory',
+            account_name='a',
+            model='opus',
+            role='task_curator',
+            cost_usd=0.02,
+            input_tokens=None,
+            output_tokens=None,
+            cache_read_tokens=None,
+            cache_create_tokens=None,
+            duration_ms=1234,
+            capped=False,
+            started_at=(_LEDGER_NOW - timedelta(minutes=1)).isoformat(),
+            completed_at=_LEDGER_NOW.isoformat(),
+        )
+    finally:
+        await store.close()
+
+
+class TestCuratorLedgerSource:
+    """The cost view reads every project's runs.db plus the curator ledger at
+    ``<RECONCILIATION_DATA_DIR>/curator_events.db``, keeping each curator
+    row's real ``project_id`` and labelling it by its role.
+    """
+
+    @pytest.fixture()
+    def ledger_config(self, tmp_path, monkeypatch):
+        from dashboard.config import DashboardConfig
+
+        project_root = tmp_path / 'proj'
+        runs_db = project_root / 'data' / 'orchestrator' / 'runs.db'
+        runs_db.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(runs_db))
+        conn.executescript(MINIMAL_SCHEMA)
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('run-a1', '10', 'dark_factory', 'a', 'opus', 'implementer', 2.0, 0,
+             (_LEDGER_NOW - timedelta(hours=1)).isoformat(), _LEDGER_NOW.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        recon_dir = tmp_path / 'recon'
+        recon_dir.mkdir()
+        monkeypatch.setenv('RECONCILIATION_DATA_DIR', str(recon_dir))
+        return DashboardConfig(project_root=project_root, known_project_roots=[])
+
+    @pytest.fixture()
+    async def pool(self):
+        from dashboard.data.db import DbPool
+
+        pool = DbPool()
+        try:
+            yield pool
+        finally:
+            await pool.close_all()
+
+    @pytest.mark.asyncio
+    async def test_sources_are_runs_dbs_then_curator_ledger(self, ledger_config, pool):
+        from dashboard.project_dbs import _cost_dbs, _cost_sources
+
+        await _write_curator_ledger_row(ledger_config.curator_events_db)
+
+        sources = await _cost_sources(ledger_config, pool)
+
+        runs_dbs = await _cost_dbs(ledger_config, pool)
+        curator_ledger = await pool.get(ledger_config.curator_events_db)
+        assert curator_ledger is not None
+        assert sources == [*runs_dbs, curator_ledger]
+
+    @pytest.mark.asyncio
+    async def test_curator_row_keeps_project_and_is_labelled_by_role(
+        self, ledger_config, pool,
+    ):
+        from dashboard.project_dbs import _cost_sources
+
+        await _write_curator_ledger_row(ledger_config.curator_events_db)
+
+        by_role = await aggregate_cost_by_role(
+            await _cost_sources(ledger_config, pool), days=7, now=_LEDGER_NOW,
+        )
+
+        assert by_role['dark_factory']['task_curator'] == {'opus': pytest.approx(0.02)}
+        assert by_role['dark_factory']['implementer'] == {'opus': pytest.approx(2.0)}
+
+    @pytest.mark.asyncio
+    async def test_missing_curator_ledger_is_a_strict_no_op(self, ledger_config, pool):
+        from dashboard.data.model_role import aggregate_model_role_rollup
+        from dashboard.project_dbs import _cost_dbs, _cost_sources
+
+        assert not ledger_config.curator_events_db.exists()
+
+        sources = await _cost_sources(ledger_config, pool)
+        runs_dbs = await _cost_dbs(ledger_config, pool)
+
+        assert sources == [*runs_dbs, None]
+        for aggregate in (
+            aggregate_cost_summary,
+            aggregate_cost_by_project,
+            aggregate_cost_by_account,
+            aggregate_cost_by_role,
+            aggregate_cost_trend,
+            aggregate_account_events,
+            aggregate_run_cost_breakdown,
+            aggregate_model_role_rollup,
+        ):
+            with_ledger_slot = await aggregate(sources, days=7, now=_LEDGER_NOW)
+            runs_only = await aggregate(runs_dbs, days=7, now=_LEDGER_NOW)
+            assert with_ledger_slot == runs_only, aggregate.__name__

@@ -62,12 +62,13 @@ function endpointsFor(win) {
     '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
                                                         'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
+    '/api/v2/dashboard/invariants':                   { 'INVARIANTS': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
     '/api/v2/dashboard/memory-graphs':                { 'MEMORY_OPS': PLAIN },
     '/api/v2/dashboard/recon':                        { 'RECON_STATE': PLAIN, 'AGENTS': PLAIN },
     [`/api/v2/dashboard/merge-queue?window=${w}`]:    { 'MERGE_QUEUE': PLAIN },
     [`/api/v2/dashboard/costs?window=${w}`]:          { 'COSTS': PLAIN },
-    [`/api/v2/dashboard/performance?window=${w}`]:    { 'PERFORMANCE': PLAIN },
+    [`/api/v2/dashboard/performance?window=${w}`]:    { 'PERFORMANCE': PLAIN, 'PERFORMANCE_LISTING': PLAIN },
     [`/api/v2/dashboard/burndown?window=${w}`]:       { 'BURNDOWN': PLAIN, 'BURNDOWN_BY_PROJECT': PLAIN },
     '/api/v2/dashboard/curator':                      { 'CURATOR_STATE': PLAIN },
     '/api/v2/dashboard/scheduler':                    { 'SCHEDULER': PLAIN },
@@ -171,16 +172,20 @@ window.DF_DATA = {
   //   Rows carry no description/details: the Task Detail pane fetches those
   //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
+  // INVARIANTS: one claimant-invariant record per known root (E-1). Seeded
+  //   EMPTY so a project with no record renders no chip: unknown is not clean.
+  INVARIANTS: [],
   PERFORMANCE: {},
+  // performance_cards.js::cardsListing answers a missing Datum, so no zero is seeded.
+  PERFORMANCE_LISTING: null,
   MEMORY_STATUS: {
-    graphiti: { connected: false, node_count: 0, edge_count: 0, episode_count: 0 },
-    mem0: { connected: false, memory_count: 0 },
-    taskmaster: { connected: false },
+    graphiti: { connected: null, node_count: 0, edge_count: 0, episode_count: 0 },
+    mem0: { connected: null, memory_count: 0 },
     queue: { stats: null, spark: { labels: [], values: [] } },
     projects: {},
     wal: { status: 'offline', reason: null, rows: [] },
   },
-  MEMORY_OPS: { labels: [], reads: [], writes: [], other: [], total: [], totals: null, by_operation: [] },
+  MEMORY_OPS: { labels: [], reads: [], writes: [], other: [], total: [], by_operation: [], totals: null, newest_hour_total: null },
   RECON_STATE: {
     buffer: { buffered_count: 0, oldest_event_age_seconds: null },
     burst_state: [],
@@ -190,9 +195,9 @@ window.DF_DATA = {
     runs: [],
   },
   // MERGE_QUEUE: {project_label: {depth, outcomes, latency: {p50, p95, p99,
-  //   mean_ms, with_duration, without_duration}, recent, recent_total,
-  //   speculative, active, in_queue: Datum, live_probe_configured, active_spark,
-  //   halt, train_events:
+  //   mean_ms, with_duration, without_duration}, recent, recent_total: Datum,
+  //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
+  //   active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
   //   member_task_ids, ...event-specific keys}}]}}; every recent and active
   //   row's title is a Datum. The payload's top-level served_at is the receipt

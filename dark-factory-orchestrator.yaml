@@ -413,9 +413,14 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_shadow_ruling_doc_contract.py — reads
 #       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
 #       payload literals against the live parser (task 5374).
+#   scripts/tests/test_design_invariants_consistency.py — reads
+#       skills/prd/references/gates.md live; its enumeration and citation
+#       scans walk the repo with no skills/ prune (task 4941).
 #   fused-memory/tests/test_referent_declaration_examples.py — reads
 #       skills/reflect/SKILL.md to execute its `entities=` examples against
 #       the live entities_gate (task 3675).
+#   tests/scripts/test_merge_marker_search_snippets.py — EXECUTES every
+#       merge-marker search in skills/**/*.md against a shadowed fixture history (task 5774).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
@@ -782,16 +787,26 @@ timeouts:
 # correctness-free speed knob: the lockfile alone determines WHAT is installed
 # and npm's cache is keyed by integrity, so a cache hit is always the right
 # bytes — it just avoids a registry round-trip on every cold worktree.
-# MEASURED 2026-08-28 with an empty, isolated npm cache (the worst case, and the
-# one a fresh host actually sees): 15.9s. Warm cache: ~2s.
+# The same install also provisions the dashboard DOM harness's devDependencies
+# (jsdom, react, react-dom; task 4899), which dashboard/tests/js/ needs.
+# It runs only on a COLD verify, so a task worktree that cold-verified before a
+# package-lock.json change keeps its old node_modules. The harness then fails,
+# naming the stale package and `npm ci` as the remedy. Merge verify is always
+# cold, so main is unaffected. Re-provisioning on lockfile drift is ticket
+# tkt_0RVST44N7D57CY4ERSJCVJ3QW2.
+# MEASURED 2026-10-14, with those added, against an empty isolated npm cache
+# (the worst case, and the one a fresh host actually sees): 14.5s. Warm cache:
+# 10.6s. Both were taken at load average ~105 on 32 cores; the pyright-only
+# 2026-08-28 figures were 15.9s and ~2s.
 #
 # DISK, stated because it is a real per-worktree cost and nobody should have to
-# rediscover it: this leaves a 37MB `node_modules/` in every cold-verified
-# worktree (gitignored, and pyright/ruff/pytest are all given explicit targets
-# so nothing walks it). Context, measured the same day on this host: the `.venv`
-# each worktree already carries is 156-803MB, so this adds roughly 5-24% to a
-# worktree's footprint, on 2.0T free. If that ever stops being a rounding error
-# the answer is worktree GC, not dropping the pin.
+# rediscover it: this leaves a 70MB `node_modules/` in every cold-verified
+# worktree (37MB of it pyright; measured 2026-10-14). It is gitignored, and
+# pyright/ruff/pytest are all given explicit targets, so nothing walks it.
+# Context, measured 2026-08-28 on this host: the `.venv` each worktree already
+# carries is 156-803MB, so this adds roughly 9-45% to a worktree's footprint,
+# on 2.0T free. If that ever stops being a rounding error the answer is
+# worktree GC, not dropping the pin.
 verify_cold_preprovision_command: "uv sync --all-packages && npm ci --no-audit --no-fund --prefer-offline"
 
 # TEMPORARY manual override (watcher, 2026-07-13) to break the cross-project
@@ -890,8 +905,20 @@ verify_admission_pytest_n: "8"
 # timeouts/day went 2,1,3,7,13,9,7 (08-28..09-07). Dose-response against the
 # number of OTHER concurrent orchestrator-suite fan-outs: 0-0.5 others -> 1978s
 # median, 0/12 timeouts; >=0.5 others -> 3600s censored, 29/52 timeouts. So 2
-# slots is not a middle ground either. Slot time is not the constraint: the whole
-# task-lane leg volume (~240 legs/14d) sums to ~5.5h/day, i.e. ~23% of ONE slot.
+# slots is not a middle ground either.
+# CORRECTED 2026-09-18: an earlier version of this block said slot time was not
+# the constraint ("~240 legs/14d, ~5.5h/day, ~23% of ONE slot"). That counted one
+# module's legs only (the basis lines above are orchestrator-module only, and
+# orchestrator is 34% of gated arrivals), so it undercounted slot-gated task
+# legs by 6.3x: measured arrivals are 107.5 legs/day (n=578 over 5.38d), not
+# ~17.1/day. Priced at service times from the same period, offered work is
+# 23.9 h/day, so the ONE slot is ~99% utilised, not ~23%. The orchestrator
+# full-suite task leg alone is 22% of arrivals and 86% of slot work, and its
+# mean service time rose from 644s (July) to 3,066s (from 2026-09-12).
+# Sources, in plans/verify-merge-queue-policy-study-2026-09-18/:
+# measure-sem.md, and critic.md finding 1 (summary: SYNTHESIS.md §1).
+# With the slot saturated and in-flight tasks pinned at max_concurrent_tasks,
+# mean task duration is set by WIP and leg service time, not by slot ordering.
 # The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
 # 49-72 and non-discriminating at this load, per task 3590).
 # The main-tip sweep (background role) shares this slot and was already live in
@@ -910,13 +937,13 @@ verify_admission_pytest_n: "8"
 # to 1. That is the same reversibility clause the 09-03 raise carried, which did
 # fire and was honoured.
 # MEASUREMENT GAP, stated rather than papered over: the "~23% of ONE slot"
-# figure above could NOT be re-verified on 2026-09-23 — `workflow_verify` events
-# carry only {base_sha, branch, passed, tip_sha} and NO duration, so task-lane
-# slot-hours are not derivable from the event store at all. Only the leg COUNT
-# is: 572 workflow_verify events in 14.4d versus the ~240/14d that figure was
-# computed from. Task 5798 closes that gap. Until it lands, this knob is being
-# tuned on merge-lane duration plus queue-depth observation, not on task-lane
-# slot utilisation.
+# figure (corrected above) could NOT be re-verified on 2026-09-23 —
+# `workflow_verify` events carry only {base_sha, branch, passed, tip_sha} and NO
+# duration, so task-lane slot-hours are not derivable from the event store at
+# all. Only the leg COUNT is: 572 workflow_verify events in 14.4d versus the
+# ~240/14d that figure was computed from. Task 5798 closes that gap. Until it
+# lands, this knob is being tuned on merge-lane duration plus queue-depth
+# observation, not on task-lane slot utilisation.
 # PUT BACK TO 1 (task 5797 gate, 2026-09-27). The dated-revert clause above
 # fired. Equal 4.3d arms on either side of the 09-23 reload:
 #   orchestrator-suite task-leg verify (verify-summary census):
@@ -928,6 +955,23 @@ verify_admission_pytest_n: "8"
 # all five measures, with sources and caveats:
 # plans/verify-admission-task-slots-gate.md.
 verify_admission_task_slots: 1
+
+# TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
+# plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a
+# role class instead of the unordered poll. This is a TAIL fix only, not a
+# mean-duration or throughput change. Prediction to check against the recorded
+# verify_admission_plan events (rows with order='arrival'): mean plan completion
+# unchanged, median about +35% (the expected cost, not a regression), p90 about
+# -30%, maximum wait about 34h -> 12h. Revert by setting 'unordered' (green
+# tier: applies at the next reload_config or restart).
+verify_admission_order: arrival
+
+# Run each verify leg in its own weighted cgroup scope, a sibling of this unit
+# under app.slice, so agents stop losing thread-for-thread to verify xdist
+# workers (task 5206, operator decision Leo 2026-09-08; per-role weights from
+# task 5205). It also takes verify load out of this unit's own_cpu_some10.
+# Restart tier: not in RELOADABLE_FIELDS, so it goes live at the next redeploy.
+verify_use_cgroup_scope: true
 
 # Pin `-n auto` for every verify subprocess (task 3589's residual, operator
 # decision Leo 2026-09-08). pytest-xdist resolves `-n auto` via psutil physical
@@ -1283,39 +1327,7 @@ sandbox:
 # plain boundary-safe string-prefix matching against changed file paths with
 # no filesystem check), chosen deliberately so a typo'd prefix fails CI
 # instead of silently never matching a changed file at fire time.
-# DEPLOY PAUSE — TEMPORARY, 2026-09-03. Restore to `true` once tasks 3730,
-# 3733 and 4755 have landed (task 5020 is the deterministic gate that asks for
-# exactly that; do not remove this comment without closing it).
-#
-# WHY: this tier restarts the WHOLE FLEET (restart-all-orchestrators.sh restarts
-# all seven units) whenever a merge touches orchestrator_restart_watch_prefixes.
-# MEASURED 2026-08-28 -> 09-03: 8 of 12 run boundaries were this tier. Every
-# restart soft-cancels every in-flight task, and at the current ~6.8h median task
-# duration against an ~8.3h run, most tasks never finish. Runs <10h delivered
-# 0.254 done/h at 22.4 cancellations per completed task; runs >=10h delivered
-# 0.426 done/h at 7.5. So the fleet does ~1.7x more work per hour, and wastes 3x
-# less, when it is simply left alone.
-#
-# THE TRAP THIS BREAKS: the survival fixes (3730/3733/4755) are THEMSELVES
-# orchestrator code, so landing one triggers this tier, which restarts the fleet,
-# which kills the in-flight work — including, historically, those very fixes.
-# Task 3728 was killed eight times this way before landing on its ninth attempt.
-#
-# SCOPE — read before widening: this pauses the merge-landed COORDINATOR tier
-# only. The watchdog LIVENESS probe is deliberately untouched and must stay on;
-# it is not clock-gated, never invokes the sweep script, and is the only thing
-# that revives a genuinely wedged unit. The watchdog STALENESS tier is throttled
-# separately via ORCH_RESTART_MIN_INTERVAL_SECS in its own systemd unit env.
-#
-# COST: orchestrator code stops reaching the fleet while this is false (deploy
-# latency was a ~2h median). Unpausing deploys everything accumulated in one
-# restart. If something lands that fixes an actively-breaking fleet problem,
-# flip this back deliberately rather than waiting for 4907.
-#
-# RED TIER: not in RELOADABLE_FIELDS, so this takes effect at the next restart
-# — which is the point. It was edited ~1.6h before a scheduled 8h-clock restart
-# so it costs no additional restart of its own.
-orchestrator_restart_on_merge_enabled: false
+orchestrator_restart_on_merge_enabled: true
 orchestrator_restart_script: "scripts/restart-all-orchestrators.sh"
 orchestrator_restart_watch_prefixes:
   - "orchestrator/src/"
@@ -1323,18 +1335,6 @@ orchestrator_restart_watch_prefixes:
   - "orchestrator/pyproject.toml"
   - "orchestrator/uv.lock"
   - "escalation/pyproject.toml"
-
-# Starvation watchdog idle-only backstop, effectively OFF until task 3821 deploys
-# (Leo, 2026-09-11, L2 docket option A). Its eligibility clock is in-memory, so
-# every restart re-anchors the whole pending pool, and idle_only_secs (72h in
-# defaults.yaml) later the entire cohort fires at once: 489 records on 09-07
-# (esc-4851-3) and 368 on 09-10 (esc-4507-5). With deploys paused, processes now
-# routinely outlive 72h. 30 days satisfies the idle_only_secs >= idle_secs
-# validator and leaves the dual gate (skip_threshold AND idle_secs) armed.
-# Green tier: applied by hot reload. REVERT by deleting this block once 3821's
-# restart-safe clock is deployed, or when deploys resume (task 5020).
-starvation_watchdog:
-  idle_only_secs: 2592000.0
 
 # Recovery-veto-streak alarm: silence the ESCALATION arm only (Leo, 2026-09-12,
 # authorizing the standing request in cockpit decision veto-streak-alarm-retune-df,

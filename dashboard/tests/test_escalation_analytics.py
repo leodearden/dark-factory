@@ -207,12 +207,26 @@ class TestDoneByDay:
 
         assert result == {'2026-07-10': 2, '2026-07-11': 1}
 
-    def test_missing_db_returns_empty_dict(self, tmp_path):
+    def test_missing_db_is_unreadable(self, tmp_path):
+        """No runs.db is no reading — never {}, which would claim no task completed."""
         from dashboard.data.escalation_analytics import _done_by_day
 
         missing = tmp_path / 'does-not-exist' / 'runs.db'
 
-        assert _done_by_day(missing) == {}
+        assert _done_by_day(missing) is None
+
+    def test_a_failing_query_is_unreadable(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        tableless = tmp_path / 'runs.db'
+        sqlite3.connect(str(tableless)).close()
+
+        assert _done_by_day(tableless) is None
+
+    def test_a_readable_empty_db_is_a_measured_empty_dict(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        assert _done_by_day(_make_runs_db(tmp_path, [])) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +713,7 @@ class TestAggregateProjectWorkflow:
         assert by_date[done_only_day]['filings'] == 0
         assert by_date[done_only_day]['done'] == 1
         assert by_date[done_only_day]['ratio'] == 0.0
+        assert workflow['done_counts_read'] is True
 
         # flow_daily: sparse cube over the 5 terminal-with-valid-times
         # records, keyed by (date(resolved_at), source, level, tier, class).
@@ -726,6 +741,24 @@ class TestAggregateProjectWorkflow:
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
         assert sum(row['n'] for row in workflow['flow_daily']) == len(entry['lifespan']['samples'])
+
+    def test_unreadable_runs_db_serves_unmeasured_done_counts(self, tmp_path):
+        """An unread runs.db is not 'no tasks completed': done and ratio are unmeasured."""
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        archive = build_golden_archive(esc_dir, now)
+        expected_filings_by_date: dict[str, int] = {}
+        for esc in archive.values():
+            d = datetime.fromisoformat(esc['timestamp']).date().isoformat()
+            expected_filings_by_date[d] = expected_filings_by_date.get(d, 0) + 1
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'absent' / 'runs.db', now=now)
+        workflow = entry['workflow']
+
+        assert workflow['done_counts_read'] is False
+        rows = workflow['esc_per_done_daily']
+        assert {row['date']: row['filings'] for row in rows} == expected_filings_by_date
+        assert all(row['done'] is None and row['ratio'] is None for row in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1775,11 +1808,14 @@ class TestCorpusViewsAndProvenance:
 
         payload = _analytics(projects, now=now)
 
+        read = {entry['project']: entry['workflow']['done_counts_read'] for entry in payload['per_project']}
+        assert read == {'alpha': True, 'beta': True, 'gamma': False}
         done = {
             entry['project']: sum(day['done'] for day in entry['workflow']['esc_per_done_daily'])
             for entry in payload['per_project']
+            if entry['workflow']['done_counts_read']
         }
-        assert done == {'alpha': 1, 'beta': 2, 'gamma': 0}
+        assert done == {'alpha': 1, 'beta': 2}
 
     def test_generated_at_is_the_corpus_instant(self, tmp_path):
         now = golden_now()

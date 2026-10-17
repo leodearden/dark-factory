@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _serial_recovery_helpers import (
+    ORCH_SHAPED_ADDOPTS,
+    ORCH_SHAPED_PYPROJECT,
+    ROOT_SHAPED_PYPROJECT,
+    pyproject_with_addopts,
+)
 from _verify_config_corpus import (
     DASHBOARD_LINT_COMMAND,
     FM_LINT_COMMAND,
@@ -57,11 +63,11 @@ from orchestrator.verify_plan import (
     _is_collectable_test_file,
     _is_conftest,
     _is_test_file,
-    _scope_prefix_to_keyword,
     classify_file,
     derive_verify_plan,
     effective_merge_module_configs,
     reverse_dependent_test_targets,
+    scope_prefix_to_keyword,
 )
 
 # The real config command strings this suite exercises live in
@@ -1116,11 +1122,11 @@ class TestDeriveVerifyPlanMergeBreadth:
 
 
 # ---------------------------------------------------------------------------
-# The two scopers: &&-chain trailing-clause preservation (task 3061)
+# The scoper: &&-chain trailing-clause preservation (task 3061)
 # ---------------------------------------------------------------------------
 
 # Every real config command, paired with the keyword its slot scopes on. Used
-# as the lockstep corpus below; `_scope_to_keyword` and `_scope_prefix_to_keyword`
+# as the lockstep corpus below; `_scope_to_keyword` and `scope_prefix_to_keyword`
 # must agree on ALL of them, for EVERY keyword — including the mismatched
 # pairings, which exercise the keyword-absent and keyword-in-a-later-segment
 # rejections.
@@ -1147,12 +1153,27 @@ _SHELL_CONSTRUCT_HAZARDS: list[tuple[str, str]] = [
     ('subst-in-double-quotes', 'ruff check "$(ls && echo x)" && python3 y.py'),
 ]
 
+# Chains the tail gate REJECTS, or that bail out before any rewrite: a sibling
+# checker behind the pytest slot (task 3218), and a keyword absent from or
+# OPAQUE in segment 0.
+_REJECTED_CHAINS: list[tuple[str, str]] = [
+    ('pytest-named-sibling', _SIBLING_CHECKER_TEST_COMMAND),
+    ('pytest-unnamed-sibling', _SIBLING_CHECKER_TEST_COMMAND_UNNAMED),
+    ('multi-clause-keyword-absent', 'mypy src/ && python3 x.py'),
+    ('multi-clause-keyword-absent-opaque', 'true && python3 x.py'),
+    ('multi-clause-opaque-prefix', 'echo pytest && python3 x.py'),
+]
+
 _LOCKSTEP_KEYWORDS = ('ruff check', 'pyright', 'pytest')
 
 _LOCKSTEP_CASES = [
-    (raw, keyword, f'{name}::{keyword.replace(" ", "-")}')
-    for name, raw in (*_REAL_CONFIG_COMMANDS, *_SHELL_CONSTRUCT_HAZARDS)
-    for keyword in _LOCKSTEP_KEYWORDS
+    *(
+        (raw, keyword, f'{name}::{keyword.replace(" ", "-")}')
+        for name, raw in (*_REAL_CONFIG_COMMANDS, *_SHELL_CONSTRUCT_HAZARDS, *_REJECTED_CHAINS)
+        for keyword in _LOCKSTEP_KEYWORDS
+    ),
+    # Gate condition 0b: a keyword that is not the tool, over a pytest clause.
+    (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'uv run', 'pytest-unnamed-sibling::uv-run'),
 ]
 
 
@@ -1161,7 +1182,7 @@ class TestScoperTrailingClausePreservation:
 
     Task 3061: every subproject's ``lint_command`` chains a
     ``python3 fused-memory/scripts/check_*.py <dir>`` gate after ``ruff
-    check``. Both scopers truncated at the keyword, so scoped pre-merge
+    check``. Scoping truncated at the keyword, so scoped pre-merge
     verify silently ran only ruff — the bare-MagicMock and asyncmock-
     assertion gates were invisible until post-merge (task 2920's violation
     landed exactly this way).
@@ -1328,15 +1349,15 @@ class TestScoperTrailingClausePreservation:
         ids=[test_id for _, _, test_id in _LOCKSTEP_CASES],
     )
     def test_lockstep_between_the_two_scopers(self, raw, keyword):
-        """The string scoper and the VerifyCmd scoper must never disagree.
+        """The string scoper is byte-identical to ``render(scope_prefix_to_keyword(...))``.
 
-        They were historically kept in sync only by a docstring mandate —
-        a convention this very bug shows was load-bearing and unenforced.
-        Both now route through the shared ``split_chain_tail`` gate, so this
-        asserts a property that holds by construction.
+        The two were once separate pipelines kept in sync by a docstring
+        mandate, and drifted. The string scoper now renders the VerifyCmd
+        scoper; this corpus sweep catches a future re-duplication of the
+        pipeline in verify.py.
         """
         assert _scope_to_keyword(raw, keyword, self._FILES) == render(
-            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            scope_prefix_to_keyword(raw, keyword, self._FILES)
         )
 
 
@@ -1348,10 +1369,10 @@ class TestScoperTrailingClausePreservation:
 
 
 class TestTailPreservationAllowlist:
-    """Both scopers must return a STRUCTURED command for a chained pytest slot.
+    """A chained pytest slot must scope to a STRUCTURED command, in both forms.
 
     Task 3218 part 1. ``split_chain_tail``'s ACCEPT makes
-    ``_scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
+    ``scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
     and ``verify._scope_to_keyword`` return a multi-clause string that
     re-parses the same way. ``with_junitxml`` and ``with_pytest_timeout`` are
     documented no-ops on ``raw is not None``, so the merge leg's
@@ -1360,8 +1381,9 @@ class TestTailPreservationAllowlist:
     per-test timeout floor — is silently never collected.
 
     Excluding ``'pytest'`` from the gate's keyword allowlist closes this at
-    all five pytest-slot consumers at once, because both scopers route
-    through that one shared gate.
+    all five pytest-slot consumers at once: each scopes through
+    ``scope_prefix_to_keyword`` (the string scoper renders it), which consults
+    that one gate.
     """
 
     _FILES = ['a/test_x.py']
@@ -1372,8 +1394,8 @@ class TestTailPreservationAllowlist:
         ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
     )
     def test_plan_scoper_yields_structured_junit_injectable_pytest(self, raw):
-        """_scope_prefix_to_keyword: raw-retained is the failure mode; assert against it."""
-        scoped = _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        """scope_prefix_to_keyword: raw-retained is the failure mode; assert against it."""
+        scoped = scope_prefix_to_keyword(raw, 'pytest', self._FILES)
         assert scoped.tool is ToolKind.PYTEST
         assert scoped.raw is None, 'a raw-retained pytest cmd silently loses --junitxml'
 
@@ -1416,17 +1438,6 @@ class TestTailPreservationAllowlist:
             ' fused-memory/tests'
         ) in scoped
 
-    @pytest.mark.parametrize(
-        'raw',
-        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
-        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
-    )
-    def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
-        """The two scopers must agree here too — the gate is shared, so this is structural."""
-        assert _scope_to_keyword(raw, 'pytest', self._FILES) == render(
-            _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
-        )
-
 
 # ---------------------------------------------------------------------------
 # A gate-rejected multi-clause command must SAY what it dropped
@@ -1434,7 +1445,10 @@ class TestTailPreservationAllowlist:
 
 
 class TestDroppedChainClausesAreLogged:
-    """Both scopers log the clauses a gate REJECT silently discards (task 3218 2b).
+    """The scoper logs the clauses a gate REJECT silently discards (task 3218 2b).
+
+    ``verify._scope_to_keyword`` renders ``scope_prefix_to_keyword``, so it
+    emits that one record, on ``orchestrator.verify_plan``.
 
     ``split_chain_tail`` returns ``(raw, '')`` for both "single-segment,
     nothing to preserve" and "multi-segment, rejected", so today a caller
@@ -1513,7 +1527,7 @@ class TestDroppedChainClausesAreLogged:
         configs, and stay at DEBUG.
         """
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
-            result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            result = scope_prefix_to_keyword(raw, keyword, self._FILES)
 
         messages = self._records(caplog, 'orchestrator.verify_plan', level)
         assert len(messages) == 1, f'expected exactly one record, got {messages}'
@@ -1528,18 +1542,28 @@ class TestDroppedChainClausesAreLogged:
         assert self._records(caplog, 'orchestrator.verify_plan') == messages
 
     @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
-    def test_string_scoper_logs_the_equivalent_record(
+    def test_string_scoper_emits_the_plan_scopers_record(
         self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
     ):
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+        """The string scoper renders scope_prefix_to_keyword, so it emits that record and no copy of its own."""
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            scope_prefix_to_keyword(raw, keyword, self._FILES)
+        expected = self._records(caplog, 'orchestrator.verify_plan', level)
+        caplog.clear()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'),
+        ):
             result = _scope_to_keyword(raw, keyword, self._FILES)
 
-        messages = self._records(caplog, 'orchestrator.verify', level)
-        assert len(messages) == 1, f'expected exactly one record, got {messages}'
-        assert keyword in messages[0]
-        assert f'dropped {dropped} trailing' in messages[0]
+        assert len(expected) == 1, f'expected exactly one record, got {expected}'
+        assert f'dropped {dropped} trailing' in expected[0]
+        assert keyword in expected[0]
+        assert self._records(caplog, 'orchestrator.verify_plan', level) == expected
+        assert self._records(caplog, 'orchestrator.verify_plan') == expected
+        assert self._records(caplog, 'orchestrator.verify') == []
         assert result is not None
-        assert self._records(caplog, 'orchestrator.verify') == messages
 
     @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
     def test_wording_matches_the_level(
@@ -1552,7 +1576,7 @@ class TestDroppedChainClausesAreLogged:
         repo's own root ``test_command``, on every fallback verify.
         """
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
-            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            scope_prefix_to_keyword(raw, keyword, self._FILES)
 
         messages = self._records(caplog, 'orchestrator.verify_plan', level)
         assert len(messages) == 1, f'expected exactly one record, got {messages}'
@@ -1599,48 +1623,23 @@ class TestDroppedChainClausesAreLogged:
         ordinary config, so this is reachable in practice.
         """
         with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
-            plan_result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+            plan_result = scope_prefix_to_keyword(raw, keyword, self._FILES)
         assert self._records(caplog, 'orchestrator.verify_plan') == []
 
         caplog.clear()
-        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'),
+        ):
             string_result = _scope_to_keyword(raw, keyword, self._FILES)
         assert self._records(caplog, 'orchestrator.verify') == []
+        assert self._records(caplog, 'orchestrator.verify_plan') == []
 
         # Pin the premise the silence rests on: these really do come back with
         # every clause intact, so there was genuinely nothing to report.
         if 'x.py' in raw:
             assert string_result == raw
             assert render(plan_result) == raw
-
-    @pytest.mark.parametrize(
-        ('raw', 'keyword'),
-        [
-            (ROOT_TYPE_CHECK_COMMAND, 'pyright'),
-            (ROOT_TEST_COMMAND, 'pytest'),
-            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
-            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
-            (FM_LINT_COMMAND, 'ruff check'),
-            ('ruff check src/ --select E', 'ruff check'),
-            ('mypy src/', 'ruff check'),
-            ('true', 'pytest'),
-            ('mypy src/ && python3 x.py', 'ruff check'),
-            ('true && python3 x.py', 'pytest'),
-            ('echo pytest && python3 x.py', 'pytest'),
-            ('uv run pytest tests/ && python3 scripts/check_markers.py tests', 'uv run'),
-        ],
-        ids=[
-            'root-type-check', 'root-test', 'pytest-named-sibling',
-            'pytest-unnamed-sibling', 'fm-lint', 'single-clause', 'opaque-mypy', 'no-op-true',
-            'multi-clause-keyword-absent', 'multi-clause-keyword-absent-opaque',
-            'multi-clause-opaque-prefix', 'uv-run-keyword-over-a-pytest-clause',
-        ],
-    )
-    def test_logging_is_the_only_observable_change(self, raw, keyword):
-        """Both scopers' returned commands stay byte-identical, and in lockstep."""
-        string_scoped = _scope_to_keyword(raw, keyword, self._FILES)
-        plan_scoped = render(_scope_prefix_to_keyword(raw, keyword, self._FILES))
-        assert string_scoped == plan_scoped
 
 
 # ---------------------------------------------------------------------------
@@ -1658,7 +1657,7 @@ class TestReprojectStrChainTail:
     Once the scoper starts preserving a trailing ``&&`` clause, the string
     handed to ``_reproject_str`` is a chain; re-parsing the whole chain
     classifies it OPAQUE and the injection is SILENTLY dropped. This class
-    guards that regression BEFORE the scopers change, so no intermediate
+    guards that regression BEFORE the scoping change, so no intermediate
     commit is red.
 
     It ALSO guards the converse hazard (task 3061 step-7). ``_reproject_str``
@@ -2223,7 +2222,7 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
         test_command='pytest',
     )),
     # Commands the scoper cannot narrow at all: OPAQUE (mypy) and a keyword
-    # that never appears (`true`). _scope_prefix_to_keyword returns the
+    # that never appears (`true`). scope_prefix_to_keyword returns the
     # command UNSCOPED here while _derive_module_runs still labels the slot
     # FILE_SCOPED — a pre-existing property of scope_kind that scoped_targets
     # must track consistently rather than contradict.
@@ -2310,7 +2309,7 @@ class TestPlanRecordScopedTargets:
 
     Task 3219. ``cmd.targets`` cannot answer that question once ``cmd`` is
     raw-retained, which is the shape the tail-preserving chained-lint accept
-    path (_scope_prefix_to_keyword) produces for EVERY subproject — each
+    path (scope_prefix_to_keyword) produces for EVERY subproject — each
     one's lint_command chains a sibling checker. The scoping itself was and
     remains correct; only the machine-readable record was lost.
 
@@ -2771,38 +2770,31 @@ _ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
 
 
 class TestVersionPinSurvivesPrefixScoping:
-    """``_scope_prefix_to_keyword`` must keep a pinned npx package version.
+    """``scope_prefix_to_keyword`` must keep a pinned npx package version.
 
-    Task 3931 / esc-3805-1 — the LOCKSTEP counterpart of
-    ``test_verify.py::TestVersionPinSurvivesScoping``.
+    Task 3931 / esc-3805-1 — the ``VerifyCmd``-layer half of
+    ``test_verify.py::TestVersionPinSurvivesScoping``, which pins the same
+    property on ``verify._scope_to_keyword``, this function's rendering.
 
-    This function is the ``VerifyCmd``-layer twin of
-    ``verify._scope_to_keyword`` and carries the IDENTICAL byte-offset
-    truncation (``retained = head[: idx + len(keyword)]``); its own docstring
-    states that *raw* "is ALWAYS truncated to everything up to and including
-    the first occurrence of *keyword* before being (re-)parsed". So it strips a
-    version pin exactly the same way, and the two layers must be fixed in the
-    SAME commit or they silently diverge — the trap task 3830 fell into, where
-    a plan named only verify.py while verify_plan.py needed the identical
-    change.
+    Its own docstring states that *raw* "is ALWAYS truncated to everything up
+    to and including the first occurrence of *keyword* before being
+    (re-)parsed", and that truncation was the byte-offset slice
+    ``retained = head[: idx + len(keyword)]``, so it stripped a version pin.
 
     MEASURED on this branch before the step-6 change (and after step-4, so this
     is verify_plan.py's own stripping, not the parser's):
 
-        _scope_prefix_to_keyword(PINNED, 'pyright', [file])
+        scope_prefix_to_keyword(PINNED, 'pyright', [file])
             -> ToolKind.PYRIGHT, renders 'npx pyright <file>'   <-- pin GONE
     """
 
     def test_pinned_chain_keeps_its_version(self):
-        cmd = _scope_prefix_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        cmd = scope_prefix_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
         assert cmd.tool is ToolKind.PYRIGHT
         assert render(cmd) == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
-            f'_scope_prefix_to_keyword dropped the version pin, rendering '
-            f'{render(cmd)!r} (task 3931, esc-3805-1). This is the '
-            'VerifyCmd-layer twin of verify._scope_to_keyword and must be '
-            'fixed in lockstep with it — the pair routes through one shared '
-            'split_chain_tail gate and its STRUCTURAL lockstep is a documented '
-            'property'
+            f'scope_prefix_to_keyword dropped the version pin, rendering '
+            f'{render(cmd)!r} (task 3931, esc-3805-1) — its keyword truncation '
+            'must stay token-aware (verify_cmd.keyword_truncation_end)'
         )
 
     def test_unpinned_chain_scopes_exactly_as_today(self):
@@ -2812,15 +2804,176 @@ class TestVersionPinSurvivesPrefixScoping:
             '(task 3931 / 4538) — the pinned fixture above would then be the '
             'same string as this one and neither guard would mean anything'
         )
-        cmd = _scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
+        cmd = scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
         assert cmd.tool is ToolKind.PYRIGHT
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
 
     def test_a_longer_unrelated_token_is_not_absorbed(self):
-        """Same boundary rule as verify.py's: widen across `@<version>` ONLY.
+        """The `keyword_truncation_end` boundary rule: widen across `@<version>` ONLY.
 
         Passes today; it is the floor that makes the step-6 widening provably
         narrow rather than a general "keep the whole token" change.
         """
-        cmd = _scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
+        cmd = scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
+
+
+#: A repo-shaped tree: the root and two subprojects each carry pytest config.
+_CONFIG_TREE = {
+    'pyproject.toml': ROOT_SHAPED_PYPROJECT,
+    'orchestrator/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+    'cockpit/pyproject.toml': pyproject_with_addopts(('-n', 'auto', '--dist', 'loadgroup', '-m', 'not smoke')),
+}
+
+
+class _RecordingTreeReader:
+    """A dict-backed ``worktree_reader`` that records every path it is asked for."""
+
+    def __init__(self, contents: dict[str, str]) -> None:
+        self.contents = contents
+        self.paths: list[str] = []
+
+    def __call__(self, path: str) -> str | None:
+        self.paths.append(path)
+        return self.contents.get(path)
+
+
+class TestPytestConfigPathForCommand:
+    """``pytest_config_path_for_command(cmd, worktree_reader)``.
+
+    Maps the command ACTUALLY being run to the config pytest reads for it:
+    pytest's own walk from the common ancestor of its positional targets (or
+    its cwd when it names none), bounded at the reader's root. Correct for
+    scoped, cwd-stripped commands as well as the module's unscoped one.
+    """
+
+    @staticmethod
+    def _resolve(command: str, contents: dict[str, str] = _CONFIG_TREE):
+        reader = _RecordingTreeReader(contents)
+        return verify_plan_module.pytest_config_path_for_command(parse_config_command(command), reader), reader
+
+    @pytest.mark.parametrize(
+        ('command', 'expected'),
+        [
+            pytest.param(
+                'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300',
+                'orchestrator/pyproject.toml',
+                id='module-directory',
+            ),
+            pytest.param(
+                'uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q '
+                '--import-mode=importlib -n auto --dist loadgroup',
+                'pyproject.toml',
+                id='scripts-from-root',
+            ),
+            pytest.param(
+                'uv run --project orchestrator pytest '
+                'orchestrator/tests/test_x.py::TestA::test_b --tb=short -q',
+                'orchestrator/pyproject.toml',
+                id='scoped-cwd-stripped',
+            ),
+            pytest.param('cd cockpit && uv run pytest tests/', 'cockpit/pyproject.toml', id='cd'),
+            pytest.param('pytest -m warm_lane_bash', 'pyproject.toml', id='no-targets'),
+            pytest.param(
+                'cd orchestrator && pytest -m warm_lane_bash',
+                'orchestrator/pyproject.toml',
+                id='no-targets-under-cd',
+            ),
+            pytest.param(
+                'pytest orchestrator/tests/test_a.py cockpit/tests/test_b.py',
+                'pyproject.toml',
+                id='two-subtrees',
+            ),
+        ],
+    )
+    def test_real_command_shapes_resolve_to_the_config_pytest_reads(self, command, expected):
+        assert self._resolve(command)[0] == expected
+
+    def test_a_readable_file_target_starts_the_walk_at_its_parent(self):
+        path, reader = self._resolve(
+            'pytest orchestrator/tests/test_x.py',
+            {**_CONFIG_TREE, 'orchestrator/tests/test_x.py': 'def test_x():\n    pass\n'},
+        )
+        assert path == 'orchestrator/pyproject.toml'
+        assert not any(p.startswith('orchestrator/tests/test_x.py/') for p in reader.paths)
+
+    @pytest.mark.parametrize(
+        'target',
+        [
+            pytest.param('pkg/tests/v1.2/', id='dotted-directory'),
+            pytest.param('pkg/tests/v1.2/test_a.py::test_t', id='node-id-inside-a-dotted-directory'),
+        ],
+    )
+    def test_a_dotted_directory_is_walked_as_a_directory(self, target):
+        """A dot in a directory name does not make it a file: pytest asks the filesystem."""
+        contents = {
+            'pkg/pyproject.toml': ROOT_SHAPED_PYPROJECT,
+            'pkg/tests/v1.2/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+            'pkg/tests/v1.2/test_a.py': 'def test_t():\n    pass\n',
+        }
+        assert self._resolve(f'pytest {target}', contents)[0] == 'pkg/tests/v1.2/pyproject.toml'
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('cargo test --workspace', id='cargo'),
+            pytest.param('npm test', id='npm'),
+            pytest.param('cd orchestrator && pytest tests/ && cd ../cockpit && pytest tests/', id='raw-chain'),
+            pytest.param('pytest -c x.ini tests/', id='dash-c'),
+            pytest.param('pytest --config-file x.ini tests/', id='config-file'),
+            pytest.param('pytest --config-file=x.ini tests/', id='config-file-attached'),
+            pytest.param('pytest /abs/tests/', id='absolute-target'),
+            pytest.param('pytest ../x/tests/', id='escaping-target'),
+            pytest.param('cd orchestrator && pytest ../../x/', id='escaping-under-cd'),
+        ],
+    )
+    def test_refused_commands_resolve_to_none_without_a_read(self, command):
+        path, reader = self._resolve(command)
+        assert path is None
+        assert reader.paths == []
+
+
+class TestGoverningAddopts:
+    """``governing_addopts(cmd, worktree_reader)``: the RAW addopts pytest will apply.
+
+    xdist tokens included — stripping them is ``verify_cmd.serial_pytest``'s
+    job, beside the ``-p no:xdist`` that requires it. Every refusal is ``()``,
+    which renders the historical blank ``-o addopts=``.
+    """
+
+    @staticmethod
+    def _addopts(command: str, contents: dict[str, str]) -> tuple[str, ...]:
+        return verify_plan_module.governing_addopts(
+            parse_config_command(command), _RecordingTreeReader(contents),
+        )
+
+    def test_the_resolved_pyprojects_raw_addopts_are_returned(self):
+        assert self._addopts(
+            'uv run --project orchestrator pytest orchestrator/tests/test_x.py', _CONFIG_TREE,
+        ) == ORCH_SHAPED_ADDOPTS
+
+    @pytest.mark.parametrize(
+        ('command', 'contents'),
+        [
+            pytest.param('pytest tests/', {}, id='nothing-resolves'),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pytest.ini': '[pytest]\naddopts = -q\n', 'pyproject.toml': ROOT_SHAPED_PYPROJECT},
+                id='non-pyproject-config',
+            ),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pyproject.toml': '[tool.pytest.ini_options]\ntimeout = 300\n'},
+                id='no-addopts-key',
+            ),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pyproject.toml': '[tool.pytest]\naddopts = ["-q"]\n'},
+                id='toml-mode',
+            ),
+            pytest.param('cargo test --workspace', _CONFIG_TREE, id='refused-command'),
+        ],
+    )
+    def test_every_refusal_is_the_empty_tuple(self, command, contents):
+        assert self._addopts(command, contents) == ()

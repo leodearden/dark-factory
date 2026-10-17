@@ -40,9 +40,13 @@ inheriting it from the dataclass not yet having the field.
 """
 
 
+_CAP_HIT_RECORDS = [{'stage': 'architect', 'cause': 'cap_hit', 'reason': ''}]
+"""``invocation_errors`` of an architect cell refused by a cap hit."""
+
+
 def _cell(
     task_id, config_name, *, trial=1, plan_quality=None, plan_steps=0,
-    role_under_test='architect', cap_tainted=False, invocation_error=None,
+    role_under_test='architect', cap_tainted=False, invocation_errors=None,
     cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None, drop_metrics=(),
 ):
     """Build a synthetic ``EvalResult`` with a production-shaped metrics dict.
@@ -60,7 +64,7 @@ def _cell(
     ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
     from orchestrator.evals.metrics import EvalMetrics
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         plan_quality=plan_quality,
@@ -69,7 +73,7 @@ def _cell(
         cost_usd=cost_usd,
         judge_cost_usd=judge_cost_usd,
         cap_tainted=cap_tainted,
-        invocation_error=invocation_error,
+        invocation_errors=invocation_errors,
     )
     metrics = {**m.to_dict(), **(extra_metrics or {})}
     for key in drop_metrics:
@@ -94,7 +98,7 @@ def _mixed_results():
     return [
         # A: one transport refusal (never got to ask the model) + two scored cells.
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+              invocation_errors=_CAP_HIT_RECORDS, drop_metrics=_PRE_SIGMA),
         _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6,
               drop_metrics=_PRE_SIGMA),
         _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4,
@@ -409,9 +413,9 @@ def test_no_scored_cells_reports_none_not_zero():
     """A candidate whose every cell was cap-tainted reports n=0, mean=None."""
     results = [
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
+              invocation_errors=_CAP_HIT_RECORDS),
         _cell('f2', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
+              invocation_errors=_CAP_HIT_RECORDS),
     ]
 
     row = mod.summarize_candidates(results)[0]
@@ -567,7 +571,7 @@ def test_cap_tainted_cell_bands_unmeasured():
     session-cap window — a property of the schedule, not of the candidate.
     """
     m = _metrics(plan_steps=5, plan_quality=0.95, cap_tainted=True,
-                 invocation_error='architect: cap_hit',
+                 invocation_errors=_CAP_HIT_RECORDS,
                  extra_metrics={'judged_without_reference': False})
 
     assert mod.band_for_cell(m, 0.80) == 'unmeasured'
@@ -602,7 +606,7 @@ def test_partition_is_exact():
         _cell('f3', 'A', plan_steps=0, plan_quality=0.0,
               extra_metrics={'judged_without_reference': False}),
         # unmeasured: cap-tainted.
-        _cell('f4', 'A', cap_tainted=True, invocation_error='architect: cap_hit',
+        _cell('f4', 'A', cap_tainted=True, invocation_errors=_CAP_HIT_RECORDS,
               extra_metrics={'judged_without_reference': False}),
     ]
 
@@ -801,7 +805,7 @@ _BAND_CELL_KWARGS = {
     'declined': dict(plan_steps=0, plan_quality=0.0,
                      extra_metrics={'judged_without_reference': False,
                                     'terminal_kind': 'false_premise'}),
-    'unmeasured': dict(cap_tainted=True, invocation_error='architect: cap_hit',
+    'unmeasured': dict(cap_tainted=True, invocation_errors=_CAP_HIT_RECORDS,
                        extra_metrics={'judged_without_reference': False,
                                       'terminal_kind': 'none'}),
 }
@@ -1011,9 +1015,9 @@ def test_rendering_is_deterministic():
 def campaign_seam(monkeypatch):
     """Patch every live seam so ``--run`` is exercised at ZERO spend.
 
-    Three patches, each closing a different way a test could reach the real
-    world: ``run_ofat_stage`` (the fan-out that would spawn architect runs),
-    ``save_result`` (which writes into the packaged results dir), and
+    Two patches, each closing a different way a test could reach the real
+    world: ``run_ofat_stage`` (the fan-out that would spawn architect runs, and
+    whose executors persist into the packaged results dir), and
     ``load_config`` (which would demand a real config / OAuth).
 
     A fourth is a TRIPWIRE rather than a stub: ``ofat_candidates`` fails the
@@ -1026,7 +1030,7 @@ def campaign_seam(monkeypatch):
     from orchestrator.evals import configs as eval_configs
     from orchestrator.evals import runner as eval_runner
 
-    calls = {'ofat': [], 'saved': []}
+    calls = {'ofat': []}
 
     async def _recorder(task_paths, candidates, base_config=None, **kwargs):
         calls['ofat'].append({
@@ -1052,7 +1056,6 @@ def campaign_seam(monkeypatch):
         )
 
     monkeypatch.setattr(eval_runner, 'run_ofat_stage', _recorder)
-    monkeypatch.setattr(eval_runner, 'save_result', lambda r: calls['saved'].append(r))
     monkeypatch.setattr(orch_config, 'load_config', lambda *a, **k: object())
     monkeypatch.setattr(eval_configs, 'ofat_candidates', _tripwire)
     return calls
@@ -1124,19 +1127,6 @@ def test_run_summarizes_the_returned_cells(tmp_path, campaign_seam, capsys):
     assert {c['task_id'] for c in loaded['cells']} == {'alpha', 'beta'}
     assert loaded['candidates'][0]['config_name'] == 'architect-opus-max'
     assert loaded['candidates'][0]['n'] == 2
-
-
-def test_run_persists_each_cell(tmp_path, campaign_seam):
-    """Every returned cell is persisted, so a later --results-dir can re-read it."""
-    d = _make_fixture_dir(tmp_path, ['alpha', 'beta'])
-
-    mod.main([
-        '--run', '--tasks-dir', str(d),
-        '--candidate', 'architect-opus-max', '--trials', '2',
-    ])
-
-    assert len(campaign_seam['saved']) == 4
-    assert {r.task_id for r in campaign_seam['saved']} == {'alpha', 'beta'}
 
 
 def test_results_dir_reanalyzes_persisted_cells(tmp_path, capsys):
@@ -1380,7 +1370,7 @@ def _cap_tainted_keyless_corpus():
         _cell('f2', 'A', plan_quality=0.6, plan_steps=5,
               extra_metrics={mod.MARKER_KEY: False}),
         _cell('f3', 'A', plan_steps=5, cap_tainted=True,
-              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+              invocation_errors=_CAP_HIT_RECORDS, drop_metrics=_PRE_SIGMA),
     ]
 
 
@@ -1469,7 +1459,7 @@ def test_an_empty_admitted_pool_answers_zero_on_both_surfaces():
     """
     results = [
         _cell('f1', 'A', plan_steps=5, cap_tainted=True,
-              invocation_error='architect: cap_hit',
+              invocation_errors=_CAP_HIT_RECORDS,
               extra_metrics={mod.MARKER_KEY: False}),
     ]
 
@@ -1511,8 +1501,8 @@ def test_the_rendered_fraction_quotes_one_population():
 
 # ===== step 17: --results-dir must not silently absorb out-of-campaign cells =====
 #
-# Not hypothetical. ``save_result`` (runner.py:1370) writes into the SHARED
-# packaged ``RESULTS_DIR = Path(__file__).parent / 'results'`` (runner.py:50),
+# Not hypothetical. The eval executors persist into the SHARED packaged dir
+# (``orchestrator/src/orchestrator/evals/results.py::ResultStore.packaged``),
 # and the main checkout's copy already holds 586 persisted cells — 51 of them v1
 # ``architect-fable-high`` runs over the incumbent-biased standing corpus (e.g.
 # ``df_task_12__architect-fable-high__*.json``). The documented round-trip

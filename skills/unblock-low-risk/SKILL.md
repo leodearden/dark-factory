@@ -46,7 +46,11 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
    human-rehearsal mandate. This precondition turns that external kill into a self-halt.
 
    **Mechanical backstop:** precondition 6's `b3_gate check` below now *also* scans the task
-   description and proposal/block-reason text for this same phrase family and returns
+   description, the proposal text and the block reason's prose for this same phrase family
+   (captured tool output — the fenced excerpt under each `## Test Failures`, `## Lint Issues`
+   or `## Type Errors` section of the verify failure report — is excluded, so
+   pytest/lint output that merely contains a phrase like
+   'do not run' no longer aborts; task 6933) and returns
    `verdict == 'abort'` with an `'explicit stop instruction present'` reason when found — so
    even if this precondition is somehow skipped, the existing "**ONLY** `verdict == 'fresh'`
    proceeds" rule at precondition 6 already routes this class to ABORT, with the gate's
@@ -224,7 +228,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
      # merge-state-vocab:end
          wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
-         sleep(wait)
+         sleep(wait)   # unattended: realise per skills/merge-queue/SKILL.md#waiting-between-polls, its FOREGROUND form only -- a bare sleep 60 is blocked by the harness
          result = mcp__escalation__merge_status(request_id)
      # merge-state-vocab:begin partition=LIVE_STATES
      #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES (second copy).
@@ -396,8 +400,8 @@ Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
 Add `--report-only` to inspect without changing anything; it detects and reports, moves nothing,
 and returns `blocked` rather than `clean` when it finds damage it deliberately left in place.
 
-**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to a
-`MERGE_RR.quarantined-<timestamp>` sibling — **moved, never deleted**, because a *successful*
+**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to
+`<git-common-dir>/rerere-specimens/MERGE_RR.<worktree>-<stamp>` — **moved, never deleted**, because a *successful*
 abort deletes that file and it is the only record of which conflict ids the worktree was carrying.
 It also removes `*.lock` files that are both older than an hour **and** held open by no running
 process; a lock with a live holder is retained at any age.
@@ -440,7 +444,7 @@ eyeballed listing.
   outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
   `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
-  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  **neither arm licenses a write** — never self-stamp on either. Read rules 2 and 2v there for the
   argument rather than restating it; the disposition here is the **same on both arms**, and it
   turns on re-reading this task's scheduler status **fresh**:
   - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed
@@ -530,7 +534,7 @@ On any ABORT:
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
   return, exactly as the normal `task_failure`/`review_issues` path does.
 - Leave the worktree intact (do not remove it) so the human can inspect your partial work.
-  That includes any `MERGE_RR.quarantined-*` file the rebase-recovery preflight left behind: it is
+  That includes any `<git-common-dir>/rerere-specimens/MERGE_RR.<worktree>-*` file the rebase-recovery preflight left behind: it is
   preserved evidence of what the worktree was carrying when it wedged, and the human inspecting
   your partial work is the reader it was preserved for. Do not tidy it away.
 - Return a structured result so the watcher can log it to the digest.

@@ -69,7 +69,9 @@ __all__ = [
     'TaskRef',
     'TicketRef',
     'UndisposedException',
+    'disposition_record',
     'governed_exceptions',
+    'owner_record',
     'parse_disposition_marker',
 ]
 
@@ -119,24 +121,30 @@ _POLICY_ID_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
 _TICKET_ID_RE = re.compile(_TICKET_ID_PATTERN)
 _POLICY_ID_RE = re.compile(_POLICY_ID_PATTERN)
 
-# The keyword probe.  Case-sensitive on purpose: the grammar D6 publishes is
-# lower-case, so `# DEBT: task 5601` is not a marker at all and must return
-# None rather than raise — otherwise every comment beginning with the word
-# DEBT becomes an instrument failure.
 _MARKER_KEYWORD_RE = re.compile(r'#\s*(?:debt|ratified):')
+"""The keyword probe.
 
-# One anchored form per INLINE_MARKER_FORMS entry, matched against the comment
-# from the keyword onward.  The trailing `$` is what rejects extra prose after
-# a disposition: a comment reading `debt: task 5601 (see also 5602)` is a note,
-# not a marker, and honouring its prefix would silently disposition an entry by
-# half a sentence.  That example omits the leading `#` every published form
-# carries, deliberately rather than by typo: the keyword probe above scans a
-# whole comment token and cannot tell a quoted marker from a real one, so
-# spelling the example in full would make this very line a malformed
-# disposition.
+Case-sensitive on purpose: the grammar D6 publishes is lower-case, so
+``# DEBT: task 5601`` is not a marker at all and must return None rather than
+raise — otherwise every comment beginning with the word DEBT becomes an
+instrument failure.
+
+The probe scans a whole comment token and cannot tell a quoted marker from a
+real one, which is why every example marker in this module sits in a docstring.
+``scripts/inline_suppressions.py`` reads COMMENT tokens only, so a marker quoted
+in a ``#`` comment anywhere in the tree is a permanent gate violation that no
+disposition can cover, while the same text inside a string token is invisible
+to it."""
+
 _DEBT_TASK_RE = re.compile(rf'^#\s*debt:\s*task\s+({_TASK_ID_PATTERN})\s*$')
 _DEBT_TICKET_RE = re.compile(rf'^#\s*debt:\s*ticket\s+({_TICKET_ID_PATTERN})\s*$')
 _RATIFIED_RE = re.compile(rf'^#\s*ratified:\s*({_POLICY_ID_PATTERN})\s*$')
+"""One anchored form per :data:`INLINE_MARKER_FORMS` entry, matched against the
+comment from the keyword onward.
+
+The trailing ``$`` is what rejects extra prose after a disposition: a comment
+reading ``# debt: task 5601 (see also 5602)`` is a note, not a marker, and
+honouring its prefix would silently disposition an entry by half a sentence."""
 
 INLINE_MARKER_FORMS: tuple[str, ...] = (
     '# debt: task <task id>',
@@ -294,6 +302,44 @@ Disposition = Debt | Policy
 """D2's three legal states, as two types: ``Debt(TaskRef | TicketRef)`` and
 ``Policy(row id)``.  A bare ref is not a disposition — it answers "who", not
 "why this entry is legal"."""
+
+
+def owner_record(ref: TaskRef | TicketRef) -> dict[str, object]:
+    """*ref* as the vocabulary's JSON wire format: ``{'type', 'id'}``.
+
+    The one shape the inline scanner's report, the register's ``--json`` and
+    the owner sweep all speak, so no consumer parses a ``task 5601``-style
+    string back into a ref (heuristic 12).
+
+    Raises:
+        MalformedDisposition: *ref* is not a :class:`TaskRef` or :class:`TicketRef`.
+    """
+    if isinstance(ref, TaskRef):
+        return {'type': 'task', 'id': ref.id}
+    if isinstance(ref, TicketRef):
+        return {'type': 'ticket', 'id': ref.id}
+    raise MalformedDisposition(
+        f'owner_record: {ref!r} is not a TaskRef or a TicketRef.', value=ref
+    )
+
+
+def disposition_record(disposition: Disposition) -> dict[str, object]:
+    """*disposition* as the vocabulary's JSON wire format.
+
+    ``{'type': 'debt', 'owner': <owner_record>}`` or
+    ``{'type': 'policy', 'ratified': <row id>}`` — the twin of
+    :func:`owner_record`, and spoken by the same consumers.
+
+    Raises:
+        MalformedDisposition: *disposition* is not a :class:`Debt` or :class:`Policy`.
+    """
+    if isinstance(disposition, Debt):
+        return {'type': 'debt', 'owner': owner_record(disposition.owner)}
+    if isinstance(disposition, Policy):
+        return {'type': 'policy', 'ratified': disposition.ratified}
+    raise MalformedDisposition(
+        f'disposition_record: {disposition!r} is not a Debt or a Policy.', value=disposition
+    )
 
 
 def parse_disposition_marker(comment: str) -> Disposition | None:
@@ -531,7 +577,9 @@ def governed_exceptions(
     literals.  Only this runtime call also sees the KEY SET — the container's
     actual contents, which no AST can enumerate — so this is the one place keys
     and dispositions are reconciled, and the only place that can notice a list
-    has quietly grown an entry.
+    has quietly grown an entry.  Call it by its own name, bare or as
+    ``<module>.governed_exceptions``: the static register refuses an
+    import-time alias with exit 2.
 
     ``dispositions`` defaults to an empty ``MappingProxyType`` rather than
     ``{}``: ruff's B006 forbids a mutable default, and the immutable proxy is

@@ -26,6 +26,8 @@ const {
   corpusAgeCaption,
   windowedClassSplit,
   taskCard,
+  levelCount,
+  windowedEscPerDone,
 } = window.DF_ESCALATION_VIEWS;
 // The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
 const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
@@ -251,31 +253,14 @@ function EscalationStatStrip({ analytics, projectFilter }) {
   // dashboard/tests/js/pins_recovery.test.mjs.
   const { count: pinningCount, pinnedTaskCount } = pinningSummary(openItems);
 
-  // (c) esc-per-done — aggregate ratio sum(filings)/sum(done) over the
-  // WINDOWED rows, NOT a mean of daily ratios (undefined/biased on
-  // low-volume or done==0 days). Also builds a per-date map (summed across
-  // projects — dates can repeat across per_project entries) for the trend
-  // sparkline; re-derived from filings/done rather than the payload's
-  // per-project row.ratio, since that field isn't valid post-rollup.
-  let filingsSum = 0, doneSum = 0;
-  const epdByDate = {}; // date -> { filings, done }
-  for (const p of projects) {
-    const epd = sliceRowsByWindow((p.workflow || {}).esc_per_done_daily || [], cutoff);
-    for (const row of epd) {
-      filingsSum += row.filings || 0;
-      doneSum += row.done || 0;
-      const bucket = epdByDate[row.date] || (epdByDate[row.date] = { filings: 0, done: 0 });
-      bucket.filings += row.filings || 0;
-      bucket.done += row.done || 0;
-    }
-  }
-  const escPerDone = doneSum > 0 ? filingsSum / doneSum : null;
-  // Null ratio (done == 0 that day) is OMITTED rather than plotted as a
-  // misleading zero — same precedent as tab_escalation_analytics.jsx.
-  const epdSpark = Object.keys(epdByDate).sort()
-    .map(d => epdByDate[d])
-    .filter(b => b.done > 0)
-    .map(b => b.filings / b.done);
+  // (c) esc-per-done — every filtered project's WINDOWED esc_per_done_daily
+  // rows and whether its completed-task counts were read, read once by
+  // escalation_views.js. Its filings feed the churn tile below too.
+  const escPerDone = windowedEscPerDone(projects.map(p => ({
+    project: p.project,
+    doneCountsRead: (p.workflow || {}).done_counts_read,
+    rows: sliceRowsByWindow((p.workflow || {}).esc_per_done_daily || [], cutoff),
+  })));
 
   // (d) churn-24h rate — sum(WINDOWED churn_daily)/sum(WINDOWED
   // esc_per_done_daily filings); both are keyed by filed-date
@@ -290,17 +275,16 @@ function EscalationStatStrip({ analytics, projectFilter }) {
       churnByDate[d] = (churnByDate[d] || 0) + n;
     }
   }
-  const churnRate = filingsSum > 0 ? churnSum / filingsSum : null;
+  const churnRate = escPerDone.filings > 0 ? churnSum / escPerDone.filings : null;
   // Per-day churn RATE (that day's churn / that day's filings), matching the
   // quantity the tile displays — plotting raw per-day counts here would show
   // a different quantity than the tile value and mislead when daily filing
-  // volume varies. Reuses epdByDate's per-day filings (already collected for
-  // the esc-per-done tile, same filed-date keying). Days with zero filings
-  // that day are OMITTED (undefined rate), mirroring epdSpark's done==0
-  // omission above.
+  // volume varies. Reuses the esc-per-done reading's per-day filings (same
+  // filed-date keying). Days with zero filings that day are OMITTED
+  // (undefined rate), as the esc/done spark omits a day that completed nothing.
   const churnSpark = Object.keys(churnByDate).sort()
-    .filter(d => (epdByDate[d] || {}).filings > 0)
-    .map(d => churnByDate[d] / epdByDate[d].filings);
+    .filter(d => (escPerDone.filingsByDate[d] || 0) > 0)
+    .map(d => churnByDate[d] / escPerDone.filingsByDate[d]);
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
@@ -323,9 +307,9 @@ function EscalationStatStrip({ analytics, projectFilter }) {
       />
       <C.StatTile
         label="esc / done"
-        datum={derivedDatum(escPerDone, EP_ESCALATIONS, 'no tasks completed in this window')}
+        datum={derivedDatum(escPerDone.ratio, EP_ESCALATIONS, escPerDone.absentReason)}
         format={ratio => ratio.toFixed(2)}
-        history={epdSpark}
+        history={escPerDone.ratioDaily}
         sparkColor={C.PALETTE.accent}
       />
       <C.StatTile
@@ -447,7 +431,6 @@ function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
-  const byLevel = gs.by_level || {};
   const pendingInQueue = queuePending(DF);
 
   return (
@@ -520,7 +503,7 @@ function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
         </button>
         {/* Summary pills */}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)' }}>
-          <DatumReading datum={pendingInQueue} /> queue pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
+          <DatumReading datum={pendingInQueue} /> queue pending · <DatumReading datum={levelCount(DF, 1)} /> L1 · <DatumReading datum={levelCount(DF, 2)} /> L2
           {/* Global, like the pips beside it: read from the unfiltered top-level
               summary, so with a project filter active this can count files in
               queues that are not rendered below.  Titled rather than re-derived

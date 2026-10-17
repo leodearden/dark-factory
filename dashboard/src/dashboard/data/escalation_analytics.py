@@ -98,20 +98,21 @@ def load_regime_markers(path: Path | None = None) -> tuple[list[dict], int]:
 # ---------------------------------------------------------------------------
 
 
-def _done_by_day(runs_db: Path) -> dict[str, int]:
+def _done_by_day(runs_db: Path) -> dict[str, int] | None:
     """Return ``{date: count}`` of ``outcome='done'`` task_results rows.
 
     Bucketed by ``date(completed_at)``. Sync, read-only (``mode=ro`` URI),
     fail-open — mirrors ``orchestrator.digest._query_events_ro``'s discipline
-    applied to ``runs.db`` instead of an events DB: a missing DB logs at
-    DEBUG and returns ``{}``; any other failure logs at WARNING and returns
-    ``{}``. Never raises.
+    applied to ``runs.db`` instead of an events DB. None when runs.db cannot
+    be read — never ``{}``, which would claim no task completed: a missing DB
+    logs at DEBUG, any other failure at WARNING. A readable DB returns its
+    dict, possibly empty. Never raises.
     """
     runs_db = Path(runs_db)
     try:
         if not runs_db.exists():
             logger.debug('_done_by_day: DB not found (fail-open): %s', runs_db)
-            return {}
+            return None
         db_uri = runs_db.resolve().as_uri() + '?mode=ro'
         conn = sqlite3.connect(db_uri, uri=True)
         try:
@@ -128,9 +129,9 @@ def _done_by_day(runs_db: Path) -> dict[str, int]:
         # rather than an unexpected failure (WARNING).
         if not runs_db.exists():
             logger.debug('_done_by_day: DB not found (fail-open): %s', runs_db)
-            return {}
+            return None
         logger.warning('_done_by_day: query failed for %s', runs_db, exc_info=True)
-        return {}
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +552,11 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
     - ``esc_per_done_daily``: per ``date(timestamp)``,
       ``{date, filings, done, ratio}`` — ``done`` from :func:`_done_by_day`
       against *runs_db*; ``ratio`` is ``None`` when ``done == 0`` (no div0).
+      When *runs_db* could not be read, every filing date's row carries
+      ``done`` and ``ratio`` ``None``.
+    - ``done_counts_read``: whether *runs_db*'s completed-task counts were
+      read. It is the authority on ``done``: a project with no filing has no
+      row, so a per-row null alone could not say its counts are unknown.
     - ``flow_daily``: sparse ``[{date,source,level,tier,class,n}]`` cube over
       terminal-with-valid-times records (same population as
       ``lifespan.samples`` — both gate on parseable ``timestamp`` AND
@@ -644,17 +650,23 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
             churn_daily[date_key] = churn_daily.get(date_key, 0) + 1
 
     done_by_date = _done_by_day(Path(runs_db))
-    esc_per_done_daily = [
-        {
-            'date': d,
-            'filings': filings_by_date.get(d, 0),
-            'done': done_by_date.get(d, 0),
-            'ratio': (
-                filings_by_date.get(d, 0) / done_by_date[d] if done_by_date.get(d) else None
-            ),
-        }
-        for d in sorted(set(filings_by_date) | set(done_by_date))
-    ]
+    if done_by_date is None:
+        esc_per_done_daily = [
+            {'date': d, 'filings': filings_by_date[d], 'done': None, 'ratio': None}
+            for d in sorted(filings_by_date)
+        ]
+    else:
+        esc_per_done_daily = [
+            {
+                'date': d,
+                'filings': filings_by_date.get(d, 0),
+                'done': done_by_date.get(d, 0),
+                'ratio': (
+                    filings_by_date.get(d, 0) / done_by_date[d] if done_by_date.get(d) else None
+                ),
+            }
+            for d in sorted(set(filings_by_date) | set(done_by_date))
+        ]
 
     flow_daily = [
         {'date': d, 'source': source, 'level': level, 'tier': tier, 'class': cls, 'n': n}
@@ -666,6 +678,7 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
         'action_mix': action_mix,
         'churn_daily': churn_daily,
         'esc_per_done_daily': esc_per_done_daily,
+        'done_counts_read': done_by_date is not None,
         'flow_daily': flow_daily,
     }
 

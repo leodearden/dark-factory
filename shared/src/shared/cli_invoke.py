@@ -14,7 +14,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
@@ -229,6 +229,26 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude backend binary resolution.
+#
+# WHY THIS EXISTS: argv[0] used to be the hardcoded bare PATH name 'claude',
+# resolved by the kernel against whatever PATH the spawning process happened
+# to inherit. On 2026-08-13→08-18 the fused-memory systemd user unit pinned no
+# Environment=PATH=, its inherited user-manager PATH lacked ~/.local/bin, and
+# so every curator LLM call raised FileNotFoundError for 80+ hours — with no
+# log line naming the binary that could not be found.
+#
+# _CLAUDE_BINARY_ENV_VAR is the operator escape hatch: an absolute path here
+# removes PATH from the equation entirely, and is the remediation the
+# unresolvable-binary escalation recommends.
+# ─────────────────────────────────────────────────────────────────────────────
+_CLAUDE_BINARY_ENV_VAR = 'CLAUDE_BINARY'
+# The historical argv[0]. Kept as the fallback so an environment that never
+# sets _CLAUDE_BINARY_ENV_VAR and does have `claude` on PATH is byte-identical
+# to the pre-task-4448 behaviour.
+_DEFAULT_CLAUDE_BINARY = 'claude'
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -250,6 +270,11 @@ CRASH_RECOVERY_RESUME_PROMPT = (
 # W4-beta single-source collapse); this module now consumes the verdict
 # indirectly via classify_invocation's CliLocalError variant.
 
+# A caller's prompt source, awaited with no arguments for the prompt to send
+# NOW.  It returns None to decline: the work the prompt asks for is no longer
+# needed.  See invoke_with_cap_retry's *rebuild_prompt*.
+PromptBuilder = Callable[[], Awaitable[str | None]]
+
 
 __all__ = [
     'CAP_HIT_RESUME_PROMPT',
@@ -258,10 +283,12 @@ __all__ = [
     'AgentFailureKind',
     'AgentResult',
     'AllAccountsCappedException',
+    'PromptBuilder',
     'TranscriptEvidence',
     'build_failure_message',
     'classify_agent_failure',
     'classify_cap_kill',
+    'claude_binary_spec',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'detect_resumable_progress',
@@ -276,12 +303,48 @@ __all__ = [
     'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'resolve_claude_binary',
     'resumable_progress_for_session',
     'transcript_evidence',
     'transcript_evidence_for_session',
     'transcript_exists',
     'transcript_model_id_for_session',
 ]
+
+
+def claude_binary_spec() -> str:
+    """Return the Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
+
+    An empty ``CLAUDE_BINARY`` is treated as unset rather than as an empty
+    argv[0], so ``CLAUDE_BINARY=`` in a systemd unit or a shell profile
+    degrades to the default instead of producing an unspawnable command.
+
+    The spec may be a bare name (resolved against PATH) or an absolute path.
+    Setting it to an absolute path is the remediation for the 2026-08-13→08-18
+    incident, in which the bare name ``claude`` failed to resolve off an
+    unpinned inherited systemd PATH and silently degraded every curator
+    decision for 80+ hours.
+
+    Never raises.
+    """
+    return os.environ.get(_CLAUDE_BINARY_ENV_VAR) or _DEFAULT_CLAUDE_BINARY
+
+
+def resolve_claude_binary() -> str | None:
+    """Resolve :func:`claude_binary_spec` to an absolute path, or ``None``.
+
+    ``None`` means the spec names nothing executable on the current PATH —
+    precisely the 2026-08-13→08-18 condition, where a bare ``claude`` resolved
+    off an unpinned inherited systemd PATH. Returning the resolution instead of
+    deferring it to ``exec`` is what lets callers report the failure by name
+    (see ``build_claude_argv``'s warning and
+    ``TaskCurator.startup_self_check``) rather than surfacing a bare
+    ``FileNotFoundError`` from deep inside a spawn.
+
+    Never raises: several callers only assemble an argv and never spawn, so a
+    raising resolver would break them on any host without the CLI installed.
+    """
+    return shutil.which(claude_binary_spec())
 
 
 class AllAccountsCappedException(Exception):
@@ -333,6 +396,9 @@ class AllAccountsCappedException(Exception):
 # shared/tests/test_wildcard_deny_live_inventory.py (``-m integration``).  If a
 # CLI change ever denies the schema tool itself, ``_parse_claude_output``
 # reports ``schema_tool_denied``.
+#
+# StructuredOutput survives a non-empty ``--tools`` list too, which is what a
+# caller's ``available_tools`` emits (measured CLI 2.1.287, task 4344).
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
 _SCHEMA_OUTPUT_ATTACHMENT = 'structured_output'
 
@@ -453,6 +519,10 @@ class AgentResult:
       (not a list) so the default is a safe immutable dataclass default.
     - ``stop_reason``: the CLI result JSON's ``stop_reason`` (None when absent
       or not a string); ``'refusal'`` marks an API-side usage-policy refusal.
+    - ``retry_aborted``: True when the caller's prompt builder declined a retry
+      ``invoke_with_cap_retry`` was about to make, so this is the last
+      attempt's result returned unretried.  Never a success: every attempt
+      that triggers a retry was already judged unusable.
     """
 
     success: bool
@@ -478,6 +548,7 @@ class AgentResult:
     resume_fallbacks: int = 0
     resume_fallback_session_ids: tuple[str, ...] = ()
     stop_reason: str | None = None
+    retry_aborted: bool = False
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
     when the transcript could not be read or located.  Stamped on both the
@@ -1527,7 +1598,7 @@ def require_non_blank_prompt(
     CLI" failure impossible to cause from OUR side.
 
     The claude backend is 100% stdin-dependent.  ``build_claude_argv`` emits
-    ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
+    ``cmd = [<resolved claude binary>, '--print', '--output-format', 'json']`` and NEVER
     appends a positional prompt or a ``-`` stdin marker (unlike the codex
     backend in ``orchestrator/agents/invoke.py``, which passes its own input
     argument).  The prompt is delivered solely on stdin — ``stdin_data =
@@ -2033,6 +2104,36 @@ def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) 
         invoke_kwargs['session_id'] = str(uuid.uuid4())
 
 
+async def _consult_prompt_builder(
+    build_prompt: PromptBuilder, invoke_kwargs: dict[str, Any], label: str,
+) -> bool:
+    """Ask the caller's builder for the prompt of the re-dispatch about to run.
+
+    Returns False when the builder declines (None).  Otherwise a FRESH
+    re-dispatch sends the built string, while a resumed one discards it and
+    keeps its continuation prompt.  A builder that raises or builds a blank
+    prompt is logged, and the re-dispatch keeps the prompt already in place:
+    for a fresh one, the original that ``_reset_for_fresh_retry`` restored.
+    """
+    try:
+        built = await build_prompt()
+        if built is None:
+            logger.warning(
+                f'{label}: prompt builder declined the retry — work no longer '
+                f'needed; returning the last attempt unretried',
+            )
+            return False
+        if not invoke_kwargs.get('resume_session_id'):
+            require_non_blank_prompt(built, context=f'{label} prompt builder')
+            invoke_kwargs['prompt'] = built
+    except Exception:
+        logger.warning(
+            f'{label}: prompt builder failed — re-dispatching without a rebuilt prompt',
+            exc_info=True,
+        )
+    return True
+
+
 @dataclass
 class _SubprocessResult:
     stdout: str
@@ -2079,6 +2180,8 @@ async def invoke_claude_agent(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -2087,6 +2190,19 @@ async def invoke_claude_agent(
     servers, ignoring the ambient ``.mcp.json`` merge (task 2796, THREAD 2);
     forwarded verbatim to ``build_claude_argv``. Default ``False`` keeps every
     existing caller byte-identical.
+
+    *available_tools*, when not None, is the CLI's built-in tool REGISTRY
+    filter (``--tools``): which built-in tools exist at all.  That is a
+    different axis from *allowed_tools* (permission allow rules) and
+    *disallowed_tools* (deny rules).  Like ``--tools ''`` it does NOT filter
+    MCP, so a caller must also pass ``mcp_config=no_mcp_servers_config()``
+    with ``strict_mcp_config=True``.  Forwarded verbatim to
+    ``build_claude_argv``, which validates it.
+
+    *setting_sources*, when not None, names the settings files the CLI reads
+    (``--setting-sources``); ``[]`` reads none, so no ambient permission allow
+    rule reaches the call.  Forwarded verbatim to ``build_claude_argv``, which
+    validates it.
 
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
@@ -2160,7 +2276,22 @@ async def invoke_claude_agent(
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
+        available_tools=available_tools,
+        setting_sources=setting_sources,
     )
+
+
+@dataclass(frozen=True)
+class _DispatchedAttempt:
+    """What the cost row records about one dispatched attempt.
+
+    Built fresh at each dispatch, so after the retry loop it describes the
+    attempt whose result is returned: no field can outlive its attempt.
+    """
+
+    started_at: str
+    completed_at: str
+    unattributed_cap: bool = False
 
 
 async def invoke_with_cap_retry(
@@ -2175,7 +2306,7 @@ async def invoke_with_cap_retry(
     role: str = '',
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     max_cap_retries: int | None = None,
-    rebuild_prompt: Callable[[bool], Awaitable[str]] | None = None,
+    rebuild_prompt: PromptBuilder | None = None,
     resume_delivers_prompt: bool = False,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
@@ -2193,7 +2324,7 @@ async def invoke_with_cap_retry(
     retry resumes that session via ``--resume`` instead of starting fresh.
     This preserves all agent progress (tool calls, reasoning) across
     account switches.  If resume itself fails (non-cap-hit error), falls
-    back to a fresh invocation with the original prompt.
+    back to a fresh invocation with the original (or rebuilt) prompt.
 
     Resume eligibility is a TWO-PART rule, and both parts require a
     *config_dir* (without one there is no correct place to glob for the
@@ -2209,7 +2340,7 @@ async def invoke_with_cap_retry(
        ``CAP_HIT_RESUME_PROMPT`` ("continue where you left off") would point
        at nowhere.
 
-    Failing either part retries FRESH, which replays the real task prompt.
+    Failing either part retries FRESH, which sends the real task prompt.
     Both guards fire only on affirmative proof; every ambiguous or unreadable
     transcript resumes, because a wrong downgrade discards real agent work.
     The specific reason is named in the cap-hit warning (``resume_or_fresh``).
@@ -2251,16 +2382,22 @@ async def invoke_with_cap_retry(
     cap.  Failed results are always offered.  Consumer: the legibility runner,
     whose replies routinely quote cap text (task 6042).
 
-    *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
-    on a cap retry whose session cannot be resumed (no ``session_id`` on the
-    capped result) — ``True`` signals ``session_lost``.  Its return value
-    replaces ``prompt`` for the next invocation, letting the caller rebuild
-    fresh context (e.g. re-gathered pending escalations) instead of reusing
-    the stale original prompt.  The resumable path (capped result carries a
-    ``session_id``) is unaffected — it keeps resuming with
-    ``CAP_HIT_RESUME_PROMPT`` and never calls this hook.  Defaults to
-    ``None``, which preserves the existing fresh-retry behaviour (reuse the
-    original prompt unchanged).
+    *rebuild_prompt*, when provided, is a ``PromptBuilder`` awaited with no
+    arguments immediately before EVERY re-dispatch — whatever triggered it
+    (cap hit, auth failure, wedge, failed resume, pre-turn CLI rejection) —
+    and never before the first dispatch, which sends ``prompt`` as the caller
+    built it, before any slot wait.  It runs after the cooldown and inside
+    the next acquired slot, so what it builds reflects the caller's state at
+    dispatch time, not at the start of a long cap wait, and its cost is paid
+    while holding that slot.  A FRESH re-dispatch sends the built string; a
+    resumed one keeps ``CAP_HIT_RESUME_PROMPT``, so there the builder runs
+    only for its decline answer and its string is discarded — a builder
+    should decide whether to decline before it builds.  Returning ``None``
+    cancels the retry: no further dispatch is made and the last attempt's
+    result is returned with ``retry_aborted=True`` and ``success=False``.  A
+    builder that raises or builds a blank prompt is logged and the retry
+    proceeds on the original prompt rather than aborting the loop.  Defaults
+    to ``None``: fresh retries replay the original prompt unchanged.
 
     *resume_delivers_prompt*, when ``True``, delivers the caller's real
     ``prompt`` on a caller-initiated resume (``resume_session_id`` pre-set
@@ -2273,19 +2410,13 @@ async def invoke_with_cap_retry(
     task context, so the short crash-recovery continuation prompt is sufficient
     and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
 
-    The ``session_lost`` argument is currently always ``True`` — every wired
-    call site is an unresumable cap retry.  It is kept as an explicit
-    parameter (rather than a no-arg callable) as a forward-compat placeholder
-    matching the caller contract in PRD §7.4, so a future resumable-path call
-    (if ever wired) needs no signature change.  If the hook itself raises,
-    the failure is caught and logged, and the retry falls back to the
-    already-restored original prompt rather than aborting the retry loop.
-
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
-    When *cost_store* is provided, successful invocations are recorded via
-    ``save_invocation()`` and cap-hit events via ``save_account_event()``.
+    When *cost_store* is provided, invocations are recorded via
+    ``save_invocation()`` only.  Account events belong to the gate, which
+    writes them to its own cost store, so give the gate the same store
+    (``shared/src/shared/usage_gate.py::UsageGate._write_cost_event``).
 
     All keyword arguments are forwarded to ``invoke_claude_agent()``.  When a
     custom *invoke_fn* is supplied, it additionally receives *backend*
@@ -2405,39 +2536,7 @@ async def invoke_with_cap_retry(
             )
             last_cap_wait_log_at = now
 
-    async def _rebuild_fresh_prompt() -> None:
-        """Let the caller rebuild the prompt for an unresumable cap retry.
-
-        session_lost is always True at both call sites (exact-detect and
-        heuristic FRESH cap paths) — this helper only runs where the capped
-        session cannot be resumed, per the rebuild_prompt hook contract
-        (PRD §7.4 / task W4-zeta). Closes over: rebuild_prompt, invoke_kwargs,
-        label.
-
-        A failure raised by the caller's hook (e.g. a transient I/O/MCP error
-        while re-gathering pending escalations) is caught and logged rather
-        than propagated: propagating would abort the entire patient cap-retry
-        loop over a transient hook failure.  ``invoke_kwargs['prompt']`` was
-        already restored to ``original_prompt`` by the preceding
-        ``_reset_for_fresh_retry`` call, so on failure it is simply left as
-        that already-restored value — the retry degrades to the stale
-        original prompt instead of dying.
-        """
-        if rebuild_prompt is None:
-            return
-        try:
-            invoke_kwargs['prompt'] = await rebuild_prompt(True)
-        except Exception:
-            logger.warning(
-                f'{label}: rebuild_prompt hook raised — falling back to original prompt',
-                exc_info=True,
-            )
-
     account_name = ''
-    unattributed_cap = False  # True when heuristic fires but token is unresolvable;
-    # controls: (1) skip confirm, (2) mark capped=True in cost_store
-    started_at = ''
-    completed_at = ''
     # Loop-local, stamped onto the RETURNED result at the single exit below
     # (task 3578).  Must live out here rather than on any individual result:
     # the retry loop rebinds `result` on every pass, so a count written to the
@@ -2449,6 +2548,9 @@ async def invoke_with_cap_retry(
     # pre-allocated session_id, so the lost id is unrecoverable from the
     # returned result.
     resume_fallback_session_ids: list[str] = []
+    # Re-dispatches consult the caller's builder; the first dispatch does not.
+    dispatches = 0
+    retry_aborted = False
 
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
@@ -2487,16 +2589,20 @@ async def invoke_with_cap_retry(
     # fresh invocation discards nothing.
     if not usage_gate:
         while True:
+            if (
+                dispatches
+                and rebuild_prompt is not None
+                and not await _consult_prompt_builder(rebuild_prompt, invoke_kwargs, label)
+            ):
+                retry_aborted = True
+                break
             started_at = datetime.now(UTC).isoformat()
             result = await invoke(
                 **invoke_kwargs,
                 config_dir=config_dir.path if config_dir else None,
             )
-            completed_at = datetime.now(UTC).isoformat()
-            # Re-stamped per attempt (above), so started_at/completed_at always
-            # describe the attempt actually RETURNED — leaving the discarded
-            # attempt's stamps in place would write a silently false window
-            # into the cost_store invocations row.
+            dispatches += 1
+            attempt = _DispatchedAttempt(started_at, datetime.now(UTC).isoformat())
             if not _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
                 break
             cli_input_rejected_retries += 1
@@ -2524,6 +2630,17 @@ async def invoke_with_cap_retry(
         scope = scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
         while True:
             async with usage_gate.invoke_slot(scope=scope, park=park_on_frozen_pool) as slot:
+                # Consulted inside the acquired slot, after any cooldown or
+                # park, and before attribution and credentials: a declined
+                # retry keeps the last attempt's account, writes nothing, and
+                # leaves the unsettled slot for __aexit__ to release.
+                if (
+                    dispatches
+                    and rebuild_prompt is not None
+                    and not await _consult_prompt_builder(rebuild_prompt, invoke_kwargs, label)
+                ):
+                    retry_aborted = True
+                    break
                 # slot.account_name is derived from slot.lease — the SAME
                 # account slot.token came from (task W4-δ, PRD §7.4). This
                 # is what makes the attribution below (and the save_invocation
@@ -2542,7 +2659,8 @@ async def invoke_with_cap_retry(
                     oauth_token=slot.token,
                     config_dir=config_dir.path if config_dir else None,
                 )
-                completed_at = datetime.now(UTC).isoformat()
+                dispatches += 1
+                attempt = _DispatchedAttempt(started_at, datetime.now(UTC).isoformat())
 
                 # Lazy (function-local) import: invocation_outcome.py imports
                 # shared.cli_invoke at module top (for is_zero_output_timeout),
@@ -2578,14 +2696,9 @@ async def invoke_with_cap_retry(
                 # unconditionally; an unresolvable token means the account
                 # vanished/refreshed, so failing over is safe and
                 # self-terminating (no separate unattributed fall-through).
-                # Rebuild via the caller's hook (no-op when rebuild_prompt is
-                # None): a live-continuation caller's original_prompt
-                # (resume_delivers_prompt=True) is only valid inside the
-                # resumed session, not the brand-new one this failover starts.
                 if isinstance(outcome, AuthFailed):
                     slot.report(outcome)
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                    await _rebuild_fresh_prompt()
                     logger.warning(
                         f'{label}: account {account_name} auth-failed '
                         f'(HTTP {result.api_error_status}) — failing over',
@@ -2610,8 +2723,7 @@ async def invoke_with_cap_retry(
                         f'{account_name} ({outcome.reason}) — terminal, no '
                         f'cross-account failover',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Pre-turn CLI REJECTION (task 3143 / esc-3118-1): the prompt
@@ -2643,10 +2755,7 @@ async def invoke_with_cap_retry(
                 # there is nothing to resume, and reusing the prior attempt's
                 # pre-allocated session_id would hit the reify-3604 'Session ID
                 # ... is already in use' wedge.  _reset_for_fresh_retry
-                # regenerates it.  The caller's rebuild_prompt hook is
-                # deliberately NOT invoked: it signals session_lost, and here no
-                # context was ever built, let alone lost — the original prompt
-                # is still exactly the right thing to send.
+                # regenerates it.
                 #
                 # slot.confirm settles the slot as a normal zero-cost
                 # completion (mirroring the ModelNotFound branch's shape): no
@@ -2654,8 +2763,7 @@ async def invoke_with_cap_retry(
                 # the ACCOUNT failed.
                 if _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
                     cli_input_rejected_retries += 1
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     logger.warning(
                         f'{label}: CLI rejected the invocation before any model turn '
                         f'(no prompt reached the CLI) on account {account_name} — '
@@ -2687,10 +2795,6 @@ async def invoke_with_cap_retry(
                 # response whose cap-pattern IS detectable, so cap accounting resumes
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
-                # Rebuild via the caller's hook (no-op when rebuild_prompt is
-                # None): a live-continuation caller's original_prompt
-                # (resume_delivers_prompt=True) is only valid inside the
-                # wedged session, not the brand-new one this retry starts.
                 if isinstance(outcome, ZeroOutputWedge) and invoke_kwargs.get('resume_session_id'):
                     logger.warning(
                         f'{label}: zero-output timed-out invocation '
@@ -2699,7 +2803,6 @@ async def invoke_with_cap_retry(
                         f'before retry',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
                 offered_to_cap_detector = (
@@ -2718,18 +2821,6 @@ async def invoke_with_cap_retry(
                     )
 
                     acct_name = usage_gate.active_account_name
-                    if cost_store:
-                        try:
-                            await cost_store.save_account_event(
-                                account_name=account_name,
-                                event_type='cap_hit',
-                                project_id=project_id or None,
-                                run_id=run_id or None,
-                                details=label,
-                                created_at=datetime.now(UTC).isoformat(),
-                            )
-                        except Exception:
-                            logger.warning('Failed to save cap_hit event', exc_info=True)
 
                     # ------------------------------------------------------------------
                     # MEASURED 2026-08-01 (task 3454, claude CLI 2.1.220), and
@@ -2876,7 +2967,6 @@ async def invoke_with_cap_retry(
                     # greps keep matching.
                     if not result.session_id:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (no session_id)'
                     elif config_dir is not None and not transcript_exists(
                         config_dir.path, result.session_id
@@ -2887,7 +2977,6 @@ async def invoke_with_cap_retry(
                             f'into an empty session (context from this attempt is lost)',
                         )
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (transcript unreachable)'
                     elif config_dir is not None and not resumable_progress_for_session(
                         config_dir.path, result.session_id
@@ -2900,7 +2989,6 @@ async def invoke_with_cap_retry(
                             f'nowhere',
                         )
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (no resumable progress)'
                     else:
                         invoke_kwargs['resume_session_id'] = result.session_id
@@ -3002,7 +3090,7 @@ async def invoke_with_cap_retry(
                                 f'{label}: heuristic cap suspected but no account could be marked '
                                 f'(token unresolved) — treating as normal failure',
                             )
-                            unattributed_cap = True
+                            attempt = replace(attempt, unattributed_cap=True)
                         else:
                             consecutive_cap_hits += 1
                             full_cycles = (consecutive_cap_hits - 1) // num_accounts
@@ -3012,7 +3100,6 @@ async def invoke_with_cap_retry(
                             )
                             # Cannot resume a session that never ran
                             _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                            await _rebuild_fresh_prompt()
                             acct_name = usage_gate.active_account_name
                             logger.warning(
                                 f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
@@ -3075,8 +3162,7 @@ async def invoke_with_cap_retry(
                         f'cross-account failover; returning result to caller for '
                         f'transient requeue',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Progress-timeout guard (reify-4827, task 2360 fix #2): a
@@ -3099,15 +3185,10 @@ async def invoke_with_cap_retry(
                         f'caller for γ re-resume instead of discarding into '
                         f'a fresh retry',
                     )
-                    if not unattributed_cap:
-                        slot.confirm(result.cost_usd)
+                    slot.confirm(result.cost_usd)
                     break
 
                 # Non-cap-hit failure while resuming → fall back to fresh invocation.
-                # Rebuild via the caller's hook (no-op when rebuild_prompt is None):
-                # mirrors the two cap-hit fresh-fallback paths above, since a
-                # live-continuation caller's original_prompt (resume_delivers_prompt=True)
-                # is only valid inside the resumed session, not a brand-new one.
                 if not result.success and invoke_kwargs.get('resume_session_id'):
                     # This branch — and ONLY this branch — is the population
                     # task 3578 measured: 28 occurrences where a resume was
@@ -3133,13 +3214,14 @@ async def invoke_with_cap_retry(
                         f'retrying fresh',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
-                if not unattributed_cap:
-                    slot.confirm(result.cost_usd)
+                slot.confirm(result.cost_usd)
                 break
 
+    if retry_aborted:
+        result.retry_aborted = True
+        result.success = False
     result.account_name = account_name
     result.resume_fallbacks = resume_fallbacks
     result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
@@ -3154,7 +3236,7 @@ async def invoke_with_cap_retry(
         max_turns=invoke_kwargs.get('max_turns'),
         backend=backend,
     )
-    capped_reason = CapReason.ACCOUNT if unattributed_cap else ceiling_reason
+    capped_reason = CapReason.ACCOUNT if attempt.unattributed_cap else ceiling_reason
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -3173,8 +3255,8 @@ async def invoke_with_cap_retry(
                 capped=capped_reason is not None,
                 capped_reason=capped_reason,
                 model_id=result.model_id,
-                started_at=started_at,
-                completed_at=completed_at,
+                started_at=attempt.started_at,
+                completed_at=attempt.completed_at,
             )
         except Exception:
             logger.warning('Failed to save invocation cost', exc_info=True)
@@ -3196,6 +3278,8 @@ def build_claude_argv(
     resume_session_id: str | None,
     session_id: str | None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Assemble the Claude CLI argv — the single source of truth shared by the
     non-sandbox (``_invoke_claude``) and sandbox (``_invoke_claude_with_sandbox``)
@@ -3218,6 +3302,25 @@ def build_claude_argv(
     ``--mcp-config``). The default ``False`` keeps every existing caller's argv
     byte-identical.
 
+    ``available_tools`` (default ``None``, which emits nothing): the CLI's
+    built-in tool REGISTRY filter, emitted as ``--tools <a,b,c>`` (``[]`` gives
+    ``--tools ''``).  It decides which built-in tools exist, a different axis
+    from ``allowed_tools`` (permission allow rules) and ``disallowed_tools``
+    (deny rules).  Entries must be bare tool names; a permission-rule spec such
+    as ``'Bash(git log:*)'`` belongs in ``allowed_tools``.  It cannot be
+    combined with a ``'*'`` deny, which also sets the registry and would win.
+    Like ``--tools ''``, it does NOT filter MCP, so a caller must also pass
+    ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``.
+    Both refusals raise ``ValueError`` before any temp file exists.
+
+    ``setting_sources`` (default ``None``, which emits nothing and leaves the
+    CLI reading every settings file): the settings files the CLI reads, emitted
+    as ``--setting-sources <a,b>`` from ``'user'``, ``'project'`` and
+    ``'local'``.  ``[]`` gives ``--setting-sources ''``, which reads none of
+    them, so no ambient permission allow rule reaches the call.  Managed
+    (policy) settings are not a source and still apply.  An unknown entry
+    raises ``ValueError`` before any temp file exists.
+
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
     ``temp_files`` lists the temp file paths created.  It is never empty — the
     sysprompt path is always present, on the resume path too (task 3983) —
@@ -3229,7 +3332,30 @@ def build_claude_argv(
     already created during this call are unlinked before the exception
     propagates — callers never need to clean up after a raised call.
     """
-    cmd = ['claude', '--print', '--output-format', 'json']
+    _check_available_tools(available_tools, disallowed_tools)
+    _check_setting_sources(setting_sources)
+    # argv[0] is RESOLVED here rather than left for the kernel to look up
+    # against whatever PATH the spawning process inherited. This one site
+    # covers BOTH spawn paths — the sandbox and non-sandbox invocations here,
+    # and the orchestrator's, which reaches this same helper via
+    # orchestrator/src/orchestrator/agents/invoke.py::_invoke_claude_with_sandbox.
+    #
+    # Fail-open: an unresolvable spec falls back to itself, so a caller that
+    # only assembles an argv (several test suites, the startup probe) keeps
+    # working on a host with no CLI installed. The WARNING is the diagnostic
+    # that was missing on 2026-08-13→08-18, when a bare `claude` failed to
+    # resolve off an unpinned systemd PATH and the curator degraded silently
+    # for 80+ hours.
+    _spec = claude_binary_spec()
+    _resolved = resolve_claude_binary()
+    if _resolved is None:
+        logger.warning(
+            'claude binary %r does not resolve on PATH — spawning it will fail. '
+            'Set %s to an absolute path, or pin Environment=PATH= in the unit. '
+            'PATH=%s',
+            _spec, _CLAUDE_BINARY_ENV_VAR, os.environ.get('PATH'),
+        )
+    cmd = [_resolved or _spec, '--print', '--output-format', 'json']
 
     cmd.extend(['--model', model])
     cmd.extend(['--max-budget-usd', str(max_budget_usd)])
@@ -3290,6 +3416,8 @@ def build_claude_argv(
 
         cmd.extend(['--permission-mode', permission_mode])
         cmd.extend(['--max-turns', str(max_turns)])
+        if setting_sources is not None:
+            cmd.extend(['--setting-sources', ','.join(setting_sources)])
 
         if effort:
             cmd.extend(['--effort', effort])
@@ -3301,6 +3429,8 @@ def build_claude_argv(
             # registry filter keeps only that tool.  See _SCHEMA_OUTPUT_TOOL.
             cmd.extend(['--tools', ''])
             disallowed_tools = [t for t in disallowed_tools if t != '*']
+        if available_tools is not None:
+            cmd.extend(['--tools', ','.join(available_tools)])
         if disallowed_tools:
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
@@ -3325,6 +3455,37 @@ def build_claude_argv(
         raise
 
     return cmd, temp_files
+
+
+def _check_available_tools(
+    available_tools: list[str] | None, disallowed_tools: list[str] | None,
+) -> None:
+    """Refuse an ``available_tools`` registry the CLI would not honour as given."""
+    if available_tools is None:
+        return
+    if disallowed_tools and '*' in disallowed_tools:
+        raise ValueError(
+            "available_tools and disallowed_tools=['*'] both set the built-in "
+            "tool registry, and the '*' deny would win over the list; pass one"
+        )
+    for entry in available_tools:
+        if not entry.isidentifier():
+            raise ValueError(
+                f'available_tools entry {entry!r} is not a bare tool name; '
+                "permission-rule specs such as 'Bash(git log:*)' go in allowed_tools"
+            )
+
+
+_SETTING_SOURCES = frozenset({'user', 'project', 'local'})
+
+
+def _check_setting_sources(setting_sources: list[str] | None) -> None:
+    """Refuse a ``setting_sources`` entry that is not one of the CLI's file sources."""
+    for entry in setting_sources or ():
+        if entry not in _SETTING_SOURCES:
+            raise ValueError(
+                f'setting_sources entry {entry!r} is not one of {sorted(_SETTING_SOURCES)}'
+            )
 
 
 def apply_spawn_env(env: dict[str, str], spawn_env: dict[str, str] | None) -> None:
@@ -3383,6 +3544,8 @@ async def _invoke_claude(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
@@ -3403,6 +3566,8 @@ async def _invoke_claude(
         resume_session_id=resume_session_id,
         session_id=session_id,
         strict_mcp_config=strict_mcp_config,
+        available_tools=available_tools,
+        setting_sources=setting_sources,
     )
 
     # User prompt goes over stdin, never argv, to avoid ARG_MAX on large

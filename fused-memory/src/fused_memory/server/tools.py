@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid as uuid_mod
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,7 @@ from shared.delivered_check_polarity import (
     polarity_error,
 )
 from shared.task_statuses import ACTIVE
+from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.backends.mem0_client import (
@@ -86,6 +88,11 @@ from fused_memory.reconciliation.citation_verifier import (
     is_concrete_memory_id,
     repoint_task_citations,
 )
+from fused_memory.reconciliation.consolidation_proposal import (
+    PROPOSER_AGENT_ID,
+    ConsolidationProposal,
+    record_proposal,
+)
 from fused_memory.reconciliation.flag_record_contract import (
     recon_stage_flag_kind_refusal,
 )
@@ -104,8 +111,10 @@ from fused_memory.reconciliation.task_filter import (
     is_proposed_resolution_framing,
 )
 from fused_memory.server.consolidation import (
+    ProposalLimits,
     build_consolidation_result,
     validate_consolidate_args,
+    validate_proposal_args,
 )
 from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.entity_mint_authz import (
@@ -126,7 +135,11 @@ from fused_memory.server.grouped_read import (
     group_memory_document,
     group_search_results,
 )
-from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.guard_excerpt import excerpt_fields
+from fused_memory.server.manifest_stamping import (
+    stamp_capability_manifests,
+    stamping_action_required,
+)
 from fused_memory.server.markup_tripwire import (
     # The write-time gate this module hosted was retired in task 4458: the ONE
     # markup mechanism now runs at the dispatch boundary
@@ -148,6 +161,10 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_retired_derived_topic_ids,
     resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
+)
+from fused_memory.server.resolve_prefix_route import (
+    register_resolve_prefix_route,
+    resolver_unavailable_body,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.server.topic_cluster_store import TopicClusterStore, seed_topic_cluster
@@ -190,12 +207,14 @@ from fused_memory.services.consolidation_ops import (
     patch_memory_metadata,
     read_topic_closure,
 )
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.id_resolver import IdResolver, is_uuid_prefix
+from fused_memory.services.memory_service import MemoryService, metadata_row_text
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
     summarize_search_query,
     summarize_search_results,
 )
+from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
@@ -632,6 +651,79 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
         return canonicalize_project_id(project_id), None
     except PathShapedProjectIdError as e:
         return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
+#: The refusal a read tool gives a prefix that names several ids; the uuid
+#: prefix guard refuses with the same error_type.
+_AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
+
+
+@dataclass(frozen=True)
+class _ResolvedId:
+    """The prefix named exactly one live id in the tool's namespace: read *full_id*."""
+
+    full_id: str
+
+
+@dataclass(frozen=True)
+class _PrefixResponse:
+    """The prefix named no one readable id: *body* is the tool's whole response."""
+
+    body: dict[str, Any]
+
+
+async def _resolve_or_respond(
+    id_resolver: IdResolver, project_id: str, prefix: str, *, serves: Namespace,
+) -> _ResolvedId | _PrefixResponse:
+    """Resolve a read tool's prefix-shaped id argument, or answer for the tool (PRD C4).
+
+    The response is the outage (``prefix_checked: False``, never a miss —
+    INV-11), the ambiguity refusal with its candidates, or the miss report of
+    what each namespace holds.
+    """
+    try:
+        resolution = await id_resolver.resolve_prefix(project_id, prefix)
+    except ResolverUnavailable as exc:
+        return _PrefixResponse({
+            **resolver_unavailable_body(exc),
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': False,
+        })
+    if resolution.outcome == 'ambiguous':
+        return _PrefixResponse({
+            'error': (
+                f'{prefix!r} is the prefix of {len(resolution.candidates)} ids; '
+                'pass the full uuid of the one you mean'
+            ),
+            'error_type': _AMBIGUOUS_UUID_PREFIX,
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': True,
+            'candidates': [candidate._asdict() for candidate in resolution.candidates],
+        })
+    if resolution.outcome == 'unique' and resolution.candidates[0].namespace == serves:
+        return _ResolvedId(resolution.candidates[0].id)
+    return _PrefixResponse({
+        'found': False,
+        'prefix_checked': True,
+        'prefix': prefix,
+        'project_id': project_id,
+        'namespaces': await id_resolver.miss_report(project_id, prefix, resolution),
+        'hint': _prefix_miss_hint(prefix, resolution, serves),
+    })
+
+
+def _prefix_miss_hint(prefix: str, resolution: Resolution, serves: Namespace) -> str:
+    malformed = validate_full_uuid(prefix)
+    remediation = malformed['hint'] if malformed else ''
+    if resolution.candidates:
+        elsewhere = resolution.candidates[0].namespace
+        return (
+            f'No {serves} id starts with {prefix!r}, but a live {elsewhere} id does '
+            f'(see namespaces). {remediation}'
+        )
+    return f'No live id in any namespace starts with {prefix!r}. {remediation}'
 
 
 _UPDATE_MEMORY_MODES = ('merge', 'replace')
@@ -1184,10 +1276,17 @@ def create_mcp_server(
     curator_usage_gate: UsageGate | None = None,
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
+    id_resolver: IdResolver | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+
+    def _resolver() -> IdResolver:
+        # Built per use: the resolver is stateless and its factory reads the
+        # service's CURRENT config, so a hot reload of the read timeout or
+        # collection prefix applies to the next resolution.
+        return id_resolver or IdResolver.for_memory_service(memory_service)
     _taskmaster_configured = task_interceptor is not None
 
     async def _backlog_gate(project_id: str) -> dict | None:
@@ -1441,6 +1540,13 @@ def create_mcp_server(
         # can creep in and turn this back into a state read.
         return JSONResponse(_ALIVE_BODY, status_code=200)
 
+    # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
+    register_resolve_prefix_route(
+        mcp,
+        lambda project_id, prefix: _resolver().resolve_prefix(project_id, prefix),
+        known_projects=_kp,
+    )
+
     # ------------------------------------------------------------------
     # Write tools
     # ------------------------------------------------------------------
@@ -1511,7 +1617,7 @@ def create_mcp_server(
             'error': refusal.error,
             'error_type': refusal.error_type,
             'agent_id': agent_id,
-            'content_excerpt': content[:200],
+            **excerpt_fields(content_excerpt=content),
             'hint': refusal.hint,
         }
 
@@ -1748,7 +1854,7 @@ def create_mcp_server(
             'error': 'premature_completion_claim_write_blocked',
             'error_type': 'ReconPrematureCompletionClaimWriteRejected',
             'agent_id': agent_id,
-            'content_excerpt': content[:200],
+            **excerpt_fields(content_excerpt=content),
             'blocked_task_ids': sorted(blocked),
             'hint': _PREMATURE_COMPLETION_HINT,
         }
@@ -3235,7 +3341,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
             conflicting_task_ids = find_conflicting_task_status_ids(content)
@@ -3244,7 +3350,7 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
@@ -3257,7 +3363,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
@@ -3568,7 +3674,7 @@ def create_mcp_server(
                 'error': 'count_snapshot_write_blocked',
                 'error_type': 'ReconSnapshotWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -3580,7 +3686,7 @@ def create_mcp_server(
                 'error': 'mixed_temporal_framing_write_blocked',
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
             }
         if (
             category == 'temporal_facts'
@@ -3593,7 +3699,7 @@ def create_mcp_server(
                     'error': 'conflicting_task_status_framing_write_blocked',
                     'error_type': 'ReconConflictingTaskStatusWriteRejected',
                     'agent_id': agent_id,
-                    'content_excerpt': content[:200],
+                    **excerpt_fields(content_excerpt=content),
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
@@ -3609,7 +3715,7 @@ def create_mcp_server(
                 'error': 'live_task_status_current_fact_write_blocked',
                 'error_type': 'ReconLiveTaskStatusWriteRejected',
                 'agent_id': agent_id,
-                'content_excerpt': content[:200],
+                **excerpt_fields(content_excerpt=content),
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
         # task 2824: reject a recon-stage present-tense completion claim ("task N
@@ -4034,6 +4140,7 @@ def create_mcp_server(
             ack = {**ack, ROUTED_KEY: outcome}
             if attached_to is not None:
                 ack[CANONICAL_ID_KEY] = attached_to
+            ack.update(truncation_fields(*triage_decision.truncation_facts))
             # Drained AFTER any fallback record above, so one drain covers both
             # triage_write's internal fail-opens and this body's own.
             storm = _triage_fail_open_counter.drain_storm()
@@ -4144,6 +4251,107 @@ def create_mcp_server(
             _source=source,
         )
         return result.model_dump()
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def propose_consolidation(
+        project_id: str,
+        run_id: str,
+        topic: str,
+        member_ids: list[str],
+        category: str,
+        claim: str,
+        rationale: str,
+        seeded_from: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Propose consolidating a near-duplicate Mem0 cluster. Recon Stage 1's one channel for it.
+
+        You propose; code decides whether the cluster is consolidated and
+        executes it. A ValidationError names every offender at once, with a
+        hint: fix them all and call again in the same turn. Re-calling for the
+        same (project, topic, run) overwrites the earlier proposal until code
+        has acted on it; after that the call is refused. Only recon
+        Stage 1 may propose: agent_id must be 'recon-stage-memory_consolidator'
+        — a naming convention, not authentication.
+
+        Args:
+            project_id: Project scope.
+            run_id: The reconciliation run emitting this proposal.
+            topic: Topic slug the cluster belongs under (lowercase, hyphenated).
+            member_ids: Full 36-character ids of the cluster's records.
+            category: Memory category the canonical is written under.
+            claim: ONE assertion on one line; it becomes the canonical's first
+                   paragraph verbatim.
+            rationale: Why these records are one cluster. Reviewer-facing;
+                       never reaches the canonical.
+            seeded_from: What surfaced the cluster, e.g. a near-duplicate
+                         soft-block (optional). Reviewer-facing.
+            agent_id: Must be 'recon-stage-memory_consolidator' (optional,
+                      auto-derived from MCP context).
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if agent_id != PROPOSER_AGENT_ID:
+            return {
+                'error': 'consolidation_proposal_not_permitted',
+                'error_type': 'ConsolidationProposalNotPermitted',
+                'agent_id': agent_id,
+            }
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        # Read per call, never captured, so a reload_config of these leaves
+        # applies to the next proposal.
+        config = memory_service.config.consolidation_auto
+        err, members = validate_proposal_args(
+            topic=topic,
+            member_ids=member_ids,
+            run_id=run_id,
+            claim=claim,
+            category=category,
+            rationale=rationale,
+            seeded_from=seeded_from,
+            limits=ProposalLimits.from_config(config),
+        )
+        if err:
+            return err
+        ledger = memory_service.recon_ledger
+        if ledger is None:
+            return {
+                'error': (
+                    'no reconciliation ledger is wired on this server, so the '
+                    'proposal could not be persisted'
+                ),
+                'error_type': 'ReconLedgerUnavailable',
+            }
+        proposal = ConsolidationProposal(
+            project_id=project_id,
+            run_id=run_id,
+            topic=topic,
+            member_ids=tuple(members),
+            category=category,
+            claim=claim,
+            rationale=rationale,
+            seeded_from=seeded_from,
+        )
+        recorded = await record_proposal(
+            ledger, proposal, now=datetime.now(UTC), ttl_hours=config.proposal_ttl_hours
+        )
+        if not recorded:
+            return {
+                'error': (
+                    'the proposal for this (project, topic, run) has already been '
+                    'acted on, so it was not overwritten'
+                ),
+                'error_type': 'ConsolidationProposalAlreadyActed',
+                'ledger_key': proposal.ledger_key(),
+            }
+        return {'ok': True, 'ledger_key': proposal.ledger_key()}
 
     # ------------------------------------------------------------------
     # Read tools
@@ -4476,12 +4684,16 @@ def create_mcp_server(
 
         Return shape: ``{'present': bool, 'ledger_available': bool,
         'project_id': str, 'run_id': str, 'stage': str, 'remediation':
-        bool | None, 'reason': str, 'expected': bool | None,
-        'run_lookup_available': bool, 'run_status': str | None}``. When the
-        ledger is not wired (``ledger_available: False``), ``present`` is
-        always ``False`` and MUST be treated as inconclusive, not a definitive
-        absence — mirrors ``write_cycle_summary`` returning ``False`` when
-        unwired.
+        bool | None, 'agent_outcome': str | None, 'reason': str, 'expected':
+        bool | None, 'run_lookup_available': bool, 'run_status': str | None}``.
+        When the ledger is not wired (``ledger_available: False``),
+        ``present`` is always ``False`` and MUST be treated as inconclusive,
+        not a definitive absence — mirrors ``write_cycle_summary`` returning
+        ``False`` when unwired.
+
+        A present row whose ``agent_outcome`` is not ``'completed'`` records a
+        stage agent that died or was never launched — not a healthy zero-work
+        cycle. ``agent_outcome: None`` means unrecorded.
 
         ``present: False`` alone does NOT mean a summary was lost — it
         conflates four unrelated situations, and ``reason`` names which one:
@@ -4758,9 +4970,21 @@ def create_mcp_server(
 
         Args:
             project_id: Project scope (required)
-            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up
+            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up, or
+                an 8-31 lowercase-hex prefix of one
 
         Returns:
+            For a PREFIX that names exactly one live memory: that memory's
+            hit or miss below, plus ``resolved_from_prefix``. For any other
+            prefix: the miss report ``{'found': False, 'prefix_checked': True,
+            'prefix', 'project_id', 'namespaces', 'hint'}`` listing what each
+            namespace (mem0, mem0_tombstone, graphiti_node, graphiti_edge)
+            holds, with ``mem0_tombstone: None`` when the tombstone store could
+            not be read; ``{'error_type': 'ambiguous_uuid_prefix', 'candidates', ...}``
+            when it names several ids; ``{'error_type': 'resolver_unavailable',
+            'store', 'prefix_checked': False, ...}`` when a store could not be
+            read. Any other non-uuid id is a ``ValidationError`` with a ``hint``.
+
             ``{'found': True, 'memory_id', 'project_id', 'content', 'metadata'}``
             on a hit (``metadata`` is the full raw Qdrant payload); ``{'found':
             False, 'memory_id', 'project_id'}`` on a genuine miss — plus
@@ -4796,6 +5020,15 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(memory_id):
+            match await _resolve_or_respond(_resolver(), project_id, memory_id, serves='mem0'):
+                case _PrefixResponse(body=response):
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, memory_id = memory_id, full_id
+        elif err := validate_full_uuid(memory_id, field_name='memory_id'):
+            return err
         record = await memory_service.get_memory_by_id(
             project_id=project_id,
             memory_id=memory_id,
@@ -4806,6 +5039,8 @@ def create_mcp_server(
                 'memory_id': memory_id,
                 'project_id': project_id,
             }
+            if resolved_from_prefix is not None:
+                miss['resolved_from_prefix'] = resolved_from_prefix
             # A miss may be a DELIBERATE reap rather than a never-existed. The
             # lookup is guarded and the key omitted when empty, so this can
             # only ever add information to an answer that is already correct —
@@ -4842,6 +5077,8 @@ def create_mcp_server(
             'content': record['content'],
             'metadata': record['metadata'],
         }
+        if resolved_from_prefix is not None:
+            hit['resolved_from_prefix'] = resolved_from_prefix
         # ADDITIVE ONLY (task 3129): a canonical gains its group; a CHILD keeps
         # its own content/metadata/memory_id and gains only grouped.parent —
         # replacing a child's body with its parent's would make a citation
@@ -4977,8 +5214,15 @@ def create_mcp_server(
         want to confirm its identity without the fuzzy/semantic matching that
         can mask duplicate-node pathology.
 
+        An 8-31 lowercase-hex PREFIX naming exactly one Entity node is read
+        through to it (the result gains ``resolved_from_prefix``, as does the
+        NodeNotFoundError, with the resolved ``entity_uuid``, if the node is
+        gone by read time); any other prefix returns get_memory_by_id's miss
+        report, ambiguity refusal or ``resolver_unavailable`` shape instead of
+        a NodeNotFoundError.
+
         Args:
-            entity_uuid: UUID of the Entity node to look up
+            entity_uuid: UUID of the Entity node to look up, or a prefix of one
             project_id: Project scope (required)
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
@@ -4989,6 +5233,26 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(entity_uuid):
+            match await _resolve_or_respond(
+                _resolver(), project_id, entity_uuid, serves='graphiti_node',
+            ):
+                case _PrefixResponse(body=response):
+                    await _log_read(
+                        operation='get_entity_by_uuid',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={'entity_uuid': entity_uuid},
+                        result_summary={
+                            'prefix_checked': response['prefix_checked'],
+                            'outcome': response.get('error_type', 'miss_report'),
+                        },
+                    )
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, entity_uuid = entity_uuid, full_id
         try:
             result = await memory_service.get_entity_by_uuid(
                 entity_uuid=entity_uuid, project_id=project_id
@@ -5005,6 +5269,8 @@ def create_mcp_server(
                     'has_summary': bool(result.get('summary')),
                 },
             )
+            if resolved_from_prefix is not None:
+                return {**result, 'resolved_from_prefix': resolved_from_prefix}
             return result
         except NodeNotFoundError as e:
             # Expected diagnostic outcome, not a backend failure — this tool
@@ -5019,7 +5285,10 @@ def create_mcp_server(
                 params={'entity_uuid': entity_uuid},
                 result_summary={'found': False},
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            miss = {'error': str(e), 'error_type': type(e).__name__}
+            if resolved_from_prefix is not None:
+                miss |= {'entity_uuid': entity_uuid, 'resolved_from_prefix': resolved_from_prefix}
+            return miss
         except Exception as e:
             await _log_read(
                 operation='get_entity_by_uuid',
@@ -6484,7 +6753,7 @@ def create_mcp_server(
         if topic_cluster_store is not None:
             member_rows = closure.members if isinstance(closure.members, list) else []
             member_texts = [
-                row.get('content')
+                metadata_row_text(row)
                 for row in member_rows
                 if isinstance(row, dict) and row.get('id') != canonical_id
             ]
@@ -9464,6 +9733,12 @@ def create_mcp_server(
         Like ``manifest_stamping``, the key is attached ONLY when non-empty,
         so a clean batch's response is byte-identical to the pre-gate one.
 
+        A ``pending`` commit also stamps any capability-manifest sidecar the
+        batch names and attaches the ``manifest_stamping`` report, plus
+        ``manifest_stamping_action_required`` when it needs repair; it never
+        blocks the flip. The contract is the
+        ``fused_memory.server.manifest_stamping`` module docstring.
+
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
         """
@@ -9625,6 +9900,9 @@ def create_mcp_server(
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
+                action_required = stamping_action_required(manifest_report)
+                if action_required:
+                    result['manifest_stamping_action_required'] = action_required
         # Non-blocking half of the polarity gate (task 3500), attached in the
         # same CONDITIONAL shape as `manifest_stamping` directly above: only
         # when non-empty, so a clean batch's response is byte-identical to the
@@ -10383,15 +10661,15 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Snapshot dict with keys: skip_counts, parks, effective_priorities,
-            pin_queue, overrides, current_holders, snapshot_at.
-            Returns the empty skeleton when no snapshot file exists yet.
+            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        snapshot = await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        return snapshot.to_json()
 
     @mcp.tool()
     @mcp_tool_errors()

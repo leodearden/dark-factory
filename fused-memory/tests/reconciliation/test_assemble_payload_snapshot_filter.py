@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _clip_assertions import assert_elided
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -119,6 +120,172 @@ class TestAssemblePayloadSnapshotStripping:
             f'Expected _entity_summary_snapshot_lines_stripped=1, '
             f'got {stage._entity_summary_snapshot_lines_stripped}'
         )
+
+
+def _buffered_events_block(payload: str) -> str:
+    return payload.split('### Buffered Events', 1)[1].split('### Related Context', 1)[0]
+
+
+class TestAssembledPayloadDisclosesTheTokenBudgetClip:
+    """Events the token budget deferred are named under the Buffered Events block."""
+
+    @pytest.mark.asyncio
+    async def test_deferred_events_render_a_clip_note(self):
+        stage = make_consolidator()
+        stage.assembled_payload = AssembledPayload(events=[], events_remaining=7, token_budget=65_000)
+
+        result = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='test_project'), prior_reports=[],
+        )
+
+        [note] = [
+            line for line in _buffered_events_block(result).splitlines() if line.startswith('_NOTE:')
+        ]
+        assert '7 additional buffered event(s)' in note
+        assert 'reconciliation.token_budget=65000 cap' in note
+        assert 'NOT complete this cycle' in note
+        assert 'the newest events (still buffered for a later chunk) were dropped first' in note
+
+    @pytest.mark.asyncio
+    async def test_no_deferred_events_render_no_note(self):
+        stage = make_consolidator()
+        stage.assembled_payload = AssembledPayload(events=[], events_remaining=0, token_budget=65_000)
+
+        result = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='test_project'), prior_reports=[],
+        )
+
+        assert '_NOTE:' not in _buffered_events_block(result)
+
+
+_EPISODES_HEADER = '### New Episodes Since Last Reconciliation'
+_MEMORIES_HEADER = '### New Mem0 Memories Since Last Reconciliation'
+
+
+def _section(payload: str, header: str) -> str:
+    return payload.split(header, 1)[1].split('\n### ', 1)[0]
+
+
+def _episodes(*contents: str, created_at: tuple[str, ...] = ()) -> list[dict]:
+    stamps = created_at or ('2026-05-28T00:00:00Z',) * len(contents)
+    return [
+        {'uuid': f'e{i}', 'created_at': stamp, 'content': c}
+        for i, (c, stamp) in enumerate(zip(contents, stamps, strict=True))
+    ]
+
+
+def _memories(*contents: str, created_at: tuple[str, ...] = ()) -> dict:
+    return {'results': [
+        {'id': f'm{i}', 'memory': c, 'metadata': {'category': 'temporal_facts'},
+         **({'created_at': created_at[i]} if created_at else {})}
+        for i, c in enumerate(contents)
+    ]}
+
+
+async def _time_windowed_payload(stage, watermark: Watermark | None = None) -> str:
+    return await stage.assemble_payload(
+        events=[], watermark=watermark or Watermark(project_id='test_project'), prior_reports=[],
+    )
+
+
+def _rendered_from(section: str, body: str) -> str:
+    """The rest of the line in *section* where *body*'s rendering begins."""
+    return section[section.index(body[:20]):].split('\n', 1)[0]
+
+
+def _notes(section: str) -> list[str]:
+    return [line for line in section.splitlines() if line.startswith('_NOTE:')]
+
+
+class TestTimeWindowedPayloadDisclosesClips:
+    """Per-record body clips and saturated fetch caps are both visible in the Stage-1 payload."""
+
+    @pytest.mark.asyncio
+    async def test_long_records_carry_the_elision_marker_and_short_ones_do_not(self):
+        episode_body = 'e' * 10_000
+        memory_body = 'm' * 10_000
+        stage = make_consolidator()
+        stage.memory.get_episodes = AsyncMock(
+            return_value=_episodes(f'{_SNAPSHOT_LINE}\n{episode_body}', 'short episode'),
+        )
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value=_memories(f'{memory_body}\n{_SNAPSHOT_LINE}', 'short memory'),
+        )
+
+        result = await _time_windowed_payload(stage)
+
+        episodes = _section(result, _EPISODES_HEADER)
+        assert_elided(_rendered_from(episodes, episode_body), episode_body)
+        assert _rendered_from(episodes, 'short episode') == 'short episode'
+        memories = _section(result, _MEMORIES_HEADER)
+        assert_elided(_rendered_from(memories, memory_body), memory_body)
+        assert _rendered_from(memories, 'short memory') == 'short memory'
+        assert stage._entity_summary_snapshot_lines_stripped == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_that_fills_its_limit_renders_a_fetch_cap_note(self):
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory_limit = 3
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes('a', 'b'))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories('x', 'y', 'z'))
+
+        result = await _time_windowed_payload(stage)
+
+        [episode_note] = _notes(_section(result, _EPISODES_HEADER))
+        assert 'episode_limit=2' in episode_note
+        assert 'NOT known complete this cycle' in episode_note
+        [memory_note] = _notes(_section(result, _MEMORIES_HEADER))
+        assert 'memory_limit=3' in memory_note
+        assert 'NOT known complete this cycle' in memory_note
+
+    @pytest.mark.asyncio
+    async def test_a_full_episode_fetch_that_reached_the_watermark_renders_no_note(self):
+        """Episodes arrive newest-first, so one at or before the watermark proves nothing newer was cut."""
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes(
+            'new', 'old', created_at=('2026-05-28T12:00:00Z', '2026-05-27T00:00:00Z'),
+        ))
+        watermark = Watermark(
+            project_id='test_project', last_episode_timestamp=datetime(2026, 5, 28, tzinfo=UTC),
+        )
+
+        result = await _time_windowed_payload(stage, watermark)
+
+        episodes = _section(result, _EPISODES_HEADER)
+        assert 'new' in episodes and 'old' not in episodes
+        assert _notes(episodes) == []
+
+    @pytest.mark.asyncio
+    async def test_a_full_mem0_fetch_notes_even_past_the_watermark(self):
+        """mem0's get_all is not recency-ordered, so a dropped old record proves nothing about the rest."""
+        stage = make_consolidator()
+        stage.memory_limit = 2
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories(
+            'new', 'old', created_at=('2026-05-28T12:00:00+00:00', '2026-05-27T00:00:00+00:00'),
+        ))
+        watermark = Watermark(
+            project_id='test_project', last_memory_timestamp=datetime(2026, 5, 28, tzinfo=UTC),
+        )
+
+        result = await _time_windowed_payload(stage, watermark)
+
+        [memory_note] = _notes(_section(result, _MEMORIES_HEADER))
+        assert 'memory_limit=2' in memory_note
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_under_its_limit_renders_no_note(self):
+        stage = make_consolidator()
+        stage.episode_limit = 2
+        stage.memory_limit = 3
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes('a'))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories('x', 'y'))
+
+        result = await _time_windowed_payload(stage)
+
+        assert '_NOTE:' not in _section(result, _EPISODES_HEADER)
+        assert '_NOTE:' not in _section(result, _MEMORIES_HEADER)
 
 
 class TestRunSurfacesSnapshotStrippedStat:

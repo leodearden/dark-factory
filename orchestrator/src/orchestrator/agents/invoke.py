@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,8 @@ from shared.cli_invoke import (  # noqa: F401
 
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
+
+from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 
 # MCP startup-timeout injection (bounded drop-on-fail for all projects)
 from orchestrator.mcp_lifecycle import apply_mcp_startup_env
@@ -198,6 +200,23 @@ async def invoke_agent(
         raise ValueError(f'Unknown backend: {backend!r}')
 
 
+def _sandbox_spawn(
+    cmd: list[str],
+    env: Mapping[str, str],
+    cwd: Path,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+) -> tuple[list[str], dict[str, str]]:
+    """The argv and env every backend spawns: a requested sandbox wraps *cmd* and turns rerere off."""
+    if sandbox_modules is None:
+        return cmd, dict(env)
+    from orchestrator.agents.sandbox_dispatch import wrap_command
+    return (
+        wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras),
+        {**env, **sandbox_git_config_env(env)},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Claude backend — thin wrapper adding sandbox support over shared.cli_invoke
 # ---------------------------------------------------------------------------
@@ -265,7 +284,7 @@ async def _invoke_claude_with_sandbox(
     # For sandboxed invocations we need to build the command ourselves
     # and use the lower-level shared primitives
     if sandbox_modules is not None:
-        from orchestrator.agents.sandbox_dispatch import resolve_active_backend, wrap_command
+        from orchestrator.agents.sandbox_dispatch import resolve_active_backend
         active = resolve_active_backend()
         if active != 'none':
             # Same lockstep obligation as the argv build below, applied to the
@@ -300,8 +319,6 @@ async def _invoke_claude_with_sandbox(
             # User prompt piped via stdin to avoid ARG_MAX
             stdin_data = prompt.encode()
 
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
             env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
             if env_overrides:
                 env.update(env_overrides)
@@ -314,6 +331,8 @@ async def _invoke_claude_with_sandbox(
             # for the full rationale on the CLAUDE_SPAWN_SESSION_ID/
             # LAUNCHER_PID scrub.
             apply_spawn_env(env, spawn_env)
+
+            cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
 
             try:
                 result = await _run_subprocess(
@@ -329,6 +348,10 @@ async def _invoke_claude_with_sandbox(
             finally:
                 for path in temp_files:
                     Path(path).unlink(missing_ok=True)
+
+        env_overrides = {
+            **env_overrides, **sandbox_git_config_env({**os.environ, **env_overrides}),
+        }
 
     # No sandbox or bwrap unavailable — use shared invocation
     return await invoke_claude_agent(
@@ -418,12 +441,7 @@ async def _invoke_codex(
         cmd.append('-')
         codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
-        if sandbox_modules is not None:
-            from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
-        # Strip OPENAI_API_KEY if using OAuth
-        env = dict(os.environ)
+        cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
 
         result = await _run_subprocess_local(
             cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
@@ -598,11 +616,7 @@ async def _invoke_gemini(
 
         cmd = ['gemini', '-p', prompt, '-m', model, '-o', 'json', '--yolo']
 
-        if sandbox_modules is not None:
-            from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
-        env = dict(os.environ)
+        cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
         return _parse_gemini_output(result, model, prices)
@@ -1052,12 +1066,6 @@ async def _invoke_pi(
 
         cmd.append(prompt)
 
-        if sandbox_modules is not None:
-            from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
-
-        _warn_if_argv_near_arg_max(cmd)
-
         env = dict(os.environ)
         if oauth_token:
             # Strip a lingering ANTHROPIC_API_KEY so it can't shadow the
@@ -1072,6 +1080,9 @@ async def _invoke_pi(
             env['ANTHROPIC_OAUTH_TOKEN'] = oauth_token
         if env_overrides:
             env.update(env_overrides)
+
+        cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
+        _warn_if_argv_near_arg_max(cmd)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'pi', model, max_budget_usd, timeout_seconds)
         return _parse_pi_output(result, model, prices)

@@ -21,9 +21,12 @@ Two properties are load-bearing here and pinned as such:
 
 import pytest
 
+from fused_memory.config.schema import ConsolidationAutoConfig
+from fused_memory.models.enums import MemoryCategory
 from fused_memory.server.consolidation import (
     ProposalLimits,
     validate_consolidate_args,
+    validate_proposal_args,
 )
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN
 
@@ -330,22 +333,36 @@ def _ids(n: int) -> list[str]:
     return [f'{i:08x}-0000-4000-8000-000000000000' for i in range(n)]
 
 
+_PROPOSAL_ARGS = {
+    'topic': _TOPIC,
+    'member_ids': _ids(5),
+    'run_id': 'run-1',
+    'claim': _OK,
+    'category': 'procedural_knowledge',
+    'rationale': 'Five records state the same rule in different words.',
+    'seeded_from': None,
+    'limits': _LIMITS,
+}
+
+
 def _propose(**overrides):
     """Validate a well-formed PROPOSAL arg set with *overrides* applied.
 
-    The proposal shape carries no `canonical_content` (task gamma's tool has
-    not written one yet — it is proposing that the cluster be consolidated at
-    all) and no delete arm, so `supersedes` and `run_id` stay absent.
+    `run_id` is present: it is the proposal's ledger identity, not a tombstone
+    attribution.
     """
-    kwargs = {
-        'canonical_content': None,
-        'topic': _TOPIC,
-        'supersedes': None,
-        'retain': _ids(5),
-        'run_id': None,
-        'claim': _OK,
-        'limits': _LIMITS,
-    }
+    return validate_proposal_args(**{**_PROPOSAL_ARGS, **overrides})
+
+
+def _propose_through_the_core(**overrides):
+    """The proposal arm reached through `validate_consolidate_args` directly.
+
+    Only for the core's own fail-closed rules: a caller holding the op's
+    parameter names can pass a `canonical_content` alongside `limits`, which
+    `validate_proposal_args` cannot express.
+    """
+    kwargs = {**_PROPOSAL_ARGS, 'canonical_content': None, 'supersedes': None}
+    kwargs['retain'] = kwargs.pop('member_ids')
     kwargs.update(overrides)
     return validate_consolidate_args(**kwargs)
 
@@ -393,16 +410,15 @@ class TestProposalArm:
     """
 
     def test_a_well_formed_proposal_passes(self):
-        err, supersedes, retain = _propose()
+        err, members = _propose()
 
         assert err is None, err
-        assert supersedes == []
-        assert retain == _ids(5)
+        assert members == _ids(5)
 
     def test_canonical_content_is_not_required(self):
         """The op arm's own requirement must not leak into this one: a
         proposal has no canonical text yet, by construction."""
-        err, _, _ = _propose(canonical_content=None)
+        err, _, _ = _propose_through_the_core(canonical_content=None)
 
         assert err is None, err
 
@@ -414,7 +430,7 @@ class TestProposalArm:
         a silently dropped canonical text is the mirror of the silently dropped
         claim the op arm already refuses. The boundary is `is not None`, so a
         blank string is refused too rather than dropped."""
-        err, _, _ = _propose(canonical_content=content)
+        err, _, _ = _propose_through_the_core(canonical_content=content)
 
         assert err is not None
         assert err['error_type'] == 'ValidationError'
@@ -424,21 +440,21 @@ class TestProposalArm:
     def test_canonical_content_refusal_is_collected_not_short_circuited(self):
         """Refusing the stray text must not cost the caller the claim checks:
         one round trip names every problem, on this branch as on every other."""
-        err, _, _ = _propose(canonical_content=_CONTENT, claim=_SHORT)
+        err, _, _ = _propose_through_the_core(canonical_content=_CONTENT, claim=_SHORT)
 
         assert err is not None
         assert 'canonical_content' in err['error']
         assert '8-word minimum' in err['error']
 
     def test_a_missing_claim_is_refused(self):
-        err, _, _ = _propose(claim=None)
+        err, _ = _propose(claim=None)
 
         assert err is not None
         assert 'claim' in err['error']
 
     def test_a_malformed_topic_is_still_refused(self):
         """The topic rule is shared by both arms — one namespace, one check."""
-        err, _, _ = _propose(topic='memory_consolidation')
+        err, _ = _propose(topic='memory_consolidation')
 
         assert err is not None
         assert 'topic' in err['error']
@@ -447,7 +463,7 @@ class TestProposalArm:
 
     def test_a_multi_line_claim_is_refused(self):
         claim = 'Stage one keeps reproposing\nthe identical unaddressed cluster'
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is not None
         assert 'claim' in err['error']
@@ -457,7 +473,7 @@ class TestProposalArm:
         claim = _OK + ' ' + 'z' * (_LIMITS.claim_max_chars - len(_OK))
         assert len(claim) == _LIMITS.claim_max_chars + 1
 
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is not None
         assert str(_LIMITS.claim_max_chars) in err['error']
@@ -468,7 +484,7 @@ class TestProposalArm:
         claim = _OK + ' ' + 'z' * (_LIMITS.claim_max_chars - len(_OK) - 1)
         assert len(claim) == _LIMITS.claim_max_chars
 
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is None, err
 
@@ -477,7 +493,7 @@ class TestProposalArm:
         claim: a banner opens with `[CORRECTION ...]`, so a claim lifted from
         one would carry the banner into the canonical's first paragraph."""
         claim = '[CORRECTION 2026-09-08] Stage one keeps reproposing the cluster'
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is not None
         assert 'claim' in err['error']
@@ -493,7 +509,7 @@ class TestProposalArm:
         """A claim is an ASSERTION, not a heading. A label-shaped opening reads
         as a title in the canonical's first paragraph, which is the position
         PRD §2 measured the retrieval property out of."""
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is not None
         assert 'claim' in err['error']
@@ -508,7 +524,7 @@ class TestProposalArm:
     def test_an_ordinary_claim_beginning_with_those_words_is_accepted(self, claim):
         """The `\\b` and the case-sensitivity are the point: the rule refuses the
         LABEL `INDEX —`, not every sentence that starts with the same letters."""
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is None, err
 
@@ -520,7 +536,7 @@ class TestProposalArm:
             'The memory consolidation is a consolidation of the memory for all '
             'of these'
         )
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is not None
         assert 'claim' in err['error']
@@ -532,14 +548,14 @@ class TestProposalArm:
             'The memory consolidation ratchet grew by one canonical per '
             'reconciliation pass until gate 3200'
         )
-        err, _, _ = _propose(claim=claim)
+        err, _ = _propose(claim=claim)
 
         assert err is None, err
 
     def test_a_seven_word_claim_is_refused_and_eight_is_accepted(self):
         """The boundary, both sides, so an off-by-one cannot pass unnoticed."""
-        short_err, _, _ = _propose(claim=_SHORT)
-        ok_err, _, _ = _propose(claim=_OK)
+        short_err, _ = _propose(claim=_SHORT)
+        ok_err, _ = _propose(claim=_OK)
 
         assert short_err is not None
         assert ok_err is None, ok_err
@@ -548,22 +564,22 @@ class TestProposalArm:
 
     @pytest.mark.parametrize('count', [1, 21])
     def test_a_member_count_outside_the_range_is_refused(self, count):
-        err, _, _ = _propose(retain=_ids(count))
+        err, _ = _propose(member_ids=_ids(count))
 
         assert err is not None
         assert str(count) in err['error']
-        assert 'retain' in err['error']
+        assert 'member_ids' in err['error']
 
     @pytest.mark.parametrize('count', [2, 20])
     def test_the_member_count_bounds_are_inclusive(self, count):
-        err, _, _ = _propose(retain=_ids(count))
+        err, _ = _propose(member_ids=_ids(count))
 
         assert err is None, err
 
     def test_the_limits_are_read_from_the_argument_not_a_default(self):
         """ProposalLimits carries NO defaults: the numbers have exactly one
         home (ConsolidationAutoConfig) and a default here would be a second."""
-        err, _, _ = _propose(retain=_ids(5), limits=ProposalLimits(200, 6, 20))
+        err, _ = _propose(member_ids=_ids(5), limits=ProposalLimits(200, 6, 20))
 
         assert err is not None
         assert '5' in err['error']
@@ -574,20 +590,209 @@ class TestProposalArm:
         """PRD C1's reason for checking at the emit boundary: the LLM fixes its
         shape IN-TURN, which it can only do if one refusal names every fault."""
         claim = 'INDEX\n' + 'x' * 300
-        err, _, _ = _propose(claim=claim, retain=_ids(1))
+        err, _ = _propose(claim=claim, member_ids=_ids(1), category='facts')
 
         assert err is not None
         assert 'single line' in err['error'], err['error']
         assert str(_LIMITS.claim_max_chars) in err['error'], err['error']
         assert 'INDEX' in err['error'], err['error']
         assert '8' in err['error'], err['error']
-        assert 'retain' in err['error'], err['error']
+        assert 'member_ids' in err['error'], err['error']
+        assert "category" in err['error'], err['error']
+        assert "'facts'" in err['error'], err['error']
 
     def test_the_hint_names_the_shape_rules(self):
         """PRD D3: the emitting stage needs something actionable, not just a
         list of what it got wrong."""
-        err, _, _ = _propose(claim=_SHORT)
+        err, _ = _propose(claim=_SHORT)
 
         assert err is not None
         assert err['hint']
         assert 'claim' in err['hint']
+
+
+class TestProposalCategory:
+    """A proposal names the category its canonical is written under (PRD C1)."""
+
+    @pytest.mark.parametrize('bad', ['facts', 'Procedural_Knowledge', None, 3])
+    def test_a_category_outside_the_six_is_refused_by_name(self, bad):
+        err, _ = _propose(category=bad)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'category' in err['error']
+        assert repr(bad) in err['error']
+
+    @pytest.mark.parametrize('category', [c.value for c in MemoryCategory])
+    def test_each_of_the_six_categories_passes(self, category):
+        err, _ = _propose(category=category)
+
+        assert err is None, err
+
+    def test_the_hint_names_the_six_categories(self):
+        err, _ = _propose(category='facts')
+
+        assert err is not None
+        for category in MemoryCategory:
+            assert category.value in err['hint']
+
+
+class TestProposalRunId:
+    """`run_id` is a component of the proposal row's ledger identity, so a
+    proposal without one has nowhere to land."""
+
+    @pytest.mark.parametrize('missing', [None, '', '   ', 7])
+    def test_a_proposal_without_a_run_id_is_refused(self, missing):
+        err, _ = _propose(run_id=missing)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'run_id' in err['error']
+        assert 'run_id' in err['hint']
+
+
+class TestProposalReviewerText:
+    """`rationale` and `seeded_from` are stored verbatim in the shared recon
+    ledger and read back in full, so both are bounded; `rationale` is the
+    reviewer's only evidence for the proposal, so it is required."""
+
+    @pytest.mark.parametrize('missing', [None, '', '   ', 7])
+    def test_a_proposal_without_a_rationale_is_refused(self, missing):
+        err, _ = _propose(rationale=missing)
+
+        assert err is not None
+        assert 'rationale' in err['error']
+        assert 'rationale' in err['hint']
+
+    def test_a_rationale_is_bounded_inclusively(self):
+        at_cap, _ = _propose(rationale='r' * 2000)
+        over_cap, _ = _propose(rationale='r' * 2001)
+
+        assert at_cap is None, at_cap
+        assert over_cap is not None
+        assert '`rationale` is 2001 characters, over the 2000 limit' in over_cap['error']
+
+    def test_seeded_from_is_optional(self):
+        err, _ = _propose(seeded_from=None)
+
+        assert err is None, err
+
+    @pytest.mark.parametrize('bad', ['', '   ', 7])
+    def test_a_blank_or_non_string_seeded_from_is_refused(self, bad):
+        err, _ = _propose(seeded_from=bad)
+
+        assert err is not None
+        assert 'seeded_from' in err['error']
+
+    def test_seeded_from_is_bounded_inclusively(self):
+        at_cap, _ = _propose(seeded_from='s' * 500)
+        over_cap, _ = _propose(seeded_from='s' * 501)
+
+        assert at_cap is None, at_cap
+        assert over_cap is not None
+        assert '`seeded_from` is 501 characters, over the 500 limit' in over_cap['error']
+
+    def test_reviewer_text_problems_are_collected_with_the_rest(self):
+        err, _ = _propose(rationale='', seeded_from='s' * 501, claim=_SHORT)
+
+        assert err is not None
+        assert 'rationale' in err['error']
+        assert 'seeded_from' in err['error']
+        assert '8-word minimum' in err['error']
+
+
+class TestTheProposalEntryPoint:
+    def test_it_is_the_core_s_proposal_arm_under_the_proposal_s_names(self):
+        members = _ids(4)
+        members.append('873889a1')
+
+        assert _propose(member_ids=members, topic='bad_topic') == (
+            _propose_through_the_core(retain=members, topic='bad_topic')[0],
+            members,
+        )
+
+
+class TestOpArmRefusesACategory:
+    """The fail-closed mirror of the claim-without-limits rule."""
+
+    @pytest.mark.parametrize('field', ['rationale', 'seeded_from'])
+    def test_reviewer_text_without_limits_is_refused_by_name(self, field):
+        err, _, _ = _call(**{field: 'Five records state the same rule.'})
+
+        assert err is not None
+        assert f'`{field}` was passed without `limits`' in err['error']
+
+    def test_a_category_without_limits_is_refused_by_name(self):
+        err, _, _ = _call(category='procedural_knowledge')
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'category' in err['error']
+        assert 'limits' in err['error']
+
+    def test_an_explicit_none_category_is_indistinguishable_from_omitting_it(self):
+        assert _call(category=None) == _call()
+        assert _call(category=None, topic='bad_topic') == _call(topic='bad_topic')
+
+
+class TestProposalArmSpeaksItsOwnVocabulary:
+    """A proposal's caller passed `member_ids` to `propose_consolidation`; an
+    error naming `retain` and `consolidate_memories` describes an interface
+    that caller never saw."""
+
+    def test_the_error_is_prefixed_with_the_proposal_tool(self):
+        err, _ = _propose(topic='memory_consolidation')
+
+        assert err is not None
+        assert err['error'].startswith('propose_consolidation: ')
+
+    def test_the_op_arm_prefix_is_unchanged(self):
+        err, _, _ = _call(topic='memory_consolidation')
+
+        assert err is not None
+        assert err['error'].startswith('consolidate_memories: ')
+
+    def test_a_malformed_member_is_named_by_its_member_ids_slot(self):
+        members = _ids(5)
+        members[2] = '873889a1'
+        err, _ = _propose(member_ids=members)
+
+        assert err is not None
+        assert "member_ids[2] is not a full 36-character UUID: '873889a1'" in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    def test_a_repeated_member_names_both_member_ids_slots(self):
+        members = _ids(4)
+        members.append(members[1])
+        err, _ = _propose(member_ids=members)
+
+        assert err is not None
+        assert 'member_ids[4] repeats member_ids[1]' in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    def test_the_count_problem_names_member_ids(self):
+        err, _ = _propose(member_ids=_ids(1))
+
+        assert err is not None
+        assert 'member_ids' in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    @pytest.mark.parametrize('empty', [None, []])
+    def test_an_empty_member_list_reports_the_count_not_the_op_arm_rule(self, empty):
+        err, _ = _propose(member_ids=empty)
+
+        assert err is not None
+        assert '0 members' in err['error']
+        assert 'member_ids' in err['error']
+        assert 'requires at least one arm' not in err['error']
+        assert 'add_memory' not in err['hint']
+
+
+def test_proposal_limits_from_config_maps_the_three_leaves():
+    """The ONE place the config -> limits mapping lives (gamma and delta share it)."""
+    config = ConsolidationAutoConfig(claim_max_chars=150, member_min=3, member_max=9)
+
+    assert ProposalLimits.from_config(config) == ProposalLimits(150, 3, 9)

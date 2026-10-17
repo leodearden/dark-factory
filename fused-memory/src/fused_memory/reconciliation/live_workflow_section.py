@@ -15,15 +15,17 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.timestamps import parse_timestamp_or_warn
 
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.models.scope import ProjectRoot
 from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
 from fused_memory.services.landed_on_main import LandingQuery, LandingVerdict, probe_landing
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_BRANCH_PREFIX,
-    DEFAULT_HEARTBEAT_TTL,
     ClaimantLabel,
     WorkflowLiveness,
     claimant_label,
@@ -84,7 +86,7 @@ class LandedToken(StrEnum):
 
 LIVE_WORKFLOW_RULES_HEADING = '### Reading the Live-Workflow Signals section'
 
-_HEARTBEAT_TTL_MINUTES = int(DEFAULT_HEARTBEAT_TTL.total_seconds() // 60)
+_HEARTBEAT_TTL_MINUTES = int(DEFAULT_CLAIMANT_HEARTBEAT_TTL.total_seconds() // 60)
 
 
 def render_live_workflow_authority_rules() -> str:
@@ -136,8 +138,9 @@ def render_live_workflow_authority_rules() -> str:
         f'in parentheses. Such a task is NOT stranded work, whatever its status says. '
         f'Never recommend or perform any of these for it: resume it, redispatch it, '
         f'reset it to pending, or reopen it. The correct disposition is one '
-        f'info-severity, non-actionable finding saying the work landed but the '
-        f"task's status lags, citing the rendered evidence.\n\n"
+        f'{FindingSeverity.minor}-severity, non-actionable finding '
+        f"(`severity='{FindingSeverity.minor}'`, `actionable=false`) saying the work "
+        f"landed but the task's status lags, citing the rendered evidence.\n\n"
         f'`{LandedToken.FALSE}` means there is no positive evidence of landing, and '
         f'`{LandedToken.UNKNOWN}` means the landing probe failed. Neither is evidence '
         f'that the work is unmerged; the stranded rules in this section apply '
@@ -145,8 +148,9 @@ def render_live_workflow_authority_rules() -> str:
         f'For a task whose status is done, `metadata.done_provenance` (read it with '
         f"`get_task`) is the merge lane's landing record, and it outranks any branch "
         f'state. Never set a done task back to pending or in-progress on branch-state '
-        f'grounds. A refused reopen is not grounds to escalate; record an info '
-        f'finding instead (the task-3838 reopen storm).\n\n'
+        f'grounds. A refused reopen is not grounds to escalate; record a '
+        f'non-actionable {FindingSeverity.minor} finding instead (the task-3838 '
+        f'reopen storm).\n\n'
         f'Never assert or cite a live-workflow signal ({signals}) for a task unless '
         f"that task has a row in THIS payload's `{LIVE_WORKFLOW_SECTION_HEADER}` "
         f'section. The section rendered in this payload is the sole authority for '
@@ -462,7 +466,7 @@ def _metadata_of(task: Mapping) -> Mapping:
 
 def _read_local_hoists(
     project_root: ProjectRoot,
-) -> tuple[bool | None, dict | None, datetime | None]:
+) -> tuple[bool | None, SchedulerStateSnapshot | None, datetime | None]:
     """The three local-file hoists, each fail-safe to None; run in ONE thread hop.
 
     A None orchestrator check lets :func:`detect_live_workflow` derive it per
@@ -474,7 +478,7 @@ def _read_local_hoists(
     except Exception:
         orch_live = None
     try:
-        sched: dict | None = read_scheduler_state(Path(project_root))
+        sched: SchedulerStateSnapshot | None = read_scheduler_state(Path(project_root))
     except Exception:
         sched = None
     try:
@@ -512,7 +516,7 @@ def _corroboration(
     task: dict,
     task_id: str,
     now: datetime,
-    scheduler_state: dict | None,
+    scheduler_state: SchedulerStateSnapshot | None,
     orchestrator_started: datetime | None,
 ) -> bool | None:
     """The task-2963 verdict for an in-progress task; None (gate inert) otherwise or on error.

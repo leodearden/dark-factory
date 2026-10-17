@@ -496,12 +496,11 @@ def census(path: Path) -> int:
 **Expected disposition**: `flag: exceptions-owned-or-ratified`
 
 **Redesign that clears it**: Name the task or ticket that owns removing the
-exemption in `follow_up` (`Debt(TaskRef(n))` / `Debt(TicketRef(id))`) —
-today the only available disposition, because the ratification table
-(`docs/legibility/exception-ratifications.yaml`) lands with the mechanism
-and is not in the tree yet. Once it is, an exemption that is a deliberate,
-permanent ruling rather than debt may instead add a row there and cite its
-id (`Policy(ratified)`). An entry may never carry neither.
+exemption in `follow_up` (`Debt(TaskRef(n))` / `Debt(TicketRef(id))`), or,
+for an exemption that is a deliberate, permanent ruling rather than debt, add
+a row to the ratification table
+(`docs/legibility/exception-ratifications.yaml`) and cite its id
+(`Policy(ratified)`). An entry may never carry neither.
 
 ### Code-snippet-shaped (`INV-12-CODE`)
 

@@ -28,9 +28,11 @@ from _workflow_helpers import (
     _make_resolving_steward,
     _make_review,
     _make_status_setting_steward,
+    fixed_prompt,
 )
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator import session_registry
 from orchestrator.agents.invoke import AgentResult
@@ -7037,10 +7039,9 @@ class TestMarkBlockedBypassDetection:
     ):
         """When done_provenance.commit IS on main, treat as legitimate done.
 
-        The first set_task_status('blocked') is rejected (because the row is
-        already done) but bypass-detection sees a valid provenance commit on
-        main and lets the existing flow continue (which falls through to the
-        steward / DONE path).
+        The set_task_status('blocked') is rejected because the row is already
+        done, and bypass-detection sees a valid provenance commit on main.  The
+        exit reports the observed done, and nothing is filed.
         """
         from orchestrator.scheduler import TerminalExitRejection
 
@@ -7075,19 +7076,14 @@ class TestMarkBlockedBypassDetection:
         scheduler.set_task_status = raising_set  # type: ignore[method-assign]
 
         outcome = await workflow._mark_blocked('synthetic reason')
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Expected BLOCKED on legitimate-done path (no steward), got {outcome!r}'
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected the observed DONE on the legitimate-done path, got {outcome!r}'
         )
+        assert outcome_allows_status(outcome, 'done')
 
-        # Legitimate done — no bypass_done L1 and no reopen.
-        bypass_l1 = [
-            e for e in queue.get_by_task(task_assignment.task_id, level=1)
-            if e.category == 'bypass_done'
-        ]
-        assert not bypass_l1, (
-            f'expected no bypass_done L1 for legitimate done, got '
-            f'{[(e.id, e.category) for e in bypass_l1]}'
-        )
+        # Legitimate done — no escalation of any category, and no reopen.
+        filed = queue.get_by_task(task_assignment.task_id)
+        assert filed == [], [(e.id, e.level, e.category) for e in filed]
 
         # The reopen_reason must NOT contain 'bypass detected'.
         assert 'bypass detected' not in scheduler.reopen_reasons.get(
@@ -8698,7 +8694,7 @@ class TestBuildSpawnEnv:
             capturing_invoke_with_cap_retry,
         )
 
-        await workflow._invoke(ARCHITECT, prompt='x', cwd=config.project_root)
+        await workflow._invoke(ARCHITECT, build_prompt=fixed_prompt('x'), cwd=config.project_root)
 
         assert len(captured_calls) == 1
         architect_kwargs = captured_calls[0]
@@ -8707,7 +8703,7 @@ class TestBuildSpawnEnv:
         assert architect_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
         assert workflow._architect_spawn_session_id == architect_kwargs['session_id']
 
-        await workflow._invoke(IMPLEMENTER, prompt='y', cwd=config.project_root)
+        await workflow._invoke(IMPLEMENTER, build_prompt=fixed_prompt('y'), cwd=config.project_root)
 
         assert len(captured_calls) == 2
         implementer_kwargs = captured_calls[1]

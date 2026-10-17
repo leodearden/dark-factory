@@ -6,7 +6,9 @@ unit/template suite (tests/scripts/test_dashboard_service_template.py, which
 also owns the helper's negative-case guard) and the fleet-wide sweep
 (tests/scripts/test_systemd_restart_backoff.py) — and duplicating it into
 both is how the two copies drift until one silently stops catching the
-defect.  Written for task 3333, lifted here by task 3408.
+defect.  Written for task 3333, lifted here by task 3408.  The same
+reasoning brings the effective ExecStart= command parse here, together with
+the discovery scope the content-discovered sweeps share.
 
 Almost every line of the docstrings below is measured systemd 255.4
 behaviour, not restatement of the code.  Preserve it: it is the reason the
@@ -135,14 +137,13 @@ def require_installed_unit(basename: str) -> pathlib.Path:
 # at that docstring rather than restating it, because prose copies drift the
 # same way code copies do and nothing keeps them in step.
 #
-# WHAT DID NOT MOVE, and why: `_exec_start_line` (file content -> the
-# ExecStart= line) stayed in test_orchestrator_service_files.py and
-# `_argv_from_exec_start_show` (systemctl struct -> argv) stayed in
-# test_know_live_installed_unit_parity.py.  Each still has exactly ONE
-# consumer, and this module's lift trigger is a second consumer, not proximity
-# or tidiness: lifting a single-consumer helper buys no de-duplication while
-# widening this module's surface.  Their negative-case guards stay with them,
-# per the same convention that kept systemctl_user_show's where it was written.
+# WHAT DID NOT MOVE, and why: `_argv_from_exec_start_show` (systemctl struct
+# -> argv) stayed in test_know_live_installed_unit_parity.py.  It still has
+# exactly ONE consumer, and this module's lift trigger is a second consumer,
+# not proximity or tidiness: lifting a single-consumer helper buys no
+# de-duplication while widening this module's surface.  Its negative-case
+# guard stays with it, per the same convention that kept systemctl_user_show's
+# where it was written.
 # ---------------------------------------------------------------------------
 
 # CLAUDE.md makes `<project_root>/dark-factory-orchestrator.yaml` the
@@ -163,10 +164,9 @@ class MalformedExecStart(ValueError):
     and must FAIL.  Which inputs land where is the contract on
     config_arg_from_exec_start below, stated there once.
 
-    Also raised by callers that own the OTHER half of a parse — locating the
-    ExecStart= text before the scan sees it (cf. test_orchestrator_service_
-    files._exec_start_line) — so a broken unit surfaces as one class whichever
-    layer notices it first.
+    Also raised by the OTHER half of a parse — locating the ExecStart= text
+    before the scan sees it (logical_exec_start below) — so a broken unit
+    surfaces as one class whichever layer notices it first.
     """
 
 
@@ -188,20 +188,20 @@ def config_arg_from_exec_start(
     how a guard waves through the drift it exists to catch.  Verified before
     the two copies were reconciled onto this contract: every committed unit
     uses the space-separated form with a real path, so tightening moved no live
-    verdict — only the failure text.  (A caller that has to LOCATE the
-    ExecStart= text first owns the third no-value case, a unit with no usable
-    ExecStart= line, and raises the same class for the same reason.)
+    verdict — only the failure text.  (logical_exec_start below, which LOCATES
+    the ExecStart= text first, owns the third no-value case, a unit with no
+    usable ExecStart= line, and raises the same class for the same reason.)
 
     *exec_start_value* may be a whole ``ExecStart=`` line, just its value, or
     the ``argv[]=`` segment of a ``systemctl show`` struct: the scan looks only
     for ``--config`` tokens and is prefix-agnostic.  That looseness is not
-    laxity — the three call sites genuinely hold those three shapes, and
-    normalising at the boundary would have meant three wrappers or three
-    copies.  *unit_name* is pure diagnostics, interpolated into both raises so
-    the caller's context (a unit path, or a ``systemctl --user show ...``
-    provenance string) survives into the failure; the messages say "command
-    line" rather than "ExecStart= line" precisely because two of those three
-    accepted shapes are not one.
+    laxity — the call sites genuinely hold different shapes (a command value,
+    a ``systemctl show`` ``argv[]=`` segment), and normalising at the boundary
+    would have meant a wrapper or a copy per shape.  *unit_name* is pure
+    diagnostics, interpolated into both raises so the caller's context (a
+    unit path, or a ``systemctl --user show ...`` provenance string) survives
+    into the failure; the messages say "command line" rather than "ExecStart=
+    line" precisely because two of those three accepted shapes are not one.
     """
     tokens = exec_start_value.split()
     for i, token in enumerate(tokens):
@@ -225,6 +225,80 @@ def config_arg_from_exec_start(
                 )
             return value
     return None
+
+
+# ---------------------------------------------------------------------------
+# The effective ExecStart= command
+#
+# Read by tests/scripts/test_orchestrator_service_files.py::
+# _exec_start_config_arg, tests/scripts/test_dashboard_service_template.py::
+# _uvicorn_int_flag and tests/scripts/test_uv_run_venv_isolation.py::
+# discover_uv_run_units.  Its home is here because those three carried three
+# disagreeing copies.  Its negative-case guard lives in
+# test_orchestrator_service_files.py's fixture-string section.
+# ---------------------------------------------------------------------------
+
+# The trailing `=` keeps ExecStartPre= out; whitespace around the `=` is legal
+# systemd.syntax.  A discovery grep must use this SAME anchor as the parser
+# (tests/scripts/test_uv_run_venv_isolation.py::discover_exec_start_files), or
+# a unit it discovers is then reported as declaring no ExecStart= at all.
+EXEC_START_PREFIX = r"ExecStart[ \t]*="
+_EXEC_START_RE = re.compile(rf"^{EXEC_START_PREFIX}")
+
+
+def logical_exec_start(text: str, unit_name: str = "<unit>") -> str:
+    """Return the effective ExecStart= COMMAND in unit *text* as one logical line.
+
+    LAST OCCURRENCE WINS, as in systemd and restart_directive below: a drop-in
+    under <unit>.d/ merges by appending, so an override lands as an empty
+    ``ExecStart=`` list RESET followed by the real command.  A first-match read
+    answers about the reset, or about the overridden command — either way a
+    command systemd never runs.
+
+    CONTINUATIONS ARE JOINED: the ExecStart= of scripts/dashboard.service.
+    template and scripts/fused-memory.service.template spans several physical
+    lines, and an unjoined read sees one fragment — passing a flag check
+    vacuously until the day that flag moves to a continuation line.
+
+    Returns the command WITHOUT the directive prefix.  Raises MalformedExecStart
+    when *text* has no ExecStart= at all, or when the effective one carries no
+    command: neither is a legitimate "this command lacks X" answer, the
+    None-vs-raise split config_arg_from_exec_start's contract states.
+    *unit_name* is diagnostics only, named in both raises.
+    """
+    lines = text.splitlines()
+    start_indices = [
+        i for i, ln in enumerate(lines) if _EXEC_START_RE.match(ln.strip())
+    ]
+    if not start_indices:
+        raise MalformedExecStart(
+            f"{unit_name} declares no ExecStart= line, so there is no command "
+            "to inspect. Treating this as an answer would silently drop the "
+            "unit out of whichever guard asked."
+        )
+
+    parts: list[str] = []
+    idx = start_indices[-1]
+    while True:
+        line = lines[idx].strip()
+        continued = line.endswith("\\")
+        if continued:
+            line = line[:-1]
+        parts.append(line.strip())
+        if not continued or idx + 1 >= len(lines):
+            break
+        idx += 1
+
+    command = _EXEC_START_RE.sub("", " ".join(p for p in parts if p), count=1).strip()
+    if not command:
+        raise MalformedExecStart(
+            f"{unit_name}'s effective ExecStart= carries no command: the last "
+            "assignment is a list RESET with nothing appended after it, so "
+            "systemd has no command to run at all. Treating this as an answer "
+            "would silently drop a unit that cannot start out of whichever "
+            "guard asked."
+        )
+    return command
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +403,64 @@ def assert_restart_backoff_effective(path: pathlib.Path) -> None:
         "starts from systemd's 100ms default and the backoff that runs is not "
         "the one the file describes."
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit discovery scope
+#
+# Shared by the two content-discovered sweeps:
+# tests/scripts/test_systemd_restart_backoff.py::
+# discover_units_declaring_a_restart_cap and
+# tests/scripts/test_uv_run_venv_isolation.py::discover_exec_start_files.
+# ---------------------------------------------------------------------------
+
+# What discovery refuses to treat as a unit, excluded by CATEGORY rather than
+# by naming individual paths.  Both categories are files that CONTAIN a unit as
+# quoted text rather than files systemd can load, and both break the sweeps
+# the same way: restart_directive and logical_exec_start above are
+# last-occurrence-wins FILE-WIDE, so on a file holding more than one embedded
+# unit they splice a directive out of one and a directive out of another and
+# report a verdict about neither.
+#
+#   **/tests/**  — parity suites embed whole units as column-0 triple-quoted
+#     fixtures.  Measured in test_systemd_restart_backoff.py's sweep:
+#     tests/scripts/test_check_fused_memory_unit_parity.py was swept as a 13th
+#     "unit" and PASSED by accident, splicing a RestartMaxDelaySec= cap out of
+#     the NEGATIVE fixture (which deliberately models the defect) together with
+#     RestartSteps= out of an unrelated POSITIVE one.  The glob form is
+#     load-bearing: a plain `:!tests/` excludes only the top-level directory and
+#     leaves fused-memory/tests/, orchestrator/tests/, scripts/tests/ and
+#     dashboard/tests/ swept — and fused-memory/tests/test_systemd_unit_config.py
+#     already parses systemd units, so one fixture there gaining a column-0
+#     directive either sweep anchors on would drag a .py file back in.
+#
+#   **/*.md — prose.  A doc may legitimately show the DEFECT a sweep guards
+#     against: a PRD or postmortem quoting the defective unit next to the fixed
+#     one, and no mechanical rule distinguishes a cautionary example from a
+#     prescription.  For test_systemd_restart_backoff.py that "before" fence is
+#     a cap with no RestartSteps=; for test_uv_run_venv_isolation.py it is a
+#     `uv run` missing run-level `--no-sync`, or carrying a stale `--frozen`
+#     beside it.  plans/afk-C1-systemd.md is the live instance — an as-built
+#     record of what was deployed, already diverged from the fleet in three
+#     visible ways (`Requires=fused-memory.service`, which the real units reject
+#     and test_orchestrator_service_files.py asserts is ABSENT; an obsolete
+#     `--config orchestrator/config.yaml`; no `--no-sync`).
+#     Editing a directive inside it would falsify the record without making any
+#     unit correct.  Excluding the category rather than the path means the next
+#     doc quoting a unit does not turn CI red and does not have to be
+#     hand-added to a constant in a test file.
+#
+# The cost is that a doc which IS a copy-source for real units must opt back in
+# explicitly: FACTORY_INIT_REFERENCE below.
+NON_UNIT_PATHSPECS = (
+    ":(exclude,glob)**/tests/**",
+    ":(exclude,glob)**/*.md",
+)
+
+# The copy-source new projects' supervised units are minted from, and the only
+# markdown file each sweep opts back in.  Each consumer guards it
+# UNCONDITIONALLY, i.e. strictly more strongly than its sweep would.
+FACTORY_INIT_REFERENCE = "skills/factory-init/references/supervised-unit.md"
 
 
 # ---------------------------------------------------------------------------

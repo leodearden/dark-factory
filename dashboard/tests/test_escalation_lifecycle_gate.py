@@ -723,6 +723,7 @@ class TestFrontendPayloadContract:
         workflow = entry['workflow']
         assert {
             'tier_weekly', 'action_mix', 'churn_daily', 'esc_per_done_daily', 'flow_daily',
+            'done_counts_read',
         } <= set(workflow)
         assert workflow['esc_per_done_daily']
         for row in workflow['esc_per_done_daily']:

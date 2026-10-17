@@ -1,21 +1,28 @@
-"""AST scanner for wildcard-tool-deny call sites that leave MCP reachable.
+"""AST scanner for registry-filter call sites that leave MCP reachable.
 
 Why this exists
 ---------------
-``shared/src/shared/cli_invoke.py::build_claude_argv`` does NOT forward a
-``disallowed_tools=['*']`` wildcard verbatim when an ``output_schema`` is also
-present.  The schema is delivered through a synthetic ``StructuredOutput``
-tool that a ``'*'`` deny would block, failing every structured-output call, so
-the builder emits ``--tools ''`` instead.
+Two call shapes reach the CLI through a built-in tool REGISTRY filter
+(``--tools``), and a registry filter does **not** filter MCP:
 
-That registry filter removes built-in and deferred tools, but it does **not**
-filter MCP.  So at a call that reads as "deny every tool", MCP tools are still
-reachable — and the CLI
+* A ``disallowed_tools=['*']`` wildcard with an ``output_schema``.
+  ``shared/src/shared/cli_invoke.py::build_claude_argv`` does NOT forward the
+  wildcard verbatim then.  The schema is delivered through a synthetic
+  ``StructuredOutput`` tool that a ``'*'`` deny would block, failing every
+  structured-output call, so the builder emits ``--tools ''`` instead.  At a
+  call that reads as "deny every tool", MCP tools are still reachable.
+* An ``available_tools`` argument, with or without a schema.  It emits
+  ``--tools <list>``, which names the built-in tools that exist and says
+  nothing about MCP (task 4344).
+
+In both cases MCP tools stay reachable — and the CLI
 ambient-merges whatever ``.mcp.json`` sits at ``cwd``.  This repo's root holds a
-live one (servers ``escalation``, ``fused-memory``), and every one of these
-callers runs at ``permission_mode='bypassPermissions'``, so the result is
-unreviewed MCP **write** access: ``halt_scheduler`` and ``delete_memory`` are
-in the blast radius.
+live one (servers ``escalation``, ``fused-memory``), and the wildcard callers
+run at ``permission_mode='bypassPermissions'``, so the result is unreviewed MCP
+**write** access: ``halt_scheduler`` and ``delete_memory`` are in the blast
+radius.  A registry-filter caller's permission mode is no substitute for
+closing MCP either: the mode can change at the call, and this gate reads only
+what closes the hole.
 
 A caller closes the hole in one of exactly two ways, and this scanner
 recognises both:
@@ -50,14 +57,17 @@ Design
   anti-vacuity test nothing to measure: this tree is already green, so the
   ratchet passes trivially and a detector that silently stopped detecting would
   look identical.
-* **What must be literal, and why.**  A call is a site only when its
+* **What must be literal, and why.**  A wildcard site counts only when its
   ``disallowed_tools`` is a display holding a literal ``'*'``: a ``**kwargs``
   splat or a ``Name``-valued deny-list is silence, never a finding, because a
   false RED in a whole-tree gate blocks every merge until someone blesses a
   non-defect, which trains reviewers to bless rows unread and destroys the
   gate's value.  An ``output_schema`` need only be passed and not literally
   falsy — real callers pass it by name, so demanding a literal would blind the
-  scanner.  A PROTECTION, by contrast, counts only when spelled literally at
+  scanner.  An ``available_tools`` argument need only be passed and not the
+  literal ``None``, for the same reason: real callers pass it by name, and
+  EVERY non-None value emits ``--tools`` (``[]`` emits ``--tools ''``), so no
+  non-None spelling can be a false RED.  A PROTECTION, by contrast, counts only when spelled literally at
   the call: an unresolvable argument must never be a blessing, and a name the
   scanner cannot see through may hold ``{}`` at runtime — the very footgun
   being guarded.
@@ -104,8 +114,9 @@ EXEMPT_NEUTRAL_CWD = 'neutral_cwd'
 NOT_EXEMPT = ''
 
 _VIOLATION_MESSAGE = (
-    "wildcard deny + output_schema becomes --tools '', which does not filter MCP, so MCP "
-    'tools stay reachable and the ambient .mcp.json at cwd is merged'
+    "a registry filter (available_tools, or a wildcard deny + output_schema, which "
+    "becomes --tools '') does not filter MCP, so MCP tools stay reachable and the "
+    'ambient .mcp.json at cwd is merged'
 )
 _STRICT_MCP_MESSAGE = (
     'MCP closed explicitly: a truthy mcp_config with strict_mcp_config=True '
@@ -118,7 +129,9 @@ _NEUTRAL_CWD_MESSAGE = (
 
 
 class WildcardMcpScopingSite(NamedTuple):
-    """One call that hits the wildcard-deny + ``output_schema`` substitution.
+    """One call that reaches the CLI through a registry filter that does not
+    filter MCP: the wildcard-deny + ``output_schema`` substitution, or an
+    ``available_tools`` argument.
 
     Reported whether or not it is protected: ``exemption`` says how it is, and
     is :data:`NOT_EXEMPT` when it is not.  Use :func:`is_violation` to ask.
@@ -166,6 +179,18 @@ def _denies_everything(node: ast.expr | None) -> bool:
         isinstance(elt, ast.Constant) and elt.value == '*'
         for elt in node.elts
     )
+
+
+def _sets_registry_filter(node: ast.expr | None) -> bool:
+    """True when an ``available_tools`` argument is passed and is not the
+    literal ``None``.
+
+    Any other value counts — a ``Name``, a call, even an empty display, since
+    ``[]`` still emits ``--tools ''``.  Every non-None value emits ``--tools``.
+    """
+    if node is None:
+        return False
+    return not (isinstance(node, ast.Constant) and node.value is None)
 
 
 def _is_falsy_literal(node: ast.expr | None) -> bool:
@@ -238,13 +263,15 @@ def find_wildcard_mcp_scoping_sites(
     tree: ast.Module,
     filename: str,
 ) -> list[WildcardMcpScopingSite]:
-    """Report every wildcard-deny + ``output_schema`` call in *tree*.
+    """Report every call in *tree* that reaches the CLI through a registry
+    filter that does not filter MCP.
 
-    A call is a site when ALL THREE hold, in order:
+    A call is a site when its callee's bare name is in :data:`TARGET_CALLEES`
+    AND either trigger holds:
 
-    1. the callee's bare name is in :data:`TARGET_CALLEES`;
-    2. ``disallowed_tools`` is a list/tuple display containing ``'*'``;
-    3. ``output_schema`` is passed and is not a falsy literal.
+    * WILDCARD — ``disallowed_tools`` is a list/tuple display containing
+      ``'*'`` AND ``output_schema`` is passed and is not a falsy literal; or
+    * REGISTRY — ``available_tools`` is passed and is not the literal ``None``.
 
     Anything else contributes nothing — not a compliant site, nothing.
 
@@ -278,9 +305,10 @@ def find_wildcard_mcp_scoping_sites(
         callee = _callee_name(node)
         if callee not in TARGET_CALLEES:
             continue
-        if not _denies_everything(_keyword(node, 'disallowed_tools')):
-            continue
-        if _is_falsy_literal(_keyword(node, 'output_schema')):
+        wildcard = _denies_everything(
+            _keyword(node, 'disallowed_tools')
+        ) and not _is_falsy_literal(_keyword(node, 'output_schema'))
+        if not (wildcard or _sets_registry_filter(_keyword(node, 'available_tools'))):
             continue
 
         pmap = parent_map()

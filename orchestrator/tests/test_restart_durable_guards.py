@@ -14,12 +14,10 @@ files on disk.
 Covers:
   step-7: the steward's capped set and its three per-escalation counters.
   step-9: the merge worker's coalesce one-strike registry.
-  step-11: the offline lane's red-path state (open fix task, advance count,
-           promoted blocker) — one coupled subject keyed by one fingerprint.
+  task-6861: the offline lane's episode record — every red-path decision
+             for a command in one record, read by whichever worker runs next.
   step-13: the scheduler's resurrection guard, which decides whether a
            re-pended task carries an age bonus it did not earn.
-  step-17: the offline lane's three sidecars diverging from each other —
-           one coupled subject, three files, no joint atomicity.
   step-19: the steward's four guards being scoped to the TASK, not to the
            process, so its two enumeration sites keep reading only its own
            marks.
@@ -31,16 +29,23 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import shared.safe_io as _safe_io
-from _orch_helpers import make_placeholder_future
+from _lane_episode_fakes import Clock, FakeLedgerClient
+from _orch_helpers import make_placeholder_future, pydantic_spec
 from escalation.models import Escalation
 
 from orchestrator import guard_state
+from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.merge_types import QueuedBranch
+from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_episode_state import (
+    EPISODES_FILE,
+    CommandRecord,
+    EpisodeStore,
+)
 
 # A round, arbitrary instant.  Every TTL assertion is relative to it, so no
 # test here depends on the wall clock.
@@ -462,308 +467,180 @@ class TestCoalesceDerailSurvivesRedeploy:
 
 
 # ---------------------------------------------------------------------------
-# step-11 — the offline lane's red-path state
+# task-6861 — the offline lane's episode record
 # ---------------------------------------------------------------------------
 
-_CONFIRMED = ['t::a', 't::b']
-_WORKTREE = Path('/tmp/_offline-deep')
+_LANE_COMMAND = 'integration'
+_LANE_NODE = 'tests/test_a.py::test_one'
+_LANE_HEAD = 'a1' * 20
+_LANE_PASS_BOUND_SECS = 30.0
+
+# A lane command red on one test every run, in pytest's own summary form.
+_RED_SCRIPT = (
+    f'echo "FAILED {_LANE_NODE} - AssertionError: still red"\n'
+    'echo "1 failed in 0.01s"\n'
+    'exit 1\n'
+)
 
 
-def _fingerprint() -> str:
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-    return compute_failing_test_set_fingerprint(_CONFIRMED)
+class _ProcessDied(BaseException):
+    """The orchestrator process ends here: ``OfflineLaneWorker.run`` lets anything but an ``Exception`` through."""
 
 
-def _offline_config(tmp_path: Path, **git_overrides):
-    from _orch_helpers import pydantic_spec
-
-    from orchestrator.config import GitConfig, OrchestratorConfig
-
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.project_root = tmp_path
-    config.git = GitConfig(**git_overrides)
-    return config
+class _Stopped(BaseException):
+    """The process is stopped at its next look at main, after the pass it was woken for."""
 
 
-class _OfflineLane(NamedTuple):
-    """One worker and the collaborator mocks its red path is measured through.
+class _TaskStore(FakeLedgerClient):
+    """The task store, which outlives every process; it can end its caller between submit and commit."""
 
-    They travel together because the worker declares them as optional
-    Protocols, so reaching back through ``worker.task_client`` would be a
-    read against ``... | None``.
+    die_at_next_commit = False
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        if self.die_at_next_commit:
+            self.die_at_next_commit = False
+            raise _ProcessDied
+        await super().commit_planning(task_ids)
+
+
+class _LaneHost:
+    """One project root, its task store and its clock; each :meth:`process` is a redeploy's fresh worker."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.project_root = tmp_path
+        self.worktree = tmp_path / 'wt'
+        self.worktree.mkdir()
+        (self.worktree / 'red.sh').write_text(_RED_SCRIPT)
+        self.store = _TaskStore([])
+        self.clock = Clock()
+
+    def process(self) -> _LaneProcess:
+        return _LaneProcess(self)
+
+    def record(self) -> CommandRecord:
+        return EpisodeStore(self.project_root, clock=self.clock).load(_LANE_COMMAND)
+
+
+class _LaneProcess:
+    """A worker with empty memory on the host's project root, running the red command."""
+
+    def __init__(self, host: _LaneHost) -> None:
+        self._host = host
+        self._git_ops = MagicMock()
+        self._git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=host.worktree)
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.project_root = host.project_root
+        config.git = GitConfig(
+            offline_lane_legacy_numeric_enabled=False,
+            offline_lane_commands=[LaneCommand(name=_LANE_COMMAND, command='sh red.sh')],
+            offline_lane_poll_interval_secs=0.01,
+        )
+        self.worker = OfflineLaneWorker(
+            self._git_ops,
+            config,
+            lock_path=host.project_root / 'offline_lane.lock',
+            task_client=host.store,
+            now=host.clock,
+        )
+
+    async def red_pass(self, *, minutes: float = 30) -> None:
+        """Wake the worker *minutes* after the last pass and let ``run()`` make one pass, then stop it."""
+        self._host.clock.advance(minutes=minutes)
+        self._git_ops.get_main_sha = AsyncMock(side_effect=[_LANE_HEAD, _Stopped()])
+        await self.worker.on_post_merge('task-1', _LANE_HEAD, _LANE_HEAD)
+        with pytest.raises(_Stopped):
+            await asyncio.wait_for(self.worker.run(), timeout=_LANE_PASS_BOUND_SECS)
+
+
+@pytest.mark.asyncio
+class TestOfflineLaneEpisodeRecordSurvivesRedeploy:
+    """Every red-path decision lives in one record per command, in
+    ``data/orchestrator/guards/offline_lane_episodes.json``: the held
+    episodes, the covering task's binding and how far its filing got.  A
+    redeploy's fresh worker reads that file, so it neither files a second
+    task for a break already covered nor abandons a filing it was cut off
+    in the middle of (red-path PRD §6 scenarios 19 and 21).
     """
 
-    worker: Any
-    task_client: AsyncMock
-    escalation_queue: MagicMock
+    async def test_a_redeployed_worker_files_no_second_task_for_a_covered_break(self, tmp_path: Path):
+        host = _LaneHost(tmp_path)
+        first = host.process()
+        await first.red_pass()
+        await first.red_pass()
+        assert len(host.store.submitted) == 1
 
-    async def advance(self, head: str) -> None:
-        await self.worker._handle_red_run(_WORKTREE, head)
+        redeployed = host.process()
+        await redeployed.red_pass()
+        await redeployed.red_pass()
 
-    def blockers(self) -> list:
-        return [
-            call.args[0] for call in self.escalation_queue.submit.call_args_list
-            if call.args[0].level == 2
-        ]
+        assert len(host.store.submitted) == 1
+        assert host.record().episodes[_LANE_NODE].covering_task_id == '7001'
 
+    async def test_a_filing_cut_off_before_commit_planning_is_committed_not_refiled(self, tmp_path: Path):
+        """Scenario 19: the submit landed, the process died before
+        ``commit_planning``; the next process's next pass commits that task."""
+        host = _LaneHost(tmp_path)
+        first = host.process()
+        await first.red_pass()
+        host.store.die_at_next_commit = True
+        with pytest.raises(_ProcessDied):
+            await first.red_pass()
+        stranded = host.record().episodes[_LANE_NODE]
 
-def _offline_lane(
-    tmp_path: Path, config, *, fix_task_id: str = 'fix-1', status: str = 'in-progress',
-) -> _OfflineLane:
-    """A worker rooted at *config.project_root*, with its red-path collaborators.
+        await host.process().red_pass()
 
-    ``escalation_queue.get_by_task`` returns nothing, so the pending-escalation
-    dedup can never be what suppresses a second blocker — only the worker's own
-    idempotency guard can, which is what these tests are about.
-    """
-    from orchestrator.offline_lane import OfflineLaneWorker
+        assert (stranded.covering_task_id, stranded.planning_committed, stranded.filing_due) == ('7001', False, True)
+        assert host.store.tasks['7001']['status'] == 'pending'
+        assert len(host.store.submitted) == 1
+        episode = host.record().episodes[_LANE_NODE]
+        assert (episode.planning_committed, episode.filing_due) == (True, False)
 
-    git_ops = MagicMock()
-    git_ops.get_main_sha = AsyncMock(return_value='headsha')
-    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=_WORKTREE)
+    async def test_an_unreadable_record_costs_at_most_one_duplicate_and_says_so(
+        self, tmp_path: Path, caplog,
+    ):
+        """Scenario 21: the record is lost while its task is open."""
+        host = _LaneHost(tmp_path)
+        first = host.process()
+        await first.red_pass()
+        await first.red_pass()
+        episodes_file = guard_state.guard_path(tmp_path, EPISODES_FILE)
+        assert episodes_file is not None
+        episodes_file.write_text('{ not json', encoding='utf-8')
 
-    task_client = AsyncMock()
-    task_client.submit_fix_task = AsyncMock(return_value=fix_task_id)
-    task_client.get_status = AsyncMock(return_value=status)
+        with caplog.at_level(logging.WARNING):
+            redeployed = host.process()
+        for _ in range(4):
+            await redeployed.red_pass()
 
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-offline-1'
+        assert len(host.store.submitted) == 2
+        assert any(
+            record.levelno >= logging.WARNING and EPISODES_FILE in record.getMessage()
+            for record in caplog.records
+        )
 
-    worker = OfflineLaneWorker(
-        git_ops,
-        config,
-        lock_path=tmp_path / 'offline_lane.lock',
-        confirmation_runner=AsyncMock(return_value=list(_CONFIRMED)),
-        task_client=task_client,
-        escalation_queue=escalation_queue,
+    @pytest.mark.parametrize(
+        ('idle', 'submitted'),
+        [(timedelta(days=14) - timedelta(minutes=1), 1), (timedelta(days=14), 2)],
+        ids=['kept', 'expired'],
     )
-    worker._last_green_head = 'GREEN'
-    return _OfflineLane(worker, task_client, escalation_queue)
-
-
-@pytest.mark.asyncio
-class TestOfflineLaneRedStateSurvivesRedeploy:
-    """The three red-path attributes are ONE subject keyed by one fingerprint.
-
-    Persisting the counts without ``open_fix_tasks`` would be inert, not
-    merely incomplete: ``_handle_red_run`` branches on it, so an empty map
-    routes a restarted worker into ``_file_new_fix_task``, which files a
-    DUPLICATE task for a break already tracked and resets the advance count
-    to 1 before it can ever reach the promotion threshold.
-    """
-
-    async def test_a_restart_does_not_file_a_second_task_for_the_same_break(
-        self, tmp_path: Path, guard_clock,
+    async def test_the_record_expires_fourteen_days_after_its_last_write(
+        self, tmp_path: Path, idle: timedelta, submitted: int,
     ):
-        config = _offline_config(tmp_path)
-        first = _offline_lane(tmp_path, config)
-        await first.advance('HEAD1')
-        first.task_client.submit_fix_task.assert_awaited_once()
+        """Kept, the binding still covers the test, so two spaced reds file
+        nothing; expired, the record is gone and they file a fresh task that
+        names no prior one."""
+        host = _LaneHost(tmp_path)
+        first = host.process()
+        await first.red_pass()
+        await first.red_pass()
 
-        redeployed = _offline_lane(tmp_path, config)
-        await redeployed.advance('HEAD2')
+        host.clock.advance(seconds=idle.total_seconds())
+        redeployed = host.process()
+        await redeployed.red_pass(minutes=0)
+        await redeployed.red_pass()
 
-        redeployed.task_client.submit_fix_task.assert_not_awaited()
-        redeployed.task_client.append_suspect_range.assert_awaited_once_with(
-            'fix-1', 'GREEN..HEAD2',
-        )
-
-    async def test_the_advance_count_accumulates_across_restarts(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """Three advances, three different workers: on main the count never
-        reaches the threshold if a redeploy lands between advances."""
-        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=3)
-
-        await _offline_lane(tmp_path, config).advance('HEAD1')
-        second = _offline_lane(tmp_path, config)
-        await second.advance('HEAD2')
-        assert second.blockers() == [], 'two advances must not promote'
-
-        third = _offline_lane(tmp_path, config)
-        await third.advance('HEAD3')
-
-        assert len(third.blockers()) == 1
-
-    async def test_a_promoted_blocker_is_not_re_filed_after_a_restart(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """The symptom an operator cannot tell from a genuine recurrence."""
-        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=2)
-
-        first = _offline_lane(tmp_path, config)
-        await first.advance('HEAD1')
-        await first.advance('HEAD2')
-        assert len(first.blockers()) == 1
-
-        redeployed = _offline_lane(tmp_path, config)
-        await redeployed.advance('HEAD3')
-
-        assert redeployed.blockers() == []
-
-    async def test_the_done_clear_arm_is_durable(self, tmp_path: Path, guard_clock):
-        """A landed fix task must free the fingerprint on disk, so a genuine
-        LATER recurrence files a FRESH task rather than deduping against
-        state that no longer describes anything."""
-        config = _offline_config(tmp_path)
-        await _offline_lane(tmp_path, config).advance('HEAD1')
-        await _offline_lane(tmp_path, config, status='done').advance('HEAD2')
-
-        later = _offline_lane(tmp_path, config, fix_task_id='fix-2')
-        await later.advance('HEAD3')
-        later.task_client.submit_fix_task.assert_awaited_once()
-
-    async def test_an_empty_task_id_records_nothing_on_disk_either(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """The task-2016 amendment, across the persistence change: a bogus
-        empty id must not become a key a later genuine recurrence dedups
-        against."""
-        config = _offline_config(tmp_path)
-        await _offline_lane(tmp_path, config, fix_task_id='').advance('HEAD1')
-
-        redeployed = _offline_lane(tmp_path, config).worker
-        assert _fingerprint() not in redeployed.open_fix_tasks
-        assert _fingerprint() not in redeployed._red_advance_counts
-
-    async def test_the_red_state_expires(self, tmp_path: Path, guard_clock):
-        """Past the TTL a fresh worker files a new task rather than deduping
-        against a fix task that has long since stopped being relevant."""
-        config = _offline_config(tmp_path)
-        await _offline_lane(tmp_path, config).advance('HEAD1')
-
-        guard_clock[0] = _T0 + timedelta(days=15)
-
-        redeployed = _offline_lane(tmp_path, config, fix_task_id='fix-2')
-        await redeployed.advance('HEAD2')
-        redeployed.task_client.submit_fix_task.assert_awaited_once()
-
-
-def _guard_file(config, filename: str) -> Path:
-    """Where one of the offline lane's three sidecars lives.
-
-    Resolved through the production helper rather than re-spelling the
-    layout, so these tests keep pointing at the real files if it moves.
-    """
-    path = guard_state.guard_path(config.project_root, filename)
-    assert path is not None, 'the fixture always supplies a project_root'
-    return path
-
-
-_OPEN_FIX_TASKS_FILE = 'offline_lane_open_fix_tasks.json'
-_ADVANCE_COUNTS_FILE = 'offline_lane_red_advance_counts.json'
-_PROMOTED_BLOCKERS_FILE = 'offline_lane_promoted_blockers.json'
-
-
-@pytest.mark.asyncio
-class TestOfflineLaneToleratesDivergentGuardFiles:
-    """One coupled subject, three files, no joint atomicity.
-
-    ``open_fix_tasks`` / ``_red_advance_counts`` / ``_promoted_blockers`` are
-    documented as one subject keyed by one fingerprint, but they persist as
-    three independent files written one after another, each of which can
-    fail-open to ``{}`` on its own.  So a fingerprint present in one and
-    absent from another is reachable — a partial write, a single corrupt
-    file, an individually-dropped schema-drifted row — while the consumers
-    still index as if the three were in lockstep.
-
-    A ``KeyError`` out of that read is not a local crash: ``run()`` catches it
-    with exponential backoff, so it would recur on every pass for up to the
-    14-day TTL, skipping the rest of ``_run_once`` (the infra sub-run) each
-    time.  A single corrupt file would have become a two-week wedge of the
-    offline lane.  These tests drive ``_handle_red_run`` DIRECTLY so the crash
-    is observed rather than swallowed by that retry arm.
-    """
-
-    async def test_a_partial_write_still_completes_the_update_branch(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """Filing writes two files in sequence; the second failing with
-        ENOSPC/EACCES is warned and swallowed, leaving the next process with
-        the fingerprint open and no count."""
-        config = _offline_config(tmp_path)
-        await _offline_lane(tmp_path, config).advance('HEAD1')
-        _guard_file(config, _ADVANCE_COUNTS_FILE).unlink()
-
-        redeployed = _offline_lane(tmp_path, config)
-        await redeployed.advance('HEAD2')
-
-        redeployed.task_client.append_suspect_range.assert_awaited_once_with(
-            'fix-1', 'GREEN..HEAD2',
-        )
-        redeployed.task_client.submit_fix_task.assert_not_awaited()
-
-    async def test_a_corrupt_counts_file_still_completes_the_update_branch(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """``load_json_or_warn(on_corrupt='warn')`` fails THAT file open to
-        ``{}`` while its two siblings load fine — the divergence is the
-        fail-open contract working, not a second bug."""
-        config = _offline_config(tmp_path)
-        await _offline_lane(tmp_path, config).advance('HEAD1')
-        _guard_file(config, _ADVANCE_COUNTS_FILE).write_text('{not json', encoding='utf-8')
-
-        redeployed = _offline_lane(tmp_path, config)
-        await redeployed.advance('HEAD2')
-
-        redeployed.task_client.append_suspect_range.assert_awaited_once_with(
-            'fix-1', 'GREEN..HEAD2',
-        )
-        redeployed.task_client.submit_fix_task.assert_not_awaited()
-
-    async def test_the_divergence_is_not_papered_over_by_filing_a_duplicate(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """The open fingerprint is still authoritative: a lost count must not
-        route the worker back into ``_file_new_fix_task``."""
-        config = _offline_config(tmp_path)
-        await _offline_lane(tmp_path, config).advance('HEAD1')
-        _guard_file(config, _ADVANCE_COUNTS_FILE).unlink()
-
-        redeployed = _offline_lane(tmp_path, config, fix_task_id='fix-2')
-        await redeployed.advance('HEAD2')
-
-        assert redeployed.worker.open_fix_tasks[_fingerprint()] == 'fix-1'
-
-    async def test_promotion_is_still_reachable_after_the_count_is_lost(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """The count restarting from zero is the designed degrade.  Never
-        advancing at all is not — that is the wedge."""
-        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=2)
-        await _offline_lane(tmp_path, config).advance('HEAD1')
-        _guard_file(config, _ADVANCE_COUNTS_FILE).unlink()
-
-        rebuilding = _offline_lane(tmp_path, config)
-        await rebuilding.advance('HEAD2')
-        assert rebuilding.blockers() == [], 'the count restarts, so this is advance 1'
-
-        reaching = _offline_lane(tmp_path, config)
-        await reaching.advance('HEAD3')
-
-        assert len(reaching.blockers()) == 1
-
-    async def test_a_lost_promotion_record_re_files_once_then_settles(
-        self, tmp_path: Path, guard_clock,
-    ):
-        """The third file diverging is the same shape: one duplicate blocker
-        is the cost of the lost record, and the next worker is quiet again."""
-        config = _offline_config(tmp_path, offline_lane_red_advances_before_blocker=2)
-        first = _offline_lane(tmp_path, config)
-        await first.advance('HEAD1')
-        await first.advance('HEAD2')
-        assert len(first.blockers()) == 1
-        _guard_file(config, _PROMOTED_BLOCKERS_FILE).unlink()
-
-        re_filing = _offline_lane(tmp_path, config)
-        await re_filing.advance('HEAD3')
-        assert len(re_filing.blockers()) == 1
-
-        settled = _offline_lane(tmp_path, config)
-        await settled.advance('HEAD4')
-
-        assert settled.blockers() == []
+        assert len(host.store.submitted) == submitted
+        assert host.store.submitted[-1]['metadata']['x_offline_lane']['prior_task_ids'] == []
 
 
 # ---------------------------------------------------------------------------
@@ -788,15 +665,29 @@ def _scheduler():
     return scheduler
 
 
-def _task(task_id: str, status: str = 'pending') -> dict:
+_FILED = '2026-10-01T00:00:00+00:00'
+_REOPENED = '2026-10-05T00:00:00+00:00'
+
+
+def _task(task_id: str, status: str = 'pending', pending_since: str | None = None) -> dict:
+    metadata: dict = {'files': [f'mod{task_id}']}
+    if pending_since is not None:
+        metadata['pending_since'] = pending_since
     return {
         'id': task_id,
         'title': f'Task {task_id}',
         'status': status,
         'priority': 'medium',
         'dependencies': [],
-        'metadata': {'files': [f'mod{task_id}']},
+        'metadata': metadata,
     }
+
+
+async def _tick(scheduler, tasks: list[dict]) -> str | None:
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+    scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    assignment = await scheduler.acquire_next()
+    return assignment.task_id if assignment is not None else None
 
 
 def _spy_on_guard_writes(monkeypatch) -> list:
@@ -821,11 +712,11 @@ class TestResurrectionAnchorSurvivesRedeploy:
         queue over genuinely-old pending tasks once per redeploy, and its
         victims are the starvation watchdog's own."""
         first = _scheduler()
-        first._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
-        first._update_age_anchors([_task('100')], _MAX_ID)
+        first._update_age_anchors([_task('100', pending_since=_FILED)], _MAX_ID)
+        first._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100')], _MAX_ID)
+        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
 
         assert redeployed._compute_age('100', _MAX_ID) == 0
 
@@ -848,24 +739,26 @@ class TestResurrectionAnchorSurvivesRedeploy:
         assert redeployed._compute_age('epic-a', _MAX_ID) == 0
         assert redeployed._compute_age('epic-b', _MAX_ID) == 0
 
-    def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
+    @pytest.mark.asyncio
+    async def test_a_cold_start_writes_once_and_a_steady_state_tick_not_at_all(
         self, guard_clock, monkeypatch,
     ):
         """The two halves of one property, measured from the same spy.
 
-        The COLD START is the first ``acquire_next`` tick after every fleet
-        redeploy, inline on the event loop: it observes every active
-        non-pending task at once — 373 in the live store today, 345 of them
-        ``deferred``, a status that accumulates monotonically — so a
-        per-element write would make that tick pay N writes of an N-entry
-        file.  The STEADY STATE re-observes the same ids every ~15s, which is
+        The COLD START is a first tick that finds N stamps changed while the
+        process was down, inline on the event loop.  Its N resets are
+        batched, so it pays one write rather than N writes of an N-entry file.
+        The STEADY STATE re-observes the same ids every ~15s, which is
         the difference between a quiet guard and a file rewritten ~5,760 times
         a day.  Spying from BEFORE the first call is what makes the cold start
         assertable at all.
         """
-        cold_start = [
-            _task(str(tid), status='deferred') for tid in range(1000, 1200)
-        ]
+        ids = range(1000, 1200)
+        first = _scheduler()
+        await _tick(first, [_task(str(tid), 'in-progress', _FILED) for tid in ids])
+        await _tick(first, [_task('99', 'in-progress')])
+
+        cold_start = [_task(str(tid), pending_since=_REOPENED) for tid in ids]
         scheduler = _scheduler()
 
         writes = _spy_on_guard_writes(monkeypatch)
@@ -881,31 +774,50 @@ class TestResurrectionAnchorSurvivesRedeploy:
 
         assert writes == [], 'a re-observation of an unchanged observation must be silent'
 
-    def test_the_guard_expires(self, guard_clock):
-        """The mark cannot outlive the task it was recorded for."""
+    @pytest.mark.asyncio
+    async def test_the_guard_expires(self, guard_clock):
+        """A record that no write refreshed within the TTL expires, and the
+        restart re-anchors the task to its own id.  That is the trade-off
+        which bounds the file, and it takes a TTL with no age-guard write."""
         first = _scheduler()
-        first._update_age_anchors([_task('100', status='cancelled')], _MAX_ID)
+        await _tick(first, [
+            _task('100', 'in-progress', _FILED), _task('4000', 'in-progress'),
+        ])
+        await _tick(first, [_task('100', pending_since=_REOPENED), _task('4000', 'in-progress')])
 
         guard_clock[0] = _T0 + timedelta(days=31)
 
         redeployed = _scheduler()
-        redeployed._update_age_anchors([_task('100')], _MAX_ID)
+        redeployed._update_age_anchors([_task('100', pending_since=_REOPENED)], _MAX_ID)
         assert redeployed._compute_age('100', _MAX_ID) == _MAX_ID - 100
+
+    @pytest.mark.asyncio
+    async def test_any_write_within_the_ttl_keeps_an_in_fetch_record_alive(self, guard_clock):
+        """'1000''s departure on day 20 re-records '100''s reset, so on day 40
+        the restart restores it: '900''s 150 beats the 50 accrued since."""
+        first = _scheduler()
+        await _tick(first, [_task('100', 'in-progress', _FILED), _task('1000', 'in-progress')])
+        await _tick(first, [_task('100', 'in-progress', _REOPENED), _task('1000', 'in-progress')])
+        guard_clock[0] = _T0 + timedelta(days=20)
+        await _tick(first, [_task('100', 'in-progress', _REOPENED)])
+        guard_clock[0] = _T0 + timedelta(days=40)
+
+        tasks = [_task('100', pending_since=_REOPENED), _task('900'), _task('1050', 'in-progress')]
+
+        assert await _tick(_scheduler(), tasks) == '900'
 
 
 @pytest.mark.asyncio
 class TestStaleSweepRecordingSurvivesRedeploy:
     """``_phase_stale_sweep`` is the other write site and must be covered too."""
 
-    async def test_a_swept_id_is_still_marked_after_a_restart(self, guard_clock):
+    async def test_a_swept_anchor_is_restored_after_a_restart(self, guard_clock):
         first = _scheduler()
         first._pending_anchor['300'] = 5
-        first.get_tasks = AsyncMock(return_value=[_task('99')])
-        first.get_statuses = AsyncMock(return_value=({}, None))
-
-        await first.acquire_next()
-        assert '300' in first._was_non_pending
+        await _tick(first, [_task('99')])
 
         redeployed = _scheduler()
         redeployed._update_age_anchors([_task('300')], _MAX_ID)
-        assert redeployed._compute_age('300', _MAX_ID) == 0
+        assert redeployed._compute_age('300', _MAX_ID) == _MAX_ID - 5, (
+            'absence from the fetch is not a cancellation (D3)'
+        )

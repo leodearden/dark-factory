@@ -30,7 +30,6 @@ LATENCY_PERCENTILES: Mapping[LlmMetricId, float] = MappingProxyType({
     LlmMetricId.EPISODE_LATENCY_P50: 0.50,
     LlmMetricId.EPISODE_LATENCY_P95: 0.95,
 })
-_USD_PER_MTOK_DIVISOR = 1_000_000
 _Ranked = TypeVar('_Ranked')
 
 
@@ -109,10 +108,7 @@ def tokens_per_episode_metric(outcomes: Sequence[EpisodeOutcome]) -> Metric | No
 def _usd(usage: LlmTokenUsage, pricing: TokenPricing | None) -> float:
     if pricing is None:
         return 0.0
-    return (
-        usage.input_tokens * pricing.usd_per_mtok_input
-        + usage.output_tokens * pricing.usd_per_mtok_output
-    ) / _USD_PER_MTOK_DIVISOR
+    return pricing.usd_for(usage.input_tokens, usage.output_tokens)
 
 
 def usd_per_episode_metric(

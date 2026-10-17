@@ -32,6 +32,12 @@ and requiring the ref is also the volume control — an unanchored detector
 would tag a large fraction of ordinary agent narration, and a tag that fires
 constantly stops being read.
 
+A claim must also be ASSERTED (task 6677). A marker inside a quotation,
+governed by a modal, inside a conditional/interrogative, present-tense
+temporal or imperative scope, or in attributive position is not a claim. See
+tests/test_completion_claim_mood.py and
+docs/completion-claim-mood-filter-2026-10/measurement.md.
+
 Verification is split from detection behind INJECTED probes (mirroring
 :func:`middleware.recon_claim_verification_guard.verify_attributed_claims`),
 so the acceptance criterion is unit-testable with no Taskmaster, no ticket DB
@@ -235,10 +241,7 @@ APPLIED_WORK_RE: re.Pattern[str] = re.compile(
 
 # Supplementary strippers: the delta vocabulary above (BOTH families), in the
 # SAME shape as the task_filter originals (each swallows the verb it governs, so
-# removing the span removes the completion evidence). The modal/filler prefixes
-# are copied from FUTURE_ASPIRATIONAL_RE deliberately — a narrower prefix here
-# would leave "the follow-up is supposed to be filed as tkt_X next week" reading
-# as an accomplished filing.
+# removing the span removes the completion evidence).
 _EXTENSION_ANY_FORM: str = _APPLIED_ANY_FORM + r'|' + _FILING_ANY_FORM
 
 _NEGATED_EXTENSION_RE: re.Pattern[str] = re.compile(
@@ -247,13 +250,32 @@ _NEGATED_EXTENSION_RE: re.Pattern[str] = re.compile(
     r'|\b(?:' + _EXTENSION_ANY_FORM + r')\s+nothing\b',
     re.IGNORECASE,
 )
-_ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
-    r'\b(?:will|going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
+
+# The gate's ONE modal vocabulary: every contracted form in either apostrophe,
+# optionally with "'ve", and the closed filler run that may separate a governor
+# from the verb it governs. task_filter.FUTURE_ASPIRATIONAL_RE keeps its own
+# narrower copy for its soft-block detectors; the gate strips with both, so
+# this wider list is the one in force here.
+_MODAL: str = (
+    r"(?:will|would|shall|should|must|may|might|can|could|cannot|"
+    r"won['’]t|shan['’]t|can['’]t|(?:would|should|must|might|could)n['’]t)"
+    r"(?:['’]ve)?"
+)
+_FILLER_RUN: str = (
+    r'(?:\s+(?:not|never|have|be|been|being|get|got|also|already|now|just|then|'
+    r'still|yet|soon|finally|eventually|first|only|fully|successfully))*'
+)
+
+# A modal or intention phrase, the filler run, then the verb it governs: "must
+# have landed", "won’t be merged", "is supposed to be filed as tkt_X next week".
+# The intention phrases are FUTURE_ASPIRATIONAL_RE's. The governed verb is one
+# word, or a two-word extension form swallowed whole ("re filed").
+_GOVERNED_VERB_RE: re.Pattern[str] = re.compile(
+    r'\b(?:going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
     r'aims?\s+to|meant\s+to|hopes?\s+to|expects?\s+to|scheduled\s+to|slated\s+to|'
-    r'supposed\s+to|needs?\s+to|to\s+be|should|would|shall)\b'
-    r'(?:\s+(?:be|been|get|soon|also|now|already|just|then|finally|'
-    r'eventually|not|yet|still)){0,3}'
-    r'\s+(?:' + _EXTENSION_ANY_FORM + r')\b',
+    r'supposed\s+to|needs?\s+to|to\s+be|' + _MODAL + r')\b'
+    + _FILLER_RUN
+    + r'\s+(?:(?:' + _EXTENSION_ANY_FORM + r')\b|[\w-]+)',
     re.IGNORECASE,
 )
 
@@ -288,7 +310,7 @@ _EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
     NEGATED_TERMINAL_RE,
     _NEGATED_EXTENSION_RE,
     FUTURE_ASPIRATIONAL_RE,
-    _ASPIRATIONAL_EXTENSION_RE,
+    _GOVERNED_VERB_RE,
 )
 
 
@@ -296,18 +318,99 @@ def _blank(match: re.Match[str]) -> str:
     return ' ' * len(match.group(0))
 
 
+# A double-quoted span is a MENTION of someone's words, not the writer's own
+# assertion. Pairing is sequential within one line, and two kinds of pair still
+# assert: a key/value literal, opened after '=' or ':' (spaces allowed, so
+# 'status: "task 3016 merged"' and JSON both count), and a pair that crosses a
+# hard clause boundary (';' or a sentence end). The second is far likelier a
+# stray quote (an inch mark, an unclosed quote) pairing with a later one, and
+# blanking it would silently drop every claim between them. An ellipsis is not
+# a boundary: the esc-unverified-claim-5471-4 quote straddles one. Pinned by
+# tests/test_completion_claim_mood.py::TestQuotationsAreMentions.
+_QUOTATION_RE: re.Pattern[str] = re.compile(
+    r'(?P<key_value_lead>[=:][ \t]*)?(?P<quotation>"[^"\n]*"|“[^”\n]*”)'
+)
+_HARD_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r';|(?<!\.)[.!?](?=\s)')
+
+
+def _blank_quotations(text: str) -> str:
+    """*text* with every quotation span blanked, offsets preserved.
+
+    Text level, not per clause: a quotation can straddle a clause boundary
+    (the '...' inside the esc-unverified-claim-5471-4 quote), leaving the
+    clause that holds the marker with no closing quote of its own.
+    """
+
+    def blank_a_mention(match: re.Match[str]) -> str:
+        asserted = (
+            match['key_value_lead'] is not None
+            or _HARD_CLAUSE_BOUNDARY_RE.search(match['quotation']) is not None
+        )
+        return match.group(0) if asserted else _blank(match)
+
+    return _QUOTATION_RE.sub(blank_a_mention, text)
+
+
+_NON_VERIDICAL_CUE_RE: re.Pattern[str] = re.compile(
+    r'(?<![-\w])(?:if|whether|unless|in\s+case)(?![-\w])',
+    re.IGNORECASE,
+)
+_TEMPORAL_CUE_RE: re.Pattern[str] = re.compile(
+    r'(?<![-\w])(?:when(?:ever)?|once|after|before|until|till|as\s+soon\s+as|the\s+day)'
+    r'(?![-\w])',
+    re.IGNORECASE,
+)
+_PRESENT_AUXILIARY_RE: re.Pattern[str] = re.compile(
+    r'\b(?:has|have|is|are)\b', re.IGNORECASE,
+)
+_IMPERATIVE_HEAD_RE: re.Pattern[str] = re.compile(
+    r'(?:^|(?<=\()|(?<=:\s)|(?<=[—–]\s))\s*'
+    r'(?:[-*•]\s+|\(?\d+[.)]\s+)?(?:please\s+)?'
+    r'(?:check|verify|confirm|ensure|make\s+sure|determine|find\s+out|ask|wait|'
+    r're-?check|double-check|look\s+up)(?![-\w])',
+    re.IGNORECASE,
+)
+
+# A mood scope opens at a cue and runs to the next binding barrier (or clause
+# end); a marker inside it is not asserted. Three cue classes: non-veridical
+# (if/whether/unless/in case) and imperative heads (check/verify/confirm...)
+# always blank; a temporal cue blanks only a PRESENT-tense scope, because
+# present tense in a temporal clause is future reference ('once #N has
+# landed') while simple past is narrative and presupposes the event ('after
+# task 5 landed'). Each row is (cue, tense gate); None means always blank.
+# Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_MOOD_SCOPES: tuple[tuple[re.Pattern[str], re.Pattern[str] | None], ...] = (
+    (_NON_VERIDICAL_CUE_RE, None),
+    (_IMPERATIVE_HEAD_RE, None),
+    (_TEMPORAL_CUE_RE, _PRESENT_AUXILIARY_RE),
+)
+
+
+def _blank_mood_scopes(clause: str) -> str:
+    """*clause* with every non-assertive mood scope blanked, offsets preserved."""
+    chars = list(clause)
+    for cue_re, tense_gate in _MOOD_SCOPES:
+        for cue in cue_re.finditer(clause):
+            barrier = _BINDING_BARRIER_RE.search(clause, cue.end())
+            scope_end = barrier.start() if barrier else len(clause)
+            if tense_gate is None or tense_gate.search(clause, cue.end(), scope_end):
+                chars[cue.start():scope_end] = ' ' * (scope_end - cue.start())
+    return ''.join(chars)
+
+
 def _strip_exemptions(clause: str) -> str:
-    """Blank out negated-terminal and future/aspirational spans in *clause*.
+    """Blank out every span of *clause* that does not assert completion.
 
     Every stripper regex deliberately swallows the completion verb it governs,
     so blanking its span removes the completion EVIDENCE — that is what makes
-    "has not yet landed" and "will land" produce no claim. Each span becomes
-    the same number of spaces, so an offset in the result is an offset in
+    "has not yet landed", "will land" and "must have landed" produce no claim.
+    Mood scopes (:func:`_blank_mood_scopes`) go last. Each span becomes the
+    same number of spaces, so an offset in the result is an offset in
     *clause*, which is what lets a marker found here bind to a ref found there.
     """
     for stripper in _EXEMPTION_STRIPPERS:
         clause = stripper.sub(_blank, clause)
-    return clause
+    return _blank_mood_scopes(clause)
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +473,7 @@ def extract_completion_claims(
 
     claims: list[CompletionClaim] = []
     seen: set[tuple[str, str, str, str | None]] = set()
+    assertive = _blank_quotations(text)
 
     for clause, offset in _iter_clauses(text):
         mentions = _ref_mentions(
@@ -380,7 +484,8 @@ def extract_completion_claims(
         if not mentions:
             continue
         span = (offset, offset + len(clause))
-        for marker in _marker_spans(_strip_exemptions(clause)):
+        assertive_clause = assertive[span[0]:span[1]]
+        for marker in _marker_spans(_strip_exemptions(assertive_clause)):
             bound = _bind_marker(clause, marker, mentions, known_project_ids)
             if bound is None:
                 continue
@@ -506,6 +611,13 @@ _TASK_COMPLEMENT_GAP_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# A determiner (plus at most one adverb) directly before a marker makes it an
+# attributive participle modifying the noun after it ('the shipped examples').
+_ATTRIBUTIVE_LEAD_RE: re.Pattern[str] = re.compile(
+    r'\b(?:the|a|an|its|their|our|your|his|her|my)\s+(?:(?:\w+ly|already|just|now)\s+)?$',
+    re.IGNORECASE,
+)
+
 
 def _bind_marker(
     clause: str,
@@ -519,12 +631,15 @@ def _bind_marker(
     existence ('task N was merged as commit X' is a claim about X): the first
     ref after the marker, when :func:`_binds_forward` admits the gap. Otherwise
     BACKWARD: the nearest ref before the marker, with no barrier between them.
+    An attributive marker ('the merged commit X') binds forward only.
     """
     following = next((m for m in mentions if m.start >= marker.end), None)
     if following is not None and _binds_forward(
         clause[marker.end:following.start], following, known_project_ids
     ):
         return following
+    if _ATTRIBUTIVE_LEAD_RE.search(clause, 0, marker.start):
+        return None
     preceding = next((m for m in reversed(mentions) if m.end <= marker.start), None)
     if preceding is not None and not _BINDING_BARRIER_RE.search(
         clause[preceding.end:marker.start]

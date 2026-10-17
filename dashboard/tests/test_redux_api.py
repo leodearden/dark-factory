@@ -17,9 +17,8 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
-from dashboard.data.performance import PerformanceCards
+from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
-from dashboard.data.write_journal import MemoryOps
 
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
@@ -228,11 +227,13 @@ def _shape_memory(status, queue=None, **kwargs):
 
 
 def test_shape_memory_offline_keeps_required_keys():
+    """fused-memory unreachable means its stores went unmeasured: neither
+    connected nor disconnected is honest, so ``connected`` is null."""
     body = _shape_memory(_OFFLINE_STATUS)
     ms = body['MEMORY_STATUS']
-    assert ms['graphiti']['connected'] is False
-    assert ms['mem0']['connected'] is False
-    assert ms['taskmaster']['connected'] is False
+    assert ms['graphiti']['connected'] is None
+    assert ms['mem0']['connected'] is None
+    assert 'taskmaster' not in ms, 'get_status serves no taskmaster key; any value is invented'
     assert ms['queue']['stats']['value']['pending'] == 0
     assert ms['offline'] is True
 
@@ -330,12 +331,31 @@ def test_shape_memory_online_passes_through_plus_defaults():
         _queue_datum(pending=4, oldest=12.5),
     )
     ms = body['MEMORY_STATUS']
-    assert ms['graphiti']['connected'] is True
     assert ms['graphiti']['node_count'] == 100
-    assert ms['mem0']['connected'] is True
     assert ms['queue']['stats']['value']['pending'] == 4
     assert ms['queue']['stats']['value']['oldest_pending_age_seconds'] == 12.5
     assert ms['projects']['dark_factory']['graphiti_nodes'] == 100
+
+
+def test_shape_memory_online_serves_connectivity_as_get_status_measured_it():
+    body = _shape_memory({
+        'graphiti': {'connected': True},
+        'mem0': {'connected': False, 'error': 'qdrant down'},
+    })
+    ms = body['MEMORY_STATUS']
+    assert ms['graphiti']['connected'] is True
+    assert ms['mem0']['connected'] is False
+    assert ms['mem0']['error'] == 'qdrant down'
+
+
+def test_shape_memory_online_never_invents_connectivity():
+    """An absent flag is unmeasured (null), never True; and get_status serves
+    no taskmaster key, so none is served."""
+    body = _shape_memory({'graphiti': {}, 'mem0': {}})
+    ms = body['MEMORY_STATUS']
+    assert ms['graphiti']['connected'] is None
+    assert ms['mem0']['connected'] is None
+    assert 'taskmaster' not in ms
 
 
 # ---------------------------------------------------------------------------
@@ -585,71 +605,6 @@ def test_shape_wal_status_no_now_brackets_real_clock():
 
 
 # ---------------------------------------------------------------------------
-# shape_memory_graphs
-# ---------------------------------------------------------------------------
-
-
-def _memory_ops() -> MemoryOps:
-    return MemoryOps(
-        labels=('11:00', '12:00'),
-        reads=(3, 7),
-        writes=(1, 2),
-        other=(0, 2),
-        by_operation=(('search', 10), ('add_memory', 3), ('compact', 2)),
-    )
-
-
-def test_shape_memory_graphs_serves_one_memory_ops_key():
-    body = redux_api.shape_memory_graphs(_memory_ops())
-
-    assert list(body) == ['MEMORY_OPS'], (
-        'one query, one datum, one key: MEMORY_TIMESERIES and '
-        'MEMORY_OPS_BREAKDOWN are retired'
-    )
-    ops = body['MEMORY_OPS']
-    assert set(ops) == {
-        'labels', 'reads', 'writes', 'other', 'total', 'totals', 'by_operation',
-    }
-    assert ops['labels'] == ['11:00', '12:00']
-    assert ops['reads'] == [3, 7]
-    assert ops['writes'] == [1, 2]
-    assert ops['other'] == [0, 2]
-
-
-def test_shape_memory_graphs_hourly_total_sums_the_three_series():
-    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
-
-    assert ops['total'] == [
-        r + w + o for r, w, o in zip(ops['reads'], ops['writes'], ops['other'], strict=True)
-    ]
-    assert ops['total'] == [4, 11]
-
-
-def test_shape_memory_graphs_window_totals_reconcile_with_by_operation():
-    """PRD sketch #11: the caption's three numbers sum to the donut's total."""
-    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
-    totals = ops['totals']
-
-    assert totals == {'reads': 10, 'writes': 3, 'other': 2, 'total': 15}
-    assert totals['reads'] == sum(ops['reads'])
-    assert totals['writes'] == sum(ops['writes'])
-    assert totals['other'] == sum(ops['other'])
-    assert totals['total'] == totals['reads'] + totals['writes'] + totals['other']
-    assert totals['total'] == sum(row['value'] for row in ops['by_operation'])
-    assert totals['total'] == sum(ops['total'])
-
-
-def test_shape_memory_graphs_by_operation_keeps_memory_ops_order():
-    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
-
-    assert ops['by_operation'] == [
-        {'label': 'search', 'value': 10},
-        {'label': 'add_memory', 'value': 3},
-        {'label': 'compact', 'value': 2},
-    ]
-
-
-# ---------------------------------------------------------------------------
 # shape_recon
 # ---------------------------------------------------------------------------
 
@@ -718,6 +673,11 @@ MQ_SERVED_AT = datetime(2026, 10, 1, 12, 0, 30, tzinfo=UTC)
 _MQ_MEASURED_QUEUE = {
     'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
     'live_probe_configured': True,
+    'speculative': Datum(
+        {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
+        MQ_SERVED_AT, DatumState.FRESH, None, 30,
+    ),
+    'recent_total': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
 }
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
@@ -739,7 +699,6 @@ def test_shape_merge_queue_relabels_and_renames_depth():
             'outcomes': {'labels': ['done'], 'values': [12]},
             'latency': {'p50': 6000},
             'recent': [_mq_titled('17')],
-            'speculative': {'hit_rate': 0.75},
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
@@ -756,31 +715,39 @@ def test_shape_merge_queue_relabels_and_renames_depth():
 def test_shape_merge_queue_carries_the_recent_window_total():
     """recent_total is the window's merge count, which the capped recent rows may not reach."""
     recent = [_mq_titled(str(i)) for i in range(200)]
+    recent_total = Datum(228, MQ_SERVED_AT, DatumState.FRESH, None, 30)
     raw = {
         '/home/leo/src/dark-factory': {
             'depth_timeseries': {'labels': [], 'values': []},
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': recent,
-            'recent_total': 228,
-            'speculative': {},
             'active': [],
             **_MQ_MEASURED_QUEUE,
-        },
-        '/home/leo/src/reify': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
-            'recent': [],
-            'speculative': {},
-            'active': [],
-            **_MQ_MEASURED_QUEUE,
+            'recent_total': recent_total,
         },
     }
     mq = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)['MERGE_QUEUE']
-    assert mq['dark-factory']['recent_total'] == 228
+    assert mq['dark-factory']['recent_total'] == recent_total.to_wire()
     assert _task_ids(mq['dark-factory']['recent']) == _task_ids(recent)
-    assert mq['reify']['recent_total'] == 0
+
+
+def test_shape_merge_queue_refuses_a_project_without_a_recent_total():
+    """A project the route never gave a window total is a wiring bug, not a zero."""
+    project = {
+        'depth_timeseries': {'labels': [], 'values': []},
+        'outcomes': {'labels': [], 'values': []},
+        'latency': {},
+        'recent': [],
+        'active': [],
+        **_MQ_MEASURED_QUEUE,
+    }
+    del project['recent_total']
+
+    with pytest.raises(DatumContractError) as excinfo:
+        redux_api.shape_merge_queue({'/home/leo/src/reify': project}, served_at=MQ_SERVED_AT)
+
+    assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
 
 
 def test_shape_merge_queue_injects_halt_status_per_project():
@@ -790,7 +757,6 @@ def test_shape_merge_queue_injects_halt_status_per_project():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {'hit_rate': 0.0},
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
@@ -799,7 +765,6 @@ def test_shape_merge_queue_injects_halt_status_per_project():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {'hit_rate': 0.0},
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
@@ -808,7 +773,6 @@ def test_shape_merge_queue_injects_halt_status_per_project():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {'hit_rate': 0.0},
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
@@ -835,7 +799,6 @@ def test_shape_merge_queue_includes_train_events():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {'hit_rate': 0.0},
             'active': [],
             **_MQ_MEASURED_QUEUE,
             'train_events': [
@@ -863,7 +826,6 @@ def test_shape_merge_queue_includes_train_events():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {'hit_rate': 0.0},
             'active': [],
             **_MQ_MEASURED_QUEUE,
             # no 'train_events' key
@@ -897,7 +859,6 @@ def test_shape_merge_queue_attaches_outcome_colors():
             'outcomes': {'labels': _REIFY_LABELS, 'values': [3, 2, 1, 4, 2]},
             'latency': {},
             'recent': [],
-            'speculative': {},
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
@@ -924,7 +885,6 @@ def test_shape_merge_queue_empty_outcomes_yields_empty_colors():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {},
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
@@ -1015,6 +975,12 @@ def _perf_cards(
     )
 
 
+def _perf_listing(cards: dict[str, Datum[PerformanceCards]]) -> PerformanceListing:
+    """*cards* as a listing every runs.db was read for."""
+    listed = Datum(len(cards), _PERF_SERVED_AT, DatumState.FRESH, None, _PERF_WINDOW_SECONDS)
+    return PerformanceListing(cards=cards, listed=listed)
+
+
 _PERF_HISTORY = {
     'time_centiles_history': {'labels': ['2026-09-30T11:00'], 'p50': [60_000], 'p95': [90_000]},
     'one_pass_history': {'labels': ['2026-09-30T11:00'], 'values': [100.0]},
@@ -1026,7 +992,7 @@ def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
     plus_two = timezone(timedelta(hours=2))
     cards = _perf_cards((_PERF_SERVED_AT - timedelta(hours=1)).astimezone(plus_two))
     body = redux_api.shape_performance(
-        cards={'/home/leo/src/p1': cards},
+        listing=_perf_listing({'/home/leo/src/p1': cards}),
         history={'/home/leo/src/p1': _PERF_HISTORY},
         served_at=_PERF_SERVED_AT,
     )
@@ -1039,7 +1005,7 @@ def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
 
 def test_shape_performance_project_without_history_gets_empty_blocks():
     body = redux_api.shape_performance(
-        cards={'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))},
+        listing=_perf_listing({'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))}),
         served_at=_PERF_SERVED_AT,
     )
     entry = body['PERFORMANCE']['p1']
@@ -1050,13 +1016,13 @@ def test_shape_performance_project_without_history_gets_empty_blocks():
 
 def test_shape_performance_lists_exactly_the_projects_with_cards():
     body = redux_api.shape_performance(
-        cards={
+        listing=_perf_listing({
             'active': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1)),
             'idle': _perf_cards(
                 _PERF_SERVED_AT - timedelta(days=20), DatumState.STALE,
                 'no completions in the 7d window; last completion 2026-09-10T12:00:00+00:00',
             ),
-        },
+        }),
         history={'active': _PERF_HISTORY, 'history-only': _PERF_HISTORY},
         served_at=_PERF_SERVED_AT,
     )
@@ -1069,7 +1035,7 @@ def test_shape_performance_lists_exactly_the_projects_with_cards():
 
 def test_shape_performance_serves_the_instant_it_validated_against():
     body = redux_api.shape_performance(
-        cards={'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))},
+        listing=_perf_listing({'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))}),
         served_at=_PERF_SERVED_AT,
     )
     assert body['served_at'] == '2026-09-30T12:00:00+00:00'
@@ -1081,7 +1047,7 @@ def test_shape_performance_serves_an_unread_project_as_an_unknown_cards_datum():
         value=None, as_of=None, state=DatumState.UNKNOWN, reason=reason,
         freshness_bound_seconds=_PERF_WINDOW_SECONDS,
     )
-    body = redux_api.shape_performance(cards={'p1': unread}, served_at=_PERF_SERVED_AT)
+    body = redux_api.shape_performance(listing=_perf_listing({'p1': unread}), served_at=_PERF_SERVED_AT)
     assert body['PERFORMANCE']['p1']['cards'] == {
         'value': None, 'as_of': None, 'state': 'unknown', 'reason': reason,
         'freshness_bound_seconds': _PERF_WINDOW_SECONDS,
@@ -1092,7 +1058,16 @@ def test_shape_performance_propagates_a_broken_cards_datum():
     """A FRESH Datum older than its own bound is a shaper bug, not a state."""
     overdue = _perf_cards(_PERF_SERVED_AT - timedelta(days=8))
     with pytest.raises(DatumContractError):
-        redux_api.shape_performance(cards={'p1': overdue}, served_at=_PERF_SERVED_AT)
+        redux_api.shape_performance(listing=_perf_listing({'p1': overdue}), served_at=_PERF_SERVED_AT)
+
+
+def test_a_bare_listing_count_is_a_wiring_bug():
+    listing = PerformanceListing(cards={}, listed=0)  # type: ignore[arg-type]
+    with pytest.raises(DatumContractError) as excinfo:
+        redux_api.shape_performance(listing=listing, served_at=_PERF_SERVED_AT)
+
+    assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
+    assert 'PERFORMANCE_LISTING' in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2077,7 +2052,6 @@ def _mq_project(**overrides) -> dict:
         'outcomes': {'labels': [], 'values': []},
         'latency': {},
         'recent': [],
-        'speculative': {},
         'active': [],
         **_MQ_MEASURED_QUEUE,
         'train_events': [],
@@ -2175,6 +2149,44 @@ class TestShapeMergeQueueServedDatums:
         with pytest.raises(DatumContractError):
             _shaped(in_queue=broken)
 
+    def test_speculative_is_a_wire_datum(self):
+        speculative = Datum(
+            {'hit_count': 5, 'discard_count': 3, 'total': 8, 'hit_rate': 5 / 8},
+            MQ_SERVED_AT - timedelta(seconds=5), DatumState.FRESH, None, 30,
+        )
+
+        assert _shaped(speculative=speculative)['speculative'] == speculative.to_wire()
+
+    def test_a_fresh_speculative_past_its_bound_is_served_stale(self):
+        as_of = MQ_SERVED_AT - timedelta(seconds=45)
+        counts = {'hit_count': 1, 'discard_count': 0, 'total': 1, 'hit_rate': 1.0}
+
+        wire = _shaped(speculative=Datum(counts, as_of, DatumState.FRESH, None, 30))['speculative']
+
+        assert wire['state'] == 'stale'
+        assert (wire['value'], wire['as_of']) == (counts, as_of.isoformat())
+        assert '30s freshness bound' in wire['reason']
+
+    def test_an_unknown_recent_total_keeps_its_reason(self):
+        unread = unknown_datum('the merge_attempt events could not be read from runs.db', 30)
+
+        wire = _shaped(recent_total=unread)['recent_total']
+
+        assert wire == unread.to_wire()
+        assert wire['state'] == 'unknown'
+
+    @pytest.mark.parametrize('field, bare', [
+        ('speculative', {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
+        ('recent_total', 0),
+    ])
+    def test_a_bare_value_is_a_wiring_bug(self, field, bare):
+        with pytest.raises(DatumContractError) as excinfo:
+            _shaped(**{field: bare})
+
+        assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
+        assert 'myproj' in str(excinfo.value)
+        assert field in str(excinfo.value)
+
 
 # ---------------------------------------------------------------------------
 # shape_merge_queue — train_throughput passthrough (step-14 RED / step-15 GREEN)
@@ -2185,7 +2197,7 @@ def test_shape_merge_queue_includes_train_throughput():
     """shape_merge_queue exposes train_throughput dict per project.
 
     When per-project data contains 'train_throughput', it must appear in the
-    shaped output alongside 'train_events' and 'speculative'.
+    shaped output alongside 'train_events'.
     When 'train_throughput' is absent, the shaped output defaults to {}.
     """
     throughput_payload = {
@@ -2206,7 +2218,6 @@ def test_shape_merge_queue_includes_train_throughput():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {'hit_rate': 0.0},
             'active': [],
             **_MQ_MEASURED_QUEUE,
             'train_events': [],
@@ -2231,7 +2242,6 @@ def test_shape_merge_queue_includes_train_throughput():
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {'hit_rate': 0.0},
             'active': [],
             **_MQ_MEASURED_QUEUE,
             'train_events': [],
@@ -2254,7 +2264,6 @@ def _mq_project_base() -> dict:
         'outcomes': {'labels': [], 'values': []},
         'latency': {},
         'recent': [],
-        'speculative': {'hit_rate': 0.0},
         'active': [],
         **_MQ_MEASURED_QUEUE,
     }

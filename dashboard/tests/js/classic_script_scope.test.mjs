@@ -42,6 +42,7 @@ import {
   VENDORED_BABEL,
   babelScriptSrcs,
   classicScriptSrcs,
+  compileAsScriptTag,
   loadVendoredBabel,
   readIndexHtml,
 } from './_served_bundle.mjs';
@@ -70,10 +71,14 @@ const EXPECTED_WINDOW_GLOBALS = {
   'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
   'window_chip.js': 'DF_WINDOW_CHIP',
   'merge_queue.js': 'DF_MERGE_QUEUE',
+  'performance_cards.js': 'DF_PERFORMANCE_CARDS',
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
   'escalation_focus.js': 'DF_ESCALATION_FOCUS',
   'memory_readings.js': 'DF_MEMORY_READINGS',
+  'system_health.js': 'DF_SYSTEM_HEALTH',
+  'spend_readings.js': 'DF_SPEND_READINGS',
   'persisted_state.js': 'DF_PERSISTED_STATE',
+  'invariant_chip.js': 'DF_INVARIANT_CHIP',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an
@@ -261,10 +266,6 @@ test('the harness actually detects a duplicate top-level const (negative control
 });
 
 // ── The text/babel .jsx tags ──────────────────────────────────────────────
-
-function compileAsScriptTag(source, filename) {
-  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
-}
 
 const PROBE_SENTINEL = 'classic-scope probe: declarations instantiated, body not run';
 

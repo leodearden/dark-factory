@@ -435,7 +435,7 @@ def _strand_split(rows: Datum[list[dict]]) -> tuple[int | None, int | None]:
 
     Through ``tasks.task_is_stranded`` rather than ``shared.task_claimant``
     directly: that wrapper is the single dashboard-side strand predicate,
-    binding ``STRANDED_HEARTBEAT_TTL`` and the request-scoped clock onto the
+    binding ``DEFAULT_CLAIMANT_HEARTBEAT_TTL`` and the request-scoped clock onto the
     shared function so the task-row badge and this split cannot disagree.
 
     Judged at ``rows.as_of`` — the instant the rows were MEASURED — not at the
@@ -631,8 +631,9 @@ def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
     """Route one unit to its banner, from its kind and its states.
 
     THE single place the routing is decided, so the handler's project lists,
-    ``collect_active_tasks``' offline labels and every test that asserts a
-    partition all read the same rule. Keyed on the STRUCTURED failure kind and
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state``'s
+    offline and degraded lists, and every test that asserts a partition all
+    read the same rule. Keyed on the STRUCTURED failure kind and
     the census's state, never on ``reason`` — that field is by contract the
     producer's verbatim failure text, so keying on it would be an ad-hoc
     parser over a meaningful string and one reworded fan-out message would

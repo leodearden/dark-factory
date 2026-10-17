@@ -77,6 +77,7 @@ const TAB_ENDPOINTS = {
     '/api/v2/dashboard/tasks',
     '/api/v2/dashboard/orchestrators',
     '/api/v2/dashboard/scheduler',
+    '/api/v2/dashboard/invariants',
   ],
   scheduler: ['/api/v2/dashboard/scheduler'],
   curator: ['/api/v2/dashboard/curator'],

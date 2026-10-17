@@ -216,7 +216,7 @@ class TestUnknownKeyStormDetector:
         detector = _detector(clock, threshold=3, window_seconds=300, sweep_every=2)
 
         detector.record('p', 'transient-writer', ['k'])
-        assert ('p', 'transient-writer') in detector._warns
+        assert ('p', 'transient-writer') in detector.tracked_writers
 
         clock.advance(301)
         # Two records by a DIFFERENT writer, so the sweep is what evicts the
@@ -224,8 +224,10 @@ class TestUnknownKeyStormDetector:
         detector.record('p', 'steady-writer', ['k'])
         detector.record('p', 'steady-writer', ['k'])
 
-        assert ('p', 'transient-writer') not in detector._warns
-        assert ('p', 'steady-writer') in detector._warns, 'the live writer must survive'
+        assert ('p', 'transient-writer') not in detector.tracked_writers
+        assert ('p', 'steady-writer') in detector.tracked_writers, (
+            'the live writer must survive'
+        )
 
     def test_the_sweep_never_evicts_the_writer_that_triggered_it(self):
         """Its deque was appended at `now`, so it is never stale."""
@@ -234,27 +236,26 @@ class TestUnknownKeyStormDetector:
 
         detector.record('p', 'a', ['k'])
         detector.record('p', 'a', ['k'])
-        assert detector._warns[('p', 'a')].prune(300) == 2
-        # And the counting contract still holds across the sweep.
+        assert ('p', 'a') in detector.tracked_writers
+        # And both prior events survived: the third crosses.
         assert detector.record('p', 'a', ['k']) is True
 
     def test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard(self):
         """A drained writer is no longer over the line.
 
-        Leaving it in `_firing` after evicting it from `_warns` would create a
-        latch nothing can ever clear, permanently silencing a writer that
-        drifts, is fixed, and later drifts again.
+        A latch that outlived the writer's eviction would be one nothing can
+        ever clear, permanently silencing a writer that drifts, is fixed, and
+        later drifts again.
         """
         clock = _FakeClock()
         detector = _detector(clock, threshold=2, window_seconds=300, sweep_every=2)
 
         assert detector.record('p', 'a', ['k', 'k2']) is True
-        assert detector._warns[('p', 'a')].latched is True
 
         clock.advance(301)
         detector.record('p', 'other', ['k'])
         detector.record('p', 'other', ['k'])
-        assert ('p', 'a') not in detector._warns
+        assert ('p', 'a') not in detector.tracked_writers
 
         assert detector.record('p', 'a', ['k', 'k2']) is True, 'must fire again'
 
@@ -361,8 +362,8 @@ class TestUnknownKeyStormDetector:
         assert detector._time_fn is time.monotonic
 
 
-class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
-    """INV-5: the per-writer window IS ``shared.storm_counter.StormCounter``.
+class TestUnknownKeyStormDetectorDelegatesToTheSharedRegistry:
+    """INV-5: the per-writer windows ARE ``shared.storm_counter.KeyedStormCounters``.
 
     PROVENANCE, which is what makes this a re-copy rather than a body that
     merely predates the shared class. Task 3088 extracted the
@@ -372,7 +373,8 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
     2026-07-31 (7d509f0dd7), carrying its own deque, its own
     ``cutoff``/``popleft`` loop and its own count-versus-threshold compare —
     the copy the extraction had just been made to prevent. Task 4519 closes
-    that gap.
+    that gap, and task 5102 moves the per-writer keying and sweep into the
+    one keyed registry.
 
     Structural rather than behavioural on purpose, exactly as task 3259's
     ``test_harness.py::test_all_three_storm_counters_are_the_shared_storm_counter``
@@ -381,42 +383,12 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
     forbids. The behavioural halves stay where they are.
     """
 
-    def test_each_writer_window_is_a_shared_storm_counter(self):
-        from shared.storm_counter import StormCounter
+    def test_the_writer_windows_are_the_shared_keyed_registry(self):
+        from shared.storm_counter import KeyedStormCounters
 
-        clock = _FakeClock()
-        detector = _detector(clock, threshold=5)
-        detector.record('p', 'a', ['k'])
+        detector = _detector(_FakeClock(), threshold=5)
 
-        assert isinstance(detector._warns[('p', 'a')], StormCounter)
-
-    def test_the_counters_are_latched_not_rate_limited(self):
-        """The detector's contract is the CROSSING, not the standing state.
-
-        A rate-limited counter would re-answer once per window, buying the
-        filer an open-escalation ``queue.get_by_task`` read per memory write
-        for a condition already filed — the behaviour
-        :meth:`UnknownKeyStormDetector.record`'s docstring rules out.
-        """
-        clock = _FakeClock()
-        detector = _detector(clock, threshold=5)
-        detector.record('p', 'a', ['k'])
-
-        assert detector._warns[('p', 'a')].fire_mode == 'latched'
-
-    def test_the_counters_threshold_on_raw_events_not_distinct_keys(self):
-        """Not decoration: distinct-key mode here would never fire at all.
-
-        The commonest drift shape is ONE writer repeating ONE unknown key, and
-        a ``count_distinct`` counter would score that as 1 forever. The sibling
-        ``test_fires_exactly_on_the_crossing_call`` records ``['k']`` five
-        times and expects a fire, so the mode is load-bearing.
-        """
-        clock = _FakeClock()
-        detector = _detector(clock, threshold=5)
-        detector.record('p', 'a', ['k'])
-
-        assert detector._warns[('p', 'a')].count_distinct is False
+        assert isinstance(detector._warns, KeyedStormCounters)
 
     def test_a_writer_over_the_line_for_multiple_windows_still_fires_once(self):
         """The latch-vs-rate-limit discriminator, at the census level.
@@ -453,15 +425,13 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
         counter, not by the re-arm. This pins the re-arm path itself, so a
         future edit cannot widen the latch into a permanent one and stay green.
 
-        No eviction runs: ``sweep_every`` defaults to 256 and this drives six
-        records, which the closing identity assertion makes explicit rather
-        than assumed.
+        Eviction is structurally excluded: the registry's sweep never evicts
+        the key being recorded, and only writer ``a`` records here.
         """
         clock = _FakeClock()
         detector = _detector(clock, threshold=3, window_seconds=300)
 
         assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
-        counter = detector._warns[('p', 'a')]
 
         clock.advance(301)
         assert [detector.record('p', 'a', ['k']) for _ in range(3)] == [
@@ -469,10 +439,6 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
             False,
             True,
         ], 'the drained window re-arms, so the second drift is heard'
-        assert detector._warns[('p', 'a')] is counter, (
-            'and it re-armed IN PLACE — no sweep ran, so this is the re-arm '
-            'path and not the eviction path the sibling test covers'
-        )
 
 
 class TestFileUnknownKeyStormEscalation:

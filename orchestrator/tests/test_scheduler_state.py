@@ -12,10 +12,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
+from shared.project_layout import scheduler_state_json
+from shared.scheduler_state import PinQueueEntry, SchedulerStateSnapshot
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.overrides import OverrideStore
+from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import ModuleLockTable, Scheduler
 
 # ---------------------------------------------------------------------------
@@ -404,6 +408,9 @@ class TestSnapshotParkStacks:
         assert e0['owner'] == 'L'
         assert e0['shadowed'] is True
         assert isinstance(e0['rank'], int)
+        assert e0['source'] == 'fairness'
+        assert e0['tier'] == 'low'
+        assert 'pin_order' not in e0
         datetime.fromisoformat(e0['installed_at'])
 
         # top entry: H (active)
@@ -444,6 +451,18 @@ class TestSnapshotParkStacks:
         assert entries[-1]['shadowed'] is False
         for e in entries[:-1]:
             assert e['shadowed'] is True
+
+    def test_pin_and_fairness_entries_for_one_owner_carry_source(self):
+        """A pin entry reports source/pin_order; the owner's fairness entry its tier."""
+        lt = self._make_lock_table()
+        lt.install_parks('T', ['mod/a'], 'medium')
+        lt.install_parks('T', ['mod/a'], PinOrder(1))
+
+        fairness, pin = lt.snapshot_park_stacks()['mod/a']
+        assert (fairness['source'], fairness['tier']) == ('fairness', 'medium')
+        assert 'pin_order' not in fairness
+        assert (pin['source'], pin['pin_order']) == ('pin', 1)
+        assert 'tier' not in pin
 
     def test_empty_when_no_parks(self):
         """Fresh table returns empty dict."""
@@ -535,33 +554,42 @@ _SNAPSHOT_KEYS = frozenset({
 })
 
 
+def _arm_transient_cooldown(scheduler: Scheduler, task_id: str) -> None:
+    scheduler.record_requeue(
+        task_id, phase='execute', reason='agent API error: HTTP 529', detail='',
+        run_id=f'run-{task_id}', cost_usd=0.0, api_error_status=529,
+    )
+    scheduler.release(task_id, requeued=True)
+
+
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns the correct thirteen-key dict."""
+    """get_state_snapshot() returns a SchedulerStateSnapshot with the thirteen wire keys."""
 
     def test_snapshot_returns_thirteen_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
-        assert set(snap.keys()) == _SNAPSHOT_KEYS
+        assert isinstance(snap, SchedulerStateSnapshot)
+        assert set(snap.to_json()) == _SNAPSHOT_KEYS
 
     def test_snapshot_empty_scheduler_returns_empty_collections(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
-        assert snap['skip_counts'] == {}
-        assert snap['parks'] == {}
-        assert snap['park_stacks'] == {}
-        assert snap['effective_priorities'] == {}
-        assert snap['pin_queue'] == []
-        assert snap['overrides'] == {}
-        assert snap['current_holders'] == {}
-        assert snap['requeue_cooldowns'] == {}
-        assert snap['pin_reservations'] == {}
-        # snapshot_at must be an ISO8601 string.
-        datetime.fromisoformat(snap['snapshot_at'])
+        assert snap.skip_counts == {}
+        assert snap.parks == {}
+        assert snap.park_stacks == {}
+        assert snap.effective_priorities == {}
+        assert snap.pin_queue == ()
+        assert snap.overrides == {}
+        assert snap.current_holders == {}
+        assert snap.requeue_cooldowns == {}
+        assert snap.pin_reservations == {}
+        assert snap.snapshot_at is not None
+        assert snap.snapshot_at.tzinfo is not None
         # Pause state defaults — scheduler is not paused at construction.
-        assert snap['is_paused'] is False
-        assert snap['pause_reason'] is None
+        assert snap.is_paused is False
+        assert snap.pause_reason is None
 
     def test_snapshot_exposes_park_stacks_with_shadowed_owner(self):
         """park_stacks surfaces buried owners that parks omits (user-observable signal).
@@ -579,12 +607,12 @@ class TestGetStateSnapshotShape:
         snap = scheduler.get_state_snapshot()
 
         # parks: only active top (INV-7 backward-compat shape unchanged)
-        assert 'H' in snap['parks'], 'Active-top H must appear in parks'
-        assert 'L' not in snap['parks'], 'Buried L must NOT appear in parks'
+        assert 'H' in snap.parks, 'Active-top H must appear in parks'
+        assert 'L' not in snap.parks, 'Buried L must NOT appear in parks'
 
         # park_stacks: full stack, both owners present
-        assert 'mod/a' in snap['park_stacks'], 'mod/a must appear in park_stacks'
-        entries = snap['park_stacks']['mod/a']
+        assert 'mod/a' in snap.park_stacks, 'mod/a must appear in park_stacks'
+        entries = snap.park_stacks['mod/a']
         assert len(entries) == 2, f'Expected 2-deep stack in park_stacks, got {entries}'
         owners = [e['owner'] for e in entries]
         assert 'L' in owners, 'Buried L must appear in park_stacks'
@@ -599,7 +627,7 @@ class TestGetStateSnapshotShape:
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=3))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
-        assert snap['lock_depth'] == 3
+        assert snap.lock_depth == 3
 
     def test_bare_config_project_root_isolated_to_tmp(self, tmp_path):
         """Bare OrchestratorConfig() must NOT resolve project_root to the real repo.
@@ -626,16 +654,26 @@ class TestGetStateSnapshotShape:
         )
         assert snapshot_path.is_relative_to(tmp_path.resolve())
 
-    def test_snapshot_is_deep_copy_of_internal_state(self):
-        """Mutating the returned snapshot must not affect the scheduler's internal state."""
+    def test_snapshot_is_a_value_unaffected_by_later_scheduler_changes(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
-        scheduler._skip_count['X'] = 3
+        scheduler.lock_table.install_parks('P', ['mod/a'], 'high')
         snap = scheduler.get_state_snapshot()
-        snap['skip_counts']['X'] = 99
-        assert scheduler._skip_count['X'] == 3, (
-            'Mutating snapshot must not affect internal _skip_count'
-        )
+
+        scheduler.lock_table.clear_parks_for('P')
+        scheduler.lock_table.install_parks('Q', ['mod/b'], 'high')
+        _arm_transient_cooldown(scheduler, 'T1')
+
+        assert set(snap.parks) == {'P'}
+        assert set(snap.park_stacks) == {'mod/a'}
+        assert snap.requeue_cooldowns == {}
+
+    def test_snapshot_fields_cannot_be_reassigned(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        snap = scheduler.get_state_snapshot()
+        with pytest.raises(ValidationError):
+            snap.is_paused = True
 
 
 # ===========================================================================
@@ -707,37 +745,37 @@ class TestGetStateSnapshotPopulated:
         snap = scheduler.get_state_snapshot()
 
         # --- skip_counts ---
-        assert snap['skip_counts'].get('T3', 0) >= 1, (
-            f"Expected T3 skip_count >= 1, got snap['skip_counts']={snap['skip_counts']}"
+        assert snap.skip_counts.get('T3', 0) >= 1, (
+            f'Expected T3 skip_count >= 1, got skip_counts={snap.skip_counts}'
         )
 
         # --- parks ---
-        assert 'T3' in snap['parks'], f"Expected T3 in parks, got {snap['parks']}"
-        assert snap['parks']['T3']['modules'], (
+        assert 'T3' in snap.parks, f'Expected T3 in parks, got {snap.parks}'
+        assert snap.parks['T3'].modules, (
             'Expected non-empty modules list in parks[T3]'
         )
-        datetime.fromisoformat(snap['parks']['T3']['installed_at'])
+        datetime.fromisoformat(snap.parks['T3'].installed_at)
 
         # --- effective_priorities ---
-        assert snap['effective_priorities'].get('T1') == 'high', (
+        assert snap.effective_priorities.get('T1') == 'high', (
             f"Expected effective_priorities['T1']='high', "
-            f"got {snap['effective_priorities']}"
+            f'got {snap.effective_priorities}'
         )
 
         # --- pin_queue ---
-        assert snap['pin_queue'] == [{'task_id': 'T2', 'order': 1}], (
-            f"Expected pin_queue=[{{task_id:'T2',order:1}}], got {snap['pin_queue']}"
+        assert snap.pin_queue == (PinQueueEntry(task_id='T2', order=1),), (
+            f'Expected pin_queue=(T2 at order 1,), got {snap.pin_queue}'
         )
 
         # --- overrides ---
-        assert 'T1' in snap['overrides'], f"Expected T1 in overrides, got {snap['overrides']}"
-        ov_t1 = snap['overrides']['T1']
-        assert ov_t1['boost_tier'] == 'high', f"Expected boost_tier='high', got {ov_t1}"
-        assert ov_t1['pinned'] is False, f"Expected pinned=False, got {ov_t1}"
-        assert ov_t1['ttl_until'] is None, f"Expected ttl_until=None, got {ov_t1}"
+        assert 'T1' in snap.overrides, f'Expected T1 in overrides, got {snap.overrides}'
+        ov_t1 = snap.overrides['T1']
+        assert ov_t1.boost_tier == 'high', f"Expected boost_tier='high', got {ov_t1}"
+        assert ov_t1.pinned is False, f'Expected pinned=False, got {ov_t1}'
+        assert ov_t1.ttl_until is None, f'Expected ttl_until=None, got {ov_t1}'
 
         # --- current_holders ---
-        ch = snap['current_holders']
+        ch = snap.current_holders
         assert ch, 'Expected non-empty current_holders'
         # Every held module must map to its task_id.
         assert ch.get('t2/src') == 'T2', (
@@ -769,6 +807,29 @@ class TestWriteStateSnapshot:
         data = json.loads(path.read_text())
         assert set(data.keys()) == _SNAPSHOT_KEYS, (
             f'Expected keys {_SNAPSHOT_KEYS}, got {set(data.keys())}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_flushed_file_parses_back_to_the_producer_snapshot(self, tmp_path):
+        """I4, producer half: the file is the model's wire form, nothing more or less."""
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1, lock_depth=3, project_root=tmp_path),
+        )
+        scheduler.finish_startup()
+        scheduler.lock_table.install_parks('P', ['pin/mod'], PinOrder(1))
+        _arm_transient_cooldown(scheduler, 'T1')
+
+        await scheduler.flush_state_snapshot()
+
+        on_disk = SchedulerStateSnapshot.from_json(
+            json.loads(scheduler_state_json(tmp_path).read_text()),
+        )
+        produced = scheduler.get_state_snapshot()
+        assert on_disk.snapshot_at is not None
+        assert set(on_disk.pin_reservations) == {'P'}
+        assert set(on_disk.requeue_cooldowns) == {'T1'}
+        assert on_disk.model_copy(update={'snapshot_at': None}) == produced.model_copy(
+            update={'snapshot_at': None}
         )
 
     def test_write_state_snapshot_atomic_replace(self, tmp_path):
@@ -1337,13 +1398,13 @@ class TestStateSnapshotOverrideStoreLogging:
         with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
             snap = scheduler.get_state_snapshot()
 
-        # (a) Fallback preserved: pin_queue is empty list.
-        assert snap['pin_queue'] == [], (
-            f"Expected pin_queue == [], got {snap['pin_queue']!r}"
+        # (a) Fallback preserved: pin_queue is empty.
+        assert snap.pin_queue == (), (
+            f'Expected pin_queue == (), got {snap.pin_queue!r}'
         )
         # (b) Overrides fallback also preserved.
-        assert snap['overrides'] == {}, (
-            f"Expected overrides == {{}}, got {snap['overrides']!r}"
+        assert snap.overrides == {}, (
+            f'Expected overrides == {{}}, got {snap.overrides!r}'
         )
         # (c) Exactly one WARNING record from orchestrator.scheduler mentioning
         # get_pin_queue or pin_queue.
@@ -1387,13 +1448,13 @@ class TestStateSnapshotOverrideStoreLogging:
         with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
             snap = scheduler.get_state_snapshot()
 
-        # (a) Fallback preserved: overrides is empty dict.
-        assert snap['overrides'] == {}, (
-            f"Expected overrides == {{}}, got {snap['overrides']!r}"
+        # (a) Fallback preserved: overrides is empty.
+        assert snap.overrides == {}, (
+            f'Expected overrides == {{}}, got {snap.overrides!r}'
         )
         # (b) pin_queue fallback also preserved.
-        assert snap['pin_queue'] == [], (
-            f"Expected pin_queue == [], got {snap['pin_queue']!r}"
+        assert snap.pin_queue == (), (
+            f'Expected pin_queue == (), got {snap.pin_queue!r}'
         )
         # (c) Exactly one WARNING record from orchestrator.scheduler mentioning
         # get_overrides or overrides.
@@ -1515,8 +1576,10 @@ class TestDelegatesToSharedAtomicWriter:
         # 2. Force a GENUINELY DIFFERENT snapshot, so the content-dedup
         #    short-circuit at scheduler.py:6816 cannot be what keeps the
         #    payload unchanged — without this the test would pass vacuously.
-        changed_state = {**scheduler.get_state_snapshot(), 'probe_3223': 'changed'}
-        monkeypatch.setattr(scheduler, 'get_state_snapshot', lambda: dict(changed_state))
+        changed_state = scheduler.get_state_snapshot().model_copy(
+            update={'skip_counts': {'probe_3223': 1}}
+        )
+        monkeypatch.setattr(scheduler, 'get_state_snapshot', lambda: changed_state)
         assert scheduler._build_snapshot_payload() != good_payload, (
             'precondition: the second write must carry a different payload, '
             'else dedup — not the failure — would explain an unchanged value'

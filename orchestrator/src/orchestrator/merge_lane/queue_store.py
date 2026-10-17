@@ -782,6 +782,7 @@ async def recover_pending_merges(
                 try:
                     await enqueue_merge_request(
                         queue, winner_req, event_store, retention=retention,
+                        registry=registry,
                     )
                 except BaseException:
                     # Slot-leak guard: release the freshly-claimed slot if the

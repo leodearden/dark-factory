@@ -14,7 +14,8 @@ const {
 } = window.DF_PRD_GROUPING;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
-const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
+const { tasksBannerNoticesFor } = window.DF_TASKS_OFFLINE_BANNER;
+const { invariantChipFor, chainChipFor } = window.DF_INVARIANT_CHIP;
 // Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
 const {
   projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
@@ -27,6 +28,13 @@ const {
 // left rule). 'muted' means "expected, not a fault" — no accent at all.
 const PROBE_TONE_ACCENT_T = {
   muted: 'var(--line)',
+  warn: 'var(--warn)',
+  bad: 'var(--bad)',
+};
+
+// Text colour per invariant chip tone, claimant or chain (invariant_chip.js owns the tone).
+const INVARIANT_CHIP_TONE_T = {
+  muted: 'var(--fg-3)',
   warn: 'var(--warn)',
   bad: 'var(--bad)',
 };
@@ -718,13 +726,7 @@ function TasksTab({ projectFilter, search }) {
   // one too — PROJECTS is the orchestrator-derived list, a different
   // population that diverges whenever a root has no orchestrator (or the
   // reverse), which made the notice understate how many projects failed.
-  const bannerNotices = tasksBannerNotices({
-    offline: !!DF_T.TASKS_OFFLINE,
-    offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
-    degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
-    countUnknownProjects: DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || [],
-    totalProjects: DF_T.TASKS_PROJECT_COUNT || 0,
-  });
+  const bannerNotices = tasksBannerNoticesFor(DF_T);
   const bannerTestIds = {
     global: 'tasks-offline-banner',
     partial: 'tasks-partial-banner',
@@ -876,9 +878,23 @@ function TasksTab({ projectFilter, search }) {
             const groupView = focusGroupView(filtered, { focusMode, selectedId, focusAnchorId });
             const isOpen = openMap[p.id] !== false; // default-open
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
+            const invariantChip = invariantChipFor(DF_T.INVARIANTS, p.id);
+            const chainChip = chainChipFor(DF_T.INVARIANTS, p.id);
             const summary = (
               <>
                 {CENSUS_VIEWS_T.map(v => <Pip key={v.key} datum={census} color={CP_T[v.tone]} format={v.reading} />)}
+                {invariantChip && (
+                  <span className="mono" data-testid="tasks-invariant-chip" title={invariantChip.title}
+                        style={{ color: INVARIANT_CHIP_TONE_T[invariantChip.tone], fontSize: 10 }}>
+                    {invariantChip.text}
+                  </span>
+                )}
+                {chainChip && (
+                  <span className="mono" data-testid="tasks-chain-chip" title={chainChip.title}
+                        style={{ color: INVARIANT_CHIP_TONE_T[chainChip.tone], fontSize: 10 }}>
+                    {chainChip.text}
+                  </span>
+                )}
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>
                   {groupView.shownCount}/{held.length} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
                 </span>

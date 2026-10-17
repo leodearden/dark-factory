@@ -52,6 +52,15 @@ from escalation.models import (
 logger = logging.getLogger(__name__)
 
 
+def _fd_still_names(fd: int, path: Path) -> bool:
+    held = os.fstat(fd)
+    try:
+        current = os.stat(path)
+    except FileNotFoundError:
+        return False
+    return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+
 @contextlib.contextmanager
 def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     """Per-escalation-id exclusive advisory lock using a stable sidecar file.
@@ -80,10 +89,19 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     It is never RENAMED or replaced — that is the stable-inode contract above
     (task 1609) and the whole reason the sidecar exists.  It IS unlinked, in
     exactly one place: ``sweep.reap_orphan_locks``, the server-start pass that
-    stops the root accumulating a sidecar per dead id.  That pass only ever
-    touches a DEAD id — one whose record is absent from both the queue root and
-    the archive — and ``make_id``'s monotonic durable counter can never re-mint
-    such an id, so no future writer can want the inode it removes.
+    stops the root accumulating a sidecar per id whose record has left it.  It
+    removes the sidecar of any id whose record is not in the queue root,
+    including archived ones a later writer may lock again — safe by the
+    DELETION-SAFE re-validation below.  ``make_id``'s counter sidecars are
+    never candidates (``SEQ_COUNTER_SUFFIX``).
+
+    DELETION-SAFE:
+    After acquiring the flock, the acquirer re-checks that the path still names
+    the inode it locked, and re-opens if not.  So a holder may unlink the
+    sidecar inside its critical section: a waiter queued on the old inode can
+    never run beside a newcomer that created a fresh one.  The stable-inode
+    contract above is unchanged — a sidecar is never renamed or replaced while
+    in use.
 
     Usage::
 
@@ -94,9 +112,17 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     # Defensively create queue_dir so standalone callers (e.g. task ε sweep/reaper)
     # can take the lock without having first instantiated an EscalationQueue.
     Path(queue_dir).mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    while True:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if _fd_still_names(fd, lock_path):
+                break
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
         finally:
@@ -2676,8 +2702,16 @@ class EscalationQueue:
         *,
         resolved_by: str | None = None,
         resolution_turns: int | None = None,
+        append_to_resolution: str | None = None,
     ) -> Escalation | None:
-        """Patch resolved_by and/or resolution_turns on an already-resolved escalation.
+        """Patch resolution fields on an already-closed escalation.
+
+        ``append_to_resolution`` appends a note to the resolution text after a
+        blank line.  It is append-only, and idempotent on the EXACT note text:
+        when that text already occurs anywhere in the resolution (a substring
+        test), nothing is appended or written.  A note that differs in any
+        character, for example one carrying a different pause reason, is a
+        new note and is appended.
 
         Updates the existing file in place wherever it lives (root or archive); never
         resurrects an archived file into the queue root.  The tmp file used for the
@@ -2693,7 +2727,7 @@ class EscalationQueue:
         already resolved/dismissed it.
 
         Returns the updated Escalation on success, or the unmodified Escalation when
-        called with no patch arguments (both resolved_by and resolution_turns are None).
+        there is nothing to patch (every argument None, or the note already present).
 
         Locking: the WHOLE read-modify-write — locate, parse, guard, mutate,
         write — is serialized per-id by ``escalation_id_lock``, matching every
@@ -2728,8 +2762,12 @@ class EscalationQueue:
             if esc.status not in ('resolved', 'dismissed'):
                 return None
 
-            # No-op early return: nothing to patch — avoid disk I/O when both args are None.
-            if resolved_by is None and resolution_turns is None:
+            note_needed = (
+                append_to_resolution is not None
+                and append_to_resolution not in (esc.resolution or '')
+            )
+            # No-op early return: nothing to patch — avoid disk I/O.
+            if resolved_by is None and resolution_turns is None and not note_needed:
                 return esc
 
             # Apply patches
@@ -2737,6 +2775,11 @@ class EscalationQueue:
                 esc.resolved_by = resolved_by
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
+            if note_needed:
+                esc.resolution = (
+                    f'{esc.resolution}\n\n{append_to_resolution}'
+                    if esc.resolution else append_to_resolution
+                )
 
             # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root).
             self._atomic_write_path(path, esc.to_json())
@@ -3164,7 +3207,17 @@ class EscalationQueue:
         - ``fused-memory/src/fused_memory/middleware/curator_escalator.py`` —
           three sites, ``make_id('curator')`` with ``task_id='task-curator'``
         - ``fused-memory/src/fused_memory/middleware/ticket_janitor.py`` —
-          two sites, ``make_id('ticket-janitor')`` with ``task_id='task-curator'``
+          two sites, both ``make_id('ticket-janitor')``, that differ in task_id:
+          ``ticket_janitor.py::TicketJanitor._surface_probe_defect`` stores the
+          literal ``task_id='task-curator'``; the second, in
+          ``ticket_janitor.py::TicketJanitor.tick``, stores the ticket's own
+          ``task_id`` whenever one is set and not ``'_unparseable_'``, and falls
+          back to ``'task-curator'`` only otherwise.  So the second site mints
+          stem ``esc-ticket-janitor-N`` carrying a REAL NUMERIC task_id (a live
+          specimen: stem ``esc-ticket-janitor-2`` with task_id ``'2859'``).
+
+        So the divergence is NOT confined to synthetic anchor ids: an ordinary
+        numeric task id can own a record whose stem does not encode it.
 
         THEREFORE NOTHING MAY DERIVE A TASK_ID FROM A FILENAME OR FROM AN
         ESCALATION ID.  State the false identity plainly so a future reader

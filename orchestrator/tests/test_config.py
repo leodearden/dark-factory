@@ -1255,6 +1255,7 @@ class TestParkStopConfig:
 class TestMergeVerifyStormGuardFields:
     """Defaults and overrides for the merge-verify storm-guard knobs."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_preserve_existing_behaviour(self):
         config = OrchestratorConfig()
         assert config.merge_verify_workspace is False
@@ -3233,7 +3234,10 @@ class TestOrchestratorConfigPrices:
     _MODEL_COSTS).
     """
 
-    _SEED_KEYS = {'gpt-5.4', 'gpt-6-astra', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
+    _SEED_KEYS = {
+        'gpt-5.4', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'o4-mini',
+        'gemini-3.1-pro-preview', 'gemini-3-flash',
+    }
 
     def test_prices_seeded_with_expected_rates(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -3244,6 +3248,10 @@ class TestOrchestratorConfigPrices:
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
         assert config.prices['gpt-6-astra'].input_per_1m == 10.00
         assert config.prices['gpt-6-astra'].output_per_1m == 50.00
+        assert config.prices['gpt-5.6-sol'].input_per_1m == 4.00
+        assert config.prices['gpt-5.6-sol'].output_per_1m == 20.00
+        assert config.prices['gpt-5.6-terra'].input_per_1m == 2.00
+        assert config.prices['gpt-5.6-terra'].output_per_1m == 12.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25
@@ -3712,6 +3720,28 @@ class TestMainTipSweepIsolatedPrefilterEnabled:
             'restart-only (same tier as the rest of the main_tip_sweep '
             'family) and must NOT be in RELOADABLE_FIELDS'
         )
+
+
+class TestMainTipSweepColdIntervalSecs:
+    """task 5812: the main-tip sweep builds warm by default, and at most once
+    per this many seconds runs a COLD control sweep as ground truth."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_defaults_to_one_day(self):
+        assert OrchestratorConfig().main_tip_sweep_cold_interval_secs == 86400.0
+
+    def test_zero_round_trips(self):
+        """Zero means every sweep cold — the pre-5812 behaviour."""
+        config = OrchestratorConfig(main_tip_sweep_cold_interval_secs=0)
+        assert config.main_tip_sweep_cold_interval_secs == 0
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(main_tip_sweep_cold_interval_secs=-1)
+
+    def test_not_in_reloadable_fields(self):
+        """Restart-only, the same tier as the rest of the main_tip_sweep family."""
+        assert 'main_tip_sweep_cold_interval_secs' not in RELOADABLE_FIELDS
 
 
 # ---------------------------------------------------------------------------

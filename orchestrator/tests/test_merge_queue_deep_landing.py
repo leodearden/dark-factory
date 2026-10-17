@@ -519,7 +519,9 @@ class TestLandedViaChainCarrier:
         assert set(rows[0]) == {
             'request_id', 'branch', 'state', 'snapshot_tip', 'merge_sha',
             'superseded_by', 'generation', 'reason', 'landed_via_chain',
+            'absorbed_request_ids',
         }
+        assert rows[0]['absorbed_request_ids'] == []
         assert rows[0]['request_id'] == req.request_id
         assert rows[0]['branch'] == '103'
         assert rows[0]['state'] == 'blocked'

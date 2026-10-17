@@ -110,6 +110,7 @@ from fused_memory.reconciliation.unlanded_path_check import (
     check_unlanded_path_claims,
 )
 from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
+from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -124,6 +125,7 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
+_RECORD_BODY_CHARS = 500
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
@@ -1305,6 +1307,9 @@ class MemoryConsolidator(BaseStage):
         # `..._enumeration_incomplete_kind` names which way it was partial.
         # Two additions, one pattern — 0-vs-N ambiguities resolved in the
         # stats rather than left for a reader to reconstruct from logs.
+        # The `_candidates`/`_errors` pair closes the last one (task 4851):
+        # `_invalidated` alone cannot tell "nothing was stale" from "every
+        # invalidation failed".
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and NONE of
         # these stats is set for this cycle.  That includes the enumeration
@@ -1331,6 +1336,12 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_status_snapshot_edges_scanned'] = (
                 snapshot_sweep_stats['scanned']
+            )
+            report.stats['stale_status_snapshot_edges_candidates'] = (
+                snapshot_sweep_stats['candidate_edges']
+            )
+            report.stats['stale_status_snapshot_edges_errors'] = (
+                snapshot_sweep_stats['errors']
             )
             report.stats['stale_blocked_edges_superseded'] = (
                 snapshot_sweep_stats['superseded']
@@ -1664,6 +1675,17 @@ class MemoryConsolidator(BaseStage):
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
+        # Episodes arrive newest-first (undatable last), so one the watermark filter
+        # dropped proves nothing newer lay past the cap. mem0's get_all scrolls in
+        # point-id order, which proves nothing, so its note rests on the count alone.
+        if len(new_episodes) == len(episodes):
+            episodes_str = _append_note(episodes_str, fetch_cap_note(
+                fetched=len(episodes), noun='episode(s)', cap_name='episode_limit', cap=self.episode_limit,
+            ))
+        memories_str = _append_note(memories_str, fetch_cap_note(
+            fetched=len(mem0_memories), noun='memory record(s)', cap_name='memory_limit',
+            cap=self.memory_limit,
+        ))
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
@@ -1727,6 +1749,14 @@ Review the above data and perform memory consolidation:
         self._undatable_freshness_records = 0
 
         event_summary = _format_events(ap.events)
+        deferred_events_note = clip_note(
+            omitted=ap.events_remaining,
+            omitted_noun='buffered event(s)',
+            cap_name='reconciliation.token_budget',
+            cap=ap.token_budget,
+            dropped_first='the newest events (still buffered for a later chunk)',
+        )
+        event_summary = _append_note(event_summary, deferred_events_note)
 
         # Store status (cheap fetch, always useful)
         status = await self._fetch_status()
@@ -1990,6 +2020,10 @@ def _format_events(events: list[ReconciliationEvent]) -> str:
     return '\n'.join(lines)
 
 
+def _append_note(body: str, note: str) -> str:
+    return f'{body}\n\n{note}' if note else body
+
+
 def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
     if not episodes:
         return 'No new episodes.', 0
@@ -1999,7 +2033,7 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
         raw = ep.get('content') or ''
         cleaned, n = strip_snapshot_lines(raw)
         total_stripped += n
-        content = cleaned[:500]
+        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
         lines.append(f'- [{ep.get("uuid", "?")}] {ep.get("created_at", "?")}: {content}')
     return '\n'.join(lines), total_stripped
 
@@ -2021,7 +2055,7 @@ def _format_memories(memories: list[dict]) -> tuple[str, int]:
         raw = m.get('memory') or ''
         cleaned, n = strip_snapshot_lines(raw)
         total_stripped += n
-        content = cleaned[:500]
+        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
         lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')

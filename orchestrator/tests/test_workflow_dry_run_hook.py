@@ -89,6 +89,9 @@ class _Scheduler:
     def clear_merge_phase(self, tid: str) -> None:
         pass
 
+    def blocked_writes_suppressed(self, tid: str, /) -> bool:
+        return False
+
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '42',
                    enabled: bool = True) -> tuple[TaskWorkflow, _Scheduler]:

@@ -334,6 +334,30 @@ async def test_verify_api_refusal_is_an_audited_agent_failure(git_root):
     )
 
 
+@pytest.mark.asyncio
+async def test_verify_cli_max_turns_is_an_audited_agent_failure(git_root):
+    """Task 4344: on claude_cli one invocation carries the whole verification,
+    so a turn-cap exhaustion must reach the census as its own token,
+    failure_token='cli_max_turns', not escape verify() as a RuntimeError.
+    Patched at the CLI seam so the whole chain is exercised, as above.
+    """
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = AgentResult(
+            success=False, output='', subtype='error_max_turns',
+        )
+        verifier = CodebaseVerifier(_default_config())
+        result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
+
+    assert result.verdict == 'inconclusive'
+    assert result.agent_failed is True
+    assert result.failure_token == 'cli_max_turns', (
+        f"Expected failure_token='cli_max_turns' but got {result.failure_token!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # MODEL-INVARIANT tests (task 4343): the two structured fields cannot desync.
 # ---------------------------------------------------------------------------

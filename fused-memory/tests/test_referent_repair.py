@@ -43,6 +43,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     EdgeNotFoundError,
 )
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
@@ -329,6 +330,26 @@ def _finding(**overrides) -> ReferentFinding:
     return ReferentFinding(**fields)
 
 
+def _junk_fallback_finding(**overrides) -> ReferentFinding:
+    """ROUTE 1: the whole-set fallback with a junk target — the live defect.
+
+    A paraphrased fact citing no task number at all, a derived referent set
+    holding only 'redis:6379', and an edge on a 'Task 1251' node.
+    """
+    fields = {
+        'old_endpoint_uuid': 'n-1251',
+        'old_endpoint_name': 'Task 1251',
+        'endpoint_referent': Referent(number='1251'),
+        'cited': (),
+        'referent_set': ('redis:6379',),
+        'intended_referent': Referent(number='6379', project_id='redis'),
+        'new_endpoint_uuid': None,
+        'resolvable': True,
+    }
+    fields.update(overrides)
+    return _finding(**fields)
+
+
 def _stats(*findings, endpoints_checked: int | None = None) -> ReferentStats:
     """zeta's return value, carrying *findings*.
 
@@ -360,6 +381,35 @@ def _reassigned(**overrides) -> dict:
     }
     payload.update(overrides)
     return payload
+
+
+def _repair_success_lines(caplog) -> list[logging.LogRecord]:
+    """The pass's "Referent repair executed" announcements.
+
+    Keyed on the FORMAT STRING, never on the rendered message, so the
+    emptied-node delete — INFO, on this very path — cannot be miscounted as a
+    repair announcement.
+    """
+    return [
+        r for r in caplog.records
+        if isinstance(r.msg, str)
+        and r.msg.startswith('Referent repair executed')
+    ]
+
+
+def _streaks(service) -> dict[str, int]:
+    """The storm gauge as an operator reads it: the public counters'
+    ``'streaks'`` entry."""
+    return service.referent_repair_counts()['streaks']
+
+
+async def _run_repairing_passes(
+    service, count: int, *, group_id: str = 'dark_factory',
+) -> None:
+    """Build a real streak of *count*: one episode per pass, each repairing one
+    endpoint against the fixture's cooperative backend."""
+    for _ in range(count):
+        await service._repair_episode_referents(_stats(_finding()), group_id=group_id)
 
 
 class TestTheEpisodeIdentityParameter:
@@ -1746,6 +1796,102 @@ class TestPerFindingFailureContainment:
             )
 
 
+class TestADegradedTargetLookupDefersTheRepair:
+    """"Could not look" is not "not there", so eta acts on neither reading.
+
+    zeta stamps `uuid_lookup_degraded=True` when its lookup of the intended
+    target raised, and always pairs it with `new_endpoint_uuid=None`. Read as
+    "absent", that None would send the finding through resolve-or-MINT and book
+    `minted=True` for a node nobody showed was missing. eta instead DEFERS it:
+    nothing is written, and the record is `'failed'`, the infrastructure bucket,
+    because the backend did not cooperate. It is never a refusal.
+    """
+
+    @staticmethod
+    def _degraded(**overrides) -> ReferentFinding:
+        return _finding(new_endpoint_uuid=None, uuid_lookup_degraded=True, **overrides)
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_finding_writes_nothing_and_books_failed(self, service):
+        stats = await service._repair_episode_referents(
+            _stats(self._degraded()), group_id='dark_factory',
+        )
+
+        assert_never_repaired(service)
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'failed'
+        assert record.minted is False
+        assert record.moved is False
+        assert record.new_endpoint_uuid == ''
+        assert record.intended_referent == 'Task 3127'
+        assert 'Task 3127' in record.reason
+        assert stats.failed == 1
+        assert stats.nodes_minted == 0
+        assert stats.repaired == 0
+        assert stats.flagged_unrepairable == 0, (
+            'infrastructure, not a refusal: it must stay out of the NEVER-GUESS '
+            'bucket'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_deferral_is_contained_to_that_finding(self, service):
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                self._degraded(edge_uuid='e1'),
+                _finding(
+                    edge_uuid='e2',
+                    intended_referent=Referent(number='3128'),
+                    new_endpoint_uuid='n-3128',
+                ),
+            ),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3128', group_id='dark_factory', merge_duplicates=False,
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e2', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        assert [r.outcome for r in stats.repairs] == ['failed', 'repaired']
+
+    @pytest.mark.asyncio
+    async def test_the_deferral_warns_once_naming_the_edge_and_announces_no_repair(
+        self, service, caplog,
+    ):
+        with caplog.at_level(logging.INFO, logger=_MEMORY_SERVICE_LOGGER):
+            await service._repair_episode_referents(
+                _stats(self._degraded()), group_id='dark_factory',
+            )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'e1' in warnings[0].getMessage()
+        assert _repair_success_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_fallback_target_is_deferred_not_refused_as_implausible(
+        self, service,
+    ):
+        """The plausibility guard reads target existence off the same lookup.
+        Reading a degraded answer as "absent" would refuse with a reason saying
+        no node of that name exists, a claim that lookup never checked."""
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        stats = await service._repair_episode_referents(
+            _stats(_junk_fallback_finding(uuid_lookup_degraded=True)),
+            group_id='dark_factory',
+        )
+
+        record = stats.repairs[0]
+        assert record.outcome == 'failed'
+        assert stats.flagged_unrepairable == 0
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+
+
 class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
     """The thing this pass EXISTS to do was the one thing it never said.
 
@@ -1757,17 +1903,6 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
     and the level `server/main.py` sets as the deployed root, so the line
     genuinely lands.
     """
-
-    @staticmethod
-    def _success_lines(caplog) -> list[logging.LogRecord]:
-        """Keyed on the FORMAT STRING, never on the rendered message, so the
-        emptied-node delete — INFO, on this very path — cannot be miscounted
-        as a repair announcement."""
-        return [
-            r for r in caplog.records
-            if isinstance(r.msg, str)
-            and r.msg.startswith('Referent repair executed')
-        ]
 
     @staticmethod
     def _payload(record: logging.LogRecord) -> dict:
@@ -1791,7 +1926,7 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
             )
 
         assert stats.repaired == 1
-        lines = self._success_lines(caplog)
+        lines = _repair_success_lines(caplog)
         assert len(lines) == 1
         assert lines[0].levelno == logging.INFO
         payload = self._payload(lines[0])
@@ -1843,7 +1978,7 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
         # below would be pinning the uninteresting half of the case.
         assert stats.repairs[0].deleted_emptied_node == 'n-3129'
         assert 'deleted_emptied_node' in stats.repairs[0].to_dict()
-        payload = self._payload(self._success_lines(caplog)[0])
+        payload = self._payload(_repair_success_lines(caplog)[0])
         assert 'deleted_emptied_node' not in payload
         # And the deletion still announces itself on its own line.
         assert any(
@@ -1868,7 +2003,7 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
             )
 
         assert _finding().old_endpoint_uuid == 'n-3129'
-        assert self._payload(self._success_lines(caplog)[0])[
+        assert self._payload(_repair_success_lines(caplog)[0])[
             'old_endpoint_uuid'
         ] == 'n-reread'
         assert stats.repairs[0].old_endpoint_uuid == 'n-reread'
@@ -1918,7 +2053,7 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
         assert [r.moved for r in stats.repairs] == [True, False, False, False]
         assert stats.repaired == 1
 
-        lines = self._success_lines(caplog)
+        lines = _repair_success_lines(caplog)
         assert len(lines) == stats.repaired
         assert self._payload(lines[0])['edge_uuid'] == 'e-moved'
 
@@ -1941,7 +2076,7 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
 
         assert stats.repairs[0].minted is expected_minted
         assert self._payload(
-            self._success_lines(caplog)[0],
+            _repair_success_lines(caplog)[0],
         )['minted'] is expected_minted
 
     @pytest.mark.asyncio
@@ -1961,7 +2096,7 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
 
         assert stats.failed == 1
         assert stats.repaired == 0
-        assert self._success_lines(caplog) == []
+        assert _repair_success_lines(caplog) == []
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
         assert 'e1' in warnings[0].getMessage()
@@ -1983,7 +2118,7 @@ class TestAnExecutedRepairEmitsOneStructuredSuccessLine:
             )
 
         assert stats.repaired == 1
-        assert len(self._success_lines(caplog)) == 1
+        assert len(_repair_success_lines(caplog)) == 1
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
         assert 'committed' in warnings[0].getMessage()
@@ -2106,9 +2241,12 @@ class TestReferentRepairStreakSemantics:
         assert stats.repaired == 0
         assert service._referent_repair_streaks['dark_factory'] == 0
 
-    async def test_a_failed_only_pass_does_not_increment(self, service):
-        """A broken backend must never masquerade as a repair storm."""
-        service._referent_repair_streaks['dark_factory'] = 3
+    async def test_a_failed_only_pass_leaves_the_streak_unchanged(self, service):
+        """A backend fault is no evidence either way. It must not masquerade
+        as a storm, and it must not pass as the positive health signal the
+        reset arm needs: "we looked and none needed moving" is false for an
+        episode whose repair the backend refused."""
+        await _run_repairing_passes(service, 2)
         service.graphiti.ensure_entity_node = AsyncMock(
             side_effect=RuntimeError('falkor down'),
         )
@@ -2118,7 +2256,50 @@ class TestReferentRepairStreakSemantics:
         )
 
         assert stats.failed == 1
-        assert service._referent_repair_streaks['dark_factory'] == 0
+        assert _streaks(service)['dark_factory'] == 2
+
+    async def test_a_degraded_deferral_only_pass_leaves_the_streak_unchanged(
+        self, service,
+    ):
+        await _run_repairing_passes(service, 2)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid=None, uuid_lookup_degraded=True)),
+            group_id='dark_factory',
+        )
+
+        assert stats.failed == 1
+        assert _streaks(service)['dark_factory'] == 2
+
+    async def test_a_failed_only_pass_does_not_create_the_streak_key(self, service):
+        """No conclusion has been drawn about that group, exactly as on the
+        checked-nothing arm."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+
+        assert 'reify' not in _streaks(service)
+
+    async def test_a_pass_that_repaired_and_failed_still_increments(self, service):
+        """A real repair outranks a co-occurring failure."""
+        await _run_repairing_passes(service, 2)
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), 'n-3127'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 1
+        assert stats.failed == 1
+        assert _streaks(service)['dark_factory'] == 3
 
     async def test_a_moved_false_no_op_pass_does_not_increment(self, service):
         """`reassign_edge`'s corroborate-before-acting no-op: the edge was
@@ -2482,6 +2663,31 @@ class TestTheStormGate:
             'run to the threshold'
         )
 
+    async def test_a_backend_blip_mid_storm_neither_pages_nor_disarms_the_alarm(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        await _run_repairing_passes(service, 2)
+        assert _streaks(service)['dark_factory'] == 2
+        assert _escalations(to_thread_spy) == []
+
+        await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid=None, uuid_lookup_degraded=True)),
+            group_id='dark_factory',
+        )
+        assert _streaks(service)['dark_factory'] == 2
+        assert _escalations(to_thread_spy) == []
+
+        await _run_repairing_passes(service, 1)
+        assert _streaks(service)['dark_factory'] == 3
+        fired = _escalations(to_thread_spy)
+        assert len(fired) == 1
+        assert fired[0][1]['streak'] == 3
+
     async def test_a_checked_nothing_pass_never_re_pages_an_already_breached_streak(
         self, service, to_thread_spy, monkeypatch,
     ):
@@ -2572,7 +2778,9 @@ class TestTheStormGateProjectRoot:
             'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
         )
         service.set_known_projects({})
-        service.config.taskmaster.project_root = '/tmp/server-cwd-trap'
+        # Plant the whole section so the trap doesn't depend on whatever
+        # `taskmaster` section the test config happens to carry.
+        service.config.taskmaster = TaskmasterConfig(project_root='/tmp/server-cwd-trap')
 
         await service._repair_episode_referents(
             _stats(_finding()), group_id='dark_factory',
@@ -2954,32 +3162,12 @@ class TestTheTargetPlausibilityGuard:
         )
         return service
 
-    @staticmethod
-    def _junk(**overrides) -> ReferentFinding:
-        """ROUTE 1: the whole-set fallback with a junk target — the live defect.
-
-        A paraphrased fact citing no task number at all, a derived referent set
-        holding only 'redis:6379', and an edge on a 'Task 1251' node.
-        """
-        fields = {
-            'old_endpoint_uuid': 'n-1251',
-            'old_endpoint_name': 'Task 1251',
-            'endpoint_referent': Referent(number='1251'),
-            'cited': (),
-            'referent_set': ('redis:6379',),
-            'intended_referent': Referent(number='6379', project_id='redis'),
-            'new_endpoint_uuid': None,
-            'resolvable': True,
-        }
-        fields.update(overrides)
-        return _finding(**fields)
-
     @pytest.mark.asyncio
     async def test_route_1_a_junk_fallback_target_mints_nothing(self, service):
         """(1) THE HEADLINE. Nothing is minted, nothing is moved, no summary is
         touched, and the refusal is recorded naming the target."""
         stats = await service._repair_episode_referents(
-            _stats(self._junk()), group_id='dark_factory',
+            _stats(_junk_fallback_finding()), group_id='dark_factory',
         )
 
         assert len(stats.repairs) == 1
@@ -3014,7 +3202,7 @@ class TestTheTargetPlausibilityGuard:
         qualified target whose project IS registered is a real cross-project
         reference."""
         stats = await service._repair_episode_referents(
-            _stats(self._junk(
+            _stats(_junk_fallback_finding(
                 referent_set=('reify:132',),
                 intended_referent=Referent(number='132', project_id='reify'),
             )),
@@ -3029,7 +3217,7 @@ class TestTheTargetPlausibilityGuard:
         """(4) Condition (ii). THE DOMINANT LIVE SHAPE — this is what the
         referent-fidelity PRD exists to repair, and it must not regress."""
         stats = await service._repair_episode_referents(
-            _stats(self._junk(
+            _stats(_junk_fallback_finding(
                 referent_set=('Task 3127',),
                 intended_referent=Referent(number='3127'),
             )),
@@ -3044,7 +3232,7 @@ class TestTheTargetPlausibilityGuard:
         """(5) Condition (iii): zeta found exactly one node already carrying
         that name, so repointing onto it mints nothing."""
         stats = await service._repair_episode_referents(
-            _stats(self._junk(new_endpoint_uuid='n-redis')),
+            _stats(_junk_fallback_finding(new_endpoint_uuid='n-redis')),
             group_id='dark_factory',
         )
 
@@ -3061,7 +3249,7 @@ class TestTheTargetPlausibilityGuard:
         )
 
         stats = await service._repair_episode_referents(
-            _stats(self._junk()), group_id='dark_factory',
+            _stats(_junk_fallback_finding()), group_id='dark_factory',
         )
 
         assert stats.repairs[0].outcome == 'unrepairable'
@@ -3223,6 +3411,28 @@ class TestTheUserObservableSignalEndToEnd:
         )
         service.graphiti.reassign_edge.assert_awaited_once()
         service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_zeta_lookup_defers_the_repair_end_to_end(self, service):
+        """The control route with zeta's target lookup failing. zeta still
+        records the finding and flags the lookup degraded; eta branches on
+        that flag as zeta actually populates it, and writes nothing."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        found, stats = await self._pipeline(
+            service, referents=(Referent(number='3127'),),
+            endpoint_name='Task 3129', endpoint_uuid='n-3129',
+        )
+
+        assert found.findings[0].uuid_lookup_degraded is True
+        assert found.findings[0].resolvable is True
+        assert stats.repairs[0].outcome == 'failed'
+        assert stats.nodes_minted == 0
+        assert stats.repaired == 0
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti.reassign_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_duplicate_name_target_refuses_and_merges_nothing(

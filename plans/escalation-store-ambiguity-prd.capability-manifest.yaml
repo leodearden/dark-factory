@@ -4,6 +4,11 @@ tasks:
 - label: α
   task_id: 3163
   title: Deny escalation read tools to reconciliation stage agents
+  note: 'Task 3250 narrowed escalation-write-stays-sanctioned from "escalate_blocker
+    in no disallow list" to "Stage 2 only": Stage 1 and Stage 3 now deny escalate_blocker
+    and escalate_info via DISALLOW_ESCALATION_WRITES, matching the prompts'' no-action
+    boundary clause. Its absent-grep over cli_stage_runner.py was falsified by that
+    deny and became a manual check pointing at the Stage-2 retention test.'
   capabilities:
   - name: recon-stage-disallow-covers-escalation-reads
     binding: capability→producer (wired) — α edits cli_stage_runner.py:77-84; hook
@@ -17,16 +22,15 @@ tasks:
       - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
       expect: present
   - name: escalation-write-stays-sanctioned
-    binding: rejection-mechanism, inverted — escalate_blocker must NOT appear in any
-      disallow list; it is the sole sanctioned recon use (prompts/stage2.py:623,647-648),
-      so over-denying breaks Stage 2 FIX D
+    binding: rejection-mechanism, inverted — escalate_blocker must NOT appear in STAGE2_DISALLOWED;
+      it is the sole sanctioned recon use (Stage 2 FIX D Stale Flag Escalation, prompts/stage2.py),
+      so over-denying there breaks FIX D. Since task 3250 it IS denied in Stage 1 and
+      Stage 3 via DISALLOW_ESCALATION_WRITES
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: mcp__escalation__escalate_blocker
-      paths:
-      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
-      expect: absent
+      kind: manual
+      reason: absence from one composed stage list is not expressible as a file grep;
+        pinned by fused-memory/tests/test_stages.py::TestDisallowedToolLists::test_escalate_blocker_stays_allowed_in_stage2_only
   - name: stage-prompt-declares-the-boundary
     binding: capability→producer — boundary paragraph rendered from ONE ESCALATION_BOUNDARY*
       module constant (INV-5), extending the scope wording at prompts/stage2.py:647-648

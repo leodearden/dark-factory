@@ -53,7 +53,7 @@ class TestStartReportPreservesExistingEntry:
         real_id = real['finding_id']
 
         null = state.add_finding(
-            run_id='r1', severity='low', category='other',
+            run_id='r1', severity='minor', category='other',
             description='null null observation', suggested_action='note',
             actionable=False,
         )
@@ -105,7 +105,7 @@ class TestStartReportPreservesExistingEntry:
         assert any(item['finding_id'] == real_id for item in report['flagged_items'])
 
         dup_null = state.add_finding(
-            run_id='r1', severity='low', category='other',
+            run_id='r1', severity='minor', category='other',
             description='null null observation', suggested_action='note',
             actionable=False,
         )
@@ -121,7 +121,7 @@ class TestStartReportPreservesExistingEntry:
         state, _t = self._make_state()
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
+            run_id='r1', severity='minor', category='cat', description='d',
             suggested_action='a', task_id='1', flag_type='f',
         )
         state.complete('r1', 'summary text')
@@ -138,7 +138,7 @@ class TestStartReportPreservesExistingEntry:
         assert entry_after.summary == summary_before
 
         result = state.add_finding(
-            run_id='r1', severity='high', category='cat', description='late finding',
+            run_id='r1', severity='serious', category='cat', description='late finding',
             suggested_action='a',
         )
         assert result['error'] == 'report_already_completed'
@@ -174,7 +174,7 @@ class TestStartReportPreservesExistingEntryDurable:
             real_id = real['finding_id']
 
             null = state.add_finding(
-                run_id='r1', severity='low', category='other',
+                run_id='r1', severity='minor', category='other',
                 description='null null observation', suggested_action='note',
                 actionable=False,
             )
@@ -238,7 +238,7 @@ class TestStartReportResultIsUnambiguous:
         state, _t = self._make_state()
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
+            run_id='r1', severity='minor', category='cat', description='d',
             suggested_action='a', task_id='1', flag_type='f',
         )
 
@@ -339,7 +339,7 @@ class TestStartReportResultIsUnambiguous:
         assert first['already_started'] is False
 
         add_result = await tm.call_tool('add_finding', {
-            'run_id': 'r1', 'severity': 'low', 'category': 'cat',
+            'run_id': 'r1', 'severity': 'minor', 'category': 'cat',
             'description': 'd', 'suggested_action': 'a', 'task_id': '1', 'flag_type': 'f',
         })
         assert 'finding_id' in add_result
@@ -412,7 +412,7 @@ class TestStartReportActivePointerAndPersistence:
         state, _t = self._make_state()
         state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
         finding_one = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d1',
+            run_id='r1', severity='minor', category='cat', description='d1',
             suggested_action='a', task_id='1', flag_type='f',
         )
         assert 'finding_id' in finding_one, finding_one
@@ -429,7 +429,7 @@ class TestStartReportActivePointerAndPersistence:
         assert state._active['r1'] == 'stage_two'  # pointer not stolen
 
         finding_two = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d2',
+            run_id='r1', severity='minor', category='cat', description='d2',
             suggested_action='a', task_id='2', flag_type='f',
         )
         assert 'finding_id' in finding_two, finding_two
@@ -447,7 +447,7 @@ class TestStartReportActivePointerAndPersistence:
         state, _t = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         finding = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
+            run_id='r1', severity='minor', category='cat', description='d',
             suggested_action='a', task_id='1', flag_type='f',
         )
         assert 'finding_id' in finding, finding
@@ -457,7 +457,7 @@ class TestStartReportActivePointerAndPersistence:
         # persisted rows carried no is_active=True row for this run.
         del state._active['r1']
         blocked = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d2',
+            run_id='r1', severity='minor', category='cat', description='d2',
             suggested_action='a', task_id='2', flag_type='f',
         )
         assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
@@ -467,7 +467,7 @@ class TestStartReportActivePointerAndPersistence:
         assert state._active['r1'] == 's1'  # pointer restored
 
         resumed = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d3',
+            run_id='r1', severity='minor', category='cat', description='d3',
             suggested_action='a', task_id='3', flag_type='f',
         )
         assert 'finding_id' in resumed, resumed
@@ -487,7 +487,7 @@ class TestStartReportActivePointerAndPersistence:
             state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
             state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
             state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d',
+                run_id='r1', severity='minor', category='cat', description='d',
                 suggested_action='a', task_id='1', flag_type='f',
             )
             calls_before = store.upsert_many_calls
@@ -513,7 +513,7 @@ class TestStartReportActivePointerAndPersistence:
             state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
             state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
             state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d',
+                run_id='r1', severity='minor', category='cat', description='d',
                 suggested_action='a', task_id='1', flag_type='f',
             )
             del state._active['r1']
@@ -542,7 +542,7 @@ class TestStartReportActivePointerAndPersistence:
         state, t = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         finding = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
+            run_id='r1', severity='minor', category='cat', description='d',
             suggested_action='a', task_id='1', flag_type='f',
         )
         assert 'finding_id' in finding, finding
@@ -564,7 +564,7 @@ class TestStartReportActivePointerAndPersistence:
         assert 'r1' not in state._active  # tick() cleared the pointer it owned
 
         blocked = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d2',
+            run_id='r1', severity='minor', category='cat', description='d2',
             suggested_action='a', task_id='2', flag_type='f',
         )
         assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
@@ -574,7 +574,7 @@ class TestStartReportActivePointerAndPersistence:
         assert state._active['r1'] == 's1'  # pointer restored onto the surviving sibling
 
         resumed = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d3',
+            run_id='r1', severity='minor', category='cat', description='d3',
             suggested_action='a', task_id='3', flag_type='f',
         )
         assert 'finding_id' in resumed, resumed
@@ -600,7 +600,7 @@ class TestStartReportActivePointerAndPersistence:
             state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
             state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
             finding = state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d',
+                run_id='r1', severity='minor', category='cat', description='d',
                 suggested_action='a', task_id='1', flag_type='f',
             )
             assert 'finding_id' in finding, finding
@@ -622,7 +622,7 @@ class TestStartReportActivePointerAndPersistence:
             assert 'r1' not in fresh_state._active
 
             blocked = fresh_state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d2',
+                run_id='r1', severity='minor', category='cat', description='d2',
                 suggested_action='a', task_id='2', flag_type='f',
             )
             assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
@@ -632,7 +632,7 @@ class TestStartReportActivePointerAndPersistence:
             assert fresh_state._active['r1'] == 's1'
 
             resumed = fresh_state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d3',
+                run_id='r1', severity='minor', category='cat', description='d3',
                 suggested_action='a', task_id='3', flag_type='f',
             )
             assert 'finding_id' in resumed, resumed
@@ -676,7 +676,7 @@ _KNOWN_STAGES = frozenset({'memory_consolidator', 'task_knowledge_sync', 'integr
 
 def _file_finding(state, run_id, description):
     result = state.add_finding(
-        run_id=run_id, severity='low', category='cat', description=description,
+        run_id=run_id, severity='minor', category='cat', description=description,
         suggested_action='a', task_id=description, flag_type='f',
     )
     assert 'finding_id' in result, result

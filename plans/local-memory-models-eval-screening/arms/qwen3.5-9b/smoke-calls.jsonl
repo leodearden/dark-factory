@@ -1,0 +1,1 @@
+{"started_at":"2026-10-07T20:08:47.375774Z","duration_ms":15340.230460744351,"method":"POST","path":"/v1/chat/completions","status":200,"request_model":"qwen3.5-9b","request_max_tokens":4096,"request_response_format":"json_schema","prompt_tokens":75,"completion_tokens":785,"finish_reason":"stop","error_excerpt":null}

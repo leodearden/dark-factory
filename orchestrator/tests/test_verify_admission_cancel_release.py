@@ -3,7 +3,8 @@
 
 TEST-ONLY: this module pins existing, already-correct behaviour in
 ``_admission_slot``. No production behaviour change is expected or made
-here — see ``_admission_slot``'s docstring in ``verify.py`` for the
+here — see ``_flock_slot``'s docstring in ``verify.py`` (the flock half
+``_admission_slot`` composes with the admission gate since task 5628) for the
 cross-reference back to this module.
 
 Helpers are kept MODULE-LOCAL (never conftest.py) — mirrors
@@ -53,6 +54,11 @@ from shared.verify_admission import acquire_task_slot
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import _admission_slot
+from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionRequest
+
+
+def _task_request() -> AdmissionRequest:
+    return AdmissionPlan.begin(role='task', task_id=None).request(module=None, scope_kind=None)
 
 
 async def _await_flag(event: threading.Event, *, timeout: float = 5.0, msg: str) -> None:
@@ -131,7 +137,7 @@ async def test_cancel_mid_acquire_releases_the_slot_the_thread_later_wins(tmp_pa
 
     async def _run() -> None:
         nonlocal body_ran
-        async with _admission_slot('task', config):
+        async with _admission_slot('task', config, _task_request()):
             body_ran = True
 
     with contextlib.ExitStack() as stack:
@@ -180,10 +186,8 @@ class _GatedRaisingAcquire:
     calling thread on a gate and then raises ``OSError`` — used to pin
     ``_release_if_acquired``'s ``fut.exception() is not None`` guard: the
     done-callback must NOT call ``__exit__`` on a context manager whose
-    ``__enter__`` never successfully completed. Adapted from
-    ``_DeterministicAcquire`` (test_verify_admission_integration_gate.py:
-    193-261), copied module-local (not imported) per that file's own stated
-    helpers-are-module-local rationale.
+    ``__enter__`` never successfully completed. Kept module-local (not
+    imported), per the helpers-are-module-local rationale above.
 
     ``self.gate`` is a ``threading.Event``, NOT ``asyncio.Event`` —
     ``_admission_slot`` drives ``__enter__``/``__exit__`` from a real
@@ -234,7 +238,7 @@ async def test_cancel_mid_acquire_does_not_exit_a_cm_whose_enter_raised(tmp_path
 
     async def _run() -> None:
         nonlocal body_ran
-        async with _admission_slot('task', config):
+        async with _admission_slot('task', config, _task_request()):
             body_ran = True
 
     try:

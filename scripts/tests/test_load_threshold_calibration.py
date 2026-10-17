@@ -24,6 +24,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,15 +34,14 @@ import pytest
 REPO_ROOT = Path(__file__).parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'load-threshold-calibration.py'
 
-# The real store schema, copied here rather than imported: this suite cannot
-# rely on `sampler` being importable (see the module docstring).
+# A copy of sampler.store.SCHEMA, because this suite cannot import `sampler`
+# (see the module docstring). It lives until task 6773 has these tests import
+# SCHEMA through scripts/_checkout.py.
 #
 # NOTHING IN THIS SUITE RECONCILES THIS COPY, and it cannot: reconciling means
 # importing the writer. Every test below reads a DB built from this fixture, so
 # if sampler.store's schema moved, all of them would stay green against a shape
-# the store no longer writes -- measured, by renaming the `metric` column in
-# sampler.store: 73 green here, and the gate returning no_samples_in_window
-# against the live corpus.
+# the store no longer writes.
 #
 # The reconciler is therefore in the SAMPLER suite, which can import both sides:
 # sampler/tests/test_load_metrics.py::TestCalibrationScriptArmTableLockstep
@@ -55,9 +55,10 @@ CREATE TABLE IF NOT EXISTS samples (
     metric TEXT NOT NULL,
     value REAL NOT NULL,
     window_mean REAL,
-    window_max REAL
+    window_max REAL,
+    leaf TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples (metric, ts);
+CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -109,17 +110,22 @@ def load_script(*, real_host_defaults: bool = False):
     return module
 
 
-def seed_db(path: Path, series: dict[str, list[float]], *, start_ts: int = 1_000_000,
-            step: int = 5) -> Path:
-    """Write a DB with the real schema and one row per value, spaced `step` s."""
+def seed_db(path: Path, series: Mapping[str | tuple[str, str], list[float]], *,
+            start_ts: int = 1_000_000, step: int = 5) -> Path:
+    """Write a DB with the real schema and one row per value, spaced `step` s.
+
+    A plain ``str`` key is a host-level metric (``leaf`` NULL); a
+    ``(metric, leaf)`` pair is one cgroup leaf's series.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     try:
         conn.executescript(_SCHEMA)
-        for metric, values in series.items():
+        for key, values in series.items():
+            metric, leaf = (key, None) if isinstance(key, str) else key
             conn.executemany(
-                'INSERT INTO samples (ts, metric, value) VALUES (?, ?, ?)',
-                [(start_ts + i * step, metric, v) for i, v in enumerate(values)],
+                'INSERT INTO samples (ts, metric, leaf, value) VALUES (?, ?, ?, ?)',
+                [(start_ts + i * step, metric, leaf, v) for i, v in enumerate(values)],
             )
         conn.commit()
     finally:
@@ -153,6 +159,32 @@ def hermetic(argv) -> list[str]:
 def trailing_json(stdout: str) -> dict:
     """The script's contract: stdout's LAST line parses as JSON."""
     return json.loads(stdout.strip().splitlines()[-1])
+
+
+def _entries(payload: dict, section: str) -> list[dict]:
+    entries = payload[section]
+    assert isinstance(entries, list), (
+        f'{section!r} must be a list of {{metric, leaf, ...}} entries, '
+        f'got {type(entries).__name__}: {entries!r}'
+    )
+    return entries
+
+
+def series_entry(payload: dict, section: str, metric: str,
+                 leaf: str | None = None) -> dict:
+    """The one entry of a per-series JSON section naming *metric* and *leaf*."""
+    matches = [entry for entry in _entries(payload, section)
+               if (entry['metric'], entry['leaf']) == (metric, leaf)]
+    assert len(matches) == 1, (
+        f'expected exactly one {section!r} entry for {(metric, leaf)}, '
+        f'got {len(matches)}: {payload[section]!r}'
+    )
+    return matches[0]
+
+
+def series_keys(payload: dict, section: str) -> set[tuple[str, str | None]]:
+    """Every ``(metric, leaf)`` a per-series JSON section reports."""
+    return {(entry['metric'], entry['leaf']) for entry in _entries(payload, section)}
 
 
 # ── the module body is stdlib-only ──────────────────────────────────────────
@@ -314,20 +346,23 @@ def test_the_percentile_is_nearest_rank_with_a_tie_break_that_does_not_move():
     assert module.pct([], 0.5) != module.pct([], 0.5)  # NaN
 
 
-def test_percentiles_are_reported_per_metric_including_colon_stems(tmp_path: Path):
+def test_percentiles_are_reported_per_series_including_per_leaf_ones(tmp_path: Path):
     db = seed_db(tmp_path / 'db.sqlite', {
         'runqueue_ratio': [float(i) for i in range(1, 101)],
-        'own_cpu_some10:orchestrator-reify.service': [float(i) for i in range(1, 101)],
+        ('own_cpu_some10', 'orchestrator-reify.service'):
+            [float(i) for i in range(1, 101)],
     })
 
     result = run_script('--db', str(db), '--no-report')
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    percentiles = payload['percentiles']
-    assert 'runqueue_ratio' in percentiles
-    assert 'own_cpu_some10:orchestrator-reify.service' in percentiles
-    for stats in percentiles.values():
+    assert series_keys(payload, 'percentiles') == {
+        ('runqueue_ratio', None),
+        ('own_cpu_some10', 'orchestrator-reify.service'),
+    }
+    for entry in payload['percentiles']:
+        stats = entry['stats']
         assert set(stats) >= {'n', 'p50', 'p90', 'p95', 'p99', 'max'}
         assert stats['n'] == 100
         assert stats['max'] == pytest.approx(100.0)
@@ -357,7 +392,7 @@ def test_an_empty_db_exits_zero_with_a_named_degradation(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     payload = trailing_json(result.stdout)
     assert 'no_samples_in_window' in payload['degradations'], payload
-    assert payload['percentiles'] == {}
+    assert payload['percentiles'] == []
 
 
 def test_a_missing_db_exits_zero_with_a_named_degradation(tmp_path: Path):
@@ -366,6 +401,48 @@ def test_a_missing_db_exits_zero_with_a_named_degradation(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     payload = trailing_json(result.stdout)
     assert 'db_unavailable' in payload['degradations'], payload
+
+
+_PRE_LEAF_SAMPLES_DDL = (
+    'CREATE TABLE samples (ts INTEGER NOT NULL, metric TEXT NOT NULL, '
+    'value REAL NOT NULL, window_mean REAL, window_max REAL)'
+)
+
+
+def test_an_unmigrated_corpus_exits_zero_naming_corpus_not_migrated(tmp_path: Path):
+    """A corpus the sampler has not yet migrated is named, never misread.
+
+    Its per-leaf rows carry the leaf inside the metric name, so no series in it
+    can be read by metric and leaf. The store migrates the file on the
+    sampler's next tick; until then the run says so and still exits 0.
+    """
+    db = tmp_path / 'pre-leaf.sqlite'
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(_PRE_LEAF_SAMPLES_DDL)
+        conn.executemany(
+            'INSERT INTO samples (ts, metric, value) VALUES (?, ?, ?)',
+            [(1_000_000 + i * 5, metric, 1.0)
+             for i in range(10)
+             for metric in ('own_cpu_some10:x', 'runqueue_read_ok')],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+
+    assert result.returncode == 0, result.stderr
+    payload = trailing_json(result.stdout)
+    assert 'corpus_not_migrated' in payload['degradations'], payload['degradations']
+    assert payload['percentiles'] == []
+    human_report = result.stdout.strip().splitlines()[:-1]
+    degradations_section = human_report[human_report.index('## Degradations'):]
+    assert any(line.startswith('- corpus_not_migrated')
+               for line in degradations_section), degradations_section
+
+    read = load_script().read_series(db, None)
+    assert read.degradations[0].startswith('corpus_not_migrated'), read.degradations
 
 
 # ── D11: hold fraction and hold streak ──────────────────────────────────────
@@ -507,7 +584,7 @@ def test_the_ladder_lands_in_the_trailing_json(tmp_path: Path):
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    candidates = payload['holds']['runqueue_ratio']
+    candidates = series_entry(payload, 'holds', 'runqueue_ratio')['candidates']
     by_threshold = {c['threshold']: c for c in candidates}
     assert set(by_threshold) == {1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0}
 
@@ -521,25 +598,26 @@ def test_the_ladder_lands_in_the_trailing_json(tmp_path: Path):
     assert at_eight['hold_fraction'] == pytest.approx(0.0)
 
 
-def test_a_stem_arm_reports_per_leaf_and_is_never_pooled(tmp_path: Path):
+def test_a_per_leaf_arm_reports_per_leaf_and_is_never_pooled(tmp_path: Path):
     """Averaging seven unrelated projects' CPU pressure describes nothing."""
     db = seed_db(tmp_path / 'db.sqlite', {
-        'own_cpu_some10:orchestrator-reify.service': [90.0] * 100,
-        'own_cpu_some10:orchestrator-dark-factory.service': [1.0] * 100,
+        ('own_cpu_some10', 'orchestrator-reify.service'): [90.0] * 100,
+        ('own_cpu_some10', 'orchestrator-dark-factory.service'): [1.0] * 100,
     })
 
     result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    holds = payload['holds']
-    assert set(holds) == {
-        'own_cpu_some10:orchestrator-reify.service',
-        'own_cpu_some10:orchestrator-dark-factory.service',
+    assert series_keys(payload, 'holds') == {
+        ('own_cpu_some10', 'orchestrator-reify.service'),
+        ('own_cpu_some10', 'orchestrator-dark-factory.service'),
     }
-    hot = {c['threshold']: c for c in holds['own_cpu_some10:orchestrator-reify.service']}
-    cold = {c['threshold']: c
-            for c in holds['own_cpu_some10:orchestrator-dark-factory.service']}
+    hot = {c['threshold']: c for c in series_entry(
+        payload, 'holds', 'own_cpu_some10', 'orchestrator-reify.service')['candidates']}
+    cold = {c['threshold']: c for c in series_entry(
+        payload, 'holds', 'own_cpu_some10',
+        'orchestrator-dark-factory.service')['candidates']}
     assert hot[80.0]['hold_fraction'] == pytest.approx(1.0)
     assert cold[80.0]['hold_fraction'] == pytest.approx(0.0)
 
@@ -571,7 +649,7 @@ def test_an_unwritable_report_dir_is_a_named_degradation_not_a_traceback(
                   if d.startswith('report_unwritable'))
     assert str(missing) in detail, detail
     # The analysis itself is still delivered, not swallowed with the write.
-    assert payload['percentiles']['runqueue_ratio']['n'] == 3
+    assert series_entry(payload, 'percentiles', 'runqueue_ratio')['stats']['n'] == 3
 
 
 # ── a hold fraction is meaningless without the coverage it was computed over ──
@@ -592,28 +670,27 @@ def test_read_series_counts_the_tick_clock_rather_than_loading_it(tmp_path: Path
     (``--arm own_cpu_some_avg10``) and the four PSI arms never read that series
     at all, and none of them DECLARES the clock as its readability metric; the
     runqueue arm still gets it as a series because it does. The count itself is
-    served index-only by ``idx_samples_metric_ts`` — measured plan against this
-    exact schema: ``SEARCH samples USING COVERING INDEX idx_samples_metric_ts
-    (metric=?)``, no temp B-tree.
+    served index-only by ``idx_samples_metric_ts_leaf``: ``SEARCH samples USING
+    COVERING INDEX idx_samples_metric_ts_leaf (metric=?)``, no temp B-tree.
     """
     module = load_script()
     db = seed_db(tmp_path / 'db.sqlite', {
         'runqueue_read_ok': [1.0] * 100,
-        'own_read_ok:leaf.service': [1.0] * 100,
-        'own_cpu_some10:leaf.service': [30.0] * 100,
+        ('own_read_ok', 'leaf.service'): [1.0] * 100,
+        ('own_cpu_some10', 'leaf.service'): [30.0] * 100,
     })
 
     read = module.read_series(db, 'own_cpu_some_avg10')
 
     assert read.degradations == [], read.degradations
     assert read.ticks_in_corpus == 100
-    assert module.TICK_METRIC not in read.readability, (
+    assert (module.TICK_METRIC, None) not in read.readability, (
         'the tick clock was materialised as a series for an arm that does not '
-        f'declare it as its readability metric: {sorted(read.readability)}'
+        f'declare it as its readability metric: {list(read.readability)}'
     )
     # The evidence the arm DID ask for is still fetched, both halves of it.
-    assert len(read.readability['own_read_ok:leaf.service']) == 100
-    assert len(read.series['own_cpu_some10:leaf.service']) == 100
+    assert len(read.readability[('own_read_ok', 'leaf.service')]) == 100
+    assert len(read.series[('own_cpu_some10', 'leaf.service')]) == 100
 
 
 
@@ -635,7 +712,8 @@ def test_hold_fraction_is_reported_beside_its_readable_tick_coverage(tmp_path: P
     result = run_script('--db', str(db), '--arm', 'runqueue_ratio', '--no-report')
     assert result.returncode == 0, result.stderr
 
-    coverage = trailing_json(result.stdout)['coverage']['runqueue_ratio']
+    coverage = series_entry(
+        trailing_json(result.stdout), 'coverage', 'runqueue_ratio')['coverage']
     assert coverage['ticks_in_corpus'] == 100
     assert coverage['ticks_with_a_row'] == 100
     assert coverage['readable'] == 10
@@ -673,36 +751,70 @@ def test_full_coverage_raises_no_readability_degradation(tmp_path: Path):
 
     payload = trailing_json(result.stdout)
     assert 'low_readability' not in payload['degradations'], payload['degradations']
-    assert payload['coverage']['runqueue_ratio']['readable_fraction'] == pytest.approx(1.0)
+    assert series_entry(payload, 'coverage', 'runqueue_ratio')['coverage'][
+        'readable_fraction'] == pytest.approx(1.0)
 
 
-def test_a_stem_arm_reports_coverage_per_leaf_joined_on_the_leaf_tail(tmp_path: Path):
-    """own_read_ok:<leaf> is the coverage for own_cpu_some10:<leaf>, per leaf.
+def test_a_per_leaf_arm_reports_coverage_per_leaf_paired_by_leaf(tmp_path: Path):
+    """A leaf's ``own_read_ok`` is the coverage for that leaf's ``own_cpu_some10``.
 
     One leaf can be unreadable while its siblings are fine, so pooling the
-    stem's coverage would hide exactly the case worth seeing.
+    arm's coverage would hide exactly the case worth seeing.
     """
     db = seed_db(tmp_path / 'db.sqlite', {
         'runqueue_read_ok': [1.0] * 20,
-        'own_read_ok:orchestrator-reify.service': [1.0] * 20,
-        'own_cpu_some10:orchestrator-reify.service': [30.0] * 20,
-        'own_read_ok:orchestrator-know-live.service': [1.0] * 2 + [0.0] * 18,
-        'own_cpu_some10:orchestrator-know-live.service': [30.0] * 2,
+        ('own_read_ok', 'orchestrator-reify.service'): [1.0] * 20,
+        ('own_cpu_some10', 'orchestrator-reify.service'): [30.0] * 20,
+        ('own_read_ok', 'orchestrator-know-live.service'): [1.0] * 2 + [0.0] * 18,
+        ('own_cpu_some10', 'orchestrator-know-live.service'): [30.0] * 2,
     })
 
     result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
     assert result.returncode == 0, result.stderr
 
-    coverage = trailing_json(result.stdout)['coverage']
-    assert coverage['own_cpu_some10:orchestrator-reify.service'][
-        'readable_fraction'] == pytest.approx(1.0)
-    assert coverage['own_cpu_some10:orchestrator-know-live.service'] == {
+    payload = trailing_json(result.stdout)
+    assert series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'orchestrator-reify.service',
+    )['coverage']['readable_fraction'] == pytest.approx(1.0)
+    assert series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'orchestrator-know-live.service',
+    )['coverage'] == {
         'ticks_in_corpus': 20, 'ticks_with_a_row': 20,
         'readable': 2, 'readable_fraction': 0.1,
-        # Named, so a reader of the escalation can tell WHICH series was
-        # counted — the per-leaf join is the thing this test is about.
-        'readability_metric': 'own_read_ok:orchestrator-know-live.service',
+        # The bare metric: the leaf it was counted for is the entry's own.
+        'readability_metric': 'own_read_ok',
     }
+
+
+def test_a_per_leaf_series_is_paired_with_the_readability_series_of_the_same_leaf(
+    tmp_path: Path,
+):
+    """Each leaf's coverage is counted from that leaf's own ``own_read_ok`` rows.
+
+    Leaf a reads on every tick and leaf b on every other one, so their counts
+    can only differ if each value series is paired with its own leaf's
+    readability rows; pooled, or paired across leaves, they would agree.
+    """
+    path = tmp_path / 'db.sqlite'
+    seed_db(path, {
+        'runqueue_read_ok': [1.0] * 40,
+        ('own_read_ok', 'a.service'): [1.0] * 40,
+        ('own_cpu_some10', 'a.service'): [30.0] * 40,
+        ('own_read_ok', 'b.service'): [1.0, 0.0] * 20,
+    })
+    db = seed_db(path, {('own_cpu_some10', 'b.service'): [30.0] * 20}, step=10)
+
+    result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
+    assert result.returncode == 0, result.stderr
+
+    payload = trailing_json(result.stdout)
+    assert series_keys(payload, 'coverage') == {
+        ('own_cpu_some10', 'a.service'), ('own_cpu_some10', 'b.service'),
+    }
+    a = series_entry(payload, 'coverage', 'own_cpu_some10', 'a.service')['coverage']
+    b = series_entry(payload, 'coverage', 'own_cpu_some10', 'b.service')['coverage']
+    assert (a['ticks_with_a_row'], a['readable']) == (40, 40), a
+    assert (b['ticks_with_a_row'], b['readable']) == (40, 20), b
 
 
 def seed_leaf_present_for_the_last_fifth(path: Path, *, readable: int = 20) -> Path:
@@ -710,19 +822,19 @@ def seed_leaf_present_for_the_last_fifth(path: Path, *, readable: int = 20) -> P
 
     The shape a restarted, added or renamed ``orchestrator-*.service`` leaves
     behind, and the one task 3394's ``df-*.slice`` migration produces
-    mid-corpus: the sampler writes ``own_read_ok:<leaf>`` only on ticks it
+    mid-corpus: the sampler writes a leaf's ``own_read_ok`` only on ticks it
     DISCOVERED the leaf, so the late leaf has 20 rows — *readable* of them
     readable — while the tick clock and the steady leaf have 100.
     """
     seed_db(path, {
         'runqueue_read_ok': [1.0] * 100,
-        'own_read_ok:orchestrator-reify.service': [1.0] * 100,
-        'own_cpu_some10:orchestrator-reify.service': [30.0] * 100,
+        ('own_read_ok', 'orchestrator-reify.service'): [1.0] * 100,
+        ('own_cpu_some10', 'orchestrator-reify.service'): [30.0] * 100,
     })
     return seed_db(path, {
-        'own_read_ok:orchestrator-new.service':
+        ('own_read_ok', 'orchestrator-new.service'):
             [1.0] * readable + [0.0] * (20 - readable),
-        'own_cpu_some10:orchestrator-new.service': [30.0] * readable,
+        ('own_cpu_some10', 'orchestrator-new.service'): [30.0] * readable,
     }, start_ts=1_000_000 + 80 * 5)
 
 
@@ -748,13 +860,16 @@ def test_a_leaf_present_for_part_of_the_corpus_is_covered_over_all_of_it(
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    assert payload['coverage']['own_cpu_some10:orchestrator-new.service'] == {
+    assert series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'orchestrator-new.service',
+    )['coverage'] == {
         'ticks_in_corpus': 100, 'ticks_with_a_row': 20,
         'readable': 20, 'readable_fraction': 0.2,
-        'readability_metric': 'own_read_ok:orchestrator-new.service',
+        'readability_metric': 'own_read_ok',
     }
-    assert payload['coverage']['own_cpu_some10:orchestrator-reify.service'][
-        'readable_fraction'] == pytest.approx(1.0)
+    assert series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'orchestrator-reify.service',
+    )['coverage']['readable_fraction'] == pytest.approx(1.0)
     [absent] = details(payload, 'partial_presence')
     assert 'orchestrator-new.service' in absent and '20/100' in absent, absent
 
@@ -793,7 +908,9 @@ def test_absence_and_failed_reads_are_each_counted_against_their_own_base(
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    coverage = payload['coverage']['own_cpu_some10:orchestrator-new.service']
+    coverage = series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'orchestrator-new.service',
+    )['coverage']
     assert (coverage['ticks_in_corpus'], coverage['ticks_with_a_row'],
             coverage['readable'], coverage['readable_fraction']) == (100, 20, 10, 0.1)
     [absent] = details(payload, 'partial_presence')
@@ -806,9 +923,9 @@ def seed_leaf_present_on(path: Path, *, present: int, readable: int) -> Path:
     """A 100-tick corpus with one leaf missing from its first 100 - *present*."""
     seed_db(path, {'runqueue_read_ok': [1.0] * 100})
     return seed_db(path, {
-        'own_read_ok:orchestrator-reify.service':
+        ('own_read_ok', 'orchestrator-reify.service'):
             [1.0] * readable + [0.0] * (present - readable),
-        'own_cpu_some10:orchestrator-reify.service': [30.0] * readable,
+        ('own_cpu_some10', 'orchestrator-reify.service'): [30.0] * readable,
     }, start_ts=1_000_000 + (100 - present) * 5)
 
 
@@ -862,14 +979,16 @@ def test_a_series_with_no_read_ok_rows_is_unknown_even_when_the_clock_ran(
     """
     db = seed_db(tmp_path / 'db.sqlite', {
         'runqueue_read_ok': [1.0] * 30,
-        'own_cpu_some10:orchestrator-reify.service': [30.0] * 30,
+        ('own_cpu_some10', 'orchestrator-reify.service'): [30.0] * 30,
     })
 
     result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    coverage = payload['coverage']['own_cpu_some10:orchestrator-reify.service']
+    coverage = series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'orchestrator-reify.service',
+    )['coverage']
     assert coverage['ticks_in_corpus'] == 30
     assert coverage['ticks_with_a_row'] == 0
     assert coverage['readable_fraction'] is None, coverage
@@ -900,7 +1019,7 @@ def test_an_arm_whose_read_ok_rows_are_absent_reports_unknown_not_zero(
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    coverage = payload['coverage']['runqueue_ratio']
+    coverage = series_entry(payload, 'coverage', 'runqueue_ratio')['coverage']
     assert coverage['ticks_in_corpus'] == 0
     assert coverage['ticks_with_a_row'] == 0
     assert coverage['readable_fraction'] is None, (
@@ -952,7 +1071,7 @@ def test_a_psi_arm_says_it_has_no_readability_metric_rather_than_inventing_one(
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    assert payload['coverage']['psi_mem_full_avg10'] is None
+    assert series_entry(payload, 'coverage', 'psi_mem_full_avg10')['coverage'] is None
     assert 'low_readability' not in payload['degradations']
 
 
@@ -960,16 +1079,16 @@ def seed_a_leaf_that_never_reads(path: Path) -> Path:
     """A 100-tick corpus with one healthy leaf and one discovered-but-dark one.
 
     Exactly the shape ``collect_load_metrics`` writes for a cgroup leaf found
-    on every tick whose ``cpu.pressure`` never reads: ``own_read_ok:<leaf>`` =
-    0.0 on each of those ticks, and NO ``own_cpu_some10:<leaf>`` row at all,
-    because a failed read persists no value — persisting α's fail-open 0.0
-    would fabricate an idle cgroup.
+    on every tick whose ``cpu.pressure`` never reads: the leaf's
+    ``own_read_ok`` = 0.0 on each of those ticks, and NO ``own_cpu_some10`` row
+    for it at all, because a failed read persists no value — persisting α's
+    fail-open 0.0 would fabricate an idle cgroup.
     """
     return seed_db(path, {
         'runqueue_read_ok': [1.0] * 100,
-        'own_read_ok:good.service': [1.0] * 100,
-        'own_cpu_some10:good.service': [30.0] * 100,
-        'own_read_ok:dark.service': [0.0] * 100,
+        ('own_read_ok', 'good.service'): [1.0] * 100,
+        ('own_cpu_some10', 'good.service'): [30.0] * 100,
+        ('own_read_ok', 'dark.service'): [0.0] * 100,
     })
 
 
@@ -994,20 +1113,22 @@ def test_a_leaf_discovered_every_tick_and_readable_on_none_is_still_reported(
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    assert payload['coverage']['own_cpu_some10:dark.service'] == {
+    assert series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'dark.service')['coverage'] == {
         'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
         'readable': 0, 'readable_fraction': 0.0,
-        'readability_metric': 'own_read_ok:dark.service',
+        'readability_metric': 'own_read_ok',
     }
-    # The sibling is untouched: this is per leaf, not a stem-wide verdict.
-    assert payload['coverage']['own_cpu_some10:good.service'][
-        'readable_fraction'] == pytest.approx(1.0)
+    # The sibling is untouched: this is per leaf, not an arm-wide verdict.
+    assert series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'good.service',
+    )['coverage']['readable_fraction'] == pytest.approx(1.0)
     [dark] = [d for d in payload['degradation_details'] if 'dark.service' in d]
     assert '100' in dark, dark
 
 
 def test_an_arm_readable_on_no_tick_is_reported_in_a_full_run(tmp_path: Path):
-    """A non-stem arm goes dark the same way, and hid in a FULL run too.
+    """A host-level arm goes dark the same way, and hid in a FULL run too.
 
     ``runqueue_read_ok`` = 0.0 on every tick is a sampler that ran 100 times
     and got no /proc/stat reading, so it wrote no ``runqueue_ratio`` value row
@@ -1025,7 +1146,7 @@ def test_an_arm_readable_on_no_tick_is_reported_in_a_full_run(tmp_path: Path):
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    assert payload['coverage']['runqueue_ratio'] == {
+    assert series_entry(payload, 'coverage', 'runqueue_ratio')['coverage'] == {
         'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
         'readable': 0, 'readable_fraction': 0.0,
         'readability_metric': 'runqueue_read_ok',
@@ -1113,7 +1234,7 @@ def test_a_sampler_that_never_read_is_distinguishable_from_one_that_never_ran(
 
     payload = trailing_json(result.stdout)
     assert 'no_samples_in_window' in payload['degradations'], payload['degradations']
-    assert payload['coverage']['runqueue_ratio'] == {
+    assert series_entry(payload, 'coverage', 'runqueue_ratio')['coverage'] == {
         'ticks_in_corpus': 100, 'ticks_with_a_row': 100,
         'readable': 0, 'readable_fraction': 0.0,
         'readability_metric': 'runqueue_read_ok',
@@ -1140,15 +1261,16 @@ def test_a_coverage_that_cannot_be_true_is_refused_rather_than_printed(
     """
     db = seed_db(tmp_path / 'db.sqlite', {
         'runqueue_read_ok': [1.0] * 50,
-        'own_read_ok:leaf.service': [1.0] * 100,
-        'own_cpu_some10:leaf.service': [30.0] * 100,
+        ('own_read_ok', 'leaf.service'): [1.0] * 100,
+        ('own_cpu_some10', 'leaf.service'): [30.0] * 100,
     })
 
     result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    coverage = payload['coverage']['own_cpu_some10:leaf.service']
+    coverage = series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'leaf.service')['coverage']
     assert coverage['readable_fraction'] is None, coverage
     # The three counts stay reported verbatim: they are the evidence for the
     # verdict, and without them a reader cannot see WHICH numbers are impossible.
@@ -1190,15 +1312,16 @@ def test_a_zero_clock_with_readability_rows_is_impossible_not_unknown(
     ``impossible_coverage`` to a corpus restored or seeded by hand.
     """
     db = seed_db(tmp_path / 'db.sqlite', {
-        'own_read_ok:leaf.service': [1.0] * 100,
-        'own_cpu_some10:leaf.service': [30.0] * 100,
+        ('own_read_ok', 'leaf.service'): [1.0] * 100,
+        ('own_cpu_some10', 'leaf.service'): [30.0] * 100,
     })
 
     result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    coverage = payload['coverage']['own_cpu_some10:leaf.service']
+    coverage = series_entry(
+        payload, 'coverage', 'own_cpu_some10', 'leaf.service')['coverage']
     assert (coverage['ticks_in_corpus'], coverage['ticks_with_a_row']) == (0, 100)
     assert coverage['readable_fraction'] is None, coverage
     assert 'impossible_coverage' in payload['degradations'], payload['degradations']
@@ -1212,35 +1335,33 @@ def test_a_zero_clock_with_readability_rows_is_impossible_not_unknown(
     assert 'runqueue_read_ok' in detail and 'own_read_ok:leaf.service' in detail, detail
 
 
-def test_a_selectors_underscores_are_not_sql_wildcards(tmp_path: Path):
-    """`_` is a single-character LIKE wildcard, and every selector contains one.
+def test_a_near_miss_metric_name_is_never_read(tmp_path: Path):
+    """An arm reads its selector's metric EXACTLY, never a look-alike.
 
-    A stem selector is matched against the corpus as a ':'-prefixed pattern.
-    Spelled with LIKE, `own_cpu_some10:%` also matches `own-cpu-some10:leaf` —
-    the underscores match the hyphens — and this repo spells unit and slice
-    names with hyphens everywhere (`orchestrator-dark-factory.service`,
-    `df-<project>.slice`), so that is a realistic next metric name and not a
-    contrived one. Pooling it into this arm's series would shift the arm's
-    percentiles and hold fractions with no degradation reported.
+    This repo spells unit and slice names with hyphens everywhere
+    (`orchestrator-dark-factory.service`, `df-<project>.slice`), so a
+    hyphen-spelled `own-cpu-some10` is a realistic next metric name, and a
+    pattern match in which `_` is a wildcard would pool it into this arm,
+    shifting the arm's percentiles and hold fractions with no degradation
+    reported.
     """
+    leaf = 'orchestrator-dark-factory.service'
     db = seed_db(tmp_path / 'db.sqlite', {
-        'own_cpu_some10:orchestrator-dark-factory.service': [1.0] * 50,
-        'own-cpu-some10:a-hyphen-spelled-future-metric': [99.0] * 50,
+        ('own_cpu_some10', leaf): [1.0] * 50,
+        ('own-cpu-some10', leaf): [99.0] * 50,
     })
 
     result = run_script('--db', str(db), '--arm', 'own_cpu_some_avg10', '--no-report')
     assert result.returncode == 0, result.stderr
 
     payload = trailing_json(result.stdout)
-    assert set(payload['holds']) == {
-        'own_cpu_some10:orchestrator-dark-factory.service'
-    }, (
-        'the hyphen-spelled metric was pooled into this arm: a selector\'s '
-        f"underscores are being read as wildcards; got {sorted(payload['holds'])}"
+    assert series_keys(payload, 'holds') == {('own_cpu_some10', leaf)}, (
+        'the hyphen-spelled metric was pooled into this arm; got '
+        f"{series_keys(payload, 'holds')}"
     )
-    assert set(payload['percentiles']) == {
-        'own_cpu_some10:orchestrator-dark-factory.service'
-    }
+    assert series_keys(payload, 'percentiles') == {('own_cpu_some10', leaf)}
+    assert series_entry(
+        payload, 'percentiles', 'own_cpu_some10', leaf)['stats']['max'] == 1.0
 
 
 # ── the two-yaml drift check (detail C) ─────────────────────────────────────
@@ -1514,8 +1635,8 @@ def test_smoke_against_the_two_real_committed_configs(tmp_path: Path):
     for cannot_read in ('local_config_missing', 'local_config_unreadable',
                         'local_config_unparseable'):
         assert cannot_read not in payload['degradations'], payload['degradation_details']
-    assert payload['percentiles']['runqueue_ratio']['n'] == 2
-    assert payload['holds']['runqueue_ratio'], payload
+    assert series_entry(payload, 'percentiles', 'runqueue_ratio')['stats']['n'] == 2
+    assert series_entry(payload, 'holds', 'runqueue_ratio')['candidates'], payload
     assert 'pyyaml_absent' not in payload['degradations'], payload['degradation_details']
 
 

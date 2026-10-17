@@ -20,10 +20,12 @@ import pytest
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
+    AllAccountsCappedException,
     invoke_with_cap_retry,
 )
 from shared.config_dir import TaskConfigDir
 from shared.config_models import AccountConfig, UsageCapConfig
+from shared.cost_store import CostStore
 from shared.usage_gate import (
     SessionBudgetExhausted,
     UsageGate,
@@ -884,8 +886,8 @@ class TestConcurrentTasksWithFailover:
 @pytest.mark.asyncio
 class TestCostTrackingIntegration:
 
-    async def test_cap_hit_then_success_records_both_events(self):
-        """Cap hit -> save_account_event('cap_hit'); success -> save_invocation."""
+    async def test_cap_hit_then_success_records_invocation_only(self):
+        """The loop records invocations only; account events are the gate's."""
         gate = make_gate(['A', 'B'])
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
@@ -905,9 +907,7 @@ class TestCostTrackingIntegration:
                 prompt='work', system_prompt='sys', cwd=Path('/tmp'),
             )
 
-        cost_store.save_account_event.assert_awaited_once()
-        evt_kwargs = cost_store.save_account_event.call_args.kwargs
-        assert evt_kwargs['event_type'] == 'cap_hit'
+        cost_store.save_account_event.assert_not_awaited()
 
         cost_store.save_invocation.assert_awaited_once()
         inv_kwargs = cost_store.save_invocation.call_args.kwargs
@@ -956,6 +956,74 @@ class TestCostTrackingIntegration:
             )
 
         assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# TestCapHitHasOneWriter
+# ---------------------------------------------------------------------------
+
+
+async def _await_account_events(store, start_iso, end_iso, event_type, *, deadline_s=5.0):
+    """Poll the store until an *event_type* row lands; the gate writes its events fire-and-forget."""
+    loop = asyncio.get_running_loop()
+    give_up_at = loop.time() + deadline_s
+    while True:
+        rows = await store.account_events_in_window(start_iso, end_iso, event_type=event_type)
+        if rows or loop.time() >= give_up_at:
+            return rows
+        await asyncio.sleep(0.01)
+
+
+async def _invoke_until_first_detection(gate, store, stderr, cwd):
+    async def _cli(**_kw):
+        return make_result(stderr=stderr)
+
+    with pytest.raises(AllAccountsCappedException):
+        await invoke_with_cap_retry(
+            gate, 'lbl', invoke_fn=_cli,
+            cost_store=store, run_id='run-1', project_id='proj',
+            max_cap_retries=1,
+            prompt='work', system_prompt='sys', cwd=cwd,
+        )
+
+
+@pytest.mark.asyncio
+class TestCapHitHasOneWriter:
+    """Gate and loop share one store: a cap event yields one cap_hit row, the gate's."""
+
+    async def test_one_cap_detection_writes_exactly_one_cap_hit_row(self, tmp_path):
+        start = datetime.now(UTC).isoformat()
+        end = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        async with CostStore(tmp_path / 'runs.db') as store:
+            gate = make_gate(['A', 'B'], cost_store=store)
+            try:
+                await _invoke_until_first_detection(gate, store, _cap_stderr('A'), tmp_path)
+
+                rows = await _await_account_events(store, start, end, 'cap_hit')
+
+                assert len(rows) == 1, [(r['account_name'], r['details']) for r in rows]
+                assert rows[0]['account_name'] == 'A'
+                details = json.loads(rows[0]['details'])
+                assert 'usage limit' in details['reason']
+                assert 'resets_at' in details
+            finally:
+                await gate.shutdown()
+
+    async def test_near_cap_detection_writes_no_cap_hit_row(self, tmp_path):
+        start = datetime.now(UTC).isoformat()
+        end = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        near_cap_stderr = "You're close to your usage limit. resets in 2h"
+        async with CostStore(tmp_path / 'runs.db') as store:
+            gate = make_gate(['A', 'B'], cost_store=store)
+            try:
+                await _invoke_until_first_detection(gate, store, near_cap_stderr, tmp_path)
+
+                near_caps = await _await_account_events(store, start, end, 'near_cap')
+
+                assert [r['account_name'] for r in near_caps] == ['A']
+                assert await store.account_events_in_window(start, end, event_type='cap_hit') == []
+            finally:
+                await gate.shutdown()
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,408 @@
+prd: plans/review-all-s21-legibility-pipeline-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 6740
+  title: One detector layer for sampler and digest
+  capabilities:
+  - name: detectors-module
+    binding: producer:α creates scripts/legibility/detectors.py (D1, contract 5.1)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/detectors.py
+      expect: present
+  - name: reingestion-module
+    binding: producer:α creates scripts/legibility/reingestion.py from digest.py's provenance stratum (D1; task 5960's measured partition)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/reingestion.py
+      expect: present
+  - name: per-record-hits-function
+    binding: producer:α — detectors.record_hits (contract 5.1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def record_hits\(
+      paths:
+      - scripts/legibility/detectors.py
+      expect: present
+  - name: sampler-pattern-tables-deleted
+    binding: 'grep: sampling.py::_NOT_FOUND_PATTERNS, _SELF_CORRECT_PATTERNS, _DF_GUARD_TEXT_PATTERNS, _INTERRUPT_PATTERNS exist on ae3047ec3a; α deletes them'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^_(NOT_FOUND|SELF_CORRECT|DF_GUARD_TEXT|INTERRUPT)_PATTERNS
+      paths:
+      - scripts/legibility/sampling.py
+      expect: absent
+  - name: one-agent-class-classifier
+    binding: 'grep: classify_agent_class is defined in both sampling.py and digest.py on ae3047ec3a; α leaves one, in detectors.py (D2)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def classify_agent_class\(
+      paths:
+      - scripts/legibility/sampling.py
+      - scripts/legibility/digest.py
+      expect: absent
+  - name: live-population-agreement
+    binding: 'G6: both scorers reduce the same record_hits over the one parse contract (inventory.iter_json_lines / digest.load_transcript); presence equality holds by construction'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live transcript population; the finding's measurement re-run is recorded in the task record (0 of N disagree)
+- label: β
+  task_id: 6742
+  title: One codebook merge result and one committer
+  capabilities:
+  - name: batch-merge-entry-point
+    binding: producer:β — codebook.apply_coding_records (D3, contract 5.2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def apply_coding_records\(
+      paths:
+      - scripts/legibility/codebook.py
+      expect: present
+  - name: merge-result-type
+    binding: producer:β — frozen MergeResult in codebook.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class MergeResult
+      paths:
+      - scripts/legibility/codebook.py
+      expect: present
+  - name: caller-merge-loops-removed
+    binding: 'grep: nightly.py::run_nightly and census.py::run_census call codebook.apply_coding_record per record on ae3047ec3a; β routes both through apply_coding_records'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: apply_coding_record\(
+      paths:
+      - scripts/legibility/nightly.py
+      - scripts/legibility/census.py
+      expect: absent
+  - name: one-committer
+    binding: producer:β — unlanded.commit_only beside unlanded.roll_back (D4, contract 5.3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def commit_only\(
+      paths:
+      - scripts/legibility/unlanded.py
+      expect: present
+  - name: committer-copies-deleted
+    binding: 'grep: nightly.py::_git_commit_docs_only and census.py::_build_default_commit exist on ae3047ec3a'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def (_git_commit_docs_only|_build_default_commit)\(
+      paths:
+      - scripts/legibility/nightly.py
+      - scripts/legibility/census.py
+      expect: absent
+  - name: census-bare-sibling-imports-removed
+    binding: 'grep: census.py does bare import codebook / coder / filing_policy / config on ae3047ec3a (fk-234e0a63dfd7)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^import (codebook|coder|filing_policy|config)( |$)
+      paths:
+      - scripts/legibility/census.py
+      - scripts/tests/test_legibility_census.py
+      expect: absent
+- label: γ
+  task_id: 6744
+  title: Typed run outcome and trickle state; barren escalation recorded
+  capabilities:
+  - name: run-outcome-enum
+    binding: producer:γ — trickle_state.RunOutcome with a deferred member (D5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class RunOutcome
+      paths:
+      - scripts/legibility/trickle_state.py
+      expect: present
+  - name: state-docs-module
+    binding: producer:γ — scripts/legibility/state_docs.py (StateRead, one reader and writer; D7)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/state_docs.py
+      expect: present
+  - name: barren-escalated-recorded-and-read
+    binding: producer:γ — record_run writes barren_escalated; check_trickle_health reads it (D6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: barren_escalated
+      paths:
+      - scripts/legibility/check_trickle_health.py
+      expect: present
+  - name: racy-fixed-tmp-writer-removed
+    binding: 'grep: trickle_state.py::record_run writes path.name + ''.tmp'' on ae3047ec3a; γ routes it through state_docs (shared.safe_io.atomic_write_text)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: name \+ '\.tmp'
+      paths:
+      - scripts/legibility/trickle_state.py
+      expect: absent
+  - name: failure-status-strings-removed
+    binding: 'grep: 5 code sites compare RunResult.status to "failure" on ae3047ec3a (coder 2, nightly 1, census 2); the pattern skips docstring lines (backticks)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^[^`#]*\.status [!=]= ["'']failure["''][^`]*$'
+      paths:
+      - scripts/legibility/coder.py
+      - scripts/legibility/nightly.py
+      - scripts/legibility/census.py
+      expect: absent
+  - name: production-trickle-state-row
+    binding: 'INV-13: the signal reads a trickle-state.json written by the real nightly after γ lands, through check_trickle_progress.py'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: only a real nightly run writes the production document
+- label: δ
+  task_id: 6745
+  title: run_nightly as stage functions with one result builder
+  capabilities:
+  - name: one-result-builder
+    binding: producer:δ — nightly._finish builds NightlyResult from outcome and alarm list (D16)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def _finish\(
+      paths:
+      - scripts/legibility/nightly.py
+      expect: present
+  - name: tests-drive-injected-stages
+    binding: 'grep: test_legibility_nightly.py patches build_digests, evaluate_census_step, _default_census_launcher, select_digest_sessions, stratified_sample and build_digest by dotted path on ae3047ec3a'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: setattr\(nightly(\.[a-z_.]+)?, *'(build_digests|evaluate_census_step|_default_census_launcher|select_digest_sessions|build_digest|stratified_sample)'
+      paths:
+      - scripts/tests/test_legibility_nightly.py
+      expect: absent
+  - name: final-journal-line
+    binding: producer:δ — nightly prints one line rendered from NightlyResult
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: journal output of a real nightly run
+- label: ε
+  task_id: 6747
+  title: One alarm poster over the shared MCP client
+  capabilities:
+  - name: alarm-module
+    binding: producer:ε — scripts/legibility/alarm.py with raise_alarm and fail_loud_boundary (D11)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def (raise_alarm|fail_loud_boundary)\(
+      paths:
+      - scripts/legibility/alarm.py
+      expect: present
+  - name: poster-constant-copies-removed
+    binding: 'grep: _ESCALATION_TOOL_NAME is defined in check_trickle_health.py and check_transcript_persistence.py on ae3047ec3a'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^_ESCALATION_TOOL_NAME
+      paths:
+      - scripts/legibility/check_trickle_health.py
+      - scripts/legibility/check_transcript_persistence.py
+      - scripts/legibility/nightly.py
+      expect: absent
+  - name: census-trigger-transport-deleted
+    binding: 'grep: census_trigger.py defines post_mcp_envelope, post_mcp_tool_call and MCP_STREAMABLE_HTTP_HEADERS on ae3047ec3a (D12)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def (post_mcp_envelope|post_mcp_tool_call)\(|^MCP_STREAMABLE_HTTP_HEADERS
+      paths:
+      - scripts/legibility/census_trigger.py
+      expect: absent
+  - name: no-importer-of-old-transport
+    binding: 'grep: 18 code references to census_trigger.post_mcp_tool_call / post_mcp_envelope in scripts/escalation/fused-memory/orchestrator on ae3047ec3a'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: census_trigger\.(post_mcp_tool_call|post_mcp_envelope)
+      paths:
+      - scripts
+      - escalation
+      - fused-memory/src
+      - fused-memory/scripts
+      - orchestrator/src
+      expect: absent
+  - name: shared-sync-mcp-client
+    binding: 'producer:task-6711 (S14 ζ) upstream of ε — shared/src/shared/mcp_session.py::SyncMcpSession;
+      its filed extent (lead ruling 2026-10-10) covers the initialize handshake for stateful escalation servers
+      (server-minted mcp-session-id captured and echoed) and stateless fused-memory, /mcp via mcp_endpoint_url
+      + MCP_POST_HEADERS, SSE decode, explicit session release, isError as a typed failure, one neutral shared error type'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class SyncMcpSession
+      paths:
+      - shared/src/shared/mcp_session.py
+      expect: present
+  - name: real-server-e2e
+    binding: escalation/tests/test_legibility_census_escalation_e2e.py drives a real escalation server (serve_escalation_mcp) on ae3047ec3a; ε extends it to all four sources
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: CI test outcome, not a static pattern
+- label: ζ
+  task_id: 6749
+  title: Census trigger reads validated config and a typed census state
+  capabilities:
+  - name: second-config-reader-deleted
+    binding: 'grep: census_trigger.CensusConfig.from_mapping and load_census_config exist on ae3047ec3a (D8)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def (from_mapping|load_census_config)\(
+      paths:
+      - scripts/legibility/census_trigger.py
+      expect: absent
+  - name: strict-census-config
+    binding: producer:ζ — config.Census integer thresholds StrictInt ge=0; live dark_factory and reify census blocks are unquoted ints (G6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: StrictInt
+      paths:
+      - scripts/legibility/config.py
+      expect: present
+  - name: layout-and-census-state-modules
+    binding: producer:ζ — layout.py and census_state.py (D7, D9)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/legibility/layout.py
+      - scripts/legibility/census_state.py
+      expect: present
+  - name: inline-census-state-paths-removed
+    binding: 'grep: census.py::main and census_trigger.py::decide_for_project spell / "census-state.json" inline on ae3047ec3a'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: / ['"]census-state\.json['"]
+      paths:
+      - scripts/legibility/census.py
+      - scripts/legibility/census_trigger.py
+      - scripts/legibility/nightly.py
+      expect: absent
+  - name: census-incremental-chain-end
+    binding: producer:task-6408 (census-incremental L8b) upstream; it rewrites CensusConfig.from_mapping and the census-state fields ζ types
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency edge, wired at decompose
+- label: η
+  task_id: 6750
+  title: Candidate identity by merger-minted id; lifecycle as a transition table
+  capabilities:
+  - name: title-joins-deleted
+    binding: 'grep: census.py::_find_pending_candidate_id and _find_adjudicated_candidate exist on ae3047ec3a (D13)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def (_find_pending_candidate_id|_find_adjudicated_candidate)\(
+      paths:
+      - scripts/legibility/census.py
+      expect: absent
+  - name: resolution-type
+    binding: producer:η — Resolution variants in the codebook's owning module (contract 5.2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class RoutedToCandidate
+      paths:
+      - scripts/legibility
+      expect: present
+  - name: lifecycle-transforms-moved
+    binding: 'grep: census.py defines promote_candidate, reject_candidate, retire_entry, mark_entry_filed on ae3047ec3a (D14)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def (promote_candidate|reject_candidate|retire_entry|mark_entry_filed)\(
+      paths:
+      - scripts/legibility/census.py
+      expect: absent
+  - name: live-codebook-passes-cross-reference-checks
+    binding: 'G6: live codebook 2026-10-10 — 90 promoted candidates, 0 dangling promoted_to, no out-of-set filing values'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live data; observed through codebook.py validate on the deployed codebook
+- label: θ
+  task_id: 6751
+  title: run_census as stage functions with an explicit persist order
+  capabilities:
+  - name: effects-and-stage-types
+    binding: producer:θ — CensusEffects and CensusStage (D15)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class (CensusEffects|CensusStage)
+      paths:
+      - scripts/legibility
+      expect: present
+  - name: persist-stage
+    binding: producer:θ — one persist function owns the effect order
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def persist\(
+      paths:
+      - scripts/legibility
+      expect: present
+- label: ι
+  task_id: 6753
+  title: census.py layers and a public verifier module
+  capabilities:
+  - name: verifier-module
+    binding: producer:ι — scripts/legibility/census_verify.py with a public builder (fk-ee9a4bae4e83)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def build_[a-z_]*verify[a-z_]*\(
+      paths:
+      - scripts/legibility/census_verify.py
+      expect: present
+  - name: private-poster-patch-target-gone
+    binding: 'grep: census.py defines _post_mcp_tool_call and test_legibility_census.py patches/calls it via mod on ae3047ec3a'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _post_mcp_tool_call|mod\._post_mcp_tool_call|setattr\(mod, ["']_post_mcp_tool_call["']
+      paths:
+      - scripts/legibility/census.py
+      - scripts/tests/test_legibility_census.py
+      expect: absent
+  - name: layers-import-downward
+    binding: 'grep: no census_*.py module imports census on ae3047ec3a; ι keeps it so (heuristic 13). A preservation property, so not a dispatch gate'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: already true on main (vacuous as a delivered_check); reviewed at ι against heuristic 13
+  - name: tests-on-public-names
+    binding: 'fk-ee9a4bae4e83: 7 private census names, 52 references in test_legibility_census.py at the pin'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the test-module alias and the split's module names are chosen at implementation; reviewed against boundary row 17

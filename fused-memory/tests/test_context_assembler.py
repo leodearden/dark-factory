@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _clip_assertions import assert_elided
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.memory import MemoryCategory, MemoryResult, SourceStore
@@ -149,6 +150,20 @@ async def test_budget_stops_accumulation(mock_memory):
     assert len(result.events) < len(events)
     assert result.events_remaining > 0
     assert result.total_tokens <= 1_600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('token_budget', [1_450, 65_000])
+async def test_payload_states_the_budget_it_was_assembled_under(mock_memory, token_budget):
+    """Both the budget-stopped path and the all-fit path carry the budget value."""
+    config = _make_config(token_budget=token_budget)
+    assembler = _make_assembler(memory_service=mock_memory, config=config)
+    events = [_make_event(payload={'content_preview': f'content {i}'}) for i in range(10)]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    assert result.token_budget == token_budget
+    assert (result.events_remaining > 0) == (token_budget == 1_450)
 
 
 @pytest.mark.asyncio
@@ -739,6 +754,79 @@ def test_format_task_no_display_id_uses_task_id_field():
     }
     result = _format_task(task)
     assert '[task:42]' in result
+
+
+def _desc_line(rendered: str) -> str:
+    return next(line for line in rendered.splitlines() if line.startswith('  desc: '))
+
+
+def _task_with_description(desc: str) -> dict:
+    return {'id': '7', 'title': 'T', 'status': 'done', 'dependencies': [], 'description': desc}
+
+
+def _memory_body(formatted: str) -> str:
+    return formatted.split('): ', 1)[1]
+
+
+def test_format_task_discloses_a_clipped_description():
+    desc = 'd' * 10_000
+
+    line = _desc_line(_format_task(_task_with_description(desc)))
+
+    assert_elided(line.removeprefix('  desc: '), desc)
+
+
+def test_format_task_leaves_a_short_description_unmarked():
+    desc = 'a short description'
+
+    assert _desc_line(_format_task(_task_with_description(desc))) == f'  desc: {desc}'
+
+
+async def _memory_context(mock_memory, body: str) -> str:
+    memory = _make_memory_result(content=body)
+    mock_memory.search = AsyncMock(return_value=[memory])
+    assembler = _make_assembler(memory_service=mock_memory)
+    events = [_make_event(payload={'content_preview': 'anything'})]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    return _memory_body(result.context_items[memory.id].formatted)
+
+
+@pytest.mark.asyncio
+async def test_memory_context_discloses_a_clipped_body(mock_memory):
+    body = 'm' * 10_000
+
+    assert_elided(await _memory_context(mock_memory, body), body)
+
+
+@pytest.mark.asyncio
+async def test_memory_context_leaves_a_short_body_unmarked(mock_memory):
+    assert await _memory_context(mock_memory, 'a short memory') == 'a short memory'
+
+
+@pytest.mark.asyncio
+async def test_assembled_task_context_carries_the_elision_markers(mock_memory, mock_taskmaster):
+    """The formatted strings are what Stages 1/2/3 read verbatim, so the marker must reach them."""
+    desc = 'x' * 10_000
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        **_task_with_description(desc),
+        'id': '42',
+        'metadata': {'memory_hints': {'queries': ['long hint']}},
+    })
+    hinted = _make_memory_result(content='y' * 10_000)
+    mock_memory.search = AsyncMock(return_value=[hinted])
+    assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+    events = [_make_event(
+        event_type=EventType.task_status_changed,
+        payload={'task_id': '42', 'old_status': 'in-progress', 'new_status': 'done'},
+    )]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    task_line = _desc_line(result.context_items['task:42'].formatted)
+    assert_elided(task_line.removeprefix('  desc: '), desc)
+    assert_elided(_memory_body(result.context_items[hinted.id].formatted), hinted.content)
 
 
 # ── _ctx_task_event subtask qualification ────────────────────────────

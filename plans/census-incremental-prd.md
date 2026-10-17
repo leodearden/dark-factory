@@ -152,6 +152,7 @@ The runner computes "standing, no new evidence" from the codebook and renders it
 - **No max-interval condition** (decided, R8). Today's calendar backstop is deleted by L8b. The trigger fires on (a) or (b) only, each subject to the floor. A project with no completion signal (no previous run id, or a previous run that filed nothing) therefore fires only on (b) or by hand (`skills/census/SKILL.md`).
 - **Floor:** `floor_days` is the minimum transcript window, and the calendar's only role (R2). It never fires a census by itself. No condition fires until `now − session_watermark ≥ floor_days`. It is anchored on the watermark, not the date, and a never-censused project measures it from its earliest codebook date. `tasks_landed_*` and `last_census_done_count` are retired by L8b.
 - Every threshold remains an unquoted non-negative int, validated by `census_trigger.py::CensusConfig.from_mapping`.
+  > Superseded mechanism (2026-10-10): `plans/review-all-s21-legibility-pipeline-prd.md` D8 (task 6749, ζ) deletes `CensusConfig.from_mapping`; thresholds are validated once by a strict `config.Census` (`StrictInt`, `ge=0`) at `load_config`, and the trigger reads `LegibilityConfig.census`. The semantics above, including L8b's deprecated-key WARNING, are unchanged.
 
 ### 4.8 Boundary-test sketch
 
@@ -253,11 +254,11 @@ Not present, queued as prerequisites:
 | `invariant_violated` population and slug check | **this PRD (L9)**, resolving the circular claim in `plans/confusion-reduction-prd.md` §10 ↔ `docs/legibility/design-invariants.md` §Census seam | decomposer adds a pointer to both (not owned by this seat) |
 | Trigger semantics (§6, §7.4, §7.5, §8.5 of the parent PRD) | **this PRD (L8a, L8b)** supersedes them | decomposer adds a supersession line to `plans/confusion-reduction-prd.md` |
 | `nightly.py` | parent PRD ε (landed) | L1 adds the ledger write; L8b changes the `decide_for_project` call |
-| Quality-definition renderer | `orchestrator/src/orchestrator/agents/code_quality.py::guidance` | consumed read-only (L2, L10) through a `__file__`-relative src path, as `census.py::_SHARED_SRC` does |
+| Quality-definition renderer | `orchestrator/src/orchestrator/agents/code_quality.py::guidance` | consumed read-only (L2, L10, and L9, which slices `## Definition` with `code_quality.py::section`) through a `__file__`-relative src path, as `census.py::_SHARED_SRC` does |
 
 ## 9. Decomposition plan
 
-Every leaf edits `census.py` except L8a, L9 and L11, so the `census.py` editors form one chain: L1 → L8a → L2 → L3 → L4 → L5 → L6 → L7 → L10 → L8b. L8a sits in the chain because it shares `config.py` with L1, L7 and L8b, and `census_trigger.py` with L1 and L8b. L9 ← L1 serialises `nightly.py`, and L3 ← L9 serialises `codebook.py`. L8b's `nightly.py` edit follows L9 transitively. Externals: L4 ← task-metadata-lookup's `find_tasks_by_metadata` leaf; L8b ← completion-driven-triggers' `check_run_completion.py` leaf. G ← L8b, L9, L11. The graph is acyclic.
+Every leaf edits `census.py` except L8a and L11, so the `census.py` editors form one chain: L1 → L8a → L2 → L3 → L4 → L5 → L6 → L7 → L10 → L8b. L8a sits in the chain because it shares `config.py` with L1, L7 and L8b, and `census_trigger.py` with L1 and L8b. L9's `census.py` edit is wiring only, because C1's "enforced on write" needs the slug list at the merger; L9 enters the chain at L3 through the existing L3 ← L9, and between L9 and L2 there is no dependency, so the scheduler's file lock serialises them. L9 ← L1 serialises `nightly.py`, and L3 ← L9 serialises `codebook.py`. L8b's `nightly.py` edit follows L9 transitively. Externals: L4 ← task-metadata-lookup's `find_tasks_by_metadata` leaf; L8b ← completion-driven-triggers' `check_run_completion.py` leaf. G ← L8b, L9, L11. The graph is acyclic.
 
 L1–L10 are intermediates whose user-observable completion is G's check of a live report, the C-as-integration-gate pattern. Each also names its own observable below. Tests drive public seams only.
 
@@ -280,7 +281,7 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Consumers:** L3, L4 (route), ticket priority.
   - **Signal:** G (Findings rows carry severities other than `medium`, each with a reason).
 - **L9: invariant slugs to the coder, slug check in the merger** (normal; deps L1 (`nightly.py`); ~350 LOC).
-  - **Files:** new `scripts/legibility/invariants.py`; `coder.py::build_prompt` (slug list from the observed project's doc; absent doc → empty list, stated in the prompt); `codebook.py::validate_coding_record` (an unknown slug is stored as absent, counted in a new stat, one WARNING per run naming the values); `nightly.py` journal summary line; `scripts/tests/test_design_invariants_consistency.py` imports the reader.
+  - **Files:** new `scripts/legibility/invariants.py`; `coder.py::build_prompt` (slug list from the observed project's doc; absent doc → empty list, stated in the prompt); `codebook.py::apply_coding_record` (screens each record through `codebook.py::screen_invariant_slugs` after the `validate_coding_record` schema gate passes: an unknown slug is stored as absent, counted in a new stat, one WARNING per run naming the values; `validate_coding_record` and `validate` are unchanged); `census.py` (wiring only: `run_census` reads `invariants.read_slugs` once, `mine_to_saturation` forwards `invariant_slugs` to `coder.code_digests`, and the mining-record merge passes it to `codebook.apply_coding_record`, with one WARNING per run); `nightly.py` journal summary line; `scripts/tests/test_design_invariants_consistency.py` imports the reader.
   - **Definition as the minting test (R9):** `coder.py::build_prompt` is the one prompt both the trickle and the miner use, so L9 (the leaf that already edits it) adds the `## Definition` section of the normative doc, sliced by `orchestrator/src/orchestrator/agents/code_quality.py::section(text, '## Definition')` over `code_quality.py::NORMATIVE_DOC`, never restated, as the test a confusion must meet before it is minted as a candidate. The prompt carries no heuristic and asks for no tag. Cost: the whole section, 138 words, about 200 tokens per miner and trickle call. Rationale: a heuristic tag is a judgement about code the coder has not read, and the primary tag is part of the finding key, so pre-tagging would churn keys across the trickle→census boundary.
   - **Tests:** rows 15 and 17; reify-form headings.
   - **Consumers:** the report's invariant counts (L10); the design-invariants §Census seam guard-task rule (Leo).
@@ -326,7 +327,7 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Signal:** `similarity.py queue --project-root /home/leo/src/dark-factory` (embedding spend only, no verify) prints the queue depth and the top clusters over the live codebook. G (`## Adjudication` with an audit line per attach).
 - **L10: structured synthesis** (normal; deps L7; ~700 LOC).
   - **Files:** new `scripts/legibility/synthesis.py` (schema, validation, deterministic renderer); `census.py` (`_synthesis_prompt` input: this run's verified, screened and attached findings plus counts, never prior reports; the guidance block; apply `phase_refinements` and `corrections`); tests.
-  - **Behaviour:** C6. Heuristic 12: prose is rendered from data. The report's per-slug invariant counts come from L9's sightings.
+  - **Behaviour:** C6. Heuristic 12: prose is rendered from data. The report's per-slug invariant counts come from L9's sightings. Reconcile task 5692's interim `census.py::SYNTHESIS_NOT_APPLIED_NOTICE` and `::SYNTHESIS_PROPOSALS_HEADING`: once `corrections` and `phase_refinements` are applied, the notice must name what was applied, not deny it.
   - **Tests:** row 14, plus a golden render.
   - **Consumer:** operator.
   - **Signal:** G (`## Synthesis` has "New" and "Re-observed" sub-blocks; a standing count; the matrix reflects refinements).

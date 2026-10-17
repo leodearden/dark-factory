@@ -19,8 +19,11 @@ Usage:
         behind the pending heals pass a share ceiling, nothing is written.
     undo --run RUN_ID
         Take back every heal one apply run applied. RUN_ID may be its first 8 characters.
+        A run with no heal still applied (a plan run, an undo run, an apply run
+        already undone) is refused.
     status [--limit N]
-        List recent runs from the ledger. Never creates the ledger.
+        List recent runs, and the latest plan of each source with its document,
+        sha and whether it is still the pending plan. Never creates the ledger.
 
 Exit codes: 0 when the run is complete, or partial only by the cap or stale
 skips; 1 when a heal, read or adjudication failed or the run stopped; 2 when
@@ -51,6 +54,7 @@ from fused_memory.maintenance.link_heal_executor import (
     FoldedEscapeFiler,
     RunLimits,
     RunReport,
+    pending_plan_sha256,
     run_adjudicator_plan,
     run_apply,
     run_plan,
@@ -62,6 +66,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
     AmbiguousRun,
     LinkHealLedger,
+    NothingToUndo,
     RunLock,
     RunLockHeld,
     RunRow,
@@ -84,7 +89,10 @@ EXIT_FAILED = 1
 EXIT_REFUSED = 2
 
 NO_WRITING_RUN = 'no link-heal run has written here'
-STATUS_COUNTS = ('planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap')
+STATUS_COUNTS = (
+    'planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap', 'adjudication_failed',
+)
+PLAN_SOURCES = (RunSource.CORPUS, RunSource.ADJUDICATOR)
 
 
 def load_config(config_path: str | None) -> FusedMemoryConfig:
@@ -141,8 +149,8 @@ class Refused(Exception):
 
 
 REFUSALS = (
-    Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, CorpusFormatError,
-    CensusFailed,
+    Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, NothingToUndo,
+    CorpusFormatError, CensusFailed,
 )
 
 
@@ -208,6 +216,7 @@ def render_status(ledger_path: Path, limit: int) -> str:
     ledger = LinkHealLedger(ledger_path)
     try:
         lines.extend(_status_line(run) for run in ledger.recent_runs(limit))
+        lines.extend(_latest_plan_lines(ledger))
         if ledger.writing_run_count() == 0:
             lines.append(NO_WRITING_RUN)
     finally:
@@ -218,10 +227,39 @@ def render_status(ledger_path: Path, limit: int) -> str:
 def _status_line(run: RunRow) -> str:
     counts = run.counts or {}
     tallies = '  '.join(f'{name} {counts.get(name, 0)}' for name in STATUS_COUNTS)
+    would_escape = ', '.join(counts.get('would_escape') or ()) or 'none'
     return (
         f'{run.run_id[:8]}  {run.source.value}  writes {"yes" if run.writes else "no"}  '
-        f'finished {run.finished_at or "never"}  {tallies}'
+        f'finished {run.finished_at or "never"}  {tallies}  would_escape {would_escape}'
     )
+
+
+def _latest_plan_lines(ledger: LinkHealLedger) -> list[str]:
+    lines = []
+    for source in PLAN_SOURCES:
+        run = ledger.latest_plan_run(source)
+        if run is not None:
+            lines.append(_plan_line(run, ledger.pending_actions(source)))
+    return lines
+
+
+def _plan_line(run: RunRow, pending: Sequence[ActionRow]) -> str:
+    """The latest plan of *run*'s source, and how it stands against the heals pending now."""
+    heading = f'latest {run.source.value} plan {run.run_id[:8]}'
+    if run.plan_sha256 is None:
+        return f'{heading}  no plan document'
+    return (
+        f'{heading}  plan {run.plan_path or "unrecorded"}  '
+        f'plan_sha256 {run.plan_sha256}  {_plan_standing(run.plan_sha256, pending)}'
+    )
+
+
+def _plan_standing(plan_sha256: str, pending: Sequence[ActionRow]) -> str:
+    if not pending:
+        return 'nothing pending'
+    if plan_sha256 == pending_plan_sha256(pending):
+        return 'pending now'
+    return 'stale (pending heals changed since; re-plan)'
 
 
 @dataclass(frozen=True)
@@ -269,9 +307,12 @@ def _load_corpus(path: Path) -> tuple[LinkBasis, ...]:
 def _plan_path_for(out: Path | None, ledger_dir: Path) -> Callable[[str], Path]:
     if out is None:
         return lambda run_id: ledger_dir / f'link-heal-plan-{run_id[:8]}.json'
-    if not out.parent.is_dir():
-        raise Refused(f'cannot write the plan to {out}: {out.parent} is not a directory')
-    return lambda _run_id: out
+    plan_path = out.absolute()
+    if not plan_path.parent.is_dir():
+        raise Refused(
+            f'cannot write the plan to {plan_path}: {plan_path.parent} is not a directory',
+        )
+    return lambda _run_id: plan_path
 
 
 async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
@@ -331,8 +372,8 @@ async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
 
 
 async def _undo(args: argparse.Namespace, session: _Session) -> RunReport:
-    target = session.ledger.resolve_run(args.run)
-    await session.probe(_first_project(session.ledger.applied_actions(target.run_id)))
+    target = session.ledger.undo_target(session.ledger.resolve_run(args.run))
+    await session.probe(_first_project(target.heals))
     return await run_undo(
         target, store=session.store, ledger=session.ledger, limits=session.limits,
     )

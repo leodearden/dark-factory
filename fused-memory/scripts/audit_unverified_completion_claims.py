@@ -82,6 +82,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from shared.project_layout import tasks_db
+
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
@@ -1076,10 +1078,6 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
         return None
 
 
-#: Where a project keeps its task database, relative to its root — the path
-#: ``SqliteTaskBackend._db_path`` builds (backends/sqlite_task_backend.py:1137).
-TASKS_DB_RELPATH: tuple[str, ...] = ('.taskmaster', 'tasks', 'tasks.db')
-
 #: The tag context every in-tree caller reads under
 #: (``sqlite_task_backend.DEFAULT_TAG``, :127).
 TASKS_DEFAULT_TAG = 'master'
@@ -1147,7 +1145,7 @@ def _read_task_statuses_readonly(
     if not int_ids:
         return {}
 
-    conn = _readonly_connect(Path(project_root).joinpath(*TASKS_DB_RELPATH))
+    conn = _readonly_connect(tasks_db(project_root))
     statuses: dict[str, str] = {}
     try:
         for chunk in _chunked(int_ids):
@@ -1264,7 +1262,7 @@ async def _build_task_status_probe(
 
     The read runs over :func:`_read_task_statuses_readonly` rather than
     ``SqliteTaskBackend.get_statuses``. The backend's read path opens a
-    READ/WRITE connection first (``_get_connection``: WAL pragmas + schema
+    READ/WRITE connection first (``_get_write_access``: WAL pragmas + schema
     migration) and is never closed, leaking its aiosqlite worker threads — and
     a sweep answering cross-project claims points it at OTHER projects' live
     databases while their orchestrators are running. ``mode=ro`` makes the

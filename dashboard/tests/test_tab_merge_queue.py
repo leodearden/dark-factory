@@ -7,7 +7,12 @@ DECIDES lives in plain-JS modules that node runs:
   * "In queue now" — the tile's headline and spark, the per-project "queued"
     pip and the rail badge — reads the one served ``in_queue`` Datum through
     ``merge_queue.js`` (``projectInQueue``, ``inQueueOver``, ``inQueueHistory``),
-    and the latency panel's caption is ``merge_queue.js::latencyCaption``; both
+    and the latency panel's caption is ``merge_queue.js::latencyCaption``.
+  * The speculative tile, pip and panel read the served ``speculative`` Datum
+    through ``merge_queue.js`` (``speculativeOver``, ``projectSpeculative``,
+    ``hitRateText``); the Recent-merges window total is
+    ``merge_queue.js::recentTotal``; a queued row's "When", and its instant in
+    the Overview live feed, is ``merge_queue.js::queuedSince``. All of these
     are covered by dashboard/tests/js/merge_queue.test.mjs.
   * The Recent-merges caption ("showing N of M in <window>") is
     ``window_chip.js::recentMergesCaption``, covered by

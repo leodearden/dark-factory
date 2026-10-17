@@ -25,12 +25,15 @@ import importlib
 import json
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
 import pytest
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
+from fused_memory.services.write_journal import JournalGrowthSample
 
 #: Applied PER CLASS rather than as a module-level ``pytestmark``, so the
 #: pairwise anchor-collision regression at the foot of this file keeps running
@@ -92,6 +95,15 @@ class TestTheFiledEscalation:
         operator watches."""
         _emit(tmp_path)
         assert (tmp_path / 'data' / 'escalations').is_dir()
+
+    def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        esc_id = _emit(tmp_path)
+
+        filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
+        assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_the_id_is_minted_off_the_anchor(self, tmp_path):
         esc_id = _emit(tmp_path)
@@ -589,6 +601,20 @@ def _residue(module: Any, project_root: str) -> object:
     )
 
 
+def _journal_growth(ceiling: str) -> Callable[[Any, str], object]:
+    def fire(module: Any, project_root: str) -> object:
+        sample = JournalGrowthSample(
+            file_bytes=2, free_bytes=0, rows_inserted=2,
+            since=datetime(2026, 10, 8, tzinfo=UTC),
+        )
+        breach = module.JournalGrowthBreach(
+            ceiling=module.JournalCeiling[ceiling], measured=2, limit=1,
+        )
+        return module.emit_journal_growth_escalation(project_root, breach, sample)
+
+    return fire
+
+
 def _unverified_claim(module: Any, project_root: str) -> object:
     return module.emit_unverified_claim_escalation(
         project_root,
@@ -678,6 +704,20 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         logging.DEBUG,
         1,
     ),
+    _Filer(
+        'journal_growth_alarm file_size',
+        'fused_memory.services.journal_growth_alarm',
+        _journal_growth('FILE_SIZE'),
+        logging.DEBUG,
+        1,
+    ),
+    _Filer(
+        'journal_growth_alarm insert_rate',
+        'fused_memory.services.journal_growth_alarm',
+        _journal_growth('INSERT_RATE'),
+        logging.DEBUG,
+        1,
+    ),
 )
 
 
@@ -755,6 +795,8 @@ class TestEveryFilerPinsItsForwardedLevels:
             'referent_repair_storm_escalator',
             'completion_claim_gate',
             'memory_metadata_census',
+            'journal_growth_alarm file_size',
+            'journal_growth_alarm insert_rate',
         }
         raised = {
             f.label for f in _MIGRATED_FILERS
@@ -846,8 +888,17 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.server.write_triage import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as WRITE_TRIAGE_ANCHOR,
     )
+    from fused_memory.services.classification_fallback_alarm import (  # noqa: PLC0415
+        ANCHOR_TASK_ID as CLASSIFICATION_FALLBACK_ANCHOR,
+    )
     from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
         _ANCHOR_PREFIX as UNVERIFIED_CLAIM_PREFIX,
+    )
+    from fused_memory.services.journal_growth_alarm import (  # noqa: PLC0415
+        _FILE_SIZE_ANCHOR_TASK_ID as JOURNAL_SIZE_ANCHOR,
+    )
+    from fused_memory.services.journal_growth_alarm import (
+        _INSERT_RATE_ANCHOR_TASK_ID as JOURNAL_RATE_ANCHOR,
     )
     from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
@@ -857,7 +908,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     )
 
     return {
-        # -- the seven filers that call `file_folded_escalation` ------------
+        # -- the filers that call `file_folded_escalation` ------------------
         'write_triage': WRITE_TRIAGE_ANCHOR,
         'markup_tripwire storm (the SQUATTED one)': TRIPWIRE_ANCHOR,
         'markup_tripwire residue': TRIPWIRE_RESIDUE_ANCHOR,
@@ -868,6 +919,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'memory_metadata_census sample writer': writer_anchor_task_id(
             'dark_factory', 'claude-x',
         ),
+        'journal_growth_alarm file_size': JOURNAL_SIZE_ANCHOR,
+        'journal_growth_alarm insert_rate': JOURNAL_RATE_ANCHOR,
+        'classification_fallback_alarm': CLASSIFICATION_FALLBACK_ANCHOR,
         # -- markup_guard, which CALLS the tripwire's filers with anchors of
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
@@ -963,6 +1017,9 @@ class TestNoTwoFilersShareAnAnchor:
             'referent_repair_storm_escalator',
             'completion_claim_gate prefix',
             'memory_metadata_census base',
+            'journal_growth_alarm file_size',
+            'journal_growth_alarm insert_rate',
+            'classification_fallback_alarm',
             'mem0_update_storm_escalator',
             'entity_mint_storm_escalator',
             'scope_violation_escalator',

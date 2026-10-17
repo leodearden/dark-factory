@@ -29,6 +29,7 @@ import warnings
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,14 +37,13 @@ import httpx
 import pytest
 from openai import RateLimitError
 from pydantic import BaseModel
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.graphiti_client import (
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-    INCOMPLETE_STRUCTURAL_KINDS,
+    INCOMPLETE_KINDS,
     PagedRead,
+    ReadCompleteness,
 )
-from fused_memory.utils.target_store_preflight import task_store_path
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -324,11 +324,6 @@ def extract_params(call_args: Any) -> dict:
 # projects into stats — so the two must be settable independently.
 # ---------------------------------------------------------------------------
 
-_KNOWN_INCOMPLETE_KINDS: frozenset[str] = INCOMPLETE_STRUCTURAL_KINDS | {
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-}
-
 
 def complete_paged_read(
     *, rows_seen: int = 0, expected_rows: int | None = None
@@ -358,7 +353,7 @@ def incomplete_paged_read(
 ) -> PagedRead:
     """A PagedRead reporting an INCOMPLETE enumeration of the given kind.
 
-    `kind` is validated against the four `INCOMPLETE_*` constants rather than
+    `kind` is validated against `INCOMPLETE_KINDS` rather than
     taken on trust: a typo'd kind string matches no policy branch, so it would
     quietly behave like a complete read and the test would pass for the wrong
     reason.
@@ -367,9 +362,9 @@ def incomplete_paged_read(
     mirroring the real backend's shape closely enough that an assertion on the
     reason reaching an operator-facing message is meaningful.
     """
-    assert kind in _KNOWN_INCOMPLETE_KINDS, (
+    assert kind in INCOMPLETE_KINDS, (
         f'unknown incomplete_kind {kind!r}; expected one of '
-        f'{sorted(_KNOWN_INCOMPLETE_KINDS)}'
+        f'{sorted(INCOMPLETE_KINDS)}'
     )
     if reason is None:
         reason = (
@@ -385,6 +380,11 @@ def incomplete_paged_read(
         reason=reason,
         incomplete_kind=kind,
     )
+
+
+#: The verdict for a proven-complete read, for the StaleSummaryResult fields a
+#: test does not care about (task 4914).
+COMPLETE_READ = ReadCompleteness(complete=True, incomplete_kind=None)
 
 
 # ---------------------------------------------------------------------------
@@ -2037,7 +2037,7 @@ def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
     file; agreement with the real backend is pinned once, in
     tests/test_target_store_preflight.py.
     """
-    db = task_store_path(project_root)
+    db = tasks_db(project_root)
     db.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db)
     try:
@@ -2055,7 +2055,7 @@ def make_zero_byte_task_store(project_root: pathlib.Path) -> pathlib.Path:
     The residue shape ``target_store_preflight``'s guard must refuse, and the
     counterpart of :func:`make_populated_task_store`.
     """
-    db = task_store_path(project_root)
+    db = tasks_db(project_root)
     db.parent.mkdir(parents=True)
     db.touch()
     return db
@@ -2284,3 +2284,33 @@ class FakeMemoryLookup:
         if isinstance(verdict, BaseException):
             raise verdict
         return verdict
+
+
+async def seed_resolved_ticket(
+    store: Any,
+    db_path: pathlib.Path,
+    project_id: str,
+    *,
+    status: str,
+    latency_s: float,
+    resolved_at: datetime,
+    reason: str | None = None,
+) -> str:
+    """Submit and resolve one ticket, then pin its age and resolve latency.
+
+    The ticket goes through ``TicketStore``'s public writers, which both stamp
+    the wall clock; the timestamps are then rewritten through an independent
+    connection to *db_path*, treating the db file as the fixture.
+    """
+    import aiosqlite
+
+    ticket_id = await store.submit(project_id, '{}')
+    await store.mark_resolved(ticket_id, status=status, task_id='1', reason=reason)
+    created_at = resolved_at - timedelta(seconds=latency_s)
+    async with aiosqlite.connect(str(db_path), timeout=5) as db:
+        await db.execute(
+            'UPDATE tickets SET created_at = ?, resolved_at = ? WHERE ticket_id = ?',
+            (created_at.isoformat(), resolved_at.isoformat(), ticket_id),
+        )
+        await db.commit()
+    return ticket_id

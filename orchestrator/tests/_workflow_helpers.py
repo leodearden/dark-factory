@@ -26,6 +26,7 @@ import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
+from shared.cli_invoke import PromptBuilder
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.locking import normalize_lock
 
@@ -90,6 +91,10 @@ class FakeScheduler:
         # directly, bypassing handle_blast_radius_expansion) can be asserted.
         # Purely additive — the existing no-op `return True` is preserved.
         self.update_task_calls: list[tuple[str, str | dict]] = []
+        # Tasks a Table-B action teardown owns, modelling
+        # scheduler.py::Scheduler.blocked_writes_suppressed: their 'blocked'
+        # writes are absorbed, every other write lands.
+        self.blocked_write_suppressed_ids: set[str] = set()
 
     async def set_task_status(
         self,
@@ -101,6 +106,8 @@ class FakeScheduler:
         claimant_run_id: str | None = None,
         heartbeat_at: str | None = None,
     ) -> None:
+        if status == 'blocked' and self.blocked_writes_suppressed(task_id):
+            return
         self.statuses.setdefault(task_id, []).append(status)
         if done_provenance is not None:
             self.provenance[task_id] = done_provenance
@@ -201,6 +208,9 @@ class FakeScheduler:
 
     def clear_merge_phase(self, tid: str) -> None:
         pass
+
+    def blocked_writes_suppressed(self, task_id: str, /) -> bool:
+        return task_id in self.blocked_write_suppressed_ids
 
 
 def _merge_values_additive(old: object, new: object) -> object:
@@ -417,6 +427,29 @@ def wire_metadata_backend(
     scheduler.update_task = update_task
     scheduler.get_task = AsyncMock(side_effect=backend.get_task)
     return handle_blast_radius_expansion, update_task
+
+
+def fixed_prompt(text: str) -> PromptBuilder:
+    """A ``TaskWorkflow._invoke`` prompt builder that always returns *text*."""
+
+    async def build_prompt() -> str:
+        return text
+
+    return build_prompt
+
+
+def invoke_stub_awaiting_builder(result: AgentResult) -> AsyncMock:
+    """An ``_invoke`` double that awaits its prompt builder, then returns *result*.
+
+    For tests that replace ``_invoke`` wholesale yet assert on the briefing
+    call the builder makes.
+    """
+
+    async def invoke(_role, build_prompt: PromptBuilder, *_args, **_kwargs) -> AgentResult:
+        await build_prompt()
+        return result
+
+    return AsyncMock(side_effect=invoke)
 
 
 class FakeBriefing:
@@ -937,6 +970,7 @@ class AgentStub:
         working_idle_secs: float | None = None,
         absolute_cap_secs: float | None = None,
         prices: dict[str, Any] | None = None,
+        strict_mcp_config: bool = False,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)

@@ -5280,7 +5280,7 @@ class TestAcquireSpecLaneReseedTrashHardening:
          → git reset --hard + git clean -xfd [-e ...] runs here
 
     A no-op scripts/seed-warm-lane.sh must be committed to wl_git_repo before
-    the first acquire so _seed_warm_lane(lane, '--reset-in-place') returns 0.
+    the first acquire so _seed_warm_lane(lane, '--fresh-checkout') returns 0.
     """
 
     async def test_acquire_spec_lane_excludes_reseed_trash(self, wl_git_repo: Path):

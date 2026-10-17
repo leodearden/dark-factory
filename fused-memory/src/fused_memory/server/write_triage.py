@@ -83,9 +83,10 @@ from fused_memory.server.grouped_read import (
 # than deleted, and one home for the reader beats a third file to keep in
 # sync.)
 from fused_memory.server.near_duplicate_guard import cosine_of
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Sequence
 
     from fused_memory.models.memory import MemoryResult
     from fused_memory.services.memory_service import SearchResults
@@ -201,6 +202,8 @@ class TriageJudgeVerdict(NamedTuple):
     #: ``None`` when no call was made or none was reported. Triage ignores it;
     #: the eval prices a write from it.
     usage: JudgeUsage | None = None
+    #: Comparable candidates the judge was not shown; ``()`` when it saw them all.
+    truncation_facts: tuple[TruncationFact, ...] = ()
 
 
 def attach_write_landed(result: Any) -> bool:
@@ -362,6 +365,8 @@ class BandDecision:
     #: The slate id the judge named, before hoisting; ``None`` on every
     #: non-judged path and for a bare-word verdict.
     judged_candidate_id: str | None = None
+    #: Where the evidence behind this decision was clipped; ``()`` when nowhere.
+    truncation_facts: tuple[TruncationFact, ...] = ()
 
 
 def declares_attach_keys(metadata: Any) -> bool:
@@ -880,7 +885,10 @@ async def triage_write(
                 stage='retrieve',
             )
             return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
-        decision = decide_band(results, t_high=t_high, t_low=t_low)
+        decision = replace(
+            decide_band(results, t_high=t_high, t_low=t_low),
+            truncation_facts=_retrieval_cap_facts(results, k, t_low),
+        )
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='retrieve')
         return BandDecision(OUTCOME_STORED, None, None, None, None)
@@ -912,6 +920,20 @@ async def triage_write(
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
 
 
+def _retrieval_cap_facts(
+    results: Sequence[MemoryResult], k: int, t_low: float | None,
+) -> tuple[TruncationFact, ...]:
+    """A full top-*k* whose weakest comparable candidate still reached ``t_low`` may have cut in-band ones.
+
+    Nothing past rank *k* scores above the weakest kept candidate, so when that one
+    is below the band the cut hid nothing comparable. How many were cut is unknowable.
+    """
+    scores = [score for score in map(cosine_of, results) if score is not None]
+    if len(results) < k or t_low is None or not scores or min(scores) < t_low:
+        return ()
+    return (TruncationFact(field='triage_candidates', cap=k, elided=None),)
+
+
 def _apply_judge_verdict(
     decision: BandDecision,
     answer: object,
@@ -931,6 +953,7 @@ def _apply_judge_verdict(
     closed (D3): an unrecognised verdict is a bug, not an extension point.
     """
     verdict = _judge_verdict_of(answer)
+    decision = replace(decision, truncation_facts=decision.truncation_facts + verdict.truncation_facts)
     if verdict.outcome not in TRIAGE_OUTCOMES:
         raise ValueError(f'judge returned {verdict.outcome!r}, not in TRIAGE_OUTCOMES')
     if verdict.outcome == OUTCOME_STORED:

@@ -14,7 +14,8 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import pytest
-from shared.cli_invoke import AgentResult, no_mcp_servers_config
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import LinkHealConfig
@@ -24,6 +25,7 @@ from fused_memory.maintenance.link_adjudicator import (
     VERDICT_OUTPUT_SCHEMA,
     AdjudicationFailure,
     ClaudeShardAsker,
+    Invoke,
     LinkPair,
     LinkVerdict,
     Shard,
@@ -536,21 +538,69 @@ class TestConfiguredAdjudicator:
         assert _failures(verdicts)[2:] == [AdjudicationFailure.NOT_ATTEMPTED] * 2
 
 
+_LIVE_PAIR = LinkPair(
+    key='live',
+    child_text='Never run git stash in any checkout: refs/stash is one ref shared by every worktree.',
+    parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
+)
+
+
+async def _live_edge_verdict(invoke: Invoke) -> LinkVerdict:
+    """The live pair's verdict; capacity skips and auth reds, per shared/tests/_capacity_skip.py."""
+    results: list[AgentResult] = []
+
+    async def recording(**kwargs: Any) -> AgentResult:
+        result = await invoke(**kwargs)
+        results.append(result)
+        return result
+
+    (verdict,) = await adjudicate_links(
+        [_LIVE_PAIR], model='sonnet', shard_size=40, field_chars=4000, failure_streak=3,
+        ask=ClaudeShardAsker(invoke=recording),
+    )
+    replies = [f'{result.output}\n{result.stderr}'.strip() for result in results]
+    banners = [reply for reply in replies if looks_like_capacity_banner(reply) is not None]
+    if verdict.failed and banners:
+        pytest.skip(f'the claude CLI account is at capacity: {banners[0][:200]}')
+    return verdict
+
+
+class TestTheLiveEdgeCapacityGuard:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('banner', REAL_CLI_CAP_HIT_MESSAGES)
+    async def test_a_capacity_banner_skips_the_live_edge(self, banner):
+        invoke = FakeInvoke(AgentResult(success=False, output=banner))
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(banner)):
+            await _live_edge_verdict(invoke)
+
+    @pytest.mark.asyncio
+    async def test_an_auth_failure_is_not_skipped(self):
+        invoke = FakeInvoke(AgentResult(success=False, output='Not logged in · Please run /login'))
+
+        verdict = await _live_edge_verdict(invoke)
+
+        assert verdict.failed
+        assert verdict.failure is AdjudicationFailure.CLI_FAILED
+
+    @pytest.mark.asyncio
+    async def test_a_successful_reply_is_returned_as_is(self):
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+
+        verdict = await _live_edge_verdict(invoke)
+
+        assert not verdict.failed
+        assert verdict.verdict is Verdict.SAME
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(shutil.which('claude') is None, reason='needs the claude CLI')
 class TestTheLiveEdge:
     @pytest.mark.asyncio
     @pytest.mark.timeout(600)
     async def test_a_restatement_gets_a_verdict_from_the_real_cli(self):
-        pair = LinkPair(
-            key='live',
-            child_text='Never run git stash in any checkout: refs/stash is one ref shared by every worktree.',
-            parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
-        )
-
-        (verdict,) = await adjudicate_links(
-            [pair], model='sonnet', shard_size=40, field_chars=4000, failure_streak=3,
-        )
+        verdict = await _live_edge_verdict(invoke_with_cap_retry)
 
         assert not verdict.failed, verdict
         assert isinstance(verdict.verdict, Verdict)

@@ -267,6 +267,10 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 8. **PRD box `n/m done` is a `lower_bound` datum** over the fetched rows, rendered as
    `≥ n/m`, until a per-PRD server census exists (out of scope: the status map carries
    no PRD field).
+   *Superseded 2026-10-09 by `plans/dashboard-prd-lanes-prd.md` (§4.2, §4.4). A lineage
+   index over every task attributes each task to a PRD at read time, and
+   `GET /api/v2/dashboard/prds` serves exact per-PRD `done/total` (task 6583, γ1). The PRD
+   boxes are deleted (task 6585, δ).*
 9. **Burndown**: the sampler consumes the snapshot unit from decision 5; a failed cycle
    writes a row with `state='gap'` and `reason`; all nine members are stored — the
    three columns that do not exist today (`review`, `merge_deferred`, `infra_hold`)
@@ -644,8 +648,11 @@ and a miss cap); δ2's signal reworded as fixture-driven. META answered yes.
 ## Out of scope
 
 - A per-PRD server census (needs a PRD field on the status map — a fused-memory
-  change); PRD boxes stay `lower_bound`.
-- Field projection on `get_tasks` (task 4390; 4795's remaining lever).
+  change); PRD boxes stay `lower_bound`. *Superseded 2026-10-09: delivered by
+  `plans/dashboard-prd-lanes-prd.md` task 6583 (γ1), with no status-map change.*
+- Field projection on `get_tasks` (task 4390; 4795's remaining lever). *2026-10-09: the
+  projection part is delivered by task 6581 (`plans/dashboard-prd-lanes-prd.md` α), and
+  4390 depends on it.*
 - Regenerating `recon_status.js` from `journal.py` (5320's runtime unknown bucket
   already catches drift).
 - Dashboard supervision/watchdog and endpoint-freshness thresholds

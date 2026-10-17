@@ -90,8 +90,7 @@ def _make_server(write_journal, *, results=None, raises: Exception | None = None
 
 
 async def _search_rows(journal: WriteJournal) -> list[dict]:
-    db = journal._db
-    assert db is not None
+    db = journal._require_access().connection
     async with db.execute(
         "SELECT * FROM write_ops WHERE operation = 'search' ORDER BY created_at"
     ) as cursor:
@@ -599,7 +598,6 @@ class TestGetStatusSurfacesJournalDrops:
     async def test_reports_the_exact_drop_count(self, write_journal):
         server = create_mcp_server(_make_status_service(), None, write_journal)
         await write_journal.close()
-        write_journal._db = None
         for _ in range(7):
             await write_journal.log_write_op(
                 write_op_id='x', operation='search', kind='read',

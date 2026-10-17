@@ -1033,7 +1033,7 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
     Task 3478 made the per-segment `-n` cap reachable, and that newly composes
     it with a path no earlier test covers: on an ENV_TRANSIENT red,
     `run_verification` re-enters `_run_or_skip_timed` with
-    ``_serial_pytest_str(attempt.test.cmd)``, and on a task/background-role
+    ``_serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)``, and on a task/background-role
     verify THAT chain is segmented too — so every recovery segment is now
     handed to the cap.
 
@@ -1089,10 +1089,10 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
         )
 
     @staticmethod
-    def _recovery_chain_segments() -> list[str]:
+    def _recovery_chain_segments(worktree) -> list[str]:
         """What the recovery pass's segments must be, derived not hardcoded.
 
-        Computed as ``split_and_chain_segments(_serial_pytest_str(chain))`` —
+        Computed as ``split_and_chain_segments(_serial_pytest_str(chain, invocation_dir=worktree))`` —
         the same two transforms production composes — so if `serial_pytest`'s
         emitted form ever changes, this expectation follows it and the test
         keeps asserting "the cap added nothing" rather than freezing one
@@ -1100,7 +1100,7 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
         """
         from orchestrator.verify import _serial_pytest_str  # noqa: PLC0415
 
-        serial = _serial_pytest_str(_FLEET_TEST_COMMAND)
+        serial = _serial_pytest_str(_FLEET_TEST_COMMAND, invocation_dir=worktree)
         # `_serial_pytest_str` is typed `str | None -> str | None` because it
         # returns its argument unchanged on a None/non-parsing command; the
         # None arm is unreachable for a str argument, so narrow it explicitly
@@ -1131,7 +1131,7 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
         assert len(cmds) == 2 * n_segments, (
             f'expected one capped pass then one recovery pass, got {len(cmds)} spawns'
         )
-        assert cmds[n_segments:] == self._recovery_chain_segments()
+        assert cmds[n_segments:] == self._recovery_chain_segments(tmp_path)
         assert result.passed is True, 'the serial recovery must actually recover'
 
     @pytest.mark.real_verify_admission

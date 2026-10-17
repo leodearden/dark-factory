@@ -162,6 +162,12 @@ prices:
   gpt-6-astra:
     input_per_1m: 10.00
     output_per_1m: 50.00
+  gpt-5.6-sol:
+    input_per_1m: 4.00
+    output_per_1m: 20.00
+  gpt-5.6-terra:
+    input_per_1m: 2.00
+    output_per_1m: 12.00
   o4-mini:
     input_per_1m: 1.10
     output_per_1m: 4.40

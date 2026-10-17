@@ -29,13 +29,14 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
     from typing import Any
 
     from shared.cost_store import CostStore
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
+from orchestrator.event_store import EventType
 from orchestrator.workflow import WorkflowOutcome
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,18 @@ def update_ewa(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class CategoryShare:
+    """One escalation category's count out of the window's total."""
+
+    category: str
+    count: int
+    total: int
+
+    def __str__(self) -> str:
+        return f'{self.count}/{self.total} {self.category}'
+
+
 @dataclass
 class EscalationStats:
     """Aggregated escalation statistics for a digest window."""
@@ -119,6 +133,16 @@ class EscalationStats:
     dedupe_children_total: int = 0
     # Count of in-window escalations with status == 'pending'
     pending_total: int = 0
+
+    def dominant_category(self) -> CategoryShare | None:
+        """The most frequent category across every level and status; ties go to the smallest name."""
+        per_category: Counter[str] = Counter()
+        for (category, _level, _status), count in self.category_level_status_counts.items():
+            per_category[category] += count
+        if not per_category:
+            return None
+        category, count = min(per_category.items(), key=lambda kv: (-kv[1], kv[0]))
+        return CategoryShare(category=category, count=count, total=sum(per_category.values()))
 
 
 def aggregate_escalations(
@@ -606,6 +630,113 @@ def model_role_rollup(
 
 
 # ---------------------------------------------------------------------------
+# Scheduler-pause visibility (task 5311)
+# ---------------------------------------------------------------------------
+
+SCHEDULER_PAUSE_RESURFACE_AGE: timedelta = timedelta(hours=2)
+
+
+@dataclass(frozen=True)
+class RependedWhilePaused:
+    """A task a resolution re-pended while dispatch was paused."""
+
+    task_id: str
+    escalation_id: str
+    repended_at: str
+
+
+@dataclass(frozen=True)
+class OverdueEscalation:
+    """A pending escalation older than its re-surface age."""
+
+    escalation_id: str
+    age: timedelta
+    summary: str
+
+
+@dataclass(frozen=True)
+class PauseVisibility:
+    """What the digest's '## Paused, waiting' section renders."""
+
+    pause_reason: str | None = None
+    repended_waiting: tuple[RependedWhilePaused, ...] = ()
+    overdue_pause_escalations: tuple[OverdueEscalation, ...] = ()
+
+
+def repended_during_current_pause(events_db: Path) -> tuple[RependedWhilePaused, ...]:
+    """Latest re-pend per task since the last pause ended (a resume, or a restart that
+    declined to re-assert it), across every run; fail-open ()."""
+
+    def _query(conn: sqlite3.Connection) -> tuple[RependedWhilePaused, ...]:
+        rows = conn.execute(
+            "SELECT task_id, json_extract(data, '$.escalation_id'), timestamp, MAX(id) "
+            'FROM events WHERE event_type = ? '
+            'AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type = ? '
+            "OR (event_type = ? AND json_extract(data, '$.reasserted') = 0)) "
+            'GROUP BY task_id ORDER BY task_id',
+            (
+                EventType.repend_while_paused.value,
+                EventType.scheduler_resumed.value,
+                EventType.scheduler_pause_restored.value,
+            ),
+        ).fetchall()
+        return tuple(
+            RependedWhilePaused(task_id=task_id, escalation_id=escalation_id, repended_at=ts)
+            for task_id, escalation_id, ts, _ in rows
+        )
+
+    return _query_events_ro(events_db, 'repended_during_current_pause', (), _query)
+
+
+def overdue_pending_escalations(
+    pending: Iterable[Escalation],
+    *,
+    category: str,
+    min_age: timedelta,
+    now: datetime,
+) -> tuple[OverdueEscalation, ...]:
+    """Pending escalations of *category* at least *min_age* old, oldest first."""
+    overdue: list[OverdueEscalation] = []
+    for esc in pending:
+        if esc.status != 'pending' or esc.category != category:
+            continue
+        try:
+            age = now - datetime.fromisoformat(esc.timestamp)
+        except (ValueError, TypeError):
+            continue
+        if age >= min_age:
+            overdue.append(OverdueEscalation(esc.id, age, esc.summary))
+    return tuple(sorted(overdue, key=lambda o: o.age, reverse=True))
+
+
+def _paused_waiting_lines(visibility: PauseVisibility) -> list[str]:
+    lines = ['## Paused, waiting']
+    if visibility.pause_reason is not None:
+        lines.append(
+            f'- Paused with {len(visibility.repended_waiting)} re-pended tasks waiting '
+            f'(pause reason: {visibility.pause_reason})'
+        )
+        lines.extend(
+            f'  - task {w.task_id} (re-pended {w.repended_at} via {w.escalation_id})'
+            for w in visibility.repended_waiting
+        )
+    else:
+        lines.append('- Not paused')
+    if visibility.overdue_pause_escalations:
+        hour = timedelta(hours=1)
+        lines.append(
+            '- Unresolved scheduler-pause escalations pending > '
+            f'{SCHEDULER_PAUSE_RESURFACE_AGE / hour:g}h:'
+        )
+        lines.extend(
+            f'  - {o.escalation_id} pending {o.age / hour:.1f}h: {o.summary}'
+            for o in visibility.overdue_pause_escalations
+        )
+    lines.append('')
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Digest inputs and markdown rendering
 # ---------------------------------------------------------------------------
 
@@ -647,6 +778,8 @@ class DigestInputs:
     # constructor across digest.py, harness.py and the test suite stays valid.
     submissions_in_step: int = 0
     lifecycle_events_in_step: int = 0
+    # Task 5311 — the '## Paused, waiting' section; defaulted and appended last.
+    pause_visibility: PauseVisibility = field(default_factory=PauseVisibility)
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -720,7 +853,11 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append(
         f'- Lifecycle events in step (digest gate): {inputs.lifecycle_events_in_step}'
     )
+    share = inputs.escalation_stats.dominant_category()
+    lines.append(f'- Dominant escalation category: {share if share is not None else "none"}')
     lines.append('')
+
+    lines.extend(_paused_waiting_lines(inputs.pause_visibility))
 
     # Anomalies
     lines.append('## Anomalies')

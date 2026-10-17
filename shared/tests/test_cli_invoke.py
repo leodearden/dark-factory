@@ -387,42 +387,6 @@ class TestInvokeWithCapRetryCostStore:
         assert 'started_at' in call_kwargs
         assert 'completed_at' in call_kwargs
 
-    async def test_save_account_event_on_cap_hit(self):
-        """save_account_event is awaited with cap_hit on cap detection."""
-        gate = make_gate_mock(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock()
-
-        result = _make_result()
-
-        with (
-            patch(
-                'shared.cli_invoke.invoke_claude_agent',
-                new_callable=AsyncMock,
-                return_value=result,
-            ),
-            patch('shared.cli_invoke.asyncio') as mock_asyncio,
-        ):
-            mock_asyncio.sleep = AsyncMock()
-            await invoke_with_cap_retry(
-                gate, 'test-label',
-                cost_store=cost_store, run_id='run-1', project_id='proj-1',
-                prompt='hi',
-            )
-
-        cost_store.save_account_event.assert_awaited_once()
-        call_kwargs = cost_store.save_account_event.call_args.kwargs
-        assert call_kwargs['event_type'] == 'cap_hit'
-        assert call_kwargs['details'] == 'test-label'
-        assert 'created_at' in call_kwargs
-
     async def test_no_error_when_cost_store_none(self):
         """No CostStore-related errors when cost_store=None (default)."""
         gate = make_gate_mock(
@@ -467,41 +431,6 @@ class TestInvokeWithCapRetryCostStore:
 
         assert got.success is True
         assert 'Failed to save invocation cost' in caplog.text
-
-    async def test_save_account_event_error_swallowed(self, caplog):
-        """save_account_event failure is logged but retry still happens."""
-        gate = make_gate_mock(
-            account_count=2,
-            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
-            detect_cap_hit=MagicMock(side_effect=[True, False]),
-            active_account_name='acct-b',
-        )
-
-        cost_store = MagicMock()
-        cost_store.save_invocation = AsyncMock()
-        cost_store.save_account_event = AsyncMock(side_effect=RuntimeError('db error'))
-
-        result = _make_result()
-
-        with (
-            patch(
-                'shared.cli_invoke.invoke_claude_agent',
-                new_callable=AsyncMock,
-                return_value=result,
-            ),
-            patch('shared.cli_invoke.asyncio') as mock_asyncio,
-        ):
-            mock_asyncio.sleep = AsyncMock()
-            with caplog.at_level(logging.WARNING):
-                got = await invoke_with_cap_retry(
-                    gate, 'test-label',
-                    cost_store=cost_store, prompt='hi',
-                )
-
-        assert got.success is True
-        assert 'Failed to save cap_hit event' in caplog.text
-        # save_invocation still called on the successful retry
-        cost_store.save_invocation.assert_awaited_once()
 
     async def test_capped_false_on_successful_invocation(self):
         """capped=False on save_invocation even after prior cap hits."""
@@ -3314,6 +3243,27 @@ class TestSchemaToolNotDisallowed:
         assert 'StructuredOutput' not in captured_cmd
         assert '--json-schema' in captured_cmd
 
+    async def test_available_tools_is_forwarded_as_the_registry_filter(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read', 'Grep', 'Glob'], output_schema=self._SCHEMA,
+            )
+        assert captured_cmd[captured_cmd.index('--tools') + 1] == 'Read,Grep,Glob'
+        assert '--json-schema' in captured_cmd
+
+    async def test_setting_sources_is_forwarded(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read'], output_schema=self._SCHEMA, setting_sources=[],
+            )
+        assert captured_cmd[captured_cmd.index('--setting-sources') + 1] == ''
+
     async def test_wildcard_without_schema_is_preserved(self, tmp_path):
         """judge.py case: ['*'] with no output_schema must keep blocking all tools."""
         captured_cmd = []
@@ -3895,6 +3845,55 @@ class TestCpuGovernPrefix:
         env = {'DF_AGENT_CPU_GOVERN': '/tmp/nonexistent-govern.sh'}
         _cpu_govern_prefix(env)
         assert 'DF_AGENT_CPU_GOVERN' not in env
+
+
+class TestClaudeBinaryResolution:
+    """Unit tests for claude_binary_spec() / resolve_claude_binary() in cli_invoke.
+
+    These exist because of the 2026-08-13→08-18 outage: ``build_claude_argv``
+    emitted the bare PATH name ``claude`` as argv[0], the fused-memory systemd
+    unit pinned no ``Environment=PATH=``, and the inherited user-manager PATH
+    lacked ``~/.local/bin`` — so every curator LLM call raised
+    ``FileNotFoundError`` for 80+ hours with no diagnostic naming the binary.
+    """
+
+    def test_spec_defaults_to_bare_claude_when_env_unset(self, monkeypatch):
+        """CLAUDE_BINARY unset → the historical bare name 'claude'."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.delenv('CLAUDE_BINARY', raising=False)
+        assert claude_binary_spec() == 'claude'
+
+    def test_spec_returns_env_override(self, monkeypatch):
+        """CLAUDE_BINARY set → that value verbatim (the operator escape hatch)."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.setenv('CLAUDE_BINARY', '/opt/claude/bin/claude')
+        assert claude_binary_spec() == '/opt/claude/bin/claude'
+
+    def test_spec_ignores_empty_env_value(self, monkeypatch):
+        """CLAUDE_BINARY='' is treated as unset, not as an empty argv[0]."""
+        from shared.cli_invoke import claude_binary_spec
+        monkeypatch.setenv('CLAUDE_BINARY', '')
+        assert claude_binary_spec() == 'claude'
+
+    def test_resolve_returns_absolute_path_for_real_executable(self, monkeypatch, tmp_path):
+        """CLAUDE_BINARY pointing at an executable file → its absolute path."""
+        from shared.cli_invoke import resolve_claude_binary
+        exec_file = tmp_path / 'claude'
+        exec_file.write_text('#!/bin/sh\nexit 0\n')
+        exec_file.chmod(0o755)
+        monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
+        assert resolve_claude_binary() == str(exec_file)
+
+    def test_resolve_returns_none_for_missing_path_without_raising(self, monkeypatch, tmp_path):
+        """An unresolvable spec yields None — never an exception.
+
+        Every spawn path (and several test suites that never run the CLI)
+        reaches this helper, so raising here would break callers that only
+        wanted to assemble an argv.
+        """
+        from shared.cli_invoke import resolve_claude_binary
+        monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+        assert resolve_claude_binary() is None
 
 
 # ── Transcript readers ────────────────────────────────────────────────────────

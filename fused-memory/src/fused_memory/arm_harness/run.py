@@ -17,7 +17,7 @@ from graphiti_core import helpers as graphiti_helpers
 from shared.memory_eval_metrics import canonical_json_text
 from shared.safe_io import atomic_write_text
 
-from fused_memory.arm_harness.arm_spec import LlmArmSpec
+from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec
 from fused_memory.arm_harness.conformance import ConformanceLedger
 from fused_memory.arm_harness.instrument_checks import (
     CheckResult,
@@ -107,7 +107,9 @@ async def run_llm_arm(
     return manifest
 
 
-def require_pre_run_checks(spec: LlmArmSpec, repo_root: Path) -> tuple[CheckResult, ...]:
+def require_pre_run_checks(
+    spec: LlmArmSpec | EmbeddingArmSpec, repo_root: Path
+) -> tuple[CheckResult, ...]:
     """The passed pre-run checks, or ``PreRunCheckError``; callable before any resource opens."""
     checks = (
         check_code_sha_matches_checkout(spec, repo_root),

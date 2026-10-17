@@ -52,7 +52,8 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 ```
 
 **Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is **optional** and
-defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
+defaults to `<--name>-$CLAUDE_PID` (or `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a
+`claude agents` host); `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
 Pass either **only** as a deliberate operator override. Both are derived rather than documented for
 one reason (tasks 3994, 4248): the token is load-bearing on *every* heartbeat and on the final
 release, and it must not depend on this document getting one shell token right — which is exactly
@@ -69,6 +70,23 @@ process is `$CLAUDE_PID`. Verify with:
 ```bash
 ps -o comm= -p "$CLAUDE_PID"   # prints: claude
 ```
+
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still forces
+stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
+`lease-heartbeat` is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
+the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
+`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
+reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
+`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
 
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
 message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
@@ -331,7 +349,11 @@ always-ask list ("Bypasses" in "Always ask — keyed on record content").
    step 2 of the next pass is the authoritative source of what to handle
 6. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
-7. Go to 1 (restart watcher → confirm up → drain → handle)
+7. GET `/api/v2/dashboard/invariants` and digest this project's record (see "Reading the
+   invariants gauge" below) — once per cycle. Each `FINDING` line it prints (a chain gone
+   `overdue` or `broken` among them), and each `paused` line reading `pinned_by=[]`, is a
+   finding: handle it in step 3 of the next pass, beside the drained escalations
+8. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
 
 The fired escalation (step 5) is just the wake; you do not handle it inline. Looping back
@@ -359,6 +381,28 @@ rotation that inherits no session memory does not re-promote a cluster its prede
 promoted. `member_ids` is the projection of the record's `members` list; the raw `members` key
 stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
 of your context.
+
+**Match `root_cause` keys in canonical form, never as raw strings.** The server folds a promote
+into the pending L2 whose `root_cause` canonicalises the same under
+`escalation.canonical.canonical_root_cause`. Run that helper over the rebuilt keys and your
+candidate rather than reimplementing it; why the drain carries no canonical field is recorded at
+`escalation/src/escalation/server.py::_COMPACT_ESCALATION_FIELDS`.
+
+```bash
+uv run --directory "$DARK_FACTORY_ROOT/escalation" python -c '
+import json, sys
+from escalation.canonical import canonical_root_cause
+print(json.dumps({key: canonical_root_cause(key) for key in json.load(sys.stdin)}, indent=1))
+' <<'JSON'
+["<root_cause of each pending L2>", "<the root_cause you are about to promote under>"]
+JSON
+```
+
+Keys that map to the same canonical form are one cluster. A near-duplicate you miss is not free:
+the server still folds it (no duplicate L2), but the fold records the new spelling as an amendment
+and a `root_cause` variant and bumps `updated_at`. That makes the L2's triage-ack stale (see
+"Reading a triage-ack annotation") and counts toward the over-fold alarm (see "Reading preserved
+framing"). An unexpected `status: 'updated'` from `promote_to_l2` means your match missed.
 
 Triage from that; fetch the full record with `get_escalation(id)` **only** for
 the one item you're about to act on (and when you do, read its `amendments` —
@@ -453,7 +497,7 @@ watcher.
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess (Main Loop steps 1
-and 7), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
+and 8), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
 Watcher Lease" above):
 
 ```bash
@@ -482,6 +526,21 @@ the whole blob in context. Loop back, re-arm the watcher, and let the next compa
 authoritative list of what to handle. Fetch the full record via
 `mcp__escalation__get_escalation(escalation_id="esc-XX-N")` only for the specific item you're about
 to act on — ideally inside the handling sub-agent rather than at top level.
+
+### Reading the invariants gauge
+
+The command, what counts as a finding (the chain rule included), change-only triage, the census
+follow-up, the broken-chain journal probe, the D-4 pointer, the filing store and keys live in
+[`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
+Read them there. This skill's deltas:
+
+- **Scope.** Pass this watcher's `<project_root>` to the digest, so only this project's record is
+  read. The recon-escalation-watcher covers the whole roster.
+- **Handling.** Never inline at step 7: the watcher is down from its fire (step 5) until step 1
+  re-arms it, and handling is the step most likely to run long. A finding joins step 3 of the next
+  pass and goes through "Before an item reaches Leo" like any drained item.
+- **Stopping.** A finding still undisposed at stop goes into the handover's "Untriaged — start
+  here" section.
 
 ## Priority Hierarchy
 
@@ -1038,9 +1097,25 @@ switches on and off. Three behavioural shifts:
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
    - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
      `resolve_ticket`), and
-   - `resolve_issue(..., action='park')` so the blocking task lands `blocked`, held under an open L2
-     (no re-dispatch while the escalation is open; the stranded-blocked sweep skips a blocked task
-     that has an open escalation), and
+   - Hold the task, choosing by the record's **severity**:
+     - **Not `info`:** `resolve_issue(..., action='park')`. The task lands `blocked`, held under
+       the open L2, because a pinning escalation vetoes the stranded-blocked sweep.
+     - **`info`:** never park. An info record never pins
+       (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
+       re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
+       esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
+       1. `update_task(id, metadata={'x_deferral': {'escalation_id': '<esc-id>', 'until_condition':
+          'Leo rules <esc-id>', 'reason': '<one line>'}}, metadata_mode='merge')`;
+       2. `set_task_status(id, status='deferred')`;
+       3. confirm both with `get_task` about 30 s later.
+
+       A deferral keeps a not-yet-running task out of dispatch. It does not stop a live run, and
+       an info filer was told to keep driving, so leave an `in-progress` task alone (leave
+       pending + digest). When the ruling lands, carry it out, then re-pend the task with
+       `set_task_status(id, status='pending')` unless the ruling says otherwise, and set
+       `x_deferral` to null. Once the deferral-record gate is live (task 6525), the record goes
+       in `set_task_status(..., deferral=...)` instead. Task 6579 makes it the typed
+       `until_escalation` kind. And
    - File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
      Registry" below) — IN ADDITION to the follow-up task, so the parked decision surfaces in the
      cockpit decision queue.
@@ -1610,7 +1685,8 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
 #### When it runs
 
 - **Nightly at 05:30**, from `return-brief.timer`: headless on Fable, recommend-only and read-only.
-  This is the *nightly form*: investigate, then `record` preparations. The render that follows
+  This is the *nightly form*: investigate, then `record` preparations, which it does through
+  batch files in its per-run inbox (`data/sitting/inbox/<run>/`). The render that follows
   writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)"). Its
   autonomous closes are windowed on `closed_at`, and a close with no `closed_at` is listed as
   undated, not dropped.
@@ -2222,14 +2298,14 @@ its values may be passed to `resolve_issue`.
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` will refuse it once task 6578 lands. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 
 **C1 notes:**
 - Terminal task statuses (`done`, `cancelled`) are never overwritten by any action.
 - The removed `terminate` parameter now raises a hard error naming the five actions above.
-- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1.
+- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1. That cover holds only where the member L1 pins. An `info` member never pins by itself, so treat its task as unheld (see the `park` row).
 - Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0

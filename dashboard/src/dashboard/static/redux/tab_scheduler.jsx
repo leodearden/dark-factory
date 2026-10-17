@@ -133,6 +133,14 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
   );
 }
 
+// The priority a park-stack entry was installed at, as the orchestrator names
+// it. An orchestrator still running pre-6144 code names nothing, so its raw
+// rank is shown instead of an empty label.
+function parkEntryLabel(entry) {
+  if (entry.source === 'pin') return `pin #${entry.pin_order}`;
+  return entry.tier ?? `rank ${entry.rank}`;
+}
+
 // ── Park Stacks section ──
 // Rendered in the Modules sub-tab below ModulesView.
 // For each module with a non-empty park_stack, shows the full LIFO stack
@@ -195,7 +203,7 @@ function ParkStacksSection({ modules, rows, onEvict }) {
                       T-{entry.owner}
                     </span>
                     <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                      tier {entry.rank}
+                      {parkEntryLabel(entry)}
                     </span>
                     {ageStr && (
                       <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>{ageStr}</span>
@@ -362,6 +370,12 @@ function SchedulerTab() {
     snapshot_at = null,
     offline = false,
     offline_projects = [],
+    // Budget expired before these projects were read: their state is UNKNOWN,
+    // nothing was proven unreachable.  Deliberately separate from `offline`
+    // (see redux_api.shape_scheduler) — reading one as the other sends an
+    // operator to restart a healthy fused-memory.
+    degraded = false,
+    degraded_projects = [],
     paused = false,
     paused_projects = [],
     // Recovery/strand sweep events (PRD task-escalation-state-graph D2/S6),
@@ -579,6 +593,20 @@ function SchedulerTab() {
         <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
           ⚠ Scheduler offline
           {offline_projects.length > 0 && `: ${offline_projects.join(', ')}`}
+        </div>
+      )}
+
+      {/* Degraded banner — composes with the offline banner rather than
+           replacing it: one project can be offline while a different one
+           times out.  The copy must never claim an outage; nothing was proven
+           unreachable, the handler simply ran out of budget.  Hence a distinct
+           glyph and `badge warn` rather than the offline banner's `badge bad`.
+           Same tone as the Tasks tab's 'degraded' notice kind
+           (tasks_offline_banner.js). */}
+      {degraded && (
+        <div className="badge warn" style={{ padding: '6px 12px', fontSize: 11 }}>
+          ◐ Scheduler state unknown (budget)
+          {degraded_projects.length > 0 && `: ${degraded_projects.join(', ')}`}
         </div>
       )}
 

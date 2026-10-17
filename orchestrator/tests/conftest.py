@@ -8,7 +8,6 @@ without conflicting with sibling subprojects' conftests under
 import asyncio
 import itertools
 import json
-import logging
 import os
 import shutil
 import sys
@@ -63,6 +62,7 @@ from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
+    ample_disk_usage,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -103,7 +103,7 @@ track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _drain_leaked_tasks():
+async def _drain_leaked_tasks(_no_unexpected_exit_contract_violation):
     """Cancel every task a test left pending, then wait, before its loop closes.
 
     A task cancelled between spawning a subprocess and connecting its pipes
@@ -112,6 +112,9 @@ async def _drain_leaked_tasks():
     delivers exactly one, and hung on it. This cancel is the first of the two
     such a task needs, and the bounded wait lets it land before ``Runner.close``
     throws the second. Pinned end to end by test_leaked_task_drain.py.
+    Requesting ``_no_unexpected_exit_contract_violation`` keeps that guard
+    tearing down AFTER this drain, so a leaked run() that exits while being
+    cancelled is judged against the test that leaked it.
     """
     yield
     own = asyncio.current_task()
@@ -327,10 +330,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     state.  Pin ``project_root`` (via the ``ORCH_`` env prefix) to this test's
     ``tmp_path`` so those writes land in tmp instead.
 
-    Precedence keeps this safe: explicit kwargs still win over the env, and the
-    env overrides only ``project_root`` plus the live yaml's laptop runner and
-    ``prefer_remote`` (task 5053: pinned ``[]``/``prefer_local``, so a bare config
-    never ssh's the laptop); all else loads from config.yaml/defaults.
+    Precedence keeps this safe: explicit kwargs still win over the env, which overrides
+    only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
+    (task 5053) and ``verify_use_cgroup_scope`` (task 5206), so a bare config never
+    ssh's the laptop or spawns a real systemd scope; all else loads from yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
@@ -341,6 +344,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
+    monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
 
 
 @pytest.fixture
@@ -378,6 +382,7 @@ def code_default_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
     monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
     monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_USE_CGROUP_SCOPE", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
@@ -495,13 +500,8 @@ def _no_unexpected_exit_contract_violation(request):
     of ``real_verify_admission`` above: only for a test that DELIBERATELY
     drives a violation.
     """
-    collector = ExitContractViolationCollector()
-    contract_logger = logging.getLogger('orchestrator.exit_contract')
-    contract_logger.addHandler(collector)
-    try:
+    with ExitContractViolationCollector.listening() as collector:
         yield
-    finally:
-        contract_logger.removeHandler(collector)
     if not collector.violations:
         return
     if request.node.get_closest_marker('exit_contract_violation_expected') is not None:
@@ -639,6 +639,18 @@ def _hermetic_psi_reader(monkeypatch, request):
     monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_disk_usage(monkeypatch):
+    """Every ``shutil.disk_usage`` reads ``_orch_helpers.py::ample_disk_usage`` (task 7032).
+
+    The free-space guards read the host's disk, so a verify host under the 10 GiB
+    floor of ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
+    failed lane and workflow tests on every branch (esc-5509-2). A test of a guard
+    patches ``shutil.disk_usage`` over this one with its own numbers.
+    """
+    monkeypatch.setattr(shutil, 'disk_usage', ample_disk_usage)
+
+
 @pytest.fixture
 def forbid_live_mcp(monkeypatch):
     """Opt-in guard: fail the test if a live fused-memory MCP round-trip is attempted.
@@ -749,7 +761,7 @@ def _restore_sandbox_backend():
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
-    """Clear verify._PROBE_CACHE (and its sibling _BASELINE_FAILING_IDS_CACHE)
+    """Reset verify's main-probe caches (``verify.clear_main_probe_caches``)
     before and after every test.
 
     ``verify_failure_is_preexisting_on_main`` stores results in the
@@ -760,12 +772,12 @@ def _clear_probe_cache():
     short-circuits the probe path in the later test — causing it to skip
     worktree creation / cleanup and return the wrong result.
 
-    ``_BASELINE_FAILING_IDS_CACHE`` (task μ, verify-scope-inversion-prd.md) is
-    the sibling per-main-SHA failing-test-id baseline cache keyed on
-    ``main_sha`` alone — the same cross-test-pollution hazard applies (an
-    earlier test's seeded/probed baseline for a reused MAIN_SHA would
-    silently serve a later test's ``main_baseline_failing_ids`` call from
-    cache instead of exercising its own probe/seed path).
+    The per-main-SHA failing- and skipped-test-id baselines (task μ,
+    verify-scope-inversion-prd.md; task 3226) are keyed on ``main_sha`` alone
+    — the same cross-test-pollution hazard applies (an earlier test's
+    seeded/probed baseline for a reused MAIN_SHA would silently serve a later
+    test's ``main_baseline_failing_ids`` call from cache instead of
+    exercising its own probe/seed path).
 
     Clearing the caches before *and* after each test ensures:
     - every test starts with empty caches regardless of prior teardown;
@@ -776,17 +788,14 @@ def _clear_probe_cache():
 
     **Maintainer note — adding new verify.py process-globals:**
     If ``orchestrator/src/orchestrator/verify.py`` gains additional
-    module-level caches (e.g. a sibling result cache), add a matching
-    ``.clear()`` call here so they are also reset between tests.  The
-    relevant globals are defined near ``_PROBE_CACHE``/``_PROBE_CACHE_TTL``
-    and ``_BASELINE_FAILING_IDS_CACHE``.
+    module-level caches (e.g. a sibling result cache), clear them in
+    ``verify.clear_main_probe_caches`` — the single reset this fixture calls
+    — so they are also reset between tests.
     """
     from orchestrator import verify
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
     yield
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
 
 
 @pytest.fixture(autouse=True)
@@ -1255,4 +1264,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
+    # read a truthy Mock and run every mock-config workflow test strictly scoped.
+    config.strict_mcp_config = False
     return config

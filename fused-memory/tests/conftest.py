@@ -22,6 +22,7 @@ import sys
 import warnings
 import weakref
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -71,6 +72,7 @@ if str(REPO_ROOT) not in sys.path:
 from _fm_helpers import (  # noqa: E402
     _leaked_async_httpx_clients,
     _warn_if_drain_closed_a_foreign_client,
+    complete_paged_read,
     install_identity_mocks,
     pydantic_spec,
     reap_leaked_async_httpx_clients,
@@ -326,6 +328,27 @@ def code_default_config(monkeypatch, tmp_path):
     trick this copies.
     """
     monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
+
+
+@dataclass(frozen=True)
+class EscalationQueueRelocation:
+    legacy_relpath: str
+    relocated_relpath: str
+
+
+@pytest.fixture
+def escalation_queue_relocation(monkeypatch) -> EscalationQueueRelocation:
+    """Simulate an operator relocating the escalation queue in its one home."""
+    import shared.project_layout
+
+    relocation = EscalationQueueRelocation(
+        legacy_relpath=shared.project_layout.ESCALATION_QUEUE_RELPATH,
+        relocated_relpath='data/relocated-escalations',
+    )
+    monkeypatch.setattr(
+        shared.project_layout, 'ESCALATION_QUEUE_RELPATH', relocation.relocated_relpath
+    )
+    return relocation
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -680,10 +703,27 @@ def make_fake_maintenance_service():
 
 @pytest.fixture
 def make_edge_backend():
-    """Factory fixture: returns a callable(backend, *, nodes, edges) -> backend."""
-    def _factory(backend, *, nodes, edges):
-        backend.list_entity_nodes = AsyncMock(return_value=nodes)
-        backend.get_all_valid_edges = AsyncMock(return_value=edges)
+    """Factory fixture: callable(backend, *, nodes, edges, nodes_read=None, edges_read=None) -> backend.
+
+    Stubs the two paginated whole-graph reads, ``enumerate_entity_nodes`` and
+    ``enumerate_all_valid_edges``, to return ``(nodes, nodes_read)`` and
+    ``(edges, edges_read)``.  A read left as None is a proven-complete
+    ``complete_paged_read`` sized to its collection.  Pass
+    ``incomplete_paged_read(kind)`` to drive the completeness policy.
+
+    The back-compat shims ``list_entity_nodes`` / ``get_all_valid_edges`` stay
+    REAL: they delegate to these stubs and apply the shared policy, so a
+    caller on either surface reads the same corpus.
+    """
+    def _factory(backend, *, nodes, edges, nodes_read=None, edges_read=None):
+        if nodes_read is None:
+            nodes_read = complete_paged_read(rows_seen=len(nodes))
+        if edges_read is None:
+            edges_read = complete_paged_read(
+                rows_seen=sum(len(v) for v in edges.values())
+            )
+        backend.enumerate_entity_nodes = AsyncMock(return_value=(nodes, nodes_read))
+        backend.enumerate_all_valid_edges = AsyncMock(return_value=(edges, edges_read))
         return backend
 
     return _factory
@@ -700,8 +740,13 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     environment (the model sets ``env_prefix=''``).  A test asserting on a
     field this factory does not name is asserting on the tracked
     ``fused-memory/config/config.yaml``, not on a code default.
+
+    ``write_triage.enabled`` is the one YAML-sourced field pinned here, to
+    off: the tracked YAML ships it on (task 3169), and with it on every
+    Mem0-primary ``add_memory`` in a unit test would reach the real judge
+    client.  A test of the triage path opts in on its own config.
     """
-    return FusedMemoryConfig(
+    config = FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',
             model='gpt-4o-mini',
@@ -730,6 +775,8 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
             data_dir=str(tmp_path / 'queue'),
         ),
     )
+    config.write_triage.enabled = False
+    return config
 
 
 # ---------------------------------------------------------------------------

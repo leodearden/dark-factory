@@ -238,7 +238,7 @@ Reversing this decision means updating this section, `CLAUDE.md` and
      the repo declares at the same value. Pinned by
      tests/scripts/test_pytest_per_test_timeout_policy.py — change the configs
      and this paragraph goes red until it is updated to match. -->
-  Every pytest config caps a single test at `540` seconds of WALL CLOCK (not CPU
+  Every pytest config caps a single test at `420` seconds of WALL CLOCK (not CPU
   time), a value DERIVED FROM MEASUREMENT rather than picked — see
   `plans/pytest-per-test-timeout-measurement-2026-09-17.md` for the corpus and
   the arithmetic, and `shared/pyproject.toml` for why the cap exists at all.
@@ -254,9 +254,9 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   verify leg passes `--timeout=300` on its CLI, and a CLI `--timeout` overrides
   the ini. So verify currently runs TIGHTER than a bare local or agent `pytest`
   — an unmarked test taking 310 seconds passes locally and reds the gate, and
-  the two tests the measurement above derived its value from still run at the
-  4.9x headroom that measurement calls insufficient. Aligning that yaml knob is
-  outside the scope that set these configs and is filed as residue 2 of
+  the test the value is now derived from (45.48s) runs at only ~6.6x headroom
+  under verify's 300, short of the 8x the measurement demands. Aligning that
+  yaml knob is outside the scope that set these configs and is filed as residue 2 of
   `plans/pytest-per-test-timeout-measurement-2026-09-17.md`.
 <!-- pytest-timeout-mirror:end -->
 <!-- lint-command-mirror:begin
@@ -371,6 +371,15 @@ branch, before any merge submission:
 2. `uv run ruff check <touched packages>`.
 3. `uv run pyright` in each touched, pyright-configured package — any of the
    seven workspace members the §3 **Type-check** command walks.
+
+The inline-suppression ratchet guard,
+`scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite. A
+malformed disposition marker turns it red now. A new `type: ignore`, `noqa`
+or similar suppression with no disposition marker turns it red only once the
+operator has seeded `scripts/inline_suppression_baseline.json` (step κ1 of
+`plans/inv12-exceptions-owned-or-ratified-prd.md`). Until then that check
+skips and its skip reason says so, so a green suite does not yet mean your
+suppressions were checked.
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than

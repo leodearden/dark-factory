@@ -328,10 +328,14 @@ except (KeyError, ValueError):
 # ORCH_RESTART_MIN_INTERVAL_SECS, kept deliberately independent so fm's redeploy
 # cadence never couples to the orchestrator fleet's.
 
-# Paths whose newest commit defines "fresh" for the fm staleness pass. Includes
-# shared/src/ because fused-memory imports shared.* (e.g. shared.task_metadata),
-# so a shared change can alter fm's behavior and must count toward fm staleness.
-FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/"]
+# Paths whose newest commit defines "fresh" for the fm staleness pass: the src/
+# of fused-memory and of every workspace member the fm process loads, directly
+# or through another member (shared.*; escalation.queue and escalation.server;
+# orchestrator.* via fused_memory/reconciliation/sandbox_guard.py and
+# escalation.server's lazy imports). A change to any of them can alter fm's
+# behaviour. Derived and enforced by
+# tests/scripts/test_fm_watched_paths_import_closure.py.
+FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/", "escalation/src/", "orchestrator/src/"]
 
 # fused-memory's OWN deploy-clock file — a DIFFERENT file than the orchestrator
 # fleet clock (FLEET_DEPLOY_CLOCK_PATH), so an orchestrator fleet redeploy never
@@ -1159,7 +1163,7 @@ def _newest_fm_watched_commit_epoch() -> int | None:
     """Return the newest committer epoch touching FM_WATCHED_PATHS on HEAD, or None.
 
     fm sibling of _newest_watched_commit_epoch, identical body but diffing
-    FM_WATCHED_PATHS (fused-memory/src/ + shared/src/) instead of WATCHED_PATHS.
+    FM_WATCHED_PATHS instead of WATCHED_PATHS.
     fused_memory_staleness_pass() (task 2714) compares this against
     fused-memory.service's ActiveEnterTimestamp to detect a merged-but-
     undeployed fm change.

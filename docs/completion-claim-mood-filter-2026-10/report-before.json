@@ -1,0 +1,1459 @@
+{
+  "swept_at": "2026-10-10T04:06:30.337359+00:00",
+  "projects": [
+    "dark_factory",
+    "reify"
+  ],
+  "categories": [
+    "decisions_and_rationale",
+    "temporal_facts"
+  ],
+  "unrecognized_categories": [],
+  "scanned": 11323,
+  "records_with_claims": 1419,
+  "summary": {
+    "mismatch": 25,
+    "unverifiable": 12,
+    "edges_unqueried": 0,
+    "edges_partial": 0,
+    "by_category": {
+      "decisions_and_rationale": 21,
+      "temporal_facts": 16
+    },
+    "by_project": {
+      "dark_factory": 17,
+      "know_live": 4,
+      "knowlive": 3,
+      "reify": 12,
+      "solar_challenge_platform": 1
+    },
+    "by_graph": {
+      "dark_factory": 17,
+      "reify": 20
+    },
+    "by_subject": {
+      "commit": 15,
+      "task": 22
+    }
+  },
+  "truncated_by": null,
+  "caveats": [
+    "RETROSPECTIVE BIAS, FALSE NEGATIVES: the write-time gate reads each authority AT WRITE TIME; this sweep reads it TODAY. A claim written while its task was still in-progress VERIFIES today if that task has since gone terminal, so the sweep systematically under-counts. A low mismatch count is therefore NOT evidence the corpus is clean.",
+    "RETROSPECTIVE BIAS, FALSE POSITIVES: 'cancelled' is in shared.task_statuses.TERMINAL, so a claim about work that was later CANCELLED reads as verified here even though the work never landed.",
+    "UNVERIFIABLE INDICTS NOBODY: a task deleted since, a garbage-collected commit, or an expired ticket all read as unverifiable through no fault of the writer. 'unverifiable' and 'mismatch' are different facts and are never summed in this report.",
+    "COVERAGE, STORE: this sweep covers GRAPHITI EPISODES only. A MEM0-resident record is NOT covered, because the two categories in scope are Graphiti-primary and Mem0 is not read at all.",
+    "COVERAGE, ORPHANED EDGES: a derived RELATES_TO edge whose source episode has been deleted is NOT covered, and neither is an episode ingested through add_episode with a caller-supplied description, which carries no category and so falls outside the category scope.",
+    "COVERAGE, CROSS-GRAPH EDGES: derived edges are enumerated by EPISODE UUID in EVERY swept --project graph \u2014 not only the graph a record was read from and the graph its own group_id names. An episode's edges live in the graph its INGEST ran against, which can be neither of those two, so a rule keyed on that pair cannot reach them at all. Measured rather than hypothetical: episode a887c958-0018-4715-8817-cf048c187e8d exists only in the reify graph with group_id dark_factory, and all 8 of its derived edges exist only in the dark_factory graph. derived_edges_by_graph names which graph held each edge; edges_enumerated_in names which graphs answered; derived_edge_uuids is their flat union. RESIDUAL BOUND: a graph NOT passed to --project is not read at all, so an empty list means \"none in the graph(s) named by edges_enumerated_in\", not \"none anywhere\".",
+    "EDGES NOT ENUMERATED: enumeration has THREE states. Fully enumerated: every targeted graph answered. NOT ENUMERATED: a finding whose derived_edge_uuids and derived_edges_by_graph are null (and whose edges_unqueried is true) had NO targeted graph answer \u2014 every edge query failed \u2014 so its harm artefacts are UNKNOWN, not absent; summary.edges_unqueried is that denominator. PARTIAL: edges_unqueried_in non-empty while edges_unqueried is false means SOME targeted graph failed to answer, so the edge list is a measured LOWER BOUND and edges_unqueried_in names the graphs that were not covered; summary.edges_partial is that denominator, and the two counters never overlap. An empty list with an empty edges_unqueried_in is the opposite of all of these: every targeted graph WAS asked and returned nothing.",
+    "DETECTION BOUND: claims are detected by the deterministic lexical vocabulary in fused_memory.services.completion_claim_gate, which requires a completion marker bound to its nearest concrete NAMED REF (task id / commit sha / tkt_ id) in the same clause. A fabricated completion phrased without a named ref is invisible to this sweep by construction."
+  ],
+  "findings": [
+    {
+      "record_uuid": "ac6517e3-f151-4b5c-b5cd-75d75a9e8f92",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-04-17T02:40:09.491366+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "82dccbfa",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "no commit 82dccbfa in any registered repository (claimed project 'reify')",
+      "claimed_text": "Task 1906 upstream fix landed in dark-factory/taskmaster-ai at commit 82dccbfa (\"fix(file-storage): coerce subtask.id with String() not Number() in normalizeTaskIds\")",
+      "derived_edge_uuids": [
+        "3a856f8e-2445-4832-8184-75c0b626bb88",
+        "42ed5863-cb0c-4371-85ab-ed54643b92e9",
+        "6afdec61-9498-4f04-98be-ef18806bc277",
+        "85e9b7d7-fb96-4300-ac65-adfe5e71c641",
+        "8e7a53ab-225c-471f-8d23-922406ca8854",
+        "9fd4ab17-7b61-4423-a6e9-64530b8b95b0",
+        "c036c055-72bf-46d5-9b2e-55c4d1fdb5dc",
+        "db947844-29a4-4e5c-ac67-768fe2866834"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "3a856f8e-2445-4832-8184-75c0b626bb88",
+          "42ed5863-cb0c-4371-85ab-ed54643b92e9",
+          "6afdec61-9498-4f04-98be-ef18806bc277",
+          "85e9b7d7-fb96-4300-ac65-adfe5e71c641",
+          "8e7a53ab-225c-471f-8d23-922406ca8854",
+          "9fd4ab17-7b61-4423-a6e9-64530b8b95b0",
+          "c036c055-72bf-46d5-9b2e-55c4d1fdb5dc",
+          "db947844-29a4-4e5c-ac67-768fe2866834"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "90c50c81-dc4b-4cc5-9d79-16e119450d2d",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-04-28T10:08:43.270359+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "e091990a6",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "no commit e091990a6 in any registered repository (claimed project 'reify')",
+      "claimed_text": "Implementation pattern proven shipped in commit e091990a6",
+      "derived_edge_uuids": [
+        "37990485-5412-4da1-bfe0-c5b076fcd486",
+        "5c1ef173-ec43-41bb-ae6d-8475d5af4345",
+        "5c2059a6-c4c1-4003-b7b1-3cc3248a68b0",
+        "601812e8-0206-4b86-8a4a-e00d963d9803",
+        "736b9ff7-6b76-4c60-949c-ee2bbef5326d",
+        "d9b91680-8918-4644-9c64-04b405671520"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "37990485-5412-4da1-bfe0-c5b076fcd486",
+          "5c1ef173-ec43-41bb-ae6d-8475d5af4345",
+          "5c2059a6-c4c1-4003-b7b1-3cc3248a68b0",
+          "601812e8-0206-4b86-8a4a-e00d963d9803",
+          "736b9ff7-6b76-4c60-949c-ee2bbef5326d",
+          "d9b91680-8918-4644-9c64-04b405671520"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "d4222ff5-1351-4299-b4f7-dfe1e085e448",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-05-15T14:15:09.124012+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "42c08a8e60",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "no commit 42c08a8e60 in any registered repository (claimed project 'dark_factory')",
+      "claimed_text": "Task 1339 was meant to be a prerequisite (the plan author thought it had landed at commit f12ea587c5) but it hadn't merged at session start \u2014 1339 actually landed mid-session as commit 42c08a8e60 on main, so the cherry-pick became no-op on rebase and the _orch_helpers.py conflict was a pure whitespace/line-wrap difference resolved with --theirs",
+      "derived_edge_uuids": [
+        "14d2daf0-d674-4bbd-8308-7a3c9f6fbd3e",
+        "30f24ea8-8806-4242-b683-470b8a6be294",
+        "4f2473d4-85f6-48ba-9438-b7e7fe156605",
+        "5f52f8a6-82a6-49cd-9a5d-d8036a2eab88",
+        "9c42c483-d2af-4eaa-84e8-0945e580f4b4",
+        "de22aa27-2df5-464f-91f6-4132ab9fcfac",
+        "e2454ca6-0be5-4226-bae5-ea64612ffa9f"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "14d2daf0-d674-4bbd-8308-7a3c9f6fbd3e",
+          "30f24ea8-8806-4242-b683-470b8a6be294",
+          "4f2473d4-85f6-48ba-9438-b7e7fe156605",
+          "5f52f8a6-82a6-49cd-9a5d-d8036a2eab88",
+          "9c42c483-d2af-4eaa-84e8-0945e580f4b4",
+          "de22aa27-2df5-464f-91f6-4132ab9fcfac",
+          "e2454ca6-0be5-4226-bae5-ea64612ffa9f"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "d4222ff5-1351-4299-b4f7-dfe1e085e448",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-05-15T14:15:09.124012+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "f12ea587c5",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "no commit f12ea587c5 in any registered repository (claimed project 'dark_factory')",
+      "claimed_text": "Task 1339 was meant to be a prerequisite (the plan author thought it had landed at commit f12ea587c5) but it hadn't merged at session start \u2014 1339 actually landed mid-session as commit 42c08a8e60 on main, so the cherry-pick became no-op on rebase and the _orch_helpers.py conflict was a pure whitespace/line-wrap difference resolved with --theirs",
+      "derived_edge_uuids": [
+        "14d2daf0-d674-4bbd-8308-7a3c9f6fbd3e",
+        "30f24ea8-8806-4242-b683-470b8a6be294",
+        "4f2473d4-85f6-48ba-9438-b7e7fe156605",
+        "5f52f8a6-82a6-49cd-9a5d-d8036a2eab88",
+        "9c42c483-d2af-4eaa-84e8-0945e580f4b4",
+        "de22aa27-2df5-464f-91f6-4132ab9fcfac",
+        "e2454ca6-0be5-4226-bae5-ea64612ffa9f"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "14d2daf0-d674-4bbd-8308-7a3c9f6fbd3e",
+          "30f24ea8-8806-4242-b683-470b8a6be294",
+          "4f2473d4-85f6-48ba-9438-b7e7fe156605",
+          "5f52f8a6-82a6-49cd-9a5d-d8036a2eab88",
+          "9c42c483-d2af-4eaa-84e8-0945e580f4b4",
+          "de22aa27-2df5-464f-91f6-4132ab9fcfac",
+          "e2454ca6-0be5-4226-bae5-ea64612ffa9f"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "3095e292-1b4d-4e3b-97e1-cc296f01610c",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-07-19T21:56:25.904325+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "614e22d051",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "no commit 614e22d051 in any registered repository (claimed project 'dark_factory')",
+      "claimed_text": "Fix landed in commit 614e22d051",
+      "derived_edge_uuids": [
+        "418aedbb-673f-4c4b-b365-05e9be8f81e2",
+        "77973ea4-a948-4eab-ab22-66c8e51b66be",
+        "c76fce57-3502-4a61-92da-57b827c4b14b",
+        "cb9a309d-ba45-4c85-a6c7-ffd6f300f231",
+        "d90b3f78-2046-4956-9c5e-a1731d003a00",
+        "e704e0f9-9384-44fe-944f-056c1efaccee",
+        "f66ba4b2-7936-43c7-9b8e-6131f52961c2"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "418aedbb-673f-4c4b-b365-05e9be8f81e2",
+          "77973ea4-a948-4eab-ab22-66c8e51b66be",
+          "c76fce57-3502-4a61-92da-57b827c4b14b",
+          "cb9a309d-ba45-4c85-a6c7-ffd6f300f231",
+          "d90b3f78-2046-4956-9c5e-a1731d003a00",
+          "e704e0f9-9384-44fe-944f-056c1efaccee",
+          "f66ba4b2-7936-43c7-9b8e-6131f52961c2"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "1eefbd1e-0439-480a-a3cf-95cb6db7a830",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-07-21T17:18:35.360703+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "5317",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "Decision (Leo, 2026-07-21, esc-5317-3): task 5317 (narrow Manifold batch_difference pattern-boolean fast path) was EXPANDED to also own wiring the Manifold route into the shipped `reify build` CLI \u2014 chosen over (B) a separate sibling task and (C) folding it into general-route bookmark 5220",
+      "derived_edge_uuids": [
+        "08f376ca-6a46-4a76-9230-d1f7a232884f",
+        "11a6db76-ae22-4064-8461-a6428a4e8988",
+        "14f6631c-5ebf-4126-a07e-cf568e6e87cc",
+        "39dc1f7f-50d3-4be7-b6e5-3ca67707d6ad",
+        "59a69c50-626d-4dcd-b181-459f6d4bf0a9",
+        "7b42d60c-655b-420d-90c0-af8dd17d71d2",
+        "802aea5d-7a77-415f-980a-262a519d7bda",
+        "a52b0a89-1db1-4c3b-ab15-f1d4a17a8be2"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "08f376ca-6a46-4a76-9230-d1f7a232884f",
+          "11a6db76-ae22-4064-8461-a6428a4e8988",
+          "14f6631c-5ebf-4126-a07e-cf568e6e87cc",
+          "39dc1f7f-50d3-4be7-b6e5-3ca67707d6ad",
+          "59a69c50-626d-4dcd-b181-459f6d4bf0a9",
+          "7b42d60c-655b-420d-90c0-af8dd17d71d2",
+          "802aea5d-7a77-415f-980a-262a519d7bda",
+          "a52b0a89-1db1-4c3b-ab15-f1d4a17a8be2"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "448d8400-2c46-44f6-9af2-f1007dc455cf",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-08-07T10:49:09.743734+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "3846",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "deferred",
+      "claimed_text": "Decision (Leo, 2026-08-07): dark_factory task 3846 was filed to give recon's stranded-in-progress finding a landed-on-main check, with three deliberate scope choices worth preserving",
+      "derived_edge_uuids": [
+        "2cbcec23-8db5-4889-9e5e-f03073c1b193",
+        "4c71501a-1305-42c5-b9fd-5a647f093f26",
+        "71f74694-aeb6-456a-bfcb-d325036fb787",
+        "87721fc8-2604-4860-a057-a8f741302778",
+        "98a4dfa8-639c-4958-b65e-e34a39289ab5",
+        "e1c2051f-9ed7-4548-9a1d-ac6062ee3bbd",
+        "e39e07a0-e995-4211-aed8-71a21f1f458b"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "2cbcec23-8db5-4889-9e5e-f03073c1b193",
+          "4c71501a-1305-42c5-b9fd-5a647f093f26",
+          "71f74694-aeb6-456a-bfcb-d325036fb787",
+          "87721fc8-2604-4860-a057-a8f741302778",
+          "98a4dfa8-639c-4958-b65e-e34a39289ab5",
+          "e1c2051f-9ed7-4548-9a1d-ac6062ee3bbd",
+          "e39e07a0-e995-4211-aed8-71a21f1f458b"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "ace712bb-2664-4504-a478-7783c9caeaed",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-09-01T12:52:04.679359+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "6554",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "Task #6554's shipped OPEN QUESTION (\"does the strict-auto non-uniqueness demotion belong in CpSatSolver::solve, or in SolverRegistry as a routing-level policy applied uniformly to every domain solver",
+      "derived_edge_uuids": [
+        "01e52216-4d11-4b0e-8f33-1fc77c47fa1c",
+        "0e4867b3-7844-4582-84bf-5a35cb1e881d",
+        "2591fa0f-1429-4314-b5c3-b7ee4c946e0f",
+        "4772842d-5142-4b93-ae09-e047b2156184",
+        "56183ff2-d52e-49d2-9d99-8deebf79c5da",
+        "59bc4ebe-0a81-4831-8515-9e805fd47435",
+        "f29204da-50fa-41e4-ab09-3896e83f3b4a",
+        "f626b776-d86d-4926-9196-8687c019e8d6"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "01e52216-4d11-4b0e-8f33-1fc77c47fa1c",
+          "0e4867b3-7844-4582-84bf-5a35cb1e881d",
+          "2591fa0f-1429-4314-b5c3-b7ee4c946e0f",
+          "4772842d-5142-4b93-ae09-e047b2156184",
+          "56183ff2-d52e-49d2-9d99-8deebf79c5da",
+          "59bc4ebe-0a81-4831-8515-9e805fd47435",
+          "f29204da-50fa-41e4-ab09-3896e83f3b4a",
+          "f626b776-d86d-4926-9196-8687c019e8d6"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "8e3b3985-095a-431f-901a-e78c9ddd6208",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-09-30T18:43:45.769802+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "4714",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "Decision (2026-09-30, steward, task 4714 refresh eccf6b16b8): when task/4714 was merged with main, the shared _PROVENANCE_RANK_CLAUSE in fused-memory graphiti_client.py (tasks 4986/5264) was widened from `e.invalid_at IS NULL` to _ACTIVE_EDGE_PREDICATE (invalid_at AND expired_at both NULL), so both survivor-ranking methods count only active edges",
+      "derived_edge_uuids": [
+        "0f4ed4e4-5c7d-4eed-8465-d6a18ac8af2a",
+        "450bafbf-580c-4461-b473-80dcac0f7763",
+        "ae9f5b67-7c3d-443f-95a9-d338494be985",
+        "c9ac611b-f0d7-4039-8bef-598d7d2c3928",
+        "d5ca2b93-54ac-47cf-935a-b24b57aab73d"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "0f4ed4e4-5c7d-4eed-8465-d6a18ac8af2a",
+          "450bafbf-580c-4461-b473-80dcac0f7763",
+          "ae9f5b67-7c3d-443f-95a9-d338494be985",
+          "c9ac611b-f0d7-4039-8bef-598d7d2c3928",
+          "d5ca2b93-54ac-47cf-935a-b24b57aab73d"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "5119c736-215b-4512-86e1-28fb5a78ee82",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-01T05:58:35.463970+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "3846",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "deferred",
+      "claimed_text": "Decision: #3846 is fixed on the recon side as a PAYLOAD FACT plus a PROMPT RULE (a rendered `landed=` column and a rule forbidding resume, redispatch, reset or reopen when it is true)",
+      "derived_edge_uuids": [
+        "1a11c019-9dc6-4376-863e-da3cd703f0b4",
+        "3dccbe81-ef65-4882-9272-2fc3eeb6a6ea",
+        "5d7425be-04cf-44f6-a0ca-4a54e3cbefb5",
+        "a0006b55-4261-4525-bbfa-ac50fe2ee830",
+        "a3e8fd02-dd7c-4cb7-a1c2-777e9d31c01c",
+        "aa31b099-503b-4f2d-9ac1-e2bed5b149cb",
+        "b0b895fd-915c-4f76-ab7e-864454a62e0b",
+        "e5fca3cd-12eb-4316-8da8-40d7a7e8b3e5",
+        "ed5b0718-98d8-4183-a80d-cef0eccd3e6a",
+        "f423e04e-647d-4ab7-83d5-3b8482f07805"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "1a11c019-9dc6-4376-863e-da3cd703f0b4",
+          "3dccbe81-ef65-4882-9272-2fc3eeb6a6ea",
+          "5d7425be-04cf-44f6-a0ca-4a54e3cbefb5",
+          "a0006b55-4261-4525-bbfa-ac50fe2ee830",
+          "a3e8fd02-dd7c-4cb7-a1c2-777e9d31c01c",
+          "aa31b099-503b-4f2d-9ac1-e2bed5b149cb",
+          "b0b895fd-915c-4f76-ab7e-864454a62e0b",
+          "e5fca3cd-12eb-4316-8da8-40d7a7e8b3e5",
+          "ed5b0718-98d8-4183-a80d-cef0eccd3e6a",
+          "f423e04e-647d-4ab7-83d5-3b8482f07805"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "6ce247c2-7aa0-4ab6-9c20-9a24f435ae01",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-10-04T10:19:41.682670+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "6233",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "deferred",
+      "claimed_text": "PPRDSTATUS (leaf status) and PCITE (deleted symbols) both qualify, and PCITE is exactly what #6233 landed as (via #6931)",
+      "derived_edge_uuids": [
+        "02a803d3-87bf-48cf-a643-69ed540a435f",
+        "1b79d2f2-d055-4364-925a-3f425957dc2a",
+        "30068336-5569-46ca-a520-86d636366969",
+        "42750d05-77ee-4474-a124-f3b81fcde375",
+        "6e44cbae-d3ad-4609-8ae9-762f40575ad0",
+        "74e91bfd-dec5-4815-9a2a-f92b8f873291",
+        "9c34197b-3f79-4676-a6e9-53db2eafdabb"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "02a803d3-87bf-48cf-a643-69ed540a435f",
+          "1b79d2f2-d055-4364-925a-3f425957dc2a",
+          "30068336-5569-46ca-a520-86d636366969",
+          "42750d05-77ee-4474-a124-f3b81fcde375",
+          "6e44cbae-d3ad-4609-8ae9-762f40575ad0",
+          "74e91bfd-dec5-4815-9a2a-f92b8f873291",
+          "9c34197b-3f79-4676-a6e9-53db2eafdabb"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "7b210a44-a68d-40cc-89d8-3142c14c7d6a",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-04T10:32:45.889070+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "4280",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "deferred",
+      "claimed_text": "It is recorded as already satisfied on main by task 4848, which also landed task 4280's mechanical check",
+      "derived_edge_uuids": [
+        "4ff2a479-a60e-4b3e-ab5f-a5427bd54243",
+        "90ace989-b2c6-4665-9746-2fb810d87c2b",
+        "bb5702d2-b37e-4d18-8c7e-252e57e3131f",
+        "bea5f364-35dc-4efe-99bc-a673ceecaa24",
+        "eb25e1d7-cfe9-4c5c-bdab-f2d31372d975",
+        "ec7f415d-0783-4004-a2e7-1b0f0c459dbf",
+        "f82830f1-efc2-4300-a1a9-2281239fab1c"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "4ff2a479-a60e-4b3e-ab5f-a5427bd54243",
+          "90ace989-b2c6-4665-9746-2fb810d87c2b",
+          "bb5702d2-b37e-4d18-8c7e-252e57e3131f",
+          "bea5f364-35dc-4efe-99bc-a673ceecaa24",
+          "eb25e1d7-cfe9-4c5c-bdab-f2d31372d975",
+          "ec7f415d-0783-4004-a2e7-1b0f0c459dbf",
+          "f82830f1-efc2-4300-a1a9-2281239fab1c"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "8067822a-dc69-4452-b984-0ae4549407d7",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-04T10:40:24.410846+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "5252",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "Binding fixes attribution, and the widened boundary then buys the recall 4432 asked for ('Task 5252 (see CLAUDE.md:95) has landed')",
+      "derived_edge_uuids": [
+        "2f890b9c-41c6-438d-ad25-9c373efbd9e5",
+        "3fb6e5cb-3968-4d31-ac94-4a79ff118980",
+        "51516945-ce4c-48c1-aa41-88750bccb475",
+        "7f8ffa51-dbb8-4d1d-bd89-847fbf2a87f1",
+        "c5a9c5b7-9b5c-4b2d-b42d-54d0aad3cb8d",
+        "c6ea3742-b1db-477c-927d-6cfeeca71a26"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "2f890b9c-41c6-438d-ad25-9c373efbd9e5",
+          "3fb6e5cb-3968-4d31-ac94-4a79ff118980",
+          "51516945-ce4c-48c1-aa41-88750bccb475",
+          "7f8ffa51-dbb8-4d1d-bd89-847fbf2a87f1",
+          "c5a9c5b7-9b5c-4b2d-b42d-54d0aad3cb8d",
+          "c6ea3742-b1db-477c-927d-6cfeeca71a26"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "1679751b-e840-46fb-9b0f-e41a6c68e252",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-10-06T19:43:56.993044+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "5471",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "(3) PRD2 \u03b5 #5471 owns the shipped Bool-balance and stock-size examples, so a new Bool exemplar here would duplicate it",
+      "derived_edge_uuids": [
+        "17c0b6d9-bb2b-4dd6-8be7-be94ce2397d2",
+        "3ca35971-1128-4c6f-b736-69cbcf5652fd",
+        "3fbb7db1-6eb5-466b-bfab-065166eb94a0",
+        "56274a1b-ae21-4270-8d83-c544f5ab6ae1",
+        "5dcd7b89-b7ac-4e91-a346-7cf4cd511674",
+        "6602a68d-821c-49a4-87db-2f167c0a451c",
+        "6a2d5028-bf72-4a89-8886-dfbd1cb42d4b",
+        "804c4f90-e9fc-4f32-8d68-fe2ff78629e4",
+        "a8759c9d-dd53-4771-8e39-c96207628358",
+        "fcbd2c7c-f9da-4b83-bd07-8ca8a30abe96"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "17c0b6d9-bb2b-4dd6-8be7-be94ce2397d2",
+          "3ca35971-1128-4c6f-b736-69cbcf5652fd",
+          "3fbb7db1-6eb5-466b-bfab-065166eb94a0",
+          "56274a1b-ae21-4270-8d83-c544f5ab6ae1",
+          "5dcd7b89-b7ac-4e91-a346-7cf4cd511674",
+          "6602a68d-821c-49a4-87db-2f167c0a451c",
+          "6a2d5028-bf72-4a89-8886-dfbd1cb42d4b",
+          "804c4f90-e9fc-4f32-8d68-fe2ff78629e4",
+          "a8759c9d-dd53-4771-8e39-c96207628358",
+          "fcbd2c7c-f9da-4b83-bd07-8ca8a30abe96"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "71a366e9-8091-4dc3-a66b-c4e62e74fd38",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-07T16:26:52.300360+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "5455",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "Rationale: Task 5455 (sweep lifecycle runs.db events) is still pending, and the task text says to add an event only 'if #5455 has landed'",
+      "derived_edge_uuids": [
+        "1b3e5561-c9c6-4d53-b323-cf3d9a157b41",
+        "2ade5fc7-4169-4923-815c-76f3a934d5af",
+        "59da497b-2302-49f2-98dc-34b6c792b479",
+        "7c7593bb-6a67-44d1-9fc1-26ffcbf5cb10",
+        "97fa7a87-1727-478e-85d4-84ab9f79d78e"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "1b3e5561-c9c6-4d53-b323-cf3d9a157b41",
+          "2ade5fc7-4169-4923-815c-76f3a934d5af",
+          "59da497b-2302-49f2-98dc-34b6c792b479",
+          "7c7593bb-6a67-44d1-9fc1-26ffcbf5cb10",
+          "97fa7a87-1727-478e-85d4-84ab9f79d78e"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "b94a4690-ceac-46a6-ba50-1d0ddc54ac6a",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-10-08T05:06:55.828732+00:00",
+      "claim_kind": "disposition",
+      "subject": "task",
+      "ref": "5023",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "But PTODO excludes .md entirely (\u00a76.8), so a #5023 cite in the schema note would rot silently the day #5023 is cancelled",
+      "derived_edge_uuids": [
+        "2ea70aef-7218-4b8f-8a10-46d624bbbd95",
+        "44f43ed8-2560-423c-942c-1a81e6c4c1b2",
+        "77c4ba21-4a16-4671-b1c5-c418098275cd",
+        "bf930f33-c48b-45d6-82c8-40d46c5ebbcb",
+        "c516b1cd-da27-453a-a155-fc053835fab7",
+        "e2dcfee3-4f57-4810-a0ad-08b42a82da31",
+        "f177fae8-34e3-4133-ba26-6f1722d56472",
+        "fbe05035-ce80-4634-a898-07013bd78b7d"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "2ea70aef-7218-4b8f-8a10-46d624bbbd95",
+          "44f43ed8-2560-423c-942c-1a81e6c4c1b2",
+          "77c4ba21-4a16-4671-b1c5-c418098275cd",
+          "bf930f33-c48b-45d6-82c8-40d46c5ebbcb",
+          "c516b1cd-da27-453a-a155-fc053835fab7",
+          "e2dcfee3-4f57-4810-a0ad-08b42a82da31",
+          "f177fae8-34e3-4133-ba26-6f1722d56472",
+          "fbe05035-ce80-4634-a898-07013bd78b7d"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "6dd372bf-de10-4891-8ee4-1e356ac7cbfa",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-10T03:33:24.098641+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "abc1234",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "no commit abc1234 in any registered repository (claimed project 'dark_factory')",
+      "claimed_text": "Attributive participles must keep forward binding ('the merged commit abc1234')",
+      "derived_edge_uuids": [
+        "0c7962ab-ce53-42b9-be0c-1c9ffed81aa1",
+        "2fbfbe37-d534-4d29-bccc-62879022ebfa",
+        "5358086b-f59b-4c3f-bbbd-fa839f0475b5",
+        "7fb338d4-5e06-468c-967c-015992143631",
+        "84f2fc1a-66a5-420b-9021-930bcb2a947d",
+        "b252a8c3-4862-4337-8d7f-295aceebcc92",
+        "bb92a714-196a-4718-a9c7-17a659d23a1f",
+        "e649bddc-8602-4b6b-a2e7-48c8358c0108"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "0c7962ab-ce53-42b9-be0c-1c9ffed81aa1",
+          "2fbfbe37-d534-4d29-bccc-62879022ebfa",
+          "5358086b-f59b-4c3f-bbbd-fa839f0475b5",
+          "7fb338d4-5e06-468c-967c-015992143631",
+          "84f2fc1a-66a5-420b-9021-930bcb2a947d",
+          "b252a8c3-4862-4337-8d7f-295aceebcc92",
+          "bb92a714-196a-4718-a9c7-17a659d23a1f",
+          "e649bddc-8602-4b6b-a2e7-48c8358c0108"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "a1bacf88-fbe9-466a-b9cf-f61ba054cf38",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-04-17T07:35:15.522378+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "ccd1ea24",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "no commit ccd1ea24 in any registered repository (claimed project 'dark_factory')",
+      "claimed_text": "Stage 1 reconciliation (memory_consolidator) fix was deployed at commit ccd1ea24 but fused-memory service was NOT restarted \u2014 old code continues to run, Stage 1 still sees 0 active tasks",
+      "derived_edge_uuids": [
+        "1f5b1bf8-883e-485b-89f1-9c18b599ff0a"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "1f5b1bf8-883e-485b-89f1-9c18b599ff0a"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "30adff14-4345-4174-a1eb-d9225cda3455",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-04-20T11:45:58.661604+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "bdc355908a",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "no commit bdc355908a in any registered repository (claimed project 'dark_factory')",
+      "claimed_text": "Task 845 status changed from deferred to in-progress on 2026-04-20T10:12:06.721632Z after the killpg TOCTOU bug fix was deployed at commit bdc355908a",
+      "derived_edge_uuids": [
+        "19480fd2-f584-4196-add9-605b8cc066c9",
+        "38464421-cade-4ee1-aff9-7fe961239a00",
+        "94219032-c7c8-47ff-a811-f0f7a1b9ffd1",
+        "ad037f18-c69a-46f4-bd4e-27e091e94e4e",
+        "bf7029c3-7c74-4c31-a30f-3d4db1710cce",
+        "d386fa6f-b3ba-424d-89c5-f64b0852d146"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "19480fd2-f584-4196-add9-605b8cc066c9",
+          "38464421-cade-4ee1-aff9-7fe961239a00",
+          "94219032-c7c8-47ff-a811-f0f7a1b9ffd1",
+          "ad037f18-c69a-46f4-bd4e-27e091e94e4e",
+          "bf7029c3-7c74-4c31-a30f-3d4db1710cce",
+          "d386fa6f-b3ba-424d-89c5-f64b0852d146"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "c9edd4ff-474b-4723-9d05-7bb293620535",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-04-25T08:50:36.434811+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "434b38d521",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "no commit 434b38d521 in any registered repository (claimed project 'dark_factory')",
+      "claimed_text": "The refactor removed the last_get_statuses_error side-channel and consumed get_statuses as a tuple at all four call sites (commit 460594ac8b2610ab5c8f27c43f51d1039c72c9b3, merged 2026-04-24 via merge commit 434b38d521)",
+      "derived_edge_uuids": [
+        "379155ca-8408-4354-9d05-67d485dee9e5",
+        "5379ea3a-2419-4995-ad95-e96ec9aa4d88",
+        "d2f2794d-66e5-42d6-96fb-3b01183fc1f6"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "379155ca-8408-4354-9d05-67d485dee9e5",
+          "5379ea3a-2419-4995-ad95-e96ec9aa4d88",
+          "d2f2794d-66e5-42d6-96fb-3b01183fc1f6"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "5c5ace1a-fa3d-4f78-a5ce-c361453565d3",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-04-27T07:22:04.725282+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "4ce048ea",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "no commit 4ce048ea in any registered repository (claimed project 'reify')",
+      "claimed_text": "Task 2429 shipped via crates/reify-compiler/src/functions.rs (commit 4ce048ea)",
+      "derived_edge_uuids": [
+        "06ce2f2f-9ee9-4c40-ba0f-3f1a7e2e1961",
+        "ee9530c8-6f77-43fd-9a80-72a749663340"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "06ce2f2f-9ee9-4c40-ba0f-3f1a7e2e1961",
+          "ee9530c8-6f77-43fd-9a80-72a749663340"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "48d10784-3c96-498a-a027-14cb7ac28b95",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-05-08T02:26:15.625779+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "cf112f8dfb998a7c5d7fc4caed60b6b12325cc01",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "no commit cf112f8dfb998a7c5d7fc4caed60b6b12325cc01 in any registered repository (claimed project 'reify')",
+      "claimed_text": "Branch task/3135 tip commit cf112f8dfb998a7c5d7fc4caed60b6b12325cc01 (\"Extract face_outward_unit_normal private method in OcctKernel\") confirms implementation was merged",
+      "derived_edge_uuids": [
+        "12decb6d-9894-4da4-b312-33d7747c28e4",
+        "1378ae7e-0cc0-4c83-ae55-e1597adcf8d4",
+        "2f4fa281-cc96-40f3-a223-0f3725b75c6e",
+        "fc10bb16-5882-446b-a11a-d0714d536e13"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "12decb6d-9894-4da4-b312-33d7747c28e4",
+          "1378ae7e-0cc0-4c83-ae55-e1597adcf8d4",
+          "2f4fa281-cc96-40f3-a223-0f3725b75c6e",
+          "fc10bb16-5882-446b-a11a-d0714d536e13"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "0d2b8ace-1480-4e11-bb44-3bacd1abdb58",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-05-08T03:41:53.681360+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "95c88cdeaa",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "no commit 95c88cdeaa in any registered repository (claimed project 'reify')",
+      "claimed_text": "Commit 95c88cdeaa was merged via 3d22adae \"Merge task/3069\"",
+      "derived_edge_uuids": [
+        "320538ba-90e9-4ea5-86ff-7281894ce776",
+        "769d9135-aad9-45e7-a4de-0ea924cf24a2",
+        "9bc06e44-b4b1-483b-8748-2883f5f371b6"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "320538ba-90e9-4ea5-86ff-7281894ce776",
+          "769d9135-aad9-45e7-a4de-0ea924cf24a2",
+          "9bc06e44-b4b1-483b-8748-2883f5f371b6"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "d3cfec61-b560-4e30-8dce-582f5526dd64",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-05-31T03:21:04.080193+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "a7f2d19e3c84b501f2fe6d09c7fd8a8e471dc243",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "no commit a7f2d19e3c84b501f2fe6d09c7fd8a8e471dc243 in any registered repository (claimed project 'reify')",
+      "claimed_text": "Task 3621 (KGQ-\u03bc: curvature(Curve) + curvature(Surface) dispatch + new OCCT FFI arms) was merged into main in the reify repo at commit a7f2d19e3c84b501f2fe6d09c7fd8a8e471dc243 on 2026-05-31",
+      "derived_edge_uuids": [
+        "5320ef43-fea8-41e4-b6d0-094bc688da43",
+        "6ed5b571-49e4-4b3a-9096-9a74bb77c226",
+        "8dba21da-60a9-48c2-8af5-b5e95c557819",
+        "af22c183-7714-4fbf-8e2c-995bae73e018",
+        "bb3dce30-d5a4-475f-b8b6-bc69812294ce",
+        "bc414bc9-6cb1-4bde-9456-d20730ea7a40",
+        "dbe74169-9550-4dde-892e-463af3e231da"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "5320ef43-fea8-41e4-b6d0-094bc688da43",
+          "6ed5b571-49e4-4b3a-9096-9a74bb77c226",
+          "8dba21da-60a9-48c2-8af5-b5e95c557819",
+          "af22c183-7714-4fbf-8e2c-995bae73e018",
+          "bb3dce30-d5a4-475f-b8b6-bc69812294ce",
+          "bc414bc9-6cb1-4bde-9456-d20730ea7a40",
+          "dbe74169-9550-4dde-892e-463af3e231da"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "1e957cdb-2f55-45fc-9610-0f80b66aea76",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "cross_graph": false,
+      "created_at": "2026-06-03T12:29:41.249808+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "e89a95c8c49",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "no commit e89a95c8c49 in any registered repository (claimed project 'reify')",
+      "claimed_text": "Task 4208 (GUI IDE \u03b8: command palette Ctrl+Shift+P + symbol-jump @ / Ctrl+Shift+O) shipped via commit e89a95c8c49 (2026-06-03)",
+      "derived_edge_uuids": [
+        "7fa785bb-0ad4-4b2d-9411-e5dd11666ba3",
+        "88cd2f14-e2c3-4e3b-8e5c-3fcdc47db61c",
+        "a72fa3bb-f6c7-406a-8a13-14e504949c04",
+        "fe9e6b12-99b7-431f-8640-dbbb009dd700"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": [
+          "7fa785bb-0ad4-4b2d-9411-e5dd11666ba3",
+          "88cd2f14-e2c3-4e3b-8e5c-3fcdc47db61c",
+          "a72fa3bb-f6c7-406a-8a13-14e504949c04",
+          "fe9e6b12-99b7-431f-8640-dbbb009dd700"
+        ]
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "bc6f19e1-e9f4-4e3c-a6da-85c797913c54",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-04-07T07:01:07.637992+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "457",
+      "claim_project_id": "dark_factory",
+      "status": "unverifiable",
+      "observed": "live status for task 457 could not be resolved (project='dark_factory')",
+      "claimed_text": "vLLM eval pipeline tool-format bridge bug DISCOVERED 2026-04-06 PM, FIXED in Task 457 (merged to main, vllm_bridge.py created 19:30 BST 2026-04-06)",
+      "derived_edge_uuids": [
+        "0885fa94-185d-4eab-8fcf-c5dc67963778",
+        "64a329af-f43c-41e6-a011-335053a323fd",
+        "ad12d49d-c162-4956-81e6-bb8bafeafe88",
+        "b61612ab-d412-4fe2-9ab4-81fff8bfe79d",
+        "b64e5e0b-f7dd-43e5-9340-000a723ee455"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "0885fa94-185d-4eab-8fcf-c5dc67963778",
+          "64a329af-f43c-41e6-a011-335053a323fd",
+          "ad12d49d-c162-4956-81e6-bb8bafeafe88",
+          "b61612ab-d412-4fe2-9ab4-81fff8bfe79d",
+          "b64e5e0b-f7dd-43e5-9340-000a723ee455"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "a84319e0-023f-4a81-828c-405560d7cba0",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-07T00:55:16.580123+00:00",
+      "claim_kind": "filing_dispatch",
+      "subject": "task",
+      "ref": "7915",
+      "claim_project_id": "dark_factory",
+      "status": "unverifiable",
+      "observed": "live status for task 7915 could not be resolved (project='dark_factory')",
+      "claimed_text": "Decision: Fix the two in-repo surfaces the sightings actually passed through: roles.py WAIT_PATTERN_GUIDANCE for the dispatched #7915 session, and skills/merge-queue/SKILL.md for the interactive #7907 session",
+      "derived_edge_uuids": [
+        "0dea18f2-6c45-44a6-b3a4-0994b882a560",
+        "2a850a3b-6af3-4033-8ea9-72f32bf3601e",
+        "603bd9aa-7f24-44a5-bef3-57d019731c6c",
+        "6f52df4b-287d-4cb9-835d-c8803f49866f",
+        "c2eec68e-f62a-4932-a04f-bfecd3294a27",
+        "d6801782-2409-46f0-9078-6c3a88f3f28f"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "0dea18f2-6c45-44a6-b3a4-0994b882a560",
+          "2a850a3b-6af3-4033-8ea9-72f32bf3601e",
+          "603bd9aa-7f24-44a5-bef3-57d019731c6c",
+          "6f52df4b-287d-4cb9-835d-c8803f49866f",
+          "c2eec68e-f62a-4932-a04f-bfecd3294a27",
+          "d6801782-2409-46f0-9078-6c3a88f3f28f"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "79716ccc-2d47-48c1-97ae-ffb15f20cb33",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-10T03:32:58.726990+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "6932",
+      "claim_project_id": "dark_factory",
+      "status": "unverifiable",
+      "observed": "live status for task 6932 could not be resolved (project='dark_factory')",
+      "claimed_text": "With an unconditional 'before', the replay dropped 5 genuine narrative claims ('before task 3445 landed tests/x.py', 'before #6932's PPRDSTATUS landed', 'before 5638 was cancelled') and gained nothing beyond 7407",
+      "derived_edge_uuids": [
+        "70114226-e668-4982-9cf1-59c05d15374e",
+        "8017a01d-2282-46b0-a0ed-941077aa6353",
+        "ababe781-7cf6-4560-956a-3b7b4d613cd5",
+        "c52c2afb-1e13-46b4-a9a8-27ac7c919dd3",
+        "ea473b84-6f54-4a08-8f6a-f74c6d15f7d0"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "70114226-e668-4982-9cf1-59c05d15374e",
+          "8017a01d-2282-46b0-a0ed-941077aa6353",
+          "ababe781-7cf6-4560-956a-3b7b4d613cd5",
+          "c52c2afb-1e13-46b4-a9a8-27ac7c919dd3",
+          "ea473b84-6f54-4a08-8f6a-f74c6d15f7d0"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "79716ccc-2d47-48c1-97ae-ffb15f20cb33",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "dark_factory",
+      "graph_name": "dark_factory",
+      "cross_graph": false,
+      "created_at": "2026-10-10T03:32:58.726990+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "7407",
+      "claim_project_id": "dark_factory",
+      "status": "unverifiable",
+      "observed": "live status for task 7407 could not be resolved (project='dark_factory')",
+      "claimed_text": "With the tense gate all 5 are kept, and 7407 is still dropped because its scope ('BEFORE #7407 stamps the PRD SHIPPED is the correct order') is present tense",
+      "derived_edge_uuids": [
+        "70114226-e668-4982-9cf1-59c05d15374e",
+        "8017a01d-2282-46b0-a0ed-941077aa6353",
+        "ababe781-7cf6-4560-956a-3b7b4d613cd5",
+        "c52c2afb-1e13-46b4-a9a8-27ac7c919dd3",
+        "ea473b84-6f54-4a08-8f6a-f74c6d15f7d0"
+      ],
+      "derived_edges_by_graph": {
+        "dark_factory": [
+          "70114226-e668-4982-9cf1-59c05d15374e",
+          "8017a01d-2282-46b0-a0ed-941077aa6353",
+          "ababe781-7cf6-4560-956a-3b7b4d613cd5",
+          "c52c2afb-1e13-46b4-a9a8-27ac7c919dd3",
+          "ea473b84-6f54-4a08-8f6a-f74c6d15f7d0"
+        ],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "1712d94d-59eb-4ee1-8ae6-f38e096c78ff",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "know_live",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-05-01T18:30:20.405243+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "175",
+      "claim_project_id": "know_live",
+      "status": "unverifiable",
+      "observed": "live status for task 175 could not be resolved (project='know_live')",
+      "claimed_text": "Task 175 shipped via src/knowlive/bundle/schema.py",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "ade9717e-d6bc-4bdc-a481-0af922d8df4b",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "know_live",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-05-01T18:30:38.657241+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "171",
+      "claim_project_id": "know_live",
+      "status": "unverifiable",
+      "observed": "live status for task 171 could not be resolved (project='know_live')",
+      "claimed_text": "Task 171 shipped via src/knowlive/bundle/schema.py, src/knowlive/challenge/nonce.py, src/knowlive/challenge/pacing.py, src/knowlive/forgery_bench/__main__.py, src/knowlive/forgery_bench/tiers.py, src/knowlive/geometry/moge.py, src/knowlive/scoring/vector.py, src/knowlive/sync/extract.py, tests/test_bundle_schema.py",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "c50f0224-7850-4800-bc23-61c7f39933d9",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "know_live",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-05-01T18:32:01.466172+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "170",
+      "claim_project_id": "know_live",
+      "status": "unverifiable",
+      "observed": "live status for task 170 could not be resolved (project='know_live')",
+      "claimed_text": "Task 170 shipped via src/knowlive/geometry/hloc_match.py",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "fc33c4b6-4e96-4e3f-b864-27855510c25a",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "knowlive",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-05-07T06:36:20.955651+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "306",
+      "claim_project_id": "knowlive",
+      "status": "unverifiable",
+      "observed": "live status for task 306 could not be resolved (project='knowlive')",
+      "claimed_text": "KnowLive task 306 (warp_timeline dead-code removal) is DONE as of 2026-05-07 (done_provenance kind=merged, commit 3c9d33e1)",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "5dbaeb88-e4ab-4d57-bf1c-add24f76c82e",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "knowlive",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-05-07T06:37:11.830409+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "413",
+      "claim_project_id": "knowlive",
+      "status": "unverifiable",
+      "observed": "live status for task 413 could not be resolved (project='knowlive')",
+      "claimed_text": "KnowLive task 413 (cli/attack import boundary DRY) is DONE as of 2026-05-07 (done_provenance kind=merged, commit 69f83eee)",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "ec336c02-0125-4231-a54e-adaf6e8bdef1",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "knowlive",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-05-07T06:37:37.231186+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "471",
+      "claim_project_id": "knowlive",
+      "status": "unverifiable",
+      "observed": "live status for task 471 could not be resolved (project='knowlive')",
+      "claimed_text": "KnowLive task 471 (rigid_reflector empty-samples short-circuit) is DONE as of 2026-05-07 (done_provenance kind=merged, commit b2e13eaeab)",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "fd70bbbd-b330-467c-ad64-7fb4dcb8530a",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "know_live",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-05-07T06:57:19.781199+00:00",
+      "claim_kind": "applied_work",
+      "subject": "task",
+      "ref": "300",
+      "claim_project_id": "know_live",
+      "status": "unverifiable",
+      "observed": "live status for task 300 could not be resolved (project='know_live')",
+      "claimed_text": "Task 300 completed as found_on_main (already merged, not newly merged)",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    },
+    {
+      "record_uuid": "4964d1c6-f8fc-456b-aa12-0b0dd7e54a3c",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "solar_challenge_platform",
+      "graph_name": "reify",
+      "cross_graph": true,
+      "created_at": "2026-07-02T00:12:39.355753+00:00",
+      "claim_kind": "applied_work",
+      "subject": "commit",
+      "ref": "818d2ebf9629825a8a28e498bb33165857f2a065",
+      "claim_project_id": "solar_challenge_platform",
+      "status": "unverifiable",
+      "observed": "commit 818d2ebf9629825a8a28e498bb33165857f2a065 could not be checked in every registered repository (claimed project 'solar_challenge_platform')",
+      "claimed_text": "As of 2026-07-01T23:30:14Z: Task 115 (Customer Portal\u00b7D: React frontend integration + StaticFiles serving + working-UI smoke, extends P11 infra) is done \u2014 merged via commit 818d2ebf9629825a8a28e498bb33165857f2a065",
+      "derived_edge_uuids": [],
+      "derived_edges_by_graph": {
+        "dark_factory": [],
+        "reify": []
+      },
+      "edges_unqueried": false,
+      "edges_enumerated_in": [
+        "dark_factory",
+        "reify"
+      ],
+      "edges_unqueried_in": []
+    }
+  ]
+}

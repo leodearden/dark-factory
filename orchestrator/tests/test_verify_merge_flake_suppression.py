@@ -304,7 +304,7 @@ class TestWithPytestTimeoutStr:
             'uv run --project orchestrator --directory orchestrator '
             'pytest tests/ --tb=short -q'
         )
-        composed = _with_pytest_timeout_str(_serial_pytest_str(base), 300)
+        composed = _with_pytest_timeout_str(_serial_pytest_str(base, invocation_dir=None), 300)
         assert composed is not None
         assert '-p no:xdist' in composed
         assert '-o addopts=' in composed

@@ -1108,6 +1108,189 @@ class TestPostMergeVerifySeedsBaseline:
             f'after={after_keys!r}'
         )
 
+    # -- step-18 (task 3226): the pass path must seed BOTH baselines --------
+    #
+    # Seeding only the failing side makes the whole 3226 guard a no-op in
+    # steady state: every merge-seeded sha would have a WARM failing cache
+    # and a COLD skipped cache, so cached_main_baseline_skipped_ids returns
+    # None -> `or frozenset()` -> the unattributable set is always empty ->
+    # neither the verify.py fall-through guard nor the merge_queue reason
+    # partition can ever fire outside a hand-seeded fixture.
+
+    def _drive_pass(
+        self,
+        tmp_path: Path,
+        passing_result: VerifyResult,
+        merge_sha: str,
+    ) -> MergeOutcome | None:
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('3226', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        return asyncio.run(_run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={},
+            enospc_retries={},
+            max_timeouts=3,
+            max_enospc=1,
+            merge_sha=merge_sha,
+            verifier=_verifier(passing_result),
+        ))
+
+    def test_passing_verify_seeds_the_skipped_baseline_too(self, tmp_path: Path) -> None:
+        """(a) A passing full-breadth result carrying skipped ids seeds the
+        SKIPPED cache verbatim, while the failing side still seeds the empty
+        frozenset exactly as before (task-2590 amendment, untouched)."""
+        from orchestrator.verify import (
+            cached_main_baseline_failing_ids,
+            cached_main_baseline_skipped_ids,
+        )
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=[], skipped_test_ids=['t::s'],
+            ),
+            merge_sha='abcsha',
+        )
+        assert outcome is None, f'Expected the verify-passed sentinel (None); got {outcome!r}'
+
+        assert cached_main_baseline_skipped_ids('abcsha') == frozenset({'t::s'}), (
+            'the pass path must seed the SKIPPED baseline for the merge sha — '
+            'otherwise every merge-seeded sha has a cold skipped cache and the '
+            'whole 3226 guard is inert in steady state; got '
+            f'{cached_main_baseline_skipped_ids("abcsha")!r}'
+        )
+        seeded_failing = cached_main_baseline_failing_ids('abcsha')
+        assert seeded_failing == frozenset(), (
+            f'the failing side must still seed the empty set; got {seeded_failing!r}'
+        )
+
+    def test_passing_verify_with_no_skip_evidence_leaves_the_skipped_side_unknown(
+        self, tmp_path: Path,
+    ) -> None:
+        """(b) skipped_test_ids=None is "no skip evidence", so the skipped side
+        reads None rather than a confident empty set, while the failing side is
+        still seeded empty (task 2590)."""
+        from orchestrator.verify import (
+            cached_main_baseline_failing_ids,
+            cached_main_baseline_skipped_ids,
+        )
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=[], skipped_test_ids=None,
+            ),
+            merge_sha='abcsha',
+        )
+        assert outcome is None
+
+        assert cached_main_baseline_failing_ids('abcsha') == frozenset()
+        assert cached_main_baseline_skipped_ids('abcsha') is None, (
+            'skipped_test_ids=None must not claim "main skipped nothing"; got '
+            f'{cached_main_baseline_skipped_ids("abcsha")!r}'
+        )
+
+    def test_degraded_pass_seeds_neither_cache(self, tmp_path: Path) -> None:
+        """(c) failing_test_ids is None (scoped/degraded) -> NEITHER cache is
+        seeded, so the outer `if` stays the single gate for both sides."""
+        from orchestrator.verify import (
+            cached_main_baseline_failing_ids,
+            cached_main_baseline_skipped_ids,
+        )
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=None, skipped_test_ids=['t::s'],
+            ),
+            merge_sha='scopedsha',
+        )
+        assert outcome is None
+
+        assert cached_main_baseline_failing_ids('scopedsha') is None
+        assert cached_main_baseline_skipped_ids('scopedsha') is None, (
+            'a degraded pass must not seed the skipped side either — the outer '
+            'failing_test_ids guard is the single gate for both'
+        )
+
+    def test_merge_seeded_baseline_arms_the_skipped_on_main_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        """(d) END-TO-END: the guard must fire against a MERGE-seeded baseline,
+        not only a hand-seeded fixture.  Drive the pass path to seed both caches
+        for 'abcsha', then ask verify_failure_is_preexisting_on_main about a
+        branch failure naming the id main SKIPPED, with get_main_sha returning
+        that same 'abcsha' (the merged tree IS the next main tip — that identity
+        is the whole point of the pass-path seed)."""
+        import time as time_module
+
+        from orchestrator import verify as verify_module
+        from orchestrator.workflow import _normalize_cause_hint as _norm
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=[], skipped_test_ids=['t::skipped_on_main'],
+            ),
+            merge_sha='abcsha',
+        )
+        assert outcome is None
+
+        category = 'test_failure'
+        cause_hint = 'AssertionError in t::skipped_on_main'
+        _PROBE_CACHE[('abcsha', category, _norm(cause_hint))] = (
+            time_module.monotonic(), True,
+        )
+
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        worktree = tmp_path / 'branch-wt'
+        worktree.mkdir()
+        probe_git_ops = GitOps(config.git, config.project_root)
+        probe_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            cause_hint=cause_hint, category=category,
+            failing_test_ids=['t::skipped_on_main'],
+        )
+        legacy_probe_mock = AsyncMock(return_value=COMPILE_ERROR_RESULT)
+
+        async def _ask() -> tuple[bool, str]:
+            with (
+                patch.object(
+                    verify_module, 'run_scoped_verification', new=legacy_probe_mock,
+                ),
+                patch.object(
+                    probe_git_ops, 'get_main_sha', new=AsyncMock(return_value='abcsha'),
+                ),
+            ):
+                return await verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.py'], failing_result, probe_git_ops,
+                )
+
+        result = asyncio.run(_ask())
+
+        assert result == (True, 'abcsha'), (
+            'against a MERGE-seeded baseline, a branch-failing id that main '
+            'SKIPPED must be unattributable and defer to the signature probe — '
+            f'not the confident task-fault verdict; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Step-19 (task μ, verify-scope-inversion-prd.md): end-to-end baseline
@@ -1539,3 +1722,144 @@ class TestTrivialPassMainRedGate:
 
         assert outcome is None, f'a known-green module must not withhold; got {outcome!r}'
         cast(AsyncMock, git_ops.cleanup_merge_worktree).assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 3226: the human-facing half of "a SKIP is not a PASS".
+#
+# The branch-block reason enrichment cites "N new failing test(s) not present
+# on main".  "Not present on main['s failing baseline]" is true of two very
+# different populations: tests main RAN and passed (real evidence the branch
+# broke them) and tests main NEVER RAN (evidence of nothing).  Counting them
+# together overstates the branch's fault in the one artifact a human actually
+# reads, so the two must be partitioned and worded distinguishably.
+#
+# All cases pre-seed the probe verdict (_seed_probe_verdict, preexisting=False)
+# so the main-health classification returns None deterministically and the
+# assertions isolate the reason-enrichment seam.  Both baselines are seeded so
+# the enrichment's cache-only peeks hit without any probe.
+# ---------------------------------------------------------------------------
+
+
+class TestBranchBlockReasonSkippedOnMainPartition:
+    """A branch-failing id that main SKIPPED is reported distinguishably from a
+    genuinely-new failing test, and never inflates the new-failure count."""
+
+    def _drive(
+        self,
+        tmp_path: Path,
+        branch_ids: list[str],
+        main_failing: set[str],
+        main_skipped: set[str],
+    ) -> MergeOutcome:
+        from orchestrator.verify import seed_main_baseline
+
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('3226', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        seed_main_baseline(MAIN_SHA, frozenset(main_failing), skipped=main_skipped)
+
+        branch_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', category='test_failure',
+            failing_test_ids=branch_ids,
+        )
+
+        _seed_probe_verdict(branch_result, preexisting=False)
+
+        outcome = asyncio.run(_run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+            verifier=_verifier(branch_result),
+        ))
+        assert outcome is not None, 'expected a branch-block outcome'
+        return outcome
+
+    def test_mixed_new_and_skipped_ids_are_partitioned(self, tmp_path: Path) -> None:
+        """One genuinely-new id + one skipped-on-main id: the count is 1 (not 2),
+        only the genuinely-new id is cited as a new failing test, and the skipped
+        one is reported separately as not evidence of a branch fault."""
+        from orchestrator.verify import SKIPPED_ON_MAIN_REASON_CLAUSE
+
+        outcome = self._drive(
+            tmp_path,
+            branch_ids=['t::genuinely_new', 't::skipped_on_main'],
+            main_failing=set(),
+            main_skipped={'t::skipped_on_main'},
+        )
+        reason = outcome.reason
+
+        assert '1 new failing test(s) not present on main' in reason, (
+            f'only the genuinely-new id may be counted as a new failure; got {reason!r}'
+        )
+        assert '2 new failing test(s)' not in reason, (
+            f'a skipped-on-main id must not inflate the new-failure count; got {reason!r}'
+        )
+        assert SKIPPED_ON_MAIN_REASON_CLAUSE in reason, (
+            f'expected the skipped-on-main clause; got {reason!r}'
+        )
+
+        # The two populations must not be conflated: the skipped id must not
+        # appear inside the genuinely-new citation list.
+        new_clause, sep, _skipped_clause = reason.partition(SKIPPED_ON_MAIN_REASON_CLAUSE)
+        assert sep, f'expected the reason to carry the skipped clause; got {reason!r}'
+        assert 't::genuinely_new' in new_clause, (
+            f'the genuinely-new id must be cited as a new failing test; got {reason!r}'
+        )
+        assert 't::skipped_on_main' not in new_clause, (
+            f'the skipped-on-main id must NOT be cited among the new failing '
+            f'tests; got {reason!r}'
+        )
+        assert 't::skipped_on_main' in reason, (
+            f'the skipped-on-main id must still be named, just distinguishably; got {reason!r}'
+        )
+
+    def test_no_skipped_ids_leaves_the_reason_byte_identical(self, tmp_path: Path) -> None:
+        """CONVERSE REGRESSION: when no branch-failing id was skipped on main,
+        the wording is exactly today's — an unrelated skipped id in main's
+        baseline must not perturb it."""
+        from orchestrator.verify import SKIPPED_ON_MAIN_REASON_CLAUSE
+
+        outcome = self._drive(
+            tmp_path,
+            branch_ids=['X', 'Y'],
+            main_failing={'X'},
+            main_skipped={'t::totally_unrelated'},
+        )
+        reason = outcome.reason
+
+        assert reason.startswith(
+            'Post-merge verification failed: 1 new failing test(s) '
+            'not present on main: Y'
+        ), f'expected today wording byte-identical; got {reason!r}'
+        assert SKIPPED_ON_MAIN_REASON_CLAUSE not in reason, (
+            f'no skipped clause may appear when nothing was skipped; got {reason!r}'
+        )
+
+    def test_every_new_id_skipped_on_main_claims_no_new_failure(self, tmp_path: Path) -> None:
+        """When EVERY new id was skipped on main there is no genuinely-new
+        failing test at all — the reason must not claim one."""
+        from orchestrator.verify import SKIPPED_ON_MAIN_REASON_CLAUSE
+
+        outcome = self._drive(
+            tmp_path,
+            branch_ids=['t::s1', 't::s2'],
+            main_failing=set(),
+            main_skipped={'t::s1', 't::s2'},
+        )
+        reason = outcome.reason
+
+        assert 'new failing test(s) not present on main' not in reason, (
+            f'no genuinely-new failing test may be claimed when every new id was '
+            f'skipped on main; got {reason!r}'
+        )
+        assert SKIPPED_ON_MAIN_REASON_CLAUSE in reason, (
+            f'expected the skipped-on-main clause; got {reason!r}'
+        )
+        assert 't::s1' in reason and 't::s2' in reason, (
+            f'both skipped ids must be named; got {reason!r}'
+        )
