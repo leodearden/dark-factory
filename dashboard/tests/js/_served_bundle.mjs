@@ -1,9 +1,11 @@
-// The served bundle as node sees it: index.html's script tags, the Babel
-// build it pins, and the top-level bindings each served script declares.
+// The served bundle as node sees it: index.html's script tags, the CDN builds
+// it pins, how the browser compiles a text/babel tag, and the top-level
+// bindings each served script declares.
 //
-// A helper module, not a test: the `*.test.mjs` glob skips it. Its importers
-// are classic_script_scope.test.mjs and test_datum_access_paths.py's
-// client-binding census.
+// A helper module, not a test: the `*.test.mjs` glob skips it. It imports node
+// built-ins only and does no work at import time, because
+// test_datum_access_paths.py imports it from a bare `node -e` and
+// classic_script_scope.test.mjs must run with no npm install.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,6 +14,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const TESTS_JS_DIR = path.dirname(fileURLToPath(import.meta.url));
+export const REPO_ROOT = path.resolve(TESTS_JS_DIR, '../../..');
 export const REDUX_DIR = path.resolve(TESTS_JS_DIR, '../../src/dashboard/static/redux');
 export const INDEX_HTML = path.join(REDUX_DIR, 'index.html');
 
@@ -44,18 +47,38 @@ export function babelScriptSrcs(html) {
 // pin, and loadVendoredBabel holds this copy to it.
 export const VENDORED_BABEL = path.join(TESTS_JS_DIR, 'vendor', 'babel.min.js');
 
-const BABEL_TAG_RE =
-  /<script\s+src="(https:\/\/unpkg\.com\/@babel\/standalone@[^"]+\/babel\.min\.js)"\s+integrity="(sha384-[^"]+)"/;
+// Matches `<script src="https://unpkg.com/<pkg>@<version>/<path>" integrity="sha384-...">`,
+// for a scoped (`@babel/standalone`) or unscoped (`react`) package name.
+const CDN_SCRIPT_TAG_RE =
+  /<script\s+src="(https:\/\/unpkg\.com\/((?:@[^/"@]+\/)?[^/"@]+)@([^/"]+)\/([^"]+))"\s+integrity="(sha384-[^"]+)"/g;
+
+// The build index.html loads for `pkg`: its URL, the exact version, the file's
+// path inside the npm package (so an installed copy can be found), and the SRI
+// integrity the browser holds those bytes to.
+export function cdnScriptTag(pkg) {
+  const tag = [...readIndexHtml().matchAll(CDN_SCRIPT_TAG_RE)]
+    .map(([, url, name, version, pathInPackage, integrity]) => ({ name, url, version, pathInPackage, integrity }))
+    .find(({ name }) => name === pkg);
+  assert.ok(tag, `found no ${pkg} <script> tag with an integrity attribute in ${INDEX_HTML}`);
+  const { url, version, pathInPackage, integrity } = tag;
+  return { url, version, pathInPackage, integrity };
+}
 
 export function pinnedBabelTag() {
-  const match = readIndexHtml().match(BABEL_TAG_RE);
-  assert.ok(match, `found no @babel/standalone <script> tag with an integrity attribute in ${INDEX_HTML}`);
-  return { url: match[1], integrity: match[2] };
+  const { url, integrity } = cdnScriptTag('@babel/standalone');
+  return { url, integrity };
+}
+
+// The SRI-format digest of `file` (`sha384-<base64>`), or 'missing' when there
+// is no such file, so an identity check against an integrity attribute fails
+// with its own remedy rather than an ENOENT.
+export function sha384Digest(file) {
+  if (!fs.existsSync(file)) return 'missing';
+  return `sha384-${crypto.createHash('sha384').update(fs.readFileSync(file)).digest('base64')}`;
 }
 
 function vendoredBabelDigest() {
-  if (!fs.existsSync(VENDORED_BABEL)) return 'missing';
-  return `sha384-${crypto.createHash('sha384').update(fs.readFileSync(VENDORED_BABEL)).digest('base64')}`;
+  return sha384Digest(VENDORED_BABEL);
 }
 
 // Loads the vendored Babel only once its sha384 matches index.html's pin, so a
@@ -82,6 +105,12 @@ export const SCRIPT_TAG_BABEL_OPTIONS = {
   plugins: ['transform-class-properties', 'transform-object-rest-spread', 'transform-flow-strip-types'],
   targets: { browsers: undefined },
 };
+
+// `source` compiled exactly as Babel-standalone compiles a text/babel tag for
+// the browser: every top-level binding becomes a global `var`.
+export function compileAsScriptTag(source, filename) {
+  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
+}
 
 function patternNames(pattern) {
   switch (pattern?.type) {
