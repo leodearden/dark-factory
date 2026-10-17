@@ -17,9 +17,16 @@ from pathlib import Path
 
 import config_dir_archival_allowlist
 import loop_blocking_allowlist
+import pytest
 import silent_fallthrough_allowlist
 
-from shared.governed_exceptions import Debt, TaskRef, TicketRef, governed_exceptions
+from shared.governed_exceptions import (
+    Debt,
+    MalformedDeclaration,
+    TaskRef,
+    TicketRef,
+    governed_exceptions,
+)
 from shared.task_metadata import _BLESSED_METADATA_KEYS, _LEGACY_RETRY_LEDGER_COUNTER_KEYS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +46,7 @@ def _occurrence_keys(sites: Iterable[tuple[str, ...]]) -> list[str]:
 _RUFF_TABLES = (('tool', 'ruff', 'lint'), ('tool', 'ruff'))
 _RUFF_GLOBAL_IGNORES = ('ignore', 'extend-ignore')
 _RUFF_PER_FILE_IGNORES = ('per-file-ignores', 'extend-per-file-ignores')
+_RUFF_ONLY_CONFIG_NAMES = ('.ruff.toml', 'ruff.toml')
 
 
 def _table(config: Mapping, path: tuple[str, ...]) -> Mapping:
@@ -47,10 +55,42 @@ def _table(config: Mapping, path: tuple[str, ...]) -> Mapping:
     return config
 
 
+def _unreadable_workspace(root: Path, path: Path, fault: str) -> MalformedDeclaration:
+    return MalformedDeclaration(
+        f'RUFF_CONFIG_SUPPRESSIONS cannot derive its keys: {path.relative_to(root).as_posix()} '
+        f'{fault}. Extend ruff_suppression_keys in shared/tests/test_shared_governed_lists.py '
+        'to read the workspace as it now stands.',
+        value=path,
+    )
+
+
+def _member_dirs(root: Path, workspace: Mapping) -> list[Path]:
+    excluded = {path for pattern in workspace.get('exclude', []) for path in root.glob(pattern)}
+    dirs = []
+    for pattern in workspace.get('members', []):
+        matches = sorted(path for path in root.glob(pattern) if path.is_dir())
+        if not matches:
+            raise _unreadable_workspace(
+                root, root / 'pyproject.toml', f'declares the member {pattern!r}, which names no directory'
+            )
+        dirs += [path for path in matches if path not in excluded]
+    return dirs
+
+
+def _ruff_pyproject(root: Path, config_dir: Path) -> Path:
+    for name in _RUFF_ONLY_CONFIG_NAMES:
+        if (config_dir / name).exists():
+            raise _unreadable_workspace(
+                root, config_dir / name, 'exists, and ruff reads it instead of the pyproject.toml beside it'
+            )
+    if not (config_dir / 'pyproject.toml').is_file():
+        raise _unreadable_workspace(root, config_dir, 'has no pyproject.toml')
+    return config_dir / 'pyproject.toml'
+
+
 def _workspace_pyprojects(root: Path) -> list[Path]:
-    root_pyproject = root / 'pyproject.toml'
-    workspace = _table(tomllib.loads(root_pyproject.read_text()), ('tool', 'uv', 'workspace'))
-    return [root_pyproject, *(root / member / 'pyproject.toml' for member in workspace.get('members', []))]
+    workspace = _table(tomllib.loads((root / 'pyproject.toml').read_text()), ('tool', 'uv', 'workspace'))
+    return [_ruff_pyproject(root, config_dir) for config_dir in [root, *_member_dirs(root, workspace)]]
 
 
 def _global_ignore_keys(table: tuple[str, ...], section: Mapping) -> set[str]:
@@ -227,22 +267,79 @@ def test_repeated_sites_keep_distinct_keys() -> None:
     ]
 
 
+def _write_tree(root: Path, files: Mapping[str, str]) -> None:
+    for relpath, text in files.items():
+        (root / relpath).parent.mkdir(parents=True, exist_ok=True)
+        (root / relpath).write_text(text)
+
+
 def test_ruff_suppression_keys_come_from_every_workspace_pyproject(tmp_path: Path) -> None:
-    (tmp_path / 'pyproject.toml').write_text(
-        "[tool.uv.workspace]\nmembers = ['a', 'b']\n\n[tool.ruff.lint]\nignore = ['E501']\n"
-    )
-    (tmp_path / 'a').mkdir()
-    (tmp_path / 'a' / 'pyproject.toml').write_text(
-        "[tool.ruff.lint]\nignore = ['E501']\nper-file-ignores = {'tests/*.py' = ['F811']}\n"
-    )
-    (tmp_path / 'b').mkdir()
-    (tmp_path / 'b' / 'pyproject.toml').write_text("[tool.ruff]\nextend-ignore = ['B008']\n")
+    _write_tree(tmp_path, {
+        'pyproject.toml': (
+            "[tool.uv.workspace]\nmembers = ['a', 'b']\n\n[tool.ruff.lint]\nignore = ['E501']\n"
+            "per-file-ignores = {'conftest.py' = ['E402']}\n"
+        ),
+        'a/pyproject.toml': (
+            "[tool.ruff.lint]\nignore = ['E501']\nper-file-ignores = {'tests/*.py' = ['F811']}\n"
+        ),
+        'b/pyproject.toml': (
+            "[tool.ruff]\nextend-ignore = ['B008']\n"
+            "extend-per-file-ignores = {'scripts/*.py' = ['T201']}\n"
+        ),
+    })
 
     assert ruff_suppression_keys(tmp_path) == [
         'a/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/*.py::F811',
+        'b/pyproject.toml::tool.ruff.extend-per-file-ignores::scripts/*.py::T201',
+        'pyproject.toml::tool.ruff.lint.per-file-ignores::conftest.py::E402',
         'tool.ruff.extend-ignore::B008',
         'tool.ruff.lint.ignore::E501',
     ]
+
+
+def test_ruff_suppression_keys_expand_glob_members_less_the_excluded(tmp_path: Path) -> None:
+    _write_tree(tmp_path, {
+        'pyproject.toml': (
+            "[tool.uv.workspace]\nmembers = ['packages/*']\nexclude = ['packages/scratch']\n"
+        ),
+        'packages/a/pyproject.toml': "[tool.ruff.lint]\nignore = ['E501']\n",
+        'packages/b/pyproject.toml': "[tool.ruff.lint]\nignore = ['B008']\n",
+        'packages/scratch/pyproject.toml': "[tool.ruff.lint]\nignore = ['ALL']\n",
+        'packages/README.md': 'not a member\n',
+    })
+
+    assert ruff_suppression_keys(tmp_path) == [
+        'tool.ruff.lint.ignore::B008',
+        'tool.ruff.lint.ignore::E501',
+    ]
+
+
+@pytest.mark.parametrize(
+    ('files', 'fault'),
+    [
+        pytest.param(
+            {'a/pyproject.toml': '', 'ruff.toml': "[lint]\nignore = ['E501']\n"},
+            'ruff.toml exists',
+            id='root-ruff-toml',
+        ),
+        pytest.param(
+            {'a/pyproject.toml': '', 'a/.ruff.toml': '[lint]\n'},
+            'a/.ruff.toml exists',
+            id='member-dot-ruff-toml',
+        ),
+        pytest.param({'a/setup.cfg': ''}, 'a has no pyproject.toml', id='member-without-pyproject'),
+        pytest.param(
+            {}, "pyproject.toml declares the member 'a', which names no directory", id='member-naming-no-directory'
+        ),
+    ],
+)
+def test_ruff_suppression_keys_refuse_a_workspace_they_cannot_read(
+    tmp_path: Path, files: Mapping[str, str], fault: str
+) -> None:
+    _write_tree(tmp_path, {'pyproject.toml': "[tool.uv.workspace]\nmembers = ['a']\n", **files})
+
+    with pytest.raises(MalformedDeclaration, match=re.escape(fault)):
+        ruff_suppression_keys(tmp_path)
 
 
 def test_loop_blocking_overrides_follow_the_ledger_vocabulary() -> None:
