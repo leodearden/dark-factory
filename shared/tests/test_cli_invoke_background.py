@@ -226,6 +226,62 @@ def _monitor_rejected(tool_id: str = 'toolu_mon1') -> dict:
     }
 
 
+def _monitor_event_text(
+    task_id: str = MONITOR_TASK_ID,
+    event: str = '4953 passed, 1 skipped in 262.80s',
+    summary: str = 'test sweep result',
+) -> str:
+    """The text of a Monitor event (or expiry) notification."""
+    return (
+        '<task-notification>\n'
+        f'<task-id>{task_id}</task-id>\n'
+        f'<summary>Monitor event: "{summary}"</summary>\n'
+        f'<event>{event}</event>\n'
+        '</task-notification>'
+    )
+
+
+def _bash_completion_text(task_id: str = 'bz89cdzmh', tool_use_id: str = 'toolu_1') -> str:
+    """The text of a background Bash completion notification."""
+    return (
+        '<task-notification>\n'
+        f'<task-id>{task_id}</task-id>\n'
+        f'<tool-use-id>{tool_use_id}</tool-use-id>\n'
+        f'<output-file>{_bg_log_path(task_id)}</output-file>\n'
+        '<status>completed</status>\n'
+        '<summary>Background command "cargo test" completed (exit code 0)</summary>\n'
+        '</task-notification>'
+    )
+
+
+def _delivered_mid_turn(text: str) -> dict:
+    """A notification delivered to the model inside the running turn."""
+    return {
+        'type': 'attachment',
+        'attachment': {
+            'type': 'queued_command',
+            'prompt': text,
+            'commandMode': 'task-notification',
+        },
+    }
+
+
+def _delivered_new_turn(text: str, *, as_blocks: bool = False) -> dict:
+    """A notification delivered to the model as the prompt of a new turn.
+    ``as_blocks=True`` carries the text as a ``text`` sub-block list."""
+    content: object = [{'type': 'text', 'text': text}] if as_blocks else text
+    return {
+        'type': 'user',
+        'message': {'role': 'user', 'content': content},
+        'origin': {'kind': 'task-notification', 'producer': 'session-task'},
+    }
+
+
+def _enqueued_only(text: str) -> dict:
+    """Queue bookkeeping for a notification: NOT a delivery to the model."""
+    return {'type': 'queue-operation', 'operation': 'enqueue', 'content': text}
+
+
 def _write_transcript(base: Path, session_id: str, records: list) -> Path:
     """Write *records* as a JSONL transcript under
     base/projects/<slug>/<session_id>.jsonl — mirrors the fixture style of the
@@ -802,6 +858,210 @@ class TestMonitorArmIsALaunch:
         assert detect_ended_awaiting_background(records) is False
 
 
+_EXPIRY = '[Monitor expired after 10m with 2 events delivered. Re-arm it if you still need the watch.]'
+
+
+class TestDeliveredNotificationIsAReap:
+    """A task-notification DELIVERED to the model whose text names a harvested
+    token is a reap, for every launch kind (task 5986).
+
+    Delivery takes one of two shapes: a mid-turn ``attachment`` record
+    (``queued_command`` with ``commandMode`` ``task-notification``), or a
+    ``user`` record whose ``origin.kind`` is ``task-notification`` — the shape
+    a headless session that outlived its turn uses.  ``queue-operation``
+    records are queue bookkeeping, not delivery.
+    """
+
+    def test_monitor_event_delivered_mid_turn_then_more_work_is_false(self) -> None:
+        """Specimen df 2991: the Monitor's event reached the model mid-turn."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_fg_bash('git status')]),
+            _delivered_mid_turn(_monitor_event_text()),
+            _assistant([_fg_bash('git log --oneline -3')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_monitor_expiry_delivered_as_new_turn_is_false(self) -> None:
+        """Specimen reify 7838: the CLI stayed alive after the turn ended and
+        delivered the Monitor's expiry as a new turn."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Standing by for the eval result.')]),
+            _delivered_new_turn(_monitor_event_text(event=_EXPIRY)),
+            _assistant([_text('The watch expired after both results arrived. Done.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_bash_completion_delivered_mid_turn_is_false(self) -> None:
+        """The dominant false-downgrade shape of a Bash-only reap rule: the
+        completion reached the model and the session moved on."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _delivered_mid_turn(_bash_completion_text()),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_bash_completion_delivered_as_new_turn_is_false(self) -> None:
+        """The session ended its turn to wait, and the CLI delivered the
+        completion as a new turn rather than exiting."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_text("I'll wait for the notification.")]),
+            _delivered_new_turn(_bash_completion_text()),
+            _assistant([_text('All tests passed.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        ('structured', 'in_text'),
+        [(True, False), (False, True)],
+        ids=['task-id-token', 'log-path-token'],
+    )
+    def test_completion_matches_on_either_token(self, structured: bool, in_text: bool) -> None:
+        """The completion names both the task id and the output file, so either
+        harvested token identifies it."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(structured=structured, in_text=in_text),
+            _delivered_mid_turn(_bash_completion_text()),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_text_sub_block_content_is_read(self) -> None:
+        """A new-turn delivery whose content is a list of text sub-blocks."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Standing by for the eval result.')]),
+            _delivered_new_turn(_monitor_event_text(event=_EXPIRY), as_blocks=True),
+            _assistant([_text('Done.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_streamed_monitor_event_then_end_is_false_documented_gap(self) -> None:
+        """DOCUMENTED, ACCEPTED false negative.  Specimen reify 5623: a
+        progress-streaming Monitor delivered a mid-stream event and the session
+        ended awaiting a later one → the delivery reaps → False.
+
+        No structured flag tells a terminal event from a mid-stream one; only
+        the notification text does, and parsing it is the fragility the
+        detector refuses.  The Monitor analogue of
+        test_poll_once_still_running_then_end_is_false_documented_gap.
+        """
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _delivered_mid_turn(
+                _monitor_event_text(event='progress: 74 suites finished, 0 failures/errors so far')
+            ),
+            _assistant([_text('Suite still running clean. Waiting for completion.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_notification_for_an_unknown_task_is_not_a_reap(self) -> None:
+        """A delivery that names no harvested token engages with nothing pending."""
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _delivered_mid_turn(_monitor_event_text(task_id='zz99other')),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_enqueued_but_undelivered_is_not_a_reap(self) -> None:
+        """An event enqueued after the final turn, by a process that then
+        exited, never reached the agent."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Standing by.')]),
+            _enqueued_only(_monitor_event_text()),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_launch_after_a_delivered_notification_is_true(self) -> None:
+        """The reap is positional: a later launch outranks it."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _delivered_mid_turn(_monitor_event_text()),
+            _assistant([_bash_launch(command='job-b', tool_id='toolu_b')]),
+            _bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            {'type': 'attachment', 'attachment': 'junk'},
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'task-notification', 'prompt': None,
+                },
+            },
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'task-notification', 'prompt': 42,
+                },
+            },
+            {
+                'type': 'attachment',
+                'attachment': {
+                    'type': 'queued_command', 'commandMode': 'prompt',
+                    'prompt': _monitor_event_text(),
+                },
+            },
+            {
+                'type': 'user',
+                'origin': 'task-notification',
+                'message': {'role': 'user', 'content': _monitor_event_text()},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'other'},
+                'message': {'role': 'user', 'content': _monitor_event_text()},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'task-notification'},
+                'message': {'role': 'user', 'content': None},
+            },
+            {
+                'type': 'user',
+                'origin': {'kind': 'task-notification'},
+                'message': {'role': 'user', 'content': 42},
+            },
+        ],
+        ids=[
+            'attachment-not-a-dict',
+            'prompt-none',
+            'prompt-int',
+            'command-mode-prompt',
+            'origin-not-a-dict',
+            'origin-kind-other',
+            'content-none',
+            'content-int',
+        ],
+    )
+    def test_malformed_notification_records_never_raise(self, record: dict) -> None:
+        """Records that are not a well-formed delivery reap nothing and never raise."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            record,
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+
 class TestEndedAwaitingBackgroundForSession:
     """File-reading seam: mirrors count_transcript_turns' shape — delegate to
     read_transcript_records, then the pure detector, mapping None (unresolvable
@@ -905,6 +1165,27 @@ class TestEndedAwaitingBackgroundForSession:
         ]
         _write_transcript(tmp_path, sid, records)
         assert ended_awaiting_background_for_session(tmp_path, sid) is True
+
+    def test_reify7838_shaped_transcript_is_false(self, tmp_path: Path) -> None:
+        """Specimen reify 7838: both Monitor events were delivered mid-turn, the
+        turn ended, and the CLI stayed alive to deliver the expiry as a new
+        turn.  The session engaged with everything it armed."""
+        sid = 'sess-reify7838'
+        expiry = _monitor_event_text(event=_EXPIRY)
+        records: list = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_fg_bash('cargo run --bin eval')]),
+            _delivered_mid_turn(_monitor_event_text(event='eval rc=0')),
+            _assistant([_fg_bash('git commit -am "eval green"')]),
+            _delivered_mid_turn(_monitor_event_text(event='stdlib rc=0\n[exited with code 0]')),
+            _assistant([_text('Both suites are green and committed.')]),
+            _enqueued_only(expiry),
+            _delivered_new_turn(expiry),
+            _assistant([_text('The watch expired after delivering both results.')]),
+        ]
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is False
 
 
 # A clean success envelope: subtype='success', is_error absent, returncode 0 —
