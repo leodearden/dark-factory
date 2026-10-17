@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias
 
 from shared.lane_probe import OUTAGE_EXIT_STATUS
-from shared.proc_group import terminate_process_group
+from shared.proc_group import reap_process_groups, terminate_process_group
 from shared.verify_admission import nice_prefix
 
 from orchestrator.offline_lane_records import (
@@ -67,6 +67,7 @@ INFRA_RESULT_RE = re.compile(r'^\s*RESULT:\s*(?P<verdict>PASS|FAIL|SKIP)\s*\((?P
 _INFRA_OUTCOMES = {'PASS': 'passed', 'SKIP': 'skipped'}
 
 _TAIL_CHARS = 2000
+_PROBE_KILL_GRACE_SECS = 2.0
 
 _PYTEST_OUTCOME = r'\d+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun)'
 _PYTEST_FINAL_SUMMARY_RE = re.compile(
@@ -307,6 +308,16 @@ def _no_exit(started: float) -> ProbeResult:
     return ProbeResult(ProbeKind.BROKEN, None, None, '', time.monotonic() - started)
 
 
+async def _reap_probe_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
+    """Kill every process the probe left in its group, even after its shell has exited.
+
+    A background child can hold the probe's stdout open past its shell, so the shell's exit proves nothing
+    about the group; ``terminate_process_group`` returns at once in that case.
+    """
+    await asyncio.to_thread(reap_process_groups, [pgid], grace_secs=_PROBE_KILL_GRACE_SECS)
+    await proc.wait()
+
+
 async def run_probe(command: LaneCommand, worktree: Path) -> ProbeResult:
     """Run *command*'s ``outage_probe`` once in its cwd, at normal priority, bounded by its timeout.
 
@@ -331,7 +342,7 @@ async def run_probe(command: LaneCommand, worktree: Path) -> ProbeResult:
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=command.outage_probe_timeout_secs)
     except TimeoutError:
-        await terminate_process_group(proc, pgid)
+        await _reap_probe_group(proc, pgid)
         logger.error(
             'offline-lane: %s: outage probe timed out after %ss', command.name, command.outage_probe_timeout_secs,
         )

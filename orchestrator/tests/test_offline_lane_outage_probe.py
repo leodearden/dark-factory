@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import shutil
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -31,6 +32,7 @@ from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from fastmcp import Client
 from shared.lane_probe import OUTAGE_EXIT_STATUS
+from shared.proc_group import pid_running
 
 from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
 from orchestrator.offline_lane_confirm import (
@@ -122,6 +124,22 @@ class SubmitFailsOnce(EscalationQueue):
             self.failures -= 1
             raise OSError('queue directory unwritable')
         return super().submit(escalation)
+
+
+class ResolveFailsOnce(EscalationQueue):
+    def __init__(self, queue_dir: Path) -> None:
+        super().__init__(queue_dir)
+        self.failures = 0
+
+    def resolve(self, *args, **kwargs):
+        if self.failures:
+            self.failures -= 1
+            raise OSError('queue directory unwritable')
+        return super().resolve(*args, **kwargs)
+
+
+def _broken() -> ProbeResult:
+    return ProbeResult(ProbeKind.BROKEN, 3, None, '', 0.5)
 
 
 class Lane:
@@ -272,6 +290,7 @@ async def test_the_tick_reprobes_alone_every_recheck_and_an_up_closes_the_record
     lane.clock.advance(minutes=30)
     passed = await lane.tick(_up())
 
+    assert lane.record().rechecks == {}
     assert early == TickResult((), ())
     assert still_out.commands_due == ()
     assert lane.probes.calls == [(COMMAND, lane.deep), (COMMAND, lane.deep)]
@@ -303,6 +322,92 @@ async def test_a_level_2_holding_another_member_is_amended_not_resolved_when_the
     assert holder.status == 'pending'
     assert len(closing) == 1
     assert lane.escalation(other).status == 'pending'
+    assert lane.escalation(l1).status == 'resolved'
+
+
+@pytest.mark.asyncio
+async def test_a_changed_outage_answer_amends_the_one_record_once_with_the_new_line(tmp_path):
+    lane = Lane(tmp_path)
+    await _in_outage(lane)
+    (outage,) = lane.pending()
+    other_line = 'falkordb: write graph: ResponseError'
+
+    await lane.red_pass(ProbeResult(ProbeKind.OUTAGE, OUTAGE_EXIT_STATUS, other_line, other_line, 1.0))
+
+    (amended,) = lane.pending()
+    assert amended.id == outage.id
+    (amendment,) = amended.amendments
+    assert other_line in json.dumps(amendment)
+    assert lane.record().outage_escalation_id == outage.id
+
+
+@pytest.mark.asyncio
+async def test_an_outage_record_is_released_when_the_probe_turns_broken_and_the_broken_record_opens(tmp_path):
+    lane = Lane(tmp_path)
+    await _in_outage(lane)
+    outage = lane.record().outage_escalation_id
+
+    await lane.red_pass(_broken())
+
+    record = lane.record()
+    (broken,) = lane.pending()
+    assert lane.escalation(outage).status == 'resolved'
+    assert (record.outage_escalation_id, record.probe_broken_escalation_id) == (None, broken.id)
+    assert not record.in_outage
+
+
+@pytest.mark.asyncio
+async def test_a_broken_answer_on_the_tick_makes_the_command_due_and_releases_the_outage_record(tmp_path):
+    lane = Lane(tmp_path)
+    await _in_outage(lane)
+    outage = lane.record().outage_escalation_id
+
+    ticked = await lane.tick(_broken())
+
+    assert ticked.commands_due == (COMMAND,)
+    assert lane.record().rechecks == {}
+    assert lane.escalation(outage).status == 'resolved'
+    assert lane.record().outage_escalation_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_release_that_failed_in_a_pass_is_retried_by_the_next_tick(tmp_path):
+    queue = ResolveFailsOnce(tmp_path / 'queue')
+    lane = Lane(tmp_path, queue=queue)
+    await _in_outage(lane)
+    outage = lane.record().outage_escalation_id
+    queue.failures = 1
+
+    await lane.red_pass(_up())
+
+    record = lane.record()
+    assert (record.in_outage, record.outage_escalation_id, record.probe_record_behind) == (False, outage, True)
+    assert lane.escalation(outage).status == 'pending'
+
+    await lane.tick()
+
+    assert lane.escalation(outage).status == 'resolved'
+    assert lane.record().outage_escalation_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_level_2_under_any_task_id_is_found_by_membership_and_amended_when_the_probe_passes(tmp_path):
+    lane = Lane(tmp_path)
+    await _in_outage(lane)
+    l1 = lane.record().outage_escalation_id
+    assert l1 is not None
+    other = file_unlanded_red(lane.queue, UnlandedRed(COMMAND, '9001', 'pending', (A,), lane.clock(), ()))
+    holder = lane.queue.submit(Escalation(
+        id=lane.queue.make_id('4242'), task_id='4242', agent_role=WATCHER, severity='blocking',
+        category='infra_issue', summary='qdrant is down', detail='tracked by a human', level=2,
+        members=[l1, other], root_cause=ROOT_CAUSE,
+    ))
+
+    await lane.tick(_up())
+
+    amended = lane.escalation(holder)
+    assert amended.status == 'pending'
+    assert len([a for a in amended.amendments if f'closed its record {l1}' in a['detail']]) == 1
     assert lane.escalation(l1).status == 'resolved'
 
 
@@ -513,22 +618,40 @@ async def test_run_probe_runs_with_the_lane_role_and_at_normal_priority(tmp_path
     assert (result.result, result.returncode) == (ProbeKind.UP, 0)
 
 
+async def _wait_until_gone(child: int) -> bool:
+    for _ in range(100):
+        if not pid_running(child):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
 @pytest.mark.asyncio
 async def test_a_timed_out_probe_is_broken_and_its_whole_process_group_is_gone(tmp_path):
     probe = 'sleep 30 & echo $! > child.pid; sleep 30'
+    started = time.monotonic()
 
     result = await run_probe(_probe_command(tmp_path, probe, timeout=1), tmp_path)
 
+    elapsed = time.monotonic() - started
     child = int((tmp_path / LANE_COMMAND.cwd / 'child.pid').read_text())
     assert (result.result, result.returncode) == (ProbeKind.BROKEN, None)
-    for _ in range(100):
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            break
-        await asyncio.sleep(0.05)
-    else:
-        pytest.fail(f'background child {child} of the timed-out probe is still alive')
+    assert elapsed < 10
+    assert await _wait_until_gone(child), f'background child {child} of the timed-out probe is still alive'
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_probe_whose_shell_has_exited_still_loses_the_child_holding_its_output(tmp_path):
+    probe = 'sleep 30 & echo $! > child.pid'
+    started = time.monotonic()
+
+    result = await run_probe(_probe_command(tmp_path, probe, timeout=1), tmp_path)
+
+    elapsed = time.monotonic() - started
+    child = int((tmp_path / LANE_COMMAND.cwd / 'child.pid').read_text())
+    assert (result.result, result.returncode) == (ProbeKind.BROKEN, None)
+    assert elapsed < 10
+    assert await _wait_until_gone(child), f'background child {child} of the timed-out probe is still alive'
 
 
 @pytest.mark.asyncio

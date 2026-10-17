@@ -22,6 +22,7 @@ import contextlib
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from urllib.parse import urlparse
 
 from cleanup_test_collections import PREFIX, hold_lease
@@ -35,6 +36,10 @@ from shared.lane_probe import OUTAGE_EXIT_STATUS
 from fused_memory.arm_harness.checks import SMOKE_MESSAGES, SmokeEntities
 from fused_memory.backends.graphiti_client import build_embedder, build_llm_client
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 DEPENDENCIES = ('qdrant', 'falkordb', 'embedder', 'chat-model')
 CHECK_TIMEOUT_SECS = 30
@@ -45,8 +50,16 @@ SCRATCH_PAYLOAD = {'probe': 'lane-dependency'}
 BROKEN_CONFIG_EXIT_STATUS = 1
 
 
+class NotConfiguredReason(StrEnum):
+    NO_PROVIDER_OR_KEY = 'no provider or api key'
+
+
 class NotConfigured(Exception):
     """The dependency cannot be used because the configuration names no way to reach it."""
+
+    def __init__(self, reason: NotConfiguredReason) -> None:
+        super().__init__()
+        self.reason = reason
 
 
 class WrongAnswer(Exception):
@@ -86,7 +99,7 @@ def cause_of(error: BaseException) -> str:
 def failure_of(dependency: str, progress: Progress, error: BaseException) -> Failure:
     detail = ' '.join(repr(error).split())
     if isinstance(error, NotConfigured):
-        return Failure(f'{dependency}: not configured ({error})', detail)
+        return Failure(f'{dependency}: not configured ({error.reason.value})', detail)
     return Failure(f'{dependency}: {progress.step}: {cause_of(error)}', detail)
 
 
@@ -157,7 +170,7 @@ async def check_falkordb(cfg: FusedMemoryConfig, progress: Progress) -> None:
 async def check_embedder(cfg: FusedMemoryConfig, progress: Progress) -> None:
     embedder = build_embedder(cfg)
     if embedder is None:
-        raise NotConfigured('no provider or api key')
+        raise NotConfigured(NotConfiguredReason.NO_PROVIDER_OR_KEY)
     progress.step = 'embed'
     embedding = await embedder.create(input_data=[PROBE_VALUE])
     if not embedding:
@@ -167,7 +180,7 @@ async def check_embedder(cfg: FusedMemoryConfig, progress: Progress) -> None:
 async def check_chat_model(cfg: FusedMemoryConfig, progress: Progress) -> None:
     client = build_llm_client(cfg)
     if client is None:
-        raise NotConfigured('no provider or api key')
+        raise NotConfigured(NotConfiguredReason.NO_PROVIDER_OR_KEY)
     progress.step = 'complete'
     await client.generate_response(list(SMOKE_MESSAGES), response_model=SmokeEntities)
 
@@ -211,6 +224,11 @@ def build_parser() -> LoudArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     requested = build_parser().parse_args(argv).dependencies
     selected = [name for name in DEPENDENCIES if not requested or name in requested]
+    try:
+        assert_store_mutation_allowed(operation='lane_dependency_probe')
+    except StoreMutationUnavailable as error:
+        print(f'error: store mutation not allowed: {error}', file=sys.stderr)
+        return BROKEN_CONFIG_EXIT_STATUS
     try:
         cfg = FusedMemoryConfig()
     except Exception as error:
