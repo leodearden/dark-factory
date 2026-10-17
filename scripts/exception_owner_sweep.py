@@ -3,17 +3,40 @@
 Reads the exception register's ``--json`` for every debt owner a governed list
 or an inline marker cites, asks ``exception_owner_liveness`` whether each owner
 still owns its debt, and turns a dead owner into exactly one finding, keyed so
-that the next night does not repeat it.
+that the next night does not repeat it.  Contract:
+``plans/inv12-exceptions-owned-or-ratified-prd.md`` D11 and "Sweep".
+
+Three of the PRD's open questions, as decided:
+
+* Which tree (1): the register measures the WORKING TREE of ``--root``, not
+  HEAD blobs.  Every owner is re-read from the store just before it is acted
+  on, so a mid-merge tree shifts at most one night's citations, and key
+  idempotence settles the next.
+* Where a finding's key lives (2): a filed task carries it in
+  ``metadata.x_inv12_finding``; an escalation carries it in the caller-chosen
+  ``task_id`` slot, checked against one ``get_pending_escalations`` per run.
+  The stamp keeps no ledger of escalated keys, which would be a second home
+  of what is pending.
+* Self-citation (4): not detected.  Every dead-owner finding states both
+  remedies: re-own the site, or fix the suppression the owner's work introduced.
+
+The stamp, ``exception_register.SWEEP_STATE_PATH`` under ``--project-root``, is
+written after every completed run.  A failed run rewrites a prior stamp with
+``ok`` false and that stamp's ``last_run``, so the stamp's age is the liveness
+signal ``exception_register.py --report`` reads.  ``--dry-run`` writes,
+files and escalates nothing.
 """
 
 from __future__ import annotations
 
+import argparse
 import collections
 import dataclasses
 import datetime
 import enum
 import functools
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -25,7 +48,10 @@ from typing import TypeVar
 try:
     import _checkout as _checkout
     import exception_owner_liveness as liveness
-    from _task_db_scan import UNREADABLE_STORE_ERRORS
+    import exception_register
+    from _task_db_scan import UNREADABLE_STORE_ERRORS, tasks_db_path
+    from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+    from legibility import census_trigger
     from shared.governed_exceptions import (
         MalformedDisposition,
         TaskRef,
@@ -33,6 +59,8 @@ try:
         owner_from_record,
         owner_record,
     )
+    from shared.project_layout import default_project_root
+    from shared.safe_io import atomic_write_text
     from shared.task_statuses import OwnerLiveness
 except ImportError as exc:
     print(
@@ -758,10 +786,16 @@ def _reconcile_notes(judged: Sequence[Judged], ports: Ports, now: datetime.datet
         _write_note(ports, task_id, None)
 
 
-def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
-    """Re-resolve each cited owner immediately before acting on it, then act (INV-3)."""
-    resolve = owner_resolver(ports)
-    outputs = _Outputs(ports, scan.pending, now)
+class ActStopped(SweepFailure):
+    """:func:`act` failed part-way; ``done`` counts the outputs that had already landed."""
+
+    def __init__(self, failure: SweepFailure, done: ActOutcome) -> None:
+        super().__init__(failure.stage, failure.detail)
+        self.done = done
+
+
+def _act_on(scan: Scan, outputs: _Outputs) -> None:
+    resolve = owner_resolver(outputs.ports)
     judged: list[Judged] = []
     for citation in scan.register.citations:
         verdict = resolve(citation.owner)
@@ -775,5 +809,312 @@ def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
     if scan.register.slack_total > 0:
         outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
     outputs.roll_up()
-    _reconcile_notes(judged, ports, now)
+    _reconcile_notes(judged, outputs.ports, outputs.now)
+
+
+def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
+    """Re-resolve each cited owner immediately before acting on it, then act (INV-3).
+
+    Any failure raises :class:`ActStopped`, counting what had already landed.
+    """
+    outputs = _Outputs(ports, scan.pending, now)
+    try:
+        _act_on(scan, outputs)
+    except SweepFailure as exc:
+        raise ActStopped(exc, ActOutcome(**outputs.counts)) from exc
     return ActOutcome(**outputs.counts)
+
+
+# ---------------------------------------------------------------------------
+# One run: measure, plan, act, stamp; or fail loud.
+
+FAILURE_TASK_ID = 'inv12-owner-sweep'
+"""The escalation ``task_id`` of the sweep's report that it could not run."""
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """Which tree is measured, and which main checkout's store and stamp are used."""
+
+    root: Path
+    project_root: Path
+    dry_run: bool = False
+
+    @property
+    def stamp_path(self) -> Path:
+        return self.project_root / exception_register.SWEEP_STATE_PATH
+
+
+def _verdict_phrase(verdict: liveness.OwnerVerdict) -> str:
+    if verdict.liveness is liveness.Liveness.DEAD:
+        return f'dead ({_death_facts(verdict)})'
+    if verdict.liveness is liveness.Liveness.LIVE_VIA_SUCCESSOR:
+        chain = ' -> '.join(map(str, verdict.path))
+        return f'live via successor task {verdict.owning_task} ({chain})'
+    if verdict.owning_task is None:
+        return 'live (ticket still being curated)'
+    return f'live (task {verdict.owning_task})'
+
+
+@dataclass(frozen=True)
+class Report:
+    """One citation as measured, and what the sweep plans to do about it (None: nothing)."""
+
+    scope: str
+    owner: Owner
+    verdict: liveness.OwnerVerdict
+    action: Action | None
+
+    def line(self) -> str:
+        head = f'{self.scope} {_owner_label(self.owner)}: {_verdict_phrase(self.verdict)}'
+        return head if self.action is None else f'{head} -> {self.action.value}'
+
+
+@dataclass(frozen=True)
+class Plan:
+    """What the sweep would do, decided from one read of the finding carriers."""
+
+    reports: tuple[Report, ...]
+    tighten: Action | None
+
+    def counts(self) -> ActOutcome:
+        verdicts = collections.Counter(report.verdict.liveness for report in self.reports)
+        return ActOutcome(
+            checked=len(self.reports),
+            findings=verdicts[liveness.Liveness.DEAD],
+            via_successor=verdicts[liveness.Liveness.LIVE_VIA_SUCCESSOR],
+        )
+
+
+def plan(scan: Scan, ports: Ports) -> Plan:
+    """Each citation's planned action as of *scan*, ignoring the output bound; reads only."""
+    carriers = _carriers(ports, FINDING_KEY_FIELD)
+
+    def planned(key: FindingKey) -> Action:
+        return decide(key, carriers=carriers, pending=scan.pending)
+
+    reports = []
+    for citation in scan.register.citations:
+        verdict = scan.verdicts[citation.scope, citation.owner]
+        dead = verdict.liveness is liveness.Liveness.DEAD
+        key = FindingKey(FindingKind.DEAD_OWNER, citation.scope, citation.owner)
+        reports.append(Report(citation.scope, citation.owner, verdict, planned(key) if dead else None))
+    tighten = planned(TIGHTEN_KEY) if scan.register.slack_total > 0 else None
+    return Plan(tuple(reports), tighten)
+
+
+@dataclass(frozen=True)
+class Failure:
+    stage: FailureStage
+    detail: str
+
+
+@dataclass(frozen=True)
+class SweepResult(ActOutcome):
+    """One run: its counts, what its stamp says, and the corroborated list.
+
+    ``slack`` is None when the run failed; ``last_run`` is the stamp's, so it
+    is the PRIOR run's after a failure and None after a dry run.
+    """
+
+    ok: bool = False
+    slack: int | None = None
+    last_run: datetime.datetime | None = None
+    failure: Failure | None = None
+    reports: tuple[Report, ...] = ()
+    tighten: Action | None = None
+
+    def record(self) -> dict[str, object]:
+        """The stamp and stdout object: the Contract's nine keys, plus ``failure`` and ``via_successor``."""
+        counts = {field.name: getattr(self, field.name) for field in dataclasses.fields(ActOutcome)}
+        failure = self.failure
+        return {
+            **counts,
+            'slack': self.slack,
+            'last_run': None if self.last_run is None else self.last_run.isoformat(),
+            'ok': self.ok,
+            'failure': None if failure is None else {'stage': str(failure.stage), 'detail': failure.detail},
+        }
+
+    def lines(self) -> list[str]:
+        lines = [report.line() for report in self.reports]
+        if self.tighten is not None:
+            lines.append(f'baseline slack {self.slack} -> {self.tighten.value}')
+        return lines
+
+
+def _write_stamp(config: RunConfig, result: SweepResult) -> None:
+    atomic_write_text(config.stamp_path, json.dumps(result.record(), indent=2) + '\n', mkdir=True)
+
+
+def _report_failure(escalation: ToolCall | None, failure: SweepFailure, now: datetime.datetime) -> str:
+    """Send the one best-effort infra_issue escalation; the failure's detail, plus why that was not sent."""
+    if escalation is None:
+        return f'{failure.detail}; no escalation server to report it to'
+    args: dict[str, object] = {
+        'task_id': FAILURE_TASK_ID,
+        'agent_role': AGENT_ROLE,
+        'category': 'infra_issue',
+        'summary': f'INV-12 owner sweep failed at {failure.stage}: no finding past it was filed',
+        'detail': '\n'.join(
+            [
+                failure.detail,
+                'The stamp keeps its previous last_run, so its age shows how long the sweep has been down.',
+                f'Report: {REPORT_COMMAND}',
+            ]
+        ),
+        'evidence': [
+            {'observation': f'{failure.stage}: {failure.detail}', 'measured_at': now.isoformat(), 'ref': str(failure.stage)}
+        ],
+    }
+    try:
+        _call(escalation, FailureStage.ESCALATION, 'escalate_info', args)
+    except SweepFailure as unsent:
+        return f'{failure.detail}; the failure escalation was not sent: {unsent}'
+    return failure.detail
+
+
+def _failed(
+    config: RunConfig, failure: SweepFailure, *, escalation: ToolCall | None, now: datetime.datetime
+) -> SweepResult:
+    """Fail loud: report once (never on a dry run) and leave the prior stamp's last_run unadvanced."""
+    done = failure.done if isinstance(failure, ActStopped) else ActOutcome()
+    if config.dry_run:
+        return SweepResult(**dataclasses.asdict(done), failure=Failure(failure.stage, failure.detail))
+    detail = _report_failure(escalation, failure, now)
+    prior = exception_register.read_sweep(config.stamp_path, now=now)
+    result = SweepResult(
+        **dataclasses.asdict(done), last_run=prior.last_run, failure=Failure(failure.stage, detail)
+    )
+    if prior.last_run is not None:
+        _write_stamp(config, result)
+    return result
+
+
+def run(
+    config: RunConfig,
+    ports: Ports,
+    *,
+    read_register: Callable[[], Mapping[str, object]],
+    now: datetime.datetime,
+) -> SweepResult:
+    """Measure, then (unless a dry run) act and stamp.  A :class:`SweepFailure` is returned, never raised."""
+    try:
+        measured = scan(parse_register(read_register()), ports, now=now)
+        planned = plan(measured, ports)
+        done = planned.counts() if config.dry_run else act(measured, ports, now=now)
+    except SweepFailure as exc:
+        return _failed(config, exc, escalation=ports.escalation, now=now)
+    result = SweepResult(
+        **dataclasses.asdict(done),
+        ok=True,
+        slack=measured.register.slack_total,
+        last_run=None if config.dry_run else now,
+        reports=planned.reports,
+        tighten=planned.tighten,
+    )
+    if not config.dry_run:
+        _write_stamp(config, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Ports over the real servers, and the CLI.
+
+FUSED_MEMORY_URL_ENV = 'FUSED_MEMORY_MCP_URL'
+
+ESCALATION_TIMEOUT_SECS = 30
+
+
+def escalation_url(project_root: Path) -> str:
+    """The escalation server's MCP URL from *project_root*'s orchestrator config, or a CONFIG failure."""
+    config = DashboardConfig(project_root=project_root)
+    url = config.escalation_urls.get(config.project_root.name)
+    if url is None:
+        raise SweepFailure(
+            FailureStage.CONFIG, f'{config.project_root} configures no escalation server (escalation.port)'
+        )
+    return url
+
+
+def build_ports(project_root: Path, *, fused_memory_url: str | None, escalation_mcp_url: str | None) -> Ports:
+    """Both MCP servers over the real transport; a URL left None takes its default."""
+    fused_memory = fused_memory_url or os.environ.get(FUSED_MEMORY_URL_ENV, DEFAULT_FUSED_MEMORY_URLS[0])
+    return Ports(
+        project_root=project_root,
+        db=tasks_db_path(project_root),
+        fused_memory=functools.partial(
+            census_trigger.post_mcp_tool_call, f'{fused_memory}/mcp', timeout=SUBMIT_RESOLVE_WAIT_SECS + 15
+        ),
+        escalation=functools.partial(
+            census_trigger.post_mcp_tool_call,
+            escalation_mcp_url or escalation_url(project_root),
+            timeout=ESCALATION_TIMEOUT_SECS,
+        ),
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="INV-12's owner sweep: find every cited debt owner that no longer owns its debt.",
+        epilog=(
+            'Exit 0: the sweep ran and stamped its result. Exit 2: it could not measure or act '
+            '(the result names the stage), or it could not start; nothing past that point was filed.'
+        ),
+    )
+    parser.add_argument('--dry-run', action='store_true', help='measure and report; file, escalate and stamp nothing')
+    parser.add_argument(
+        '--root',
+        type=Path,
+        default=_checkout.ROOT,
+        help='the tree whose citations are measured (default: the checkout holding this script)',
+    )
+    parser.add_argument(
+        '--project-root',
+        type=Path,
+        default=None,
+        help="the main checkout whose tasks.db and stamp are used (default: this checkout's main checkout)",
+    )
+    parser.add_argument(
+        '--fused-memory-url',
+        default=None,
+        help=f'fused-memory base URL (default: ${FUSED_MEMORY_URL_ENV} or {DEFAULT_FUSED_MEMORY_URLS[0]})',
+    )
+    parser.add_argument(
+        '--escalation-url',
+        default=None,
+        help="escalation MCP URL (default: from the project root's dark-factory-orchestrator.yaml)",
+    )
+    return parser
+
+
+def _sweep(args: argparse.Namespace, now: datetime.datetime) -> SweepResult:
+    project_root = args.project_root or default_project_root()
+    config = RunConfig(root=args.root, project_root=project_root, dry_run=args.dry_run)
+    try:
+        ports = build_ports(
+            project_root, fused_memory_url=args.fused_memory_url, escalation_mcp_url=args.escalation_url
+        )
+    except SweepFailure as exc:
+        return _failed(config, exc, escalation=None, now=now)
+    read = functools.partial(read_register, config.root, config.stamp_path)
+    return run(config, ports, read_register=read, now=now)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        result = _sweep(args, datetime.datetime.now(datetime.UTC))
+    except Exception as exc:
+        print(f'exception_owner_sweep.py: could not run: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return 2
+    for line in result.lines():
+        print(line)
+    if result.failure is not None:
+        print(f'exception_owner_sweep.py: failed at {result.failure.stage}: {result.failure.detail}', file=sys.stderr)
+    print(json.dumps(result.record(), sort_keys=True))
+    return 0 if result.ok else 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
