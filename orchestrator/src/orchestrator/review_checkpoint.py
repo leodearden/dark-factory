@@ -19,6 +19,7 @@ from shared.cli_invoke import (
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
+from orchestrator.relocated_venv import retire_relocated_venvs
 from orchestrator.review_working_tree import (
     Phase1WorkingTree,
     attribute_phase1,
@@ -386,6 +387,10 @@ class ReviewCheckpoint:
     ) -> tuple[VerifyResult, Phase1WorkingTree | None]:
         """Mechanical verification, plus the working-tree state it measured."""
         logger.info('Review [%s]: Phase 1 — running full verification', review_id)
+        await asyncio.to_thread(
+            retire_relocated_venvs,
+            self.config.project_root, tuple(self.config.module_configs_or_empty),
+        )
         state = await read_working_tree_state(self.config.project_root)
         # A periodic project-wide review of the main checkout, not a task's verify: it queues as background.
         phase1 = await run_full_verification(
