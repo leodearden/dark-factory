@@ -1318,16 +1318,16 @@ MULTI_LINE_REASON = '\n'.join([
 ])
 
 
-def _merger_run_blocked_by_a_multi_line_reason(conn):
+def _merger_run_blocked_by(conn, reason):
     _fable_merger_run(conn, task_id='4782')
     conn.seed_event(
         _at(hours=2, minutes=30), 'merge_finalized', task_id='4782',
-        data=_merge_finalized_payload(branch='4782', state='blocked', reason=MULTI_LINE_REASON),
+        data=_merge_finalized_payload(branch='4782', state='blocked', reason=reason),
     )
 
 
 def test_a_multi_line_merge_reason_renders_as_one_table_row_with_its_first_line(runs_db):
-    _merger_run_blocked_by_a_multi_line_reason(runs_db)
+    _merger_run_blocked_by(runs_db, MULTI_LINE_REASON)
 
     body = audit_model_admission.render_markdown(_audit(runs_db))
 
@@ -1343,11 +1343,26 @@ def test_a_multi_line_merge_reason_renders_as_one_table_row_with_its_first_line(
     assert 'AssertionError' not in body
     assert 'Re-run with -x' not in body
     assert not any(line.lstrip().startswith('```') for line in body.splitlines())
-    assert sum(line.startswith('### ') for line in body.splitlines()) == 6
+
+
+@pytest.mark.parametrize(('reason', 'cell'), [
+    ('merge conflict in shared/', 'blocked (merge conflict in shared/)'),
+    ('merge conflict in shared/\nsee the merge log',
+     'blocked (merge conflict in shared/ \N{HORIZONTAL ELLIPSIS} +1 line)'),
+    ('\n\n', 'blocked'),
+])
+def test_the_merge_cell_summarizes_a_reason_by_its_line_count(runs_db, reason, cell):
+    _merger_run_blocked_by(runs_db, reason)
+
+    body = audit_model_admission.render_markdown(_audit(runs_db))
+
+    section = body.split('### 2.')[1].split('### 3.')[0]
+    rows = [line for line in section.splitlines() if line.startswith('|')]
+    assert _row_cells(rows[2])[-1] == cell
 
 
 def test_render_json_keeps_the_full_multi_line_merge_reason(runs_db):
-    _merger_run_blocked_by_a_multi_line_reason(runs_db)
+    _merger_run_blocked_by(runs_db, MULTI_LINE_REASON)
 
     payload = json.loads(audit_model_admission.render_json(_audit(runs_db)))
 
