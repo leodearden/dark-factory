@@ -182,7 +182,7 @@ def _make_fake_invoke(response_fn=None, *, default="{}"):
 def _make_fake_submit_fn():
     """Fake curator-path `submit_fn(**kwargs) -> dict` seam. Records every
     call's kwargs in `.calls` and answers in the real curator-path shape
-    (census.py::_ticket_id_from_submit_result) with an incrementing ticket
+    (disposition.ticket_id_from_submit_result) with an incrementing ticket
     id, `{"ticket": "tkt_<n>"}`."""
     calls = []
 
@@ -958,55 +958,6 @@ def test_build_task_payloads_priority_defaults_to_the_default_severity():
     cluster = _verified_cluster()
     del cluster["severity"]
     assert _single_payload(cluster)["priority"] == verdict.DEFAULT_SEVERITY
-
-
-# ---------------------------------------------------------------------------
-# task 4965 step-1: RED — _ticket_id_from_submit_result(), the single source
-# of truth for what the REAL submit_task seam returns. Every shape below is
-# one the live tool actually produces; the helper is the only place census.py
-# is allowed to know that.
-# ---------------------------------------------------------------------------
-
-def test_ticket_id_from_submit_result_reads_the_curator_ticket_key():
-    # Source of truth: fused_memory/server/tools.py::submit_task docstring
-    # ("returns {'ticket': 'tkt_<id>'}") and
-    # fused_memory/middleware/task_interceptor.py::TaskInterceptor, which
-    # ends the curator path with `return {'ticket': ticket_id}`. There is NO
-    # "id" key on this path -- reading one is the defect task 4965 fixes.
-    assert mod._ticket_id_from_submit_result({"ticket": "tkt_42"}) == "tkt_42"
-
-
-def test_ticket_id_from_submit_result_rejects_the_error_shape():
-    # Source of truth: task_interceptor.py::TaskInterceptor answers a failed
-    # or rejected submit_task with
-    # `return {'error': str(exc), 'error_type': type(exc).__name__}` -- a dict
-    # with no ticket key. Nothing was filed, so nothing may be counted.
-    assert mod._ticket_id_from_submit_result(
-        {"error": "boom", "error_type": "ValueError"}
-    ) is None
-
-
-def test_ticket_id_from_submit_result_rejects_non_dict_results():
-    # A transport fault (or a seam that answers nothing at all) can yield a
-    # non-dict; a bare string is NOT a usable result even when it looks like
-    # a ticket id, because no contract says the seam ever returns one.
-    assert mod._ticket_id_from_submit_result(None) is None
-    assert mod._ticket_id_from_submit_result("tkt_1") is None
-    assert mod._ticket_id_from_submit_result(["tkt_1"]) is None
-
-
-def test_ticket_id_from_submit_result_rejects_empty_dict():
-    assert mod._ticket_id_from_submit_result({}) is None
-
-
-def test_ticket_id_from_submit_result_rejects_unusable_ticket_values():
-    # An unusable value must never reach the report as a bare "- ", "- None"
-    # or "- {'id': 1}" bullet -- the caller excludes on None, so the helper
-    # must answer None rather than pass it through.
-    assert mod._ticket_id_from_submit_result({"ticket": ""}) is None
-    assert mod._ticket_id_from_submit_result({"ticket": None}) is None
-    assert mod._ticket_id_from_submit_result({"ticket": {"id": 1}}) is None
-    assert mod._ticket_id_from_submit_result({"ticket": 42}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -4334,7 +4285,6 @@ def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, capl
         "a rejected filing must be logged loudly, not swallowed silently"
     )
     _assert_reported_unfiled(kwargs, "backlog full")
-    assert "None" not in filed_section, "an unfilable result must never render as a '- None' bullet"
 
 
 _PROMOTED_TITLE = "Silent no-op subagent contract"
@@ -5924,7 +5874,7 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
 
 def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeypatch, capsys):
     # The operator reads this line to learn what the run produced. Filing
-    # yields tickets, not tasks (census.py::_ticket_id_from_submit_result),
+    # yields tickets, not tasks (disposition.py::ticket_id_from_submit_result),
     # so "filed_tasks=N" would overclaim N tasks that may not exist.
     _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census(

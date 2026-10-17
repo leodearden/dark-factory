@@ -20,8 +20,8 @@ back to HEAD and quarantined; see ``run_census``).
 
 Every LLM / MCP / git side effect in this module is an INJECTED seam
 (``invoke``, ``verify_fn``, ``synthesize_fn``, ``submit_fn``,
-``escalate_fn``, ``status_fetcher``, ``commit``, ``roll_back``,
-``batch_source``, ``selection_of``) --
+``task_store``, ``escalate_fn``, ``status_fetcher``, ``commit``,
+``roll_back``, ``batch_source``, ``selection_of``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
 --project shared``) has no live models. Every seam is ALWAYS faked in this
@@ -115,11 +115,13 @@ from legibility import (  # noqa: E402
     coder,
     config,
     digest,
+    disposition,
     filing_policy,
     finding_area,
     invariants,
     session_ledger,
     session_runner,
+    task_store,
     unlanded,
 )
 from legibility import verdict as verdict_mod  # noqa: E402
@@ -844,8 +846,8 @@ def build_task_payloads(
     Every payload names its run under ``metadata.x_finding_run``, and a cluster
     carrying a ``finding`` identity names its key under
     ``metadata.x_finding_key`` (quality-findings contract §8);
-    ``x_supersedes_task`` arrives with the dedup protocol's step 1c
-    (plans/census-incremental-prd.md L4). ``priority`` is the cluster's
+    ``x_supersedes_task`` arrives with the re-verify path
+    (plans/census-incremental-prd.md L5). ``priority`` is the cluster's
     severity (contract §4).
 
     ``title`` and ``description`` pass through
@@ -853,15 +855,15 @@ def build_task_payloads(
     evidence may QUOTE tool-call envelope literals, which the boundary
     markup guard refuses (task 5907).
 
-    Pure function -- returns payloads only; the actual ``submit_fn`` call
-    happens in ``run_census``.
+    Pure function -- returns payloads only; ``disposition.dispose`` decides
+    which of them ``submit_fn`` files.
     """
     observed = filing_policy.ProjectRef(project_root=project_root, project_id=project_id)
     payloads = []
     for cluster in clusters:
         target = filing_policy.resolve_target(cluster, observed=observed, harness=harness)
         metadata: dict = {
-            "source": "legibility_census",
+            "source": disposition.CENSUS_SOURCE,
             "origin_project_id": project_id,
             "x_finding_run": run_id,
         }
@@ -873,11 +875,10 @@ def build_task_payloads(
                 {"component": match.component, "evidence": match.evidence}
                 for match in target.fix_surface
             ]
-        title = cluster.get("title") or "Untitled confusion cluster"
         payloads.append(
             {
                 "project_root": target.project.project_root,
-                "title": escape_envelope_literals(f"[legibility census] {title}"),
+                "title": disposition.task_title(_cluster_title(cluster)),
                 "description": escape_envelope_literals(
                     _cluster_description(cluster, observed_project_id=project_id)
                 ),
@@ -889,23 +890,8 @@ def build_task_payloads(
     return payloads
 
 
-def _ticket_id_from_submit_result(result) -> str | None:
-    """The ticket id one curator-path ``submit_task`` call answered with, or
-    ``None`` if it filed nothing usable.
-
-    SPOT for that seam's contract (``fused_memory/server/tools.py::submit_task``,
-    ``fused_memory/middleware/task_interceptor.py::TaskInterceptor``): success
-    is ``{"ticket": "tkt_<id>"}`` -- a TICKET id, not a task id. The curator
-    decides create/combine/drop later, and ``resolve_ticket`` then yields the
-    task id. A rejection (``{"error": ..., "error_type": ...}``), a non-dict,
-    or a missing, empty or non-string ticket gives ``None``. The planning-mode
-    ``task_id`` shape is out of scope: ``build_task_payloads`` never sets
-    ``planning_mode``.
-    """
-    if not isinstance(result, dict):
-        return None
-    ticket_id = result.get("ticket")
-    return ticket_id if isinstance(ticket_id, str) and ticket_id else None
+def _cluster_title(cluster: Mapping[str, Any]) -> str:
+    return cluster.get("title") or "Untitled confusion cluster"
 
 
 # ---------------------------------------------------------------------------
@@ -1145,8 +1131,8 @@ class DryRunFiling:
     for human review, and NOTHING was filed into a live task tree.
 
     ``payload_count`` is how many payloads the file holds. Reused by both
-    ``render_report`` (which must not let an empty ``filed_ticket_ids`` read
-    as a normal run that filed nothing) and ``CensusOutcome`` (so
+    ``render_report`` (which must not let a run that filed nothing read as a
+    normal run that had nothing to file) and ``CensusOutcome`` (so
     ``main``'s summary line can name the review file instead of printing a
     misleading ``filed_tickets=0``). ``None`` in place of this record means
     the run filed normally."""
@@ -1341,14 +1327,14 @@ def build_census_record(
     matrix_md: str,
     mining_result: MiningResult,
     synthesis_md: str,
-    filed_ticket_ids: list[str],
+    project_root: str,
+    filing: Mapping[str, Any],
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
-    cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
     findings: Sequence[Mapping[str, Any]] = (),
     area_map: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1356,12 +1342,15 @@ def build_census_record(
     renders, as plain JSON-safe values. The mining records themselves are
     not carried; the codebook holds what they merged. *findings* are the
     contract §1 rows (``census_findings.FindingRow.to_record``) and
-    *area_map* the ``finding_area.AreaMap.to_record`` that keyed them."""
+    *area_map* the ``finding_area.AreaMap.to_record`` that keyed them.
+    *filing* is ``disposition.FilingReport.to_record``, and *project_root*
+    the observed project its decisions are reported against."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
         "run_id": method["run_id"],
         "date": date,
         "project_id": project_id,
+        "project_root": project_root,
         "force": force,
         "method": method,
         "mining": {
@@ -1374,8 +1363,7 @@ def build_census_record(
         "dropped_verdicts": [asdict(record) for record in dropped_verdicts],
         "matrix_md": matrix_md,
         "synthesis_md": synthesis_md,
-        "filed_ticket_ids": list(filed_ticket_ids),
-        "cross_project_tickets": [asdict(ticket) for ticket in cross_project_tickets],
+        "filing": dict(filing),
         "dry_run": _optional_asdict(dry_run),
         "withheld": [asdict(cluster) for cluster in withheld],
         "findings": [dict(row) for row in findings],
@@ -1411,10 +1399,6 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
     dry_run = _from_record(DryRunFiling, record["dry_run"])
     dropped_verdicts = [DroppedVerdict(**item) for item in record["dropped_verdicts"]]
     withheld = [filing_policy.WithheldCluster(**item) for item in record["withheld"]]
-    cross_project_tickets = [
-        CrossProjectTicket(**item) for item in record["cross_project_tickets"]
-    ]
-    filed_ticket_ids = record["filed_ticket_ids"]
 
     sections: list[ReportSection] = []
 
@@ -1593,35 +1577,16 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
-        # Checked FIRST: under --dry-run-filing, filed_ticket_ids is empty by
-        # construction, and the plain "_none filed._" placeholder would read
-        # as a normal run that simply had nothing to file.
-        filed_tasks.append(
+        # First: a dry run files nothing by construction, and a bare
+        # "_none filed._" would read as a normal run with nothing to file.
+        filed_tasks.extend([
             f"_dry-run: {dry_run.payload_count} payload(s) written to {dry_run.path} "
-            "-- NOTHING filed; review before filing._"
-        )
-    elif filed_ticket_ids:
-        filed_tasks.append(
-            f"_{len(filed_ticket_ids)} ticket(s) filed -- the curator's "
-            "create/combine/drop decision is still pending, so no task id "
-            "exists yet; resolve_ticket returns the task id once it does._"
-        )
-        filed_tasks.append("")
-        filed_tasks.extend(f"- {ticket_id}" for ticket_id in filed_ticket_ids)
-        if cross_project_tickets:
-            filed_tasks.append("")
-            filed_tasks.append(
-                f"_{len(cross_project_tickets)} of these ticket(s) were filed into "
-                "another project's task tree, so resolve_ticket needs that "
-                "project_root:_"
-            )
-            filed_tasks.append("")
-            filed_tasks.extend(
-                f"- {ticket.ticket_id} -> {ticket.project_root}"
-                for ticket in cross_project_tickets
-            )
-    else:
-        filed_tasks.append("_none filed._")
+            "-- NOTHING filed; review before filing._",
+            "",
+        ])
+    filed_tasks.extend(
+        disposition.filed_tasks_lines(record["filing"], observed_root=record["project_root"])
+    )
     emit(SECTION_FILED_TASKS, filed_tasks)
 
     if withheld:
@@ -1847,11 +1812,24 @@ def _entry_cluster(cb: dict, entry: dict) -> dict:
 
 @dataclass(frozen=True)
 class PendingFiling:
-    """One cluster to file this run. A genuine ticket for it releases the
-    withheld codebook entry *withheld_entry_id* names, if any."""
+    """One cluster to file this run. Work routed for it releases the withheld
+    codebook entry *withheld_entry_id* names, if any; its back-link lands on
+    *entry_id*."""
 
     cluster: dict
     withheld_entry_id: str | None = None
+    entry_id: str | None = None
+
+    def filing(self, payload: Mapping[str, Any]) -> disposition.Filing:
+        """This cluster as the dedup protocol files it, by *payload*."""
+        finding = self.cluster.get("finding")
+        return disposition.Filing(
+            entry_id=self.entry_id,
+            finding_key=None if finding is None else finding.key,
+            title=_cluster_title(self.cluster),
+            statement=self.cluster.get("summary") or "",
+            payload=payload,
+        )
 
 
 def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
@@ -1862,7 +1840,11 @@ def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
     ticket for its title, not two. Every other releasable withheld entry that
     ``filing_policy.is_fileable`` now accepts at its title's sighting count
     follows. An entry withheld THIS run is never among them: the split that
-    withheld it used that same count."""
+    withheld it used that same count.
+
+    Each is paired with the entry its back-link lands on: the withheld entry
+    it releases, else the last entry carrying its title."""
+    entry_id_of_title = {entry["title"]: entry["id"] for entry in cb.get("entries") or []}
     releasable = [
         entry for entry in cb.get("entries") or []
         if entry.get(ENTRY_FILING_KEY) == ENTRY_FILING_WITHHELD
@@ -1872,10 +1854,11 @@ def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
     for entry in releasable:
         entry_id_by_title.setdefault(entry["title"], entry["id"])
 
-    queue = [
-        PendingFiling(cluster, entry_id_by_title.get(cluster.get("title")))
-        for cluster in fileable
-    ]
+    queue = []
+    for cluster in fileable:
+        withheld_entry_id = entry_id_by_title.get(cluster.get("title"))
+        entry_id = withheld_entry_id or entry_id_of_title.get(cluster.get("title"))
+        queue.append(PendingFiling(cluster, withheld_entry_id, entry_id))
     paired = {pending.withheld_entry_id for pending in queue}
     sighting_counts = _sighting_counts_by_title(cb)
     for entry in releasable:
@@ -1884,7 +1867,7 @@ def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
         cluster = _entry_cluster(cb, entry)
         sighting_count = sighting_counts.get(entry["title"], 0)
         if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
-            queue.append(PendingFiling(cluster, entry["id"]))
+            queue.append(PendingFiling(cluster, entry["id"], entry["id"]))
     return queue
 
 
@@ -2149,6 +2132,49 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
     )
 
 
+def _write_dry_run_payloads(
+    requested_path: Path, payloads: list[dict], *, withheld_offered: int,
+) -> DryRunFiling:
+    """Write *payloads* -- what a real run would hand ``submit_fn`` -- for a
+    human to review, at *requested_path* or its free sibling, and say so
+    loudly; *withheld_offered* of them release earlier-withheld entries."""
+    resolved_path = _free_payloads_path(requested_path)
+    if resolved_path != requested_path:
+        logger.warning(
+            "census: dry-run payload path %s already exists and was left "
+            "UNTOUCHED (an earlier review artifact no re-run can "
+            "regenerate) -- this run's payloads were written to %s instead",
+            requested_path, resolved_path,
+        )
+    resolved_path.write_text(json.dumps(payloads, indent=2) + "\n", encoding="utf-8")
+    # The WARNING deliberately does NOT offer a repeat census as the
+    # recovery path, because that path is dead: the same confusions code as
+    # `matches` against the dumped codebook, and the sessions are ledgered as
+    # coded, so no later census mines them again. Hand filing is the only
+    # remaining handle on the work; do not reintroduce the "just run it again
+    # without the flag" guidance.
+    logger.warning(
+        "census: --dry-run-filing -- %d task payload(s) written to %s; "
+        "NOTHING was filed into a live task tree. This run HAS ALREADY "
+        "advanced the codebook and census-state, so filing those payloads "
+        "by hand is the only remaining way to land the work: a later "
+        "census will NOT re-file them (these confusions now code as "
+        "matches, not candidates, and their sessions are ledgered as coded).",
+        len(payloads), resolved_path,
+    )
+    if withheld_offered:
+        logger.warning(
+            "census: --dry-run-filing -- %d of those payload(s) are withheld "
+            "codebook entries that have since recurred; they stay marked "
+            "withheld, so the next real census re-offers them.",
+            withheld_offered,
+        )
+    # Every downstream consumer -- the report's Filed Tasks section, the
+    # commit paths and CensusOutcome -- reads the path off this one object,
+    # so they all name the file actually written.
+    return DryRunFiling(path=str(resolved_path), payload_count=len(payloads))
+
+
 def _repo_relative(path, project_root) -> str:
     """*path* relative to *project_root*, both resolved; ``ValueError``
     naming both when *path* lies outside it."""
@@ -2158,6 +2184,15 @@ def _repo_relative(path, project_root) -> str:
         raise ValueError(
             f"report_path {path} is not under project_root {project_root}"
         ) from None
+
+
+def _require_valid(cb: dict, stage: str) -> None:
+    """Raise, before anything is written, if *stage* left *cb* invalid."""
+    validation_errors = codebook.validate(cb)
+    if validation_errors:
+        raise RuntimeError(
+            f"census: codebook {stage} produced an invalid codebook: {validation_errors}"
+        )
 
 
 def _ensure_output_parents(*paths) -> None:
@@ -2272,6 +2307,11 @@ class CensusOutcome:
     released_entry_ids: tuple[str, ...] = ()
     """Withheld codebook entries filed this run because they recurred, each
     now marked ``filing: filed``."""
+
+    filing: disposition.FilingReport | None = None
+    """What contract §8 decided for every finding this run would file, and
+    what the ticket pass resolved. ``filed_ticket_ids`` and
+    ``cross_project_tickets`` are the curator tickets among its decisions."""
 
     run_id: str | None = None
     record_path: str | None = None
@@ -2432,6 +2472,7 @@ def run_census(
     verify_fn,
     synthesize_fn,
     submit_fn,
+    task_store: task_store.TaskStore,
     escalate_fn,
     status_fetcher,
     commit,
@@ -2511,11 +2552,16 @@ def run_census(
     one stays promoted, is marked withheld on its entry and is listed in the
     report, while one whose verdict was dropped is neither filed nor listed)
     -> ``_filing_queue``, which adds every earlier-withheld entry that
-    has since recurred -> ``build_task_payloads`` over that queue + *submit_fn*
-    per payload, best-effort (a genuine ticket for a withheld entry marks it
-    filed, so it is never filed twice; a raised exception, or a result
-    carrying no ticket id, is logged and excluded from ``filed_ticket_ids``
-    rather than aborting the run or inflating the filed count) -> write the
+    has since recurred -> ``build_task_payloads`` over that queue ->
+    ``disposition.dispose``, contract §8 over *task_store*: a finding whose
+    key a live, accepted or done task already carries, or that a live task
+    matches semantically, is linked to that task and never refiled; the rest
+    go to *submit_fn*, best-effort; and if any key lookup cannot run, NOTHING
+    is filed (work routed for a withheld entry marks it filed, so it is never
+    filed twice; a raised exception, or a result carrying no ticket id, is
+    logged and reported, never counted in ``filed_ticket_ids``) -> each
+    routed decision's C1 back-link onto its entry, then
+    ``disposition.resolve_tickets`` within its D7 budget -> write the
     JSON record beside *report_path* (``build_census_record``) and the
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
     (done-count from *status_fetcher*, watermark from the mining window) ->
@@ -2531,10 +2577,10 @@ def run_census(
     status ``"unlanded"`` (see ``_unlanded``).
 
     A cluster whose fix surface belongs to *harness_project*
-    (``filing_policy.resolve_target``) files into that project's task tree,
-    where the curator dedups it against the harness's own tasks. The report
-    and ``CensusOutcome.cross_project_tickets`` name the project_root each
-    such ticket went to, which is where ``resolve_ticket`` must look.
+    (``filing_policy.resolve_target``) files into that project's task tree:
+    the dedup lookups, the curator and ``resolve_ticket`` all run against
+    that project_root, which the report and
+    ``CensusOutcome.cross_project_tickets`` name.
 
     The report write, ``codebook.dump``, and ``advance_census_state`` run
     in that fixed order, with nothing else in between the latter two, to
@@ -2591,9 +2637,10 @@ def run_census(
     this flag exists to make impossible.
 
     *dry_run_payloads_path* switches filing to review mode
-    (``--dry-run-filing``): every would-be ``submit_task`` payload is
-    written there as JSON for a human to read, *submit_fn* is never
-    called, and ``filed_ticket_ids`` stays empty. ONLY the external filing
+    (``--dry-run-filing``): the dedup protocol stops before the curator, every
+    payload it would have handed *submit_fn* is written there as JSON for a
+    human to read, *submit_fn* is never called, and ``filed_ticket_ids`` stays
+    empty. ONLY the external filing
     is stubbed -- mining, verification, synthesis, the matrix, the
     codebook merge and promotions, the report write, ``codebook.dump``
     and ``advance_census_state`` all proceed exactly as on a normal run,
@@ -2971,111 +3018,62 @@ def run_census(
         disposition_conflicts=merge.counts.candidate_disposition_conflicts,
     )
 
-    validation_errors = codebook.validate(updated_codebook)
-    if validation_errors:
-        raise RuntimeError(
-            f"census: codebook merge produced an invalid codebook: {validation_errors}"
-        )
+    _require_valid(updated_codebook, "merge")
 
-    # Best-effort per payload -- a raised exception, or a result in which
-    # _ticket_id_from_submit_result finds no ticket, is logged and EXCLUDED
-    # from filed_ticket_ids rather than aborting the run or silently
-    # inflating the filed count (reviewer_comprehensive finding #1: an
-    # unfilable result must never render as a "- None" report bullet, nor
-    # count as genuinely filed).
     # Positioned BEFORE codebook.dump()/advance_census_state() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
-    # already-advanced codebook.
+    # already-advanced codebook. Filing itself is best-effort per finding
+    # (disposition.dispose): a failed submit is logged and reported, never
+    # counted as filed and never fatal.
     filing_queue = _filing_queue(fileable, updated_codebook)
     task_payloads = build_task_payloads(
         [pending.cluster for pending in filing_queue],
         project_root=project_root, project_id=project_id, run_id=run_id,
         harness=harness_project,
     )
-    filed_ticket_ids = []
-    cross_project_tickets: list[CrossProjectTicket] = []
-    released_tickets: dict[str, str] = {}
+    disposal = disposition.dispose(
+        [pending.filing(payload) for pending, payload in zip(filing_queue, task_payloads, strict=True)],
+        store=task_store,
+        submit=None if dry_run_payloads_path is not None else submit_fn,
+    )
+    withheld_entry_ids = {
+        pending.withheld_entry_id for pending in filing_queue if pending.withheld_entry_id is not None
+    }
     dry_run_filing = None
     if dry_run_payloads_path is not None:
-        # --dry-run-filing: write the payloads for human review and file
-        # NOTHING. submit_fn is deliberately left untouched (not swapped for
-        # a collector) so a test can assert it was never reached, and so the
-        # missing-ticket-id WARNING below can never fire for an intentional
-        # operator mode.
-        requested_path = Path(dry_run_payloads_path)
-        resolved_path = _free_payloads_path(requested_path)
-        if resolved_path != requested_path:
-            logger.warning(
-                "census: dry-run payload path %s already exists and was left "
-                "UNTOUCHED (an earlier review artifact no re-run can "
-                "regenerate) -- this run's payloads were written to %s instead",
-                requested_path, resolved_path,
-            )
-        resolved_path.write_text(
-            json.dumps(task_payloads, indent=2) + "\n", encoding="utf-8",
+        dry_run_filing = _write_dry_run_payloads(
+            Path(dry_run_payloads_path),
+            [dict(filing.payload) for filing in disposal.unfiled],
+            withheld_offered=sum(1 for filing in disposal.unfiled if filing.entry_id in withheld_entry_ids),
         )
-        # The WARNING deliberately does NOT offer a repeat census as the
-        # recovery path, because that path is dead: the same confusions code
-        # as `matches` against the dumped codebook, and the sessions are
-        # ledgered as coded, so no later census mines them again. Hand filing
-        # is the only remaining handle on the work; do not reintroduce the
-        # "just run it again without the flag" guidance.
-        logger.warning(
-            "census: --dry-run-filing -- %d task payload(s) written to %s; "
-            "NOTHING was filed into a live task tree. This run HAS ALREADY "
-            "advanced the codebook and census-state, so filing those payloads "
-            "by hand is the only remaining way to land the work: a later "
-            "census will NOT re-file them (these confusions now code as "
-            "matches, not candidates, and their sessions are ledgered as coded).",
-            len(task_payloads), resolved_path,
+
+    released_entry_ids = tuple(dict.fromkeys(
+        decision.filing.entry_id
+        for decision in disposal.decisions
+        if decision.routed and decision.filing.entry_id in withheld_entry_ids
+    ))
+    for entry_id in released_entry_ids:
+        updated_codebook = mark_entry_filed(updated_codebook, entry_id)
+    if released_entry_ids:
+        logger.info(
+            "census: %d withheld codebook entr(ies) recurred and were routed: %s",
+            len(released_entry_ids), list(released_entry_ids),
         )
-        withheld_offered = sum(
-            1 for pending in filing_queue if pending.withheld_entry_id is not None
-        )
-        if withheld_offered:
-            logger.warning(
-                "census: --dry-run-filing -- %d of those payload(s) are withheld "
-                "codebook entries that have since recurred; they stay marked "
-                "withheld, so the next real census re-offers them.",
-                withheld_offered,
-            )
-        # Every downstream consumer -- the report's Filed Tasks section, the
-        # commit paths and CensusOutcome -- reads the path off this one
-        # object, so they all name the file actually written.
-        dry_run_filing = DryRunFiling(
-            path=str(resolved_path), payload_count=len(task_payloads),
-        )
-    else:
-        for pending, payload in zip(filing_queue, task_payloads, strict=True):
-            try:
-                submit_result = submit_fn(**payload)
-            except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
-                logger.warning(
-                    "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
-                )
-                continue
-            ticket_id = _ticket_id_from_submit_result(submit_result)
-            if ticket_id is None:
-                logger.warning(
-                    "census: submit_fn returned no ticket id for payload %r (result=%r) "
-                    "-- not counted as filed", payload.get("title"), submit_result,
-                )
-                continue
-            filed_ticket_ids.append(ticket_id)
-            if payload["project_root"] != project_root:
-                cross_project_tickets.append(
-                    CrossProjectTicket(ticket_id=ticket_id, project_root=payload["project_root"]),
-                )
-            if pending.withheld_entry_id is not None:
-                updated_codebook = mark_entry_filed(updated_codebook, pending.withheld_entry_id)
-                released_tickets[pending.withheld_entry_id] = ticket_id
-        if released_tickets:
-            logger.info(
-                "census: %d withheld codebook entr(ies) recurred and were filed "
-                "(entry -> ticket): %s",
-                len(released_tickets), released_tickets,
-            )
+    updated_codebook = disposition.with_back_links(
+        updated_codebook,
+        [link for decision in disposal.decisions if (link := decision.back_link(run_id)) is not None],
+    )
+    updated_codebook, resolutions = disposition.resolve_tickets(
+        updated_codebook, store=task_store, run_id=run_id,
+    )
+    filing_report = disposition.FilingReport(disposal, resolutions, disposition.Backfill())
+    filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
+    cross_project_tickets = tuple(
+        CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
+        for decision in disposal.decisions
+        if decision.ticket is not None and decision.filing.project_root != project_root
+    )
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -3128,14 +3126,14 @@ def run_census(
         matrix_md=matrix_md,
         mining_result=mining_result,
         synthesis_md=synthesis_md,
-        filed_ticket_ids=filed_ticket_ids,
+        project_root=project_root,
+        filing=filing_report.to_record(),
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
         mass_rejection=mass_rejection,
         withheld=withheld,
-        cross_project_tickets=tuple(cross_project_tickets),
         findings=[
             row.to_record()
             for row in census_findings.finding_rows(
@@ -3186,6 +3184,10 @@ def run_census(
             exc,
         )
 
+    # The filing back-links changed the codebook after the merge check, so it
+    # is held to the schema again before it is written.
+    _require_valid(updated_codebook, "filing")
+
     # codebook.dump() and advance_census_state() are adjacent on purpose
     # (reviewer_comprehensive finding #4): nothing else here can raise
     # between them, so the ONLY way census-state.json can end up lagging
@@ -3214,9 +3216,10 @@ def run_census(
         dropped_verdicts=tuple(dropped_verdicts),
         unresolved_verdicts=len(dropped_verdicts),
         withheld=withheld,
-        cross_project_tickets=tuple(cross_project_tickets),
-        released_entry_ids=tuple(released_tickets),
+        cross_project_tickets=cross_project_tickets,
+        released_entry_ids=released_entry_ids,
         skipped_deletions=merge.skipped_deletions,
+        filing=filing_report,
     )
     commit_paths = [
         str(report_path), str(record_path), str(codebook_path), str(census_state_path),
