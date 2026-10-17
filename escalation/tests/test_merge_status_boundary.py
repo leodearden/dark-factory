@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,14 +28,18 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import (
+    InFlightMergeRegistry,
     MergeOutcome,
     MergeRequest,
     QueuedBranch,
+    WaiterRecord,
+    coalesce_or_enqueue_merge_request,
     enqueue_merge_request,
     landing_evidence,
 )
 from orchestrator.merge_lane import worker as merge_worker
 from orchestrator.merge_lane.queue_store import MergeQueueStore
+from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
 from shared.merge_state import EPISTEMIC_STATES, OUTCOME_STATES, MergeReason, MergeState
 from shared.merge_subject import format_merge_subject
 
@@ -312,6 +316,134 @@ async def _poll(server: Any, **key: str) -> dict[str, Any]:
     return response
 
 
+async def _absorb_by_attach(
+    world: _World, primary: MergeRequest, store: EventStore, registry: InFlightMergeRegistry,
+) -> str:
+    await register_and_enqueue_merge_request(asyncio.Queue(), primary, store, registry)
+    loser = WaiterRecord(
+        request_id='mr-attached-loser',
+        future=asyncio.get_running_loop().create_future(),
+        source='workflow',
+    )
+    assert registry.attach(primary.branch.bare_id, loser)
+    return loser.request_id
+
+
+async def _absorb_by_door_coalesce(
+    world: _World, primary: MergeRequest, store: EventStore, registry: InFlightMergeRegistry,
+) -> str:
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    loser = _request(world, primary.task_id)
+    assert (await coalesce_or_enqueue_merge_request(queue, primary, store, registry)).dispatched
+    assert (await coalesce_or_enqueue_merge_request(queue, loser, store, registry)).in_flight
+    return loser.request_id
+
+
+_ABSORB_MODES: Mapping[
+    str, Callable[[_World, MergeRequest, EventStore, InFlightMergeRegistry], Awaitable[str]]
+] = MappingProxyType({'attach': _absorb_by_attach, 'door_coalesce': _absorb_by_door_coalesce})
+
+
+async def _finalize_absorbing_in_prior_run(
+    world: _World, task_id: str, outcome: MergeOutcome, *, mode: str,
+) -> tuple[MergeRequest, str]:
+    """The prior run's primary absorbs a loser, then settles; returns the primary and the loser's id."""
+    primary = _request(world, task_id)
+    absorb = _ABSORB_MODES[mode]
+    loser_id = await absorb(world, primary, EventStore(world.db, _RUN_PRIOR), InFlightMergeRegistry())
+    primary.result.set_result(outcome)
+    await asyncio.sleep(0)
+    return primary, loser_id
+
+
+@dataclass(frozen=True)
+class _Scene:
+    """One row after the prior run: the restarted server, the key the row polls, the ids it asserts against."""
+
+    server: Any
+    key: Mapping[str, str]
+    facts: Mapping[str, str]
+
+
+_VERIFY_FAILED = MergeOutcome('blocked', reason='post-merge verify failed')
+_REBASE_CONFLICT = MergeOutcome('conflict', reason='rebase conflict')
+
+
+async def _scene_b1(world: _World) -> _Scene:
+    _unmerged_branch(world, '101')
+    prior = await _finalize_in_prior_run(world, '101', _VERIFY_FAILED)
+    return _Scene(
+        _restart(world), {'task_id': '101'}, {'task_id': '101', 'request_id': prior.request_id},
+    )
+
+
+async def _scene_b2(world: _World) -> _Scene:
+    await _finalize_in_prior_run(world, '102', _REBASE_CONFLICT)
+    resubmitted = _request(world, '102')
+    MergeQueueStore(world.journal_path).record(resubmitted)
+    server = _restart(world, live_entries=[_live_entry(resubmitted, 'queued')])
+    return _Scene(server, {'task_id': '102'}, {'resubmitted_request_id': resubmitted.request_id})
+
+
+async def _scene_b3(world: _World) -> _Scene:
+    _unmerged_branch(world, '103')
+    journaled = _journal_in_prior_run(world, '103')
+    return _Scene(
+        _restart(world), {'task_id': '103'}, {'task_id': '103', 'request_id': journaled.request_id},
+    )
+
+
+async def _scene_b4(world: _World) -> _Scene:
+    return _Scene(_restart(world), {'task_id': '104'}, {})
+
+
+async def _scene_b5(world: _World) -> _Scene:
+    original_tip = _rebase_landing(world, '105')
+    await _finalize_in_prior_run(world, '105', _VERIFY_FAILED)
+    return _Scene(
+        _restart(world), {'task_id': '105'}, {'task_id': '105', 'original_tip': original_tip},
+    )
+
+
+async def _scene_b6(world: _World) -> _Scene:
+    train_id = 'coalesce-1062-5ca1ab1e'
+    superseded = MergeOutcome('superseded', superseded_by=train_id)
+    await _finalize_in_prior_run(world, '1061', superseded)
+    newest = await _finalize_in_prior_run(world, '1062', superseded)
+    return _Scene(
+        _restart(world),
+        {'request_id': train_id},
+        {'train_id': train_id, 'newest_member_request_id': newest.request_id},
+    )
+
+
+async def _scene_b7(world: _World, *, mode: str = 'attach') -> _Scene:
+    primary, loser_id = await _finalize_absorbing_in_prior_run(
+        world, '107', _REBASE_CONFLICT, mode=mode,
+    )
+    return _Scene(
+        _restart(world), {'request_id': loser_id}, {'primary_request_id': primary.request_id},
+    )
+
+
+async def _scene_b8(world: _World) -> _Scene:
+    await _finalize_in_prior_run(world, '108', _VERIFY_FAILED)
+    vanished = GitOps(world.config.git, world.repo.parent / 'vanished')
+    return _Scene(_restart(world, git_ops=vanished), {'task_id': '108'}, {})
+
+
+_SCENES: Mapping[str, Callable[[_World], Awaitable[_Scene]]] = MappingProxyType({
+    'B1': _scene_b1,
+    'B2': _scene_b2,
+    'B3': _scene_b3,
+    'B4': _scene_b4,
+    'B5': _scene_b5,
+    'B6': _scene_b6,
+    'B7': _scene_b7,
+    'B8': _scene_b8,
+})
+
+
 class TestB1PriorRunBlockedAfterRestart:
     """B1 is THE REGRESSION PIN — must not be waived: a prior run's blocked is never this run's state."""
 
@@ -319,13 +451,9 @@ class TestB1PriorRunBlockedAfterRestart:
     async def test_b1_a_prior_run_blocked_answers_stale_record_never_blocked(
         self, world: _World, key: str,
     ) -> None:
-        _unmerged_branch(world, '101')
-        prior = await _finalize_in_prior_run(
-            world, '101', MergeOutcome('blocked', reason='post-merge verify failed'),
-        )
-        poll_key = {'task_id': '101', 'request_id': prior.request_id}[key]
+        scene = await _scene_b1(world)
 
-        response = await _poll(_restart(world), **{key: poll_key})
+        response = await _poll(scene.server, **{key: scene.facts[key]})
 
         assert response['state'] != 'blocked'
         assert response['state'] not in OUTCOME_STATES
@@ -337,26 +465,21 @@ class TestB1PriorRunBlockedAfterRestart:
         assert last['state'] == 'blocked'
         assert last['is_current_run'] is False
         assert last['run_id'] == _RUN_PRIOR
-        assert last['request_id'] == prior.request_id
+        assert last['request_id'] == scene.facts['request_id']
 
 
 class TestB2CurrentRunOnlySetsState:
     async def test_b2_a_live_resubmission_sets_state_and_the_prior_conflict_stays_history(
         self, world: _World,
     ) -> None:
-        await _finalize_in_prior_run(
-            world, '102', MergeOutcome('conflict', reason='rebase conflict'),
-        )
-        resubmitted = _request(world, '102')
-        MergeQueueStore(world.journal_path).record(resubmitted)
-        server = _restart(world, live_entries=[_live_entry(resubmitted, 'queued')])
+        scene = await _scene_b2(world)
 
-        response = await _poll(server, task_id='102')
+        response = await _poll(scene.server, **scene.key)
 
         assert response['state'] != 'conflict'
         assert response['state'] == MergeState.queued
         assert response['source'] == 'live'
-        assert response['request_id'] == resubmitted.request_id
+        assert response['request_id'] == scene.facts['resubmitted_request_id']
         last = response['last_outcome']
         assert last['state'] == 'conflict'
         assert last['run_id'] == _RUN_PRIOR
@@ -368,16 +491,14 @@ class TestB3JournaledNotYetRecovered:
     async def test_b3_a_journaled_request_with_no_live_entry_answers_journaled(
         self, world: _World, key: str,
     ) -> None:
-        _unmerged_branch(world, '103')
-        journaled = _journal_in_prior_run(world, '103')
-        poll_key = {'task_id': '103', 'request_id': journaled.request_id}[key]
+        scene = await _scene_b3(world)
 
-        response = await _poll(_restart(world), **{key: poll_key})
+        response = await _poll(scene.server, **{key: scene.facts[key]})
 
         assert response['state'] == MergeState.journaled
         assert response['source'] == 'journal'
         assert response['reason'] == MergeReason.journaled_not_live
-        assert response['request_id'] == journaled.request_id
+        assert response['request_id'] == scene.facts['request_id']
         assert response['last_outcome'] is None
 
 
@@ -385,7 +506,9 @@ class TestB4NeverSubmitted:
     async def test_b4_nothing_anywhere_answers_no_record_never_submitted(
         self, world: _World,
     ) -> None:
-        response = await _poll(_restart(world), task_id='104')
+        scene = await _scene_b4(world)
+
+        response = await _poll(scene.server, **scene.key)
 
         assert response['state'] == MergeState.no_record
         assert response['reason'] == MergeReason.never_submitted
@@ -398,16 +521,18 @@ class TestB5RebaseLandingIsConsumedFromGit:
     async def test_b5_a_rebase_landing_answers_done_from_git_with_no_landing_call_of_its_own(
         self, world: _World, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        original_tip = _rebase_landing(world, '105')
-        await _finalize_in_prior_run(
-            world, '105', MergeOutcome('blocked', reason='post-merge verify failed'),
-        )
+        scene = await _scene_b5(world)
+        task_id, original_tip = scene.facts['task_id'], scene.facts['original_tip']
         assert not _git_succeeds(world.repo, 'merge-base', '--is-ancestor', original_tip, 'main')
-        assert _git(world.repo, 'show', 'main:105.txt') == 'work for 105'
-        assert not _git_succeeds(world.repo, 'rev-parse', '--verify', '--quiet', 'refs/heads/task/105')
+        assert _git(world.repo, 'show', f'main:{task_id}.txt') == _git(
+            world.repo, 'show', f'{original_tip}:{task_id}.txt',
+        )
+        assert not _git_succeeds(
+            world.repo, 'rev-parse', '--verify', '--quiet', f'refs/heads/task/{task_id}',
+        )
         spy = _LandingPrimitiveSpy.install(monkeypatch, world.git_ops)
 
-        response = await _poll(_restart(world), task_id='105')
+        response = await _poll(scene.server, **scene.key)
 
         assert response['state'] == MergeState.done
         assert response['kind'] == 'found_on_main'
@@ -437,7 +562,7 @@ async def test_b6_a_coalesce_train_id_resolves_through_the_reverse_index(world: 
     assert last['request_id'] == scene.facts['newest_member_request_id']
 
 
-@pytest.mark.parametrize('mode', ['attach', 'door_coalesce'])
+@pytest.mark.parametrize('mode', sorted(_ABSORB_MODES))
 async def test_b7_an_absorbed_loser_resolves_to_its_primary_after_restart(
     world: _World, mode: str,
 ) -> None:
