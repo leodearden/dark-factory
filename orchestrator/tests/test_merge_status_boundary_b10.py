@@ -10,20 +10,135 @@ Git is deliberately not touched: B10 is scoped to the cross-run read.
 """
 from __future__ import annotations
 
+import json
 import math
+import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 
 pytestmark = pytest.mark.xdist_group('merge_status_boundary_b10')
 
 _BOUND_MS = 50.0
 _SAMPLES = 200
 _ABSENT = 'absent-from-every-run'
+
+
+_EVENTS = 300_000
+_RUNS = 228
+_MERGE_FINALIZED_EVERY = 115
+_TRAIN_MEMBER_EVERY = 40
+_ABSORBING_EVERY = 64
+_NOISE_DATA = json.dumps({'phase': 'verify', 'detail': 'x' * 170})
+_INSERT = (
+    'INSERT INTO events '
+    '(timestamp, run_id, task_id, event_type, phase, role, data, cost_usd, duration_ms) '
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+)
+
+
+@dataclass(frozen=True)
+class _SeededStore:
+    """A restarted run's view of the seeded store, and the ids its hit shapes look up."""
+
+    store: EventStore
+    events: int
+    merge_finalized: int
+    oldest_request_id: str
+    absorbed_loser_id: str
+    train_id: str
+
+
+def _task_id(n: int) -> str:
+    return str(1000 + n % 4000)
+
+
+def _request_id(n: int) -> str:
+    return f'mr-{n:08x}'
+
+
+def _loser_id(n: int) -> str:
+    return f'mr-loser-{n:08x}'
+
+
+def _train_id(n: int) -> str:
+    return f'coalesce-{_task_id(n)}-{n:08x}'
+
+
+def _is_train_member(n: int) -> bool:
+    return n % _TRAIN_MEMBER_EVERY == _TRAIN_MEMBER_EVERY - 1
+
+
+def _is_absorbing(n: int) -> bool:
+    return n % _ABSORBING_EVERY == _ABSORBING_EVERY - 1
+
+
+def _merge_finalized_data(n: int) -> dict[str, object]:
+    """The n-th row's payload, in orchestrator/src/orchestrator/merge_lane/worker.py::enqueue_merge_request's key set."""
+    member = _is_train_member(n)
+    state = 'superseded' if member else ('done', 'blocked', 'conflict')[n % 3]
+    return {
+        'request_id': _request_id(n),
+        'branch': _task_id(n),
+        'state': state,
+        'snapshot_tip': f'{n:040x}',
+        'merge_sha': f'{n + 1:040x}' if state == 'done' else None,
+        'superseded_by': _train_id(n) if member else None,
+        'generation': 1,
+        'reason': 'post-merge verify failed' if state == 'blocked' else None,
+        'landed_via_chain': None,
+        'absorbed_request_ids': [_loser_id(n)] if _is_absorbing(n) else [],
+    }
+
+
+def _rows(start: datetime) -> Iterator[tuple[object, ...]]:
+    for i in range(_EVENTS):
+        timestamp = (start + timedelta(seconds=i)).isoformat()
+        run_id = f'run-{i * _RUNS // _EVENTS:04d}'
+        if i % _MERGE_FINALIZED_EVERY:
+            yield (
+                timestamp, run_id, _task_id(i), EventType.phase_exit.value,
+                'verify', 'implementer', _NOISE_DATA, None, None,
+            )
+            continue
+        n = i // _MERGE_FINALIZED_EVERY
+        yield (
+            timestamp, run_id, _task_id(n), EventType.merge_finalized.value,
+            'merge', None, json.dumps(_merge_finalized_data(n)), None, None,
+        )
+
+
+@pytest.fixture(scope='module')
+def production_sized_store(tmp_path_factory: pytest.TempPathFactory) -> _SeededStore:
+    db = tmp_path_factory.mktemp('merge_status_boundary_b10') / 'runs.db'
+    EventStore(db, 'run-seed')
+    conn = sqlite3.connect(db)
+    try:
+        with conn:
+            conn.executemany(_INSERT, _rows(datetime(2026, 1, 1, tzinfo=UTC)))
+        events, merge_finalized = conn.execute(
+            'SELECT COUNT(*), SUM(event_type = ?) FROM events',
+            (EventType.merge_finalized.value,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert events >= 300_000 and merge_finalized >= 2_500, (
+        f'B10 needs >= 300,000 events and >= 2,500 merge_finalized rows; '
+        f'seeded {events} and {merge_finalized}'
+    )
+    return _SeededStore(
+        store=EventStore(db, 'run-current'),
+        events=events,
+        merge_finalized=merge_finalized,
+        oldest_request_id=_request_id(0),
+        absorbed_loser_id=_loser_id(_ABSORBING_EVERY - 1),
+        train_id=_train_id(_TRAIN_MEMBER_EVERY - 1),
+    )
 
 
 def _durable_history_reads(store: EventStore, key: str, value: str) -> object:
