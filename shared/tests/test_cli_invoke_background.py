@@ -148,6 +148,84 @@ def _text(text: str = 'thinking') -> dict:
     return {'type': 'text', 'text': text}
 
 
+MONITOR_TASK_ID = 'byk7waubd'
+
+
+def _monitor_call(
+    *,
+    tool_id: str = 'toolu_mon1',
+    command: str = 'until [ -s /tmp/x.log ]; do sleep 10; done; tail -8 /tmp/x.log',
+    timeout_ms: int = 900000,
+) -> dict:
+    """A ``Monitor`` tool_use block, in the CLI's measured input shape."""
+    return {
+        'type': 'tool_use',
+        'id': tool_id,
+        'name': 'Monitor',
+        'input': {
+            'command': command,
+            'description': 'test run completion',
+            'timeout_ms': timeout_ms,
+            'persistent': False,
+        },
+    }
+
+
+def _monitor_armed(
+    tool_id: str = 'toolu_mon1',
+    task_id: object = MONITOR_TASK_ID,
+    timeout_ms: int = 900000,
+    *,
+    nested: bool = True,
+) -> dict:
+    """The ``user`` record confirming a Monitor arm: a tool_result naming the
+    call plus the structured ``toolUseResult`` carrying the armed task's id.
+    ``nested=False`` puts the content list flat under ``record['content']``."""
+    content = [
+        {
+            'type': 'tool_result',
+            'tool_use_id': tool_id,
+            'content': (
+                f'Monitor started (task {task_id}, timeout {timeout_ms}ms).'
+                ' You will be notified on each event.'
+                ' Keep working — do not poll or sleep.'
+            ),
+        },
+    ]
+    record: dict = {
+        'type': 'user',
+        'toolUseResult': {'taskId': task_id, 'timeoutMs': timeout_ms, 'persistent': False},
+    }
+    if nested:
+        record['message'] = {'role': 'user', 'content': content}
+    else:
+        record['content'] = content
+    return record
+
+
+def _monitor_rejected(tool_id: str = 'toolu_mon1') -> dict:
+    """The ``user`` record for a Monitor call the CLI REJECTED: nothing armed."""
+    return {
+        'type': 'user',
+        'message': {
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': tool_id,
+                    'is_error': True,
+                    'content': (
+                        '<tool_use_error>InputValidationError: Monitor failed due to'
+                        ' the following issues:\nThe required parameter `description`'
+                        ' is missing</tool_use_error>'
+                    ),
+                },
+            ],
+        },
+        'toolUseResult': 'InputValidationError: [...]',
+    }
+
+
 def _write_transcript(base: Path, session_id: str, records: list) -> Path:
     """Write *records* as a JSONL transcript under
     base/projects/<slug>/<session_id>.jsonl — mirrors the fixture style of the
@@ -584,6 +662,146 @@ class TestVerdictSubmissionClearsVerdict:
         assert detect_ended_awaiting_background(records) is True
 
 
+class TestMonitorArmIsALaunch:
+    """A CONFIRMED Monitor arm is a launch (task 5986).
+
+    The launch is the ``user`` record whose tool_result names an earlier
+    ``Monitor`` call and whose structured ``toolUseResult.taskId`` is a usable
+    token — not the call, which the CLI may reject.  The Monitor call itself is
+    neither a launch nor a reap, and the armed task's id becomes a reap token.
+    """
+
+    def test_armed_monitor_then_turn_ends_is_true(self) -> None:
+        """Specimens df 3220 / reify 5690: arm, announce standing by, end."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_flat_arm_result_is_a_launch(self) -> None:
+        """The confirming record is found in the flat content shape too."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(nested=False),
+            _assistant([_text('Monitor armed. Standing by for the ratchet test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_monitor_tailing_a_pending_bg_log_is_true(self) -> None:
+        """Specimen df 2889: a Monitor whose command watches the pending Bash
+        launch's bg-log is a new wait, not a reap of that launch."""
+        log = _bg_log_path()
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_monitor_call(command=f'until grep -q "test result" {log}; do sleep 10; done')]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Waiting for the test result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_rejected_monitor_naming_the_bg_log_does_not_reap_it(self) -> None:
+        """Specimen reify 5536: a REJECTED Monitor naming the bg-log armed
+        nothing and engaged with nothing, so the Bash launch stays pending."""
+        log = _bg_log_path()
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            _assistant([_monitor_call(command=f'tail -f {log}')]),
+            _monitor_rejected(),
+            _assistant([_text('Waiting for the sweep to finish.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_unrelated_activity_after_arm_is_true(self) -> None:
+        """Activity that never references the armed task is not a reap."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_fg_bash('git status')]),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/etc/hosts'}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_rejected_monitor_alone_is_false(self) -> None:
+        """Specimen df 2849: a rejected call armed nothing, so nothing is pending."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_rejected(),
+            _assistant([_text('done')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_monitor_call_with_no_result_is_false(self) -> None:
+        """A call with no confirming record is not a launch."""
+        records = [
+            _assistant([_monitor_call()]),
+            _assistant([_text('done')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_id_result_for_a_non_monitor_call_is_not_a_launch(self) -> None:
+        """A ``taskId`` result confirms a launch only when it answers a Monitor call."""
+        records = [
+            _assistant([{'type': 'tool_use', 'id': 'toolu_some', 'name': 'SomeTool', 'input': {}}]),
+            {
+                'type': 'user',
+                'message': {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'toolu_some', 'content': 'ok'},
+                    ],
+                },
+                'toolUseResult': {'taskId': 'bq9imj9co'},
+            },
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize('degenerate_id', ['', 'a', 'xyz', 42])
+    def test_degenerate_monitor_task_id_is_not_a_launch(self, degenerate_id: object) -> None:
+        """An id no notification could ever be matched on is not a launch:
+        honoring it would fire on every such session."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(task_id=degenerate_id),
+            _assistant([_text('Monitor armed.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_task_stop_of_armed_monitor_is_false(self) -> None:
+        """Stopping the armed Monitor reaps it."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant(
+                [{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': MONITOR_TASK_ID}}]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_reference_to_the_monitor_task_id_is_false(self) -> None:
+        """The arm's ``taskId`` is harvested as a token, so reading the armed
+        task's output file reaps it."""
+        records = [
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant(
+                [
+                    {
+                        'type': 'tool_use',
+                        'name': 'Read',
+                        'input': {'file_path': f'/tmp/claude-1000/s/tasks/{MONITOR_TASK_ID}.output'},
+                    }
+                ]
+            ),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+
 class TestEndedAwaitingBackgroundForSession:
     """File-reading seam: mirrors count_transcript_turns' shape — delegate to
     read_transcript_records, then the pure detector, mapping None (unresolvable
@@ -671,6 +889,19 @@ class TestEndedAwaitingBackgroundForSession:
             _assistant([_bash_launch(command='cargo test -p crate1', tool_id='toolu_1')]),
             _bg_launch_result(tool_id='toolu_1', task_id='bg111111'),
             _assistant([_text('I will wait for the background test to finish')]),
+        ]
+        _write_transcript(tmp_path, sid, records)
+        assert ended_awaiting_background_for_session(tmp_path, sid) is True
+
+    def test_monitor_armed_transcript_is_true(self, tmp_path: Path) -> None:
+        """Specimen df 3220: the session arms a Monitor and ends its turn
+        standing by, so the process exits before the result arrives."""
+        sid = 'sess-monitor-armed'
+        records: list = [
+            _assistant([_text('arm a watch on the ratchet test')]),
+            _assistant([_monitor_call()]),
+            _monitor_armed(),
+            _assistant([_text('Monitor armed. Standing by for the ratchet test result.')]),
         ]
         _write_transcript(tmp_path, sid, records)
         assert ended_awaiting_background_for_session(tmp_path, sid) is True
