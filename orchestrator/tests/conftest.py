@@ -90,7 +90,6 @@ from orchestrator.config import (  # noqa: E402
     SandboxConfig,
 )
 from orchestrator.merge_lane import worker  # noqa: E402
-from orchestrator.merge_lane.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_lane.worker was imported (by another conftest/plugin) before
@@ -795,6 +794,7 @@ def _isolated_merge_provenance(tmp_path_factory):
     lookup in the same worker (task 5034). The file is never created unless
     something records through the facade.
     """
+    from orchestrator.merge_lane.landed_outbox import LandedOutbox, MergeProvenance
     basetemp = tmp_path_factory.getbasetemp()
     MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
 

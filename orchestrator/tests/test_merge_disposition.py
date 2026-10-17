@@ -147,7 +147,8 @@ class TestMergeOutcomeDispositionField:
         assert outcome.disposition == MergeFailureDisposition.INDETERMINATE
 
     def test_importable_from_merge_types(self):
-        from orchestrator.merge_lane.types import MergeFailureDisposition  # noqa: F401
+        from orchestrator.merge_lane.types import MergeFailureDisposition
+        assert isinstance(MergeFailureDisposition, type)
 
     def test_merge_outcome_importable_from_merge_queue_shim_carries_disposition(self):
         """merge_queue re-exports MergeOutcome (pre-existing shim); the new
@@ -168,9 +169,10 @@ class TestClassifyMergeFailureDispositionImportable:
     """classify_merge_failure_disposition is importable and a coroutine function."""
 
     def test_importable_from_merge_disposition_module(self):
-        from orchestrator.merge_lane.disposition import (  # noqa: F401
+        from orchestrator.merge_lane.disposition import (
             classify_merge_failure_disposition,
         )
+        assert callable(classify_merge_failure_disposition)
 
     def test_is_coroutine_function(self):
         from orchestrator.merge_lane.disposition import classify_merge_failure_disposition

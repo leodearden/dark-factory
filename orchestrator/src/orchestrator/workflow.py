@@ -7201,7 +7201,7 @@ class TaskWorkflow:
             'verify is the gate)',
             self.task_id, tip[:12],
         )
-        from orchestrator.merge_lane.types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         req = await submit_verified_green_merge_request(
             task_id=self.task_id,
@@ -7365,7 +7365,7 @@ class TaskWorkflow:
         reconciler still marks it done on the next sweep.
         """
         try:
-            from orchestrator.merge_lane.types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 logger.info(

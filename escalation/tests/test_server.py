@@ -47,7 +47,7 @@ from escalation.server import (
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
-    from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         MergeRequest,
         QueuedBranch,
         RealMergeItem,
@@ -3761,7 +3761,7 @@ class TestMergeRequestDedup:
     """
 
     def _make_registry(self):
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
         return InFlightMergeRegistry()
@@ -3831,8 +3831,8 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_lane import worker as _mq_mod  # type: ignore[reportMissingImports]
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import worker as _mq_mod
+        from orchestrator.merge_lane.worker import (
             MergeDispatchResult,
         )
 
@@ -4019,7 +4019,7 @@ class TestMergeRequestDedup:
         import asyncio
 
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -4079,7 +4079,7 @@ class TestMergeRequestDedup:
         import asyncio
 
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -4132,7 +4132,7 @@ class TestMergeRequestDedup:
         import asyncio
 
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -4191,7 +4191,7 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             register_and_enqueue_merge_request,
         )
@@ -4331,8 +4331,8 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
     ``orchestrator.merge_lane.landing_evidence``; the worker's
     ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
     """
-    import orchestrator.merge_lane.landing_evidence as landing_evidence  # type: ignore[reportMissingImports]
-    import orchestrator.merge_lane.worker as worker  # type: ignore[reportMissingImports]
+    import orchestrator.merge_lane.landing_evidence as landing_evidence
+    import orchestrator.merge_lane.worker as worker
 
     for module in (worker, landing_evidence):
         monkeypatch.setattr(module, 'patch_content_contained', stub)
@@ -4368,7 +4368,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         import asyncio
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_lane.worker as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         sentinel_base_sha = 's' * 40
@@ -4452,7 +4452,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_lane.worker as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
@@ -4513,7 +4513,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_lane.worker as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
@@ -4633,7 +4633,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_lane.worker as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         # Monkeypatched for determinism even though the post-step-4 gate
@@ -4801,7 +4801,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -4884,7 +4884,7 @@ class TestGetMergeQueue:
         import asyncio
         import time
 
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeRequest,
         )
@@ -4942,7 +4942,7 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
@@ -4994,7 +4994,7 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
@@ -5051,7 +5051,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5186,7 +5186,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5317,7 +5317,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5414,7 +5414,7 @@ class TestGetMergeQueue:
         # production VERIFYING->FINALIZING->GATE_REVERIFY transitions take effect.
         worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
-        import orchestrator.merge_lane.worker as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         captured_reverify_kwargs: dict = {}
 
@@ -5513,7 +5513,7 @@ class TestGetMergeQueue:
         """
         from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         REBASED_SHA = 'rebased0abc'
@@ -5534,7 +5534,7 @@ class TestGetMergeQueue:
             merge_commit='deadbeef00000002',
         )
 
-        import orchestrator.merge_lane.worker as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         GATE_FAIL = MergeOutcome('blocked', reason='post-rebase reverify gate failed')
 
@@ -6342,7 +6342,7 @@ class TestMergeStatus:
         )
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
         )

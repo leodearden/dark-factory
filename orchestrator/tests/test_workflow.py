@@ -1820,11 +1820,6 @@ class TestBoundaryTableWorkflow:
 
     def _make_wf_with_peer(self, tmp_path, real_queue, registry, *, tip: str):
         """Build a workflow and pre-seed branch B with mcp-source primary P."""
-        from orchestrator.merge_lane.worker import (  # noqa: F401 (local)
-            InFlightMergeRegistry,
-            MergeOutcome,
-        )
-
         assignment = MagicMock()
         assignment.task_id = 'B'
         assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}

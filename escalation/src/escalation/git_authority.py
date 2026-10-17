@@ -393,7 +393,7 @@ async def _evidence_verdict(
     contract by patching ``orchestrator.merge_lane.landing_evidence``, the DEFINING
     module, rather than this one.
     """
-    from orchestrator.merge_lane.landing_evidence import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.landing_evidence import (
         validate_landing_evidence,
     )
     verdict = await validate_landing_evidence(
@@ -496,7 +496,7 @@ async def probe_landing(
         # at runtime because the escalation server is hosted inside the
         # orchestrator process.  An ImportError is an Exception and therefore
         # already degrades to probe_failed via the wrapper below.
-        from orchestrator.merge_lane.landing_evidence import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.landing_evidence import (
             branch_is_degenerate,
             is_valid_sha_40,
         )

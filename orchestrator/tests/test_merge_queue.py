@@ -4395,7 +4395,7 @@ class TestSpeculativeMergeWorker:
         was NOT even attempted while the cap is held (a stronger proof the blocking
         path is genuinely bounded, not merely delayed).
         """
-        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND
 
         wt_n = await _make_branch_with_file(git_ops, 'cap-n', 'file_cap_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'cap-n1', 'file_cap_n1.py', 'n1 = 2\n')
@@ -5156,7 +5156,7 @@ class TestSpeculativeMergeWorker:
           (2) NO speculative_discard with reason='main_advanced' in EventStore.
           (3) _merge_ahead_cap._value == _MERGE_AHEAD_BOUND (cap never consumed).
         """
-        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND
 
         db_path = tmp_path / 'events_train_exempt.db'
         event_store = EventStore(db_path=db_path, run_id='test-train-exempt')
@@ -5267,7 +5267,7 @@ class TestSpeculativeMergeWorker:
           (1) N resolves 'blocked' (verify failure); N+1 resolves 'done' (normal verify).
           (2) M resolves 'done' (cap balanced — merger not stuck at acquire).
         """
-        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND
 
         wt_n = await _make_branch_with_file(git_ops, 'ci-n', 'file_ci_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'ci-n1', 'file_ci_n1.py', 'n1 = 2\n')
@@ -5351,7 +5351,7 @@ class TestSpeculativeMergeWorker:
               cap balanced after N's abandoned drain).
           (2) _merge_ahead_cap._value == _MERGE_AHEAD_BOUND after all complete.
         """
-        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _MERGE_AHEAD_BOUND
 
         wt_n = await _make_branch_with_file(git_ops, 'ab-n', 'file_ab_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'ab-n1', 'file_ab_n1.py', 'n1 = 2\n')
@@ -13656,7 +13656,7 @@ class TestRunPostMergeVerify:
         passes no archive_root (→ default None), so run_scoped_verification receives
         archive_root=None.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13688,7 +13688,7 @@ class TestRunPostMergeVerify:
         Fails today because the generic failure block (merge_queue.py:890) does not
         append the category to the reason string.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13723,7 +13723,7 @@ class TestRunPostMergeVerify:
 
         Fails today because the generic failure block does not append the category.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -15548,15 +15548,11 @@ class TestWipHaltMixin:
 
     async def test_initial_state_not_halted(self) -> None:
         """is_wip_halted is False immediately after construction."""
-        from orchestrator.merge_lane.worker import _WipHaltMixin  # noqa: F401
-
         worker = self._make_worker()
         assert not worker.is_wip_halted
 
     async def test_halt_for_wip_sets_halted(self) -> None:
         """After halt_for_wip('x'), is_wip_halted True and halt_owner_esc_id still None."""
-        from orchestrator.merge_lane.worker import _WipHaltMixin  # noqa: F401
-
         worker = self._make_worker()
         worker.halt_for_wip('x')
         assert worker.is_wip_halted
@@ -15564,8 +15560,6 @@ class TestWipHaltMixin:
 
     async def test_set_halt_owner_and_query(self) -> None:
         """set_halt_owner('e1') → is_halt_owner('e1') True, is_halt_owner('e2') False, halt_owner_esc_id == 'e1'."""
-        from orchestrator.merge_lane.worker import _WipHaltMixin  # noqa: F401
-
         worker = self._make_worker()
         worker.halt_for_wip('reason')
         worker.set_halt_owner('e1')
@@ -15575,8 +15569,6 @@ class TestWipHaltMixin:
 
     async def test_second_set_halt_owner_raises(self) -> None:
         """A second set_halt_owner call raises AssertionError."""
-        from orchestrator.merge_lane.worker import _WipHaltMixin  # noqa: F401
-
         worker = self._make_worker()
         worker.halt_for_wip('reason')
         worker.set_halt_owner('e1')
@@ -15585,8 +15577,6 @@ class TestWipHaltMixin:
 
     async def test_unhalt_clears_state(self) -> None:
         """After unhalt_wip(), is_wip_halted False and halt_owner_esc_id None."""
-        from orchestrator.merge_lane.worker import _WipHaltMixin  # noqa: F401
-
         worker = self._make_worker()
         worker.halt_for_wip('reason')
         worker.set_halt_owner('e1')
@@ -15596,10 +15586,7 @@ class TestWipHaltMixin:
 
     async def test_abandon_outcome_uses_prefix(self) -> None:
         """_abandon_outcome('t', 3) → blocked MergeOutcome starting with ABANDONED_REASON_PREFIX containing 't'."""
-        from orchestrator.merge_lane.worker import (  # noqa: F401
-            ABANDONED_REASON_PREFIX,
-            _WipHaltMixin,
-        )
+        from orchestrator.merge_lane.worker import ABANDONED_REASON_PREFIX
 
         worker = self._make_worker()
         outcome = worker._abandon_outcome('t', 3)
@@ -15619,7 +15606,8 @@ class TestHaltAdvanceResults:
 
     def test_is_importable(self) -> None:
         """_HALT_ADVANCE_RESULTS must be importable (fails before amendment)."""
-        from orchestrator.merge_lane.worker import _HALT_ADVANCE_RESULTS  # noqa: F401
+        from orchestrator.merge_lane.worker import _HALT_ADVANCE_RESULTS
+        assert isinstance(_HALT_ADVANCE_RESULTS, tuple)
 
     def test_contains_expected_results(self) -> None:
         """All five halt-triggering advance_main results must be present.
@@ -17198,8 +17186,6 @@ class TestInFlightRegistryRequestId:
         self, config: OrchestratorConfig, tmp_path: Path,
     ):
         """(c) Second coalesce returns inflight_request_id == first req's request_id."""
-        from orchestrator.merge_lane.worker import MergeDispatchResult  # noqa: F401
-
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
         req1 = _make_request('C', 'branchC', tmp_path, config)
@@ -18607,7 +18593,7 @@ class TestBoundaryTableWorkerEntry:
         Extends TestAttachFanOut with the explicit two-source framing and the
         one-merge assertion.
         """
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
         )
 
@@ -18694,7 +18680,7 @@ class TestBoundaryTableWorkerEntry:
         carries superseded_by == gen-2 request_id.
         Reuses TestMaybeAutoChainGeneration._make_req and the flag-flip pattern.
         """
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MAX_AUTO_CHAINED_GENERATIONS,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             MergeRequest,
@@ -19587,7 +19573,7 @@ class TestSoftCancelMidVerify:
             registry.detach(req.branch.bare_id, req.request_id)
             # Yield one tick so the done-callback fires.
             await asyncio.sleep(0)
-            from orchestrator.merge_lane.worker import MergeOutcome as _MO  # noqa: PLC0415
+            from orchestrator.merge_lane.worker import MergeOutcome as _MO
             return _MO('done', merge_sha=merge_result.merge_commit)
 
         with (

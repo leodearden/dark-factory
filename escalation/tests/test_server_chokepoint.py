@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     # Annotation-only (PEP 563 via `from __future__ import annotations`): the
     # runtime import stays local to each helper, mirroring every other
     # orchestrator reference in this file.
-    from orchestrator.merge_lane.worker import MergeOutcome  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MergeOutcome
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -635,8 +635,8 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
     ``orchestrator.merge_lane.landing_evidence``; the worker's
     ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
     """
-    import orchestrator.merge_lane.landing_evidence as landing_evidence  # type: ignore[reportMissingImports]
-    import orchestrator.merge_lane.worker as worker  # type: ignore[reportMissingImports]
+    import orchestrator.merge_lane.landing_evidence as landing_evidence
+    import orchestrator.merge_lane.worker as worker
 
     for module in (worker, landing_evidence):
         monkeypatch.setattr(module, 'patch_content_contained', stub)
@@ -649,7 +649,7 @@ def _make_orch_config(tmp_path: Path):
 
 
 def _make_registry():
-    from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
     return InFlightMergeRegistry()
@@ -677,7 +677,7 @@ class TestMergeRequestRequestId:
         MergeOutcome('done').
         """
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -1413,7 +1413,7 @@ class TestMergeRequestWaitSecsPositive:
         before the timeout.
         """
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -1662,7 +1662,7 @@ class TestMergeRequestDurableIntent:
         NOT cancelled (asyncio.shield protects it from the outer cancellation).
         """
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -1902,7 +1902,7 @@ class TestMergeCancel:
         False), and mis-reports cancelled=True.
         """
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -2240,7 +2240,7 @@ def _build_merge_server(
     Returns (server, mq, registry, event_store, harness).
     """
     from orchestrator.merge_lane.worker import (
-        InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        InFlightMergeRegistry,
     )
 
     esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -2286,7 +2286,7 @@ class TestBoundaryTableMcpSurface:
         Assert status='queued', position>=1, merge_queued event emitted.
         Extends TestMergeRequestWaitSecsZeroFree with the full §8-row-1 postcondition.
         """
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             QueuedBranch,
         )
@@ -2576,7 +2576,7 @@ class TestBoundaryTableMcpSurface:
 
         # Build a FRESH server (simulating restart) on the same event_store
         from orchestrator.merge_lane.worker import (
-            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
         )
 
         from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
@@ -2691,8 +2691,8 @@ class TestBoundaryTableMcpSurface:
         merge_status cross-check.
         """
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
-            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            InFlightMergeRegistry,
             MergeOutcome,
         )
 
@@ -2915,7 +2915,7 @@ class TestBoundaryTableMcpSurface:
             EventStore,
             EventType,
         )
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
             TerminalOutcomeRetention,
         )
@@ -2990,7 +2990,7 @@ class TestBoundaryTableMcpSurface:
             EventStore,
             EventType,
         )
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
             TerminalOutcomeRetention,
         )
@@ -3074,7 +3074,7 @@ class TestBoundaryTableMcpSurface:
         failure_diagnostic conditional, but never includes superseded_by.
         """
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         server, mq, _, _, _ = _build_merge_server(tmp_path)
@@ -3311,7 +3311,7 @@ class TestMergeRequestTipRecency:
         RED until step-6: without classifier_git_ops wired the MCP path
         always coalesces → returns 'attached' instead of 'queued'.
         """
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
 
@@ -3425,7 +3425,7 @@ class TestMergeRequestDuplicateInVerify:
     async def test_newer_sha_in_verify_returns_structured_reject(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
 
@@ -3524,7 +3524,7 @@ class TestMergeRequestRetentionParity:
     async def test_dispatched_merge_records_terminal_outcome_in_ring(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeOutcome,
             TerminalOutcomeRetention,
         )
@@ -3566,7 +3566,7 @@ class TestMergeRequestRetentionParity:
     async def test_coalesced_merge_registers_retention_alias(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             TerminalOutcomeRetention,
         )
 
@@ -3699,7 +3699,7 @@ class TestBoundary9CancelRetire:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
@@ -3859,7 +3859,7 @@ async def _run_fast_path_probe(
     metadata lookup off.  ``requested_ids``, when supplied, is appended to
     with every id ``scheduler.get_task`` is actually called with.
     """
-    from orchestrator.merge_lane.worker import MergeOutcome  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MergeOutcome
 
     class _RecordingEventStore:
         def __init__(self) -> None:
@@ -4031,7 +4031,7 @@ class TestMergeRequestDegenerateBranchFastPath:
         """
         from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
         from orchestrator.merge_lane.worker import (
-            MergeOutcome,  # type: ignore[reportMissingImports]
+            MergeOutcome,
         )
 
         result, _, events = await _run_fast_path_probe(

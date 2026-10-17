@@ -115,7 +115,7 @@ def validate_requested_lane(requested: Any) -> MergeLane | None:
     """
     if requested is None:
         return None
-    from orchestrator.merge_lane.worker import MERGE_LANES  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MERGE_LANES
 
     if not isinstance(requested, str) or requested not in MERGE_LANES:
         raise InvalidMergeLane(requested, tuple(MERGE_LANES))
@@ -147,7 +147,7 @@ def resolve_merge_lane(
     if requested is not None:
         return LaneChoice(lane=requested, source='argument')
 
-    from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         lane_for_task_metadata,
     )
 

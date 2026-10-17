@@ -2123,7 +2123,7 @@ class Harness:
         # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
         # here, in a periodic loop mirroring the main-tip-sweep lifecycle.
         from orchestrator.merge_lane.worker import (
-            NoLandingsCircuitBreaker as _NLCB,  # noqa: PLC0415
+            NoLandingsCircuitBreaker as _NLCB,
         )
         self._no_landings_breaker: _NLCB = _NLCB(
             window_samples=config.no_landings_breaker_window_samples,
@@ -5876,7 +5876,7 @@ class Harness:
             )
             return True
 
-        from orchestrator.merge_lane.types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         # Build + enqueue + stamp the durable race-guard marker (PRD leaf α §7)
         # via the shared submit primitive — the architect-desync exit (task
@@ -6032,7 +6032,7 @@ class Harness:
         propagated (mirrors ``enqueue_merge_request._on_finalized``).
         """
         try:
-            from orchestrator.merge_lane.types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 return  # abandoned/superseded — transient, no-op

@@ -49,6 +49,7 @@ from shared.task_statuses import TaskStatus
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.task_ground_truth import (
     BranchState,
@@ -1899,7 +1900,6 @@ from unittest.mock import AsyncMock  # noqa: E402
 
 from test_workflow import _make_workflow  # noqa: E402
 
-from orchestrator.merge_lane.gates import PlanFilesTouchedResult  # noqa: E402
 from orchestrator.workflow import WorkflowOutcome  # noqa: E402
 
 

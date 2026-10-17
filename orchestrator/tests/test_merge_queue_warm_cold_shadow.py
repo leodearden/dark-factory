@@ -39,6 +39,10 @@ from orchestrator.merge_lane.shadow import (
 )
 from orchestrator.merge_lane.worker import (
     PRODUCTION_VERIFIER,
+    MergeOutcome,
+    MergeRequest,
+    QueuedBranch,
+    SpeculativeMergeWorker,
     _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,
     parse_per_test_results,
@@ -1667,13 +1671,6 @@ class TestMaybeScheduleShadowCompare:
 # Step-15: Integration — warm capture + worker/harness wiring
 # ---------------------------------------------------------------------------
 
-from orchestrator.merge_lane.worker import (  # noqa: E402
-    MergeOutcome,
-    MergeRequest,
-    QueuedBranch,
-    SpeculativeMergeWorker,
-)
-
 
 def _make_warm_cold_config(
     project_root: Path,
@@ -1744,7 +1741,7 @@ class TestRunPostMergeVerifyOnResultCallback:
         self, tmp_path: Path
     ) -> None:
         """Passing on_result= must not raise TypeError (kwarg must exist)."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         received: list[VerifyResult] = []
         merge_wt = tmp_path / 'wt'

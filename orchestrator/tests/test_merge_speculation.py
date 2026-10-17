@@ -91,11 +91,11 @@ from orchestrator.git_ops import (  # noqa: F401
     _run,
 )
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_lane.disposition import (  # noqa: F401
+from orchestrator.merge_lane.disposition import (
     ClassificationResult,
     classify_merge_failure_disposition,
 )
-from orchestrator.merge_lane.landed_outbox import LandedOutbox  # noqa: F401
+from orchestrator.merge_lane.landed_outbox import LandedOutbox
 from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
 from orchestrator.merge_lane.worker import (
     MergeRequest,

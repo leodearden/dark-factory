@@ -2096,7 +2096,7 @@ class TestContendedLeaseDefers:
         30s ...')`` with ``req.result`` RESOLVED.
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
         from orchestrator.verify_cancel import lane_lock_path  # noqa: PLC0415
@@ -2214,7 +2214,7 @@ class TestContendedLeaseDefers:
         operator the opposite of the truth (the holder has been there a while;
         we simply cannot say how long from this exception).
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -2333,7 +2333,7 @@ class TestContendedLeaseDefers:
         (strict ``monkeypatch.setattr`` → AttributeError) and no sleep is
         performed.
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -2401,7 +2401,7 @@ class TestContendedLeaseDefers:
         for no benefit, so the backoff must be ``max(0, PERIOD - wait_secs)``.
         """
         from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -2467,7 +2467,7 @@ class TestContendedLeaseDefers:
         actually corrupt.
         """
 
-        from orchestrator.merge_lane.worker import PRODUCTION_CLOCK  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import PRODUCTION_CLOCK
 
         foreign_pgid = 2**31 - 1
         warm_path = warm_git_ops.persistent_merge_worktree_path
@@ -2558,7 +2558,7 @@ class TestContendedLeaseDefers:
         RED on main: ``MAX_CONTENDED_LEASE_DEFER_SECS`` does not exist (strict
         monkeypatch → AttributeError) and every defer requeues unconditionally.
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -2691,7 +2691,7 @@ class TestContendedLeaseDefers:
 
         RED before the amend: the first defer of the new streak caps out.
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -2984,7 +2984,7 @@ class TestContendedLeaseDefers:
         signature every time.
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
         from orchestrator.verify_cancel import lane_lock_path  # noqa: PLC0415
@@ -3071,7 +3071,7 @@ class TestContendedLeaseDefers:
         POPPED — because the lane lock genuinely WAS acquired here, so any
         prior streak is broken.
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -3163,7 +3163,7 @@ class TestContendedLeaseDefers:
         forever, converting a loud blocked outcome into a silent infinite
         defer loop.  So this test is the reason the raise is site-local.
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -3311,7 +3311,7 @@ class TestContendedLeaseDefers:
 
         RED on main: ``>=`` emits an ERROR on defers 2, 3 and 4.
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -3383,7 +3383,7 @@ class TestContendedLeaseDefers:
 
         RED on main: two defers advance it by two.
         """
-        from orchestrator.merge_lane.worker import (  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
 
@@ -3900,7 +3900,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
 
         Returns ``(worker, req, outcome, gate, fake_eq, main_sha, snap_after)``.
         """
-        from orchestrator.merge_lane.worker import PRODUCTION_CLOCK  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import PRODUCTION_CLOCK
 
         wt = await _make_branch_with_file(git_ops, branch, filename, 'x = 1\n')
 

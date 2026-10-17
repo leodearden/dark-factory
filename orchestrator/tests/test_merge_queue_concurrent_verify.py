@@ -1281,7 +1281,8 @@ class TestInflightStateAttrs:
 
     def test_inflight_entry_importable(self) -> None:
         """InflightEntry is importable from merge_queue."""
-        from orchestrator.merge_lane.worker import InflightEntry  # noqa: F401 (import check)
+        from orchestrator.merge_lane.worker import InflightEntry
+        assert isinstance(InflightEntry, type)
 
 
 # ---------------------------------------------------------------------------

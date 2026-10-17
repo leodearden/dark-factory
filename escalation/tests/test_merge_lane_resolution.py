@@ -35,7 +35,7 @@ from escalation.merge_lane_resolution import (
 # Cross-package orchestrator imports — mirrors test_merge_state_wiring.py's guard.
 # ---------------------------------------------------------------------------
 try:
-    from orchestrator.merge_lane.worker import MERGE_LANES  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MERGE_LANES
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False

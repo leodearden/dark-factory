@@ -95,7 +95,7 @@ async def test_fake_briefing_smoke() -> None:
 @pytest.fixture(autouse=True)
 def _reset_merge_provenance():
     """MergeProvenance._outbox is a process-global — never leak a bound outbox."""
-    from orchestrator.merge_lane.landed_outbox import MergeProvenance  # noqa: PLC0415
+    from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
     MergeProvenance._outbox = None
     yield
@@ -107,7 +107,7 @@ def test_merge_provenance_factories_smoke(tmp_path) -> None:
     from _workflow_helpers import _bind_landed_row, _Fixture, _make  # noqa: PLC0415
 
     from orchestrator.artifacts import TaskArtifacts  # noqa: PLC0415
-    from orchestrator.merge_lane.landed_outbox import MergeProvenance  # noqa: PLC0415
+    from orchestrator.merge_lane.landed_outbox import MergeProvenance
     from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
 
     fixture = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'pr')
