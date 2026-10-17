@@ -2794,6 +2794,29 @@ def test_validate_rejects_a_filed_ticket_row_missing_its_step():
     assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "step")
 
 
+def test_a_back_link_filed_before_finding_keys_existed_validates():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key=None)]))
+    assert mod.validate(codebook) == []
+
+
+def test_a_malformed_finding_key_on_a_filed_ticket_row_is_still_rejected():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key="fk-ZZZ")]))
+    assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "fk-ZZZ")
+
+
+def test_filed_ticket_errors_accepts_a_well_formed_row_keyed_or_not():
+    assert mod.filed_ticket_errors(_c1_ticket()) == []
+    assert mod.filed_ticket_errors(_c1_ticket(finding_key=None)) == []
+
+
+def test_filed_ticket_errors_names_the_offending_field_or_value():
+    unresolved = _c1_ticket()
+    del unresolved["resolution"]
+
+    assert any("guess" in error for error in mod.filed_ticket_errors(_c1_ticket(step="guess")))
+    assert any("resolution" in error for error in mod.filed_ticket_errors(unresolved))
+
+
 def test_validate_rejects_an_accepted_entry_without_accepted_by():
     entry = _c1_entry()
     del entry["accepted_by"]
