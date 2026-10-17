@@ -36,6 +36,7 @@ from shared.mcp_markup_middleware import (
     RepairPolicy,
     accepts_markup_override,
 )
+from shared.mcp_missing_arguments import MissingArgumentMiddleware
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 from orchestrator.mcp import markup_journal, markup_sink
@@ -403,6 +404,9 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             resolve_root=lambda worktree: _markup_project_root(worktree),
         ),
     ))
+    # Any tool call missing a required argument gets a structured refusal
+    # instead of pydantic's raw text (shared/src/shared/mcp_missing_arguments.py).
+    mcp.add_middleware(MissingArgumentMiddleware())
 
     if role == 'judge':
         @mcp.tool()
