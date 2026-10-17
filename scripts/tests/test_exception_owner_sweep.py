@@ -41,11 +41,13 @@ from exception_owner_sweep import (
     FailureStage,
     FindingKey,
     FindingKind,
+    Performed,
     Ports,
     RegisterView,
     RunConfig,
     SweepFailure,
     SweepResult,
+    Tally,
     act,
     escalation_url,
     parse_register,
@@ -319,7 +321,9 @@ class StubMcp:
     Records every call as ``(server, tool, args)``.  On the fused-memory side it
     plays the curator: a submitted candidate resolves per ``submit_outcome``,
     and a created task is INSERTED into the temp store with the submitted
-    metadata.  The stub writes; the sweep only reads.
+    metadata.  ``'pending'`` answers the unpersisted ``timeout`` of a curator
+    that has not finished, so the task may still appear after the sweep has
+    stopped waiting.  The stub writes; the sweep only reads.
     """
 
     def __init__(
@@ -434,8 +438,12 @@ def ports_for(project_root: Path, stub: StubMcp) -> Ports:
     )
 
 
-def sweep_once(register: RegisterView, ports: Ports) -> ActOutcome:
+def act_once(register: RegisterView, ports: Ports) -> Tally:
     return act(scan(register, ports, now=NOW), ports, now=NOW)
+
+
+def sweep_once(register: RegisterView, ports: Ports) -> ActOutcome:
+    return act_once(register, ports).counts()
 
 
 def view(*citations: Citation, slack_total: int = 0) -> RegisterView:
@@ -531,7 +539,7 @@ def test_scenario_22_an_owner_that_dies_between_scan_and_act_is_filed(project_ro
 
     measured = scan(register, ports, now=NOW)
     set_status(db, 2733, 'done')
-    outcome = act(measured, ports, now=NOW)
+    outcome = act(measured, ports, now=NOW).counts()
 
     assert len(stub.tool_calls('submit_task')) == 1
     assert outcome.filed == 1
@@ -545,7 +553,7 @@ def test_scenario_22_an_owner_revived_between_scan_and_act_is_not_filed(project_
 
     measured = scan(register, ports, now=NOW)
     set_status(db, 2733, 'pending')
-    outcome = act(measured, ports, now=NOW)
+    outcome = act(measured, ports, now=NOW).counts()
 
     assert stub.tool_calls('submit_task') == []
     assert stub.tool_calls('escalate_info') == []
@@ -580,6 +588,24 @@ def test_scan_is_read_only(project_root, seed):
     scan(view(Citation(INLINE_SCOPE, TaskRef(2733), ('m.py:1',))), ports_for(project_root, stub), now=NOW)
 
     assert [tool for _, tool, _ in stub.calls] == ['get_pending_escalations']
+
+
+def test_an_owner_cited_in_several_scopes_is_resolved_once_at_scan_and_once_at_act(project_root, seed):
+    created = TicketRef('tkt_0C')
+    stub = StubMcp(
+        seed([{'id': 7001, 'status': 'pending'}]),
+        owner_tickets={created.id: {'status': 'created', 'task_id': '7001'}},
+    )
+    register = view(
+        Citation(INLINE_SCOPE, created, ('c.py:1',)),
+        Citation(LIST_SCOPE, created, ('default',)),
+        Citation('pkg.third.LIST', created, ('default',)),
+    )
+
+    outcome = sweep_once(register, ports_for(project_root, stub))
+
+    assert outcome.checked == 3
+    assert len(stub.tool_calls('resolve_ticket')) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -624,11 +650,15 @@ def test_a_finding_combined_onto_a_closed_task_escalates_naming_the_outcome(proj
 
 
 @pytest.mark.parametrize(
-    ('submit_outcome', 'combine_into'),
-    [('combined', 4001), ('refused', None), ('pending', None)],
+    ('submit_outcome', 'combine_into', 'step'),
+    [
+        ('combined', 4001, Performed.ESCALATED_FILING_UNLANDED),
+        ('refused', None, Performed.ESCALATED_FILING_UNLANDED),
+        ('pending', None, Performed.ESCALATED_FILING_CURATING),
+    ],
 )
 def test_a_submit_that_yields_no_live_task_carrying_the_key_escalates(
-    project_root, seed, submit_outcome, combine_into
+    project_root, seed, submit_outcome, combine_into, step
 ):
     stub = StubMcp(
         seed([{'id': 2733, 'status': 'done'}, {'id': 4001, 'status': 'pending'}]),
@@ -636,11 +666,35 @@ def test_a_submit_that_yields_no_live_task_carrying_the_key_escalates(
         combine_into=combine_into,
     )
 
-    outcome = sweep_once(INLINE_2733, ports_for(project_root, stub))
+    tally = act_once(INLINE_2733, ports_for(project_root, stub))
 
-    assert (outcome.filed, outcome.escalated) == (0, 1)
+    assert (tally.counts().filed, tally.counts().escalated) == (0, 1)
+    assert [report.step for report in tally.reports] == [step]
     (escalated,) = stub.tool_calls('escalate_info')
     assert escalated['task_id'] == DEAD_2733.escalation_task_id()
+
+
+def test_a_filing_still_being_curated_escalates_saying_so_never_that_it_failed(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]), submit_outcome='pending')
+
+    sweep_once(INLINE_2733, ports_for(project_root, stub))
+
+    (escalated,) = stub.tool_calls('escalate_info')
+    detail = escalated['detail']
+    assert 'still being curated' in detail
+    assert 'tkt_S1' in detail
+    assert 'did not land' not in detail
+    assert 'did not land' not in escalated['evidence'][0]['observation']
+
+
+def test_a_filing_that_did_not_land_says_so(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]), submit_outcome='refused')
+
+    sweep_once(INLINE_2733, ports_for(project_root, stub))
+
+    (escalated,) = stub.tool_calls('escalate_info')
+    assert 'did not land' in escalated['detail']
+    assert 'still being curated' not in escalated['detail']
 
 
 def test_a_submit_error_is_a_fused_memory_failure(project_root, seed):
@@ -977,7 +1031,7 @@ def test_scenario_23_a_dry_run_reports_what_it_would_do_and_writes_nothing(proje
     assert result.ok
     assert {tool for _, tool, _ in stub.calls} <= {'get_pending_escalations', 'resolve_ticket'}
     assert not stamp_path(project_root).exists()
-    assert [(r.scope, r.owner, r.verdict.liveness, r.action) for r in result.reports] == [
+    assert [(r.scope, r.owner, r.verdict.liveness, r.step) for r in result.reports] == [
         (INLINE_SCOPE, TaskRef(2733), Liveness.DEAD, Action.FILE_TASK),
         (INLINE_SCOPE, TaskRef(5149), Liveness.LIVE, None),
         (LIST_SCOPE, TaskRef(2733), Liveness.DEAD, Action.FILE_ESCALATION),
@@ -1009,6 +1063,32 @@ def test_a_report_line_names_the_successor_that_keeps_an_owner_live(project_root
     assert 'via successor' in line
     assert '11' in line
     assert '12' in line
+
+
+def test_a_real_runs_lines_say_what_it_did_and_never_what_it_planned(project_root, seed):
+    stub = StubMcp(seed(dead_owners(3001, 11)))
+    document = register_document(debt=tuple(_site(f'm{index}.py', 1, TaskRef(3001 + index)) for index in range(11)))
+
+    result = run_once(project_root, stub, document)
+
+    assert [report.step for report in result.reports] == [Performed.FILED] * 10 + [Performed.OVERFLOW]
+    lines = result.lines()
+    assert lines[-1].endswith(f'-> {Performed.OVERFLOW.label}')
+    assert not any(Action.FILE_TASK.value in line for line in lines)
+
+
+def test_a_dry_runs_lines_label_every_step_as_planned(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+
+    document = register_document(debt=(_site('m.py', 1, TaskRef(2733)),), slack_total=3)
+
+    result = run_once(project_root, stub, document, dry_run=True)
+
+    lines = result.lines()
+    assert len(lines) == 2
+    for line in lines:
+        assert line.endswith(Action.FILE_TASK.value)
+        assert 'planned' in line
 
 
 def test_scenario_21_an_unreadable_store_files_nothing_and_says_so_once(project_root):
@@ -1043,7 +1123,7 @@ def _register_exited() -> Mapping[str, object]:
 @pytest.mark.parametrize(
     'document', [_register_exited, {**register_document(), 'schema_version': 2}], ids=['exited', 'unreadable']
 )
-def test_a_register_failure_fails_the_run_before_any_store_or_mcp_read(project_root, seed, document):
+def test_a_register_failure_fails_the_run_with_only_its_failure_report(project_root, seed, document):
     stub = StubMcp(seed([]))
 
     result = run_once(project_root, stub, document)
@@ -1051,7 +1131,34 @@ def test_a_register_failure_fails_the_run_before_any_store_or_mcp_read(project_r
     assert result.ok is False
     assert result.failure is not None
     assert result.failure.stage is FailureStage.REGISTER
-    assert [tool for _, tool, _ in stub.calls] == ['escalate_info']
+    assert [tool for _, tool, _ in stub.calls] == ['get_pending_escalations', 'escalate_info']
+
+
+def test_a_dependency_that_stays_down_is_reported_once_not_every_run(project_root):
+    write_prior_stamp(project_root)
+    stub = StubMcp(tasks_db_path(project_root))
+
+    first = run_once(project_root, stub, ONE_DEAD)
+    second = run_once(project_root, stub, ONE_DEAD)
+
+    (escalated,) = stub.tool_calls('escalate_info')
+    assert escalated['task_id'] == FAILURE_TASK_ID
+    assert (first.ok, second.ok) == (False, False)
+    assert second.failure is not None
+    assert second.failure.stage is FailureStage.STORE
+    assert 'still pending' in second.failure.detail
+    assert (stamped(project_root)['ok'], stamped(project_root)['last_run']) == (False, T0.isoformat())
+
+
+def test_a_failure_is_still_reported_when_the_pending_queue_is_unreadable(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]), fail_on=frozenset({'get_pending_escalations'}))
+
+    result = run_once(project_root, stub, ONE_DEAD)
+
+    (escalated,) = stub.tool_calls('escalate_info')
+    assert escalated['task_id'] == FAILURE_TASK_ID
+    assert result.failure is not None
+    assert result.failure.stage is FailureStage.ESCALATION
 
 
 def test_an_unreachable_escalation_server_fails_loud_without_raising(project_root, seed):

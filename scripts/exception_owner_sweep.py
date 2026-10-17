@@ -443,11 +443,9 @@ def _carriers(ports: Ports, field: str) -> tuple[liveness.TaskRow, ...]:
     return _from_store(ports.db, lambda: liveness.read_tasks_carrying(ports.db, field))
 
 
-def pending_escalation_ids(ports: Ports) -> frozenset[str]:
+def pending_escalation_ids(escalation: ToolCall) -> frozenset[str]:
     """The ``task_id`` of every pending escalation: one ``get_pending_escalations`` call."""
-    answer = _call(
-        ports.escalation, FailureStage.ESCALATION, 'get_pending_escalations', {'compact': True}
-    )
+    answer = _call(escalation, FailureStage.ESCALATION, 'get_pending_escalations', {'compact': True})
     records = answer.get('result')
     if not isinstance(records, list):
         raise SweepFailure(
@@ -476,7 +474,7 @@ class Scan:
 
 def scan(register: RegisterView, ports: Ports, *, now: datetime.datetime) -> Scan:
     """Resolve every cited owner once; reads only."""
-    pending = pending_escalation_ids(ports)
+    pending = pending_escalation_ids(ports.escalation)
     resolve = owner_resolver(ports)
     by_owner = {owner: resolve(owner) for owner in dict.fromkeys(c.owner for c in register.citations)}
     verdicts = {(c.scope, c.owner): by_owner[c.owner] for c in register.citations}
@@ -484,11 +482,20 @@ def scan(register: RegisterView, ports: Ports, *, now: datetime.datetime) -> Sca
 
 
 class Action(enum.Enum):
+    """What :func:`decide` plans for one finding, before the output bound or any output."""
+
     SKIP_LIVE_TASK = 'skip_live_task'
     SKIP_PENDING_ESCALATION = 'skip_pending_escalation'
     ESCALATE_CLOSED_FINDING = 'escalate_closed_finding'
     FILE_TASK = 'file_task'
     FILE_ESCALATION = 'file_escalation'
+
+    @property
+    def label(self) -> str:
+        return f'planned {self.value}'
+
+
+_SKIPS = frozenset({Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION})
 
 
 def decide(
@@ -587,6 +594,11 @@ class FilingOutcome:
     outcome: liveness.TicketOutcome
     task_row: liveness.TaskRow | None
 
+    @property
+    def still_curating(self) -> bool:
+        """The curator had not answered within the wait: a task carrying the key may yet appear."""
+        return self.outcome.state is liveness.TicketState.PENDING
+
 
 def _submit(key: FindingKey, body: _Body, ports: Ports) -> str:
     args: dict[str, object] = {
@@ -625,8 +637,7 @@ def _file_task(key: FindingKey, body: _Body, ports: Ports) -> FilingOutcome:
     return FilingOutcome(confirmed=confirmed, ticket=ticket, outcome=outcome, task_row=row)
 
 
-def _unconfirmed_body(body: _Body, filing: FilingOutcome) -> _Body:
-    """*body* plus why its filing did not land, for the escalation that replaces it."""
+def _unlanded(filing: FilingOutcome) -> str:
     outcome = filing.outcome
     reason = '' if outcome.reason is None else f' ({outcome.reason})'
     if outcome.task_id is None:
@@ -635,10 +646,21 @@ def _unconfirmed_body(body: _Body, filing: FilingOutcome) -> _Body:
         target = f'task {outcome.task_id}, which the store does not hold'
     else:
         target = f'task {outcome.task_id}, status {filing.task_row.status!r}, not carrying this finding'
-    landed = f'Filing did not land: ticket {filing.ticket} resolved {outcome.status}{reason} to {target}.'
-    return dataclasses.replace(
-        body, detail=f'{body.detail}\n{landed}', observation=f'{body.observation}; {landed}'
+    return f'Filing did not land: ticket {filing.ticket} resolved {outcome.status}{reason} to {target}.'
+
+
+def _curating(filing: FilingOutcome) -> str:
+    return (
+        f'Filing still being curated: ticket {filing.ticket} had not resolved after '
+        f'{SUBMIT_RESOLVE_WAIT_SECS} s. If the curator creates a task carrying this finding, '
+        'that task is its home and this escalation can be resolved.'
     )
+
+
+def _unconfirmed_body(body: _Body, filing: FilingOutcome) -> _Body:
+    """*body* plus why its filing is not confirmed, for the escalation that replaces it."""
+    why = _curating(filing) if filing.still_curating else _unlanded(filing)
+    return dataclasses.replace(body, detail=f'{body.detail}\n{why}', observation=f'{body.observation}; {why}')
 
 
 def _escalate(key: FindingKey, body: _Body, ports: Ports, now: datetime.datetime) -> None:
@@ -694,65 +716,163 @@ def _overflow_body(count: int) -> _Body:
     )
 
 
+class Performed(enum.Enum):
+    """What :func:`act` did about one finding, which can differ from what was planned."""
+
+    SKIPPED_EXISTING = 'skipped_existing'
+    FILED = 'filed'
+    ESCALATED = 'escalated'
+    ESCALATED_FILING_UNLANDED = 'escalated_filing_unlanded'
+    ESCALATED_FILING_CURATING = 'escalated_filing_still_curating'
+    OVERFLOW = 'overflow'
+
+    @property
+    def escalated(self) -> bool:
+        return self in (
+            Performed.ESCALATED,
+            Performed.ESCALATED_FILING_UNLANDED,
+            Performed.ESCALATED_FILING_CURATING,
+        )
+
+    @property
+    def label(self) -> str:
+        return self.value
+
+
+Step = Action | Performed
+"""A finding's step: planned on a dry run, performed on a real one."""
+
+
+def _verdict_phrase(verdict: liveness.OwnerVerdict) -> str:
+    if verdict.liveness is liveness.Liveness.DEAD:
+        return f'dead ({_death_facts(verdict)})'
+    if verdict.liveness is liveness.Liveness.LIVE_VIA_SUCCESSOR:
+        chain = ' -> '.join(map(str, verdict.path))
+        return f'live via successor task {verdict.owning_task} ({chain})'
+    if verdict.owning_task is None:
+        return 'live (ticket still being curated)'
+    return f'live (task {verdict.owning_task})'
+
+
+@dataclass(frozen=True)
+class Report:
+    """One citation as measured, and the step taken on it (None: there was none to take).
+
+    The step's label says whether it was planned or performed, so a journal
+    line never claims an output the run did not send.
+    """
+
+    scope: str
+    owner: Owner
+    verdict: liveness.OwnerVerdict
+    step: Step | None
+
+    def line(self) -> str:
+        head = f'{self.scope} {_owner_label(self.owner)}: {_verdict_phrase(self.verdict)}'
+        return head if self.step is None else f'{head} -> {self.step.label}'
+
+
+@dataclass(frozen=True)
+class Tally:
+    """One sweep's steps, which its counts derive from.
+
+    Attributes:
+        reports: One per citation, in register order.
+        tighten: The tighten finding's step; None while there is no slack.
+        rolled_up: Whether the overflow roll-up was sent.
+    """
+
+    reports: tuple[Report, ...] = ()
+    tighten: Step | None = None
+    rolled_up: bool = False
+
+    def counts(self) -> ActOutcome:
+        verdicts = collections.Counter(report.verdict.liveness for report in self.reports)
+        steps = [*(report.step for report in self.reports), self.tighten]
+        performed = collections.Counter(step for step in steps if isinstance(step, Performed))
+        return ActOutcome(
+            checked=len(self.reports),
+            findings=verdicts[liveness.Liveness.DEAD],
+            filed=performed[Performed.FILED],
+            escalated=sum(n for step, n in performed.items() if step.escalated) + int(self.rolled_up),
+            skipped_existing=performed[Performed.SKIPPED_EXISTING],
+            overflow=performed[Performed.OVERFLOW],
+            via_successor=verdicts[liveness.Liveness.LIVE_VIA_SUCCESSOR],
+        )
+
+
 class _Outputs:
-    """One act() run's outputs: what it has sent, skipped and held back so far."""
+    """One act() run's outputs: the steps taken so far, and the output budget left."""
 
     def __init__(self, ports: Ports, pending: frozenset[str], now: datetime.datetime) -> None:
         self.ports = ports
         self.pending = set(pending)
         self.now = now
         self.budget = MAX_OUTPUTS_PER_RUN
-        self.counts: collections.Counter[str] = collections.Counter()
+        self.reports: list[Report] = []
+        self.tighten: Performed | None = None
+        self.rolled_up = False
+        self._carriers: tuple[liveness.TaskRow, ...] | None = None
 
-    def raise_finding(self, key: FindingKey, body: _Body) -> None:
-        """Re-read the carriers, decide, and perform at most one budgeted output for *key*."""
-        action = decide(
-            key, carriers=_carriers(self.ports, FINDING_KEY_FIELD), pending=frozenset(self.pending)
-        )
-        if action in (Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION):
-            self.counts['skipped_existing'] += 1
-            return
+    def tally(self) -> Tally:
+        return Tally(tuple(self.reports), self.tighten, self.rolled_up)
+
+    def _decide(self, key: FindingKey, *, reread: bool) -> Action:
+        if reread or self._carriers is None:
+            self._carriers = _carriers(self.ports, FINDING_KEY_FIELD)
+        return decide(key, carriers=self._carriers, pending=frozenset(self.pending))
+
+    def raise_finding(self, key: FindingKey, body: _Body) -> Performed:
+        """Perform at most one budgeted output for *key*, returning the step taken.
+
+        The carriers are re-read only where an output can follow (INV-3), so a
+        finding that ends skipped or held back costs no further store scan.
+        """
+        if self._decide(key, reread=False) in _SKIPS:
+            return Performed.SKIPPED_EXISTING
         if self.budget == 0:
-            self.counts['overflow'] += 1
-            return
+            return Performed.OVERFLOW
+        action = self._decide(key, reread=True)
+        if action in _SKIPS:
+            return Performed.SKIPPED_EXISTING
         self.budget -= 1
         if action is Action.FILE_TASK:
-            self._file(key, body)
-        else:
-            self._escalate(key, body)
+            return self._file(key, body)
+        self._escalate(key, body)
+        return Performed.ESCALATED
 
-    def _file(self, key: FindingKey, body: _Body) -> None:
+    def _file(self, key: FindingKey, body: _Body) -> Performed:
         filing = _file_task(key, body, self.ports)
         if filing.confirmed:
-            self.counts['filed'] += 1
-        else:
-            self._escalate(key, _unconfirmed_body(body, filing))
+            return Performed.FILED
+        self._escalate(key, _unconfirmed_body(body, filing))
+        if filing.still_curating:
+            return Performed.ESCALATED_FILING_CURATING
+        return Performed.ESCALATED_FILING_UNLANDED
 
     def _escalate(self, key: FindingKey, body: _Body) -> None:
         _escalate(key, body, self.ports, self.now)
         self.pending.add(key.escalation_task_id())
-        self.counts['escalated'] += 1
 
     def roll_up(self) -> None:
         """The one unbudgeted message: how many findings the bound held back."""
-        held_back = self.counts['overflow']
+        held_back = self.tally().counts().overflow
         if held_back and OVERFLOW_KEY.escalation_task_id() not in self.pending:
             self._escalate(OVERFLOW_KEY, _overflow_body(held_back))
+            self.rolled_up = True
 
 
-Judged = tuple[Citation, liveness.OwnerVerdict]
-
-
-def _desired_notes(judged: Sequence[Judged]) -> dict[int, set[str]]:
+def _desired_notes(reports: Sequence[Report]) -> dict[int, set[str]]:
     """Owning task -> the scopes citing it, for each owner live in its own right.
 
     That is a directly cited task, or the task a cited ticket resolved to;
     never a successor, which no citation names.
     """
     desired: dict[int, set[str]] = {}
-    for citation, verdict in judged:
+    for report in reports:
+        verdict = report.verdict
         if verdict.liveness is liveness.Liveness.LIVE and verdict.owning_task is not None:
-            desired.setdefault(verdict.owning_task, set()).add(citation.scope)
+            desired.setdefault(verdict.owning_task, set()).add(report.scope)
     return desired
 
 
@@ -767,15 +887,15 @@ def _write_note(ports: Ports, task_id: int, note: Mapping[str, object] | None) -
     _call(ports.fused_memory, FailureStage.FUSED_MEMORY, 'update_task', args)
 
 
-def _reconcile_notes(judged: Sequence[Judged], ports: Ports, now: datetime.datetime) -> None:
+def _reconcile_notes(reports: Sequence[Report], ports: Ports, now: datetime.datetime) -> None:
     """Point every live cited owner at the register, and clear notes nothing names (INV-9).
 
     A note is written only when its scopes change, so ``as_of`` is the day
     these scopes were first seen.  A carrier any citation still names (its
     owner, or its ticket's task) keeps its note even when dead.
     """
-    desired = _desired_notes(judged)
-    named = {verdict.path[0] for _, verdict in judged if verdict.path}
+    desired = _desired_notes(reports)
+    named = {report.verdict.path[0] for report in reports if report.verdict.path}
     current = {row.id: row.metadata[OWNS_NOTE_FIELD] for row in _carriers(ports, OWNS_NOTE_FIELD)}
     for task_id, scopes in sorted(desired.items()):
         held = current.get(task_id)
@@ -795,34 +915,33 @@ class ActStopped(SweepFailure):
 
 
 def _act_on(scan: Scan, outputs: _Outputs) -> None:
-    resolve = owner_resolver(outputs.ports)
-    judged: list[Judged] = []
+    resolve = functools.cache(owner_resolver(outputs.ports))
     for citation in scan.register.citations:
         verdict = resolve(citation.owner)
-        judged.append((citation, verdict))
-        outputs.counts['checked'] += 1
-        outputs.counts['via_successor'] += verdict.liveness is liveness.Liveness.LIVE_VIA_SUCCESSOR
+        step: Performed | None = None
         if verdict.liveness is liveness.Liveness.DEAD:
-            outputs.counts['findings'] += 1
             key = FindingKey(FindingKind.DEAD_OWNER, citation.scope, citation.owner)
-            outputs.raise_finding(key, _dead_owner_body(citation, verdict))
+            step = outputs.raise_finding(key, _dead_owner_body(citation, verdict))
+        outputs.reports.append(Report(citation.scope, citation.owner, verdict, step))
     if scan.register.slack_total > 0:
-        outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
+        outputs.tighten = outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
     outputs.roll_up()
-    _reconcile_notes(judged, outputs.ports, outputs.now)
+    _reconcile_notes(outputs.reports, outputs.ports, outputs.now)
 
 
-def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
+def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> Tally:
     """Re-resolve each cited owner immediately before acting on it, then act (INV-3).
 
-    Any failure raises :class:`ActStopped`, counting what had already landed.
+    An owner cited in several scopes is re-read once, before its first
+    citation is acted on.  Any failure raises :class:`ActStopped`, counting
+    what had already landed.
     """
     outputs = _Outputs(ports, scan.pending, now)
     try:
         _act_on(scan, outputs)
     except SweepFailure as exc:
-        raise ActStopped(exc, ActOutcome(**outputs.counts)) from exc
-    return ActOutcome(**outputs.counts)
+        raise ActStopped(exc, outputs.tally().counts()) from exc
+    return outputs.tally()
 
 
 # ---------------------------------------------------------------------------
@@ -845,49 +964,8 @@ class RunConfig:
         return self.project_root / exception_register.SWEEP_STATE_PATH
 
 
-def _verdict_phrase(verdict: liveness.OwnerVerdict) -> str:
-    if verdict.liveness is liveness.Liveness.DEAD:
-        return f'dead ({_death_facts(verdict)})'
-    if verdict.liveness is liveness.Liveness.LIVE_VIA_SUCCESSOR:
-        chain = ' -> '.join(map(str, verdict.path))
-        return f'live via successor task {verdict.owning_task} ({chain})'
-    if verdict.owning_task is None:
-        return 'live (ticket still being curated)'
-    return f'live (task {verdict.owning_task})'
-
-
-@dataclass(frozen=True)
-class Report:
-    """One citation as measured, and what the sweep plans to do about it (None: nothing)."""
-
-    scope: str
-    owner: Owner
-    verdict: liveness.OwnerVerdict
-    action: Action | None
-
-    def line(self) -> str:
-        head = f'{self.scope} {_owner_label(self.owner)}: {_verdict_phrase(self.verdict)}'
-        return head if self.action is None else f'{head} -> {self.action.value}'
-
-
-@dataclass(frozen=True)
-class Plan:
-    """What the sweep would do, decided from one read of the finding carriers."""
-
-    reports: tuple[Report, ...]
-    tighten: Action | None
-
-    def counts(self) -> ActOutcome:
-        verdicts = collections.Counter(report.verdict.liveness for report in self.reports)
-        return ActOutcome(
-            checked=len(self.reports),
-            findings=verdicts[liveness.Liveness.DEAD],
-            via_successor=verdicts[liveness.Liveness.LIVE_VIA_SUCCESSOR],
-        )
-
-
-def plan(scan: Scan, ports: Ports) -> Plan:
-    """Each citation's planned action as of *scan*, ignoring the output bound; reads only."""
+def plan(scan: Scan, ports: Ports) -> Tally:
+    """Each citation's planned step as of *scan*, ignoring the output bound; reads only."""
     carriers = _carriers(ports, FINDING_KEY_FIELD)
 
     def planned(key: FindingKey) -> Action:
@@ -900,7 +978,7 @@ def plan(scan: Scan, ports: Ports) -> Plan:
         key = FindingKey(FindingKind.DEAD_OWNER, citation.scope, citation.owner)
         reports.append(Report(citation.scope, citation.owner, verdict, planned(key) if dead else None))
     tighten = planned(TIGHTEN_KEY) if scan.register.slack_total > 0 else None
-    return Plan(tuple(reports), tighten)
+    return Tally(tuple(reports), tighten)
 
 
 @dataclass(frozen=True)
@@ -914,7 +992,8 @@ class SweepResult(ActOutcome):
     """One run: its counts, what its stamp says, and the corroborated list.
 
     ``slack`` is None when the run failed; ``last_run`` is the stamp's, so it
-    is the PRIOR run's after a failure and None after a dry run.
+    is the PRIOR run's after a failure and None after a dry run.  The steps
+    in ``reports`` and ``tighten`` are planned on a dry run, performed otherwise.
     """
 
     ok: bool = False
@@ -922,7 +1001,7 @@ class SweepResult(ActOutcome):
     last_run: datetime.datetime | None = None
     failure: Failure | None = None
     reports: tuple[Report, ...] = ()
-    tighten: Action | None = None
+    tighten: Step | None = None
 
     def record(self) -> dict[str, object]:
         """The stamp and stdout object: the Contract's nine keys, plus ``failure`` and ``via_successor``."""
@@ -939,7 +1018,7 @@ class SweepResult(ActOutcome):
     def lines(self) -> list[str]:
         lines = [report.line() for report in self.reports]
         if self.tighten is not None:
-            lines.append(f'baseline slack {self.slack} -> {self.tighten.value}')
+            lines.append(f'baseline slack {self.slack} -> {self.tighten.label}')
         return lines
 
 
@@ -947,10 +1026,26 @@ def _write_stamp(config: RunConfig, result: SweepResult) -> None:
     atomic_write_text(config.stamp_path, json.dumps(result.record(), indent=2) + '\n', mkdir=True)
 
 
+def _failure_report_pending(escalation: ToolCall) -> bool:
+    """Whether an earlier run's failure report is still pending (INV-4).
+
+    An unreadable queue answers False: a duplicate report beats a silent outage.
+    """
+    try:
+        return FAILURE_TASK_ID in pending_escalation_ids(escalation)
+    except SweepFailure:
+        return False
+
+
 def _report_failure(escalation: ToolCall | None, failure: SweepFailure, now: datetime.datetime) -> str:
-    """Send the one best-effort infra_issue escalation; the failure's detail, plus why that was not sent."""
+    """Send the one best-effort infra_issue escalation, unless one is pending.
+
+    Returns the failure's detail, plus why no escalation was sent.
+    """
     if escalation is None:
         return f'{failure.detail}; no escalation server to report it to'
+    if _failure_report_pending(escalation):
+        return f'{failure.detail}; an earlier failure report ({FAILURE_TASK_ID}) is still pending, so none was sent'
     args: dict[str, object] = {
         'task_id': FAILURE_TASK_ID,
         'agent_role': AGENT_ROLE,
@@ -998,20 +1093,19 @@ def run(
     read_register: Callable[[], Mapping[str, object]],
     now: datetime.datetime,
 ) -> SweepResult:
-    """Measure, then (unless a dry run) act and stamp.  A :class:`SweepFailure` is returned, never raised."""
+    """Measure, then plan (a dry run) or act and stamp.  A :class:`SweepFailure` is returned, never raised."""
     try:
         measured = scan(parse_register(read_register()), ports, now=now)
-        planned = plan(measured, ports)
-        done = planned.counts() if config.dry_run else act(measured, ports, now=now)
+        tally = plan(measured, ports) if config.dry_run else act(measured, ports, now=now)
     except SweepFailure as exc:
         return _failed(config, exc, escalation=ports.escalation, now=now)
     result = SweepResult(
-        **dataclasses.asdict(done),
+        **dataclasses.asdict(tally.counts()),
         ok=True,
         slack=measured.register.slack_total,
         last_run=None if config.dry_run else now,
-        reports=planned.reports,
-        tighten=planned.tighten,
+        reports=tally.reports,
+        tighten=tally.tighten,
     )
     if not config.dry_run:
         _write_stamp(config, result)
