@@ -3548,6 +3548,27 @@ class LinkHealConfig(BaseModel):
     )
 
 
+class OverreachGuardConfig(BaseModel):
+    """The ruling-overreach guard's Stage S shadow (design.md §6.1, task 6137)."""
+
+    shadow_enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for the record-only overreach shadow judge. Read live per '
+            'job by services/overreach_shadow.py, so a hot reload takes effect on '
+            'the next decisions_and_rationale write.'
+        ),
+    )
+    judge_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            'Bound on one shadow judge call; a slower call is recorded as failed. '
+            'Read live per job by services/overreach_shadow.py.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -3593,6 +3614,9 @@ class FusedMemoryConfig(BaseSettings):
     )
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage above;
+    # shadow_enabled is a kill switch, and a restart-only kill switch is none.
+    overreach_guard: OverreachGuardConfig = Field(default_factory=OverreachGuardConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     # Here nullability would additionally cost the KILL SWITCH its green tier,
     # and a restart-only kill switch is no kill switch.
