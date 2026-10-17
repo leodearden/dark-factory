@@ -32,6 +32,7 @@ from fused_memory.reconciliation.throughput import (
     capacity_verdict,
     cycle_seconds,
     drain_stats,
+    inflow_concentration,
     inflow_daily,
     inflow_hourly,
     main,
@@ -46,6 +47,7 @@ def _make_event(
     project_id: str = 'reify',
     event_type: EventType = EventType.task_status_changed,
     timestamp: datetime | None = None,
+    payload: dict | None = None,
 ) -> ReconciliationEvent:
     return ReconciliationEvent(
         id=str(uuid.uuid4()),
@@ -53,7 +55,7 @@ def _make_event(
         source=EventSource.agent,
         project_id=project_id,
         timestamp=timestamp or datetime.now(UTC),
-        payload={'test': True},
+        payload={'test': True} if payload is None else payload,
         agent_id=None,
     )
 
@@ -292,6 +294,191 @@ async def test_inflow_daily_composition_survives_the_rollup_boundary(recon_db):
         'task_status_changed': 4,
         'memory_added': 2,
         'task_modified': 2,
+    }
+
+
+# ── inflow_concentration ───────────────────────────────────────────────
+#
+# Per-event_type composition cannot tell organic growth from one task looping
+# through the same transitions (task 7076: two solar_challenge tasks were 93%
+# of a "tenfold" inflow rise).  Per-task attribution reads the payload's
+# task_id, and payloads exist only on LIVE event_buffer rows — cleanup_drained
+# rolls up just (project, hour, event_type) — so the reader covers live rows
+# only, and an already-swept burst is deliberately unattributable.
+
+
+async def _push_task_events(
+    buf,
+    task_id: str | int,
+    event_type: EventType,
+    count: int,
+    *,
+    timestamp: datetime = _H13,
+    project_id: str = 'reify',
+) -> None:
+    for _ in range(count):
+        await buf.push(_make_event(
+            project_id=project_id, event_type=event_type, timestamp=timestamp,
+            payload={'task_id': task_id},
+        ))
+
+
+async def _seed_concentration(buf) -> None:
+    """644 x5 (3 modified + 2 status), 636 x3, '7' x1, plus 2 task-less memory events."""
+    await _push_task_events(buf, '644', EventType.task_modified, 3)
+    await _push_task_events(buf, '644', EventType.task_status_changed, 2)
+    await _push_task_events(buf, '636', EventType.task_status_changed, 3)
+    await _push_task_events(buf, '7', EventType.task_modified, 1)
+    for _ in range(2):
+        await buf.push(_make_event(
+            timestamp=_H13, event_type=EventType.memory_added,
+            payload={'memory_id': 'm-1'},
+        ))
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_ranks_tasks_by_live_row_count(recon_db):
+    """(a) Tasks ranked by event count, each with its share of ALL live rows."""
+    await _seed_concentration(recon_db)
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section['live_events'] == 11
+    assert section['unattributed_events'] == 2
+    top = section['top_tasks']
+    assert [entry['task_id'] for entry in top] == ['644', '636', '7']
+    assert top[0] == {
+        'task_id': '644',
+        'events': 5,
+        'share': pytest.approx(5 / 11),
+        'composition': {'task_modified': 3, 'task_status_changed': 2},
+    }
+    assert top[1]['events'] == 3
+    assert top[1]['composition'] == {'task_status_changed': 3}
+    assert top[2]['events'] == 1
+    assert json.loads(json.dumps(section)) == section
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_merges_int_and_str_forms_of_one_task_id(recon_db):
+    """(a) An int task_id and its string form are one task, never two entries."""
+    await _seed_concentration(recon_db)
+    await _push_task_events(recon_db, 7, EventType.task_status_changed, 1)
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section['live_events'] == 12
+    sevens = [entry for entry in section['top_tasks'] if entry['task_id'] == '7']
+    assert len(sevens) == 1
+    assert sevens[0]['events'] == 2
+    assert sevens[0]['composition'] == {
+        'task_modified': 1, 'task_status_changed': 1,
+    }
+    assert all(isinstance(entry['task_id'], str) for entry in section['top_tasks'])
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_reads_live_rows_only(recon_db):
+    """(b) Swept rows carry no payload, so they are counted by inflow but never attributed.
+
+    The contrast between the two readers IS the contract: inflow_daily still
+    counts the rolled-up hour-13 rows, inflow_concentration cannot see them.
+    A drained row that has not been swept yet is still live, so it counts.
+    """
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_modified, 4)
+    await recon_db.drain('reify')
+    assert await recon_db.cleanup_drained(max_age_seconds=0) == 4
+
+    await _push_task_events(
+        recon_db, '636', EventType.task_status_changed, 2, timestamp=_H14)
+    await recon_db.drain('reify')  # drained, NOT swept: still a live row
+    await _push_task_events(
+        recon_db, '636', EventType.task_modified, 1, timestamp=_H14)
+
+    section = inflow_concentration(db, 'reify')
+
+    assert section['live_events'] == 3
+    assert [entry['task_id'] for entry in section['top_tasks']] == ['636']
+    assert section['top_tasks'][0]['composition'] == {
+        'task_status_changed': 2, 'task_modified': 1,
+    }
+    for bound in (section['window_start'], section['window_end']):
+        assert isinstance(bound, str)
+        parsed = datetime.fromisoformat(bound)
+        assert parsed.utcoffset() is not None
+        assert parsed.astimezone(UTC).strftime('%Y-%m-%dT%H') == '2026-07-25T14'
+
+    assert inflow_daily(db, 'reify')['total_events'] == 7, (
+        'the swept rows are still inflow — they are only unattributable'
+    )
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_truncates_to_top_n_with_a_stable_tie_break(recon_db):
+    """(c) Equal counts order by task id, so the truncation is deterministic."""
+    for task_id in ('30', '10', '20'):
+        await _push_task_events(recon_db, task_id, EventType.task_modified, 2)
+
+    section = inflow_concentration(recon_db._db_path, 'reify', top_n=2)
+
+    assert [entry['task_id'] for entry in section['top_tasks']] == ['10', '20']
+    assert section['live_events'] == 6
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_counts_a_malformed_payload_as_unattributed(recon_db):
+    """(d) A payload that is not JSON is advisory data gone bad, not a report outage."""
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_modified, 2)
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "UPDATE event_buffer SET payload = 'not json' "
+            'WHERE rowid = (SELECT MIN(rowid) FROM event_buffer)')
+        conn.commit()
+    finally:
+        conn.close()
+
+    section = inflow_concentration(db, 'reify')
+
+    assert section['live_events'] == 2
+    assert section['unattributed_events'] == 1
+    assert section['top_tasks'][0]['task_id'] == '644'
+    assert section['top_tasks'][0]['events'] == 1
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_scopes_by_project_and_since(recon_db):
+    """(e) Another project's rows never appear; `since` floors by UTC hour."""
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_modified, 3)
+    await _push_task_events(
+        recon_db, '636', EventType.task_modified, 2, timestamp=_H14)
+    await _push_task_events(
+        recon_db, '999', EventType.task_modified, 5, project_id='other')
+
+    unfloored = inflow_concentration(db, 'reify')
+    assert unfloored['live_events'] == 5
+    assert '999' not in [entry['task_id'] for entry in unfloored['top_tasks']]
+
+    floored = inflow_concentration(db, 'reify', since='2026-07-25T14')
+    assert floored['live_events'] == 2
+    assert [entry['task_id'] for entry in floored['top_tasks']] == ['636']
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_is_empty_on_an_empty_database(recon_db):
+    """(f) No live rows: zero counts and no window, never a division by zero."""
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section == {
+        'window_start': None,
+        'window_end': None,
+        'live_events': 0,
+        'unattributed_events': 0,
+        'top_tasks': [],
     }
 
 
