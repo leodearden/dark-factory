@@ -712,12 +712,60 @@ class _Outputs:
             self._escalate(OVERFLOW_KEY, _overflow_body(held_back))
 
 
+Judged = tuple[Citation, liveness.OwnerVerdict]
+
+
+def _desired_notes(judged: Sequence[Judged]) -> dict[int, set[str]]:
+    """Owning task -> the scopes citing it, for each owner live in its own right.
+
+    That is a directly cited task, or the task a cited ticket resolved to;
+    never a successor, which no citation names.
+    """
+    desired: dict[int, set[str]] = {}
+    for citation, verdict in judged:
+        if verdict.liveness is liveness.Liveness.LIVE and verdict.owning_task is not None:
+            desired.setdefault(verdict.owning_task, set()).add(citation.scope)
+    return desired
+
+
+def _write_note(ports: Ports, task_id: int, note: Mapping[str, object] | None) -> None:
+    args: dict[str, object] = {
+        'id': str(task_id),
+        'project_root': str(ports.project_root),
+        'metadata': {OWNS_NOTE_FIELD: None if note is None else dict(note)},
+        'metadata_mode': 'merge',
+        'agent_id': AGENT_ROLE,
+    }
+    _call(ports.fused_memory, FailureStage.FUSED_MEMORY, 'update_task', args)
+
+
+def _reconcile_notes(judged: Sequence[Judged], ports: Ports, now: datetime.datetime) -> None:
+    """Point every live cited owner at the register, and clear notes nothing names (INV-9).
+
+    A note is written only when its scopes change, so ``as_of`` is the day
+    these scopes were first seen.  A carrier any citation still names (its
+    owner, or its ticket's task) keeps its note even when dead.
+    """
+    desired = _desired_notes(judged)
+    named = {verdict.path[0] for _, verdict in judged if verdict.path}
+    current = {row.id: row.metadata[OWNS_NOTE_FIELD] for row in _carriers(ports, OWNS_NOTE_FIELD)}
+    for task_id, scopes in sorted(desired.items()):
+        held = current.get(task_id)
+        if not (isinstance(held, Mapping) and held.get('scopes') == sorted(scopes)):
+            note = {'scopes': sorted(scopes), 'as_of': now.date().isoformat(), 'report': REPORT_COMMAND}
+            _write_note(ports, task_id, note)
+    for task_id in sorted(current.keys() - named):
+        _write_note(ports, task_id, None)
+
+
 def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
     """Re-resolve each cited owner immediately before acting on it, then act (INV-3)."""
     resolve = owner_resolver(ports)
     outputs = _Outputs(ports, scan.pending, now)
+    judged: list[Judged] = []
     for citation in scan.register.citations:
         verdict = resolve(citation.owner)
+        judged.append((citation, verdict))
         outputs.counts['checked'] += 1
         outputs.counts['via_successor'] += verdict.liveness is liveness.Liveness.LIVE_VIA_SUCCESSOR
         if verdict.liveness is liveness.Liveness.DEAD:
@@ -727,4 +775,5 @@ def act(scan: Scan, ports: Ports, *, now: datetime.datetime) -> ActOutcome:
     if scan.register.slack_total > 0:
         outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
     outputs.roll_up()
+    _reconcile_notes(judged, ports, now)
     return ActOutcome(**outputs.counts)
