@@ -2649,6 +2649,17 @@ journal, grep `retrying <date> from the retry backlog`, and the WARNING
 `abandoning <date>`: a date past `RETRY_MAX_AGE_DAYS` or `RETRY_MAX_ATTEMPTS`
 (`scripts/legibility/trickle_state.py`) is dropped from the backlog. Its
 sessions stay minable by the census within `census.ledger_retention_days`.
+A date the timer never ran at all (the host down across several 03:00s, or a
+catch-up that starts after UTC midnight) enters `retry_backlog` with 0
+attempts (task 6548). The gap is measured from `last_scheduled_target_date`,
+the target of the last SCHEDULED pass
+(`scripts/legibility/trickle_state.py::never_run_dates`). A manual
+`nightly.py run --date` pass never moves that cursor, so a backfill is not
+mistaken for a gap. When every later night finishes, an outage of up to
+`RETRY_MAX_AGE_DAYS` missed nights is fully recovered, one date per night;
+each later night that does not finish costs the oldest owed date. Never-run
+dates already past the window are abandoned in one WARNING,
+`abandoning <n> never-run date(s) <first>..<last>`.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own

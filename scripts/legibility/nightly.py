@@ -30,6 +30,7 @@ import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -717,6 +718,20 @@ _CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
 DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
 
 
+class PassKind(Enum):
+    """The kind of one :func:`run_nightly` pass.
+
+    - ``SCHEDULED``: the timer's nightly pass; it advances the schedule
+      cursor and owes the dates it jumped over.
+    - ``RETRY``: a backlog retry.
+    - ``MANUAL``: an operator's ``--date`` pass.
+    """
+
+    SCHEDULED = 'scheduled'
+    RETRY = 'retry'
+    MANUAL = 'manual'
+
+
 @dataclass
 class NightlyResult:
     """Outcome of one :func:`run_nightly` run.
@@ -1028,7 +1043,7 @@ def _record_trickle_progress(
     retry_recorder=None,
     poster=None,
     now: datetime | None = None,
-    retry: bool,
+    pass_kind: PassKind,
 ) -> None:
     """Record WHY this night went the way it did, best-effort.
 
@@ -1075,15 +1090,16 @@ def _record_trickle_progress(
     An unfinished night's date enters trickle_state's retry backlog
     (``scripts/legibility/trickle_state.py::fold_retry_backlog``) and is
     retried by :func:`run_scheduled_night`; operator view in OPERATIONS.md
-    §"Legibility trickle health probe (04:30)". A *retry* pass records only
-    its backlog fold: no streak escalation, no ``retry_due``.
+    §"Legibility trickle health probe (04:30)". A ``PassKind.RETRY`` pass
+    records only its backlog fold: no streak escalation, no ``retry_due``.
     """
     recorded_at = now if now is not None else datetime.now(UTC)
     doc = _record_run_state(
         cfg.project_id, sample, target_date, result,
-        recorder=recorder, retry_recorder=retry_recorder, now=recorded_at, retry=retry,
+        recorder=recorder, retry_recorder=retry_recorder, now=recorded_at,
+        pass_kind=pass_kind,
     )
-    if retry:
+    if pass_kind is PassKind.RETRY:
         return
     _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
     if isinstance(doc, dict) and trickle_state.finished(
@@ -1101,12 +1117,13 @@ def _record_run_state(
     recorder,
     retry_recorder,
     now: datetime | None,
-    retry: bool,
+    pass_kind: PassKind,
 ) -> dict | None:
     """Record one night through *recorder* (default
     :func:`trickle_state.record_run`) and return the document it wrote, or
-    ``None`` when the write failed. A *retry* pass is recorded through
-    *retry_recorder* (default :func:`trickle_state.record_retry`) instead.
+    ``None`` when the write failed. A ``PassKind.RETRY`` pass is recorded
+    through *retry_recorder* (default :func:`trickle_state.record_retry`)
+    instead.
 
     BEST-EFFORT, ALWAYS: the whole call is wrapped in ``try/except`` ->
     one WARNING, swallowed — mirroring :func:`post_escalation`'s
@@ -1116,7 +1133,7 @@ def _record_run_state(
     """
     recorded_at = now if now is not None else datetime.now(UTC)
     try:
-        if retry:
+        if pass_kind is PassKind.RETRY:
             record_retry = (
                 retry_recorder if retry_recorder is not None
                 else trickle_state.record_retry
@@ -1145,6 +1162,7 @@ def _record_run_state(
             commit_made=result.commit_made,
             budget_suppressed=result.budget_suppressed,
             capped=result.capped,
+            scheduled=pass_kind is PassKind.SCHEDULED,
         )
     except Exception as exc:  # noqa: BLE001 — deliberately total
         logger.warning(
@@ -1277,7 +1295,7 @@ def run_nightly(
     committer=None,
     recorder=None,
     retry_recorder=None,
-    retry: bool = False,
+    pass_kind: PassKind,
 ) -> NightlyResult:
     """Run one full nightly trickle pass for a single project (PRD §5.5).
 
@@ -1319,13 +1337,14 @@ def run_nightly(
     cannot make, and the reason 2026-07-16..29 went unnoticed for 14
     nights — and, since task 4514, a FAILED night from a productive one,
     which is the distinction that let a crashed run read as productive
-    indefinitely. The seam's contract is all four outcomes. It records the
-    scheduled pass only; *retry_recorder* (default
+    indefinitely. The seam's contract is all four outcomes. It records
+    every pass but a retry; *retry_recorder* (default
     :func:`trickle_state.record_retry`, which rewrites only the backlog) is
     the same seam for a retry pass.
 
-    *retry* marks a pass over a date the retry backlog owes, run by
-    :func:`run_scheduled_night` after the scheduled pass. It skips sessions
+    *pass_kind* (:class:`PassKind`) has no default: it decides whether the
+    pass moves the schedule cursor. A ``RETRY`` pass, run by
+    :func:`run_scheduled_night` after the ``SCHEDULED`` one, skips sessions
     the session ledger already holds, never evaluates the census trigger,
     and records through *retry_recorder*.
 
@@ -1345,7 +1364,8 @@ def run_nightly(
     elif project_id is not None:
         resolved_config_path, cfg = _load_config_for_project(
             project_id, target_date,
-            recorder=recorder, retry_recorder=retry_recorder, now=now, retry=retry,
+            recorder=recorder, retry_recorder=retry_recorder, now=now,
+            pass_kind=pass_kind,
         )
     else:
         raise ValueError('run_nightly requires either config_path or project_id')
@@ -1355,7 +1375,7 @@ def run_nightly(
             projects_root=projects_root, target_date=target_date, now=now,
             invoke=invoke, status_fetcher=status_fetcher, poster=poster,
             committer=committer, recorder=recorder, retry_recorder=retry_recorder,
-            retry=retry,
+            pass_kind=pass_kind,
         )
     except Exception as exc:
         return _crashed_night(cfg, exc, poster=poster)
@@ -1368,7 +1388,7 @@ def _load_config_for_project(
     recorder,
     retry_recorder,
     now: datetime | None,
-    retry: bool,
+    pass_kind: PassKind,
 ) -> tuple[Path, LegibilityConfig]:
     """Resolve *project_id*'s config (:func:`resolve_config`), recording a
     failed night for *project_id* before re-raising when none resolves."""
@@ -1377,7 +1397,8 @@ def _load_config_for_project(
     except Exception:
         _record_run_state(
             project_id, _nothing_sampled(), target_date, NightlyResult(exit_code=1),
-            recorder=recorder, retry_recorder=retry_recorder, now=now, retry=retry,
+            recorder=recorder, retry_recorder=retry_recorder, now=now,
+            pass_kind=pass_kind,
         )
         raise
 
@@ -1415,7 +1436,7 @@ def _run_configured_nightly(
     committer,
     recorder,
     retry_recorder,
-    retry: bool,
+    pass_kind: PassKind,
 ) -> NightlyResult:
     """:func:`run_nightly`'s pass once *cfg* has loaded."""
     # ONE recording point for all five return sites AND an unexpected
@@ -1487,7 +1508,9 @@ def _run_configured_nightly(
         # that render instead of paying for it twice. Rendering is super-linear in
         # signal-item count, so this is roughly a 2x on the job's dominant cost.
         rendered: dict[tuple, str] = {}
-        skip_sessions = _ledgered_sessions(cfg) if retry else frozenset()
+        skip_sessions = (
+            _ledgered_sessions(cfg) if pass_kind is PassKind.RETRY else frozenset()
+        )
         sample = select_digest_sessions(
             cfg, projects_root, target_date, rendered=rendered, skip_sessions=skip_sessions,
         )
@@ -1739,7 +1762,7 @@ def _run_configured_nightly(
         # scheduled pass already evaluated it this invocation, and a census that
         # failed did not advance census-state, so a second evaluation could
         # launch a second paid census.
-        if retry:
+        if pass_kind is PassKind.RETRY:
             logger.info(
                 'legibility trickle: census trigger not evaluated on a retry pass '
                 '(project=%s date=%s)',
@@ -1783,7 +1806,7 @@ def _run_configured_nightly(
             _record_trickle_progress(
                 cfg, sample, target_date, result,
                 recorder=recorder, retry_recorder=retry_recorder,
-                poster=poster, now=now, retry=retry,
+                poster=poster, now=now, pass_kind=pass_kind,
             )
 
 
@@ -1821,26 +1844,27 @@ def run_scheduled_night(
     recorder=None,
     retry_recorder=None,
 ) -> tuple[NightlyResult, ...]:
-    """The scheduled :func:`run_nightly` pass over *target_date*, then one
-    ``retry=True`` pass per date its :attr:`NightlyResult.retry_due` names,
-    in order. Every other argument reaches every pass unchanged. Each pass
-    records itself; a raise from any pass propagates."""
+    """The ``PassKind.SCHEDULED`` :func:`run_nightly` pass over *target_date*,
+    then one ``PassKind.RETRY`` pass per date its
+    :attr:`NightlyResult.retry_due` names, in order. Every other argument
+    reaches every pass unchanged. Each pass records itself; a raise from any
+    pass propagates."""
 
-    def run_pass(pass_date: date | None, *, retry: bool) -> NightlyResult:
+    def run_pass(pass_date: date | None, pass_kind: PassKind) -> NightlyResult:
         return run_nightly(
             config_path=config_path, project_id=project_id, projects_root=projects_root,
             target_date=pass_date, now=now, invoke=invoke, status_fetcher=status_fetcher,
             poster=poster, committer=committer, recorder=recorder,
-            retry_recorder=retry_recorder, retry=retry,
+            retry_recorder=retry_recorder, pass_kind=pass_kind,
         )
 
-    scheduled = run_pass(target_date, retry=False)
+    scheduled = run_pass(target_date, PassKind.SCHEDULED)
     results = [scheduled]
     for retry_date in scheduled.retry_due:
         logger.info(
             'legibility trickle: retrying %s from the retry backlog', retry_date.isoformat(),
         )
-        results.append(run_pass(retry_date, retry=True))
+        results.append(run_pass(retry_date, PassKind.RETRY))
     return tuple(results)
 
 
@@ -1934,6 +1958,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             project_id=args.project_id,
             projects_root=args.projects_root,
             target_date=args.date,
+            pass_kind=PassKind.MANUAL,
         ),)
     return next((result.exit_code for result in results if result.exit_code != 0), 0)
 
