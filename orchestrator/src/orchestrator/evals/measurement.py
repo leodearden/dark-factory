@@ -111,6 +111,17 @@ class Unmeasured:
         }
 
 
+def require_answer_iff_measured(
+    owner: str, field: str, answer: object, unmeasured: Unmeasured | None,
+) -> None:
+    """A verdict either answered or says why it did not — never both, never neither."""
+    if (answer is None) == (unmeasured is None):
+        raise ValueError(
+            f'{owner}.{field} must be None exactly when unmeasured is set; '
+            f'got {field}={answer!r}, unmeasured={unmeasured!r}'
+        )
+
+
 @dataclass(frozen=True)
 class Scored(Generic[T]):
     """An invocation that produced a measurement, and what it spent."""

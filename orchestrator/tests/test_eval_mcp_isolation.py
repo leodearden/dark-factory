@@ -34,7 +34,7 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import ARCHITECT, AgentRole
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.evals import runner, snapshots
-from orchestrator.evals.compare import _assess_task, compare_models
+from orchestrator.evals.compare import Synthesis, _assess_task, compare_models
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.judge import judge_plan_quality, run_judge
 from orchestrator.evals.results import EvalResult, ResultStore
@@ -234,7 +234,8 @@ async def test_compare_synthesizer_carries_no_mcp_servers(monkeypatch, tmp_path:
         ['A'], ['B'], {_FIXTURE_ID: _TASK},
     )
 
-    assert report.executive_summary == 'e', 'the synthesizer was never reached'
+    assert isinstance(report.synthesis, Synthesis), 'the synthesizer was never reached'
+    assert report.synthesis.executive_summary == 'e'
     assert len(calls) == 2
     for call in calls:
         _assert_zero_mcp_strict(call)
