@@ -18,13 +18,26 @@ re-derived. An edge the judge did not label counts against recall.
 
 Read-only: it writes only --out.
 
-Usage (from fused-memory/)::
+Usage (from fused-memory/), offline, against the design's adjudicated window::
 
     uv run python scripts/eval_overreach_judge.py --mode offline \\
         --worksheet /tmp/ruling-overreach-worksheet-4716.jsonl \\
         --verdicts ../docs/ruling-overreach-guard-design-2026-10-01/verdicts.json \\
         --report ../docs/ruling-overreach-guard-design-2026-10-01/report.json \\
         --out /tmp/overreach-judge-eval.json
+
+Online, per design.md §6.1 (2): a NEW frozen window, drawn after the shadow
+was deployed with ``audit_ruling_overreach.py --window-start/--window-end
+--emit-worksheet``, adjudicated under §2.6, with the weights from that
+window's own ``report.json`` (the audit run with ``--verdicts``). The sidecar
+is opened read-only and no LLM is consulted::
+
+    uv run python scripts/eval_overreach_judge.py --mode online \\
+        --sidecar <queue.data_dir>/overreach_shadow.db \\
+        --worksheet /tmp/ruling-overreach-worksheet-online.jsonl \\
+        --verdicts ../docs/<new-dated-dir>/verdicts.json \\
+        --report ../docs/<new-dated-dir>/report.json \\
+        --out /tmp/overreach-judge-eval-online.json
 
 Exit codes: 0 ran, whether or not the trigger passes (``trigger.passes`` in
 the JSON); 1 the judge or the sidecar is unavailable; 2 an input is invalid
@@ -37,9 +50,11 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +67,7 @@ from fused_memory.services.overreach_guard import (
     StructuredLLM,
     judge_edges,
 )
+from fused_memory.services.overreach_shadow import OverreachShadowStore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audit_ruling_overreach import (
@@ -90,6 +106,17 @@ class EvalInputError(ValueError):
     """An input the score must not be built from."""
 
 
+@dataclass(frozen=True)
+class Judged:
+    """One mode's labels and rationales by edge, and the judges and prompts behind them."""
+
+    labels: Mapping[EdgeKey, str]
+    rationales: Mapping[EdgeKey, str]
+    judge_models: Sequence[str | None]
+    prompt_versions: Sequence[str]
+    failures: Sequence[Mapping[str, Any]]
+
+
 # --------------------------------------------------------------------------- #
 # Inputs
 # --------------------------------------------------------------------------- #
@@ -116,6 +143,10 @@ def check_cells(rows: Iterable[Row], weights: Weights) -> None:
     weighted = {(graph, stratum) for graph, by_stratum in weights.items() for stratum in by_stratum}
     if missing := sorted({(row['graph'], row['stratum']) for row in rows} - weighted):
         raise EvalInputError(f'no population weight for worksheet cell(s) {missing}')
+
+
+def _minted_keys(rows: Iterable[Row]) -> list[EdgeKey]:
+    return [(row['graph'], edge['edge_uuid']) for row in rows for edge in row['minted']]
 
 
 def validate(rows: Sequence[Row], verdicts_obj: Any) -> VerdictSet:
@@ -227,9 +258,7 @@ def _offered_edges(row: Row) -> tuple[JudgeEdge, ...]:
     )
 
 
-async def judge_live(
-    rows: Iterable[Row], llm: StructuredLLM,
-) -> tuple[dict[EdgeKey, str], dict[EdgeKey, str], list[dict[str, Any]]]:
+async def judge_live(rows: Iterable[Row], llm: StructuredLLM) -> Judged:
     """One judge call per row, in order; a failed row is recorded and left unjudged."""
     labels: dict[EdgeKey, str] = {}
     rationales: dict[EdgeKey, str] = {}
@@ -247,7 +276,31 @@ async def judge_live(
         for judgement in judgements:
             key = (row['graph'], judgement.edge_uuid)
             labels[key], rationales[key] = judgement.label, judgement.rationale
-    return labels, rationales, failures
+    return Judged(
+        labels=labels, rationales=rationales, judge_models=[getattr(llm, 'model', None)],
+        prompt_versions=[PROMPT_VERSION], failures=failures,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The shadow's recorded labels (online mode)
+# --------------------------------------------------------------------------- #
+
+
+async def judge_from_sidecar(rows: Iterable[Row], db_path: str | Path) -> Judged:
+    """The labels the shadow recorded for the worksheet's edges; an unrecorded edge is absent."""
+    store = await OverreachShadowStore.open_read_only(db_path)
+    try:
+        stored = await store.judgements_for(_minted_keys(rows))
+    finally:
+        await store.close()
+    return Judged(
+        labels={key: judgement.label for key, judgement in stored.items()},
+        rationales={key: judgement.rationale for key, judgement in stored.items()},
+        judge_models=sorted({judgement.judge_model for judgement in stored.values()}),
+        prompt_versions=sorted({judgement.prompt_version for judgement in stored.values()}),
+        failures=[],
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -268,6 +321,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _check_mode_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.mode == 'online' and not args.sidecar:
+        parser.error('--mode online needs --sidecar')
+    if args.mode == 'offline' and args.sidecar:
+        parser.error('--sidecar is for --mode online only')
+
+
 def _load_inputs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], VerdictSet, Weights]:
     rows = load_worksheet(args.worksheet)
     verdict_set = validate(rows, json.loads(Path(args.verdicts).read_text()))
@@ -282,29 +342,38 @@ def _write(path: str, result: Mapping[str, Any]) -> None:
     out.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
 
 
+def _judge(args: argparse.Namespace, rows: Sequence[Row], llm: StructuredLLM | None) -> Judged | None:
+    """The mode's labels, or None (logged) when its judge or sidecar is unavailable."""
+    if args.mode == 'online':
+        try:
+            return asyncio.run(judge_from_sidecar(rows, args.sidecar))
+        except (sqlite3.DatabaseError, FileNotFoundError) as exc:
+            logger.error('the sidecar is unreadable (%s): %s', type(exc).__name__, exc)
+            return None
+    judge = llm if llm is not None else build_llm_client(FusedMemoryConfig())
+    if judge is None:
+        logger.error('no judge LLM is configured: the llm provider block or its api_key is missing')
+        return None
+    return asyncio.run(judge_live(rows, judge))
+
+
 def run(argv: Sequence[str] | None = None, *, llm: StructuredLLM | None = None) -> int:
-    """Parse *argv* (default ``sys.argv[1:]``) and run; *llm* replaces the configured judge."""
+    """Parse *argv* (default ``sys.argv[1:]``) and run; *llm* replaces the configured offline judge."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.mode == 'online' and not args.sidecar:
-        parser.error('--mode online needs --sidecar')
+    _check_mode_flags(parser, args)
     try:
         rows, verdict_set, weights = _load_inputs(args)
     except (VerdictError, EvalInputError, OSError, json.JSONDecodeError) as exc:
         logger.error('inputs rejected (%s): %s; nothing is written', type(exc).__name__, exc)
         return EXIT_BAD_INPUTS
-    if args.mode == 'online':
-        logger.error('sidecar reader not available')
+    judged = _judge(args, rows, llm)
+    if judged is None:
         return EXIT_UNAVAILABLE
-    judge = llm if llm is not None else build_llm_client(FusedMemoryConfig())
-    if judge is None:
-        logger.error('no judge LLM is configured: the llm provider block or its api_key is missing')
-        return EXIT_UNAVAILABLE
-    labels, rationales, failures = asyncio.run(judge_live(rows, judge))
-    scored = score(rows, verdict_set, labels, weights, rationales=rationales)
+    scored = score(rows, verdict_set, judged.labels, weights, rationales=judged.rationales)
     _write(args.out, {
-        **scored, 'mode': args.mode, 'judge_model': getattr(judge, 'model', None),
-        'prompt_version': PROMPT_VERSION, 'failures': failures,
+        **scored, 'mode': args.mode, 'judge_models': judged.judge_models,
+        'prompt_versions': judged.prompt_versions, 'failures': judged.failures,
         'trigger': trigger(scored, args.mode),
     })
     return EXIT_OK
