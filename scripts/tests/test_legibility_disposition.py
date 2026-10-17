@@ -502,3 +502,113 @@ def test_a_disposal_carries_the_resolution_its_tickets_reached(outcome, expected
     else:
         assert decision.note is not None
         assert "premise refused" in decision.note
+
+
+# ---------------------------------------------------------------------------
+# The one-shot idempotent backfill of historical census tasks
+# ---------------------------------------------------------------------------
+
+_ESCAPED_TITLE = "agents quote </function_calls> in reports"
+_IDENTITY = {
+    "finding_key": _KEY_A,
+    "finding_area": "orchestrator",
+    "finding_anchor": "orchestrator/x.py::f",
+    "finding_tags": ["h13", "kind:confusion"],
+}
+
+
+def _historical_codebook() -> dict:
+    return _codebook(
+        _entry("entry-plain", "plain title"),
+        _entry("entry-escaped", _ESCAPED_TITLE),
+        _entry("entry-retitled", "the corrected title"),
+        _entry("entry-keyed", "keyed title", **_IDENTITY),
+        _entry("entry-ticketed", "ticketed title", filed_tickets=[_row("tkt_open", run_id=_OLD_RUN)]),
+        _entry(
+            "entry-linked",
+            "already linked",
+            filed_tickets=[_row(None, task_id=5000, resolution=Resolution.CREATED, finding_key=None)],
+        ),
+        candidates=[{
+            "id": "cand-20260801-1",
+            "title": "the filed title",
+            "first_seen": "2026-08-01",
+            "disposition": "promoted",
+            "sightings": [],
+            "promoted_to": "entry-retitled",
+        }],
+    )
+
+
+_UNMATCHED = task_store.TaskHit(106, "[legibility census] nothing carries this title", "done")
+
+
+def _historical_store(**overrides: Any) -> FakeTaskStore:
+    hits = [
+        task_store.TaskHit(101, disposition.task_title("plain title"), "done"),
+        task_store.TaskHit(102, disposition.task_title(_ESCAPED_TITLE), "pending"),
+        task_store.TaskHit(103, disposition.task_title("the filed title"), "cancelled"),
+        task_store.TaskHit(104, disposition.task_title("keyed title"), "done"),
+        task_store.TaskHit(105, disposition.task_title("ticketed title"), "pending"),
+        task_store.TaskHit(5000, disposition.task_title("already linked"), "done"),
+        _UNMATCHED,
+    ]
+    return FakeTaskStore(metadata_hits={("source", disposition.CENSUS_SOURCE): hits}, **overrides)
+
+
+def _backfilled_row(task_id: int, finding_key: str | None = None) -> dict:
+    return {
+        "ticket": None,
+        "project_root": _ROOT,
+        "run_id": _RUN,
+        "finding_key": finding_key,
+        "task_id": task_id,
+        "resolution": "created",
+        "step": "curator",
+    }
+
+
+def test_backfill_links_historical_census_tasks_to_entries_by_exact_title() -> None:
+    assert disposition.task_title(_ESCAPED_TITLE) != f"[legibility census] {_ESCAPED_TITLE}"
+    store = _historical_store()
+    cb = _historical_codebook()
+
+    result, backfill = disposition.backfill(cb, store=store, project_root=_ROOT, run_id=_RUN)
+
+    assert store.arguments_of("find_tasks_by_metadata") == [
+        {"project_root": _ROOT, "key": "source", "value": disposition.CENSUS_SOURCE},
+    ]
+    assert _rows(result, "entry-plain") == [_backfilled_row(101)]
+    assert _rows(result, "entry-escaped") == [_backfilled_row(102)]
+    assert _rows(result, "entry-retitled") == [_backfilled_row(103)]
+    assert _rows(result, "entry-keyed") == [_backfilled_row(104, _KEY_A)]
+    assert _rows(result, "entry-ticketed") == _rows(cb, "entry-ticketed")
+    assert _rows(result, "entry-linked") == _rows(cb, "entry-linked")
+    assert set(backfill.linked) == {
+        (101, "entry-plain"), (102, "entry-escaped"), (103, "entry-retitled"), (104, "entry-keyed"),
+    }
+    assert backfill.unmatched == (_UNMATCHED,)
+    assert backfill.error is None
+    assert codebook.validate(result) == []
+
+
+def test_backfill_is_idempotent() -> None:
+    once, _ = disposition.backfill(_historical_codebook(), store=_historical_store(), project_root=_ROOT, run_id=_RUN)
+
+    twice, backfill = disposition.backfill(once, store=_historical_store(), project_root=_ROOT, run_id=_RUN)
+
+    assert twice == once
+    assert backfill.linked == ()
+
+
+def test_an_unreachable_backfill_changes_nothing_and_never_raises() -> None:
+    cb = _historical_codebook()
+
+    result, backfill = disposition.backfill(
+        cb, store=_historical_store(unreachable=["find_tasks_by_metadata"]), project_root=_ROOT, run_id=_RUN,
+    )
+
+    assert result == cb
+    assert backfill.linked == ()
+    assert backfill.error is not None
+    assert "find_tasks_by_metadata" in backfill.error
