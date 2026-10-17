@@ -1779,8 +1779,10 @@ class LaneCommand(BaseModel):
     with ``DF_VERIFY_ROLE=offline``, off the merge hot path, always from the
     current ``main`` head. A red result routes through the existing
     ``OfflineLaneWorker`` red path: a red detection run is confirmed and
-    narrowed to the named tests; each failing test is a per-test episode; an
-    episode is filed as one fix task (at ``fix_task_priority``) once it is
+    narrowed to the named tests; a command that declares ``outage_probe``
+    runs it first, and a probe that exits 75 naming a dependency makes the
+    pass an outage, escalated rather than filed; each failing test is a
+    per-test episode; an episode is filed as one fix task (at ``fix_task_priority``) once it is
     reproduced on ``git.offline_lane_persist_passes`` spaced passes, with one
     bounded level-1 escalation if the fix is unlanded after
     ``git.offline_lane_red_unlanded_hours`` (plans/offline-lane-red-path-prd.md).
@@ -1826,6 +1828,37 @@ class LaneCommand(BaseModel):
         description=(
             'When False this command is skipped by the offline-lane runner '
             '(a config-only off switch that leaves the entry in place).'
+        ),
+    )
+    outage_probe: str | None = Field(
+        default=None,
+        description=(
+            'Optional shell command run via ``sh -c`` once after a red '
+            'detection run, in ``<worktree>/<cwd>`` with the command\'s '
+            'environment but at normal priority (no idle nice/ionice). Exit 0 '
+            'means every external service the tests use is usable, and the red '
+            'goes to the confirm. Exit 75 '
+            '(``shared/src/shared/lane_probe.py::OUTAGE_EXIT_STATUS``) with a '
+            'first stdout line naming the failed dependency makes the pass an '
+            'outage, escalated rather than filed. Anything else, the timeout '
+            'included, is a broken probe, and the red goes to the confirm as if '
+            'none were declared (plans/offline-lane-red-path-prd.md D7). Read '
+            'by ``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
+        ),
+    )
+    outage_probe_timeout_secs: int = Field(
+        default=180,
+        ge=1,
+        description=(
+            'Seconds (default 180) the outage probe may run before its process '
+            'group is killed; a timeout is a broken probe. Read by '
+            '``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
         ),
     )
 
@@ -2105,7 +2138,8 @@ class GitConfig(BaseModel):
             'idle nice/ionice via ``sh -c`` in ``<worktree>/<cwd>`` with '
             '``DF_VERIFY_ROLE=offline``, off the merge hot path, always from '
             'head — that reuses the existing red path (confirm → per-test '
-            'episodes → fix task filed on persistence). Generic commands run IN ADDITION to whichever '
+            'episodes → fix task filed on persistence); a declared '
+            '``outage_probe`` can turn a red into an escalated outage. Generic commands run IN ADDITION to whichever '
             'legacy seams (numeric / infra) are enabled. Defaults to [] '
             '(opt-in, byte-identical no-op). Uses default_factory to avoid a '
             'shared mutable default across model instances.'

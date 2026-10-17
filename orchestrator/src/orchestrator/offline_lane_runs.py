@@ -1,21 +1,27 @@
-"""How the offline lane runs a sub-run: one streaming launcher and the three detection seams.
+"""How the offline lane runs a sub-run: one streaming launcher, the three detection seams, the outage probe.
 
 Every sub-run, detection or confirm, streams its child's combined output
 straight to a file in its pass directory and leaves a run record beside it
 (``orchestrator/src/orchestrator/offline_lane_records.py::RunRecordStore``).
+The outage probe (PRD ``plans/offline-lane-red-path-prd.md`` D7) is not a sub-run:
+:func:`run_probe` answers a ``ProbeResult``, which the pass writes onto its detect record.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias
 
+from shared.lane_probe import OUTAGE_EXIT_STATUS
+from shared.proc_group import terminate_process_group
 from shared.verify_admission import nice_prefix
 
 from orchestrator.offline_lane_records import (
@@ -26,6 +32,8 @@ from orchestrator.offline_lane_records import (
     FailureRecord,
     LanePass,
     Phase,
+    ProbeKind,
+    ProbeResult,
     RunRecord,
     RunRecordStore,
     classify_exit,
@@ -40,6 +48,10 @@ from orchestrator.verify_cmd import parse_config_command, render, with_junitxml
 if TYPE_CHECKING:
     from orchestrator.config import LaneCommand
     from orchestrator.offline_lane import CommandRunner, SuiteRunner
+
+logger = logging.getLogger(__name__)
+
+ProbeSeam: TypeAlias = 'Callable[[LaneCommand, Path], Awaitable[ProbeResult]]'
 
 RUN_OFFLINE_DEEP_SCRIPT = 'scripts/run-offline-deep.sh'
 
@@ -271,6 +283,71 @@ def _lane_env() -> dict[str, str]:
     return {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
 
 
+def command_cwd(worktree: Path, command: LaneCommand) -> Path:
+    """Where *command*'s sub-runs and its outage probe run: ``<worktree>/<cwd>``."""
+    return worktree / command.cwd
+
+
+def probe_result(returncode: int | None, stdout: str, duration: float) -> ProbeResult:
+    """D7's mapping of one probe's exit to up, outage or broken; pure.
+
+    Only stdout's first line counts: exit 0 is up, ``OUTAGE_EXIT_STATUS`` with a
+    non-empty first line is an outage naming that line, and anything else is broken.
+    """
+    lines = stdout.splitlines()
+    first_line = lines[0].strip()[:FIRST_LINE_MAX_CHARS] if lines else ''
+    if returncode == 0:
+        return ProbeResult(ProbeKind.UP, returncode, None, first_line, duration)
+    if returncode == OUTAGE_EXIT_STATUS and first_line:
+        return ProbeResult(ProbeKind.OUTAGE, returncode, first_line, first_line, duration)
+    return ProbeResult(ProbeKind.BROKEN, returncode, None, first_line, duration)
+
+
+def _no_exit(started: float) -> ProbeResult:
+    return ProbeResult(ProbeKind.BROKEN, None, None, '', time.monotonic() - started)
+
+
+async def run_probe(command: LaneCommand, worktree: Path) -> ProbeResult:
+    """Run *command*'s ``outage_probe`` once in its cwd, at normal priority, bounded by its timeout.
+
+    A probe that times out or cannot start is broken with no exit status; the log says which.
+    """
+    if command.outage_probe is None:
+        raise ValueError(f'{command.name}: declares no outage_probe')
+    started = time.monotonic()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'sh', '-c', command.outage_probe,
+            cwd=str(command_cwd(worktree, command)),
+            env=_lane_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError:
+        logger.exception('offline-lane: %s: outage probe could not start', command.name)
+        return _no_exit(started)
+    pgid = proc.pid
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=command.outage_probe_timeout_secs)
+    except TimeoutError:
+        await terminate_process_group(proc, pgid)
+        logger.error(
+            'offline-lane: %s: outage probe timed out after %ss', command.name, command.outage_probe_timeout_secs,
+        )
+        return _no_exit(started)
+    finally:
+        if proc.returncode is None:
+            await terminate_process_group(proc, pgid)
+    result = probe_result(proc.returncode, stdout.decode(errors='replace'), time.monotonic() - started)
+    if result.result == ProbeKind.BROKEN:
+        logger.warning(
+            'offline-lane: %s: outage probe is broken (exit %s); stderr tail: %s',
+            command.name, proc.returncode, stderr.decode(errors='replace')[-_TAIL_CHARS:],
+        )
+    return result
+
+
 class ConfirmRunner(Protocol):
     """Runs one confirm sub-run of a bound pass; a junit-producing confirm writes to ``junit_path``."""
 
@@ -380,7 +457,7 @@ def command_runner(store: RunRecordStore) -> CommandRunner:
         command, junit_path = _with_junit(cmd.command, lane_pass.junit_path(Phase.DETECT))
         launched = await launch(
             [*nice_prefix('background'), 'sh', '-c', command],
-            cwd=wt_path / cmd.cwd,
+            cwd=command_cwd(wt_path, cmd),
             env=_lane_env(),
             store=store,
             lane_pass=lane_pass,
