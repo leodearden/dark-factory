@@ -1,14 +1,16 @@
 """Tests for the background-task abandonment detector + downgrade (task 2761).
 
 Layer 2 of the headless ``--print`` background-task footgun fix: detect when an
-otherwise-successful ``claude --print`` run ended its turn while a backgrounded
-Bash command was still pending (launched via ``Bash run_in_background=true``,
-never subsequently reaped), and downgrade ``success``→failure so existing
+otherwise-successful ``claude --print`` run ended its turn while a background
+task it started was still pending, and downgrade ``success``→failure so existing
 non-success handling retries/resumes instead of proceeding on a half-done tree.
+A launch is a ``Bash run_in_background=true`` call or a confirmed ``Monitor``
+arm (task 5986), never subsequently reaped.
 
-A session reaps either by calling a background-management tool named in
-``_BACKGROUND_REAP_TOOLS`` or — the tool-agnostic second clause (task 3639) — by
-issuing any tool_use whose input references the task's id or output-file path.
+A session reaps by calling a background-management tool named in
+``_BACKGROUND_REAP_TOOLS``, by issuing any tool_use whose input references the
+task's id or output-file path (the tool-agnostic clause, task 3639), or by
+having a task-notification naming the task delivered to it (task 5986).
 The tool names appearing in the fixtures below are test DATA standing in for
 whatever a CLI build might emit, not a claim that each is live — only
 ``TaskStop`` is (task 5332).  Exercising the accept set's full membership is

@@ -476,9 +476,10 @@ class AgentResult:
     - ``ended_awaiting_background``: True when the run ended its turn while a
       background task it started was still pending — a ``run_in_background``
       Bash or a confirmed Monitor arm, never subsequently REAPED, where a reap
-      is a ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill OR a tool_use
+      is a ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill, a tool_use
       of any kind whose input references the launch's id / output-file path as
-      recorded in its tool_result (task 3639; see
+      recorded in its tool_result (task 3639), OR a delivered task-notification
+      naming the launch (task 5986; see
       ``detect_ended_awaiting_background`` for the full contract).  The headless
       one-shot ``claude --print`` session exits subtype=success and silently
       abandons the pending work (Reify-5164 RCA).  ``_parse_claude_output``
@@ -790,8 +791,9 @@ def note_unreadable_transcript(
 #
 # AND THE SET DOES NOT HAVE TO BE CURRENT, which is the part a future reader
 # tempted to "resync" it needs first.  ``detect_ended_awaiting_background`` reaps
-# on EITHER this set OR its second clause (task 3639): a tool_use of ANY kind
-# whose input references the background task's id or output-file path.  That
+# on this set OR on either of two other clauses: a tool_use of ANY kind whose
+# input references the background task's id or output-file path (task 3639),
+# or a delivered task-notification naming it (task 5986).  The tool_use
 # clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
 # role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
 # why correcting those prompts needed no change to this detector.  If the first
@@ -988,6 +990,7 @@ def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
 
 
 _MONITOR_TOOL = 'Monitor'
+_TASK_NOTIFICATION = 'task-notification'
 
 
 class _BackgroundEvent(enum.Enum):
@@ -1024,6 +1027,42 @@ def _monitor_arm_task_id(record: dict, monitor_call_ids: set[str]) -> str | None
         call_id = block.get('tool_use_id')
         if isinstance(call_id, str) and call_id in monitor_call_ids:
             return task_id
+    return None
+
+
+def _delivered_notification_texts(record: dict) -> list[str] | None:
+    """Return the texts of the task-notification *record* DELIVERED to the
+    model, or None when *record* is not such a delivery.
+
+    A delivery is a mid-turn ``attachment`` record (``queued_command`` with
+    ``commandMode`` ``task-notification``, text in ``prompt``) or a ``user``
+    record whose ``origin.kind`` is ``task-notification`` (text in its content,
+    a ``str`` or ``text`` sub-blocks).  ``queue-operation`` records are queue
+    bookkeeping, not delivery.  Never raises.
+    """
+    record_type = record.get('type')
+    if record_type == 'attachment':
+        attachment = record.get('attachment')
+        if not (
+            isinstance(attachment, dict)
+            and attachment.get('type') == 'queued_command'
+            and attachment.get('commandMode') == _TASK_NOTIFICATION
+        ):
+            return None
+        prompt = attachment.get('prompt')
+        return [prompt] if isinstance(prompt, str) else []
+    if record_type == 'user':
+        origin = record.get('origin')
+        if not (isinstance(origin, dict) and origin.get('kind') == _TASK_NOTIFICATION):
+            return None
+        text = _record_field(record, 'content', _is_non_empty_str)
+        if text is not None:
+            return [text]
+        return [
+            sub['text']
+            for sub in _content_blocks(record)
+            if isinstance(sub, dict) and isinstance(sub.get('text'), str)
+        ]
     return None
 
 
@@ -1069,6 +1108,11 @@ def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
     monitor_call_ids: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
+            continue
+        texts = _delivered_notification_texts(record)
+        if texts is not None:
+            if tokens and _mentions_token(texts, tokens):
+                yield _BackgroundEvent.REAP
             continue
         if record.get('type') == 'user':
             _collect_bg_tokens(record, tokens)
@@ -1119,15 +1163,23 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
         Bash task's id or output-file path, as recorded in its tool_result
         (``toolUseResult.backgroundTaskId`` and the CLI's ``Output is being
         written to: <path>`` sentence), or an armed Monitor's task id;
+      * a task-notification DELIVERED to the model whose text contains a
+        launch's identity token — a Monitor event or expiry, or a Bash
+        completion.  Delivery is either a mid-turn ``attachment`` record
+        (``queued_command`` with ``commandMode`` ``task-notification``) or a
+        ``user`` record whose ``origin.kind`` is ``task-notification`` (the CLI
+        outlived the turn and delivered it as a new one).  Queue bookkeeping
+        (``queue-operation`` records) is not delivery: an event enqueued by a
+        process that then exited never reached the agent;
       * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
         matched on the segment after the last ``__``) — calling one writes the
         role's whole deliverable to ``verdicts/<role>.json``, so the session has
         finished its job and cannot still be waiting on anything.
 
     Fire (True) iff the final background event is a launch — the session's
-    final background-management action was a launch never followed by a
-    poll/kill.  Any engagement with a background task (a poll or kill after it)
-    clears the verdict, keeping precision high and avoiding fragile shell-id /
+    final background event was a launch never followed by a reap.  Any
+    engagement with a background task (a reap of any kind after it) clears the
+    verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
 
     RCA for the second reap clause (task 3639): the original vocabulary named
@@ -1165,6 +1217,11 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     still-running task once with ``BashOutput`` and THEN ends its turn anyway
     reaps after the launch → False.  Erring toward NOT downgrading a possibly
     complete run is the safe direction for a success→failure flip.
+
+    Its Monitor analogue (accepted on the same grounds): a streaming Monitor
+    that delivered a mid-stream event, after which the session ended awaiting
+    a later one, is reaped by that delivery → False.  Telling a terminal event
+    from a mid-stream one would need parsing of the notification text.
     """
     if not records:
         return False
