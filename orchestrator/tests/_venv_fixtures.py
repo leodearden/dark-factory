@@ -9,6 +9,7 @@ what a checkout renamed after ``uv sync`` looks like.
 from __future__ import annotations
 
 import os
+import platform
 import sys
 from pathlib import Path
 
@@ -28,7 +29,7 @@ def make_venv(
     """Create *venv_dir* as a venv whose scripts name ``{built_at or venv_dir}/bin/python``."""
     bin_dir = venv_dir / 'bin'
     bin_dir.mkdir(parents=True)
-    cfg = ['home = /usr/bin', 'version_info = 3.12.3']
+    cfg = [f'home = {Path(sys.base_prefix) / "bin"}', f'version_info = {platform.python_version()}']
     if uv_managed:
         cfg.append('uv = 0.11.6')
     (venv_dir / 'pyvenv.cfg').write_text('\n'.join(cfg) + '\n')
