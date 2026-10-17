@@ -420,3 +420,82 @@ async def test_a_store_error_is_an_error_payload_never_an_empty_page(lookup_stac
     assert 'error' in response
     assert 'error_type' in response
     assert 'results' not in response
+
+
+# ── MCP face: the include_value page budget ─────────────────────────────
+
+
+def _serialized_bytes(obj: Any) -> int:
+    """The contract's measure of serialized size: stdlib ``json.dumps`` defaults, UTF-8 bytes."""
+    return len(json.dumps(obj).encode('utf-8'))
+
+
+async def _page_through(lookup_stack, **args: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = await lookup_stack.call(offset=offset, **args)
+        rows.extend(page['results'])
+        offset += page['pagination']['returned']
+        if not page['pagination']['has_more']:
+            return rows
+
+
+@pytest.mark.asyncio
+async def test_the_budget_cuts_a_page_and_pages_still_tile(lookup_stack):
+    values = {
+        await lookup_stack.seed('pending', {'x_blob': blob}): blob
+        for blob in ([f'{n}-{i}-'.ljust(1_000, 'x') for i in range(10)] for n in range(10))
+    }
+
+    first = await lookup_stack.call(key='x_blob', include_value=True, limit=10)
+    rows = await _page_through(lookup_stack, key='x_blob', include_value=True, limit=10)
+
+    assert first['pagination']['returned'] < 10
+    assert first['pagination']['has_more'] is True
+    assert first['pagination']['page_size'] == 10
+    assert _serialized_bytes(first['results']) <= _OVER_BUDGET_BYTES
+    assert [row['task_id'] for row in rows] == sorted(values)
+    assert {row['task_id']: row['matched_value'] for row in rows} == values
+    assert not any('truncated_value' in row for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_lone_over_budget_row_is_elided_and_readable_through_get_task(lookup_stack):
+    big = 'a' * 60_000
+    big_id = await lookup_stack.seed('pending', {'x_blob': big})
+    small_id = await lookup_stack.seed('pending', {'x_blob': ['small']})
+
+    first = await lookup_stack.call(key='x_blob', include_value=True)
+    second = await lookup_stack.call(key='x_blob', include_value=True, offset=1)
+    task = await lookup_stack.server._tool_manager.call_tool(
+        'get_task', {'id': str(big_id), 'project_root': lookup_stack.root},
+    )
+
+    assert 'error' not in first
+    assert [row['task_id'] for row in first['results']] == [big_id]
+    assert first['results'][0]['truncated_value'] is True
+    assert first['results'][0]['matched_value'] == {
+        '_elided': True, 'bytes': _serialized_bytes(big),
+    }
+    assert first['pagination']['has_more'] is True
+    assert [row['task_id'] for row in second['results']] == [small_id]
+    assert second['results'][0]['matched_value'] == ['small']
+    assert 'truncated_value' not in second['results'][0]
+    assert task['metadata']['x_blob'] == big
+
+
+@pytest.mark.asyncio
+async def test_an_over_budget_row_after_a_fitting_one_starts_the_next_page(lookup_stack):
+    small_id = await lookup_stack.seed('pending', {'x_blob': 'small'})
+    big_id = await lookup_stack.seed('pending', {'x_blob': 'b' * 60_000})
+
+    first = await lookup_stack.call(key='x_blob', include_value=True)
+    second = await lookup_stack.call(key='x_blob', include_value=True, offset=1)
+
+    assert [row['task_id'] for row in first['results']] == [small_id]
+    assert first['results'][0]['matched_value'] == 'small'
+    assert first['pagination']['has_more'] is True
+    assert [row['task_id'] for row in second['results']] == [big_id]
+    assert second['results'][0]['truncated_value'] is True
+    assert second['pagination']['has_more'] is False
