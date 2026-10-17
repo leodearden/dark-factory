@@ -359,10 +359,10 @@ def install_fake_httpx(monkeypatch):
 # and review suites seed ONE schema copy through one set of helpers. Fixtures
 # for the same importlib-mode reason as the tasks.db fixtures above.
 #
-# RUNS_DB_SCHEMA is a VERBATIM copy of the three tables those scripts read,
+# RUNS_DB_SCHEMA is a VERBATIM copy of the four tables those scripts read,
 # captured with
 #
-#     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events"
+#     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events runs"
 #
 # Copied rather than imported because this directory is collected by
 # `uv run --project shared pytest` and imports NO first-party package (the
@@ -410,6 +410,20 @@ CREATE TABLE account_events (
     run_id       TEXT,
     details      TEXT,
     created_at   TEXT NOT NULL
+);
+CREATE TABLE runs (
+    run_id         TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    prd_path       TEXT,
+    started_at     TEXT NOT NULL,
+    completed_at   TEXT,
+    total_tasks    INTEGER DEFAULT 0,
+    completed      INTEGER DEFAULT 0,
+    blocked        INTEGER DEFAULT 0,
+    escalated      INTEGER DEFAULT 0,
+    total_cost_usd REAL DEFAULT 0.0,
+    paused_for_cap INTEGER DEFAULT 0,
+    cap_pause_secs REAL DEFAULT 0.0
 );
 """
 
@@ -527,6 +541,15 @@ class SeedingConnection(sqlite3.Connection):
             'INSERT INTO account_events (account_name, event_type, project_id, run_id, '
             'details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
             (account_name, event_type, project_id, run_id, _payload(details), created_at),
+        )
+        self.commit()
+
+    def seed_run(self, *, run_id, started_at, project_id='dark_factory', completed_at=None):
+        """Insert one `runs` row: one orchestrator startup, as RunStore.start_run records it."""
+        self.execute(
+            'INSERT INTO runs (run_id, project_id, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?)',
+            (run_id, project_id, started_at, completed_at),
         )
         self.commit()
 

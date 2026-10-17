@@ -536,6 +536,7 @@ def test_zero_scoped_hits_is_an_empty_tuple_not_none(runs_db):
 
     assert scan.scoped_hits == ()
     assert scan.restarts == ()
+    assert scan.orchestrator_startups == ()
     assert scan.unscoped_cap_hit_count == 0
 
 
@@ -551,6 +552,27 @@ def test_restarts_are_found_even_though_live_rows_carry_a_task_id(runs_db):
 
     scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
 
+    assert [r.service for r in scan.restarts] == ['fused-memory']
+
+
+def test_orchestrator_startups_come_from_the_runs_table_not_from_service_restart(runs_db):
+    """The D6 shape: no orchestrator service_restart in the window, yet two
+    orchestrator startups, each registered in `runs` before it emits anything.
+    The run already live at *since* started before it, so it is not one."""
+    runs_db.seed_event(
+        _at(hours=3), 'service_restart',
+        data={'service': 'fused-memory', 'reason': 'post_merge_fused_memory_code_change'},
+    )
+    runs_db.seed_run(run_id='run-b756e05f8ff0', started_at=_at(hours=-15))
+    runs_db.seed_run(run_id='run-063e9795fcf6', started_at=_at(hours=2, minutes=56))
+    runs_db.seed_run(run_id='run-5352d42ce5fa', started_at=_at(days=2, hours=5, minutes=48))
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert [(s.run_id, s.started_at) for s in scan.orchestrator_startups] == [
+        ('run-063e9795fcf6', _at(hours=2, minutes=56)),
+        ('run-5352d42ce5fa', _at(days=2, hours=5, minutes=48)),
+    ]
     assert [r.service for r in scan.restarts] == ['fused-memory']
 
 
@@ -1056,6 +1078,22 @@ def test_cap_hits_and_restarts_at_or_after_until_are_excluded(runs_db):
     assert [r.service for r in scan.restarts] == ['orchestrator']
 
 
+def test_orchestrator_startups_are_half_open_on_since_and_until(runs_db):
+    runs_db.seed_run(run_id='run-at-since', started_at=_at())
+    runs_db.seed_run(run_id='run-inside', started_at=_at(hours=11))
+    runs_db.seed_run(run_id='run-at-until', started_at=UNTIL.isoformat())
+
+    bounded = audit_model_admission.scan_scoped_cap(
+        runs_db, model=FABLE, since=APPLY, until=UNTIL,
+    )
+    open_ended = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert [s.run_id for s in bounded.orchestrator_startups] == ['run-at-since', 'run-inside']
+    assert [s.run_id for s in open_ended.orchestrator_startups] == [
+        'run-at-since', 'run-inside', 'run-at-until',
+    ]
+
+
 def test_roles_on_model_does_not_count_runs_completed_at_or_after_until(runs_db):
     for hours, role in ((11, 'merger'), (12, 'steward'), (13, 'implementer')):
         runs_db.seed_invocation(
@@ -1079,6 +1117,8 @@ def test_audit_threads_until_into_every_scan(live_shaped_db):
         account_name='max-e', event_type='cap_hit', created_at=_at(hours=11),
         details={'reason': 'limit', 'scope': FABLE},
     )
+    live_shaped_db.seed_run(run_id='run-before-until', started_at=_at(hours=3))
+    live_shaped_db.seed_run(run_id='run-after-until', started_at=_at(hours=11))
 
     result = _audit(live_shaped_db, until=until)
 
@@ -1087,6 +1127,7 @@ def test_audit_threads_until_into_every_scan(live_shaped_db):
     assert [r.role for r in result.invocations] == ['merger']
     assert result.scoped_cap.scoped_hits == ()
     assert [r.service for r in result.scoped_cap.restarts] == ['orchestrator']
+    assert [s.run_id for s in result.scoped_cap.orchestrator_startups] == ['run-before-until']
     assert [(u.role, u.count) for u in result.containment.by_role] == [
         ('merger', 1), ('steward', 0),
     ]
