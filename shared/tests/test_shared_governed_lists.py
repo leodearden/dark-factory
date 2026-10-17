@@ -235,6 +235,7 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_state::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_events::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.request_park_eviction::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.find_tasks_by_metadata::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
     },
 )
 
