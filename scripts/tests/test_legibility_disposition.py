@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from legibility import disposition, task_store
+from legibility import codebook, disposition, task_store
 from legibility_task_store_fake import FakeTaskStore
 
 _ROOT = "/abs/observed"
@@ -306,3 +306,199 @@ def test_ticket_id_from_submit_result_rejects_unusable_ticket_values() -> None:
     assert disposition.ticket_id_from_submit_result({"ticket": None}) is None
     assert disposition.ticket_id_from_submit_result({"ticket": {"id": 1}}) is None
     assert disposition.ticket_id_from_submit_result({"ticket": 42}) is None
+
+
+# ---------------------------------------------------------------------------
+# C1 back-links and in-run ticket resolution (D7)
+# ---------------------------------------------------------------------------
+
+_OLD_RUN = "census-dark_factory-20261001"
+
+
+def _entry(entry_id: str, title: str = "a confusion", **fields: Any) -> dict:
+    return {
+        "id": entry_id,
+        "title": title,
+        "severity": "medium",
+        "status": "open",
+        "origin_phase": "unknown",
+        "manifested_phase": "unknown",
+        "sightings": [],
+        **fields,
+    }
+
+
+def _codebook(*entries: dict, candidates: list[dict] | None = None) -> dict:
+    return {"version": 2, "entries": list(entries), "candidates": list(candidates or [])}
+
+
+def _link(entry_id: str = "entry-a", **overrides: Any) -> disposition.BackLink:
+    fields: dict[str, Any] = {
+        "entry_id": entry_id,
+        "ticket": "tkt_1",
+        "project_root": _ROOT,
+        "run_id": _RUN,
+        "finding_key": _KEY_A,
+        "task_id": None,
+        "resolution": None,
+        "step": Step.CURATOR,
+    }
+    fields.update(overrides)
+    return disposition.BackLink(**fields)
+
+
+def _row(ticket: str | None, *, run_id: str = _RUN, **overrides: Any) -> dict:
+    return _link(ticket=ticket, run_id=run_id, **overrides).to_row()
+
+
+def _rows(cb: dict, entry_id: str) -> list[dict]:
+    (entry,) = [entry for entry in cb["entries"] if entry["id"] == entry_id]
+    return entry.get("filed_tickets", [])
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _outcome(status: task_store.TicketStatus, task_id: int | None = None, reason: str | None = None):
+    return task_store.TicketOutcome(status, task_id, reason)
+
+
+def test_with_back_links_appends_each_row_to_its_entry_without_mutating_the_input() -> None:
+    cb = _codebook(_entry("entry-a"), _entry("entry-b"))
+    links = [_link("entry-a"), _link("entry-b", ticket=None, task_id=501, resolution=Resolution.EXISTING, step=Step.KEY)]
+
+    result = disposition.with_back_links(cb, links)
+
+    assert _rows(result, "entry-a") == [links[0].to_row()]
+    assert _rows(result, "entry-b") == [links[1].to_row()]
+    assert "filed_tickets" not in cb["entries"][0]
+    assert codebook.validate(result) == []
+    assert disposition.with_back_links(result, links) == result
+
+
+def test_with_back_links_refuses_a_link_to_an_absent_entry() -> None:
+    with pytest.raises(ValueError, match="entry-missing"):
+        disposition.with_back_links(_codebook(_entry("entry-a")), [_link("entry-missing")])
+
+
+def test_a_back_link_is_held_to_the_c1_row_invariant() -> None:
+    with pytest.raises(ValueError, match="entry-a"):
+        _link("entry-a", finding_key="fk-ZZZ")
+
+
+def test_resolve_tickets_resolves_every_unresolved_row_by_its_outcome() -> None:
+    cb = _codebook(
+        _entry("entry-a", filed_tickets=[_row("tkt_c")]),
+        _entry("entry-b", filed_tickets=[_row("tkt_m")]),
+        _entry("entry-c", filed_tickets=[_row("tkt_r")]),
+        _entry("entry-d", filed_tickets=[_row("tkt_t")]),
+        _entry("entry-e", filed_tickets=[_row("tkt_x")]),
+        _entry("entry-f", filed_tickets=[_row("tkt_done", task_id=3, resolution=Resolution.CREATED)]),
+    )
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_c": _outcome(task_store.TicketStatus.CREATED, 7),
+        "tkt_m": _outcome(task_store.TicketStatus.COMBINED, 9),
+        "tkt_r": _outcome(task_store.TicketStatus.REFUSED, reason="premise refused"),
+        "tkt_t": _outcome(task_store.TicketStatus.FAILED, reason="timeout"),
+        "tkt_x": _outcome(task_store.TicketStatus.FAILED, reason="expired"),
+    })
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    assert [(row["resolution"], row["task_id"]) for entry in result["entries"] for row in entry["filed_tickets"]] == [
+        ("created", 7), ("combined", 9), ("refused", None), (None, None), ("failed", None), ("created", 3),
+    ]
+    assert "tkt_done" not in [arguments["ticket"] for arguments in store.arguments_of("resolve_ticket")]
+    assert resolutions.pending == ("tkt_t",)
+    assert {resolved.ticket for resolved in resolutions.resolved} == {"tkt_c", "tkt_m", "tkt_r", "tkt_x"}
+    assert resolutions.budget_exhausted is False
+    assert cb["entries"][0]["filed_tickets"][0]["resolution"] is None
+
+    again = FakeTaskStore(resolve_outcomes={"tkt_t": _outcome(task_store.TicketStatus.FAILED, reason="timeout")})
+    disposition.resolve_tickets(result, store=again, run_id=_RUN, clock=_Clock())
+    assert [arguments["ticket"] for arguments in again.arguments_of("resolve_ticket")] == ["tkt_t"]
+
+
+def test_resolve_tickets_stops_when_its_budget_is_spent() -> None:
+    assert disposition.RESOLVE_BUDGET_SECS == 300
+    assert disposition.RESOLVE_CALL_CAP_SECS == 115
+    clock = _Clock()
+
+    def _spend() -> None:
+        clock.now += 120
+
+    tickets = ["tkt_1", "tkt_2", "tkt_3", "tkt_4"]
+    cb = _codebook(*(_entry(f"entry-{n}", filed_tickets=[_row(ticket)]) for n, ticket in enumerate(tickets)))
+    store = FakeTaskStore(on_resolve=_spend)
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=clock)
+
+    calls = store.arguments_of("resolve_ticket")
+    assert [arguments["ticket"] for arguments in calls] == tickets[:3]
+    assert [arguments["timeout_secs"] for arguments in calls] == [115, 115, 60]
+    assert resolutions.budget_exhausted is True
+    assert "tkt_4" in resolutions.pending
+    assert _rows(result, "entry-3")[0]["resolution"] is None
+
+
+def test_resolve_tickets_resolves_carried_over_rows_first() -> None:
+    cb = _codebook(
+        _entry("entry-a", filed_tickets=[_row("tkt_new")]),
+        _entry("entry-b", filed_tickets=[_row("tkt_old", run_id=_OLD_RUN)]),
+    )
+    store = FakeTaskStore()
+
+    _, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    assert [arguments["ticket"] for arguments in store.arguments_of("resolve_ticket")] == ["tkt_old", "tkt_new"]
+    assert [(resolved.ticket, resolved.carried) for resolved in resolutions.resolved] == [
+        ("tkt_old", True), ("tkt_new", False),
+    ]
+
+
+def test_an_unreachable_ticket_stays_unresolved_and_the_next_one_is_still_resolved() -> None:
+    cb = _codebook(
+        _entry("entry-a", filed_tickets=[_row("tkt_1")]),
+        _entry("entry-b", filed_tickets=[_row("tkt_2")]),
+    )
+    store = FakeTaskStore(resolve_outcomes={"tkt_1": task_store.StoreUnreachable("resolve_ticket: down")})
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    assert _rows(result, "entry-a")[0]["resolution"] is None
+    assert _rows(result, "entry-b")[0]["resolution"] == "created"
+    assert any("down" in error for error in resolutions.errors)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (_outcome(task_store.TicketStatus.CREATED, 77), (Resolution.CREATED, 77, "filed:77")),
+        (_outcome(task_store.TicketStatus.COMBINED, 78), (Resolution.COMBINED, 78, "filed:78")),
+        (_outcome(task_store.TicketStatus.REFUSED, reason="premise refused"), (Resolution.REFUSED, None, None)),
+    ],
+    ids=["created", "combined", "refused"],
+)
+def test_a_disposal_carries_the_resolution_its_tickets_reached(outcome, expected) -> None:
+    filing = _filing(entry_id="entry-a")
+    disposal = disposition.dispose([filing], store=FakeTaskStore(), submit=_Submit({"ticket": "tkt_1"}))
+    link = _only(disposal).back_link(_RUN)
+    assert link is not None
+    cb = disposition.with_back_links(_codebook(_entry("entry-a")), [link])
+    store = FakeTaskStore(resolve_outcomes={"tkt_1": outcome})
+    _, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    decision = _only(disposal.resolved(resolutions))
+
+    resolution, task_id, shown = expected
+    assert (decision.resolution, decision.task_id) == (resolution, task_id)
+    if shown is not None:
+        assert decision.disposition() == shown
+    else:
+        assert decision.note is not None
+        assert "premise refused" in decision.note
