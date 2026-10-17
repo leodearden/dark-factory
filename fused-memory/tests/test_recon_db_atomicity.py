@@ -293,6 +293,41 @@ async def test_a_write_survives_the_stale_run_reapers_read(journal, second_conne
 
 
 @pytest.mark.asyncio
+async def test_a_legacy_multi_hop_reaper_read_kills_the_write(
+    journal, journal_tap, second_connection
+):
+    """CONTROL: the replaced read shape loses arm A's exact collision.
+
+    Same collision, same production write, same foreign commit; only the read's
+    shape is replaced, by an execute + fetchall on the journal's own connection.
+    That it kills the write is what proves arm A discriminates rather than
+    passing vacuously.
+    """
+    await _seed_runs(second_connection, stale_run=True)
+    cutoff = (datetime.now(UTC) - timedelta(seconds=STALE_CUTOFF_SECONDS)).isoformat()
+
+    rows, error = await _collide_with_a_pinned_read(
+        journal_tap.connection,
+        read=lambda: _legacy_multi_hop_read(
+            journal_tap.connection, _LEGACY_REAPER_SCAN, (cutoff,)
+        ),
+        write=lambda: journal.record_run_session(
+            'live', session_id='session-collided', stage_cursor='stage-collided'
+        ),
+        foreign_commit=lambda: _file_a_late_stale_run(second_connection),
+    )
+
+    assert error == 'SQLITE_BUSY_SNAPSHOT', (
+        f'the replaced reaper read did not kill the write ({error!r}), so this '
+        'collision no longer reproduces the defect arm A guards'
+    )
+    assert [row['id'] for row in rows] == ['long'], (
+        f"the parked read saw {[row['id'] for row in rows]!r}: it was not pinned "
+        "before the foreign commit filed 'late'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_stale_run_means_no_pinned_read_and_no_failures(journal, second_connection):
     """Arm B, a permanent control: the same loop, with nothing past the cutoff.
 
