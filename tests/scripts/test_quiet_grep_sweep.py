@@ -33,6 +33,7 @@ _SWEPT_SCRIPTS = tuple(
         "memory-metadata-coverage-census.sh",
         "verify-migration.sh",
         "run_eval_matrix.sh",
+        "deploy/install_laptop_merge_verify_trim.sh",
     )
 )
 

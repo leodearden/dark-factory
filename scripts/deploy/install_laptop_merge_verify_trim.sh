@@ -156,14 +156,14 @@ echo "installed $unit.{service,timer} into $unit_dir and scripts into $lib"
 
 cron_new="$lib/gc-worktree-targets.sh"
 current="$(crontab -l 2>/dev/null || true)"
-if printf '%s\n' "$current" | grep -qF "$cron_old"; then
+if [[ "$current" == *"$cron_old"* ]]; then
     printf '%s\n' "$current" >"$lib/crontab.bak-$label"
     while IFS= read -r line; do
         printf '%s\n' "${line//"$cron_old"/"$cron_new"}"
     done <<<"$current" | crontab -
-    crontab -l | grep -qF "$cron_new" || { echo "ERROR: crontab repoint did not take" >&2; exit 1; }
+    [[ "$(crontab -l)" == *"$cron_new"* ]] || { echo "ERROR: crontab repoint did not take" >&2; exit 1; }
     echo "crontab: gc-worktree-targets.sh now runs $cron_new (backup $lib/crontab.bak-$label)"
-elif printf '%s\n' "$current" | grep -qF "$cron_new"; then
+elif [[ "$current" == *"$cron_new"* ]]; then
     echo "crontab: already runs $cron_new (no-op)"
 else
     echo "crontab: no gc-worktree-targets.sh line to repoint"
