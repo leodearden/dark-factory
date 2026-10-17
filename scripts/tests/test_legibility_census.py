@@ -1378,6 +1378,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
         mod.SECTION_SYNTHESIS,
         mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
+        mod.SECTION_STRUCTURAL,
         mod.SECTION_COST,
     ]
 
@@ -1525,6 +1526,10 @@ _no findings touched this run._
 | finding_key | title | step | resolution | task_id | ticket | disposition | project_root | note |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | fk-a194ef3f74f9 | A filed finding | curator | created | 1000 | tkt_1 | filed:1000 |  |  |
+
+## Structural
+
+_no structural findings this run._
 
 ## Cost
 
@@ -2431,6 +2436,7 @@ def test_census_report_sections_flagless_key_set_and_order():
         mod.SECTION_SYNTHESIS,
         mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
+        mod.SECTION_STRUCTURAL,
         mod.SECTION_COST,
     ]
 
@@ -2709,9 +2715,11 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
 _IN_TREE_REMEDIATION = {"path": "docs/fixture.md", "change": "fixture remediation"}
 
 
-def _fake_verdict(remediation):
+def _fake_verdict(remediation, route=verdict.Route.MECHANICAL):
     """The verdict.Verdict the real verifier attaches to a verified cluster,
-    as a fake verifier states it: no normalisation, severity medium."""
+    as a fake verifier states it: no normalisation, severity medium, and
+    *route* (mechanical, so a fake verdict is fileable unless a test says
+    otherwise)."""
     found = None if remediation is None else verdict.Remediation(
         remediation["path"], remediation["change"],
     )
@@ -2722,14 +2730,14 @@ def _fake_verdict(remediation):
         tags=("h13", verdict.KIND_TAG),
         severity=verdict.DEFAULT_SEVERITY,
         severity_reason="fake verifier",
-        route=verdict.Route.STRUCTURAL if found is None else verdict.Route.MECHANICAL,
+        route=route,
         remediation=found,
     )
 
 
 def _make_fake_verify_fn(
     *, verified_titles=(), rejected_titles=(), fixed_entry_ids=(),
-    remediation=_IN_TREE_REMEDIATION,
+    remediation=_IN_TREE_REMEDIATION, route=verdict.Route.MECHANICAL,
 ):
     """Fake Sonnet `verify_fn(clusters, *, model)` seam. Splits the input
     clusters by title into verified/rejected per the given title sets;
@@ -2747,7 +2755,7 @@ def _make_fake_verify_fn(
 
     def fake_verify_fn(clusters, *, model):
         verified = [
-            {**c, "verdict": _fake_verdict(remediation)}
+            {**c, "verdict": _fake_verdict(remediation, route)}
             for c in clusters
             if c.get("title") in verified_titles
         ]
@@ -9590,3 +9598,116 @@ def test_run_census_looks_up_and_resolves_a_harness_filing_in_the_harness_projec
     assert link["project_root"] == _HARNESS.project_root
     [row] = _filed_rows(kwargs)
     assert row["project_root"] == _HARNESS.project_root
+
+
+# ---------------------------------------------------------------------------
+# task 6403 step-15: RED — contract §6 (D6): a structural finding is promoted
+# and recorded in the codebook, listed under ## Structural, and NOT filed.
+# ---------------------------------------------------------------------------
+
+_STRUCTURAL_TITLE = "Spurious pattern"
+_STRUCTURAL_ANCHOR = "docs/structural.md"
+
+
+def _routed_verdict(route, anchor):
+    return verdict.Verdict(
+        verified=True,
+        reason="fake verifier",
+        anchor=anchor,
+        tags=("h13", verdict.KIND_TAG),
+        severity=verdict.DEFAULT_SEVERITY,
+        severity_reason="fake verifier",
+        route=route,
+        remediation=verdict.Remediation(_IN_TREE_REMEDIATION["path"], _IN_TREE_REMEDIATION["change"]),
+    )
+
+
+def _routed_verify_fn():
+    """Verifies both _happy_invoke_response titles, each with an in-tree
+    remediation: _PROMOTED_TITLE mechanical, _STRUCTURAL_TITLE structural."""
+    verdicts = {
+        _PROMOTED_TITLE: _routed_verdict(verdict.Route.MECHANICAL, "docs/mechanical.md"),
+        _STRUCTURAL_TITLE: _routed_verdict(verdict.Route.STRUCTURAL, _STRUCTURAL_ANCHOR),
+    }
+
+    def verify_fn(clusters, *, model):
+        verified = [
+            {**c, "verdict": verdicts[c["title"]], "remediation": _IN_TREE_REMEDIATION}
+            for c in clusters
+            if c.get("title") in verdicts
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    return verify_fn
+
+
+def test_run_census_records_a_structural_finding_and_files_only_the_mechanical_one(tmp_path):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=_routed_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    [filed] = kwargs["submit_fn"].calls
+    assert filed["title"] == disposition.task_title(_PROMOTED_TITLE)
+    structural = _persisted_entry(kwargs["codebook_path"], _STRUCTURAL_TITLE)
+    assert mod.ENTRY_FILING_KEY not in structural, "a structural finding is not withheld"
+    assert "filed_tickets" not in structural
+    assert _run_record(kwargs)["filing"]["structural"] == [{
+        "entry_id": structural["id"],
+        "title": _STRUCTURAL_TITLE,
+        "finding_key": structural["finding_key"],
+        "anchor": _STRUCTURAL_ANCHOR,
+    }]
+    section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Structural")
+    [row] = _filed_table(section)
+    assert (row["finding_key"], row["entry_id"]) == (structural["finding_key"], structural["id"])
+    assert {row["id"] for row in _run_record(kwargs)["findings"]} >= {structural["id"]}, (
+        "a structural finding still has its ## Findings row"
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_structural_renders_on_every_report_right_after_filed_tasks(case):
+    record = _census_record(**_REPORT_FLAG_CASES[case])
+    keys = [section.key for section in mod.census_report_sections(record)]
+    assert keys.index(mod.SECTION_STRUCTURAL) == keys.index(mod.SECTION_FILED_TASKS) + 1
+    assert "Structural" in check_census_report.level2_titles(mod.render_report(record))
+
+
+def test_structural_section_is_the_disposition_rendering_of_the_record():
+    record = _census_record()
+    lines = _section(mod.census_report_sections(record), mod.SECTION_STRUCTURAL).lines
+    assert lines == tuple(disposition.structural_lines(record["filing"]))
+    assert lines[:3] == ("", "## Structural", "")
+    assert len(lines) == 4, "an empty run renders the placeholder alone"
+
+
+def _bare_verify_fn(titles):
+    """Verifies *titles* with neither a Verdict nor a remediation."""
+    def verify_fn(clusters, *, model):
+        return {"verified": [c for c in clusters if c.get("title") in titles], "rejected": [], "fixed": []}
+
+    return verify_fn
+
+
+def test_run_census_records_a_verdictless_unremediated_cluster_as_structural(tmp_path):
+    """The verdict parser defaults an unremediated verdict's route to
+    STRUCTURAL, so a recurring verdictless cluster is recorded, not filed."""
+    kwargs = _gate_kwargs(tmp_path, sessions=("s1", "s2"))
+    kwargs["verify_fn"] = _bare_verify_fn({_GATED_TITLE})
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["submit_fn"].calls == []
+    assert outcome.withheld == ()
+    entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
+    assert mod.ENTRY_FILING_KEY not in entry
+    assert [item["entry_id"] for item in _run_record(kwargs)["filing"]["structural"]] == [entry["id"]]
