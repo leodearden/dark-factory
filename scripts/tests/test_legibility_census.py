@@ -36,11 +36,13 @@ from legibility import (
     check_census_report,
     codebook,
     coder,
+    disposition,
     filing_policy,
     finding_area,
     invariants,
     session_ledger,
     session_runner,
+    task_store,
     trickle_state,
     unlanded,
     verdict,
@@ -48,6 +50,7 @@ from legibility import (
 from legibility import census as mod
 from legibility import config as config_mod
 from legibility import digest as digest_mod
+from legibility_task_store_fake import FakeTaskStore
 from quality_doc_texts import code_quality
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
@@ -1410,7 +1413,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
     sections = _sections(
         matrix_md=matrix_md,
         synthesis_md="Fable synthesis prose goes here.",
-        filed_ticket_ids=["tkt_1234", "tkt_1235"],
+        filing=_filing_record("tkt_1234", "tkt_1235"),
         cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
     )
 
@@ -1435,9 +1438,8 @@ def test_render_report_carries_each_piece_in_its_own_section():
     assert "Project: dark_factory" in header
     assert matrix_md in _section_text(sections, mod.SECTION_MATRIX), "embedded verbatim"
     assert "Fable synthesis prose goes here." in _section_text(sections, mod.SECTION_SYNTHESIS)
-    filed = _section_text(sections, mod.SECTION_FILED_TASKS)
-    assert "- tkt_1234" in filed
-    assert "- tkt_1235" in filed
+    filed = _filed_table(_section_text(sections, mod.SECTION_FILED_TASKS))
+    assert [row["ticket"] for row in filed] == ["tkt_1234", "tkt_1235"]
     assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in _section_text(
         sections, mod.SECTION_COST
     )
@@ -1569,9 +1571,9 @@ _no findings touched this run._
 
 ## Filed Tasks
 
-_1 ticket(s) filed -- the curator's create/combine/drop decision is still pending, so no task id exists yet; resolve_ticket returns the task id once it does._
-
-- tkt_1
+| finding_key | title | step | resolution | task_id | ticket | disposition | project_root | note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fk-a194ef3f74f9 | A filed finding | curator | created | 1000 | tkt_1 | filed:1000 |  |  |
 
 ## Cost
 
@@ -1695,6 +1697,67 @@ def _persisted_coverage_line(report):
     return _coverage_line_among(report.splitlines())
 
 
+_RENDER_ROOT = "/srv/observed-project"
+_RENDER_KEY = "fk-a194ef3f74f9"
+
+
+def _filing_report(
+    *tickets: str, first_task_id: int = 1000, project_root: str = _RENDER_ROOT,
+) -> disposition.FilingReport:
+    """One curator ticket per *tickets*, each created as the next task id from
+    *first_task_id*; the first one carries the golden's finding key."""
+    decisions = tuple(
+        disposition.Decision(
+            disposition.Filing(
+                entry_id=f"entry-{ticket}",
+                finding_key=_RENDER_KEY if index == 0 else None,
+                title="A filed finding" if index == 0 else f"A filed finding {index}",
+                statement="",
+                payload={"project_root": project_root},
+            ),
+            disposition.Step.CURATOR,
+            ticket=ticket,
+        )
+        for index, ticket in enumerate(tickets)
+    )
+    resolved = tuple(
+        disposition.ResolvedTicket(
+            entry_id=f"entry-{ticket}",
+            ticket=ticket,
+            project_root=project_root,
+            outcome=task_store.TicketOutcome(task_store.TicketStatus.CREATED, first_task_id + index, None),
+            carried=False,
+        )
+        for index, ticket in enumerate(tickets)
+    )
+    return disposition.FilingReport(
+        disposal=disposition.Disposal(decisions, ()),
+        resolutions=disposition.Resolutions(resolved),
+        backfill=disposition.Backfill(),
+    )
+
+
+def _filing_record(*tickets: str, **kwargs: Any) -> dict[str, Any]:
+    return _filing_report(*tickets, **kwargs).to_record()
+
+
+def _filed_table(section_text: str) -> list[dict[str, str]]:
+    """The Filed Tasks table of *section_text*, one dict per row keyed by its
+    column header; [] when the section renders no table."""
+    lines = [line for line in section_text.splitlines() if line.startswith("|")]
+    if not lines:
+        return []
+    header, _rule, *rows = lines
+    columns = _cells(header)
+    return [dict(zip(columns, _cells(row), strict=True)) for row in rows]
+
+
+def _report_section(report: str, title: str) -> str:
+    """The body of the level-2 section *title* in a persisted *report*."""
+    assert title in check_census_report.level2_titles(report), title
+    return report.split(f"\n## {title}\n", 1)[1].split("\n## ", 1)[0]
+
+
 def _render_kwargs(**overrides) -> dict[str, Any]:
     """The flagless `render_report` keyword set, with *overrides* applied.
 
@@ -1713,7 +1776,8 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_ticket_ids=["tkt_1"],
+        project_root=_RENDER_ROOT,
+        filing=_filing_record("tkt_1"),
         cost_note="cost",
     )
     kwargs.update(overrides)
@@ -1940,7 +2004,7 @@ _PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
 
 def test_render_report_dry_run_filing_section_names_count_and_path():
     sections = _sections(
-        filed_ticket_ids=[],
+        filing=_filing_record(),
         dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     )
 
@@ -1959,57 +2023,66 @@ def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
     # past.
     dry_run_text = _section_text(
         _sections(
-            filed_ticket_ids=[],
+            filing=_filing_record(),
             dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
         ),
         mod.SECTION_FILED_TASKS,
     )
-    plain_text = _section_text(_sections(filed_ticket_ids=[]), mod.SECTION_FILED_TASKS)
+    plain_text = _section_text(_sections(filing=_filing_record()), mod.SECTION_FILED_TASKS)
 
     assert dry_run_text != plain_text
     assert f"3 payload(s) written to {_PAYLOADS_PATH}" in dry_run_text
-    # Neither of the other two branches may leak in behind the dry-run wording.
-    assert "resolve_ticket" not in dry_run_text
-    assert "create/combine/drop" not in dry_run_text
+    assert _filed_table(dry_run_text) == []
 
 
-def test_render_report_filed_section_counts_lists_and_points_at_resolve_ticket():
+def test_render_report_filed_section_is_one_table_row_per_decision():
     # Behaviour only; the exact wording is _GOLDEN_FLAGLESS_REPORT's to lock.
-    section = _section_text(
-        _sections(filed_ticket_ids=["tkt_1", "tkt_2"]), mod.SECTION_FILED_TASKS
+    rows = _filed_table(_section_text(
+        _sections(filing=_filing_record("tkt_1", "tkt_2", first_task_id=40)),
+        mod.SECTION_FILED_TASKS,
+    ))
+
+    assert [(row["ticket"], row["task_id"], row["step"], row["resolution"]) for row in rows] == [
+        ("tkt_1", "40", "curator", "created"),
+        ("tkt_2", "41", "curator", "created"),
+    ]
+    assert [row["disposition"] for row in rows] == ["filed:40", "filed:41"]
+    assert rows[0]["finding_key"] == _RENDER_KEY
+    assert all(row["project_root"] == "" for row in rows), "the observed project is the default"
+
+
+def test_render_report_filed_tasks_section_is_the_disposition_body_under_its_heading():
+    # Whole-section locks: without a dry run the section is its heading over
+    # disposition.filed_tasks_lines, so no dry-run clause can leak in.
+    record = _census_record(filing=_filing_record("tkt_1234", "tkt_1235"))
+    filed = _section(mod.census_report_sections(record), mod.SECTION_FILED_TASKS).lines
+    assert filed == (
+        "", "## Filed Tasks", "",
+        *disposition.filed_tasks_lines(record["filing"], observed_root=_RENDER_ROOT),
     )
 
-    assert "2 ticket" in section, "the section must name how many tickets were filed"
-    bullets = [line for line in section.splitlines() if line.startswith("- ")]
-    assert bullets == ["- tkt_1", "- tkt_2"], "one bullet per ticket id, in the order filed"
-    assert "resolve_ticket" in section, (
-        "name the handle that turns a ticket id into the eventual task id"
-    )
-
-
-def test_render_report_without_dry_run_filed_tasks_section_unchanged():
-    # Whole-section locks rather than substring probes: every line the section
-    # renders is pinned, so a dry-run clause cannot leak into either branch
-    # and no `"dry-run" not in ...` probe has to anticipate its wording.
-    #
-    # The filed branch's one prose line is pinned by POSITION only: its
-    # wording is _GOLDEN_FLAGLESS_REPORT's to lock, and what it must say is
-    # test_render_report_filed_section_counts_lists_and_points_at_resolve_ticket's.
-    filed = _section(
-        _sections(filed_ticket_ids=["tkt_1234", "tkt_1235"]), mod.SECTION_FILED_TASKS
-    ).lines
-    assert filed[:3] == ("", "## Filed Tasks", "")
-    assert len(filed) == 7 and filed[4] == "", (
-        f"one disclosure line, its blank, then the bullets; got {filed!r}"
-    )
-    assert filed[5:] == ("- tkt_1234", "- tkt_1235")
-
-    # The empty branch is UNCHANGED: no ticket count, no pending prose, just
-    # the placeholder. A run that filed nothing must not acquire a disclosure
-    # about a decision that was never triggered.
+    # A run that filed nothing renders the placeholder alone.
     assert _section(
-        _sections(filed_ticket_ids=[]), mod.SECTION_FILED_TASKS
+        _sections(filing=_filing_record()), mod.SECTION_FILED_TASKS
     ).lines == ("", "## Filed Tasks", "", "_none filed._")
+
+
+def test_render_report_names_the_project_a_cross_project_decision_filed_into():
+    harness_root = "/srv/harness"
+    rows = _filed_table(_section_text(
+        _sections(filing=_filing_record("tkt_7", project_root=harness_root)),
+        mod.SECTION_FILED_TASKS,
+    ))
+    assert [(row["ticket"], row["project_root"]) for row in rows] == [("tkt_7", harness_root)]
+
+
+def test_build_census_record_carries_the_filing_record_and_the_observed_root():
+    filing = _filing_record("tkt_1")
+    record = _census_record(filing=filing)
+    assert record["filing"] == filing
+    assert record["project_root"] == _RENDER_ROOT
+    assert "filed_ticket_ids" not in record
+    assert "cross_project_tickets" not in record
 
 
 # ---------------------------------------------------------------------------
@@ -2105,7 +2178,7 @@ _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
     "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
     "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, offered=2, cap=2)},
     "dry_run_filing": {
-        "filed_ticket_ids": [],
+        "filing": _filing_record(),
         "dry_run": mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     },
     "unresolved_verdicts": {"dropped_verdicts": _sample_dropped_verdicts()},
@@ -2515,7 +2588,8 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_ticket_ids=["tkt_1"],
+        project_root=_RENDER_ROOT,
+        filing=_filing_record("tkt_1"),
         cost_note="cost",
     ))
     assert report == _GOLDEN_FLAGLESS_REPORT
@@ -2540,6 +2614,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         verify_fn=_poison("verify_fn"),
         synthesize_fn=_poison("synthesize_fn"),
         submit_fn=_make_fake_submit_fn(),
+        task_store=FakeTaskStore(),
         escalate_fn=_make_fake_escalate_fn(),
         status_fetcher=_make_fake_status_fetcher(0),
         commit=_poison("commit"),
@@ -4151,16 +4226,26 @@ def test_run_census_submit_fn_raising_is_best_effort_not_fatal(tmp_path, caplog)
 
     assert outcome.status == "done", "one filing failure must not abort the pipeline"
     assert outcome.filed_ticket_ids == []
-    assert any("submit_fn" in r.message for r in caplog.records), "must log loudly, not swallow silently"
+    assert any("submit_task raised" in r.message for r in caplog.records), (
+        "must log loudly, not swallow silently"
+    )
 
     # the codebook was already persisted before filing was attempted, and the
     # rest of the pipeline (report + state + commit) must still complete
     assert kwargs["codebook_path"].exists()
     assert kwargs["census_state_path"].exists()
     assert kwargs["report_path"].exists()
-    report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    assert "_none filed._" in report_text
+    _assert_reported_unfiled(kwargs, "simulated transient MCP failure")
     assert len(fake_commit.calls) == 1
+
+
+def _assert_reported_unfiled(kwargs, reason: str) -> None:
+    """The run's one decision is reported open, with no ticket and no task,
+    and its note names *reason*: a failed filing is visible, never counted."""
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    [row] = _filed_table(_report_section(report_text, "Filed Tasks"))
+    assert (row["ticket"], row["task_id"], row["disposition"]) == ("", "", "open")
+    assert reason in row["note"]
 
 
 # ---------------------------------------------------------------------------
@@ -4200,12 +4285,10 @@ def test_run_census_submit_fn_non_dict_result_is_not_counted_as_filed(tmp_path, 
         "a non-dict submit_fn result must not crash the ticket read, and must "
         "not be counted as a genuinely-filed ticket"
     )
-    assert any("no ticket id" in r.message for r in caplog.records), "must log loudly, not swallow silently"
-
-    report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    filed_section = report_text.split("## Filed Tasks")[1].split("## Cost")[0]
-    assert "None" not in filed_section, "an id-less result must never render as a '- None' bullet"
-    assert "_none filed._" in filed_section
+    assert any("returned no ticket" in r.message for r in caplog.records), (
+        "must log loudly, not swallow silently"
+    )
+    _assert_reported_unfiled(kwargs, "returned no ticket")
 
 
 # ---------------------------------------------------------------------------
@@ -4247,16 +4330,10 @@ def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, capl
         "an {'error', 'error_type'} result means NOTHING was filed -- it must "
         "never inflate the filed-ticket count"
     )
-    assert any("no ticket id" in r.message for r in caplog.records), (
+    assert any("returned no ticket" in r.message for r in caplog.records), (
         "a rejected filing must be logged loudly, not swallowed silently"
     )
-
-    report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    filed_section = report_text.split("## Filed Tasks")[1].split("## Cost")[0]
-    assert "_none filed._" in filed_section
-    assert "backlog full" not in filed_section, (
-        "an error payload must never leak into the human-facing report as a bullet"
-    )
+    _assert_reported_unfiled(kwargs, "backlog full")
     assert "None" not in filed_section, "an unfilable result must never render as a '- None' bullet"
 
 
@@ -8709,19 +8786,11 @@ def test_run_census_files_a_harness_fix_surface_into_the_harness_project(tmp_pat
 def test_run_census_report_names_the_project_a_cross_project_ticket_went_to(tmp_path):
     kwargs = _hosted_kwargs(tmp_path, harness_project=_HARNESS)
 
-    outcome = mod.run_census(**kwargs)
+    mod.run_census(**kwargs)
 
-    filed_text = _section_text(
-        _sections(
-            filed_ticket_ids=outcome.filed_ticket_ids,
-            cross_project_tickets=outcome.cross_project_tickets,
-        ),
-        mod.SECTION_FILED_TASKS,
-    )
-    assert any(
-        "tkt_1" in line and _HARNESS.project_root in line for line in filed_text.splitlines()
-    )
-    assert filed_text in kwargs["report_path"].read_text(encoding="utf-8")
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    [row] = _filed_table(_report_section(report_text, "Filed Tasks"))
+    assert (row["ticket"], row["project_root"]) == ("tkt_1", _HARNESS.project_root)
 
 
 def test_run_census_without_harness_project_files_into_the_observed_project(tmp_path):
@@ -9417,3 +9486,157 @@ def test_run_census_without_a_briefing_keys_everything_to_repo_and_says_so(tmp_p
 
     assert _persisted_promoted_entry(kwargs)["finding_area"] == "repo"
     assert finding_area.BRIEFING_RELPATH in _findings_of_report(kwargs)
+
+
+# ---------------------------------------------------------------------------
+# task 6403 step-13: RED — run_census runs contract §8 (dedup before filing)
+# through its `task_store` seam, and every routed finding links back to its
+# codebook entry (C1 filed_tickets; plans/census-incremental-prd.md L4).
+# ---------------------------------------------------------------------------
+
+_READ_TOOLS = frozenset({"find_tasks_by_metadata", "search_tasks", "get_task", "resolve_ticket"})
+
+
+def _keyed_kwargs(tmp_path, store, **overrides):
+    """A run that promotes and would file _PROMOTED_TITLE under _ROW5_KEY."""
+    _write_briefing(tmp_path)
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_keyed_verify_fn())
+    kwargs.update(task_store=store, **overrides)
+    return kwargs
+
+
+def _filed_rows(kwargs) -> list[dict[str, str]]:
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    return _filed_table(_report_section(report, "Filed Tasks"))
+
+
+def test_run_census_row7_a_live_task_carrying_the_key_is_not_refiled(tmp_path):
+    """PRD §4.8 row 7: step 1 finds the key on a pending task."""
+    store = FakeTaskStore(metadata_hits={
+        (disposition.FINDING_KEY_METADATA, _ROW5_KEY): (
+            task_store.TaskHit(501, disposition.task_title(_PROMOTED_TITLE), "pending"),
+        ),
+    })
+    kwargs = _keyed_kwargs(tmp_path, store)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["submit_fn"].calls == []
+    assert outcome.filed_ticket_ids == []
+    assert _persisted_promoted_entry(kwargs)["filed_tickets"] == [{
+        "ticket": None,
+        "project_root": str(tmp_path),
+        "run_id": kwargs["run_id"],
+        "finding_key": _ROW5_KEY,
+        "task_id": 501,
+        "resolution": "existing",
+        "step": "key",
+    }]
+    [decision] = _run_record(kwargs)["filing"]["decisions"]
+    assert (decision["task_id"], decision["step"]) == (501, "key")
+    [row] = _filed_rows(kwargs)
+    assert (row["task_id"], row["step"], row["disposition"]) == ("501", "key", "filed:501")
+
+
+def _unreachable_post(mode):
+    def post(url, tool_name, arguments, *, timeout):
+        if mode == "raises":
+            raise ConnectionError("connection refused")
+        return {"error": "down", "error_type": "ConnectionError"}
+
+    return post
+
+
+@pytest.mark.parametrize("mode", ["error-payload", "raises"])
+def test_run_census_row8_an_unreachable_key_lookup_files_nothing(tmp_path, mode):
+    """PRD §4.8 row 8: step 1 cannot run, so NOTHING is filed."""
+    store = task_store.McpTaskStore(url="http://fused-memory.invalid/mcp", post=_unreachable_post(mode))
+    kwargs = _keyed_kwargs(tmp_path, store)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["submit_fn"].calls == []
+    assert outcome.filed_ticket_ids == []
+    assert outcome.filing is not None
+    unreachable = outcome.filing.disposal.unreachable
+    assert unreachable is not None and "find_tasks_by_metadata" in unreachable
+    filing = _run_record(kwargs)["filing"]
+    assert filing["unreachable"] == unreachable
+    assert [item["finding_key"] for item in filing["unfiled"]] == [_ROW5_KEY]
+    section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Filed Tasks")
+    assert "NOTHING was filed" in section
+    assert unreachable in section
+    assert _ROW5_KEY in section
+    assert "filed_tickets" not in _persisted_promoted_entry(kwargs)
+
+
+def test_run_census_records_a_combined_ticket_against_the_task_it_joined(tmp_path):
+    store = FakeTaskStore(
+        tasks={77: task_store.TaskRecord(77, "an older task", "pending", {})},
+        resolve_outcomes={"tkt_1": task_store.TicketOutcome(task_store.TicketStatus.COMBINED, 77, None)},
+    )
+    kwargs = _keyed_kwargs(tmp_path, store)
+
+    mod.run_census(**kwargs)
+
+    [link] = _persisted_promoted_entry(kwargs)["filed_tickets"]
+    assert (link["ticket"], link["task_id"], link["resolution"], link["step"]) == (
+        "tkt_1", 77, "combined", "curator",
+    )
+    [row] = _filed_rows(kwargs)
+    assert (row["task_id"], row["resolution"]) == ("77", "combined")
+    assert store.tasks[77].metadata == {}, "a combine writes no metadata onto the task (T4)"
+    assert set(store.tools_called()) <= _READ_TOOLS
+
+
+def test_run_census_records_a_refused_ticket_with_its_reason(tmp_path):
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_1": task_store.TicketOutcome(task_store.TicketStatus.REFUSED, None, "already covered"),
+    })
+    kwargs = _keyed_kwargs(tmp_path, store)
+
+    mod.run_census(**kwargs)
+
+    [link] = _persisted_promoted_entry(kwargs)["filed_tickets"]
+    assert (link["ticket"], link["task_id"], link["resolution"]) == ("tkt_1", None, "refused")
+    [row] = _filed_rows(kwargs)
+    assert (row["ticket"], row["task_id"], row["resolution"]) == ("tkt_1", "", "refused")
+    assert "already covered" in row["note"]
+
+
+def test_run_census_names_the_task_a_created_ticket_resolved_to(tmp_path):
+    store = FakeTaskStore(first_created_id=4242)
+    kwargs = _keyed_kwargs(tmp_path, store)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.filed_ticket_ids == ["tkt_1"]
+    [row] = _filed_rows(kwargs)
+    assert (row["ticket"], row["task_id"], row["step"], row["resolution"]) == (
+        "tkt_1", "4242", "curator", "created",
+    )
+    [link] = _persisted_promoted_entry(kwargs)["filed_tickets"]
+    assert (link["task_id"], link["resolution"], link["finding_key"]) == (4242, "created", _ROW5_KEY)
+    assert store.arguments_of("resolve_ticket")[0]["project_root"] == str(tmp_path)
+
+
+def test_run_census_looks_up_and_resolves_a_harness_filing_in_the_harness_project(tmp_path):
+    store = FakeTaskStore()
+    kwargs = _hosted_kwargs(tmp_path, harness_project=_HARNESS, task_store=store)
+
+    mod.run_census(**kwargs)
+
+    key_lookups = [
+        arguments for arguments in store.arguments_of("find_tasks_by_metadata")
+        if arguments["key"] == disposition.FINDING_KEY_METADATA
+    ]
+    assert [arguments["project_root"] for arguments in key_lookups] == [_HARNESS.project_root]
+    assert [arguments["project_root"] for arguments in store.arguments_of("resolve_ticket")] == [
+        _HARNESS.project_root,
+    ]
+    [link] = _persisted_entry(kwargs["codebook_path"], _DF_TITLE)["filed_tickets"]
+    assert link["project_root"] == _HARNESS.project_root
+    [row] = _filed_rows(kwargs)
+    assert row["project_root"] == _HARNESS.project_root
