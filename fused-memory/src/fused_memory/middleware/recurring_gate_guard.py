@@ -78,12 +78,13 @@ with a one-line ``AsyncMock``.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
 from shared.task_statuses import TERMINAL
+
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
     'GATE_SUBJECT_ALIASES',
@@ -158,36 +159,6 @@ GATE_SUBJECT_SUBMISSION_ALIASES: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes → empty dict).
-
-    Behaviourally identical to ``execution_class_guard._parse_metadata`` —
-    None → {}; empty string → {}; dict → returned as-is (callers that need
-    to mutate must copy first); JSON string → parsed dict, or {} if the
-    parse fails or yields a non-dict value; anything else → {}. Kept in
-    lockstep deliberately: the two guards run back-to-back on the same
-    ``submit_task`` payload and must never disagree about a malformed blob.
-    """
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-# ---------------------------------------------------------------------------
 # Public submission readers
 # ---------------------------------------------------------------------------
 
@@ -212,7 +183,7 @@ def extract_gate_subject(
     INCOMING submission must pass :data:`GATE_SUBJECT_SUBMISSION_ALIASES`
     instead — see that constant for why the two orders differ.
     """
-    meta = _parse_metadata(metadata)
+    meta = raw_metadata_dict(metadata, source='recurring_gate_guard')
     for key in aliases:
         value = meta.get(key)
         if isinstance(value, bool) or not isinstance(value, (str, int)):
@@ -241,7 +212,7 @@ def is_gate_submission(metadata: str | dict[str, Any] | None) -> bool:
     satisfies the predicate (``bool('false')`` is True and would silently
     accept the opposite of the caller's intent).
     """
-    meta = _parse_metadata(metadata)
+    meta = raw_metadata_dict(metadata, source='recurring_gate_guard')
     if meta.get('execution_class') != 'operational':
         return False
     return meta.get('operational_mode', 'gate') == 'gate'
@@ -292,10 +263,10 @@ def find_open_gate(tasks: Any, subject: str) -> dict[str, Any] | None:
             continue
         if str(row.get('status', '')) in TERMINAL:
             continue
-        metadata = row.get('metadata')
-        if extract_gate_subject(metadata) != subject:
+        meta = raw_metadata_dict(row.get('metadata'), source='recurring_gate_guard')
+        if extract_gate_subject(meta) != subject:
             continue
-        if not is_gate_submission(metadata):
+        if not is_gate_submission(meta):
             continue
         task_id = str(row.get('id', '') or '')
         if not task_id:
@@ -415,7 +386,7 @@ async def recurring_gate_guard_error(
     if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
         return None
 
-    meta = _parse_metadata(metadata)
+    meta = raw_metadata_dict(metadata, source='recurring_gate_guard')
     if not is_gate_submission(meta):
         return None
 
