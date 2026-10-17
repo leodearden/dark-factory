@@ -7,6 +7,7 @@ resolve to one module object, whichever runs first.
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,13 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
-from fused_memory.services.overreach_guard import PROMPT_VERSION
+from fused_memory.services.overreach_guard import PROMPT_VERSION, EdgeJudgement, JudgeEdge
+from fused_memory.services.overreach_shadow import (
+    SIDECAR_FILENAME,
+    JudgedEpisode,
+    OverreachShadowStore,
+    ShadowOutcome,
+)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 SCRIPT_PATH = SCRIPTS / 'eval_overreach_judge.py'
@@ -256,8 +263,8 @@ class TestRunOffline:
         assert out['precision']['rate'] == 1.0
         assert out['recall']['rate'] == 1.0
         assert out['trigger']['passes'] is True
-        assert out['prompt_version'] == PROMPT_VERSION
-        assert out['judge_model'] == 'fake-judge-1'
+        assert out['prompt_versions'] == [PROMPT_VERSION]
+        assert out['judge_models'] == ['fake-judge-1']
         assert out['unjudged'] == [] and out['failures'] == []
 
     def test_a_judge_failure_leaves_that_episode_unjudged(self, tmp_path: Path) -> None:
@@ -308,5 +315,155 @@ class TestRunRejectsBadInputs:
         paths = _run_inputs(tmp_path)
         with pytest.raises(SystemExit) as exit_info:
             mod.run(_argv(paths, mode='online'), llm=_OracleLLM())
+        assert exit_info.value.code == 2
+        assert not paths['out'].exists()
+
+
+# --------------------------------------------------------------------------- #
+# The CLI, online: the shadow's own labels, read back from its sidecar
+# --------------------------------------------------------------------------- #
+# Each episode: (graph, stratum, uuid, judge model, prompt version, edge groups),
+# an edge group being (verdict, sidecar label, count). A None label is an edge
+# the shadow never judged.
+#   cell (dark_factory, ruling_lexeme), w=2:  10 TP, 1 FP, 11 FN, 1 TN
+#   cell (reify, other_decisions),     w=10: 10 TP, 11 FN (one unjudged), 1 TN
+# Precision clears both bounds; recall stays under 0.50.
+
+OLDER_PROMPT = 'prompt-v-older'
+ONLINE_EPISODES = [
+    (DF, RULING, 'df-on0', 'judge-a', PROMPT_VERSION,
+     (('overreach', 'overreach', 10), ('holding', 'overreach', 1))),
+    (DF, RULING, 'df-on1', 'judge-a', PROMPT_VERSION,
+     (('overreach', 'holding', 11), ('holding', 'holding', 1))),
+    (REIFY, OTHER, 'rf-on0', 'judge-b', OLDER_PROMPT, (('overreach', 'overreach', 10),)),
+    (REIFY, OTHER, 'rf-on1', 'judge-b', OLDER_PROMPT,
+     (('overreach', 'holding', 10), ('overreach', None, 1), ('holding', 'holding', 1))),
+]
+
+
+def _online_edges(uuid: str, groups) -> list[tuple[str, str, str | None]]:
+    """``(edge_uuid, verdict, sidecar label)`` for each of *uuid*'s edges, in order."""
+    flat = [(verdict, label) for verdict, label, count in groups for _ in range(count)]
+    return [(f'{uuid}-e{i}', verdict, label) for i, (verdict, label) in enumerate(flat)]
+
+
+ONLINE_ROWS = [
+    _row(graph, uuid, stratum, [edge for edge, _, _ in _online_edges(uuid, groups)])
+    for graph, stratum, uuid, _, _, groups in ONLINE_EPISODES
+]
+ONLINE_VERDICTS = {
+    (graph, edge): verdict
+    for graph, _, uuid, _, _, groups in ONLINE_EPISODES
+    for edge, verdict, _ in _online_edges(uuid, groups)
+}
+UNJUDGED_EDGE = (REIFY, 'rf-on1-e10')
+
+
+async def _seed_sidecar(data_dir: Path) -> Path:
+    store = await OverreachShadowStore.open(data_dir)
+    try:
+        for graph, _, uuid, judge_model, prompt_version, groups in ONLINE_EPISODES:
+            edges = _online_edges(uuid, groups)
+            await store.record(
+                episode=JudgedEpisode(
+                    graph=graph, episode_uuid=uuid, judge_model=judge_model,
+                    prompt_version=prompt_version, classifiers=('category_decisions',),
+                    minted_count=len(edges), outcome=ShadowOutcome.judged,
+                ),
+                judgements=[
+                    (JudgeEdge(uuid=edge, fact=f'fact of {edge}', source_name='S', target_name='T'),
+                     EdgeJudgement(edge_uuid=edge, label=label, rationale=f'shadow on {edge}'))
+                    for edge, _, label in edges if label is not None
+                ],
+            )
+        # A flag outside the worksheet: it must not count as a false positive.
+        await store.record(
+            episode=JudgedEpisode(
+                graph=DF, episode_uuid='unsampled', judge_model='judge-c',
+                prompt_version='prompt-v-unsampled', classifiers=('category_decisions',),
+                minted_count=1, outcome=ShadowOutcome.judged,
+            ),
+            judgements=[(
+                JudgeEdge(uuid='stray', fact='f', source_name='S', target_name='T'),
+                EdgeJudgement(edge_uuid='stray', label='overreach', rationale='r'),
+            )],
+        )
+    finally:
+        await store.close()
+    return data_dir / SIDECAR_FILENAME
+
+
+class _NeverCalledLLM:
+    model = 'never'
+
+    async def generate_response(self, *args, **kwargs):
+        raise AssertionError('this run must never consult an LLM')
+
+
+def _online_argv(paths: dict[str, Path], sidecar: Path) -> list[str]:
+    return [*_argv(paths, mode='online'), '--sidecar', str(sidecar)]
+
+
+class TestRunOnline:
+    @pytest.fixture
+    def online(self, tmp_path: Path) -> tuple[dict[str, Path], Path]:
+        paths = _write_inputs(
+            tmp_path, ONLINE_ROWS, _verdicts_obj(ONLINE_ROWS, ONLINE_VERDICTS), _report_obj(WEIGHTS),
+        )
+        return paths, asyncio.run(_seed_sidecar(tmp_path / 'sidecar'))
+
+    def _run(self, online) -> dict[str, Any]:
+        paths, sidecar = online
+        assert mod.run(_online_argv(paths, sidecar), llm=_NeverCalledLLM()) == 0
+        return json.loads(paths['out'].read_text())
+
+    def test_precision_and_recall_come_from_the_sidecar_labels(self, online) -> None:
+        out = self._run(online)
+        assert out['mode'] == 'online'
+        assert out['precision'] == audit.weighted_rate([(2.0, 10, 11), (10.0, 10, 10)])
+        assert out['recall'] == audit.weighted_rate([(2.0, 10, 21), (10.0, 10, 21)])
+
+    def test_the_unjudged_edge_is_a_listed_false_negative(self, online) -> None:
+        out = self._run(online)
+        assert [(u['graph'], u['edge_uuid']) for u in out['unjudged']] == [UNJUDGED_EDGE]
+        assert out['confusion_by_cell'][REIFY][OTHER]['fn'] == 11
+        assert out['coverage'] == {'offered': len(ONLINE_VERDICTS), 'judged': len(ONLINE_VERDICTS) - 1}
+
+    def test_the_recorded_judges_and_prompts_are_reported(self, online) -> None:
+        out = self._run(online)
+        assert out['judge_models'] == ['judge-a', 'judge-b']
+        assert out['prompt_versions'] == sorted([PROMPT_VERSION, OLDER_PROMPT])
+
+    def test_the_trigger_ignores_a_recall_under_the_offline_floor(self, online) -> None:
+        out = self._run(online)
+        assert out['recall']['rate'] < mod.RECALL_MIN
+        assert out['trigger']['passes'] is True
+        assert 'recall' not in out['trigger']['checks']
+
+    def test_the_sidecar_is_opened_read_only(self, online) -> None:
+        _, sidecar = online
+        before = (sidecar.read_bytes(), sidecar.stat().st_mtime_ns)
+        self._run(online)
+        assert (sidecar.read_bytes(), sidecar.stat().st_mtime_ns) == before
+
+    def test_online_mode_never_builds_an_llm(self, online, monkeypatch) -> None:
+        def _refuse(*args, **kwargs):
+            raise AssertionError('online mode must never build an LLM')
+
+        monkeypatch.setattr(mod, 'build_llm_client', _refuse)
+        paths, sidecar = online
+        assert mod.run(_online_argv(paths, sidecar)) == 0
+
+    def test_a_missing_sidecar_is_unavailable_and_writes_nothing(self, online, tmp_path: Path) -> None:
+        paths, _ = online
+        missing = tmp_path / 'nowhere' / SIDECAR_FILENAME
+        assert mod.run(_online_argv(paths, missing), llm=_NeverCalledLLM()) == 1
+        assert not paths['out'].exists()
+        assert not missing.exists()
+
+    def test_offline_mode_rejects_a_sidecar(self, online) -> None:
+        paths, sidecar = online
+        with pytest.raises(SystemExit) as exit_info:
+            mod.run([*_argv(paths), '--sidecar', str(sidecar)], llm=_NeverCalledLLM())
         assert exit_info.value.code == 2
         assert not paths['out'].exists()
