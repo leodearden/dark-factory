@@ -1,7 +1,7 @@
 # signal_leaves backfill, tranche ε4 (task 6591)
 
 Task 6591 is tranche ε4 of `plans/dashboard-prd-lanes-prd.md` §9.
-Rule applied: a leaf is named only where the PRD's own text, including its `.capability-manifest.md` twin, names the integration gate or goal-signal leaf. A leaf is never inferred from the dependency graph. A named leaf must also carry raw `metadata.prd_path` == the key, because the drift audit compares that field.
+Rule: `plans/dashboard-prd-lanes-prd.md` §9, ε1–ε4, "The rule." A named leaf was also checked against raw `metadata.prd_path`, because `scripts/audit_manifest_descriptor_drift.py::_stale_signal_bindings` compares that field (task 6949).
 
 | Key | Result | Leaf (label → task) | Named by (section heading) / Why unnamed |
 |---|---|---|---|
