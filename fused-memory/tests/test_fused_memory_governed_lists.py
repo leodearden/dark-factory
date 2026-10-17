@@ -31,7 +31,7 @@ BLESSED_MEMORY_METADATA_KEYS = governed_exceptions(
 )
 
 WALL_CLOCK_DEADLINE_BASELINE = governed_exceptions(
-    'fused_memory.scripts.check_bare_magicmock_config._WALL_CLOCK_DEADLINE_DEBT',
+    'fused_memory_scripts.check_bare_magicmock_config._WALL_CLOCK_DEADLINE_DEBT',
     'Per-file budgets of wall-clock-deadline (Rule C) violations grandfathered when the '
     'rule was adopted; each budget may only fall.',
     ['fused-memory/scripts/check_bare_magicmock_config.py::_WALL_CLOCK_DEADLINE_DEBT'],
