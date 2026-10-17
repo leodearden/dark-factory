@@ -2597,7 +2597,9 @@ class TestConfigReload:
         'review.full_review_min_tasks',
         'verify_env',
         'git.offline_lane_test_threads',
-        'git.offline_lane_red_advances_before_blocker',
+        'git.offline_lane_persist_passes',
+        'git.offline_lane_recheck_secs',
+        'git.offline_lane_red_unlanded_hours',
         'merge_verify_max_concurrent_modules',
     ])
     def test_representative_reloadable_members_present(self, path):
