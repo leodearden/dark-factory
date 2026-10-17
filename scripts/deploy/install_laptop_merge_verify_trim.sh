@@ -163,7 +163,7 @@ if [[ "$current" == *"$cron_old"* ]]; then
     done <<<"$current" | crontab -
     [[ "$(crontab -l)" == *"$cron_new"* ]] || { echo "ERROR: crontab repoint did not take" >&2; exit 1; }
     echo "crontab: gc-worktree-targets.sh now runs $cron_new (backup $lib/crontab.bak-$label)"
-elif printf '%s\n' "$current" | grep -qF "$cron_new"; then
+elif [[ "$current" == *"$cron_new"* ]]; then
     echo "crontab: already runs $cron_new (no-op)"
 else
     echo "crontab: no gc-worktree-targets.sh line to repoint"
