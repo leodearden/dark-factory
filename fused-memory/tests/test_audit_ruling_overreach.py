@@ -5,6 +5,7 @@ loads its sibling, so ``scripts/`` never lands on ``sys.path``.
 """
 from __future__ import annotations
 
+import ast
 import dataclasses
 import hashlib
 import json
@@ -14,9 +15,11 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from fused_memory.services.overreach_guard import is_guarded_category
 
+from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation import task_filter
-from fused_memory.services import completion_claim_gate
+from fused_memory.services import completion_claim_gate, overreach_guard
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_ruling_overreach.py'
 
@@ -276,6 +279,130 @@ class TestSpecimens:
 
     def test_recall_with_no_specimen_read_is_not_computed(self) -> None:
         assert mod.specimen_recall('ruling_lexeme_head', {}) is None
+
+
+# --------------------------------------------------------------------------- #
+# One copy of the class vocabulary (task 6137, design.md §8 leaf 1)
+# --------------------------------------------------------------------------- #
+
+_RE_PATTERN_CONSUMERS = frozenset(
+    {'compile', 'search', 'match', 'fullmatch', 'findall', 'finditer', 'sub', 'subn', 'split'}
+)
+_RULING_SHAPE_WORDS = ('ruling', 'ruled', 'decision')
+
+
+def _docstring_constants(tree: ast.AST) -> set[int]:
+    """``id()`` of every docstring Constant: the first statement of a module, class or def."""
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    return {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, owners) and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+
+
+def _code_string_constants(source: str) -> list[str]:
+    tree = ast.parse(source)
+    docstrings = _docstring_constants(tree)
+    return [
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+def _pattern_literal_parts(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Constant):
+        return [node.value] if isinstance(node.value, str) else []
+    if isinstance(node, ast.JoinedStr):
+        return [
+            part.value for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        ]
+    return []
+
+
+def _regex_literals_mentioning_ruling_shape(source: str) -> list[str]:
+    """Pattern literals passed to an ``re`` function that name a ruling-shape word."""
+    tree = ast.parse(source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _RE_PATTERN_CONSUMERS
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == 're'
+        ):
+            continue
+        pattern = next((kw.value for kw in node.keywords if kw.arg == 'pattern'), None)
+        pattern = pattern if pattern is not None else (node.args[0] if node.args else None)
+        for text in _pattern_literal_parts(pattern) if pattern is not None else []:
+            if any(word in text.lower() for word in _RULING_SHAPE_WORDS):
+                offenders.append(f'{text!r} (line {node.lineno})')
+    return offenders
+
+
+class TestTheClassVocabularyGuardHasTeeth:
+    @pytest.mark.parametrize('source', [
+        "import re\n_X = re.compile(r'\\bruling\\b')\n",
+        "import re\n_X = re.compile(r'\\s*RULING\\b', re.IGNORECASE)\n",
+        "import re\nm = re.search(rf'{x}(decision|decided)', text)\n",
+    ], ids=['compile-ruling', 'compile-RULING-header', 'search-fstring-decision'])
+    def test_a_second_ruling_vocabulary_is_flagged(self, source: str) -> None:
+        assert _regex_literals_mentioning_ruling_shape(source) != []
+
+    def test_the_tag_group_pattern_is_not_flagged(self) -> None:
+        source = "import re\n_TAG_GROUP = re.compile(r'\\[([^\\]]+)\\]\\s*')\n"
+        assert _regex_literals_mentioning_ruling_shape(source) == []
+
+    def test_a_docstring_naming_the_category_is_not_a_code_constant(self) -> None:
+        source = '"""decisions_and_rationale"""\ndef f():\n    """decisions_and_rationale"""\n'
+        assert 'decisions_and_rationale' not in _code_string_constants(source)
+
+    def test_a_code_constant_naming_the_category_is_seen(self) -> None:
+        source = "DECISIONS_CATEGORY = 'decisions_and_rationale'\n"
+        assert 'decisions_and_rationale' in _code_string_constants(source)
+
+
+class TestOneCopyOfTheClassVocabulary:
+    """The class predicate, the classifiers and the labels live in src, once.
+
+    fused_memory.services.overreach_guard is the single copy (design.md §8
+    leaf 1, heuristic 11); this script evaluates it and must IMPORT it.
+    """
+
+    def test_the_vocabulary_is_imported_from_src(self) -> None:
+        imported = {
+            alias.name
+            for node in ast.walk(ast.parse(SCRIPT_PATH.read_text()))
+            if isinstance(node, ast.ImportFrom)
+            and node.module == 'fused_memory.services.overreach_guard'
+            for alias in node.names
+        }
+        assert {'EPISODE_CLASSIFIERS', 'LABELS', 'HEAD_CHARS'} <= imported
+
+    def test_no_code_constant_spells_the_category(self) -> None:
+        assert 'decisions_and_rationale' not in _code_string_constants(SCRIPT_PATH.read_text())
+
+    def test_no_regex_literal_names_a_ruling_shape_word(self) -> None:
+        offenders = _regex_literals_mentioning_ruling_shape(SCRIPT_PATH.read_text())
+        assert offenders == [], (
+            f'the script compiles a ruling-shape pattern of its own: {offenders}. '
+            'The vocabulary lives in fused_memory.services.overreach_guard and must be IMPORTED.'
+        )
+
+    @pytest.mark.parametrize('category', list(MemoryCategory))
+    def test_category_decisions_is_the_src_class_predicate(self, category) -> None:
+        episode = _episode('x', source=f'add_memory:{category.value}')
+        assert mod.CLASSIFIERS['category_decisions'](episode) is is_guarded_category(category)
+
+    @pytest.mark.parametrize('source', ['add_memory:bogus', None])
+    def test_an_unparseable_category_is_out_of_class(self, source) -> None:
+        assert mod.CLASSIFIERS['category_decisions'](_episode('x', source=source)) is False
+
+    def test_the_labels_are_the_src_labels(self) -> None:
+        assert mod.LABELS is overreach_guard.LABELS
 
 
 # --------------------------------------------------------------------------- #
