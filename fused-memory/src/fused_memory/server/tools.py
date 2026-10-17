@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid as uuid_mod
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1254,8 +1255,35 @@ def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
     }
 
 
-# find_tasks_by_metadata's page-size cap (plans/task-metadata-lookup-prd.md decision 6).
+# find_tasks_by_metadata's page-size cap, and its include_value page budget in
+# serialized bytes of ``results`` (plans/task-metadata-lookup-prd.md decision 6).
 METADATA_LOOKUP_LIMIT_CAP = 100
+RESULT_BYTE_BUDGET = 48_000
+
+
+def _json_bytes(obj: Any) -> int:
+    """Serialized size as the lookup contract measures it: stdlib ``json.dumps``, UTF-8 bytes."""
+    return len(json.dumps(obj).encode('utf-8'))
+
+
+def _elided_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    elided = {'_elided': True, 'bytes': _json_bytes(row['matched_value'])}
+    return {**row, 'matched_value': elided, 'truncated_value': True}
+
+
+def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The longest prefix of *rows* whose serialized list fits ``RESULT_BYTE_BUDGET``.
+
+    Sizes add up exactly as ``json.dumps`` of the list: ``[]`` plus each row
+    plus a ``', '`` between rows. A first row too big to fit alone comes back
+    as the only row, with its value elided.
+    """
+    size = len('[]')
+    for count, row in enumerate(rows):
+        size += _json_bytes(row) + (len(', ') if count else 0)
+        if size > RESULT_BYTE_BUDGET:
+            return list(rows[:count]) if count else [_elided_row(row)]
+    return list(rows)
 
 
 def _pagination_meta(
@@ -9711,7 +9739,7 @@ def create_mcp_server(
             statuses=statuses, limit=page_size, offset=offset, tag=tag,
             include_value=include_value,
         )
-        results = found['results']
+        results = _fit_rows_to_budget(found['results']) if include_value else found['results']
         pid = resolve_project_id(normalized)
         response: dict[str, Any] = {
             'project_id': pid,
