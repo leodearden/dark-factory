@@ -1,26 +1,27 @@
-"""The seed report every merge-lane ratchet suite measures against.
+"""What the merge-lane ratchet suites share: the instrument and the one seed report.
 
-ONE synthetic report, never two. ``test_merge_lane_ratchet.py`` pins what the
-instrument's comparators and write gate do with it,
-``test_merge_lane_ratchet_commit_delta.py`` pins the pure faces the commit-time
-gate calls over images rendered from it, and
-``test_merge_lane_ratchet_commit_gate.py`` commits it into throwaway repos to
-pin what the commit-time auditor does with the resulting blobs. A second
-declaration would drift, and the suites would then disagree about what a
-raise looks like.
+The ``scripts/`` modules are imported HERE, once, so no suite carries its own
+``sys.path`` bootstrap; orchestrator/pyproject.toml's [tool.pyright] extraPaths
+already carries "../scripts", so this needs no type-checker config.
 
-It lives HERE rather than in any one suite because a test module reaching into
-a sibling test module for a private name is the shape this repo names an
-interface smell -- pointedly, one this very instrument MEASURES. It also tied
-collection of the gate suite to importing a 3700-line sibling. ``_orch_helpers``
-is the home for helpers the WHOLE suite shares; this is the narrower one for a
-single subject, matching the ``_*_fixtures.py`` modules already beside it.
-
-Only what more than one suite uses lives here. ``blank_file_entry`` is used by
-test_merge_lane_ratchet.py and test_merge_lane_ratchet_commit_delta.py; every
-other helper has one consuming module and stays in it.
+``synthetic_report`` is the ONE seed every suite measures against. A second
+declaration would drift, and the suites would then disagree about what a raise
+looks like. A helper lives here only when more than one suite uses it;
+``_orch_helpers`` is the home for what the whole test tree shares.
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_SCRIPTS = Path(__file__).parents[2] / 'scripts'
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
+import source_measures  # type: ignore[import-not-found]  # noqa: E402
+
+__all__ = ['blank_file_entry', 'metrics', 'source_measures', 'synthetic_report']
 
 
 def synthetic_report() -> dict:

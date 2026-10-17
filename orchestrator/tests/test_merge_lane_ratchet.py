@@ -51,14 +51,18 @@ import ast
 import copy
 import dataclasses
 import json
-import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 from _git_fixtures import RepoSeed, build_repo
-from _merge_lane_ratchet_fixtures import blank_file_entry, synthetic_report
+from _merge_lane_ratchet_fixtures import (
+    blank_file_entry,
+    metrics,
+    source_measures,
+    synthetic_report,
+)
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This module AST-parses the Appendix A cluster (8 CLUSTER_PATHS entries, one
@@ -108,17 +112,6 @@ pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group('merge_lane_ratchet'),
 ]
-
-# Make scripts/merge_lane_metrics.py importable. This is the sanctioned
-# precedent for an orchestrator/tests/ module importing a scripts/ one -- see
-# test_run_vllm_eval.py -- and needs no new pyright config: orchestrator/
-# pyproject.toml's [tool.pyright] extraPaths already carries "../scripts".
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-
-import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
-import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
 

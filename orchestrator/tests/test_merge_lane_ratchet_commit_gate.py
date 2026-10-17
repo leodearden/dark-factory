@@ -43,22 +43,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-
-# The seed report is IMPORTED, never re-declared: a second synthetic baseline
-# would drift from the one the instrument's own unit tests pin, and the two
-# would then disagree about what a raise looks like. It sits in a fixtures
-# module of its own rather than in either suite -- see that module's docstring.
-from _merge_lane_ratchet_fixtures import synthetic_report
+from _merge_lane_ratchet_fixtures import metrics, synthetic_report
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
-
-# Same bootstrap as test_merge_lane_ratchet.py, and for the same reason:
-# orchestrator/pyproject.toml's [tool.pyright] extraPaths already carries
-# "../scripts", so importing the instrument needs no new config.
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-
-import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
 _GATE = _REPO_ROOT / metrics.COMMIT_GATE_RELPATH

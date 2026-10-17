@@ -13,18 +13,10 @@ and no live measurement is taken.
 from __future__ import annotations
 
 import copy
-import sys
 from pathlib import Path
 
 import pytest
-from _merge_lane_ratchet_fixtures import blank_file_entry, synthetic_report
-
-# orchestrator/pyproject.toml's [tool.pyright] extraPaths already carries "../scripts".
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-
-import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
+from _merge_lane_ratchet_fixtures import blank_file_entry, metrics, synthetic_report
 
 
 def _baseline_image(tmp_path: Path, name: str, report: dict) -> Path:
