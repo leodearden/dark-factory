@@ -598,12 +598,39 @@ class ServiceRestart:
 
 
 @dataclass(frozen=True)
+class OrchestratorStartup:
+    """One orchestrator process start, as registered in `runs`.
+
+    The writer is orchestrator/src/orchestrator/run_store.py::RunStore.start_run,
+    called from orchestrator/src/orchestrator/harness.py::Harness.run.
+    """
+
+    started_at: str
+    run_id: str
+
+
+@dataclass(frozen=True)
 class ScopedCapScan:
     """Whether the model's cap scope has been hit, and whether it can yet be (check 4)."""
 
     scoped_hits: tuple[ScopedCapHit, ...]
     unscoped_cap_hit_count: int
     restarts: tuple[ServiceRestart, ...]
+    orchestrator_startups: tuple[OrchestratorStartup, ...]
+
+
+def _orchestrator_startups(
+    conn: sqlite3.Connection, *, since: datetime, until: datetime | None
+) -> tuple[OrchestratorStartup, ...]:
+    """Every orchestrator startup in ``[since, until)``, in start order."""
+    bounds, params = _time_bounds('started_at', since, until)
+    return tuple(
+        OrchestratorStartup(started_at=started_at, run_id=run_id)
+        for started_at, run_id in conn.execute(
+            f'SELECT started_at, run_id FROM runs WHERE {bounds} ORDER BY started_at, run_id',
+            params,
+        )
+    )
 
 
 def scan_scoped_cap(
@@ -613,7 +640,7 @@ def scan_scoped_cap(
     since: datetime,
     until: datetime | None = None,
 ) -> ScopedCapScan:
-    """Cap hits attributable to *model*'s scope, plus the restarts, in ``[since, until)``.
+    """Cap hits attributable to *model*'s scope, plus restarts and startups, in ``[since, until)``.
 
     The writer of the shape read here is ``shared/src/shared/usage_gate.py::
     UsageGate._handle_cap_detected`` — its scoped path emits ``{"reason": ...,
@@ -628,9 +655,13 @@ def scan_scoped_cap(
     orchestrator restarts, a cap on *model* lands on the account-level path, and
     dropping scope-less rows would hide precisely that.
 
-    Restarts are returned NAMED for the same reason: only an orchestrator
-    restart reloads a restart-tier leaf, so a count that lumps in dashboard and
-    fused-memory restarts answers "has it had a chance to take effect?" wrongly.
+    Only an orchestrator STARTUP reloads a restart-tier leaf, and
+    ``orchestrator_startups`` is the witness to one: the `runs` row each
+    startup registers before it emits anything.  `service_restart` rows are
+    not that witness.  They name backing-service restarts, and for the
+    orchestrator only the merge-landed coordinator's restart REQUESTS,
+    stamped before the startup they cause; the watchdog and manual restart
+    paths record none.  They are kept, named, beside the startups.
     """
     bounds, params = _time_bounds('created_at', since, until)
     cursor = conn.execute(
@@ -666,6 +697,7 @@ def scan_scoped_cap(
         scoped_hits=tuple(scoped),
         unscoped_cap_hit_count=unscoped,
         restarts=tuple(restarts),
+        orchestrator_startups=_orchestrator_startups(conn, since=since, until=until),
     )
 
 
