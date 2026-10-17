@@ -103,8 +103,12 @@ def _utc_now() -> datetime:
 
 
 def lane_policy(config: OrchestratorConfig) -> LanePolicy:
-    """The lane's persistence policy, read at every pass and tick; the defaults until δ3."""
-    return LanePolicy()
+    """The lane's persistence policy, read from the live ``config.git`` knobs."""
+    return LanePolicy(
+        persist_passes=config.git.offline_lane_persist_passes,
+        recheck_secs=config.git.offline_lane_recheck_secs,
+        red_unlanded_hours=config.git.offline_lane_red_unlanded_hours,
+    )
 
 
 class GitAncestry(Protocol):

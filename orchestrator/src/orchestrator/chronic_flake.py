@@ -21,16 +21,14 @@ evidence (dates/counts/roles) for the filed task's description AND an
 independent/fallback trigger via this module's own configured
 threshold/window. :func:`maybe_file_chronic_flake_tasks` unions both.
 
-This module never talks to the fused-memory MCP directly (mirrors
-``offline_lane.OfflineLaneTaskClient``'s cross-project scope boundary) —
+This module never talks to the fused-memory MCP directly —
 :class:`ChronicFlakeTaskClient` is the pluggable seam, and
 :class:`SchedulerChronicFlakeTaskClient` is the concrete adapter over a
 duck-typed scheduler exposing ``dispatch_tool`` and ``submit_task``
 (self-contained here to avoid a workflow<->harness import cycle).
 
 Non-blocking guarantee: :func:`maybe_file_chronic_flake_tasks` is internally
-catch-all-defensive (mirrors ``compute_failing_test_set_fingerprint``'s
-fail-safe philosophy) so a ledger/MCP/search error can never fail the
+catch-all-defensive, so a ledger/MCP/search error can never fail the
 verify/merge path; callers (``TaskWorkflow._maybe_file_chronic_flakes``)
 wrap it in a second try/except as belt-and-suspenders.
 """
@@ -237,9 +235,7 @@ def build_chronic_flake_fix_task_arguments(
     """Build the ``submit_task`` argument block for an auto-filed De-flake
     fix task (task 2358).
 
-    Modeled on :func:`~orchestrator.workflow.build_offline_lane_fix_task_arguments`
-    (title/description/priority/project_root/metadata shape). Unlike the
-    offline-lane red-fix task, this fires on a test that is CURRENTLY
+    Unlike the offline lane's fix task, this fires on a test that is CURRENTLY
     GREEN overall (retry-once absorbed the flake) — so it is filed at
     ``priority='medium'``, non-blocking, purely to make the flake debt
     visible and owned.
@@ -353,8 +349,7 @@ class FilingLedger:
 
 class ChronicFlakeTaskClient(Protocol):
     """Pluggable task-filing seam so this module never talks to the
-    fused-memory MCP directly — mirrors
-    ``offline_lane.OfflineLaneTaskClient``'s cross-project scope boundary.
+    fused-memory MCP directly.
     :class:`SchedulerChronicFlakeTaskClient` (step-15/step-16) is the
     concrete adapter over a duck-typed scheduler.
 
@@ -484,9 +479,7 @@ async def maybe_file_chronic_flake_tasks(
     catch-all so a ledger/config surprise degrades to ``[]`` instead of
     propagating, and each per-test filing attempt is independently
     try/excepted so one bad test (a raising ``submit_task``) cannot stop
-    the rest from being considered — mirrors
-    ``compute_failing_test_set_fingerprint``'s fail-safe philosophy and
-    ``offline_lane``'s fail-open call-site pattern.
+    the rest from being considered.
     """
     cfg = config.chronic_flake
     if not cfg.enabled:
@@ -759,8 +752,6 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     return None, _response_error('get_task response carries no task', envelope)
 
 
-# Per-call timeout for submit_task — matches
-# harness._OfflineLaneTaskClient.submit_fix_task's precedent.
 _SUBMIT_TASK_TIMEOUT_SECS = 30
 
 
@@ -771,8 +762,7 @@ class SchedulerChronicFlakeTaskClient:
 
     Self-contained here (not in ``harness.py``) so this module never talks
     to the fused-memory MCP directly and avoids a workflow<->harness import
-    cycle — mirrors ``harness._OfflineLaneTaskClient``'s scope boundary,
-    just re-derived locally rather than imported.
+    cycle.
     """
 
     def __init__(self, scheduler: Any, project_root: str | Path) -> None:

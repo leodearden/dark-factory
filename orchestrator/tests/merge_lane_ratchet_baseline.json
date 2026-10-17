@@ -1113,6 +1113,7 @@
     "orchestrator/tests/test_offline_lane.py": {"patch_targets": [], "private_reads": 38},
     "orchestrator/tests/test_offline_lane_infra_integration.py": {"patch_targets": [], "private_reads": 15},
     "orchestrator/tests/test_offline_lane_integration.py": {"patch_targets": [], "private_reads": 17},
+    "orchestrator/tests/test_offline_lane_policy_reload.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_offline_lane_records.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_orphan_reaper.py": {"patch_targets": [], "private_reads": 22},
     "orchestrator/tests/test_outcome_kind.py": {"patch_targets": [], "private_reads": 0},
