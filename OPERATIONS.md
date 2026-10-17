@@ -202,6 +202,63 @@ a broken or absent ledger to go fix, not a clean bill of health. A
 more occurrences than one read returns, so the counters cover a partial
 window.
 
+### The offline lane's red path
+
+What the offline lane does with a red test, from the pass that sees it to
+the fix task and its escalation, is specified in
+`plans/offline-lane-red-path-prd.md`; this subsection is only where to look.
+
+**Where a pass is recorded.** Every pass writes
+`data/orchestrator/offline-lane/<command-slug>/<YYYYmmddTHHMMSS-head6>/record.json`
+(the slug is the command name lower-cased with runs of other characters
+turned into `-`; the legacy legs use `legacy_numeric` and `legacy_infra`),
+next to the per-phase `detect.log`, `confirm.log` and `*.junit.xml`.
+`record.json` names the command, leg, head, pass id, the `detect` and
+`confirm` run blocks (`null` for a phase that did not run), the `outcome`,
+and `effect`: the lists `tests_counted`, `episodes_started`,
+`episodes_extended`, `episodes_ended`, `tasks_filed` and
+`escalations_raised`. A pass whose `effect` is still `null` was cut short.
+
+**Where a held red is remembered.** `data/orchestrator/guards/offline_lane_episodes.json`
+holds one record per command, with one `episodes[]` element per failing
+test. A red held at 1 of 2 looks like an element with one entry in
+`counted_passes`, `covering_task_id: null`, `filed_at: null` and
+`ended_at: null`. Once the test has been reproduced on enough counted
+passes, the same element has `covering_task_id` and `filed_at` set; a
+cleared test gets `ended_at`. A filing that could not be made is kept as
+`filing_due: true` (with `filing_failure`) and retried on the poll tick.
+
+**The three knobs**, all under `git:` and all hot-reloadable with
+`mcp__escalation__reload_config` (read `applied` in the reply):
+
+- `git.offline_lane_persist_passes` (2): spaced counted passes a test must be
+  reproduced on before one fix task is filed for it. `1` restores filing on
+  the first reproduced pass.
+- `git.offline_lane_recheck_secs` (1800): the least spacing between two counted
+  passes, and how long a held red waits before the lane re-runs the command;
+  also how long a filing may stay due before it is escalated.
+- `git.offline_lane_red_unlanded_hours` (24): how long a held episode may go
+  unextended before it expires, and how long after a fix task was filed a
+  still-red test counts as unlanded.
+
+**Escalations.** The lane files them as role `orchestrator-offline-lane`,
+level 1, against a per-command sentinel task id `__offline_lane__<command-slug>`
+(look them up with `mcp__escalation__get_task_escalations`). Category
+`dependency_discovered` means a fix task has not landed its fix
+`red_unlanded_hours` after it was filed; the detail names the task, its live
+status and the record directories. Category `infra_issue` is the stuck-write
+record: a fix-task filing has stayed due for `recheck_secs` and every retry
+failed; the detail carries the reason. The lane resolves that record itself
+once no filing is due.
+
+**Retention.** Pass directories older than 14 days are pruned, except those an
+episode (live or ended) still counts. Entries in the episode store expire
+after 14 days without a write.
+
+#### Outages and the flake ledger
+
+Appended by later leaves of plans/offline-lane-red-path-prd.md.
+
 ### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
 
 **A non-empty directory no longer means the task had a verify failure.**
