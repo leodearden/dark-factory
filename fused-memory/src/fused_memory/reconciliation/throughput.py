@@ -33,8 +33,8 @@ out.
 
 The rule this module enforces: **bucket by parsing, never by SQL string
 comparison against a ``datetime('now')`` literal.**  ``utc_hour_bucket`` is the
-single place that parsing happens; every reader in this module and the rollup
-in ``event_buffer.cleanup_drained`` route through it.
+single place that bucketing happens, on top of ``_parse_utc``; every reader in
+this module and the rollup in ``event_buffer.cleanup_drained`` route through it.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ import json
 import sqlite3
 import sys
 from collections import Counter
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ __all__ = [
     'DRAIN_MODES',
     'classify_run',
     'drain_stats',
+    'inflow_concentration',
     'inflow_daily',
     'remediation_duty_cycle',
     'inflow_hourly',
@@ -88,10 +90,15 @@ def utc_hour_bucket(ts: str) -> str:
             garbage into a plausible-looking wrong hour would silently corrupt
             the measurement, so this fails loudly instead.
     """
+    return _parse_utc(ts).strftime('%Y-%m-%dT%H')
+
+
+def _parse_utc(ts: str) -> datetime:
+    """Parse an ISO8601 timestamp to an aware UTC instant; naive means UTC."""
     parsed = datetime.fromisoformat(ts)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC).strftime('%Y-%m-%dT%H')
+    return parsed.astimezone(UTC)
 
 
 def _connect_ro(db_path: str | Path) -> sqlite3.Connection:
@@ -269,11 +276,109 @@ def inflow_daily(
 
     return {
         'daily': {day: daily[day] for day in sorted(daily)},
-        'composition': {
-            etype: composition[etype]
-            for etype in sorted(composition, key=lambda e: (-composition[e], e))
-        },
+        'composition': _ranked_counts(composition),
         'total_events': sum(daily.values()),
+    }
+
+
+def _ranked_counts(counts: Counter[str]) -> dict[str, int]:
+    """``counts`` as a dict ordered largest first, ties broken by name."""
+    return {key: counts[key] for key in sorted(counts, key=lambda k: (-counts[k], k))}
+
+
+def _payload_task_id(payload: str) -> str | None:
+    """The task id a stored payload names, as a string; None when it names none.
+
+    A payload that is not JSON names no task: attribution is advisory, so one
+    bad row is counted as unattributed rather than taking the report down.
+    """
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, dict) or decoded.get('task_id') is None:
+        return None
+    return str(decoded['task_id'])
+
+
+def _live_rows(
+    conn: sqlite3.Connection,
+    project_id: str,
+    floor: str | None,
+) -> Iterator[sqlite3.Row]:
+    """Every live ``event_buffer`` row for the project, of ANY status, at or after ``floor``."""
+    if not _table_exists(conn, 'event_buffer'):
+        return
+    for row in conn.execute(
+        'SELECT timestamp, event_type, payload FROM event_buffer WHERE project_id = ?',
+        (project_id,),
+    ):
+        if floor is None or utc_hour_bucket(row['timestamp']) >= floor:
+            yield row
+
+
+def inflow_concentration(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Which task ids a project's live inflow comes from, largest first.
+
+    Covers LIVE ``event_buffer`` rows only, because only they carry a payload:
+    ``cleanup_drained`` rolls a swept row up to (project, hour, event_type) and
+    its task id is gone.  That loses nothing that matters — while a backlog
+    exists the buffered rows ARE the backlog — but a burst that was already
+    swept is unattributable, so the window bounds state what was covered.
+
+    Args:
+        db_path: Path to reconciliation.db (opened read-only).
+        project_id: Project to report on.
+        since: Optional inclusive floor (see :func:`inflow_hourly`).
+        top_n: How many tasks to report.
+
+    Returns:
+        ``{'window_start', 'window_end', 'live_events', 'unattributed_events',
+        'top_tasks': [{'task_id', 'events', 'share', 'composition'}]}``.  The
+        window bounds are the earliest and latest UTC instants counted (None
+        with no rows).  ``share`` is against ALL live rows, task-less ones
+        included, so it reads directly as a fraction of inflow.  Ties order by
+        task id, so the truncation is deterministic.
+
+    Raises:
+        ValueError: On a malformed stored timestamp, like every reader here.
+    """
+    instants: list[datetime] = []
+    per_task: dict[str, Counter[str]] = {}
+    unattributed = 0
+
+    conn = _connect_ro(db_path)
+    try:
+        for row in _live_rows(conn, project_id, _normalise_since(since)):
+            instants.append(_parse_utc(row['timestamp']))
+            task_id = _payload_task_id(row['payload'])
+            if task_id is None:
+                unattributed += 1
+                continue
+            per_task.setdefault(task_id, Counter())[row['event_type']] += 1
+    finally:
+        conn.close()
+
+    ranked = sorted(per_task.items(), key=lambda item: (-item[1].total(), item[0]))
+    return {
+        'window_start': min(instants).isoformat() if instants else None,
+        'window_end': max(instants).isoformat() if instants else None,
+        'live_events': len(instants),
+        'unattributed_events': unattributed,
+        'top_tasks': [
+            {
+                'task_id': task_id,
+                'events': types.total(),
+                'share': types.total() / len(instants),
+                'composition': _ranked_counts(types),
+            }
+            for task_id, types in ranked[:top_n]
+        ],
     }
 
 
