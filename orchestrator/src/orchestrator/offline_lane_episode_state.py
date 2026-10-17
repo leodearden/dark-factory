@@ -52,8 +52,8 @@ def unconfirmable_node(command: str) -> str:
 @dataclass(frozen=True)
 class LanePolicy:
     persist_passes: int = 2
-    recheck_secs: int = 1800
-    red_unlanded_hours: int = 24
+    recheck_secs: float = 1800.0
+    red_unlanded_hours: float = 24.0
 
     @property
     def recheck(self) -> timedelta:

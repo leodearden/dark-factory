@@ -1778,9 +1778,13 @@ class LaneCommand(BaseModel):
     (a shell string, via ``sh -c``) at idle nice/ionice in ``<worktree>/<cwd>``
     with ``DF_VERIFY_ROLE=offline``, off the merge hot path, always from the
     current ``main`` head. A red result routes through the existing
-    ``OfflineLaneWorker`` red path (confirm → fingerprint → dedup'd fix task →
-    staged L2), filing the fix task at ``fix_task_priority`` — no new mechanism
-    (INV-5). This generalizes the previously reify-hard-coded run seams to
+    ``OfflineLaneWorker`` red path: a red detection run is confirmed and
+    narrowed to the named tests; each failing test is a per-test episode; an
+    episode is filed as one fix task (at ``fix_task_priority``) once it is
+    reproduced on ``git.offline_lane_persist_passes`` spaced passes, with one
+    bounded level-1 escalation if the fix is unlanded after
+    ``git.offline_lane_red_unlanded_hours`` (plans/offline-lane-red-path-prd.md).
+    This generalizes the previously reify-hard-coded run seams to
     per-project config (PRD plans/integration-test-lane-prd.md, task alpha).
     """
 
@@ -1793,14 +1797,11 @@ class LaneCommand(BaseModel):
     command: str = Field(
         description=(
             'Shell command string launched via ``sh -c`` for this sub-run '
-            '(e.g. ``pytest -m integration``). Required. NOTE: the default '
-            'confirm/dedup path is pytest-oriented — it serializes via '
-            '``_serial_pytest_str`` and extracts still-failing pytest '
-            'node-ids. A non-pytest command that reproduces red (non-zero '
-            'exit, no parseable node-ids) is filed under a stable '
-            '``<name>::nonzero-exit`` sentinel rather than being swallowed as '
-            'a flake; inject a custom ``command_confirmation_runner`` for '
-            'richer per-failure dedup.'
+            '(e.g. ``pytest -m integration``). Required. A command that '
+            'exits non-zero while naming no test is held and filed under the '
+            "lane's unconfirmable pseudo-test "
+            '(``offline_lane_episode_state.py::UNCONFIRMABLE_SUFFIX``) rather '
+            'than being swallowed as a flake.'
         ),
     )
     cwd: str = Field(
@@ -2059,15 +2060,41 @@ class GitConfig(BaseModel):
             'included) never widens what counts as a stale lock.'
         ),
     )
-    offline_lane_red_advances_before_blocker: int = Field(
-        default=3,
+    offline_lane_persist_passes: int = Field(
+        default=2,
         ge=1,
         description=(
-            'N = number of consecutive confirmed-red advances (same failing-'
-            'test-set fingerprint) the offline-deep lane worker (β3, PRD '
-            '§11.3 / C4) tolerates before promoting its filed fix task to a '
-            'born-at-L2 escalate_blocker. Not frozen — retunable via '
-            'orchestrator.yaml without a code change.'
+            'Number of counted passes (default 2) on which a per-test red '
+            'must reproduce before the offline-deep lane files its fix task '
+            '(PRD plans/offline-lane-red-path-prd.md D5); 1 restores filing '
+            'on the first reproduced pass. Read by '
+            '``offline_lane_episodes.lane_policy`` at every pass and tick, '
+            'never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_recheck_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'Minimum start-to-start spacing (seconds, default 1800.0) of '
+            'counted offline-lane passes, and the delay before a held red is '
+            're-observed (PRD D5, D12); also the outage probe loop period. '
+            'Read by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_red_unlanded_hours: float = Field(
+        default=24.0,
+        gt=0,
+        description=(
+            'Hours (default 24.0) a filed red may stay unlanded before the '
+            'lane raises its one bounded level-1 escalation (PRD D11); also '
+            'the expiry of a held episode (D5), one knob serving both. Read '
+            'by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
         ),
     )
     offline_lane_commands: list[LaneCommand] = Field(
@@ -2077,8 +2104,8 @@ class GitConfig(BaseModel):
             'entry drives one additional offline-lane sub-run — launched at '
             'idle nice/ionice via ``sh -c`` in ``<worktree>/<cwd>`` with '
             '``DF_VERIFY_ROLE=offline``, off the merge hot path, always from '
-            'head — that reuses the existing red path (confirm → dedup fix '
-            'task → staged L2). Generic commands run IN ADDITION to whichever '
+            'head — that reuses the existing red path (confirm → per-test '
+            'episodes → fix task filed on persistence). Generic commands run IN ADDITION to whichever '
             'legacy seams (numeric / infra) are enabled. Defaults to [] '
             '(opt-in, byte-identical no-op). Uses default_factory to avoid a '
             'shared mutable default across model instances.'
@@ -6163,10 +6190,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # picked up by the very next invocation.
         'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
-        # leaf-mutation only per I3)
+        # leaf-mutation only per I3); the persistence trio is read by
+        # `offline_lane_episodes.lane_policy` at every pass, never cached
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
-        'git.offline_lane_red_advances_before_blocker',
+        'git.offline_lane_persist_passes',
+        'git.offline_lane_recheck_secs',
+        'git.offline_lane_red_unlanded_hours',
         # advance_main's foreign-index-lock stand-off budget (task 3060) —
         # a leaf-mutation-only tuning knob re-read per advance (never
         # captured at startup), so a reload takes effect on the very next
