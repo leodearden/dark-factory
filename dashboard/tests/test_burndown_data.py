@@ -2011,6 +2011,46 @@ class TestDownsample:
                 assert row is not None
                 assert row[0] == 1  # only the recent one
 
+    async def test_retains_relative_to_an_explicit_now(self, tmp_path):
+        """Both cutoffs are measured from *now*; against today's wall clock the
+        recent hour would collapse to one row and the 89-day row would expire."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+        now = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+        old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+        gap_only_hour = old_hour - timedelta(hours=1)
+        recent_hour = (now - timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
+
+        def at(hour: datetime, minute: int) -> str:
+            return (hour + timedelta(minutes=minute)).isoformat()
+
+        kept_89d = (now - timedelta(days=89)).isoformat()
+        sync_conn = sqlite3.connect(str(db_path))
+        _insert_value(sync_conn, 'proj', at(old_hour, 10))
+        _insert_gap(sync_conn, 'proj', at(old_hour, 50))
+        _insert_gap(sync_conn, 'proj', at(gap_only_hour, 10))
+        _insert_gap(sync_conn, 'proj', at(gap_only_hour, 50))
+        _insert_value(sync_conn, 'proj', at(recent_hour, 10))
+        _insert_value(sync_conn, 'proj', at(recent_hour, 50))
+        _insert_value(sync_conn, 'proj', kept_89d)
+        _insert_value(sync_conn, 'proj', (now - timedelta(days=100)).isoformat())
+        sync_conn.commit()
+        sync_conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await downsample(conn, now=now)
+            async with conn.execute('SELECT ts, state FROM snapshots ORDER BY ts') as cur:
+                got = [tuple(row) for row in await cur.fetchall()]
+
+        expected = [
+            (kept_89d, 'value'),
+            (at(gap_only_hour, 50), 'gap'),
+            (at(old_hour, 10), 'value'),
+            (at(recent_hour, 10), 'value'),
+            (at(recent_hour, 50), 'value'),
+        ]
+        assert got == expected, f'expected {expected}, got {got}'
+
 
 # ---------------------------------------------------------------------------
 # get_burndown_projects

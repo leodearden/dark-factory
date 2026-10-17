@@ -41,6 +41,7 @@ from dashboard.data.orchestrator import (
     find_running_orchestrators,
     read_max_concurrent_tasks,
 )
+from dashboard.data.retention import SqlPredicate, apply_retention
 from dashboard.data.task_snapshot import (
     PER_CALL_TIMEOUT,
     TaskSnapshot,
@@ -488,15 +489,7 @@ async def _snapshot_columns(db: aiosqlite.Connection) -> frozenset[str]:
         return frozenset(row[1] for row in await cur.fetchall())
 
 
-@dataclass(frozen=True, slots=True)
-class _Predicate:
-    """A SQL boolean expression and the parameters it binds."""
-
-    sql: str
-    params: tuple[str, ...]
-
-
-def _measured_rows(columns: frozenset[str]) -> _Predicate:
+def _measured_rows(columns: frozenset[str]) -> SqlPredicate:
     """THE predicate for "this row carries a measurement".
 
     A POSITIVE selection of ``state = 'value'`` plus a NULL state (a row from
@@ -505,44 +498,23 @@ def _measured_rows(columns: frozenset[str]) -> _Predicate:
     column is un-migrated, and every row in it is measured by construction.
     """
     if 'state' not in columns:
-        return _Predicate('TRUE', ())
-    return _Predicate('(state IS NULL OR state = ?)', (SnapshotState.VALUE.value,))
+        return SqlPredicate('TRUE', ())
+    return SqlPredicate('(state IS NULL OR state = ?)', (SnapshotState.VALUE.value,))
 
 
-async def downsample(conn: aiosqlite.Connection) -> None:
+async def downsample(
+    conn: aiosqlite.Connection, *, now: datetime | None = None,
+) -> None:
     """Compact old snapshots: hourly after 7 days, expire after 90 days.
 
     Each old (project, hour) keeps ONE row: its latest measured row when it
     has one, else its latest gap, so a gap never displaces a measurement.
+    The policy lives in dashboard/src/dashboard/data/retention.py::apply_retention.
     """
-    now = datetime.now(UTC)  # clock-exempt: single-capture writer
-    cutoff_7d = (now - timedelta(days=7)).isoformat()
-    cutoff_90d = (now - timedelta(days=90)).isoformat()
     measured = _measured_rows(await _snapshot_columns(conn))
-
-    # Phase 1: For rows older than 7 days, keep one per (project_id, hour).
-    await conn.execute(
-        f"""
-        DELETE FROM snapshots
-        WHERE ts < ?
-          AND id NOT IN (
-              SELECT id FROM (
-                  SELECT id, ROW_NUMBER() OVER (
-                      PARTITION BY project_id, strftime('%Y-%m-%dT%H', ts)
-                      ORDER BY CASE WHEN {measured.sql} THEN 0 ELSE 1 END, ts DESC
-                  ) AS rn
-                  FROM snapshots
-                  WHERE ts < ?
-              )
-              WHERE rn = 1
-          )
-        """,
-        (cutoff_7d, *measured.params, cutoff_7d),
+    await apply_retention(
+        conn, 'snapshots', now=resolve_now(now), partition_by=('project_id',), prefer=measured,
     )
-
-    # Phase 2: Delete everything older than 90 days.
-    await conn.execute('DELETE FROM snapshots WHERE ts < ?', (cutoff_90d,))
-
     await conn.commit()
 
 

@@ -5,11 +5,11 @@ store sizes, write queue depth, reconciliation state, live merge-queue
 depth) into a dedicated SQLite database so they can be rendered as time
 series even though the underlying sources are point-in-time only.
 
-Sampling cadence and downsampling rules match
-``dashboard/data/burndown.py`` so both files retain at most 90 days of
-history (10-minute raw, hourly after 7 days). The collector runs on a
-sibling lifespan task in ``app.py``; route handlers read via the shared
-``DbPool`` (read-only).
+Sampling cadence matches ``dashboard/data/burndown.py`` (10-minute raw
+rows); both databases share one retention policy,
+dashboard/src/dashboard/data/retention.py::apply_retention (hourly after 7
+days, nothing after 90). The collector runs on a sibling lifespan task in
+``app.py``; route handlers read via the shared ``DbPool`` (read-only).
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from dashboard.data.orchestrator import (
     find_running_orchestrators,
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
+from dashboard.data.retention import apply_retention
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
 
@@ -98,13 +99,7 @@ async def fan_out_list_tickets(
     # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
     # takes effect without needing to pass an explicit kwarg.
     effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
-    seen_roots: set[str] = set()
-    all_roots: list[str] = []
-    for root in [config.project_root, *config.known_project_roots]:
-        key = str(root)
-        if key not in seen_roots:
-            seen_roots.add(key)
-            all_roots.append(key)
+    all_roots = [str(root) for root in config.all_project_roots]
 
     async def _fan_out_one_root(root_str: str) -> tuple[int, list[dict]]:
         """Query list_tickets for *root_str* across all configured URLs.
@@ -379,7 +374,7 @@ async def _sample_curator(
 
     Args:
         http_client: Shared AsyncClient for MCP HTTP calls.
-        config: Dashboard configuration (fused_memory_urls, known_project_roots).
+        config: Dashboard configuration (fused_memory_urls, all_project_roots).
         tickets_db: Read-only aiosqlite connection to tickets.db. If None,
             ticket latency fields are all None and only pending/capped are set.
         runs_dbs: Per-project runs.db connections for cap-event lookup.
@@ -697,57 +692,34 @@ async def collect_metrics_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# Downsampling — same policy as burndown (raw 10min, hourly after 7d, drop 90d).
+# Downsampling — dashboard/src/dashboard/data/retention.py::apply_retention.
 # ---------------------------------------------------------------------------
 
 
-_DOWNSAMPLE_TABLES = (
-    ('orchestrator_snapshots', 'project_id'),
-    ('memory_snapshots', 'project_id'),
-    ('queue_snapshots', None),
-    ('recon_snapshots', None),
-    ('merge_snapshots', 'project_id'),
-    ('curator_snapshots', None),
-    ('curator_refusal_snapshots', None),
+_DOWNSAMPLE_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ('orchestrator_snapshots', ('project_id',)),
+    ('memory_snapshots', ('project_id',)),
+    ('queue_snapshots', ()),
+    ('recon_snapshots', ()),
+    ('merge_snapshots', ('project_id',)),
+    ('curator_snapshots', ()),
+    ('curator_refusal_snapshots', ()),
 )
 
 
-async def downsample_metrics(conn: aiosqlite.Connection) -> None:
-    """Compact old metrics rows: hourly after 7 days, drop after 90 days.
+async def downsample_metrics(
+    conn: aiosqlite.Connection, *, now: datetime | None = None,
+) -> None:
+    """Compact old metrics rows in one transaction.
 
-    For per-project tables, partition key is (project_id, hour); for
-    system-wide tables, partition key is just hour.
+    Rows older than 7 days keep one row per (project_id, hour) in per-project
+    tables and one per hour in system-wide ones; rows older than 90 days are
+    dropped. The policy lives in
+    dashboard/src/dashboard/data/retention.py::apply_retention.
     """
-    now = datetime.now(UTC)  # clock-exempt: single-capture retention cutoff
-    cutoff_7d = (now - timedelta(days=7)).isoformat()
-    cutoff_90d = (now - timedelta(days=90)).isoformat()
-
-    for table, pid_col in _DOWNSAMPLE_TABLES:
-        rowid_col = 'id' if pid_col is not None else 'rowid'
-        partition = (
-            f"{pid_col}, strftime('%%Y-%%m-%%dT%%H', ts)"
-            if pid_col is not None
-            else "strftime('%%Y-%%m-%%dT%%H', ts)"
-        )
-        await conn.execute(
-            f"""
-            DELETE FROM {table}
-            WHERE ts < ?
-              AND {rowid_col} NOT IN (
-                  SELECT {rowid_col} FROM (
-                      SELECT {rowid_col}, ROW_NUMBER() OVER (
-                          PARTITION BY {partition}
-                          ORDER BY ts DESC
-                      ) AS rn
-                      FROM {table}
-                      WHERE ts < ?
-                  )
-                  WHERE rn = 1
-              )
-            """,
-            (cutoff_7d, cutoff_7d),
-        )
-        await conn.execute(f'DELETE FROM {table} WHERE ts < ?', (cutoff_90d,))
+    now = resolve_now(now)
+    for table, partition_by in _DOWNSAMPLE_TABLES:
+        await apply_retention(conn, table, now=now, partition_by=partition_by)
     await conn.commit()
 
 

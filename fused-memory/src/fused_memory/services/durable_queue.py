@@ -16,7 +16,6 @@ import time
 from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
@@ -69,21 +68,16 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # empirical half rather than restoring the names by reflex. The removal is a
 # judgement about the CURRENT deployment, not a fact settled for all time.
 #
-# REINSTATEMENT NOW TAKES TWO EDITS, NOT ONE (task 3586). Re-adding names here
-# is no longer sufficient, because _classify_failure checks its payload-derived
-# permanent rule BEFORE the transient one: a self-referential not-found dies at
-# attempt 1 whatever this set says. That rule could itself mis-fire under the
-# very topology that would justify reinstatement — attempt 1 creates the
-# episodic node and then fails downstream; attempt 2's by-uuid lookup
-# (routing_='r') lands on a lagging follower and raises NodeNotFoundError naming
-# the item's OWN uuid, which is genuinely transient but reads as the permanent
-# proof. Disabling it means passing identity_payload_keys={} to
-# DurableWriteQueue, and that is a CODE CHANGE today, not a config edit: the
-# kwarg is deliberately not a QueueConfig field (see
-# DEFAULT_IDENTITY_PAYLOAD_KEYS below) and MemoryService's construction site
-# (memory_service.py:1190) does not pass it. Whoever reinstates the budget must
-# wire that kwarg through in the same change, or the reinstatement is a no-op
-# for exactly the failures it was meant to cover.
+# REINSTATEMENT IS ONE EDIT (task 5474). The payload-identity rule ships with
+# no operation mapped (DurableWriteQueue's identity_payload_keys defaults to
+# empty), so today it cannot pre-empt a reinstated name: re-adding names here is
+# sufficient. If a caller ever injects identity_payload_keys=, _classify_failure's
+# permanent-before-transient precedence applies again — a self-referential
+# not-found then dies at attempt 1 whatever this set says — and the clustered
+# caveat returns with it: attempt 1 creates the node and then fails downstream;
+# attempt 2's by-uuid lookup (routing_='r') lands on a lagging follower and
+# raises a not-found naming the item's OWN uuid, which is genuinely transient
+# but reads as the permanent proof.
 #
 # ABSENT HERE MEANS "NOT EXTENDED", NOT "FAIL FAST" — and the empirical half
 # above argues the stronger claim. Dropping these names only returns them to
@@ -97,10 +91,10 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # blunter "terminal error names" counterpart 3585 offered as a fallback. It
 # does NOT act on this set or on any name list — it fires only when the
 # not-found names the very uuid the operation exists to create, a proof derived
-# from the item's own payload. So the two mechanisms stay independent: editing
-# the names here cannot switch the permanent rule on or off, and 3586's rule is
-# checked FIRST precisely so re-adding a name here cannot hand a
-# provably-doomed write the extended budget back.
+# from the item's own payload, and only for an operation a caller has mapped
+# through identity_payload_keys= (none by default; see REINSTATEMENT IS ONE
+# EDIT above). So the two mechanisms stay independent: editing the names here cannot switch the
+# permanent rule on or off.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'TimeoutError',
     'ConnectionError',
@@ -148,43 +142,6 @@ def _parse_not_found_uuid(message: str) -> str | None:
     match = _NOT_FOUND_MESSAGE_RE.match(message)
     return match.group(1) if match else None
 
-
-# operation -> the payload key holding THE UUID THAT OPERATION CREATES.
-#
-# Deliberately NOT "any uuid appearing in the payload". A payload may
-# legitimately REFERENCE other nodes' uuids, and a not-found naming one of those
-# is genuinely retryable: the node may live in a different graph (for FalkorDB
-# the group_id IS the database, and graphiti's by-uuid lookup Cypher carries no
-# group_id predicate), or a concurrent write creating it may still be in flight.
-# Those keep their full retry budget. Only the uuid this operation exists to
-# CREATE licenses the conclusion that retrying cannot possibly help.
-#
-# Verified vocabulary (the queue has exactly four operation strings, dispatched
-# by MemoryService._execute_durable_write at memory_service.py:1402-1410):
-#   add_episode           — 'uuid' is minted by the producer as its OWN fresh
-#                           identity (memory_service.py:2516), stamped onto the
-#                           payload (:2534) and forwarded to the backend
-#                           (:2248). The self-referential case.
-#   add_memory_graphiti   — no 'uuid' key at all.
-#   mem0_classify_and_add — no uuid key.
-#   mem0_add              — legacy, no live producer.
-# ('_write_op_id' / '_causation_id' are write-journal ids, not graph uuids.)
-#
-# COUPLING TO TASK 3561, which is in flight and changes exactly this key: its
-# fix stops handing graphiti a caller-minted uuid (passing None so the library
-# takes its CREATE branch rather than its LOAD branch). If it lands and the key
-# disappears, this rule simply falls open and every add_episode failure returns
-# to the ordinary policy — which is correct. This classifier is the generic
-# safety net for the NEXT operation that references its own not-yet-created
-# uuid, not a fix for that one instance.
-#
-# Not a QueueConfig field: the config surface exists for operator tuning,
-# whereas this is a fact about the payload vocabulary that an operator has no
-# basis to retune. It is overridable via the constructor only — the test seam,
-# and the property that keeps this a generic component.
-DEFAULT_IDENTITY_PAYLOAD_KEYS: Mapping[str, str] = MappingProxyType({
-    'add_episode': 'uuid',
-})
 
 # -- Schema ------------------------------------------------------------------
 
@@ -341,12 +298,8 @@ class DurableWriteQueue:
             frozenset(transient_error_names) if transient_error_names is not None
             else DEFAULT_TRANSIENT_ERROR_NAMES
         )
-        # An explicit map REPLACES the default rather than extending it, so a
-        # caller can express "no operation has a self-identity" as {}.
-        self._identity_payload_keys: Mapping[str, str] = (
-            dict(identity_payload_keys) if identity_payload_keys is not None
-            else DEFAULT_IDENTITY_PAYLOAD_KEYS
-        )
+        # operation -> payload key of the graph uuid it CREATES; empty = rule off.
+        self._identity_payload_keys: Mapping[str, str] = dict(identity_payload_keys or {})
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
         self._access: AtomicConnection | None = None

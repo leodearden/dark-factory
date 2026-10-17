@@ -40,6 +40,7 @@ import pytest
 from _fm_helpers import make_populated_task_store, make_zero_byte_task_store
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -47,7 +48,6 @@ from fused_memory.utils.target_store_preflight import (
     TargetStoreMissing,
     assert_queue_dir_populated,
     assert_task_store_populated,
-    task_store_path,
 )
 
 
@@ -166,7 +166,7 @@ class TestTaskStoreArm:
             assert await backend.get_tasks(project_root=str(tmp_path)) == {'tasks': []}
         finally:
             await backend.close()
-        assert task_store_path(tmp_path).exists()
+        assert tasks_db(tmp_path).exists()
 
         with pytest.raises(TargetStoreMissing):
             assert_task_store_populated(tmp_path, operation='audit_duplicate_tasks')
@@ -196,7 +196,7 @@ class TestTaskStoreArm:
 
     def test_a_database_with_rows_but_no_tasks_table_is_refused(self, tmp_path: Path):
         """A different database at the task-store path is not the task store."""
-        db = task_store_path(tmp_path)
+        db = tasks_db(tmp_path)
         db.parent.mkdir(parents=True)
         connection = sqlite3.connect(db)
         try:
@@ -210,14 +210,14 @@ class TestTaskStoreArm:
             assert_task_store_populated(tmp_path, operation='op')
 
     def test_non_sqlite_bytes_fail_open(self, tmp_path: Path):
-        db = task_store_path(tmp_path)
+        db = tasks_db(tmp_path)
         db.parent.mkdir(parents=True)
         db.write_bytes(b'this is not a sqlite database\n' * 64)
 
         assert assert_task_store_populated(tmp_path, operation='op') is None
 
     def test_a_directory_at_the_store_path_fails_open(self, tmp_path: Path):
-        task_store_path(tmp_path).mkdir(parents=True)
+        tasks_db(tmp_path).mkdir(parents=True)
 
         assert assert_task_store_populated(tmp_path, operation='op') is None
 
@@ -227,7 +227,7 @@ class TestTaskStoreArm:
 
         message = str(excinfo.value)
         assert 'audit_duplicate_tasks' in message
-        assert str(task_store_path(tmp_path)) in message
+        assert str(tasks_db(tmp_path)) in message
         assert '--project-root' in message
         assert not (tmp_path / '.taskmaster').exists()
 
@@ -240,7 +240,7 @@ class TestTaskStoreArm:
 
         message = str(excinfo.value)
         assert 'correct_found_on_main_backlog' in message
-        assert str(task_store_path(tmp_path).resolve()) in message
+        assert str(tasks_db(tmp_path).resolve()) in message
         assert '--project-root' in message
         assert 'does not exist' not in message
 

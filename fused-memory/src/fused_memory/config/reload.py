@@ -103,6 +103,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Replaced wholesale rather than merged, so a category the latest run
     # stopped deriving a cutoff for does not keep a stale one.
     'write_triage.t_high_by_category',
+    # Per-project cutoffs (task 5547). No server-side consumer: the audit CLI
+    # builds a fresh FusedMemoryConfig per run, so an in-place reload is safe
+    # and restart_required would be a false alarm. Yielded whole by
+    # _iter_leaves, so it reloads all-or-nothing like the map above.
+    'write_triage_project_calibrations',
     # The two write-triage OPERATOR KNOBS (task 3127), green-tier for a
     # different reason than the calibrated thresholds above: they are hand-set,
     # not derived, and both are read LIVE off the shared
@@ -122,7 +127,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Retrieval width, tuned against measured recall on a running server rather
     # than by redeploying. Read live per write, same path as the flag above.
     'write_triage.candidate_k',
-    # The eight write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
+    # The write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
     # for exactly the reason the two operator knobs above are: every one of
     # them is read LIVE off the shared memory_service.config.write_triage
     # object per middle-band write by server/write_triage_judge.py's resolvers,
@@ -130,7 +135,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # makes this registration real rather than restart-only in disguise.
     # tests/test_config_reload.py::TestWriteTriageJudgeLeavesAreGreenTier pins
     # both halves, and derives the expected leaf set from
-    # WriteTriageConfig.model_fields, so a NINTH judge_* leaf added later
+    # WriteTriageConfig.model_fields, so a further judge_* leaf added later
     # without a line here fails there rather than degrading silently.
     #
     # `judge_enabled` in particular MUST be green-tier, for the same reason
@@ -143,6 +148,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'write_triage.judge_enabled',
     'write_triage.judge_provider',
     'write_triage.judge_model',
+    'write_triage.judge_api_url',
     'write_triage.judge_timeout_seconds',
     'write_triage.judge_candidate_count',
     'write_triage.judge_reasoning_effort',

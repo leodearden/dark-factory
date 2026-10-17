@@ -2761,6 +2761,7 @@ async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
         'missing_labels': [],
         'errors': [],
     }
+    assert 'manifest_stamping_action_required' not in result
 
     alpha_task = await server._tool_manager.call_tool(
         'get_task', {'id': alpha_id, 'project_root': root},
@@ -2815,6 +2816,68 @@ async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
     reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
     by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
     assert by_label == {'alpha': int(alpha_id), 'beta': int(beta_id)}
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_surfaces_unlabeled_task_without_blocking_flip(
+    real_task_stack, tmp_path,
+):
+    """A PRD-bound task whose label sits under a near-miss key never blocks
+    the flip, but the response carries a top-level action list naming it.
+    Repairing the key and re-running commit_planning on the now-pending task
+    stamps the label and clears the action list."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_FOO_PRD_SIDECAR_YAML, encoding='utf-8')
+
+    server, _interceptor = real_task_stack
+    root = str(tmp_path)
+
+    submitted = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Producer alpha',
+            'planning_mode': True,
+            'metadata': {
+                'files': ['src/alpha.py'],
+                'prd_path': 'plans/foo-prd.md',
+                'prd_label': 'alpha',
+            },
+        },
+    )
+    assert submitted['status'] == 'deferred', f'got {submitted!r}'
+    task_id = submitted['task_id']
+
+    result = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    task = await server._tool_manager.call_tool(
+        'get_task', {'id': task_id, 'project_root': root},
+    )
+    assert task['status'] == 'pending'
+    assert result['manifest_stamping']['near_miss_keys'] == [
+        {'task_id': task_id, 'key': 'prd_label', 'value': 'alpha', 'sidecar_label': 'alpha'},
+    ]
+    action = result['manifest_stamping_action_required']
+    assert action
+    assert any(task_id in line for line in action)
+
+    await server._tool_manager.call_tool(
+        'update_task',
+        {'id': task_id, 'project_root': root, 'metadata': {'prd_task_label': 'alpha'}},
+    )
+    rerun = await server._tool_manager.call_tool(
+        'commit_planning', {'project_root': root, 'task_ids': task_id},
+    )
+
+    assert rerun['manifest_stamping']['stamped'] == ['alpha']
+    assert 'manifest_stamping_action_required' not in rerun
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'alpha': int(task_id), 'beta': None}
 
 
 @pytest.mark.asyncio

@@ -202,9 +202,11 @@ _REAP_UNWIND_TIMEOUT_SECONDS = 5.0
 #     dict, an empty/malformed result) that ``call`` raises to signal
 #     fall-through. :class:`PreformattedFanoutError` subclasses it.
 #
-# ``task_runtime`` and ``merge_halt`` carry their own near-copies with
-# ``OSError`` added. They are outside task 4958's file lock and deliberately
-# left alone; folding them in is a separate change.
+# ``merge_halt`` extends this tuple with ``OSError`` at its own site
+# (merge_halt.py::_PROBE_FAILURE_EXCEPTIONS) rather than widening it here.
+# task_runtime.py::_probe_one deliberately does not use it: its ordered
+# deadline/unreachable split (task 3517) is a fault-domain taxonomy that one
+# flat tuple cannot express.
 FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
     httpx.ConnectError,
     httpx.TimeoutException,
@@ -294,9 +296,9 @@ _DEFAULT_PER_URL_DEADLINE_SECONDS = 75.0
 # ── why the deadline is default-on ──────────────────────────────────
 #
 # Most live :func:`first_success` call sites carry no enclosing deadline of
-# their own — measured under task 4958: ``app::api_curator_cancel`` (the
-# ``cancel_ticket`` proxy), ``app::_scheduler_proxy``, the three ``tasks``
-# sites, and ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
+# their own — measured under task 4958: ``app::_mcp_write_proxy`` (the
+# ``cancel_ticket`` and scheduler write proxy), the three ``tasks`` sites, and
+# ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
 # had to hand-convert ``TimeoutError`` into ``ValueError`` to do so. Those
 # unwrapped sites are precisely the ones that could park forever, and they are
 # outside this module — so an opt-in parameter would have left the hole open
@@ -352,17 +354,9 @@ def project_label(project_root: str | os.PathLike[str]) -> str:
     """Render *project_root* as the short project name the UI labels it with.
 
     The basename, falling back to the full string for a root with no basename
-    (``'/'``) so a label can never degrade to empty. This is the single
-    definition of that rule for the fan-out cluster — :func:`fanout_label`
-    composes it rather than re-deriving it.
-
-    ``redux_api``, ``metrics`` and ``api/merge_queue.py`` call this directly
-    (task 5595). ``active_tasks._project_label`` is still an independent
-    hand-rolled copy of the same rule. It is not imported here
-    (``active_tasks`` imports from ``tasks``, which imports this module), which
-    also means the delegation can only run the other way: it can eventually
-    call *this*, collapsing the last copy. Until it does, the two definitions
-    must be kept string-identical by hand.
+    (``'/'``) so a label can never degrade to empty. This is the dashboard's
+    single definition of that rule: :func:`fanout_label` composes it, and the
+    data modules import it rather than re-deriving it.
     """
     root_str = str(project_root)
     return Path(root_str).name or root_str
@@ -389,21 +383,19 @@ def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
     A collapsed key also erases the diagnosis: the message names only the
     shared URL, so the operator cannot tell *which* project_root is down.
 
-    The discriminator is :func:`project_label` — the basename, the same rule
-    ``redux_api`` labels its payloads with and deliberately string-identical
-    to ``active_tasks._project_label``, so operator log labels match the
-    project chips the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
-    helper's home (see :func:`project_label`) and this docstring is the single
-    place the convention is written down.
+    The discriminator is :func:`project_label` — the same helper the data
+    modules label project chips with, so operator log labels are the same
+    string as the chips the UI already renders. ``mcp_fanout``, the leaf of this
+    cluster, is the helper's home (see :func:`project_label`) and this
+    docstring is the single place the convention is written down.
 
     **The guarantee above assumes project-root basenames are distinct.** Two
     configured roots sharing one (``/srv/team-a/app`` and ``/srv/team-b/app``,
     or two checkouts both named ``dark-factory``) collapse back onto a single
     key and reintroduce both failure modes described above. That assumption is
-    pre-existing and system-wide rather than introduced here —
-    ``scheduler``'s ``label_to_root = {_project_label(r): r for r in ...}``
-    already silently drops one of two same-basename roots, and ``redux_api``
-    keys its whole per-project payload on the same basename — so this helper
+    pre-existing and system-wide rather than introduced here — ``redux_api``
+    keys its whole per-project payload on the same basename, as do the
+    scheduler's per-label joins — so this helper
     inherits it deliberately instead of diverging from every other project
     label the dashboard renders. For ``list_tickets`` the unambiguous full root
     is in any case still in the message body (metrics appends
@@ -565,10 +557,10 @@ async def first_success(
     an ``httpx.PoolTimeout`` (this client's own pool is saturated) is
     distinguishable from a genuinely unreachable endpoint.
 
-    ``log_failures=False`` suppresses that reporting for the two ``app.py``
-    proxies that already emit their own fully-detailed WARNING at the call
-    site: the failure is then reported exactly once, by the caller, rather
-    than twice at the same level.
+    ``log_failures=False`` suppresses that reporting for ``app.py``'s
+    MCP-write proxy, which already emits its own fully-detailed WARNING at the
+    call site: the failure is then reported exactly once, by the caller,
+    rather than twice at the same level.
 
     **A builtin ``TimeoutError`` is exempt from that suppression** and is
     always reported. It cannot be a duplicate of a call-site line, by
@@ -576,7 +568,7 @@ async def first_success(
     the call site sees is a ``CancelledError`` — a ``BaseException``, outside
     its own ``except (ConnectError, TimeoutException, HTTPStatusError,
     ValueError)`` — and it logs nothing. Suppressing here too would make a hang
-    the ONE failure at those two sites that leaves no journal trace at all,
+    the ONE failure at that site that leaves no journal trace at all,
     which is the task-1814 shape this module's log policy exists to prevent.
 
     ``per_url_timeout`` is a **whole-operation deadline applied to each URL's
@@ -586,7 +578,7 @@ async def first_success(
     deliberately no way to disable it. A backstop with an off switch is a
     footgun — the only caller who would reach for it is one that has not
     thought about hangs, which is exactly the population it protects. Most live
-    call sites (``app.py``'s two proxies, the three ``tasks.py`` sites,
+    call sites (``app.py``'s MCP-write proxy, the three ``tasks.py`` sites,
     ``scheduler.py``'s) have no enclosing deadline of their own and are the
     ones that can park forever; a default-on bound closes that for them without
     editing any of them, and is non-binding for the callers that already wrap

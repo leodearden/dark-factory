@@ -57,6 +57,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.project_layout import escalation_queue_dir
+
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
     DuplicateFinding,
@@ -89,7 +91,6 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_COOLDOWN_SECS = 3600.0
-_QUEUE_DIRNAME = 'data/escalations'
 
 # Short in-process dedup window for zero-output-timeout reports. A batch of N
 # candidates that all hit ZOT bisects to N concurrent size-1 curate() calls,
@@ -320,7 +321,7 @@ class CuratorEscalator:
     def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(escalation_queue_dir(project_root))
             self._queues[project_root] = q
         return q
 

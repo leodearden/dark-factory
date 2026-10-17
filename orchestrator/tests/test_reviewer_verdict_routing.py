@@ -74,7 +74,8 @@ def _invoke_writes_review_verdict(
     that never called ``submit_review_verdict``.
     """
 
-    def _side_effect(*args, **kwargs):
+    async def _side_effect(_role, build_prompt, *args, **kwargs):
+        await build_prompt()
         if verdict is not None:
             f.artifacts.write_verdict(
                 'reviewer_comprehensive',

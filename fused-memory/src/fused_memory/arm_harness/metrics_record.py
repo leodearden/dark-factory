@@ -51,6 +51,9 @@ class EmbeddingMetricId(StrEnum):
     MRR = 'mrr'
     QUERY_EMBED_LATENCY_P95 = 'query-embed-latency-p95'
     REEMBED_THROUGHPUT = 'reembed-throughput'
+    MEM0_KNOWN_ITEM_RECALL_AT_5 = 'mem0-known-item-recall@5'
+    MEM0_KNOWN_ITEM_RECALL_AT_10 = 'mem0-known-item-recall@10'
+    MEM0_MRR = 'mem0-mrr'
 
 
 LLM_METRIC_IDS: frozenset[str] = frozenset(LlmMetricId)

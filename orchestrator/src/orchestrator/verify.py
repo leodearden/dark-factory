@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import errno
 import fnmatch
+import functools
 import gzip
 import hashlib
 import json
@@ -19,12 +20,12 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar
 
 if TYPE_CHECKING:
     from shared.psi import PsiSample
@@ -46,6 +47,20 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.verify_admission_gate import (
+    AdmissionGrant,
+    AdmissionPlan,
+    AdmissionPolicy,
+    AdmissionRequest,
+    gate_for,
+)
+from orchestrator.verify_admission_record import (
+    AdmissionLeg,
+    begin_plan,
+    emit_admission_plan,
+    legs_from_wire,
+    plan_request,
+)
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -62,6 +77,7 @@ from orchestrator.verify_classify import (
     classify_failure,
     is_external_kill_rc,
     is_interpreter_missing_workspace_packages,
+    is_partially_provisioned_venv_type_failure,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -73,17 +89,12 @@ from orchestrator.verify_cmd import (
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
-    has_unpreserved_chain_clauses,
-    keyword_truncation_end,
     parse_config_command,
-    promote_cwd_to_project,
     render,
     reproject,
-    scope_to,
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
-    strip_cwd,
     with_junitxml,
     with_pytest_timeout,
 )
@@ -109,7 +120,8 @@ _suppressed_flake_records: list[dict] = []
 
 #: Errno values that indicate a transient infrastructure failure (disk
 #: pressure, quota, read-only fs, I/O error, fd exhaustion).  Mirrors the
-#: set used in merge_queue._ENOSPC_MARKERS and git_ops.WarmLaneDiskPressure.
+#: set used in git_ops.WarmLaneDiskPressure; disk-full detection in tool
+#: OUTPUT is verify_classify.py::reports_disk_full.
 _INFRA_ERRNOS: frozenset[int] = frozenset({
     errno.ENOSPC,   # No space left on device
     errno.EDQUOT,   # Quota exceeded
@@ -150,117 +162,12 @@ class VerifyInfraError(Exception):
 
 
 def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | None:
-    """Narrow *cmd* to *files* by parsing the prefix through *keyword*, scoping, and rendering.
+    """*cmd* narrowed to *files* and rendered back to a shell string; ``None`` passes through.
 
-    Replaces the historical ``_scope_command`` + ``_strip_directory_flag`` /
-    ``_strip_leading_cd`` pairing: everything in *cmd* up to and including
-    the first occurrence of *keyword* is parsed as one tool invocation
-    (folding in any leading ``cd <dir> &&`` or uv ``--project``/
-    ``--directory`` context), its targets are replaced by *files*, any cwd
-    shift is cleared (the new targets are worktree-root-relative), and the
-    result is rendered back to a shell string. This eliminates the old
-    dash-token-harvesting mangling (verify.py's historical ``_scope_command``
-    regression): ``scope_to`` only ever replaces targets, never re-derives
-    flags from unparsed remainder text.
-
-    Returns *cmd* unchanged (no scoping applied) when: *cmd* is ``None``;
-    *keyword* is not present in *cmd* (nothing recognisable to scope, e.g. a
-    no-op ``'true'`` or a ``mypy``-based command); or the *keyword*-prefix
-    does not parse into a single recognised, structured tool invocation
-    (P1 — an OPAQUE or raw-retained/unparseable prefix is left untouched
-    rather than truncated into a possibly-broken argv).
-
-    Content after the matched *keyword* occurrence is truncated WITHIN the
-    matched segment: a value-taking flag positioned after the target (e.g.
-    ``'ruff check src/ --select E'``) would otherwise have its value misread
-    as an extra target by ``scope_to``, so truncating first is what keeps
-    this safe.
-
-    A trailing ``&&``-chained clause is a separate question, decided by
-    ``verify_cmd.split_chain_tail``: a SIBLING CHECKER (a different tool, no
-    ``cd`` sequencing — every subproject's ``lint_command`` chains a
-    ``python3 .../check_*.py <dir>`` gate after ``ruff check``) is PRESERVED
-    unscoped and verbatim, because it asserts a whole-directory invariant
-    that narrowing would break; a SAME-TOOL FAN-OUT (the root config's ``cd X
-    && npx pyright`` chain) is still dropped, since preserving it would run
-    two more subprojects unscoped AND leave a ``cd ../orchestrator`` that
-    misresolves once ``strip_cwd`` has removed the leading ``cd``.
-
-    The PYTEST slot is excluded from tail preservation outright (task 3218):
-    ``'pytest'`` is off the gate's ``_TAIL_PRESERVING_KEYWORDS``, so a
-    chained ``test_command`` always truncates and the scoped result stays
-    STRUCTURED — which is what keeps ``with_junitxml`` and
-    ``with_pytest_timeout`` live on it. A preserved tail there would have
-    silently cost the junit report that drives
-    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
-    per-test timeout floor. The dropped clauses are not silent: a
-    multi-clause command whose tail the gate rejects is reported by
-    ``verify_plan.log_dropped_chain_clauses`` below, naming the keyword and
-    the dropped-clause count — at DEBUG when a dropped clause re-invokes the
-    tool (an intended same-tool fan-out truncation), at INFO when none does (a
-    sibling check that will now never run), independent of which slot is
-    running. The record is emitted only on the rewriting path: both bail-outs
-    below return *cmd* with its chain intact, so nothing is dropped there and
-    nothing is reported.
-
-    Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
-    layer counterpart) is now STRUCTURAL rather than a convention: both route
-    through that one shared ``split_chain_tail`` gate. When the gate rejects,
-    ``head is cmd`` and ``tail == ''``, so the body below collapses to its
-    pre-gate form byte-for-byte. Both bail-outs return *cmd* — the full
-    original, never ``head`` — so a gate-accepted command can never be
-    silently truncated on the unparseable path.
+    The string form of ``verify_plan.py::scope_prefix_to_keyword``, which owns the scoping
+    rule (keyword truncation, chain-tail preservation, bail-outs, and the dropped-clause record).
     """
-    if cmd is None:
-        return None
-    head, tail = split_chain_tail(cmd, keyword)
-    idx = head.find(keyword)
-    if idx == -1:
-        return cmd
-    # Task 3931 / esc-3805-1: token-aware, not a bare byte-offset slice. The
-    # old `head[: idx + len(keyword)]` cut mid-token at the `@` of a pinned npx
-    # package spec, silently dropping `@1.1.408` before the string was
-    # re-parsed — so the gate advertised a pinned pyright and ran whatever npx
-    # last cached. See `keyword_truncation_end` for the boundary rule and why
-    # it is anchored on `@` rather than "keep the whole token"; the shared
-    # helper is also what keeps this in structural lockstep with
-    # `verify_plan._scope_prefix_to_keyword`.
-    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
-    parsed = parse_config_command(retained)
-    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
-        return cmd
-    # Sited AFTER both bail-outs on purpose: each of them returns *cmd* — the
-    # whole original, chain and all — so a gate REJECT costs nothing there and
-    # a record would name clauses that in fact still run. Only the rewriting
-    # path below actually discards them. A record that does not correspond to
-    # a real drop is the same failure mode this log exists to avoid.
-    #
-    # The LEVEL follows what was actually dropped, not which slot is running.
-    # A dropped clause that re-invokes the tool at an argv head is an intended
-    # same-tool fan-out -> DEBUG, not the WARNING the reverse-dependency
-    # widening's no-op uses further down this module: BOTH root configs are
-    # that case and hit it on every fallback verify, so a louder level would be
-    # steady noise that trains operators to ignore the record. A dropped clause
-    # that does NOT invoke the tool is a sibling check that will now never run
-    # -> INFO, the possible-false-GREEN direction, the same level
-    # `_with_junitxml_str` uses for the missing junit report.
-    #
-    # Keying that on `keyword == 'pytest'` instead — the first spelling of this
-    # record — got it backwards on the live config: this repo's root
-    # `test_command` is a pure pytest fan-out with no sibling checker anywhere,
-    # and was reported at INFO as a dropped sibling check on every fallback
-    # verify that scopes it.
-    #
-    # The record itself is `verify_plan`'s, emitted onto THIS module's logger.
-    # Sharing the one implementation is what makes the two scopers' records
-    # read alike structurally rather than by hand-mirroring — the same
-    # argument that put the tail-preservation policy in one shared gate.
-    # `retained` is the truncation point, so the clauses past it are exactly
-    # the ones this call discards — which is what makes the count right.
-    if has_unpreserved_chain_clauses(cmd, tail):
-        verify_plan.log_dropped_chain_clauses(logger, cmd, keyword, retained)
-    rendered = render(strip_cwd(promote_cwd_to_project(scope_to(parsed, files))))
-    return f'{rendered} {tail}' if tail else rendered
+    return None if cmd is None else render(verify_plan.scope_prefix_to_keyword(cmd, keyword, files))
 
 
 def _reproject_str(cmd: str | None, project: str) -> str | None:
@@ -322,11 +229,12 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
     ``cwd_rel is not None`` ("an explicit ``--directory`` is already set"),
     so in exactly the bailed case the discarded expression was a pure
     re-render with no ``--project`` injection to lose. Note this asymmetry
-    against the two scopers: they apply ``strip_cwd``, so their ``cwd_rel``
-    is always already ``None`` at render time and neither needs this guard.
-    ``strip_cwd`` is deliberately NOT used here — unlike the scopers, which
-    re-target to worktree-root-relative files, this helper acts on an
-    unscoped/bail-through command whose ``--directory`` is load-bearing (it
+    against the scoper (``verify_plan.py::scope_prefix_to_keyword``, and its
+    string rendering ``_scope_to_keyword``): it applies ``strip_cwd``, so its
+    ``cwd_rel`` is always already ``None`` at render time and it needs no
+    such guard. ``strip_cwd`` is deliberately NOT used here — unlike the
+    scoper, which re-targets to worktree-root-relative files, this helper
+    acts on an unscoped/bail-through command whose ``--directory`` is load-bearing (it
     selects the directory ruff/pyright run in and find their config from).
     Bail, do not rewrite. Guarding on *tail* first keeps the pre-existing
     no-tail ``--directory`` -> ``cd`` renormalisation byte-identical.
@@ -1033,76 +941,237 @@ _XDIST_NODE_DOWN_PRECEDING_NODEID_RE = re.compile(
 )
 
 
-def _extract_failing_test_ids(test_output: str) -> list[str]:
-    """Extract pytest node-ids of failing/errored/crashed tests from *test_output*.
+class FailureKind(StrEnum):
+    FAILED = 'failed'
+    ERROR = 'error'
 
-    Scans for the three failure surfaces documented above the module-level
-    patterns: ``FAILED <nodeid>`` summary lines, ``ERROR <nodeid>`` /
-    ``ERROR <file.py>`` summary lines (fixture/teardown/collection errors),
-    and xdist worker-crash notices (both the explicit ``crashed while
-    running '<nodeid>'`` phrasing and the in-progress ``<nodeid>`` line
-    immediately preceding a ``node down: Not properly terminated`` marker).
 
-    Returns node-ids in first-seen (leftmost-match) order, de-duplicated.
-    Returns ``[]`` for falsy *test_output* or output with no recoverable
-    node-id (a non-test failure such as a lint/type error block, or a
-    worker-crash notice with no adjacent node-id) — the caller
-    (``confirm_main_tip_failure_is_real``) treats an empty list as
-    "unconfirmable" and fails safe to alarm rather than guessing.
+@dataclass(frozen=True)
+class PytestFailure:
+    node_id: str
+    kind: FailureKind
+    first_line: str
+
+
+@dataclass(frozen=True)
+class _FailureMatch:
+    position: int
+    node_id: str
+    kind: FailureKind
+    summary_reason: str | None  # None: the surface is not a short-summary line
+
+
+_SUMMARY_LINE_SURFACES = (
+    (_FAILED_LINE_NODEID_RE, FailureKind.FAILED),
+    (_ERROR_LINE_NODEID_RE, FailureKind.ERROR),
+    (_ERROR_LINE_FILE_RE, FailureKind.ERROR),
+)
+_XDIST_CRASH_SURFACES = (
+    (_XDIST_CRASH_NODEID_RE, FailureKind.FAILED),
+    (_XDIST_NODE_DOWN_PRECEDING_NODEID_RE, FailureKind.FAILED),
+)
+_SUMMARY_REASON_SEPARATOR = ' - '
+_SECTION_HEADER_RE = re.compile(r'^_+ (.+?) _+$', re.MULTILINE)
+_SECTION_END_RE = re.compile(r'^(?:_+ .+ _+|=+ .+ =+)$', re.MULTILINE)
+_ERROR_SECTION_PREFIX_RE = re.compile(r'^ERROR (?:at (?:setup|teardown) of|collecting) ')
+_TRACEBACK_E_PREFIX = 'E   '
+
+
+def _summary_reason(test_output: str, match: re.Match[str]) -> str:
+    line_end = test_output.find('\n', match.end(1))
+    rest = test_output[match.end(1) : len(test_output) if line_end < 0 else line_end]
+    return rest.partition(_SUMMARY_REASON_SEPARATOR)[2].strip()
+
+
+def _failure_matches(test_output: str) -> list[_FailureMatch]:
+    matches = [
+        _FailureMatch(m.start(1), m.group(1), kind, _summary_reason(test_output, m))
+        for pattern, kind in _SUMMARY_LINE_SURFACES
+        for m in pattern.finditer(test_output)
+    ]
+    matches += [
+        _FailureMatch(m.start(1), m.group(1), kind, None)
+        for pattern, kind in _XDIST_CRASH_SURFACES
+        for m in pattern.finditer(test_output)
+    ]
+    return sorted(matches, key=lambda match: match.position)
+
+
+def _section_title(node_id: str) -> str:
+    return '.'.join(node_id.split('::')[1:]) or node_id
+
+
+_SectionBodies = dict[tuple[str, FailureKind], list[str]]
+
+
+def _section_bodies(test_output: str) -> _SectionBodies:
+    """Every FAILURES/ERRORS section body, keyed by its ``(title, kind)``, in output order."""
+    bodies: _SectionBodies = {}
+    for header in _SECTION_HEADER_RE.finditer(test_output):
+        title = _ERROR_SECTION_PREFIX_RE.sub('', header.group(1))
+        kind = FailureKind.ERROR if title != header.group(1) else FailureKind.FAILED
+        section_end = _SECTION_END_RE.search(test_output, header.end())
+        body = test_output[header.end() : section_end.start() if section_end else len(test_output)]
+        bodies.setdefault((title, kind), []).append(body)
+    return bodies
+
+
+def _section_body_of(sections: _SectionBodies, node_id: str, kind: FailureKind) -> str | None:
+    candidates = sections.get((_section_title(node_id), kind), [])
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    path_line = re.compile(rf'^{re.escape(node_id.partition("::")[0])}:\d+:', re.MULTILINE)
+    naming_path = [body for body in candidates if path_line.search(body)]
+    return naming_path[0] if len(naming_path) == 1 else None
+
+
+def _section_first_error_line(sections: _SectionBodies, node_id: str, kind: FailureKind) -> str:
+    """First ``E   `` line of the FAILURES/ERRORS section pytest printed for the test."""
+    body = _section_body_of(sections, node_id, kind)
+    traceback_line = _PYTEST_TRACEBACK_E_RE.search(body) if body is not None else None
+    if traceback_line:
+        return traceback_line.group(0).removeprefix(_TRACEBACK_E_PREFIX).strip()
+    return ''
+
+
+def _stated_first_line(matches: list[_FailureMatch]) -> str | None:
+    """The summary-line reason, ``''`` when no surface can carry one, ``None`` when the sections must be read."""
+    stated_reasons = [m.summary_reason for m in matches if m.summary_reason]
+    if stated_reasons:
+        return stated_reasons[0]
+    if any(m.summary_reason is not None for m in matches):
+        return None
+    return ''
+
+
+def parse_pytest_failures(test_output: str) -> tuple[PytestFailure, ...]:
+    """Parse the failing, errored and crashed tests named in pytest *test_output*.
+
+    Reads the five surfaces documented above ``_FAILED_LINE_NODEID_RE``, in
+    first-seen (leftmost-match) order, de-duplicated on ``(node_id, kind)``: a
+    node that is both FAILED and ERROR yields two entries.  ``first_line`` is the
+    reason on the short-summary line, else the first ``E   `` line of the test's
+    own FAILURES/ERRORS section, else ``''``; it is not length-capped.  Sections
+    sharing a title are told apart by the ``path:line:`` lines naming the test's
+    file; if that does not single one out, ``first_line`` is ``''``.  Returns
+    ``()`` for falsy *test_output*.
     """
     if not test_output:
-        return []
-    matches: list[tuple[int, str]] = []
-    for pattern in (
-        _FAILED_LINE_NODEID_RE,
-        _ERROR_LINE_NODEID_RE,
-        _ERROR_LINE_FILE_RE,
-        _XDIST_CRASH_NODEID_RE,
-        _XDIST_NODE_DOWN_PRECEDING_NODEID_RE,
-    ):
-        for m in pattern.finditer(test_output):
-            matches.append((m.start(1), m.group(1)))
-    matches.sort(key=lambda item: item[0])
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for _, node_id in matches:
-        if node_id not in seen:
-            seen.add(node_id)
-            ordered.append(node_id)
-    return ordered
+        return ()
+    by_identity: dict[tuple[str, FailureKind], list[_FailureMatch]] = {}
+    for match in _failure_matches(test_output):
+        by_identity.setdefault((match.node_id, match.kind), []).append(match)
+    stated = {identity: _stated_first_line(matches) for identity, matches in by_identity.items()}
+    sections = _section_bodies(test_output) if None in stated.values() else {}
+    return tuple(
+        PytestFailure(
+            node_id, kind,
+            _section_first_error_line(sections, node_id, kind) if line is None else line,
+        )
+        for (node_id, kind), line in stated.items()
+    )
 
 
-def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
-    """Parse a pytest junitxml report at *path* into failing/errored test ids.
+def node_ids_of(failures: Iterable[PytestFailure]) -> list[str]:
+    """Node ids in order, de-duplicated on ``node_id`` alone."""
+    return list(dict.fromkeys(failure.node_id for failure in failures))
 
-    Task μ (verify-scope-inversion-prd.md): the STRUCTURED counterpart to
-    :func:`_extract_failing_test_ids` above (which regexes pytest stdout) —
-    this is the baseline-attribution signal, parsed via stdlib
-    ``xml.etree.ElementTree`` rather than a regex. The SAME parser feeds both
-    the per-main-SHA baseline probe and a branch's merge-gate result, so diff
-    consistency — not exact pytest-node-id fidelity — is what matters (see
-    ``diff_new_failures``/``is_wholly_preexisting``).
 
-    A ``<testcase>`` counts as failing iff it has a ``<failure>`` or
-    ``<error>`` child (a ``<skipped>`` child does not count). Its id is
-    ``f'{classname}::{name}'``; when ``classname`` is absent, falls back to
-    ``f'{file}::{name}'`` (the ``file`` attribute some junit writers emit),
-    then to the bare ``name`` when neither is present. ``<testcase>``
-    elements are found via ``root.iter('testcase')`` so both the modern
-    ``<testsuites><testsuite>...`` wrapping and a bare ``<testsuite>`` root
-    are handled uniformly, and multiple ``<testsuite>`` blocks are all
-    covered.
+def reproduced_failures(
+    original: Sequence[PytestFailure], rerun: Sequence[PytestFailure],
+) -> tuple[PytestFailure, ...]:
+    """The *rerun* failures that confirm a failure of *original*, in *rerun* order.
 
-    Returns:
-        - ``None`` when *path* does not exist, or the file is empty/malformed
-          (``ET.ParseError``) — "no junit collected", the B3 degrade signal
-          callers fall back on.
-        - ``[]`` when the report parses but no testcase is failing/errored
-          ("junit collected, zero failing" — main/branch genuinely clean).
-        - Otherwise a sorted, de-duplicated list of failing/errored ids.
+    A re-run failure confirms an original for the same node id only, and a
+    setup or collection ERROR confirms only an original ERROR of that node: a
+    FAILED original is not reproduced by an ERROR the re-run's own form can
+    produce.  Both outputs must come from the same command run from the same
+    cwd, because pytest's summary ids are cwd-relative.
+    """
+    original_kinds: dict[str, set[FailureKind]] = {}
+    for failure in original:
+        original_kinds.setdefault(failure.node_id, set()).add(failure.kind)
+    return tuple(
+        failure
+        for failure in rerun
+        if failure.node_id in original_kinds
+        and (failure.kind is FailureKind.FAILED or FailureKind.ERROR in original_kinds[failure.node_id])
+    )
 
-    Never raises: any unexpected parse-time exception is treated the same as
-    ``ET.ParseError`` (fail-soft to ``None``).
+
+def _extract_failing_test_ids(test_output: str) -> list[str]:
+    """Node-ids of failing/errored/crashed tests in first-seen order, de-duplicated.
+
+    ``[]`` when *test_output* is falsy or names no recoverable node-id; the
+    caller (``confirm_main_tip_failure_is_real``) treats that as "unconfirmable"
+    and fails safe to alarm.  Byte-identical to the pre-typed-parse scan.
+    """
+    return list(dict.fromkeys(match.node_id for match in _failure_matches(test_output)))
+
+
+class _JunitTestIds(NamedTuple):
+    """One junitxml report's test ids, split by what the report says happened.
+
+    ``failing`` holds testcases with a ``<failure>`` or ``<error>`` child;
+    ``skipped`` holds testcases the run NEVER EXECUTED.  The two are disjoint,
+    and a testcase in neither ran and passed — the only state from which a
+    caller may conclude "main ran it and it was green".
+    """
+
+    failing: list[str]
+    skipped: list[str]
+
+
+# pytest's junitxml records two outcomes of tests that DID run as a
+# ``<skipped>`` child: an xfail (typed ``pytest.xfail``) and a strict XPASS
+# (untyped, with this fixed message) — see
+# ``_pytest/junitxml.py::_NodeReporter.append_skipped`` and ``::append_failure``.
+# Neither belongs in the never-executed population.
+_PYTEST_XFAIL_SKIP_TYPE = 'pytest.xfail'
+_PYTEST_STRICT_XPASS_SKIP_MESSAGE = 'xfail-marked test passes unexpectedly'
+
+
+def _junit_testcase_id(testcase: ET.Element) -> str:
+    """``classname::name``, else ``file::name``, else the bare ``name``.
+
+    The ONE id spelling for every vector parsed from a report.  The vectors are
+    set-differenced against each other and against main's baselines, so two
+    spellings would make every such comparison silently miss.
+    """
+    name = testcase.get('name', '')
+    classname = testcase.get('classname')
+    if classname:
+        return f'{classname}::{name}'
+    file_attr = testcase.get('file')
+    return f'{file_attr}::{name}' if file_attr else name
+
+
+def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
+    skipped = testcase.find('skipped')
+    return (
+        skipped is not None
+        and skipped.get('type') != _PYTEST_XFAIL_SKIP_TYPE
+        and skipped.get('message') != _PYTEST_STRICT_XPASS_SKIP_MESSAGE
+    )
+
+
+def _extract_test_ids_from_junit(path: Path) -> _JunitTestIds | None:
+    """Parse the pytest junitxml report at *path* ONCE into failing and skipped ids.
+
+    Task μ (verify-scope-inversion-prd.md) introduced the failing vector as the
+    STRUCTURED baseline-attribution signal (the stdout-regex counterpart is
+    :func:`_extract_failing_test_ids`); task 3226 added the skipped vector,
+    because the failing vector alone cannot tell "main ran it and it passed"
+    from "main never ran it".  The SAME parser feeds both the per-main-SHA
+    baseline probe and a branch's merge-gate result, so diff consistency — not
+    exact pytest-node-id fidelity — is what matters.  ``root.iter('testcase')``
+    handles a ``<testsuites>`` wrapper, a bare ``<testsuite>`` root, and several
+    ``<testsuite>`` blocks alike; ids are sorted and de-duplicated.
+
+    Returns ``None`` when *path* is missing, empty or malformed — "no junit
+    collected", the B3 degrade signal.  Never ``([], [])`` for that case: an
+    empty pair claims "main ran everything and nothing failed", the very
+    conclusion a missing report must not license.  Never raises.
     """
     try:
         tree = ET.parse(path)
@@ -1112,19 +1181,41 @@ def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
     if root is None:
         return None
 
-    ids: set[str] = set()
+    failing: set[str] = set()
+    skipped: set[str] = set()
     for testcase in root.iter('testcase'):
-        if testcase.find('failure') is None and testcase.find('error') is None:
-            continue
-        name = testcase.get('name', '')
-        classname = testcase.get('classname')
-        if classname:
-            test_id = f'{classname}::{name}'
-        else:
-            file_attr = testcase.get('file')
-            test_id = f'{file_attr}::{name}' if file_attr else name
-        ids.add(test_id)
-    return sorted(ids)
+        if testcase.find('failure') is not None or testcase.find('error') is not None:
+            failing.add(_junit_testcase_id(testcase))
+        elif _junit_testcase_never_ran(testcase):
+            skipped.add(_junit_testcase_id(testcase))
+    return _JunitTestIds(failing=sorted(failing), skipped=sorted(skipped))
+
+
+def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
+    """``{junit id: 'passed' | 'skipped'}`` for every testcase of the report at *path* that did not fail.
+
+    Ids use the spelling of :func:`_extract_test_ids_from_junit`.  ``'skipped'``
+    means the test never executed; an xfail or a strict XPASS ran and counts as
+    ``'passed'``.  A testcase with a ``<failure>`` or ``<error>`` child is
+    absent.  ``None`` when *path* is missing, empty or malformed; never raises.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    if root is None:
+        return None
+    return {
+        _junit_testcase_id(testcase): 'skipped' if _junit_testcase_never_ran(testcase) else 'passed'
+        for testcase in root.iter('testcase')
+        if testcase.find('failure') is None and testcase.find('error') is None
+    }
+
+
+def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
+    """The failing half of :func:`_extract_test_ids_from_junit`; ``None`` when no report parsed."""
+    ids = _extract_test_ids_from_junit(path)
+    return None if ids is None else ids.failing
 
 
 def _worker_death_cause_hint(output: str, truncation_evidence: str) -> str:
@@ -1475,7 +1566,8 @@ def _remember_main_baseline(main_sha: str, record: _MainShaBaseline) -> None:
     _BASELINE_FAILING_IDS_CACHE[main_sha] = record
     _BASELINE_FAILING_IDS_CACHE.move_to_end(main_sha)
     while len(_BASELINE_FAILING_IDS_CACHE) > _BASELINE_CACHE_MAX_SHAS:
-        _BASELINE_FAILING_IDS_CACHE.popitem(last=False)
+        evicted_sha, _ = _BASELINE_FAILING_IDS_CACHE.popitem(last=False)
+        _BASELINE_SKIPPED_IDS_CACHE.pop(evicted_sha, None)
 
 
 def _recall_main_baseline(main_sha: str, *, touch: bool) -> _MainShaBaseline | None:
@@ -1485,8 +1577,31 @@ def _recall_main_baseline(main_sha: str, *, touch: bool) -> _MainShaBaseline | N
     return record
 
 
-def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
-    """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
+# Process-wide cache for the per-main-SHA SKIPPED-test-id baseline (task
+# 3226).  Deliberately a PARALLEL dict rather than a field on _MainShaBaseline:
+# narrowed per-module probes rebuild that record (task 5627) with no skip
+# evidence of their own, and a whole-tree skipped vector must survive those
+# rebuilds unchanged.  Written only by seed_main_baseline, so a skipped entry
+# only ever sits beside a whole-tree failing entry seeded by the same call —
+# see that function for the rule — and _remember_main_baseline evicts it with
+# that entry, so both sides share one recency bound.
+#
+# WHY a second baseline at all: the failing baseline can only say "id X was
+# red on main".  Its ABSENCE is ambiguous — it conflates "main RAN X and it
+# passed" (evidence the branch broke it) with "main NEVER RAN X" (evidence of
+# nothing at all).  Only the first licenses the confident task-fault verdict
+# in verify_failure_is_preexisting_on_main's id-diff fast path.  This cache
+# holds the second population so the two can be told apart; see the
+# 2026-07-29 reify-allowlist incident, where a sibling repo's mutable state
+# made a whole guard skip on one side of a comparison and pass-shaped on the
+# other.
+_BASELINE_SKIPPED_IDS_CACHE: dict[str, frozenset[str]] = {}
+
+
+def seed_main_baseline(
+    main_sha: str, ids: Iterable[str], *, skipped: Iterable[str] | None = None,
+) -> None:
+    """Seed (or refresh) the per-main-SHA baselines — failing, and skipped when known.
 
     *ids* is the whole tree's failing set at *main_sha*; ``frozenset()``
     means every module is green there. Called from the PASS path of a
@@ -1494,9 +1609,28 @@ def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
     CAS-advance to become the next main tip — see merge_queue.py's
     ``_run_post_merge_verify``), so in steady state
     ``main_baseline_failing_ids`` below is a cache hit for as long as that
-    SHA is main's tip and never pays for a probe (B2).
+    SHA is main's tip and never pays for a probe (B2); and from that
+    function's own whole-tree cold-start probe.
+
+    THE SKIPPED-SIDE RULE (task 3226), stated here and nowhere else: the
+    skipped entry for *main_sha* describes the same whole-tree run as its
+    failing entry, or is absent.  A *skipped* of ``None`` means that run
+    collected no skip evidence — "unknown", which is NOT "nothing skipped" —
+    so it removes any skipped entry rather than recording an empty set, and
+    :func:`cached_main_baseline_skipped_ids` then reads ``None``.  A run that
+    parsed its junit report always supplies both vectors, so in steady state
+    both sides are warm.  Callers pass *skipped* verbatim: a run genuinely
+    did skip those tests, whereas the pass path overrides *ids* to empty
+    because a passing run has no live failures (task 2590).  A narrowed
+    per-module probe (task 5627) never writes the skipped side: it has skip
+    evidence for part of the tree only, and a partial vector would read as
+    "main skipped nothing else".
     """
     _remember_main_baseline(main_sha, _MainShaBaseline(every_module=frozenset(ids)))
+    if skipped is None:
+        _BASELINE_SKIPPED_IDS_CACHE.pop(main_sha, None)
+    else:
+        _BASELINE_SKIPPED_IDS_CACHE[main_sha] = frozenset(skipped)
 
 
 async def main_baseline_failing_ids(
@@ -1627,7 +1761,7 @@ async def _whole_tree_main_baseline(
         )
         return None
     ids = frozenset(probe_result.failing_test_ids)
-    seed_main_baseline(main_sha, ids)
+    seed_main_baseline(main_sha, ids, skipped=probe_result.skipped_test_ids)
     return ids
 
 
@@ -1739,6 +1873,102 @@ def known_failing_ids_on_main(main_sha: str) -> frozenset[str]:
     """
     _cached = _recall_main_baseline(main_sha, touch=False)
     return _cached.known_failing() if _cached is not None else frozenset()
+
+
+def cached_main_baseline_skipped_ids(main_sha: str) -> 'frozenset[str] | None':
+    """Cache-ONLY peek at the per-main-SHA SKIPPED-id baseline — never probes.
+
+    Mirror of :func:`cached_main_baseline_failing_ids` for the skipped
+    population: pure, synchronous, side-effect-free, and bounded by the same
+    SHA recency as the failing side (see :func:`_remember_main_baseline`).
+
+    Read the return values precisely — the whole point of this cache is that
+    they are NOT interchangeable:
+
+    - ``None``      — no skip evidence for this sha: never probed, evicted,
+                      or seeded by a run that collected none (see
+                      :func:`seed_main_baseline`).  No verdict may be derived
+                      from it.
+    - ``frozenset()`` — main WAS probed and skipped nothing.
+    - non-empty     — main NEVER RAN these tests.  Their absence from the
+                      failing baseline is therefore not evidence that the
+                      branch broke them.
+
+    Used on the critical path by ``verify_failure_is_preexisting_on_main``'s
+    id-diff fast path and by ``merge_queue._run_post_merge_verify``'s
+    branch-block reason enrichment, both of which must NEVER trigger a probe
+    (G4, task 2564) — hence cache-only.
+    """
+    return _BASELINE_SKIPPED_IDS_CACHE.get(main_sha)
+
+
+class NewFailingIds(NamedTuple):
+    """Branch-failing ids absent from main's failing baseline, split by attribution.
+
+    ``unattributable`` ids are in main's SKIPPED baseline: main never ran them,
+    so their absence from its failing baseline is evidence of nothing.
+    ``attributable`` ids are the rest — main ran them green, or (cold skipped
+    baseline) nothing says otherwise — and they blame the branch.
+    """
+
+    attributable: frozenset[str]
+    unattributable: frozenset[str]
+
+
+def partition_new_failing_ids(new_ids: Iterable[str], main_sha: str) -> NewFailingIds:
+    """Split *new_ids* against main *main_sha*'s skipped baseline (task 3226).
+
+    The ONE attribution rule for ids absent from main's failing baseline:
+    ``verify_failure_is_preexisting_on_main`` blames the branch iff any id is
+    attributable, and :func:`describe_new_failing_ids` counts only attributable
+    ids as new failures.  Cache-only (via
+    :func:`cached_main_baseline_skipped_ids`), so it never probes on the
+    critical path (G4, task 2564); a cold skipped baseline makes every id
+    attributable, which is the pre-3226 behaviour exactly.
+    """
+    new = frozenset(new_ids)
+    unattributable = new & (cached_main_baseline_skipped_ids(main_sha) or frozenset())
+    return NewFailingIds(attributable=new - unattributable, unattributable=unattributable)
+
+
+SKIPPED_ON_MAIN_REASON_CLAUSE = (
+    'test(s) SKIPPED on main (main never ran them — not evidence of a branch fault)'
+)
+
+
+def describe_new_failing_ids(new_ids: Iterable[str], main_sha: str) -> str:
+    """Word the failing ids absent from main's failing baseline for a block reason.
+
+    Partitioned by :func:`partition_new_failing_ids`: only attributable ids are
+    counted as new failures; unattributable ones are named under
+    :data:`SKIPPED_ON_MAIN_REASON_CLAUSE`.  With no unattributable id the
+    wording is the pre-3226 one byte for byte.
+    """
+    attributable, unattributable = partition_new_failing_ids(new_ids, main_sha)
+    clauses = []
+    if attributable:
+        clauses.append(
+            f'{len(attributable)} new failing test(s) not present on main: '
+            f"{', '.join(sorted(attributable))}"
+        )
+    if unattributable:
+        clauses.append(
+            f'{len(unattributable)} {SKIPPED_ON_MAIN_REASON_CLAUSE}: '
+            f"{', '.join(sorted(unattributable))}"
+        )
+    return '; plus '.join(clauses)
+
+
+def clear_main_probe_caches() -> None:
+    """Forget every process-wide main-probe verdict and per-main-SHA baseline.
+
+    The single reset for :data:`_PROBE_CACHE`, :data:`_BASELINE_FAILING_IDS_CACHE`
+    and :data:`_BASELINE_SKIPPED_IDS_CACHE`; a cache added beside them belongs
+    here too, so every caller that resets one resets all of them.
+    """
+    _PROBE_CACHE.clear()
+    _BASELINE_FAILING_IDS_CACHE.clear()
+    _BASELINE_SKIPPED_IDS_CACHE.clear()
 
 
 def _worst_category(categories: list[str]) -> str:
@@ -1946,8 +2176,10 @@ def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
     cause of the no-op — a raw-retained ``&&``-chain, an OPAQUE command, a
     non-pytest tool — rather than only the tail-preservation one. As of task
     3218 step-2 the tail-preservation cause is no longer reachable through
-    the two scopers at all (``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``,
-    so a chained pytest slot now comes back structured); this remains as
+    the scoper (``verify_plan.py::scope_prefix_to_keyword``, and its string
+    rendering ``_scope_to_keyword``) at all (``'pytest'`` is off
+    ``_TAIL_PRESERVING_KEYWORDS``, so a chained pytest slot now comes back
+    structured); this remains as
     defence in depth for a hand-written multi-clause ``test_command`` that
     reaches the injection site directly.
 
@@ -2054,6 +2286,11 @@ WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 _NO_VERDICT_SUMMARY_MARKERS = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
 
 
+def is_no_verdict_summary(summary: str) -> bool:
+    """True when *summary* carries a no-verdict note — a signal-killed leg or an xdist-truncated session — so it records no verdict on the code."""
+    return any(marker in summary for marker in _NO_VERDICT_SUMMARY_MARKERS)
+
+
 def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
     """Describe a leg that was terminated by an external signal.
 
@@ -2106,6 +2343,57 @@ def _worker_death_leg_note(label: str) -> str:
     return (
         f'{label} leg {WORKER_DEATH_SUMMARY_MARKER}; '
         f'remaining tests never ran; tally is partial'
+    )
+
+
+def _classify_leg(rc: int, out: str, timed_out: bool, cmd: str | None) -> FailureCategory:
+    return classify_failure(_tool_for_cmd(cmd), rc, out, timed_out)
+
+
+def _type_leg_read_partially_provisioned_venv(
+    rc: int, out: str, timed_out: bool, cmd: str | None, *, test_rc: int, test_cmd: str | None,
+) -> bool:
+    """True when task 6127's cross-leg refinement decides the TYPE leg.
+
+    Only an UNKNOWN_TEST_FAILURE fall-through qualifies, so every
+    ``classify_failure`` guard and every specific per-tool category stays
+    authoritative.  The output must show a partially provisioned venv that the
+    same run's passing pytest leg corroborates
+    (``verify_classify.py::is_partially_provisioned_venv_type_failure``).
+    ``_classify_type_leg`` and ``_warn_if_type_leg_read_partially_provisioned_venv``
+    both ask this one question, so the log never disagrees with the category.
+    """
+    return _classify_leg(rc, out, timed_out, cmd) == FailureCategory.UNKNOWN_TEST_FAILURE and (
+        is_partially_provisioned_venv_type_failure(
+            out, test_tool=_tool_for_cmd(test_cmd), test_leg_passed=test_rc == 0,
+        )
+    )
+
+
+def _classify_type_leg(
+    rc: int, out: str, timed_out: bool, cmd: str | None, *, test_rc: int, test_cmd: str | None,
+) -> FailureCategory:
+    if _type_leg_read_partially_provisioned_venv(
+        rc, out, timed_out, cmd, test_rc=test_rc, test_cmd=test_cmd,
+    ):
+        return FailureCategory.ENV_TRANSIENT
+    return _classify_leg(rc, out, timed_out, cmd)
+
+
+def _warn_if_type_leg_read_partially_provisioned_venv(attempt: 'VerifyAttempt') -> None:
+    type_leg, test_leg = attempt.type, attempt.test
+    if not _type_leg_read_partially_provisioned_venv(
+        type_leg.rc, type_leg.output, type_leg.timed_out, type_leg.cmd,
+        test_rc=test_leg.rc, test_cmd=test_leg.cmd,
+    ):
+        return
+    logger.warning(
+        'Verification type check failed with %d distinct unresolved top-level '
+        'modules while the same run\'s pytest leg passed: pyright read a venv '
+        'that was still being provisioned. This is an ENVIRONMENT fault, NOT a '
+        'branch defect. Likely fix surface: verify_cold_preprovision_command '
+        'is missing or failing on the verifying host. See task 6127.',
+        len(unresolved_top_level_modules(type_leg.output)),
     )
 
 
@@ -2193,18 +2481,19 @@ def _summarize_checks(
     if passed:
         return True, 'passed', '', 'All checks passed', []
 
+    classify_type_leg = functools.partial(_classify_type_leg, test_rc=test_rc, test_cmd=test_cmd)
     hint_parts = []
     per_check_categories: list[str] = []
-    for rc, out, to, cmd in (
-        (test_rc, test_out, test_timed_out, test_cmd),
-        (lint_rc, lint_out, lint_timed_out, lint_cmd),
-        (type_rc, type_out, type_timed_out, type_cmd),
+    for rc, out, to, cmd, classify in (
+        (test_rc, test_out, test_timed_out, test_cmd, _classify_leg),
+        (lint_rc, lint_out, lint_timed_out, lint_cmd, _classify_leg),
+        (type_rc, type_out, type_timed_out, type_cmd, classify_type_leg),
     ):
         if rc != 0:
             h = _extract_cause_hint(out)
             if h:
                 hint_parts.append(h)
-            per_check_categories.append(classify_failure(_tool_for_cmd(cmd), rc, out, to))
+            per_check_categories.append(classify(rc, out, to, cmd))
     cause_hint = ' | '.join(hint_parts)
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
@@ -2886,6 +3175,7 @@ def _archive_merge_verify_logs(
     cause_hint: str,
     *,
     module_prefix: 'str | None' = None,
+    role: Literal['merge', 'task'] = 'merge',
 ) -> list[Path]:
     """Write merge-verify run outputs + summary DIRECTLY to the durable archive.
 
@@ -2939,7 +3229,7 @@ def _archive_merge_verify_logs(
             archived.append(path)
 
     summary_path = _archive_attempt_summary(
-        _build_summary_payload(runs, category, cause_hint, role='merge'),
+        _build_summary_payload(runs, category, cause_hint, role=role),
         archive_root, task_id, attempt_id,
         module_prefix=module_prefix, stamp=utc_ts,
     )
@@ -3181,19 +3471,8 @@ def _apply_cargo_scope(
         if old != new:
             logger.info('cargo scope (%s): %r -> %r', label, old, new)
 
-    return ModuleConfig(
-        prefix=mc.prefix,
-        test_command=new_test,
-        lint_command=new_lint,
-        type_check_command=new_type,
-        lock_depth=mc.lock_depth,
-        max_per_module=mc.max_per_module,
-        module_overrides=mc.module_overrides,
-        verify_command_timeout_secs=mc.verify_command_timeout_secs,
-        verify_cold_command_timeout_secs=mc.verify_cold_command_timeout_secs,
-        concurrent_verify=mc.concurrent_verify,
-        verify_env=mc.verify_env,
-        scope_cargo=mc.scope_cargo,
+    return replace(
+        mc, test_command=new_test, lint_command=new_lint, type_check_command=new_type,
     )
 
 
@@ -3921,6 +4200,10 @@ class CheckRun:
     # off, a lint/type leg, or an ungated role such as merge), never 0.0.
     # LAST field, for the rule ``segments`` and ``load`` state above.
     slot_wait_secs: 'float | None' = None
+    # The admitted leg this check's slot wait ended in (task 5628). ``None``
+    # when it competed for no slot, on the terms ``slot_wait_secs`` states.
+    # LAST field, as above.
+    admission: 'AdmissionLeg | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -3938,9 +4221,9 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 10-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments/load/slot_wait_secs), 7 of
-        which were previously hand-built inline in ``run_verification``.
+        (all take ``list[dict]``) — the exact 11-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission),
+        7 of which were previously hand-built inline in ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
         ``None`` serialises as ``''``, matching the pre-refactor
@@ -3959,8 +4242,9 @@ class CheckRun:
         historical ones, and "absent" vs "null" is the distinction that tells
         it whether a run predates load stamping or merely went unstamped.
 
-        ``slot_wait_secs`` (task 5671) is emitted unconditionally too: absent
-        means the run predates it, ``None`` means it queued for no slot.
+        ``slot_wait_secs`` (task 5671) and ``admission`` (task 5628) are
+        emitted unconditionally too: absent means the run predates them,
+        ``None`` means it queued for no slot.
         """
         return {
             'label': self.label,
@@ -3973,6 +4257,7 @@ class CheckRun:
             'segments': self.segments,
             'load': self.load,
             'slot_wait_secs': self.slot_wait_secs,
+            'admission': None if self.admission is None else self.admission.to_dict(),
         }
 
 
@@ -4093,7 +4378,7 @@ class VerifyResult:
     # ran. On the fallback (no-module_configs) path, the same decision is
     # derived once and then reconciled against _build_fallback_config's
     # already-executed ModuleConfig via _executed_fallback_plan (see
-    # _safe_derive_verify_plan_dict and its call site below), so the
+    # _safe_derive_executed_fallback_plan and its call site below), so the
     # attached record reflects the actual subproject/mixed-subproject
     # rescoping and OPAQUE-chain first-clause scoping that ran, not the
     # idealized flat '__fallback__' decision alone — see
@@ -4103,7 +4388,7 @@ class VerifyResult:
     # Machine-readable failing/errored pytest node ids, parsed from a
     # structured merge-role run's junitxml report (task μ,
     # verify-scope-inversion-prd.md — the baseline-attribution signal;
-    # see _extract_failing_test_ids_from_junit and with_junitxml in
+    # see _extract_test_ids_from_junit and with_junitxml in
     # verify_cmd.py). Deliberately a plain JSON-native `list[str] | None`
     # (mirrors `contention`/`plan` immediately above), so it round-trips
     # losslessly through the generic codec (asdict / VerifyResult(**d)).
@@ -4114,6 +4399,27 @@ class VerifyResult:
     # collected, zero failing" (main/branch genuinely clean under this
     # run) and must NOT be conflated with None.
     failing_test_ids: list[str] | None = None
+    # Task 3226: the node ids the same junit report records as NEVER EXECUTED
+    # (an xfail ran, so it is not here), from the same single parse by
+    # _extract_test_ids_from_junit. A plain
+    # JSON-native `list[str] | None` exactly like failing_test_ids above, so it
+    # round-trips through the generic codec (asdict / VerifyResult(**d)) with
+    # no allowlist to touch.
+    #
+    # WHY IT IS CARRIED ALONGSIDE failing_test_ids rather than derived: the
+    # failing vector alone cannot distinguish "this run RAN the test and it
+    # passed" from "this run never ran it". Both look identical — an id absent
+    # from failing_test_ids — yet only the first is evidence about the code.
+    # Consumers that diff a branch's ids against a main baseline need the
+    # second vector to know which of the two they are looking at; without it a
+    # SKIP on main reads as a PASS on main, and a test that main never ran gets
+    # attributed to the branch under test.
+    #
+    # None = "no junit collected" (the same B3 degrade signal as above) — and
+    # deliberately NOT a licence to assume nothing was skipped. `[]` = "junit
+    # collected, zero skipped", which IS such a licence, and the two must never
+    # be conflated.
+    skipped_test_ids: list[str] | None = None
     # Task 5627: module prefix -> the junit-derived failing ids of the module
     # run that produced them. Plain JSON-native, like `failing_test_ids`.
     # None = no module attribution; the ids are then unattributable. When
@@ -4194,6 +4500,11 @@ class VerifyResult:
     # compare=False a failing CLI verify that produced an `unconfirmable` observation
     # would break test_cli test_verify_merge_cli_wrapper_transparency.
     flake_suppression: FlakeSuppression | None = field(default=None, compare=False)
+    # Task 5628: one record per gated test-leg admission, retries and the
+    # env-recovery rerun included: each test CheckRun's ``admission``. None =
+    # no gated leg ran. compare=False because the stamps are wall clock, as for
+    # ``duration_secs``.
+    admission_legs: tuple[AdmissionLeg, ...] | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -4204,6 +4515,8 @@ class VerifyResult:
                 'VerifyResult: failing_test_ids_by_module does not cover exactly '
                 'failing_test_ids; ids in only one of them: %s', sorted(mismatch),
             )
+        if self.admission_legs is not None:
+            self.admission_legs = legs_from_wire(self.admission_legs)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -5274,6 +5587,25 @@ def _scope_launch_argv(scope_unit: str, cpu_weight: int | None) -> list[str]:
     return argv
 
 
+async def _reap_command_subtree(
+    proc: asyncio.subprocess.Process | None,
+    pgid: int | None,
+    scope_unit: str | None,
+) -> None:
+    """Kill a spawned verify command's whole subtree: its cgroup scope first
+    (reaps process-group escapes), then its spawn process group as the backstop.
+
+    A no-op when the spawn never returned a process: either it failed before
+    any scope existed, or it was interrupted and asyncio's spawn cleanup
+    already killed the child."""
+    if proc is None:
+        return
+    if scope_unit is not None:
+        await _kill_cgroup_scope(scope_unit)
+    if pgid is not None:
+        await terminate_process_group(proc, pgid, grace_secs=5.0)
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -5294,8 +5626,9 @@ async def _run_cmd(
 
     When *use_cgroup_scope* is True and ``systemd-run`` is available, the
     command is launched inside a transient systemd ``--user --scope`` (its own
-    cgroup) so a timeout/cancel can reap the WHOLE subtree by cgroup
-    (``_kill_cgroup_scope``), regardless of process-group escapes — e.g. an
+    cgroup) so any abnormal exit after the spawn (a timeout, a cancel, or
+    another exception such as a log-write ``OSError``) reaps the WHOLE subtree
+    by cgroup (``_kill_cgroup_scope``), regardless of process-group escapes — e.g. an
     inner GNU ``timeout`` that setpgid'd cargo into a separate group, which
     defeats the ``killpg``-on-spawn-pgid fallback and was the leak that let a
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
@@ -5578,11 +5911,7 @@ async def _run_cmd(
         rc = proc.returncode if proc.returncode is not None else 1
         return rc, buf.decode(errors='replace'), False
     except TimeoutError:
-        # cgroup kill (primary, reaps process-group escapes) then killpg backstop.
-        if scope_unit is not None:
-            await _kill_cgroup_scope(scope_unit)
-        if proc is not None and pgid is not None:
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        await _reap_command_subtree(proc, pgid, scope_unit)
         if _cs_timeout_msg:
             # Clock-stop path: include actual wall time and which deadline
             # fired so infra_timeout incidents are distinguishable in the
@@ -5591,12 +5920,10 @@ async def _run_cmd(
             return 1, f'Command clock-stop timed out ({_cs_timeout_msg[-1]}): {cmd}', True
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
-        if scope_unit is not None:
-            await _kill_cgroup_scope(scope_unit)
-        if proc is not None and pgid is not None:
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        await _reap_command_subtree(proc, pgid, scope_unit)
         raise
     except Exception as e:
+        await _reap_command_subtree(proc, pgid, scope_unit)
         return 1, f'Command failed: {e}', False
 
 
@@ -6171,12 +6498,52 @@ def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _admission_executor_singleton
 
 
-@contextlib.asynccontextmanager
-async def _admission_slot(role: str, config: OrchestratorConfig):
-    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
+def _admission_policy(config: OrchestratorConfig) -> AdmissionPolicy:
+    """The admission gate's policy as *config* states it now (read at each grant)."""
+    return AdmissionPolicy(
+        slots=config.verify_admission_task_slots,
+        order=config.verify_admission_order,
+        promote_after_secs=config.verify_admission_background_promote_secs,
+    )
 
-    Callers gate only a verify's test leg; WHICH roles that gate actually
-    acquires for is T1's ``is_gated_role`` to decide, never re-derived here.
+
+@contextlib.asynccontextmanager
+async def _admission_slot(
+    role: str, config: OrchestratorConfig, request: AdmissionRequest | None,
+) -> AsyncIterator[AdmissionGrant | None]:
+    """Admit one verify test leg: the in-process gate decides whose turn it is
+    (task 5628, plans/verify-admission-fifo-prd.md), then ``_flock_slot`` takes
+    the cross-process flock slot.
+
+    Yields the gate's grant with the flock's answer stamped on as
+    ``slot_held``. Only an admitted waiter polls the flock, so the admission
+    executor holds at most ``verify_admission_task_slots`` pollers, plus any
+    cancelled leg's thread still finishing its poll. Callers gate only a
+    verify's test leg; WHICH roles are gated is T1's ``is_gated_role`` to
+    decide, never re-derived here. An ungated role yields None and never
+    touches the gate or the executor (task 5424).
+    """
+    if not is_gated_role(role):
+        async with _flock_slot(role, config):
+            yield None
+        return
+    if request is None:
+        raise ValueError(
+            f'a gated verify role reaches the admission gate only with an AdmissionRequest: '
+            f'role={role!r} came without one',
+        )
+    gate = gate_for(Path(config.verify_admission_slots_dir))
+    async with (
+        gate.admit(request, lambda: _admission_policy(config)) as grant,
+        _flock_slot(role, config) as held,
+    ):
+        yield replace(grant, slot_held=held)
+
+
+@contextlib.asynccontextmanager
+async def _flock_slot(role: str, config: OrchestratorConfig) -> AsyncIterator[bool]:
+    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``;
+    yields whether a slot is held.
 
     Gated role — the mkdir (T1 never creates ``slots_dir`` itself, and fails
     open when it is absent) and the blocking, potentially-unbounded
@@ -6210,6 +6577,7 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     slots_dir = Path(config.verify_admission_slots_dir)
     n = config.verify_admission_task_slots
     cm = None
+    held = False
     try:
         # Constructing the CM runs none of acquire_task_slot's body (it is a
         # @contextlib.contextmanager generator function); only __enter__ does,
@@ -6223,7 +6591,7 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
             )
             enter_future = loop.run_in_executor(executor, cm.__enter__)
             try:
-                await asyncio.shield(enter_future)
+                held = await asyncio.shield(enter_future)
             except asyncio.CancelledError:
                 def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
                     if cm is None or fut.cancelled() or fut.exception() is not None:
@@ -6233,11 +6601,12 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
                 enter_future.add_done_callback(_release_if_acquired)
                 raise
         else:
-            cm.__enter__()
+            held = cm.__enter__()
     except OSError:
         cm = None
+        held = False
     try:
-        yield
+        yield held
     finally:
         if cm is not None:
             with contextlib.suppress(OSError):
@@ -6385,8 +6754,14 @@ async def run_verification(
     archive_root: Path | None = None,
     role: Literal['merge', 'task', 'background'] = 'task',
     segment_chained_test: bool = False,
+    admission_request: AdmissionRequest | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    *admission_request* places the gated test leg in the admission gate's
+    order (task 5628). A caller verifying several modules as one plan passes
+    each module its plan's request; when it is None a gated role gets a plan
+    of its own, stamped once here so every retry keeps its arrival.
 
     *segment_chained_test* (task 3338 / esc-3062-2) opts the TEST leg into
     per-segment execution: when the configured command is an `&&` chain
@@ -6452,6 +6827,13 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+    if admission_request is not None and admission_request.role != role:
+        raise ValueError(
+            f'an admission request must carry its verify role: request role='
+            f'{admission_request.role!r}, verify role={role!r}',
+        )
+    if admission_request is None:
+        admission_request = plan_request(begin_plan(role, task_id=task_id), module_prefix)
 
     # Task μ (verify-scope-inversion-prd.md): under role=='merge' AND
     # merge_verify_breadth=='full', inject --junitxml into the test leg (see
@@ -6471,8 +6853,8 @@ async def run_verification(
     # (OPAQUE / raw-retained chain / non-pytest tool / cmd is None all leave
     # the flag uninjected), so this never duplicates that check. When
     # nothing ever injects the flag, pytest never writes the report, and
-    # _extract_failing_test_ids_from_junit below degrades to None (file not
-    # found) — the same B3 degrade signal as an unreadable report.
+    # _extract_test_ids_from_junit below degrades to None (file not found)
+    # — the same B3 degrade signal as an unreadable report.
     #
     # The path is worktree-internal (merge worktrees lack `.task/` —
     # git_ops.py scrubs it) and per-module_prefix (mirrors _stream_log_path's
@@ -6675,9 +7057,13 @@ async def run_verification(
             if prefix:
                 cmd = f'{shlex.join(prefix)} /bin/bash -c {shlex.quote(cmd)}'
         slot_requested = time.monotonic()
-        async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
+        async with (
+            _admission_slot(role, config, admission_request) if admission
+            else contextlib.nullcontext()
+        ) as grant:
             # The queueing half of the leg, which `load_start` below excludes.
-            slot_wait_secs = time.monotonic() - slot_requested if slot_gated else None
+            slot_taken = time.monotonic()
+            slot_wait_secs = slot_taken - slot_requested if slot_gated else None
             started_at = datetime.now(UTC).isoformat()
             t0 = time.monotonic()
             # INSIDE the admission slot, beside the clock it belongs to: the
@@ -6870,6 +7256,7 @@ async def run_verification(
             # to no command's duration.
             elapsed = time.monotonic() - t0
             load_end = _load_sample()
+        slot_released = time.monotonic()
         # Mis-resolved interpreter (task 3367 / esc-3359-1): make the condition
         # LEGIBLE at the point it is observed. Classification alone routes the
         # merge lane correctly (ENV_TRANSIENT -> a loud infra_issue hold) but
@@ -6967,6 +7354,10 @@ async def run_verification(
             # return through this single construction.
             load={'start': load_start, 'end': load_end, 'xdist': xdist},
             slot_wait_secs=slot_wait_secs,
+            admission=None if grant is None else AdmissionLeg.of(
+                grant, slot_taken=slot_taken, released=slot_released,
+                rc=rc, timed_out=timed_out_flag,
+            ),
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
@@ -6982,6 +7373,7 @@ async def run_verification(
             worktree, config, verify_env=verify_env, timeout=timeout,
         )
 
+    test_runs: list[CheckRun] = []
     retries = 0
     while True:
         # attempt_id is the persistence ID handed in by the caller (or None for
@@ -7024,6 +7416,7 @@ async def run_verification(
                 await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
             ])
 
+        test_runs.append(attempt.test)
         if attempt.passed or not attempt.pure_timeout_failure or retries >= max_retries:
             break
 
@@ -7117,6 +7510,7 @@ async def run_verification(
         new_test = await _run_or_skip_timed(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
+        test_runs.append(new_test)
 
         # Recompute pure-timeout consistency for the recovery run via a fresh
         # VerifyAttempt: lint/type are unchanged from the first pass (only
@@ -7146,6 +7540,8 @@ async def run_verification(
             # the pure-timeout retry loop, so "after {max_retries} retries"
             # would misdescribe it.
             summary = 'Verification timed out during env-recovery retry'
+
+    _warn_if_type_leg_read_partially_provisioned_venv(attempt)
 
     # Bare pytest-xdist worker-crash retry (task 2365): under host overload a
     # starved xdist worker is os._exit()'d by pytest-timeout's thread method,
@@ -7291,11 +7687,14 @@ async def run_verification(
     # None when the report does not attribute failures (not a full-breadth
     # merge verify) or is missing/unparseable (nothing ever injected
     # the flag, or the test leg was skipped/crashed before writing it) — the
-    # B3 degrade signal. See _extract_failing_test_ids_from_junit's docstring.
+    # B3 degrade signal. See _extract_test_ids_from_junit's docstring.
     failing_test_ids: list[str] | None = None
+    skipped_test_ids: list[str] | None = None
     if junit.kind == 'attributing':
         assert junit.leg_path is not None  # _JunitReportPlan pairs them
-        failing_test_ids = _extract_failing_test_ids_from_junit(junit.leg_path)
+        junit_ids = _extract_test_ids_from_junit(junit.leg_path)
+        if junit_ids is not None:
+            failing_test_ids, skipped_test_ids = junit_ids
     # The report dies with its worktree; the LOG archival above is gated on
     # `not passed`, this deliberately is not. The gzip runs off the event
     # loop, which also carries the scheduler, the MCP server and the merge
@@ -7325,8 +7724,10 @@ async def run_verification(
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
         failing_test_ids=failing_test_ids,
+        skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        admission_legs=tuple(run.admission for run in test_runs if run.admission is not None) or None,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -7415,10 +7816,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # stutter the same sentence twice).
         for r in results:
             for fragment in r.summary.removeprefix('Failures: ').split(', '):
-                if (
-                    any(marker in fragment for marker in _NO_VERDICT_SUMMARY_MARKERS)
-                    and fragment not in parts
-                ):
+                if is_no_verdict_summary(fragment) and fragment not in parts:
                     parts.append(fragment)
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
@@ -7458,6 +7856,19 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     # child — see VerifyResult.failing_test_ids_by_module.
     failing_test_ids_by_module = _aggregate_failing_ids_by_module(results)
 
+    # Task 3226: aggregate skipped_test_ids by the IDENTICAL rule. The
+    # None-contributes-nothing half is what matters here: a module that
+    # collected no junit (OPAQUE command, breadth != full) knows nothing about
+    # skips, and letting it poison the aggregate to None would discard a
+    # SIBLING module's real, collected skip evidence — returning the whole run
+    # to the can't-tell state this field exists to escape. Note this is the
+    # failing_test_ids rule, NOT the deliberately-different fail-closed rule
+    # used by failing_leg_categories just below.
+    _child_skipped_ids = [r.skipped_test_ids for r in results if r.skipped_test_ids is not None]
+    skipped_test_ids = (
+        sorted({sid for ids in _child_skipped_ids for sid in ids}) if _child_skipped_ids else None
+    )
+
     # Task 3173 review amendment: union the per-leg categories across FAILING
     # children only, order-preserved and de-duplicated (same deterministic
     # style as the kill-note fragment merge above).  A PASSING child has no
@@ -7494,8 +7905,10 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
         failing_test_ids=failing_test_ids,
+        skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
     )
 
 
@@ -7506,6 +7919,7 @@ async def run_full_verification(
     force_rediscover: bool = False,
     role: Literal['merge', 'task', 'background'] = 'task',
     max_retries: int | None = None,
+    event_store: 'EventStore | None' = None,
 ) -> VerifyResult:
     """Run verification for ALL subprojects against the project root.
 
@@ -7529,6 +7943,10 @@ async def run_full_verification(
     *max_retries* overrides ``config.verify_timeout_retries`` for every
     internal :func:`run_verification`; ``None`` keeps the config default, and
     ``run_main_tip_sweep`` passes ``0`` (task 5812).
+
+    A gated *role* verifies its subprojects as ONE admission plan, recorded on
+    *event_store* as a ``verify_admission_plan`` event (task 5628; see
+    :func:`_recorded_admission_plan`).
 
     Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
     mean "discovery never ran".  When it holds any dict (including ``{}``,
@@ -7561,23 +7979,52 @@ async def run_full_verification(
         module_configs = config._module_configs
     else:
         module_configs = _discover_module_configs(project_root)
-    if not module_configs:
-        logger.info('Full verification: no subproject configs — using global')
-        return await run_verification(
-            project_root, config, role=role, max_retries=max_retries,
-        )
+    admission_plan = begin_plan(role, task_id=None)
 
-    logger.info(
-        'Full verification: running %d subprojects in parallel',
-        len(module_configs),
-    )
-    results = await asyncio.gather(
-        *(
-            run_verification(project_root, config, mc, role=role, max_retries=max_retries)
-            for mc in module_configs.values()
+    async def verify_all() -> VerifyResult:
+        if not module_configs:
+            logger.info('Full verification: no subproject configs — using global')
+            return await run_verification(
+                project_root, config, role=role, max_retries=max_retries,
+                admission_request=plan_request(admission_plan, None),
+            )
+        logger.info(
+            'Full verification: running %d subprojects in parallel',
+            len(module_configs),
         )
-    )
-    return _aggregate_results(list(results))
+        results = await asyncio.gather(
+            *(
+                run_verification(
+                    project_root, config, mc, role=role, max_retries=max_retries,
+                    admission_request=plan_request(admission_plan, mc.prefix),
+                )
+                for mc in module_configs.values()
+            )
+        )
+        return _aggregate_results(list(results))
+
+    return await _recorded_admission_plan(config, event_store, admission_plan, verify_all())
+
+
+async def _recorded_admission_plan(
+    config: OrchestratorConfig,
+    event_store: 'EventStore | None',
+    plan: AdmissionPlan | None,
+    verify: Awaitable[VerifyResult],
+) -> VerifyResult:
+    """Await *verify*, which runs *plan*'s legs, then record the plan on *event_store*.
+
+    A plan that raises while admission is on is recorded as raised, without
+    legs. A cancelled plan is not recorded.
+    """
+    try:
+        result = await verify
+    except Exception:
+        if _verify_admission_active(config):
+            emit_admission_plan(event_store, plan, (), outcome='raised')
+        raise
+    emit_admission_plan(event_store, plan, result.admission_legs or (), outcome='returned')
+    return result
 
 
 def _worktree_reader(
@@ -7669,6 +8116,21 @@ def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
     return attr
 
 
+def _test_scope_kind(plan: verify_plan.VerifyPlan | None, module_prefix: str) -> str | None:
+    """The scope kind *plan* gave *module_prefix*'s test slot; None when it planned none."""
+    if plan is None:
+        return None
+    return next(
+        (
+            str(run.scope_kind)
+            for run in plan.runs
+            if run.module_prefix == module_prefix
+            and _mc_attr_for_run_or_none(run) == 'test_command'
+        ),
+        None,
+    )
+
+
 def _executed_module_configs_from_plan(
     module_configs: list[ModuleConfig],
     plan: verify_plan.VerifyPlan,
@@ -7695,14 +8157,7 @@ def _executed_module_configs_from_plan(
     ``None`` for a subproject with zero matching files: the caller must skip
     that subproject rather than run its full unscoped suite.
 
-    Uses ``dataclasses.replace`` (imported as ``replace``) rather than a
-    hand-listed ``ModuleConfig(...)`` reconstruction, so every other
-    ModuleConfig field — lock_depth, max_per_module, module_overrides,
-    verify_command_timeout_secs, verify_cold_command_timeout_secs,
-    concurrent_verify, verify_env, scope_cargo — survives onto the executed
-    config unchanged (the same pattern :func:`_apply_cargo_scope` already
-    uses), so ``run_verification``'s resolvers see identical per-module
-    overrides to what they'd have seen from *mc* directly.
+    Copies *mc* via ``dataclasses.replace`` so all non-command fields survive.
 
     Guard: a TRIVIAL *plan* (``derive_verify_plan``'s top-level "no
     .py/.rs file at all" short-circuit — a single run with
@@ -7864,7 +8319,7 @@ def _executed_fallback_plan(
     return replace(plan, runs=tuple(executed_runs))
 
 
-def _safe_derive_verify_plan_dict(
+def _safe_derive_executed_fallback_plan(
     existing_files: list[str],
     module_configs: list[ModuleConfig],
     config: OrchestratorConfig,
@@ -7873,18 +8328,18 @@ def _safe_derive_verify_plan_dict(
     role: Literal['merge', 'task'],
     executed_fallback: ModuleConfig | None = None,
     fallback_pytest_reason: str | None = None,
-) -> dict | None:
-    """Best-effort executed-plan dict for ``VerifyResult.plan``.
+) -> verify_plan.VerifyPlan | None:
+    """Best-effort executed plan for ``VerifyResult.plan`` and the fallback leg's scope kind.
 
     Used by the fallback (no-``module_configs``) branch of
     :func:`run_scoped_verification` — the module-config branch derives its
     plan directly and executes it (see
     :func:`_executed_module_configs_from_plan`), so this helper's job is
     giving the fallback branch the same ``VerifyResult.plan`` treatment: it
-    best-effort-builds the EXECUTED plan record without re-deriving it
+    best-effort-builds the EXECUTED plan without re-deriving it
     inline. When *executed_fallback* is given (the fallback branch's own
     already-executed ``ModuleConfig``), the derived DECISION plan is folded
-    through :func:`_executed_fallback_plan` first, so the returned dict
+    through :func:`_executed_fallback_plan` first, so the returned plan
     records what actually ran (module_prefix + rendered command) rather than
     the idealized flat ``'__fallback__'`` decision alone.
     *fallback_pytest_reason* rides along on that same path (and only that
@@ -7893,11 +8348,10 @@ def _safe_derive_verify_plan_dict(
     :func:`_executed_fallback_plan` needs in order to record a marker-deselection
     widening the executed config already applied. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
-    dataclass edge, or a future change to ``_verify_cmd_to_dict``/``to_dict``
-    — must never fail an otherwise-passing verify attempt just because its
-    plan record couldn't be built. Catches broadly and logs a warning,
-    returning ``None`` (``VerifyResult.plan``'s own default) on any failure
-    instead of propagating and failing the gate.
+    dataclass edge — must never fail an otherwise-passing verify attempt
+    just because its plan couldn't be built. Catches broadly and logs a
+    warning, returning ``None`` (``VerifyResult.plan``'s own default) on any
+    failure instead of propagating and failing the gate.
     """
     try:
         plan = verify_plan.derive_verify_plan(
@@ -7907,7 +8361,7 @@ def _safe_derive_verify_plan_dict(
             plan = _executed_fallback_plan(
                 plan, executed_fallback, pytest_reason=fallback_pytest_reason,
             )
-        return plan.to_dict()
+        return plan
     except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
         logger.warning(
             'derive_verify_plan failed — omitting VerifyResult.plan for this attempt: %s',
@@ -8097,6 +8551,11 @@ async def run_scoped_verification(
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
+    A gated *role* verifies as ONE admission plan, stamped here so every leg
+    and retry keeps the plan's place in the admission gate's order, and
+    recorded on *event_store* as a ``verify_admission_plan`` event (task 5628;
+    see :func:`_recorded_admission_plan`).
+
     Scoping modes (in priority order):
 
     1. **File-scoped within subprojects** — when *module_configs* is non-empty
@@ -8125,10 +8584,43 @@ async def run_scoped_verification(
     :func:`_is_verify_cold`.  Set this to ``True`` from the merge-queue
     call sites so post-merge verifies get the cold timeout.
     """
+    admission_plan = begin_plan(role, task_id=task_id)
+    scoped_verify = _run_scoped_verification_body(
+        worktree, config, module_configs, task_files,
+        max_retries=max_retries,
+        is_merge_verify=is_merge_verify,
+        attempt_id=attempt_id,
+        task_id=task_id,
+        archive_root=archive_root,
+        force_workspace=force_workspace,
+        role=role,
+        event_store=event_store,
+        admission_plan=admission_plan,
+    )
+    return await _recorded_admission_plan(config, event_store, admission_plan, scoped_verify)
+
+
+async def _run_scoped_verification_body(
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    task_files: list[str] | None,
+    *,
+    max_retries: int | None,
+    is_merge_verify: bool,
+    attempt_id: int | None,
+    task_id: str | None,
+    archive_root: Path | None,
+    force_workspace: bool,
+    role: Literal['merge', 'task'],
+    event_store: 'EventStore | None',
+    admission_plan: AdmissionPlan | None,
+) -> VerifyResult:
+    """``run_scoped_verification``'s scoping and execution; every leg joins *admission_plan*."""
     scope_cargo_enabled = config.scope_cargo
     _fanout_sem = _module_fanout_semaphore(config, role)
 
-    async def _verify_module(mc: ModuleConfig) -> 'VerifyResult':
+    async def _verify_module(mc: ModuleConfig, scope_kind: str | None = None) -> 'VerifyResult':
         async with _fanout_sem:
             return await run_verification(
                 worktree, config, mc,
@@ -8136,6 +8628,7 @@ async def run_scoped_verification(
                 is_merge_verify=is_merge_verify,
                 attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                 role=role,
+                admission_request=plan_request(admission_plan, mc.prefix, scope_kind),
             )
 
     # When the plan didn't provide a file list, try to derive one from git —
@@ -8228,7 +8721,9 @@ async def run_scoped_verification(
                             plan_dict, worktree, attempt_id=attempt_id,
                             task_id=task_id, archive_root=archive_root,
                         )
-                        results = await asyncio.gather(*(_verify_module(mc) for mc in scoped))
+                        results = await asyncio.gather(*(
+                            _verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped
+                        ))
                         aggregated = _aggregate_results(list(results))
                         aggregated.plan = plan_dict
                         return aggregated
@@ -8253,6 +8748,7 @@ async def run_scoped_verification(
                 task_id=task_id,
                 archive_root=archive_root,
                 role=role,
+                admission_request=plan_request(admission_plan, None),
             )
         if module_configs:
             # λ (task 2589, R1): the broad merge gate. role=='merge' +
@@ -8502,10 +8998,11 @@ async def run_scoped_verification(
                     scoped = scoped + widened
             else:
                 scoped = module_configs
+                plan = None
                 plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
             results = await asyncio.gather(
-                *(_verify_module(mc) for mc in scoped)
+                *(_verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped)
             )
             aggregated = _aggregate_results(list(results))
             if plan_dict is not None:
@@ -8646,11 +9143,12 @@ async def run_scoped_verification(
                 # _build_fallback_config's own read above (see the NOTE at
                 # the _build_fallback_config call site) — unchanged from
                 # before this task.
-                plan_dict = _safe_derive_verify_plan_dict(
+                fallback_plan = _safe_derive_executed_fallback_plan(
                     existing_files, module_configs, config, fallback_reader, role=role,
                     executed_fallback=fallback,
                     fallback_pytest_reason=fallback_pytest_reason,
                 )
+                plan_dict = fallback_plan.to_dict() if fallback_plan is not None else None
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
                 _persist_verify_plan(
@@ -8685,6 +9183,10 @@ async def run_scoped_verification(
                     # test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
                     # is a lower bound, not the whole chain.
                     segment_chained_test=role != 'merge',
+                    admission_request=plan_request(
+                        admission_plan, fallback.prefix,
+                        _test_scope_kind(fallback_plan, fallback.prefix),
+                    ),
                 )
                 fallback_result.plan = plan_dict
                 return fallback_result
@@ -8711,6 +9213,7 @@ async def run_scoped_verification(
                         is_merge_verify=is_merge_verify,
                         attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                         role=role,
+                        admission_request=plan_request(admission_plan, rewritten.prefix),
                     )
 
         # INV-1 (task 2883) GLOBAL-tail backstop: the merge gate must never
@@ -8739,6 +9242,7 @@ async def run_scoped_verification(
             is_merge_verify=is_merge_verify,
             attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
             role=role,
+            admission_request=plan_request(admission_plan, None),
         )
     finally:
         _maybe_prune_archive(archive_root)
@@ -8795,6 +9299,18 @@ async def verify_failure_is_preexisting_on_main(
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
+          - UNATTRIBUTABLE IDS (task 3226): the task-μ id-diff fast path
+            found branch-failing ids absent from main's failing baseline,
+            and EVERY one of them is in main's SKIPPED baseline — main never
+            RAN them, so the diff is evidence of nothing.  The function then
+            falls through to the (category, cause_hint) signature comparison
+            and returns whatever THAT concludes.  One attributable id (main
+            ran it green) is enough to establish task fault, so a mixed set
+            still returns ``(False, '')`` from the diff — the same partition
+            :func:`partition_new_failing_ids` gives the merge-queue reason.
+            See the 2026-07-29 reify-allowlist incident, whose shape was a
+            guard that skipped on one side of a comparison and looked
+            pass-shaped on the other.
           - CONFIRM GATE (task 3597): the signature matched, but
             ``_main_probe_failure_is_isolated_flake`` positively confirmed
             every named failing test passes in isolation on the main
@@ -8880,9 +9396,27 @@ async def verify_failure_is_preexisting_on_main(
             )
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)
-                wholly = is_wholly_preexisting(branch_ids, baseline)
-                return wholly, (main_sha if wholly else '')
-            # baseline is None (B3) — fall through to the legacy probe below.
+                if is_wholly_preexisting(branch_ids, baseline):
+                    return True, main_sha
+                # Task 3226: a SKIP is not a PASS.  An attributable id (main
+                # ran it green) blames the branch; a diff made up entirely of
+                # ids main skipped proves nothing and defers to the signature
+                # comparison below.  An empty branch set keeps the task-fault
+                # verdict, exactly as before.
+                attributable, unattributable = partition_new_failing_ids(
+                    diff_new_failures(branch_ids, baseline), main_sha,
+                )
+                if attributable or not unattributable:
+                    return False, ''
+                logger.warning(
+                    'verify_failure_is_preexisting_on_main: all %d new branch-'
+                    'failing id(s) were SKIPPED on main %.8s (%s) — main never '
+                    'ran them, so the id diff supports no verdict; deferring to '
+                    'the signature probe instead of blaming the branch',
+                    len(unattributable), main_sha, ', '.join(sorted(unattributable)),
+                )
+            # baseline is None (B3), or every new id was unattributable — fall
+            # through to the legacy probe below.
 
         # Check the process-wide probe cache before paying the worktree-add cost.
         _norm_hint = _normalize(failing_result.cause_hint)
@@ -9009,6 +9543,7 @@ async def run_main_tip_sweep(
     *,
     main_sha: str | None = None,
     seed_mode: SweepSeedMode = SweepSeedMode.COLD,
+    event_store: 'EventStore | None' = None,
 ) -> 'tuple[str, VerifyResult] | None':
     """Run a full unscoped verification sweep against the current main-tip SHA.
 
@@ -9163,8 +9698,8 @@ async def run_main_tip_sweep(
             # background asyncio.Task with no dispatch/merge/deploy path awaiting it, so
             # its fan-out should never contend with real task/merge lane verifies.
             # max_retries=0 (task 5812): no pure-timeout re-runs on either pass.
-            result = await run_full_verification(  # type: ignore[arg-type]
-                tmp_path, config, role='background', max_retries=0,
+            result = await run_full_verification(
+                tmp_path, config, role='background', max_retries=0, event_store=event_store,
             )
 
             # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
@@ -9258,8 +9793,8 @@ async def run_main_tip_sweep(
                     )
                     return (main_sha, result)
 
-                retry = await run_full_verification(  # type: ignore[arg-type]
-                    tmp_path, config, role='background', max_retries=0,
+                retry = await run_full_verification(
+                    tmp_path, config, role='background', max_retries=0, event_store=event_store,
                 )
 
                 if retry.category in INFRA_TRANSIENT_CATEGORIES:
@@ -9614,6 +10149,10 @@ def _group_node_ids_by_subproject(
     order and logs a WARNING naming every candidate prefix and *log_label* —
     a low-likelihood, non-fatal ambiguity, not a fail-safe path.
 
+    A ModuleConfig keyed on an empty prefix is never probed (it would match
+    every node-id and yield a leading-slash qualified id); it is skipped with
+    a WARNING, so node-ids it alone could own map to nothing (``None``).
+
     Args:
         worktree: Tree the existence probes run against.
         module_configs: Prefix -> ModuleConfig, freshly discovered on
@@ -9622,11 +10161,19 @@ def _group_node_ids_by_subproject(
         log_label: Caller name, embedded in every log line so an operator can
             attribute the message to the right call site.
     """
+    if node_ids and '' in module_configs:
+        logger.warning(
+            '%s: ignoring ModuleConfig with an empty prefix (test_command=%r) '
+            "— an empty prefix would match every node-id and qualify it as "
+            "'/<node_id>'",
+            log_label, module_configs[''].test_command,
+        )
+    probe_prefixes = [prefix for prefix in module_configs if prefix]
     groups: dict[str, list[str]] = {}
     for node_id in node_ids:
         file_part = node_id.split('::', 1)[0]
         candidates: list[tuple[str, str]] = []
-        for prefix, _mc in module_configs.items():
+        for prefix in probe_prefixes:
             if (worktree / prefix / file_part).exists():
                 candidates.append((prefix, f'{prefix}/{node_id}'))
             elif file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():

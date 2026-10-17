@@ -66,6 +66,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_records import LEGACY_NUMERIC_COMMAND, Leg
 
 logger = logging.getLogger(__name__)
 
@@ -1655,7 +1656,7 @@ async def test_b8_offline_deep_worktree_isolated_from_merge_lane(git_ops, repo):
 # em-dash ``verify.sh: ERROR — <msg>`` banner followed by the full usage()
 # block (bare ``Usage:``/``Options:`` section headers + invocation/option
 # lines). run-offline-deep.sh merges stderr into stdout, so this whole blob
-# reaches the numeric confirmation seam's parser.
+# reaches the numeric confirm.
 _VERIFY_USAGE_DUMP = (
     "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
     "\n"
@@ -1671,21 +1672,34 @@ _VERIFY_USAGE_DUMP = (
 )
 
 
+def _child_writing(output: bytes, *, returncode: int):
+    """A fake ``create_subprocess_exec`` whose child writes *output* into the file it is handed."""
+
+    async def fake_exec(*argv, **kwargs):
+        kwargs['stdout'].write(output)
+        proc = AsyncMock()
+        proc.returncode = returncode
+        return proc
+
+    return fake_exec
+
+
 @pytest.mark.asyncio
-async def test_verify_usage_dump_confirmation_files_no_task_or_escalation(git_ops, tmp_path):
+async def test_verify_usage_dump_confirmation_files_no_task_or_escalation(git_ops, tmp_path, caplog):
     """Incident reproduction (task 5308; reify:5264) — when the DEFAULT numeric
     confirmation seam ingests a reify verify.sh usage/help/error dump (stderr
     merged into stdout), the full red path files ZERO fix tasks and ZERO
     escalations, never one fake fix task built from usage lines.
 
     Unlike B4 (which injects a fake confirmation_runner), this leaves the
-    numeric confirmation seam at its DEFAULT so the REAL
-    ``_default_confirmation_run`` parser runs end-to-end — the reify-subprocess
-    boundary is faked one level deeper, at ``create_subprocess_exec``, which is
-    patched to emit the usage dump with returncode 64. Everything downstream of
-    the parse (the empty-``confirmed`` guard, fingerprinting, fix-task filing,
-    escalation staging) is the real ``_handle_red_run`` chain, driven directly
-    (the confirmed-list → ``_handle_red_run`` corruption flow's entry point).
+    numeric confirmation seam at its DEFAULT so the REAL confirm runs
+    end-to-end — the reify-subprocess boundary is faked one level deeper, at
+    ``create_subprocess_exec``, which is patched to emit the usage dump with
+    returncode 64. The confirm makes that pass Unconfirmable (usage text),
+    which projects to no confirmed ids; everything downstream (the
+    empty-``confirmed`` guard, fingerprinting, fix-task filing, escalation
+    staging) is the real ``_handle_red_run`` chain, driven directly (the
+    confirmed-list → ``_handle_red_run`` corruption flow's entry point).
 
     RED pre-fix: the seam's inline comprehension turns every non-blank usage
     line into a confirmed test ID, filing a fix task + an L0 info escalation.
@@ -1694,16 +1708,20 @@ async def test_verify_usage_dump_confirmation_files_no_task_or_escalation(git_op
     head = await git_ops.get_main_sha()
     wt_path = git_ops.persistent_offline_deep_worktree_path
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
-    mock_proc.returncode = 64
+    worker.records.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, head)
+    with patch(
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'red\n', returncode=1),
+    ):
+        await worker.suite_runner(wt_path, head, 1)
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ):
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(_VERIFY_USAGE_DUMP.encode(), returncode=64),
+    ), caplog.at_level(logging.WARNING):
         await worker._handle_red_run(wt_path, head)
 
+    assert 'unconfirmable: usage_text' in caplog.text
     # Zero fix tasks filed, zero fingerprints opened.
     cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
     assert worker.open_fix_tasks == {}

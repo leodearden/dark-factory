@@ -186,9 +186,13 @@ Next run: {chain form and task ids}
 | tasks | mechanical findings, acceptances, the trigger chain — all through fused-memory MCP with `metadata.source: "review"` |
 | fused-memory | review summary and pattern observations |
 
+### Report home
+
+`review/reports/` is tracked, and its only reports are `<run_id>.json` and `<run_id>.md` (contract §5). Files there from the retired three-file format, `phase[12]-*.json` and `summary-*.md`, carry no `as_of_sha` and are not reports. No step reads them: `since` comes only from committed `review-*.json` ("Pin the run" step 5). A project may keep exactly those two globs gitignored, as dark-factory's root `.gitignore` does. Nothing else in the home is ever ignored: if `git add` refuses a record path as ignored, the project's rule is too broad (a wholesale `review/reports/` or `review/`, still present in some projects), so narrow it to those two globs and commit that `.gitignore` change with the report.
+
 ### Committing the report
 
-After the last phase run, write both files under `<project_root>/review/reports/` and commit only them to main by the project's direct-commit rule (in dark-factory: `git add` the two paths, then `git commit --only` them, never while a merge verify is in flight — `CLAUDE.md` §"Working in the main checkout"). A project that forbids direct commits gets them through `/merge-queue`. An uncommitted report is invisible to the next run's `since`. Then `git worktree remove` the pinned tree.
+After the last phase run, write both files under `<project_root>/review/reports/` and commit only them (plus the `.gitignore` narrowed per "Report home", if one was needed) to main by the project's direct-commit rule (in dark-factory: `git add` the two paths, then `git commit --only` them, never while a merge verify is in flight — `CLAUDE.md` §"Working in the main checkout"). A project that forbids direct commits gets them through `/merge-queue`. An uncommitted report is invisible to the next run's `since`. Then `git worktree remove` the pinned tree.
 
 ## Graceful degradation
 

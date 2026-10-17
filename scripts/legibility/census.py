@@ -46,11 +46,13 @@ Fable ONLY for synthesis, read from ``config.Models``
 
 Codebook handling (PRD decision 1 -- sole writer, never delete): new
 mining sightings/candidates merge through the EXISTING
-``codebook.apply_coding_record``. Census-only lifecycle transitions
+``codebook.apply_coding_records``. Census-only lifecycle transitions
 (promote/reject/retire) are deterministic in-memory transforms in this
 module, persisted via ``codebook.dump()`` after ``codebook.validate()``
-and ``codebook.assert_no_deletion()`` confirm the write is safe.
-``codebook.py`` itself is NOT modified.
+and ``codebook.assert_no_deletion()`` confirm the write is safe. The
+contract finding fields those transforms stamp (finding identity, run
+history) are defined in ``codebook.py``'s schema and minted by
+``census_findings.py``.
 """
 from __future__ import annotations
 
@@ -62,7 +64,6 @@ import functools
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -105,14 +106,17 @@ _ORCH_SRC = Path(__file__).resolve().parents[2] / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
-import codebook  # noqa: E402
-import coder  # noqa: E402
-import filing_policy  # noqa: E402
 from legibility import (  # noqa: E402
+    census_findings,
     census_identity,
     census_trigger,
     census_window,
+    codebook,
+    coder,
+    config,
     digest,
+    filing_policy,
+    finding_area,
     invariants,
     session_ledger,
     session_runner,
@@ -125,8 +129,6 @@ from orchestrator.agents import code_quality  # noqa: E402
 # restated here -- this module only asks the question, via the predicate.
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.toolcall_markup import escape_envelope_literals  # noqa: E402
-
-import config  # noqa: E402
 
 logger = logging.getLogger("legibility.census")
 
@@ -598,6 +600,10 @@ class CensusPostRefusedUnderTest(RuntimeError):
     """
 
 
+class CensusPreconditionFailed(RuntimeError):
+    """A check before any spend refused this run."""
+
+
 _own_endpoint_declared: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "census_own_endpoint_declared", default=False,
 )
@@ -819,6 +825,7 @@ def build_task_payloads(
     *,
     project_root: str,
     project_id: str,
+    run_id: str,
     harness: filing_policy.ProjectRef | None = None,
 ) -> list[dict]:
     """Map each verified cluster to one curator-path ``submit_task`` kwarg
@@ -834,6 +841,13 @@ def build_task_payloads(
     ``metadata.x_fix_surface``, and ``metadata.origin_project_id`` always names
     the observed project.
 
+    Every payload names its run under ``metadata.x_finding_run``, and a cluster
+    carrying a ``finding`` identity names its key under
+    ``metadata.x_finding_key`` (quality-findings contract §8);
+    ``x_supersedes_task`` arrives with the dedup protocol's step 1c
+    (plans/census-incremental-prd.md L4). ``priority`` is the cluster's
+    severity (contract §4).
+
     ``title`` and ``description`` pass through
     ``shared.toolcall_markup::escape_envelope_literals`` because cluster
     evidence may QUOTE tool-call envelope literals, which the boundary
@@ -846,7 +860,14 @@ def build_task_payloads(
     payloads = []
     for cluster in clusters:
         target = filing_policy.resolve_target(cluster, observed=observed, harness=harness)
-        metadata: dict = {"source": "legibility_census", "origin_project_id": project_id}
+        metadata: dict = {
+            "source": "legibility_census",
+            "origin_project_id": project_id,
+            "x_finding_run": run_id,
+        }
+        finding = cluster.get("finding")
+        if finding is not None:
+            metadata["x_finding_key"] = finding.key
         if target.fix_surface:
             metadata["x_fix_surface"] = [
                 {"component": match.component, "evidence": match.evidence}
@@ -861,7 +882,7 @@ def build_task_payloads(
                     _cluster_description(cluster, observed_project_id=project_id)
                 ),
                 "task_kind": "normal",
-                "priority": cluster.get("priority", "medium"),
+                "priority": cluster.get("severity", verdict_mod.DEFAULT_SEVERITY),
                 "metadata": metadata,
             }
         )
@@ -890,8 +911,7 @@ def _ticket_id_from_submit_result(result) -> str | None:
 # ---------------------------------------------------------------------------
 # promote_candidate / reject_candidate / retire_entry / mark_entry_filed —
 # census-only codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
-# reuse gamma's validator + never-delete assertion + sole-writer dump;
-# codebook.py itself is NOT modified)
+# reuse gamma's validator + never-delete assertion + sole-writer dump)
 # ---------------------------------------------------------------------------
 
 def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
@@ -901,7 +921,10 @@ def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
     raise ValueError(f"{kind}: no id {item_id!r} found")
 
 
-def promote_candidate(cb: dict, cand_id: str, entry_fields: dict) -> dict:
+def promote_candidate(
+    cb: dict, cand_id: str, entry_fields: dict, *,
+    finding: census_findings.FindingIdentity | None = None,
+) -> dict:
     """Promote candidate *cand_id* in *cb* to a new codebook entry.
 
     Returns a NEW codebook (a ``copy.deepcopy`` of *cb*, never mutated in
@@ -912,15 +935,20 @@ def promote_candidate(cb: dict, cand_id: str, entry_fields: dict) -> dict:
     candidate's OWN sightings (the candidate is the source of truth for
     what was actually observed, not *entry_fields*). The candidate itself
     is stamped ``disposition="promoted"`` and ``promoted_to`` naming the
-    new entry id -- RETAINED, never removed (PRD decision 3).
+    new entry id -- RETAINED, never removed (PRD decision 3). A *finding*
+    identity is stamped on the candidate (``census_findings.stamped``), and
+    the entry carries the stamped candidate's identity and supersedes chain
+    (``census_findings.carried_identity``).
     ``codebook.assert_no_deletion`` is run against the pre-transform *cb*
     before returning, as a construction-independent safety net.
     """
     result = copy.deepcopy(cb)
     candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="promote_candidate")
+    if finding is not None:
+        candidate.update(census_findings.stamped(candidate, finding))
 
     new_entry_id = entry_fields["id"]
-    entry = dict(entry_fields)
+    entry = {**entry_fields, **census_findings.carried_identity(candidate)}
     entry["sightings"] = copy.deepcopy(candidate.get("sightings") or [])
     result.setdefault("entries", []).append(entry)
 
@@ -931,12 +959,16 @@ def promote_candidate(cb: dict, cand_id: str, entry_fields: dict) -> dict:
     return result
 
 
-def reject_candidate(cb: dict, cand_id: str) -> dict:
+def reject_candidate(
+    cb: dict, cand_id: str, *, finding: census_findings.FindingIdentity | None = None,
+) -> dict:
     """Reject candidate *cand_id* in *cb*: stamps ``disposition="rejected"``
-    in place on a deep copy, RETAINED (never removed). Returns a NEW
-    codebook; *cb* is never mutated."""
+    (and a *finding* identity, when given) in place on a deep copy, RETAINED
+    (never removed). Returns a NEW codebook; *cb* is never mutated."""
     result = copy.deepcopy(cb)
     candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="reject_candidate")
+    if finding is not None:
+        candidate.update(census_findings.stamped(candidate, finding))
     candidate["disposition"] = "rejected"
 
     codebook.assert_no_deletion(cb, result)
@@ -1054,7 +1086,7 @@ class VerifyCoverage:
     operator cap that produced the split. The ``novel - offered``
     remainder is DEFERRED, not dropped: those clusters still merge into
     the codebook as ``pending`` candidates via the untouched
-    ``codebook.apply_coding_record`` path (which consumes raw mining
+    ``codebook.apply_coding_records`` path (which consumes raw mining
     records, not verified clusters), so ``_find_pending_candidate_id`` can
     still find them.
 
@@ -1141,6 +1173,7 @@ SECTION_VERIFICATION = "verification"
 SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
 SECTION_MATRIX = "matrix"
 SECTION_SYNTHESIS = "synthesis"
+SECTION_FINDINGS = "findings"
 SECTION_FILED_TASKS = "filed-tasks"
 SECTION_WITHHELD = "withheld-clusters"
 SECTION_COST = "cost"
@@ -1148,6 +1181,20 @@ SECTION_COST = "cost"
 
 Never rendered -- they exist so a caller can ask WHICH blocks a report
 carries and in what order without matching on the English inside them."""
+
+SYNTHESIS_NOT_APPLIED_NOTICE = (
+    "_The census does not parse this section: nothing proposed in it has been "
+    "applied to the codebook._"
+)
+"""Runner-authored first line of every ``## Synthesis`` body, until
+plans/census-incremental-prd.md L10 retires or reconciles it."""
+
+SYNTHESIS_PROPOSALS_HEADING = (
+    "Proposed codebook changes (not applied; act on by hand)"
+)
+"""The heading :func:`_synthesis_prompt` tells the model to put any proposed
+codebook change under, in place of the "inputs to the merger" claim earlier
+reports made."""
 
 
 @dataclass(frozen=True)
@@ -1302,10 +1349,14 @@ def build_census_record(
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
     cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
+    findings: Sequence[Mapping[str, Any]] = (),
+    area_map: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The run's JSON record: everything :func:`census_report_sections`
     renders, as plain JSON-safe values. The mining records themselves are
-    not carried; the codebook holds what they merged."""
+    not carried; the codebook holds what they merged. *findings* are the
+    contract §1 rows (``census_findings.FindingRow.to_record``) and
+    *area_map* the ``finding_area.AreaMap.to_record`` that keyed them."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
         "run_id": method["run_id"],
@@ -1327,6 +1378,8 @@ def build_census_record(
         "cross_project_tickets": [asdict(ticket) for ticket in cross_project_tickets],
         "dry_run": _optional_asdict(dry_run),
         "withheld": [asdict(cluster) for cluster in withheld],
+        "findings": [dict(row) for row in findings],
+        "area_map": None if area_map is None else dict(area_map),
         "cost_note": cost_note,
     }
 
@@ -1531,7 +1584,12 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
     # immediately. The golden pins `matrix\n## Synthesis`; normalising this
     # during a refactor is the one plausible way to break byte-identity while
     # every structural assertion still passes.
-    emit(SECTION_SYNTHESIS, ["## Synthesis", "", record["synthesis_md"]])
+    emit(
+        SECTION_SYNTHESIS,
+        ["## Synthesis", "", SYNTHESIS_NOT_APPLIED_NOTICE, "", record["synthesis_md"]],
+    )
+
+    emit(SECTION_FINDINGS, census_findings.report_lines(record))
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
@@ -1640,7 +1698,7 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
     their ``matches``, just not into verification.
 
     Two defensive skips keep verification aligned with what
-    ``codebook.apply_coding_record`` will actually do with these same
+    ``codebook.apply_coding_records`` will actually do with these same
     records at merge time (mirrors its own title-keyed grouping,
     codebook.py:494):
 
@@ -1648,7 +1706,7 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
       the merge's sole grouping key, so a titleless candidate has nothing
       to resolve a promoted/rejected verdict back to.
     - A title already seen earlier in *records* is also SKIPPED
-      (first-occurrence wins) -- ``apply_coding_record`` collapses every
+      (first-occurrence wins) -- ``apply_coding_records`` collapses every
       new candidate sharing a title into the SAME pending codebook
       candidate, so a second cluster for that title would spend a
       redundant verify_fn call on a candidate id that can never be found
@@ -1690,13 +1748,13 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
 
 def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     """Locate a still-``pending`` candidate in *cb* by *title* -- the same
-    key ``codebook.apply_coding_record`` groups new candidates by, so a
+    key ``codebook.apply_coding_records`` groups new candidates by, so a
     verified/rejected cluster (built pre-merge from a raw mining record) can
     be resolved to the REAL candidate id the merge just assigned it.
 
     ``None`` is a NORMAL outcome, not a defensive impossibility. When a
     re-mined title's only same-title candidate is already adjudicated,
-    ``codebook.apply_coding_record`` deliberately declines to fabricate a
+    ``codebook.apply_coding_records`` deliberately declines to fabricate a
     pending twin (task 4144 -- fabricating one is how rejected
     ``cand-20260722-28`` came back as pending ``cand-20260724-2`` in the
     live codebook) and routes the recurrence sighting to the standing
@@ -1761,21 +1819,30 @@ _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
 retired confusion needs no ticket."""
 
 
+def _entry_text(cb: dict, entry: Mapping[str, Any], field: str) -> str | None:
+    """*entry*'s *field* (``cause`` or ``area``): its own when a correction has
+    written it, else that of the candidate it was promoted from."""
+    return entry.get(field) or (_promoted_from(cb, entry["id"]) or {}).get(field)
+
+
 def _entry_cluster(cb: dict, entry: dict) -> dict:
-    """A fileable cluster rebuilt from codebook *entry*. Its cause and area are
-    the entry's own when a correction has written them, else those of the
-    candidate it was promoted from."""
-    source = _promoted_from(cb, entry["id"]) or {}
+    """A fileable cluster rebuilt from codebook *entry*, by :func:`_entry_text`;
+    its severity and finding identity are the entry's own."""
     sightings = list(entry.get("sightings") or [])
-    return _cluster_record(
+    cluster = _cluster_record(
         title=entry["title"],
-        cause=entry.get("cause") or source.get("cause"),
-        area=entry.get("area") or source.get("area"),
+        cause=_entry_text(cb, entry, "cause"),
+        area=_entry_text(cb, entry, "area"),
         origin_phase=entry["origin_phase"],
         manifested_phase=entry["manifested_phase"],
         evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
         sightings=sightings,
     )
+    return {
+        **cluster,
+        "severity": entry["severity"],
+        "finding": census_findings.FindingIdentity.from_record(entry),
+    }
 
 
 @dataclass(frozen=True)
@@ -1830,12 +1897,25 @@ def _promoted_from(cb: dict, entry_id: str) -> dict | None:
     return None
 
 
+def _with_finding(cluster: dict, area_map: finding_area.AreaMap) -> dict:
+    """*cluster* carrying the finding identity and severity its Verdict gives;
+    a cluster without a Verdict is returned as it is."""
+    found = cluster.get("verdict")
+    if not isinstance(found, verdict_mod.Verdict):
+        return cluster
+    return {
+        **cluster,
+        "finding": census_findings.identity_of(found, area_map),
+        "severity": found.severity,
+    }
+
+
 def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
     """Locate the standing already-adjudicated (non-``pending``) candidate
     in *cb* for *title* -- the one whose verdict explains why
     ``_find_pending_candidate_id`` found nothing.
 
-    Mirrors ``codebook.apply_coding_record``'s own TWO-STEP precedence for
+    Mirrors ``codebook.apply_coding_records``'s own TWO-STEP precedence for
     exactly this situation (its ``elif same_title:`` branch, reached when
     every same-title candidate is adjudicated), so census and the merger
     cannot disagree about which record is authoritative:
@@ -2017,7 +2097,7 @@ def _report_dropped_verdicts(
     say WHICH titles; the summary says how much of the run went nowhere.
 
     *disposition_conflicts* is the run's accumulated
-    ``candidate_disposition_conflicts`` from ``codebook.apply_coding_record``
+    ``candidate_disposition_conflicts`` from ``codebook.apply_coding_records``
     -- the MERGER's view of the same underlying situation the dropped verdicts
     are this loop's view of. It rides the same line rather than a second one
     because an operator reading a journal wants the two numbers side by side:
@@ -2206,6 +2286,9 @@ class CensusOutcome:
     """Why a landed run's codings could not be ledgered, naming the ledger
     path; those sessions are re-mined by the next census."""
 
+    skipped_deletions: tuple[codebook.SkippedRecord, ...] = ()
+    """Mined coding records the merge skipped as deletion-shaped."""
+
 
 def _defer(
     stage: str,
@@ -2255,7 +2338,7 @@ def _defer(
             "tasks, and last_census_at was NOT advanced -- so this window "
             "WILL be re-mined and these sightings are not lost. The mining "
             "spend for this run is sunk. Recovery is a plain re-run once "
-            "capacity returns; re-mining is idempotent (apply_coding_record "
+            "capacity returns; re-mining is idempotent (apply_coding_records "
             "dedups sightings by session)."
         )
 
@@ -2286,7 +2369,7 @@ def _defer(
 
 
 def _unlanded(
-    commit_error: Exception,
+    landing: unlanded.CommitResult,
     landed: CensusOutcome,
     *,
     commit_paths: list[str],
@@ -2325,7 +2408,7 @@ def _unlanded(
             "in the working tree."
         )
     detail = (
-        f"{commit_error}\n\n"
+        f"git commit did not land after {landing.attempts} attempt(s): {landing.stderr}\n\n"
         f"{rollback.describe()}\n\n"
         "Remediation tickets filed before the commit: "
         f"{', '.join(landed.filed_ticket_ids) or 'none'}.\n"
@@ -2412,13 +2495,16 @@ def run_census(
     diagnoses -- lesson guards-assert-unverified-diagnoses) ->
     ``synthesize_fn`` (Fable, ``census_synthesis`` -- clustering/prose ONLY
     here) -> ``compute_matrix``/``render_matrix`` over verified sightings ->
-    merge every mining record via ``codebook.apply_coding_record`` -> apply
+    merge every mining record via ``codebook.apply_coding_records`` -> apply
     ``promote_candidate``/``reject_candidate`` for verified/rejected
     clusters (resolved to the merge's real candidate ids by title; a
     promoted entry takes the cluster Verdict's severity and severity_reason,
     and a verified cluster *verify_fn* returned without a Verdict gets the
     verdict parser's defaults) and ``retire_entry`` for any entry ids
-    *verify_fn* reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
+    *verify_fn* reports fixed; contract finding keys are stamped at promotion
+    and at a verdict-bearing rejection (``census_findings``, areas from
+    ``finding_area.load_area_map``), and every entry sighted this run has the
+    run appended to its ``last_seen_runs`` -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the singleton filing gate
     (``_split_fileable``: a verified cluster files only with an in-tree
     remediation or a recurrence, counted in the merged codebook; a withheld
@@ -2433,11 +2519,13 @@ def run_census(
     JSON record beside *report_path* (``build_census_record``) and the
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
     (done-count from *status_fetcher*, watermark from the mining window) ->
-    *commit* of report + record + codebook + state -> ledger every coded
-    session (``session_ledger``, only once the commit has landed; a failed
-    write is ``CensusOutcome.ledger_write_error``, never a crash). A *commit*
-    that raises (e.g. refused by the target repo's pre-commit hook) hands
-    every one of those paths to *roll_back*, which quarantines them and
+    *commit* of report + record + codebook + state -> ledger every merged
+    coding's session (``session_ledger``, only once the commit has landed; a
+    failed write is ``CensusOutcome.ledger_write_error``, never a crash). A
+    *commit* whose ``unlanded.CommitResult`` is not ok after
+    ``unlanded.commit_only``'s bounded lock retries (e.g. refused by the
+    target repo's pre-commit hook) hands every one of those paths to
+    *roll_back*, which quarantines them and
     restores them to HEAD -- census-state included, so ``last_census_at``
     is not advanced by a census that did not land -- and the run returns
     status ``"unlanded"`` (see ``_unlanded``).
@@ -2457,7 +2545,7 @@ def run_census(
     itself (the one residual risk -- e.g. a disk-full atomic-write failure)
     leaves the codebook advanced ahead of census-state.json on disk.
     Recovery for that residual case is a plain re-run:
-    ``codebook.apply_coding_record`` dedups merged sightings/candidates by
+    ``codebook.apply_coding_records`` dedups merged sightings/candidates by
     session, and a promoted/rejected candidate is no longer ``"pending"``,
     so re-mining the same window is idempotent rather than double-counted.
     A storm batch encountered during mining (see ``mine_to_saturation``) is
@@ -2609,6 +2697,9 @@ def run_census(
     )
 
     invariant_slugs = invariants.read_slugs(project_root)
+    area_map = finding_area.load_area_map(project_root)
+    for note in area_map.notes:
+        logger.warning("census: finding area map: %s", note)
     mining_result = mine_to_saturation(
         batch_source,
         codebook_dict,
@@ -2758,24 +2849,25 @@ def run_census(
             logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
 
     synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
+    verified = [_with_finding(cluster, area_map) for cluster in verified]
+    rejected = [_with_finding(cluster, area_map) for cluster in rejected]
 
     verified_sightings = [s for cluster in verified for s in (cluster.get("sightings") or [])]
     matrix_md = render_matrix(compute_matrix(verified_sightings))
 
-    updated_codebook = codebook_dict
-    # The merger's own count of the same situation the dropped-verdict loops
-    # below detect from the other side -- previously discarded with the rest of
-    # `_stats`, which made a conflict the adjudication loops never reached
-    # invisible everywhere.
-    disposition_conflicts = 0
-    slug_tally = codebook.SlugTally()
-    for record in mining_result.records:
-        updated_codebook, _stats = codebook.apply_coding_record(
-            updated_codebook, record, invariant_slugs=invariant_slugs,
+    merge = codebook.apply_coding_records(
+        codebook_dict, mining_result.records, invariant_slugs=invariant_slugs,
+    )
+    updated_codebook = merge.codebook
+    logger.info("census: merge: %s", merge.summary())
+    if merge.skipped_deletions:
+        logger.warning(
+            "census: %d mined coding record(s) carried a deletion directive and "
+            "were skipped: %s",
+            len(merge.skipped_deletions),
+            "; ".join(skipped.describe() for skipped in merge.skipped_deletions),
         )
-        disposition_conflicts += _stats.get("candidate_disposition_conflicts", 0)
-        slug_tally = slug_tally.plus(_stats["invariant_slugs"])
-    codebook.warn_unknown_invariant_slugs(slug_tally, invariant_slugs, run=run_id)
+    codebook.warn_unknown_invariant_slugs(merge.invariant_slugs, invariant_slugs, run=run_id)
 
     # ONE list for every verdict this run paid for and dropped, shared by both
     # adjudication loops below -- a per-loop name would fork the tally
@@ -2788,6 +2880,8 @@ def run_census(
     # sightings into its entry, and _sighting_counts_by_title dedups by session.
     fileable, held_back = _split_fileable(verified, updated_codebook)
     marked_withheld: list[filing_policy.WithheldCluster] = []
+    promoted: list[census_findings.Adjudication] = []
+    refuted: list[census_findings.Adjudication] = []
 
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -2820,12 +2914,16 @@ def run_census(
             "status": "open",
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
+            **census_findings.first_sighting_fields(run_id),
         }
         held = held_back.get(cluster.get("title"))
         if held is not None:
             entry_fields[ENTRY_FILING_KEY] = ENTRY_FILING_WITHHELD
             marked_withheld.append(held)
-        updated_codebook = promote_candidate(updated_codebook, cand_id, entry_fields)
+        updated_codebook = promote_candidate(
+            updated_codebook, cand_id, entry_fields, finding=cluster["finding"],
+        )
+        promoted.append(census_findings.Adjudication(entry_fields["id"], found, cluster.get("cause")))
 
     withheld = tuple(marked_withheld)
     if withheld:
@@ -2853,13 +2951,24 @@ def run_census(
                 contradicting_disposition="promoted",
             ))
             continue
-        updated_codebook = reject_candidate(updated_codebook, cand_id)
+        updated_codebook = reject_candidate(
+            updated_codebook, cand_id, finding=cluster.get("finding"),
+        )
+        if cluster.get("finding") is not None:
+            refuted.append(census_findings.Adjudication(cand_id, cluster["verdict"], cluster.get("cause")))
 
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
 
+    updated_codebook, sighted = census_findings.mark_seen(
+        updated_codebook,
+        run_id=run_id,
+        sessions={record["session"] for record in mining_result.records if record.get("session")},
+    )
+
     _report_dropped_verdicts(
-        dropped_verdicts, disposition_conflicts=disposition_conflicts,
+        dropped_verdicts,
+        disposition_conflicts=merge.counts.candidate_disposition_conflicts,
     )
 
     validation_errors = codebook.validate(updated_codebook)
@@ -2881,7 +2990,8 @@ def run_census(
     filing_queue = _filing_queue(fileable, updated_codebook)
     task_payloads = build_task_payloads(
         [pending.cluster for pending in filing_queue],
-        project_root=project_root, project_id=project_id, harness=harness_project,
+        project_root=project_root, project_id=project_id, run_id=run_id,
+        harness=harness_project,
     )
     filed_ticket_ids = []
     cross_project_tickets: list[CrossProjectTicket] = []
@@ -3026,6 +3136,18 @@ def run_census(
         mass_rejection=mass_rejection,
         withheld=withheld,
         cross_project_tickets=tuple(cross_project_tickets),
+        findings=[
+            row.to_record()
+            for row in census_findings.finding_rows(
+                updated_codebook,
+                promoted=promoted,
+                refuted=refuted,
+                sighted=sighted,
+                run_id=run_id,
+                cause_of=functools.partial(_entry_text, updated_codebook, field="cause"),
+            )
+        ],
+        area_map=area_map.to_record(),
     )
     # The record is written FIRST and the report rendered from that very text,
     # so the markdown can only ever say what the record holds. Both precede
@@ -3094,17 +3216,17 @@ def run_census(
         withheld=withheld,
         cross_project_tickets=tuple(cross_project_tickets),
         released_entry_ids=tuple(released_tickets),
+        skipped_deletions=merge.skipped_deletions,
     )
     commit_paths = [
         str(report_path), str(record_path), str(codebook_path), str(census_state_path),
     ]
     if dry_run_filing is not None:
         commit_paths.append(dry_run_filing.path)
-    try:
-        commit(paths=commit_paths, message=f"legibility census {date}")
-    except Exception as exc:  # noqa: BLE001 - any unlanded commit is rolled back, never a crash
+    landing = commit(paths=commit_paths, message=f"legibility census {date}")
+    if not landing.ok:
         return _unlanded(
-            exc, landed,
+            landing, landed,
             commit_paths=commit_paths,
             roll_back=roll_back,
             escalate_fn=escalate_fn,
@@ -3113,7 +3235,7 @@ def run_census(
     if selection is None:
         return landed
     return _ledger_census_codings(
-        landed, mining_result.records, run_id=run_id, ledger=selection.ledger,
+        landed, list(merge.merged_records), run_id=run_id, ledger=selection.ledger,
     )
 
 
@@ -3226,6 +3348,12 @@ def _synthesis_prompt(verified: list, *, quality_block: str) -> str:
         "write clear, factual prose for a dated census report -- "
         "observations only, never a diagnosis that was not itself "
         "verified.\n\n"
+        "Your prose is embedded verbatim in the report and is never parsed: "
+        "nothing you write is applied to the codebook "
+        "(docs/legibility/confusion-codebook.yaml). Put any codebook change "
+        "you propose under a heading reading exactly "
+        f"'{SYNTHESIS_PROPOSALS_HEADING}', and never describe such proposals "
+        "as inputs to the merger.\n\n"
         "Each cluster's verdict tags name the heuristics of the quality "
         "definition below that its finding rests on; cite those heuristics "
         "by name where the prose discusses the finding.\n\n"
@@ -3661,38 +3789,6 @@ def _build_default_escalate_fn(cfg):
     return _escalate_fn
 
 
-def _build_default_commit(project_root):
-    """Build the real git-commit seam: ``git commit --only
-    <paths> -m message`` in *project_root* (CLAUDE.md's scoped-commit
-    convention -- never a bare ``git commit``, never ``git stash``). A path
-    git has never tracked before (this run's first-ever census-state.json
-    / dated report) makes ``--only`` fail with "did not match any file";
-    that one case is retried once after a scoped ``git add -- <paths>``
-    (mirrors ``nightly._git_commit_docs_only``'s identical fallback).
-    Raises on any other failure, a refusing pre-commit hook included --
-    ``run_census`` then rolls every written path back to HEAD."""
-    def _commit(*, paths, message) -> None:
-        str_paths = [str(p) for p in paths]
-
-        def _run():
-            return subprocess.run(
-                ["git", "-C", str(project_root), "commit", "--only", *str_paths, "-m", message],
-                capture_output=True, text=True,
-            )
-
-        result = _run()
-        if result.returncode != 0 and "did not match any file" in (result.stderr or "").lower():
-            subprocess.run(
-                ["git", "-C", str(project_root), "add", "--", *str_paths],
-                capture_output=True, text=True,
-            )
-            result = _run()
-        if result.returncode != 0:
-            raise RuntimeError(f"git commit failed: {(result.stderr or '').strip()}")
-
-    return _commit
-
-
 # ---------------------------------------------------------------------------
 # main(argv) -- CLI: `python scripts/legibility/census.py --project-root <root>
 #                      [--config <path>] [--force]`
@@ -3827,8 +3923,8 @@ def main(argv: list[str] | None = None) -> int:
     Otherwise builds the real default seams (headless-CLI ``invoke`` for
     mining/verify/synthesis, MCP posters for ``submit_fn``/``escalate_fn``,
     ``census_trigger.default_status_fetcher`` for the done-count baseline,
-    a :class:`census_window.WindowBatchSource` over the mining window, a
-    scoped git-commit helper, and the ``unlanded.roll_back`` that puts
+    a :class:`census_window.WindowBatchSource` over the mining window,
+    ``unlanded.commit_only`` for the scoped commit, and the ``unlanded.roll_back`` that puts
     back a commit that did not land) and runs the full pipeline via
     ``run_census``. ``--harness-config`` (default ``DEFAULT_HARNESS_CONFIG_PATH``)
     names the project whose task tree receives harness-owned fix surfaces,
@@ -3866,11 +3962,13 @@ def main(argv: list[str] | None = None) -> int:
     project at ``as_of_sha``, its HEAD (``census_identity.resolve_as_of_sha``),
     resolved after the gate and before any spend.
 
-    Returns non-zero only on a genuine fail-loud error (a config-load
-    failure, a project root that is not a git repo, an uncaught exception
-    from ``run_census``, or an ``"unlanded"`` census whose commit did not
-    land) -- a deferred
-    (headroom-preflight) outcome still exits 0, mirroring
+    Returns non-zero only on a genuine fail-loud error. Every such exit
+    after the config has loaded has filed exactly one escalation:
+    :func:`_census_failed`'s for any raise, a refused precondition included,
+    or ``run_census``'s own for an ``"unlanded"`` census whose commit did not
+    land. Before the config loads there is no escalation target, so a bad
+    ``--project-root`` or an unloadable config is reported on stderr only.
+    A deferred (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
     an operator-facing failure, not an expected defer/no-fire outcome.
 
@@ -3989,22 +4087,48 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
+    # One escalate_fn closure shared by run_census's own defer/unlanded
+    # escalations and this boundary, so every census escalation has one source.
+    escalate_fn = _build_default_escalate_fn(cfg)
+    try:
+        return _run_configured_census(
+            args, project_root=project_root, cfg=cfg, config_path=config_path,
+            escalate_fn=escalate_fn,
+        )
+    except Exception as exc:
+        return _census_failed(cfg, escalate_fn, exc)
+
+
+def _census_failed(cfg: config.LegibilityConfig, escalate_fn, exc: Exception) -> int:
+    """Report a census that failed after its config loaded -- stderr, then the
+    journal, then one best-effort escalation -- and return the exit code."""
+    summary = f"legibility census run failed ({cfg.project_id}): {type(exc).__name__}: {exc}"
+    detail = "".join(traceback.format_exception(exc))
+    print(f"census: FAILED -- {exc}", file=sys.stderr)
+    logger.error("%s -- %s", summary, detail)
+    escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
+    return 1
+
+
+def _run_configured_census(
+    args: argparse.Namespace, *, project_root: Path, cfg: config.LegibilityConfig,
+    config_path: Path, escalate_fn,
+) -> int:
+    """:func:`main`'s run once *cfg* has loaded. Raises on every failure but an
+    ``"unlanded"`` outcome, which ``run_census`` has already escalated."""
     mismatch = _project_identity_mismatch(project_root, cfg, config_path)
     if mismatch is not None:
-        print(f"census: {mismatch}", file=sys.stderr)
-        return 1
+        raise CensusPreconditionFailed(mismatch)
 
     harness_config_path = (
         Path(args.harness_config) if args.harness_config else DEFAULT_HARNESS_CONFIG_PATH
     )
     try:
         harness_cfg = config.load_config(harness_config_path)
-    except Exception as exc:  # noqa: BLE001 - an unloadable harness config fails loud at CLI startup
-        print(
-            f"census: failed to load harness config at {harness_config_path}: {exc}",
-            file=sys.stderr,
-        )
-        return 1
+    except Exception as exc:
+        raise CensusPreconditionFailed(
+            f"failed to load harness config at {harness_config_path}: {exc}"
+        ) from exc
     harness_project = filing_policy.ProjectRef(
         project_root=harness_cfg.project_root, project_id=harness_cfg.project_id,
     )
@@ -4027,8 +4151,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         as_of_sha = census_identity.resolve_as_of_sha(project_root)
     except RuntimeError as exc:
-        print(f"census: cannot resolve as_of_sha -- {exc}", file=sys.stderr)
-        return 1
+        raise CensusPreconditionFailed(f"cannot resolve as_of_sha -- {exc}") from exc
 
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
     census_state_path = project_root / "docs" / "legibility" / "census-state.json"
@@ -4053,11 +4176,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         codebook_dict = {"version": 2, "entries": [], "candidates": []}
 
-    # One escalate_fn closure shared by BOTH consumers: run_census's
-    # headroom-defer path and main()'s hard-failure catch-all below -- so
-    # defer and hard-failure escalations share one census escalation source
-    # and one never-mask-the-exit contract.
-    escalate_fn = _build_default_escalate_fn(cfg)
     batch_source = census_window.WindowBatchSource(
         cfg,
         projects_root=DEFAULT_PROJECTS_ROOT,
@@ -4075,62 +4193,47 @@ def main(argv: list[str] | None = None) -> int:
         mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
             cfg, project_root=project_root, runner=runner,
         )
-        try:
-            outcome = run_census(
-                batch_source=batch_source,
-                selection_of=lambda: batch_source.selection,
-                invoke=mining_invoke,
-                # The in-verify re-probe rides the SAME cwd-scoped invoke as the
-                # verifier it guards (so it fails exactly when the verifier would)
-                # but on the cheap trickle tier, matching every other headroom
-                # gate -- one probe implementation, one model tier, four sites.
-                verify_fn=_build_default_verify_fn(
-                    str(project_root),
-                    verify_invoke,
-                    headroom_probe=functools.partial(
-                        preflight_headroom, verify_invoke, model=cfg.models.trickle,
-                    ),
+        outcome = run_census(
+            batch_source=batch_source,
+            selection_of=lambda: batch_source.selection,
+            invoke=mining_invoke,
+            # The in-verify re-probe rides the SAME cwd-scoped invoke as the
+            # verifier it guards (so it fails exactly when the verifier would)
+            # but on the cheap trickle tier, matching every other headroom
+            # gate -- one probe implementation, one model tier, four sites.
+            verify_fn=_build_default_verify_fn(
+                str(project_root),
+                verify_invoke,
+                headroom_probe=functools.partial(
+                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
                 ),
-                synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
-                submit_fn=default_submit_fn,
-                escalate_fn=escalate_fn,
-                status_fetcher=status_fetcher,
-                commit=_build_default_commit(project_root),
-                roll_back=functools.partial(
-                    unlanded.roll_back, project_root,
-                    project_id=cfg.project_id, label=f"census-{date_str}",
-                ),
-                codebook_dict=codebook_dict,
-                config=cfg,
-                project_root=str(project_root),
-                project_id=cfg.project_id,
-                codebook_path=codebook_path,
-                census_state_path=census_state_path,
-                report_path=report_path,
-                date=date_str,
-                run_id=identity.run_id,
-                as_of_sha=as_of_sha,
-                since=prior.as_of_sha,
-                force=args.force,
-                max_batches=args.max_batches,
-                max_verify_clusters=args.max_verify_clusters,
-                dry_run_payloads_path=dry_run_payloads_path,
-                harness_project=harness_project,
-            )
-        except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
-            print(f"census: FAILED -- {exc}", file=sys.stderr)
-            # PRD decision 8 -- degradation never silent: file a best-effort
-            # escalation via the shared closure so a hard failure leaves an
-            # operator signal, not just a stderr line. The closure swallows all
-            # POST errors internally (logging a best-effort warning), so this
-            # never masks the exit and `return 1` always runs.
-            escalate_fn(
-                category="infra_issue",
-                severity="info",
-                summary=f"legibility census run failed ({cfg.project_id}): {exc}",
-                detail=traceback.format_exc(),
-            )
-            return 1
+            ),
+            synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
+            submit_fn=default_submit_fn,
+            escalate_fn=escalate_fn,
+            status_fetcher=status_fetcher,
+            commit=functools.partial(unlanded.commit_only, project_root),
+            roll_back=functools.partial(
+                unlanded.roll_back, project_root,
+                project_id=cfg.project_id, label=f"census-{date_str}",
+            ),
+            codebook_dict=codebook_dict,
+            config=cfg,
+            project_root=str(project_root),
+            project_id=cfg.project_id,
+            codebook_path=codebook_path,
+            census_state_path=census_state_path,
+            report_path=report_path,
+            date=date_str,
+            run_id=identity.run_id,
+            as_of_sha=as_of_sha,
+            since=prior.as_of_sha,
+            force=args.force,
+            max_batches=args.max_batches,
+            max_verify_clusters=args.max_verify_clusters,
+            dry_run_payloads_path=dry_run_payloads_path,
+            harness_project=harness_project,
+        )
 
     if outcome.status == "deferred":
         # The FIELDS, not only the prose. The two defer flavours read much the
@@ -4181,10 +4284,14 @@ def main(argv: list[str] | None = None) -> int:
         f" unresolved_verdicts={outcome.unresolved_verdicts}"
         if outcome.unresolved_verdicts else ""
     )
+    skipped = (
+        f" skipped_deletions={len(outcome.skipped_deletions)}"
+        if outcome.skipped_deletions else ""
+    )
     print(
         f"census: done -- report={outcome.report_path} "
         f"filed_tickets={len(outcome.filed_ticket_ids)} "
-        f"stop_reason={outcome.stop_reason}{unresolved}{ledger_failed}"
+        f"stop_reason={outcome.stop_reason}{unresolved}{skipped}{ledger_failed}"
     )
     return 0
 

@@ -20,6 +20,7 @@ Task δ/1720 additions (merge-ready confidence gate):
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -109,6 +110,7 @@ def _make_single_req(
         config=config,
         result=future,
         lane=lane,
+        awaited_by_workflow=True,
     )
 
 
@@ -151,8 +153,9 @@ def _make_worker(
 ) -> SpeculativeMergeWorker:
     """Build a bare MergeLane for these tests.
 
-    *clock* is for the one test whose SUBJECT is a wait: a FakeClock makes the
-    worker's deadline arithmetic run to completion without a wall-clock wait.
+    *clock* is for the one test whose SUBJECT is a wait: a
+    ``FakeClock(sleep_cap=0.0)`` makes the worker's deadline arithmetic run to
+    completion without a wall-clock wait.
     Everywhere else the wait is incidental and the production clock is what
     keeps the test honest about real concurrency, so it is left alone.
     """
@@ -318,6 +321,7 @@ def _make_req(
         config=config,
         result=future,
         lane='normal',
+        awaited_by_workflow=True,
     )
 
 
@@ -1039,11 +1043,11 @@ def _gated_verify(
 ):
     """A ``run_scoped_verification``-shaped gate wrapping :func:`_first_verify_gated`.
 
-    For the two callers that must still patch the module global rather than
-    inject the port: the TRAIN scene below (see its comment — _do_train_merge
-    does not forward the worker's verifier) and out-of-group
-    test_coalesce_integration_gate.py, which imports this name. One gate
-    implementation, two ways of installing it.
+    For the callers that patch the module global rather than inject the port:
+    the TRAIN scene below and out-of-group test_coalesce_integration_gate.py,
+    which imports this name. Their workers are built WITHOUT ``verifier=``,
+    so they run the production verifier, which resolves the patched name.
+    One gate implementation, two ways of installing it.
     """
     return AsyncMock(side_effect=_first_verify_gated(gate_release, gate_entered).run_scoped)
 
@@ -1131,12 +1135,10 @@ class TestEndToEndWiring:
         await queue.put(req2)
         await queue.put(req3)
 
-        # The TRAIN path is the one place the injected verify port does not
-        # reach: _do_train_merge calls _run_post_merge_verify WITHOUT
-        # forwarding worker's verifier (merge_queue.py:7297-7307), so it always
-        # resolves PRODUCTION_VERIFIER. Until that gap closes, the train's gate
-        # has to be installed on the module global — but it is the SAME gate
-        # object the port-injected scenes use, not a second implementation.
+        # This worker is built WITHOUT verifier=, so the train verify runs the
+        # production verifier, which resolves the patched module global: the
+        # train's gate is installed there. It is the SAME gate object the
+        # port-injected scenes use, not a second implementation.
         async with running_merge_worker(worker):
             with patch(
                 'orchestrator.merge_queue.run_scoped_verification',
@@ -1932,7 +1934,7 @@ class TestRedriveCoalesceMembers:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='realtipsha')),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=verdict),
             ) as mock_validate,
         ):
@@ -1998,7 +2000,7 @@ class TestRedriveCoalesceMembers:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value=None)),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=verdict),
             ),
         ):
@@ -2060,7 +2062,7 @@ class TestRedriveCoalesceMembers:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='realtipsha')),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=verdict),
             ),
         ):
@@ -2187,6 +2189,7 @@ class TestRedriveCoalesceMembersStaleEvidence:
         git_ops: GitOps,
         coalesce_config: OrchestratorConfig,
         tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
     ):
         """m1's found_on_main re-drive hits done_evidence_stale; m2's succeeds.
 
@@ -2274,10 +2277,10 @@ class TestRedriveCoalesceMembersStaleEvidence:
             patch.object(git_ops, 'is_ancestor', AsyncMock(return_value=True)),
             patch.object(git_ops, 'resolve_branch_sha', AsyncMock(return_value='shatip')),
             patch(
-                'orchestrator.merge_queue.validate_landing_evidence',
+                'orchestrator.merge_lane.member_redrive.validate_landing_evidence',
                 AsyncMock(return_value=accepted_verdict),
             ),
-            patch('orchestrator.merge_queue.logger') as mock_logger,
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
         ):
             await worker._redrive_coalesce_members(req, 'mainsha000')
 
@@ -2294,7 +2297,10 @@ class TestRedriveCoalesceMembersStaleEvidence:
 
         # The generic except-Exception log path must NOT fire for the
         # StaleEvidenceRejection — only the new dedicated branch handles it.
-        mock_logger.exception.assert_not_called()
+        assert [
+            record.getMessage() for record in caplog.records
+            if record.levelno >= logging.ERROR and record.exc_info is not None
+        ] == []
 
         # Exactly one pending L2 provenance_conflict escalation filed via the
         # worker's shared sink.
@@ -2953,10 +2959,13 @@ class TestAwaitUnadvancedPredecessor:
         against the worker's clock, and that clock is the test's.  The proof
         that the wait really ran to its deadline rather than falling out early
         is the clock's own record of what it was asked to sleep.
+
+        The interlock polls toward that real deadline ~38,400 times, so each
+        poll must be a bare yield (``sleep_cap=0.0``).
         """
         config = _make_config(tmp_path)
         queue: asyncio.Queue = asyncio.Queue()
-        clock = FakeClock()
+        clock = FakeClock(sleep_cap=0.0)
         worker = _make_worker(queue, config, clock=clock)
         pred = _make_single_req('pred', config=config)
         worker._last_merged_request = pred

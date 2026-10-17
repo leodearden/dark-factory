@@ -42,6 +42,7 @@ from legibility import (
     config as config_mod,
 )
 from legibility.config import TrickleCensusCaps, load_config
+from pydantic import ValidationError
 from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 
@@ -143,8 +144,8 @@ def _write_transcript(
     turn plus a structural tool-error (nonzero confusion signal): a user
     turn, an assistant tool_use, and a user tool_result carrying
     ``is_error: true`` with 'No such file or directory' content (matches
-    sampling._NOT_FOUND_PATTERNS too, for a score > 0 on more than one
-    signal class).
+    legibility.detectors.NOT_FOUND_PATTERNS too, for a score > 0 on more
+    than one signal class).
 
     *user_text* overrides the first user turn. It exists so a test can write
     TWO transcripts that both survive to the digest phase: the sampler's
@@ -198,14 +199,12 @@ def _write_quiet_transcript(
     """A sibling of :func:`_write_transcript` that carries NO confusion signal.
 
     Same JSONL shape — a user turn, an assistant ``tool_use``, a user
-    ``tool_result`` — but the exchange SUCCEEDS: no ``is_error``, no
-    ``sampling._NOT_FOUND_PATTERNS`` text ('no such file' / 'not found' /
-    'does not exist' / 'command not found'), no
-    ``_SELF_CORRECT_PATTERNS`` in the assistant's text blocks, no
-    ``_DF_GUARD_TEXT_PATTERNS`` / ``_DF_GUARD_TOOL_NAMES``, and no
-    ``_INTERRUPT_PATTERNS``. So the record scores 0 and the sampler drops it
-    as zero-signal BEFORE the budget phase — a genuinely quiet night, never
-    a budget-skipped candidate. The score-0 claim is asserted (not assumed)
+    ``tool_result`` — but the exchange SUCCEEDS: no ``is_error``, and no
+    literal from legibility.detectors' tables (``NOT_FOUND_PATTERNS``,
+    ``SELF_CORRECTION_PATTERNS``, ``DF_GUARD_PATTERNS``,
+    ``INTERRUPT_PATTERN``) in any carrier. So the record scores 0 and the
+    sampler drops it as zero-signal BEFORE the budget phase — a genuinely
+    quiet night, never a budget-skipped candidate. The score-0 claim is asserted (not assumed)
     in ``test_run_nightly_quiet_night_is_not_reported_as_suppressed``.
     """
     lines = [
@@ -266,6 +265,89 @@ def test_select_scored_records_includes_matching_session(tmp_path):
     assert record.session.path == session_path
     assert record.score > 0
     assert record.stratum
+
+
+def _two_session_night(tmp_path) -> tuple[config_mod.LegibilityConfig, Path]:
+    """One date carrying two signal-bearing sessions, 'session-a' and
+    'session-b', whose first turns differ so the sampler's dedupe keeps both."""
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    for session_id, user_text in (
+        ('session-a', 'please fix this confusing bug'),
+        ('session-b', 'why does the merge lane keep parking my task'),
+    ):
+        _write_transcript(
+            projects_root / _encode_cwd(work_cwd) / f'{session_id}.jsonl',
+            cwd=work_cwd, timestamp='2026-07-13T10:00:00Z',
+            session_id=session_id, user_text=user_text,
+        )
+    return cfg, projects_root
+
+
+def _scored_session_names(scored: list) -> list[str]:
+    return sorted(record.session.path.stem for record in scored)
+
+
+class TestSamplingSkipsAlreadyCodedSessions:
+    """A retry pass must not re-code a session the ledger already holds; the
+    identity is the transcript's sessionId, the key the census skips on."""
+
+    def test_skipped_session_is_not_scored(self, tmp_path):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        scored = nightly.select_scored_records(
+            cfg, projects_root, date(2026, 7, 13), skip_sessions=frozenset({'session-a'}),
+        )
+
+        assert _scored_session_names(scored) == ['session-b']
+
+    def test_the_default_skips_nothing(self, tmp_path):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        scored = nightly.select_scored_records(cfg, projects_root, date(2026, 7, 13))
+
+        assert _scored_session_names(scored) == ['session-a', 'session-b']
+
+    def test_a_skipped_session_never_enters_the_sample_accounting(self, tmp_path):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        sample = nightly.select_digest_sessions(
+            cfg, projects_root, date(2026, 7, 13), skip_sessions=frozenset({'session-a'}),
+        )
+
+        assert sample.total_records == 1
+        assert [record.path.stem for record in sample.selected] == ['session-b']
+
+    def test_a_skip_that_removed_sessions_logs_their_count_once(self, tmp_path, caplog):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            nightly.select_scored_records(
+                cfg, projects_root, date(2026, 7, 13),
+                skip_sessions=frozenset({'session-a'}),
+            )
+
+        skipped_lines = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.INFO and 'already-coded' in record.getMessage()
+        ]
+        assert len(skipped_lines) == 1
+        assert 'skipped 1 ' in skipped_lines[0]
+
+    def test_a_skip_that_matched_nothing_logs_no_skip_line(self, tmp_path, caplog):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            scored = nightly.select_scored_records(
+                cfg, projects_root, date(2026, 7, 13),
+                skip_sessions=frozenset({'session-elsewhere'}),
+            )
+
+        assert _scored_session_names(scored) == ['session-a', 'session-b']
+        assert not [
+            record for record in caplog.records if 'already-coded' in record.getMessage()
+        ]
 
 
 def test_select_scored_records_reads_archive_root(tmp_path):
@@ -612,9 +694,9 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
     real_select = nightly.select_digest_sessions
     real_build = nightly.build_digests
 
-    def spy_select(cfg, roots, target, *, rendered=None):
+    def spy_select(cfg, roots, target, *, rendered=None, **kwargs):
         seen['select'] = rendered
-        return real_select(cfg, roots, target, rendered=rendered)
+        return real_select(cfg, roots, target, rendered=rendered, **kwargs)
 
     def spy_build(selected, **kwargs):
         seen['build'] = kwargs.get('rendered')
@@ -659,8 +741,9 @@ def test_build_digests_isolates_extractor_crash(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# step-7/8: git helpers (_git_status_changed, _git_commit_docs_only) --
-# against a REAL tmp `git init` repo, plus a fake-runner ref-lock retry test.
+# step-7/8: _git_status_changed, nightly's did-the-dump-change gate, against a
+# REAL tmp `git init` repo. The commit itself is unlanded.commit_only, tested
+# in scripts/tests/test_legibility_unlanded.py.
 # ---------------------------------------------------------------------------
 
 _CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
@@ -690,95 +773,6 @@ def test_git_status_changed_detects_dirty_codebook(tmp_path):
     )
 
     assert nightly._git_status_changed(repo, _CODEBOOK_RELPATH) is True
-
-
-def test_git_commit_docs_only_commits_only_that_path(tmp_path):
-    repo = _init_repo(tmp_path)
-    (repo / _CODEBOOK_RELPATH).write_text(
-        'version: 2\nentries: []\ncandidates: []\n', encoding='utf-8',
-    )
-    (repo / 'scratch.txt').write_text('unrelated wip\n', encoding='utf-8')
-
-    result = nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'legibility: nightly sightings')
-
-    assert result.ok is True
-    assert result.sha
-
-    status = subprocess.run(
-        ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
-    ).stdout
-    assert 'scratch.txt' in status
-    assert 'confusion-codebook.yaml' not in status
-
-    shown = subprocess.run(
-        ['git', 'show', '--stat', '--format=', 'HEAD'],
-        cwd=repo, check=True, capture_output=True, text=True,
-    ).stdout
-    assert 'confusion-codebook.yaml' in shown
-    assert 'scratch.txt' not in shown
-
-
-def test_git_commit_docs_only_noop_returns_not_ok(tmp_path):
-    repo = _init_repo(tmp_path)
-
-    result = nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'legibility: no-op')
-
-    assert result.ok is False
-
-
-def test_git_commit_docs_only_retries_on_ref_lock_then_succeeds(tmp_path):
-    calls = {'commit_attempts': 0}
-
-    def fake_runner(args, **kwargs):
-        if 'commit' in args:
-            calls['commit_attempts'] += 1
-            if calls['commit_attempts'] < 3:
-                return subprocess.CompletedProcess(args, 1, stdout='', stderr='fatal: cannot lock ref ...')
-            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
-        if 'rev-parse' in args:
-            return subprocess.CompletedProcess(args, 0, stdout='deadbeef\n', stderr='')
-        raise AssertionError(f'unexpected git invocation: {args}')
-
-    result = nightly._git_commit_docs_only(
-        tmp_path, [_CODEBOOK_RELPATH], 'msg', runner=fake_runner, retries=5, backoff=0,
-    )
-
-    assert result.ok is True
-    assert result.sha == 'deadbeef'
-    assert calls['commit_attempts'] == 3
-
-
-def test_git_commit_docs_only_gives_up_on_persistent_lock_error(tmp_path):
-    def fake_runner(args, **kwargs):
-        if 'commit' in args:
-            return subprocess.CompletedProcess(args, 1, stdout='', stderr='fatal: cannot lock ref ...')
-        raise AssertionError(f'unexpected git invocation: {args}')
-
-    result = nightly._git_commit_docs_only(
-        tmp_path, [_CODEBOOK_RELPATH], 'msg', runner=fake_runner, retries=3, backoff=0,
-    )
-
-    assert result.ok is False
-
-
-def test_git_commit_docs_only_never_invokes_stash(tmp_path, monkeypatch):
-    calls = []
-    real_run = subprocess.run
-
-    def spy_run(args, **kwargs):
-        calls.append(args)
-        return real_run(args, **kwargs)
-
-    monkeypatch.setattr(nightly.subprocess, 'run', spy_run)
-
-    repo = _init_repo(tmp_path)
-    (repo / _CODEBOOK_RELPATH).write_text(
-        'version: 2\nentries: []\ncandidates: []\n', encoding='utf-8',
-    )
-
-    nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'msg')
-
-    assert not any('stash' in call for call in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -1601,7 +1595,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
 # fail-safe arm logged "tasks-landed: no status_fetcher configured" instead of
 # a delta: condition (b) could not fire AT ALL. Every OTHER seam in
 # run_nightly already resolves None to its real implementation (committer ->
-# _git_commit_docs_only, recorder -> trickle_state.record_run, poster ->
+# unlanded.commit_only, recorder -> trickle_state.record_run, poster ->
 # _default_poster); status_fetcher alone resolved to nothing, which is how
 # three prior repairs of this exact code (2953, 3291, 4085) each left the
 # wiring loop open.
@@ -1780,6 +1774,22 @@ def _pool_the_night_on(monkeypatch, accounts_file, env_file):
     return opened
 
 
+def _capture_poster():
+    """A ``poster=`` seam that keeps every envelope. Returns (fn, envelopes)."""
+    envelopes = []
+
+    def _post(url, envelope):
+        envelopes.append(envelope)
+
+    return _post, envelopes
+
+
+def _one_escalation(envelopes):
+    """The ``escalate_info`` arguments of the one envelope posted."""
+    assert len(envelopes) == 1, f'expected exactly ONE escalation, got {envelopes}'
+    return envelopes[0]['params']['arguments']
+
+
 def _run_one_digest_night(tmp_path, **kwargs):
     """Drive a night carrying ONE real digest, so the coder is genuinely
     reached (an empty sample returns before it). Returns
@@ -1791,9 +1801,9 @@ def _run_one_digest_night(tmp_path, **kwargs):
         projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
         cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
-    escalations = []
+    poster, escalations = _capture_poster()
     kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
-    kwargs.setdefault('poster', lambda url, envelope: escalations.append(envelope))
+    kwargs.setdefault('poster', poster)
     result = nightly.run_nightly(
         config_path=config_path,
         projects_root=projects_root,
@@ -1802,11 +1812,6 @@ def _run_one_digest_night(tmp_path, **kwargs):
         **kwargs,
     )
     return result, escalations
-
-
-def _escalated_detail(escalations):
-    [envelope] = escalations
-    return envelope['params']['arguments']['detail']
 
 
 class TestRunNightlyRunsOnThePooledSessionRunner:
@@ -1870,7 +1875,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         )
         assert result.reason is not None
         assert 'coder storm' in result.reason
-        detail = _escalated_detail(escalations)
+        detail = _one_escalation(escalations)['detail']
         assert 'credentials rejected' in detail, detail
         assert _P in detail and _Q in detail, detail
         errors = [r for r in _nightly_warnings(caplog) if r.levelno == logging.ERROR]
@@ -1891,7 +1896,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.commit_made is False
         assert result.reason is not None
         assert 'found no pool account with headroom' in result.reason, result.reason
-        assert 'all 2 pool accounts capped' in _escalated_detail(escalations)
+        assert 'all 2 pool accounts capped' in _one_escalation(escalations)['detail']
         assert [r for r in _nightly_warnings(caplog) if r.levelno >= logging.ERROR] == [], (
             'a capped night is weather (task 4503): nothing belongs in journalctl -p err'
         )
@@ -1933,7 +1938,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
         assert result.exit_code == 1
         assert result.coder_status == 'failure'
-        assert 'could not be started' in _escalated_detail(escalations)
+        assert 'could not be started' in _one_escalation(escalations)['detail']
         coder_warnings = [
             r.getMessage() for r in caplog.records
             if r.name == 'legibility.coder' and r.levelno >= logging.WARNING
@@ -2014,12 +2019,11 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
             monkeypatch.setattr(nightly.codebook, 'validate', _raise)
 
-        with (
-            pytest.raises(RuntimeError) if outcome == 'raised'
-            else contextlib.nullcontext()
-        ):
-            _run_one_digest_night(tmp_path, recorder=recorder)
+        result, escalations = _run_one_digest_night(tmp_path, recorder=recorder)
 
+        if outcome == 'raised':
+            assert result.exit_code == 1
+            assert 'a stage crashed after coding' in _one_escalation(escalations)['summary']
         assert [record['closed'] for record in opened] == [1]
         _one_recorded(recorded)
 
@@ -2124,6 +2128,16 @@ def test_resolve_config_path_matches_by_project_id_field(tmp_path):
     resolved = nightly.resolve_config_path("proj_a", search_roots=[tmp_path])
 
     assert resolved == config_a
+
+
+def test_resolve_config_returns_the_matched_path_with_its_loaded_config(tmp_path):
+    config_a = _write_config(tmp_path / "proj-a", project_id="proj_a")
+    _write_config(tmp_path / "proj-b", project_id="proj_b")
+
+    path, cfg = nightly.resolve_config("proj_a", search_roots=[tmp_path])
+
+    assert path == config_a
+    assert cfg == load_config(config_a)
 
 
 def test_resolve_config_path_unknown_id_raises(tmp_path):
@@ -2751,9 +2765,9 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
 
 def _failing_committer(repo, paths, message):
     """A fake committer simulating a persistent ref-lock/commit failure --
-    mirrors _git_commit_docs_only's own ok=False-after-final-attempt
+    mirrors unlanded.commit_only's own ok=False-after-final-attempt
     contract without touching a real repo."""
-    return nightly.GitCommitResult(
+    return unlanded.CommitResult(
         ok=False, sha=None, stderr='fatal: cannot lock ref (simulated)', attempts=5,
     )
 
@@ -2812,6 +2826,37 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
     assert 'cannot lock ref (simulated)' in arguments['detail']
     assert str(quarantine_dir) in arguments['detail']
+
+
+def test_run_nightly_lands_through_a_transient_index_lock(tmp_path):
+    """Boundary row 4: an index.lock held across the commit's first two
+    attempts delays the night's commit; it does not roll the night back."""
+    landings = []
+
+    def contended_committer(repo, paths, message):
+        lock = Path(repo) / '.git' / 'index.lock'
+        lock.touch()
+        backoffs = []
+
+        def release_on_second_backoff(seconds):
+            backoffs.append(seconds)
+            if len(backoffs) == 2:
+                lock.unlink()
+
+        landing = unlanded.commit_only(repo, paths, message, sleep=release_on_second_backoff)
+        landings.append((landing, lock.exists()))
+        return landing
+
+    result, repo = _run_e2e_nightly(tmp_path, committer=contended_committer)
+
+    assert result.exit_code == 0
+    assert result.commit_made is True
+    assert result.rollback is None
+    [(landing, lock_still_held)] = landings
+    assert landing.attempts == 3
+    assert lock_still_held is False
+    [entry] = [e for e in _committed_codebook(repo)['entries'] if e['id'] == 'known-cause']
+    assert [s['session'] for s in entry['sightings']] == ['session-1']
 
 
 def _assert_refused_dump_rolled_back(repo: Path, head_bytes: bytes, result) -> Path:
@@ -2927,7 +2972,8 @@ def _fake_invoke_deletion_directive(prompt: str, model: str) -> str:
     })
 
 
-def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
+def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='legibility.nightly')
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
 
@@ -2962,6 +3008,8 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
     assert result.exit_code == 0
     assert result.applied == 0
     assert result.coder_status == 'ok'
+    [merge_line] = [m for m in _messages(caplog, logging.INFO) if 'merge: ' in m]
+    assert {'deletion_directive=1', 'matched=0'} <= set(merge_line.split())
 
     assert len(escalation_calls) == 1
     _url, envelope = escalation_calls[0]
@@ -3152,7 +3200,7 @@ def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
 
 # ---------------------------------------------------------------------------
 # step-9/10: a conflict-only night must PERSIST its recurrence sighting.
-# apply_coding_record's adjudicated-title branch appends the sighting but
+# apply_coding_records's adjudicated-title branch appends the sighting but
 # bumps neither `matched` nor `candidates_applied` -- so a night whose ONLY
 # merge effect is a conflict append would end with applied == 0, skip the
 # `if applied > 0` dump gate, and drop the mutated codebook on the floor.
@@ -3194,7 +3242,7 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
     # before the run (otherwise _git_status_changed would report true for an
     # unrelated reason and the commit assertion would pass vacuously). The
     # seeded sighting carries session 'session-old' -- NOT 'session-1' -- so
-    # apply_coding_record's `already_seen` guard does not short-circuit the
+    # apply_coding_records's `already_seen` guard does not short-circuit the
     # conflict branch, and the later "sightings grew 1 -> 2" assertion
     # unambiguously proves an APPEND rather than a create.
     codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
@@ -3297,19 +3345,15 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
         session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
 
-    real_apply = codebook.apply_coding_record
+    real_apply = codebook.apply_coding_records
+    correction = {'entry_id': 'known-cause', 'note': 'framing refuted', 'title': 'Corrected Cause'}
 
-    def apply_with_correction(cb, record, **kwargs):
-        return real_apply(cb, {
-            **record,
-            'corrections': [{
-                'entry_id': 'known-cause',
-                'note': 'framing refuted',
-                'title': 'Corrected Cause',
-            }],
-        }, **kwargs)
+    def apply_with_correction(cb, records, **kwargs):
+        return real_apply(
+            cb, [{**record, 'corrections': [correction]} for record in records], **kwargs,
+        )
 
-    monkeypatch.setattr(nightly.codebook, 'apply_coding_record', apply_with_correction)
+    monkeypatch.setattr(nightly.codebook, 'apply_coding_records', apply_with_correction)
 
     result = nightly.run_nightly(
         config_path=config_path,
@@ -3725,19 +3769,28 @@ def test_configure_logging_env_var_still_wins_over_an_unknown_default_level(monk
 # task 3340 step-9/10: run_nightly records trickle run state on EVERY path
 # ---------------------------------------------------------------------------
 
-def _recorder_spy():
-    """A ``recorder=`` seam spy that DELEGATES to the real
-    ``trickle_state.record_run``, so the assertions below run against real
+def _recorder_spy(delegate=trickle_state.record_run):
+    """A ``recorder=`` (or ``retry_recorder=``) seam spy that DELEGATES to
+    the real *delegate*, so the assertions below run against real
     classifier + streak output rather than a mock that could drift from it.
     Returns (fn, calls) where each call is (kwargs, returned_doc)."""
     calls = []
 
     def _record(project_id, **kwargs):
-        doc = trickle_state.record_run(project_id, **kwargs)
+        doc = delegate(project_id, **kwargs)
         calls.append((dict(kwargs, project_id=project_id), doc))
         return doc
 
     return _record, calls
+
+
+def _write_unloadable_config(root: Path, *, project_id: str) -> Path:
+    """Write *project_id*'s legibility.yaml under *root* with a budget that
+    fails validation, so ``load_config`` raises on it."""
+    config_path = _write_config(root, project_id=project_id)
+    with config_path.open('a', encoding='utf-8') as fh:
+        fh.write('budgets:\n  max_daily_digest_bytes: lots\n')
+    return config_path
 
 
 def _one_recorded(calls):
@@ -3762,7 +3815,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
                      transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
-                     invariants_doc: str | None = None):
+                     invariants_doc: str | None = None,
+                     unreadable_transcripts: bool = False):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3791,7 +3845,9 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     is committed as the project's design-invariants doc, and
     *recorder* / *committer* / *poster* / *invoke* are the injected seams
     (*poster* defaults to a no-op, so a test that does not care about
-    escalations never has to build one).
+    escalations never has to build one). *unreadable_transcripts* is the
+    exception: it strips every permission bit from the projects root for the
+    run, so enumerating the transcripts raises inside sampling.
     """
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
@@ -3850,7 +3906,12 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     elif branch is not None:  # pragma: no cover - guards a typo'd branch id
         raise AssertionError(f'unknown decision-8 branch {branch!r}')
 
-    return nightly.run_nightly(**kwargs), repo
+    try:
+        if unreadable_transcripts:
+            projects_root.chmod(0)
+        return nightly.run_nightly(**kwargs), repo
+    finally:
+        projects_root.chmod(0o755)
 
 
 class TestRunNightlyRecordsTrickleState:
@@ -3959,17 +4020,25 @@ class TestRunNightlyRecordsTrickleState:
 
     def test_unexpected_exception_mid_run_still_records(self, tmp_path, monkeypatch):
         """A crashed night that recorded NOTHING would let the progress
-        probe read a stale streak as healthy. The exception must still
-        propagate — recording is not swallowing."""
+        probe read a stale streak as healthy. The boundary converts the
+        exception into a failed, escalated result — recording is not
+        swallowing."""
         def _boom(selected, **kwargs):
             raise RuntimeError('synthetic mid-run explosion')
 
         monkeypatch.setattr(nightly, 'build_digests', _boom)
         recorder, calls = _recorder_spy()
+        poster, posted = _capture_poster()
 
-        with pytest.raises(RuntimeError, match='synthetic mid-run explosion'):
-            _run_e2e_nightly(tmp_path, recorder=recorder)
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, poster=poster)
 
+        assert result.exit_code == 1
+        assert result.escalated is True
+        arguments = _one_escalation(posted)
+        assert arguments['summary'].startswith('legibility trickle')
+        assert 'RuntimeError' in arguments['summary']
+        assert 'synthetic mid-run explosion' in arguments['summary']
+        assert 'Traceback' in arguments['detail']
         doc = _one_recorded(calls)
         assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] != 0, (
@@ -3979,6 +4048,126 @@ class TestRunNightlyRecordsTrickleState:
             'the sample was computed before the crash, so its real counters '
             'are still recordable'
         )
+
+    def test_a_crash_keeps_what_the_night_had_already_established(
+        self, tmp_path, monkeypatch,
+    ):
+        """The sampler found a suppressed night and escalated it before the
+        crash; neither fact may be lost, even when the crash's own POST
+        fails."""
+        def _boom(selected, **kwargs):
+            raise RuntimeError('synthetic mid-run explosion')
+
+        monkeypatch.setattr(nightly, 'build_digests', _boom)
+        recorder, calls = _recorder_spy()
+        posted = []
+
+        def _server_gone_after_the_first_post(url, envelope):
+            if posted:
+                raise ConnectionError('escalation server went away')
+            posted.append(envelope)
+
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, budget_bytes=10,
+            poster=_server_gone_after_the_first_post,
+        )
+
+        assert result.exit_code == 1
+        assert 'RuntimeError' in (result.reason or '')
+        assert result.budget_suppressed is True
+        assert 'suppressed' in _one_escalation(posted)['summary']
+        assert result.escalated is True, (
+            'the suppression escalation was posted this night'
+        )
+        assert _one_recorded(calls)['budget_suppressed'] is True
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_an_unreadable_transcript_dir_escalates_and_records_a_failed_night(
+        self, tmp_path,
+    ):
+        recorder, calls = _recorder_spy()
+        poster, posted = _capture_poster()
+
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, poster=poster, unreadable_transcripts=True,
+        )
+
+        assert result.exit_code == 1
+        assert result.escalated is True
+        assert 'PermissionError' in _one_escalation(posted)['summary']
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['target_date'] == '2026-07-13'
+        assert doc['consecutive_failed_runs'] == 1
+        assert doc['budget_suppressed'] is False
+        assert set(doc['counters'].values()) == {0}, (
+            'sampling never returned, so nothing was counted'
+        )
+
+    def test_a_project_id_with_no_loadable_config_records_a_failed_night_then_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+        recorder, calls = _recorder_spy()
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+            )
+
+        doc = _one_recorded(calls)
+        assert calls[0][0]['project_id'] == 'testproj'
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['target_date'] == '2026-07-13'
+        assert doc['consecutive_failed_runs'] == 1
+        assert set(doc['counters'].values()) == {0}
+
+    def test_an_unloadable_config_path_raises_without_recording(self, tmp_path):
+        config_path = _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        recorder, calls = _recorder_spy()
+
+        with pytest.raises(ValidationError):
+            nightly.run_nightly(
+                config_path=config_path, target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+            )
+
+        assert calls == []
+
+    def test_a_codebook_dump_failure_escalates_instead_of_escaping(
+        self, tmp_path, monkeypatch,
+    ):
+        """Only the night's own dump fails: the fixture seeds its codebook
+        through the same function, before any coding starts."""
+        coding_started = []
+
+        def _invoke(prompt, model):
+            coding_started.append(True)
+            return _fake_invoke_known_cause(prompt, model)
+
+        real_dump = codebook.dump
+
+        def _dump_failing_once_coding_started(cb, path):
+            if coding_started:
+                raise OSError('No such file or directory')
+            real_dump(cb, path)
+
+        monkeypatch.setattr(codebook, 'dump', _dump_failing_once_coding_started)
+        recorder, calls = _recorder_spy()
+        poster, posted = _capture_poster()
+
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, poster=poster, invoke=_invoke,
+        )
+
+        assert result.exit_code == 1
+        assert result.escalated is True
+        assert 'OSError' in _one_escalation(posted)['summary']
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_FAILED
 
     def test_a_crash_after_selecting_digests_records_failed_not_productive(
         self, tmp_path
@@ -4073,6 +4262,13 @@ def _streak_escalations(calls):
     ]
 
 
+def _testproj_state() -> dict:
+    """The state document the real recorder last wrote for 'testproj'."""
+    status, doc = trickle_state.load_state(trickle_state.trickle_state_path('testproj'))
+    assert status == 'ok' and doc is not None, f'no readable state: {status!r}'
+    return doc
+
+
 class _NightRunner:
     """Drive REAL consecutive run_nightly calls against one repo, so the
     streak is built by the actual pipeline + recorder rather than a
@@ -4088,18 +4284,33 @@ class _NightRunner:
         self.projects_root.mkdir(parents=True, exist_ok=True)
         self.escalations = []
 
-    def night(self, day, kind):
+    def night(self, day, kind, *, invoke=None):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
         'productive' (real signal, stock budget), 'quiet' (no sessions at
-        all for this date) or 'storm' (real signal, every digest's coding
-        output unparseable, so the night exits 1 and records ``failed``)."""
-        target = date(2026, 7, day)
+        all for this date), 'storm' (real signal, every digest's coding
+        output unparseable, so the night exits 1 and records ``failed``) or
+        'capped' (real signal, every digest hits a usage cap, so the night
+        is deferred at exit 0). *invoke* replaces the kind's coder."""
+        self._prepare(day, kind)
+        return nightly.run_nightly(
+            **self._pass_kwargs(day, on_night=day, invoke=invoke or self._coder(kind)),
+        )
+
+    def scheduled_night(self, day, kind):
+        """Run night *day* as main() does for an undated run: through
+        run_scheduled_night, so any retry the backlog owes runs too."""
+        self._prepare(day, kind)
+        return nightly.run_scheduled_night(
+            **self._pass_kwargs(day, on_night=day, invoke=self._coder(kind)),
+        )
+
+    def _prepare(self, day, kind):
         _write_config(
             self.repo, project_id='testproj', escalation_port=8199,
             cwd_prefixes=[self.work_cwd],
             max_daily_digest_bytes=10 if kind == 'barren' else None,
         )
-        if kind in ('barren', 'productive', 'storm'):
+        if kind in ('barren', 'productive', 'storm', 'capped'):
             _write_transcript(
                 self.projects_root / _encode_cwd(self.work_cwd)
                 / f'session-{day}.jsonl',
@@ -4107,27 +4318,38 @@ class _NightRunner:
                 timestamp=f'2026-07-{day:02d}T10:00:00Z',
                 session_id=f'session-{day}',
             )
+
+    @staticmethod
+    def _coder(kind):
+        if kind == 'storm':
+            return _fake_invoke_unparseable
+        if kind == 'capped':
+            return _fake_invoke_capped
+        return _fake_invoke_known_cause
+
+    def retry(self, day, *, on_night, invoke=_fake_invoke_known_cause,
+              recorder=None, retry_recorder=None):
+        """Run night *on_night*'s retry pass of *day*'s date, on that night's
+        clock, over the config and transcripts already on disk."""
         return nightly.run_nightly(
+            **self._pass_kwargs(day, on_night=on_night, invoke=invoke), retry=True,
+            recorder=recorder, retry_recorder=retry_recorder,
+        )
+
+    def _pass_kwargs(self, day, *, on_night, invoke) -> dict[str, Any]:
+        return dict(
             config_path=self.config_path,
             projects_root=self.projects_root,
-            target_date=target,
-            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
-            invoke=(
-                _fake_invoke_unparseable if kind == 'storm'
-                else _fake_invoke_known_cause
-            ),
+            target_date=date(2026, 7, day),
+            now=datetime(2026, 7, on_night + 1, 3, 0, 0, tzinfo=UTC),
+            invoke=invoke,
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),
         )
 
     def recorded(self):
         """The state document the REAL recorder just wrote for this run."""
-        status, doc = trickle_state.load_state(
-            trickle_state.trickle_state_path('testproj')
-        )
-        assert (status, doc) != ('missing', None), 'no run recorded yet'
-        assert doc is not None
-        return doc
+        return _testproj_state()
 
 
 class TestBarrenStreakEscalation:
@@ -4326,6 +4548,422 @@ class TestBarrenStreakEscalation:
             f'a quiet project must post NOTHING however long it stays quiet; '
             f'got {runner.escalations!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5678: an unfinished night's date enters the retry backlog
+# ---------------------------------------------------------------------------
+
+class TestScheduledPassRetryBacklog:
+    """A scheduled pass that did not finish leaves its date owed; one that
+    finished reports which owed dates to retry next."""
+
+    def test_a_storming_night_enters_the_backlog(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'storm')
+
+        assert runner.recorded()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_capped_night_exits_clean_and_still_enters_the_backlog(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, branch='capped')
+
+        assert result.exit_code == 0
+        doc = _testproj_state()
+        assert doc['capped'] is True
+        assert doc['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_finished_night_reports_the_owed_date(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        productive = runner.night(14, 'productive')
+
+        assert productive.exit_code == 0
+        assert productive.retry_due == (date(2026, 7, 13),)
+
+    def test_an_unfinished_night_schedules_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        stormed = runner.night(14, 'storm')
+
+        assert stormed.retry_due == ()
+        assert runner.recorded()['retry_backlog'] == {'2026-07-13': 1, '2026-07-14': 1}
+
+    def test_a_finished_night_with_nothing_owed_schedules_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+
+        productive = runner.night(13, 'productive')
+
+        assert productive.exit_code == 0
+        assert productive.retry_due == ()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_a_night_that_raises_enters_the_backlog(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, unreadable_transcripts=True)
+
+        assert result.exit_code == 1
+        assert result.retry_due == ()
+        assert _testproj_state()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_project_id_whose_config_does_not_load_enters_the_backlog(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+            )
+
+        assert _testproj_state()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_the_recorder_seam_receives_capped(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(tmp_path, branch='capped', recorder=recorder)
+
+        assert calls[0][0]['capped'] is True
+
+
+def _without_backlog(doc: dict) -> dict:
+    return {key: value for key, value in doc.items() if key != 'retry_backlog'}
+
+
+def _commit_subjects(repo: Path) -> list[str]:
+    return subprocess.run(
+        ['git', 'log', '--format=%s'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+
+def _counting_invoke(calls: list[str]):
+    def _invoke(prompt: str, model: str) -> str:
+        calls.append(prompt)
+        return _fake_invoke_known_cause(prompt, model)
+
+    return _invoke
+
+
+def _seed_state(*, day: int, exit_code: int) -> None:
+    trickle_state.record_run(
+        'testproj', target_date=date(2026, 7, day),
+        recorded_at=datetime(2026, 7, day + 1, 3, 0, tzinfo=UTC), exit_code=exit_code,
+        total_records=0, zero_signal_dropped=0, dedupe_collapsed=0,
+        below_sampling_cut=0, budget_skipped=0, selected_count=0,
+    )
+
+
+def _owed_after_storm_then_productive(tmp_path) -> tuple[_NightRunner, dict]:
+    """Night 13 storms and night 14 is productive, so date 13 is owed with
+    one attempt. Returns the runner and the state document night 14 wrote."""
+    runner = _NightRunner(tmp_path)
+    runner.night(13, 'storm')
+    runner.night(14, 'productive')
+    before = runner.recorded()
+    assert before['retry_backlog'] == {'2026-07-13': 1}
+    return runner, before
+
+
+class TestRetryPass:
+    """``run_nightly(retry=True)`` re-runs an owed date and touches ONLY the
+    backlog: the recorded health keeps describing the scheduled night."""
+
+    def test_a_recovered_date_lands_its_sightings_and_leaves_the_backlog(self, tmp_path):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        result = runner.retry(13, on_night=14)
+
+        assert result.exit_code == 0
+        assert _commit_subjects(runner.repo)[0] == (
+            'legibility: nightly trickle sightings for 2026-07-13'
+        )
+        after = runner.recorded()
+        assert after['retry_backlog'] == {}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['target_date'] == '2026-07-14'
+
+    def test_a_failed_retry_counts_an_attempt_and_exits_non_zero(self, tmp_path):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        result = runner.retry(13, on_night=14, invoke=_fake_invoke_unparseable)
+
+        assert result.exit_code == 1
+        after = runner.recorded()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+        assert after['consecutive_failed_runs'] == 0
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_a_retry_that_raises_counts_an_attempt_and_keeps_the_health_record(
+        self, tmp_path,
+    ):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        runner.projects_root.chmod(0)
+        try:
+            result = runner.retry(13, on_night=14)
+        finally:
+            runner.projects_root.chmod(0o755)
+
+        assert result.exit_code == 1
+        after = runner.recorded()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+
+    def test_a_retry_whose_config_does_not_load_counts_an_attempt_then_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        _seed_state(day=13, exit_code=1)
+        _seed_state(day=14, exit_code=0)
+        before = _testproj_state()
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13), retry=True,
+                now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+            )
+
+        after = _testproj_state()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['target_date'] == '2026-07-14'
+
+    def test_a_retry_records_through_the_retry_recorder_seam(self, tmp_path):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        recorder, recorded = _recorder_spy()
+        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+
+        runner.retry(13, on_night=14, recorder=recorder, retry_recorder=retry_recorder)
+
+        assert recorded == []
+        assert _one_recorded(retried)['retry_backlog'] == {}
+        assert retried[0][0]['target_date'] == date(2026, 7, 13)
+
+    def test_a_retry_whose_config_does_not_load_records_through_the_retry_recorder_seam(
+        self, tmp_path, monkeypatch,
+    ):
+        _seed_state(day=13, exit_code=1)
+        _seed_state(day=14, exit_code=0)
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+        recorder, recorded = _recorder_spy()
+        retry_recorder, retried = _recorder_spy(trickle_state.record_retry)
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13), retry=True,
+                now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+                recorder=recorder, retry_recorder=retry_recorder,
+            )
+
+        assert recorded == []
+        assert _one_recorded(retried)['retry_backlog'] == {'2026-07-13': 2}
+        assert retried[0][0]['exit_code'] == 1
+
+    def test_a_retry_never_evaluates_the_census_step(self, tmp_path, monkeypatch):
+        census_calls = []
+
+        def _spy(cfg, **kwargs):
+            census_calls.append(cfg.project_id)
+            return 'census: spy', False
+
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy)
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        assert census_calls == ['testproj'], 'the scheduled night 14 evaluates it once'
+
+        result = runner.retry(13, on_night=14)
+
+        assert census_calls == ['testproj']
+        assert result.census_line is None
+        assert result.census_fire is False
+
+    def test_a_retry_skips_sessions_the_ledger_already_holds(self, tmp_path):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        session_ledger.record_codings(session_ledger.ledger_path('testproj'), [
+            session_ledger.LedgerRow(
+                session='session-13', instrument_version=1,
+                coded_by=session_ledger.CodedBy.CENSUS, run_ref='census-run',
+                outcome=session_ledger.Outcome.MATCHED,
+                coded_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+            ),
+        ])
+        retry_prompts: list[str] = []
+
+        result = runner.retry(13, on_night=14, invoke=_counting_invoke(retry_prompts))
+
+        assert retry_prompts == []
+        assert result.exit_code == 0
+        assert runner.recorded()['retry_backlog'] == {}
+
+        scheduled_prompts: list[str] = []
+        runner.night(13, 'productive', invoke=_counting_invoke(scheduled_prompts))
+        assert len(scheduled_prompts) == 1, 'a scheduled pass does not skip ledgered sessions'
+
+    def test_a_retry_never_refires_the_barren_streak_escalation(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+        for day in (14, 15, 16):
+            runner.night(day, 'barren')
+        streak = runner.recorded()
+        assert streak['outcome'] == trickle_state.OUTCOME_BARREN
+        assert streak['consecutive_barren_runs'] == trickle_state.DEFAULT_MAX_BARREN_RUNS
+        assert streak['retry_backlog'] == {'2026-07-13': 1}
+        posted_before = len(_streak_escalations(runner.escalations))
+
+        result = runner.retry(13, on_night=16)
+
+        assert len(_streak_escalations(runner.escalations)) == posted_before
+        assert result.barren_escalated is False
+
+    def test_a_retry_never_schedules_another_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+        runner.night(14, 'storm')
+        assert runner.night(15, 'productive').retry_due == (date(2026, 7, 13),)
+
+        result = runner.retry(13, on_night=15)
+
+        assert result.exit_code == 0
+        assert result.retry_due == ()
+        assert runner.recorded()['retry_backlog'] == {'2026-07-14': 1}
+
+
+def _scripted_run_nightly(*outcomes):
+    """A ``run_nightly`` fake recording each call's kwargs. Call N gets
+    outcome N (the last repeats); an exception outcome is raised."""
+    calls: list[dict[str, Any]] = []
+
+    def _fake(**kwargs):
+        calls.append(kwargs)
+        outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return _fake, calls
+
+
+class TestRunScheduledNight:
+    """An undated run is the scheduled night plus, once that night finished,
+    the retry the backlog owes; a dated run stays a single pass."""
+
+    def test_a_failed_night_is_recovered_by_the_next_healthy_night(self, tmp_path):
+        """The 2026-08-17 scenario: a lost night is now retried, not dropped."""
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'productive')
+
+        assert [result.exit_code for result in results] == [0, 0]
+        assert _commit_subjects(runner.repo)[:2] == [
+            'legibility: nightly trickle sightings for 2026-07-13',
+            'legibility: nightly trickle sightings for 2026-07-14',
+        ]
+        doc = runner.recorded()
+        assert doc['retry_backlog'] == {}
+        assert doc['target_date'] == '2026-07-14'
+
+    def test_an_unfinished_night_runs_no_retry_and_burns_no_attempt(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'storm')
+
+        assert len(results) == 1
+        assert runner.recorded()['retry_backlog']['2026-07-13'] == 1
+
+    def test_a_capped_night_runs_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'capped')
+
+        assert len(results) == 1
+        assert results[0].capped is True
+        assert runner.recorded()['retry_backlog']['2026-07-13'] == 1
+
+    def test_every_argument_reaches_both_passes(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
+            nightly.NightlyResult(exit_code=0),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+        now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
+        invoke, status_fetcher, poster = object(), object(), object()
+        committer, recorder, retry_recorder = object(), object(), object()
+
+        nightly.run_scheduled_night(
+            config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
+            target_date=date(2026, 7, 14), now=now, invoke=invoke,
+            status_fetcher=status_fetcher, poster=poster, committer=committer,
+            recorder=recorder, retry_recorder=retry_recorder,
+        )
+
+        shared = dict(
+            config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
+            now=now, invoke=invoke, status_fetcher=status_fetcher, poster=poster,
+            committer=committer, recorder=recorder, retry_recorder=retry_recorder,
+        )
+        assert calls == [
+            {**shared, 'target_date': date(2026, 7, 14), 'retry': False},
+            {**shared, 'target_date': date(2026, 7, 13), 'retry': True},
+        ]
+
+    def test_main_retries_the_owed_date_after_an_undated_run(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
+            nightly.NightlyResult(exit_code=0),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert exit_code == 0
+        assert len(calls) == 2
+        scheduled, retried = calls
+        assert retried['target_date'] == date(2026, 7, 13)
+        assert retried['retry'] is True
+        for key in ('project_id', 'config_path', 'projects_root'):
+            assert retried[key] == scheduled[key]
+
+    def test_main_fails_when_the_retry_fails(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
+            nightly.NightlyResult(exit_code=1),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert exit_code == 1
+        assert len(calls) == 2
+
+    def test_a_dated_run_is_a_single_pass(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 10),)),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a', '--date', '2026-07-13'])
+
+        assert exit_code == 0
+        assert len(calls) == 1
+        assert calls[0]['target_date'] == date(2026, 7, 13)
+
+    def test_a_scheduled_pass_that_raises_propagates_and_runs_no_retry(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(FileNotFoundError('no legibility.yaml'))
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        with pytest.raises(FileNotFoundError):
+            nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -5220,7 +5858,7 @@ class TestRunNightlyInvariantSlugs:
 
         assert result.exit_code == 0
         assert any(
-            'invariant slugs: 0 valid, 0 rejected' in m
+            'merge: ' in m and 'invariant_slugs_valid=0 invariant_slugs_rejected=0' in m
             for m in _messages(caplog, logging.INFO)
         )
 
@@ -5243,7 +5881,7 @@ class TestRunNightlyInvariantSlugs:
         [candidate] = [c for c in committed['candidates'] if c['title'] == 'novel']
         assert ['invariant_violated' in s for s in candidate['sightings']] == [False]
         assert any(
-            'invariant slugs: 1 valid, 1 rejected' in m
+            'merge: ' in m and 'invariant_slugs_valid=1 invariant_slugs_rejected=1' in m
             for m in _messages(caplog, logging.INFO)
         )
         naming_it = [m for m in _messages(caplog, logging.WARNING) if 'made-up-free-text' in m]

@@ -18,6 +18,15 @@ Argument wiring and live dependencies only; every behaviour lives in
   topology       a scratch graph's node/edge counts and topology hash
   teardown       delete the arm's scratch graph and, with --collection, its replica
 
+The embedding axis (task ι):
+
+  mem0-snapshot      a frozen, read-only JSONL snapshot of one Mem0 collection
+  probe-set          the embedding probe set, read from the frozen reference graph
+  embed-specs        the two incumbent control specs and one spec per slate arm
+  embed-run          one embedding arm, end to end, into <out-root>/<arm_id>/<STAMP>/
+  embed-preregister  the embedding pre-registration inputs of a control pair
+  embed-compare      each candidate run judged against those inputs (offline)
+
 Exit codes, run-directory layout and the live check:
 README.md §"Arm-runner harness (task ε)" beside this script.
 """
@@ -26,24 +35,39 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
+import importlib.util
+import itertools
 import json
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from types import ModuleType
+from typing import Any, Protocol, TypeVar
 from urllib.parse import urlparse
 
 import build_corpus
 from falkordb.asyncio import FalkorDB
+from graphiti_core.embedder import EmbedderClient
 from qdrant_client import AsyncQdrantClient
 from redis.exceptions import RedisError
 from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.memory_eval_metrics import canonical_json_text, run_stamp
 from shared.safe_io import atomic_write_text
 
-from fused_memory.arm_harness.arm_backend import IndexBuildError, open_arm_backend
+from fused_memory.arm_harness.arm_backend import (
+    IndexBuildError,
+    open_arm_backend,
+    open_embedding_arm_backend,
+)
+from fused_memory.arm_harness.arm_embedder import (
+    ArmEmbedder,
+    EmbedSettings,
+    QueryEmbedder,
+    build_arm_embedder,
+)
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.checks import (
     ProbeCleanupError,
@@ -58,6 +82,32 @@ from fused_memory.arm_harness.corpus import (
     corpus_sha,
     select_replay_items,
 )
+from fused_memory.arm_harness.embedding_graph_phase import (
+    SEARCH_K,
+    ArmScratchGraph,
+    EmbeddingRunCheckFailed,
+    EmbeddingSearchBackend,
+    frozen_reference_check,
+)
+from fused_memory.arm_harness.embedding_preregistration import (
+    EmbeddingComparison,
+    EmbeddingPreregistrationError,
+    EmbeddingPreregistrationInputs,
+    compare_embedding_arm,
+    derive_embedding_preregistration_inputs,
+    load_embedding_preregistration_inputs,
+    serialize_embedding_preregistration_inputs,
+)
+from fused_memory.arm_harness.embedding_run import (
+    EmbeddingRunRefused,
+    Mem0Ranker,
+    run_embedding_arm,
+)
+from fused_memory.arm_harness.embedding_run_manifest import (
+    EmbeddingRunManifest,
+    load_embedding_run_manifest,
+)
+from fused_memory.arm_harness.graph_copy import ReembedCensusError
 from fused_memory.arm_harness.incumbent_cost import (
     INCUMBENT_COST_FILENAME,
     PRODUCTION_TELEMETRY_FILENAME,
@@ -74,19 +124,43 @@ from fused_memory.arm_harness.incumbent_cost import (
 )
 from fused_memory.arm_harness.instrument_checks import CheckResult
 from fused_memory.arm_harness.llm_metrics import TokenAccountingError
-from fused_memory.arm_harness.margins import MarginDerivationError
+from fused_memory.arm_harness.margins import MarginDerivationError, MarginEntry
+from fused_memory.arm_harness.mem0_replica import (
+    CollectionReader,
+    Mem0Snapshot,
+    ReplicaClient,
+    ReplicaHit,
+    load_snapshot,
+    snapshot_collection,
+    snapshot_sha,
+    write_snapshot,
+)
 from fused_memory.arm_harness.metrics_record import (
     IndexConfiguration,
     MetricsRecord,
     load_metrics_records,
     write_metrics_record,
 )
+from fused_memory.arm_harness.normalization import VectorInvariantError
 from fused_memory.arm_harness.preregistration import (
     PreregistrationError,
     PreregistrationInputs,
     derive_preregistration_inputs,
     load_preregistration_inputs,
     serialize_preregistration_inputs,
+)
+from fused_memory.arm_harness.probe_set import (
+    TRANSCRIPT_QUERY_CAP,
+    FrozenReference,
+    Mem0KnownItem,
+    Mem0SnapshotPin,
+    ProbeSet,
+    ProbeSetError,
+    TranscriptPin,
+    build_probe_set,
+    probe_set_sha,
+    read_probe_set,
+    serialize_probe_set,
 )
 from fused_memory.arm_harness.replay import ArmGraph, ReplayJournal
 from fused_memory.arm_harness.replay_types import (
@@ -95,6 +169,7 @@ from fused_memory.arm_harness.replay_types import (
     ReplaySettings,
     default_replay_settings,
 )
+from fused_memory.arm_harness.retrieval import Rank
 from fused_memory.arm_harness.run import (
     OUTCOMES_FILENAME,
     RUN_MANIFEST_FILENAME,
@@ -109,6 +184,7 @@ from fused_memory.arm_harness.scratch_guard import (
     ScratchGuardError,
     require_scratch_name,
 )
+from fused_memory.arm_harness.scratch_indices import IndexDropError
 from fused_memory.arm_harness.screening import (
     ScreeningVerdict,
     derive_screening_verdict,
@@ -119,7 +195,14 @@ from fused_memory.arm_harness.screening_evidence import (
     ScreeningEvidenceError,
     load_arm_evidence,
 )
-from fused_memory.arm_harness.slate import SlateArm, load_llm_slate
+from fused_memory.arm_harness.slate import (
+    EmbeddingSlateArm,
+    SlateArm,
+    embedding_candidate_spec,
+    embedding_control_spec,
+    load_embedding_slate,
+    load_llm_slate,
+)
 from fused_memory.arm_harness.teardown import CollectionClient, teardown_arm
 from fused_memory.arm_harness.topology import (
     IntegrityVerdict,
@@ -128,6 +211,7 @@ from fused_memory.arm_harness.topology import (
     read_topology,
     topology_hash,
 )
+from fused_memory.arm_harness.transcript_queries import iter_transcript_queries
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.services.write_journal import WriteJournal
 
@@ -145,23 +229,43 @@ JOURNAL_DIRNAME = 'journal'
 PARITY_DIRNAME = 'parity'
 MIN_CONTROL_RUNS = 2
 
+PROBE_SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'memory_eval_retrieval_probe.py'
+MEM0_PROJECT_ID = 'dark_factory'
+EMBED_SETTINGS = EmbedSettings(batch_size=64, concurrency=4)
+EMBEDDING_CONTROL_SCRATCH_GROUPS = {
+    'incumbent-embed-a': 'evalmem_lme_emb_ctl_a',
+    'incumbent-embed-b': 'evalmem_lme_emb_ctl_b',
+}
+REFERENCE_EPISODES_CYPHER = 'MATCH (e:Episodic) RETURN e.uuid, e.content'
+CITED_EPISODES_CYPHER = (
+    'MATCH ()-[r:RELATES_TO]->() UNWIND r.episodes AS uuid RETURN DISTINCT uuid'
+)
+
 
 class EpisodeSource(Protocol):
     async def fetch_population(self) -> list[build_corpus.EpisodeRecord]: ...
 
 
-class ScratchGraph(Protocol):
-    """The slice of a falkordb ``AsyncGraph`` the index probe, topology read and teardown use."""
-
-    async def query(self, q: str, params: dict[str, Any] | None = None) -> Any: ...
-
-    async def ro_query(self, q: str, params: dict[str, Any] | None = None) -> Any: ...
+class ScratchGraph(ArmScratchGraph, Protocol):
+    """The slice of a falkordb ``AsyncGraph`` an embedding run, the probes and teardown use."""
 
     async def delete(self) -> None: ...
 
 
 class ScratchGraphClient(Protocol):
+    async def list_graphs(self) -> list[str]: ...
+
     def select_graph(self, graph_id: str, /) -> ScratchGraph: ...
+
+
+class QdrantClient(CollectionClient, CollectionReader, ReplicaClient, Protocol):
+    """The slice of ``AsyncQdrantClient`` teardown, a Mem0 snapshot and an arm's replica use."""
+
+
+class ArmEmbedderBuilder(Protocol):
+    def __call__(
+        self, spec: EmbeddingArmSpec, base_config: FusedMemoryConfig, /, *, settings: EmbedSettings
+    ) -> ArmEmbedder: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,7 +280,12 @@ class HarnessDeps:
     ]
     open_journal: Callable[[Path], AbstractAsyncContextManager[ReplayJournal]]
     open_falkordb: Callable[[], AbstractAsyncContextManager[ScratchGraphClient]]
-    open_qdrant: Callable[[], AbstractAsyncContextManager[CollectionClient]]
+    open_qdrant: Callable[[], AbstractAsyncContextManager[QdrantClient]]
+    open_embedding_arm_backend: Callable[
+        [EmbeddingArmSpec, FusedMemoryConfig, EmbedderClient],
+        AbstractAsyncContextManager[EmbeddingSearchBackend],
+    ]
+    build_arm_embedder: ArmEmbedderBuilder
 
 
 def build_live_deps() -> HarnessDeps:
@@ -198,7 +307,7 @@ def build_live_deps() -> HarnessDeps:
             await client.aclose()
 
     @contextlib.asynccontextmanager
-    async def open_qdrant() -> AsyncIterator[CollectionClient]:
+    async def open_qdrant() -> AsyncIterator[QdrantClient]:
         client = AsyncQdrantClient(url=base.mem0.qdrant_url)
         try:
             yield client
@@ -212,6 +321,8 @@ def build_live_deps() -> HarnessDeps:
         open_journal=_open_journal,
         open_falkordb=open_falkordb,
         open_qdrant=open_qdrant,
+        open_embedding_arm_backend=open_embedding_arm_backend,
+        build_arm_embedder=build_arm_embedder,
     )
 
 
@@ -251,6 +362,15 @@ def _load_llm_spec(path: Path, command: str) -> LlmArmSpec:
     spec = _load_spec(path)
     if not isinstance(spec, LlmArmSpec):
         raise _Refusal(EXIT_REFUSED, f'{command} drives LLM arms; {path} is a {spec.axis} arm')
+    return spec
+
+
+def _load_embedding_spec(path: Path, command: str) -> EmbeddingArmSpec:
+    spec = _load_spec(path)
+    if not isinstance(spec, EmbeddingArmSpec):
+        raise _Refusal(
+            EXIT_REFUSED, f'{command} drives embedding arms; {path} is a {spec.axis} arm'
+        )
     return spec
 
 
@@ -300,7 +420,12 @@ def _fresh_run_dir(run_dir: Path) -> Path:
     return run_dir
 
 
-def _load_run(run_dir: Path) -> tuple[RunManifest, tuple[MetricsRecord, ...]]:
+_Manifest = TypeVar('_Manifest', RunManifest, EmbeddingRunManifest)
+
+
+def _load_run_with(
+    run_dir: Path, load_manifest: Callable[[Path], _Manifest]
+) -> tuple[_Manifest, tuple[MetricsRecord, ...]]:
     """A committed run's manifest and records; a spec naming a protected graph raises raw."""
     manifest_path = run_dir / RUN_MANIFEST_FILENAME
     if not manifest_path.is_file():
@@ -309,9 +434,17 @@ def _load_run(run_dir: Path) -> tuple[RunManifest, tuple[MetricsRecord, ...]]:
             f'{run_dir} has no {RUN_MANIFEST_FILENAME}: an interrupted run, or not a run dir',
         )
     try:
-        return load_run_manifest(manifest_path), load_metrics_records(run_dir)
+        return load_manifest(manifest_path), load_metrics_records(run_dir)
     except (OSError, ValueError) as error:
         raise _Refusal(EXIT_REFUSED, f'{run_dir} is not a readable run: {error}') from error
+
+
+def _load_run(run_dir: Path) -> tuple[RunManifest, tuple[MetricsRecord, ...]]:
+    return _load_run_with(run_dir, load_run_manifest)
+
+
+def _load_embedding_run(run_dir: Path) -> tuple[EmbeddingRunManifest, tuple[MetricsRecord, ...]]:
+    return _load_run_with(run_dir, load_embedding_run_manifest)
 
 
 def _load_control_run(run_dir: Path) -> tuple[RunManifest, tuple[MetricsRecord, ...]]:
@@ -362,6 +495,47 @@ def _scratch_graph(
     client: ScratchGraphClient, name: str, checkpoint: GuardCheckpoint
 ) -> ScratchGraph:
     return client.select_graph(require_scratch_name(name, checkpoint=checkpoint))
+
+
+def _read_probe_set(path: Path) -> tuple[ProbeSet, str]:
+    """The probe set at ``path`` and its sha, which every embedding arm's corpus_sha names."""
+    try:
+        return read_probe_set(path)
+    except (OSError, ValueError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} is not a readable probe set: {error}') from error
+
+
+def _arm_probe_set(path: Path, spec: EmbeddingArmSpec) -> ProbeSet:
+    probe_set, sha = _read_probe_set(path)
+    if sha != spec.corpus_sha:
+        raise _Refusal(
+            EXIT_CORPUS_INTEGRITY,
+            f'arm {spec.arm_id!r} names corpus_sha {spec.corpus_sha}, but {path} hashes to {sha}',
+        )
+    return probe_set
+
+
+def load_probe_module() -> ModuleType:
+    """E1's ``memory_eval_retrieval_probe``, loaded by path once (scripts/ is no package).
+
+    The shape of ``scripts/retro_stamp_topics.py::_load_probe_module``: a module already
+    in ``sys.modules`` is reused, so every caller shares one set of its classes.
+    """
+    mod_name = 'memory_eval_retrieval_probe'
+    cached = sys.modules.get(mod_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(mod_name, PROBE_SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'cannot load {PROBE_SCRIPT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
 
 
 # --- output ---------------------------------------------------------------------------
@@ -513,14 +687,18 @@ def _cmd_preregister(args: argparse.Namespace, deps: DepsFactory) -> int:
     return EXIT_OK
 
 
-def _print_preregistration(inputs: PreregistrationInputs) -> None:
-    for entry in inputs.margins:
+def _print_margins(margins: Sequence[MarginEntry]) -> None:
+    for entry in margins:
         configuration = f' [{entry.index_configuration}]' if entry.index_configuration else ''
         print(
             f'margin {entry.metric_id}{configuration}: reference {entry.reference_value} '
             f'sigma {entry.sigma} ({entry.sigma_source}) floor {entry.floor} '
             f'margin {entry.margin} ({entry.direction})'
         )
+
+
+def _print_preregistration(inputs: PreregistrationInputs) -> None:
+    _print_margins(inputs.margins)
     envelope, profile = inputs.envelope, inputs.call_profile
     print(
         f'envelope: warm p95 under load < {envelope.p95_bound_ms} ms '
@@ -536,7 +714,7 @@ def _print_preregistration(inputs: PreregistrationInputs) -> None:
 
 def _cmd_screen(args: argparse.Namespace, deps: DepsFactory) -> int:
     out = _fresh_output(args.out)
-    slate = _read_slate(args.arms_manifest)
+    slate = _read_slate(args.arms_manifest, load_llm_slate)
     evidence = {
         arm.arm_id: load_arm_evidence(ArmEvidencePaths(args.evidence_root, arm.arm_id), arm)
         for arm in slate
@@ -553,9 +731,12 @@ def _cmd_screen(args: argparse.Namespace, deps: DepsFactory) -> int:
     return EXIT_OK
 
 
-def _read_slate(path: Path) -> tuple[SlateArm, ...]:
+_Arm = TypeVar('_Arm', SlateArm, EmbeddingSlateArm)
+
+
+def _read_slate(path: Path, load: Callable[[Path], tuple[_Arm, ...]]) -> tuple[_Arm, ...]:
     try:
-        return load_llm_slate(path)
+        return load(path)
     except (OSError, ValueError) as error:
         raise _Refusal(EXIT_REFUSED, f'{path} is not a readable arms manifest: {error}') from error
 
@@ -683,6 +864,348 @@ async def _teardown(
             return
         async with live.open_qdrant() as qdrant:
             await teardown_arm(falkor, qdrant, spec)
+
+
+# --- the embedding axis ----------------------------------------------------------------
+
+
+def _cmd_mem0_snapshot(args: argparse.Namespace, deps: DepsFactory) -> int:
+    out = _fresh_output(args.out)
+    snapshot = asyncio.run(_mem0_snapshot(deps(), args.collection))
+    write_snapshot(out, snapshot)
+    print(
+        f'{len(snapshot.records)} records from {snapshot.source!r}, '
+        f'{snapshot.excluded_empty} without text left out'
+    )
+    print(f'sha256: {snapshot_sha(out)}')
+    print(f'wrote: {out}')
+    return EXIT_OK
+
+
+async def _mem0_snapshot(live: HarnessDeps, collection: str) -> Mem0Snapshot:
+    async with live.open_qdrant() as qdrant:
+        return await snapshot_collection(qdrant, collection)
+
+
+def _cmd_probe_set(args: argparse.Namespace, deps: DepsFactory) -> int:
+    out = _fresh_output(args.out)
+    reference = _read_frozen_reference(args.reference_json)
+    corpus = _reference_corpus_sha(args.control_a_outcomes, reference)
+    replayed = {
+        outcome.replay_episode_uuid
+        for outcome in _read_outcomes(args.control_a_outcomes)
+        if outcome.ok and outcome.replay_episode_uuid is not None
+    }
+    snapshot_pin, snapshot = _read_mem0_snapshot(args.mem0_snapshot)
+    mem0_items = _mem0_known_items(args.registry, snapshot)
+    transcript = _transcript_pin(args.transcript_corpus)
+    read = asyncio.run(_read_reference(deps(), reference))
+    if not read.frozen.passed:
+        _print_checks((read.frozen,))
+        return EXIT_CHECK_FAILED
+    probe_set = build_probe_set(
+        corpus_sha=corpus,
+        reference=reference,
+        episodes=read.episodes,
+        cited_episode_uuids=read.cited,
+        control_ok_episode_uuids=replayed,
+        transcript=transcript,
+        mem0_snapshot=snapshot_pin,
+        mem0_known_items=mem0_items,
+    )
+    text = serialize_probe_set(probe_set)
+    atomic_write_text(out, text, mkdir=True)
+    _print_probe_set(probe_set)
+    print(f'sha256: {probe_set_sha(text.encode())}')
+    print(f'wrote: {out}')
+    return EXIT_OK
+
+
+def _read_frozen_reference(path: Path) -> FrozenReference:
+    try:
+        return FrozenReference.model_validate_json(path.read_bytes())
+    except (OSError, ValueError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} is not a readable frozen reference: {error}') from error
+
+
+def _reference_corpus_sha(outcomes: Path, reference: FrozenReference) -> str:
+    """δ's corpus_sha, from the run.json beside control A's outcomes, once that run built the reference."""
+    run, _ = _load_control_run(outcomes.parent)
+    if run.spec.scratch_group_id != reference.graph:
+        raise _Refusal(
+            EXIT_REFUSED,
+            f'{outcomes.parent} replayed into {run.spec.scratch_group_id!r}, not the reference '
+            f'graph {reference.graph!r}, so its outcomes are not the reference\'s episodes',
+        )
+    return run.spec.corpus_sha
+
+
+def _read_mem0_snapshot(path: Path) -> tuple[Mem0SnapshotPin, Mem0Snapshot]:
+    try:
+        snapshot, sha = load_snapshot(path), snapshot_sha(path)
+    except (OSError, ValueError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} is not a readable Mem0 snapshot: {error}') from error
+    pin = Mem0SnapshotPin(
+        source=snapshot.source,
+        sha256=sha,
+        point_count=len(snapshot.records),
+        excluded_empty=snapshot.excluded_empty,
+    )
+    return pin, snapshot
+
+
+def _mem0_known_items(registry_path: Path, snapshot: Mem0Snapshot) -> list[Mem0KnownItem]:
+    """Each phrasing of E1's project topics whose canonical the snapshot holds, by hash or else id."""
+    probe = load_probe_module()
+    try:
+        registry = probe.load_topic_registry(registry_path)
+    except probe.RegistryError as error:
+        raise _Refusal(EXIT_REFUSED, f'{registry_path}: {error}') from error
+    held_hashes = {probe.content_key(record.data) for record in snapshot.records}
+    held_ids = {record.id for record in snapshot.records}
+    return [
+        Mem0KnownItem(
+            topic=entry.topic,
+            phrasing=phrasing.text,
+            held_out=phrasing.held_out,
+            canonical_content_hash=entry.canonical.content_hash,
+            canonical_last_known_id=entry.canonical.last_known_id,
+        )
+        for entry in registry.entries
+        if entry.project_id == MEM0_PROJECT_ID
+        and (
+            entry.canonical.content_hash in held_hashes
+            or entry.canonical.last_known_id in held_ids
+        )
+        for phrasing in entry.phrasings
+    ]
+
+
+def _transcript_pin(path: Path) -> TranscriptPin:
+    try:
+        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        queries = tuple(itertools.islice(iter_transcript_queries(path), TRANSCRIPT_QUERY_CAP))
+    except (OSError, ValueError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} is not a readable transcript corpus: {error}') from error
+    return TranscriptPin(path=path.name, sha256=sha, queries=queries)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReferenceRead:
+    frozen: CheckResult
+    episodes: tuple[tuple[str, str], ...]
+    cited: frozenset[str]
+
+
+async def _read_reference(live: HarnessDeps, reference: FrozenReference) -> _ReferenceRead:
+    """The reference's live hash check, Episodic (uuid, content) pairs and cited uuids; ro_query only."""
+    async with live.open_falkordb() as client:
+        graph = _scratch_graph(client, reference.graph, GuardCheckpoint.TOPOLOGY_READ)
+        topology = await read_topology(graph, reference.graph)
+        episodes = await graph.ro_query(REFERENCE_EPISODES_CYPHER)
+        cited = await graph.ro_query(CITED_EPISODES_CYPHER)
+    return _ReferenceRead(
+        frozen=frozen_reference_check(reference, topology_hash(*topology)),
+        episodes=tuple((uuid, content) for uuid, content in episodes.result_set),
+        cited=frozenset(uuid for (uuid,) in cited.result_set),
+    )
+
+
+def _print_probe_set(probe_set: ProbeSet) -> None:
+    topics = {item.topic for item in probe_set.mem0_known_items}
+    print(
+        f'query words {probe_set.query_words}: {len(probe_set.known_items)} known items, '
+        f'{probe_set.uncited_episodes} uncited episodes left out'
+    )
+    print(
+        f'transcript queries {len(probe_set.transcript.queries)}; Mem0 known items '
+        f'{len(probe_set.mem0_known_items)} over {len(topics)} topics'
+    )
+
+
+def _cmd_embed_specs(args: argparse.Namespace, deps: DepsFactory) -> int:
+    slate = _read_slate(args.arms_manifest, load_embedding_slate)
+    _, corpus = _read_probe_set(args.probe_set)
+    arm_ids = [*EMBEDDING_CONTROL_SCRATCH_GROUPS, *(arm.arm_id for arm in slate)]
+    if len(set(arm_ids)) != len(arm_ids):
+        raise _Refusal(
+            EXIT_REFUSED, f'{args.arms_manifest} reuses a control arm id: arms {arm_ids}'
+        )
+    outputs = {arm_id: _fresh_output(args.out_dir / f'{arm_id}.json') for arm_id in arm_ids}
+    specs = _embedding_specs(args, slate, corpus, deps().base_config)
+    _write_all_or_none(*((outputs[spec.arm_id], _spec_text(spec)) for spec in specs))
+    for spec in specs:
+        print(f'wrote: {outputs[spec.arm_id]}')
+    return EXIT_OK
+
+
+def _embedding_specs(
+    args: argparse.Namespace,
+    slate: Sequence[EmbeddingSlateArm],
+    corpus: str,
+    base_config: FusedMemoryConfig,
+) -> tuple[EmbeddingArmSpec, ...]:
+    """The incumbent controls, at the base config's embedder, then each slate arm."""
+    incumbent = base_config.embedder
+    try:
+        controls = tuple(
+            embedding_control_spec(
+                arm_id,
+                model_id=incumbent.model,
+                embedding_dim=incumbent.dimensions,
+                code_sha=args.code_sha,
+                corpus_sha=corpus,
+                scratch_group_id=scratch,
+            )
+            for arm_id, scratch in EMBEDDING_CONTROL_SCRATCH_GROUPS.items()
+        )
+        candidates = tuple(
+            embedding_candidate_spec(
+                arm,
+                code_sha=args.code_sha,
+                corpus_sha=corpus,
+                preregistration_sha=args.preregistration_sha,
+            )
+            for arm in slate
+        )
+    except ValueError as error:
+        raise _Refusal(EXIT_REFUSED, f'the embedding specs are not valid: {error}') from error
+    return (*controls, *candidates)
+
+
+def _spec_text(spec: EmbeddingArmSpec) -> str:
+    return canonical_json_text(spec.model_dump(mode='json'))
+
+
+def _cmd_embed_run(args: argparse.Namespace, deps: DepsFactory) -> int:
+    spec = _load_embedding_spec(args.arm_spec, 'embed-run')
+    require_pre_run_checks(spec, args.repo_root)
+    probe_set = _arm_probe_set(args.probe_set, spec)
+    run_dir = _fresh_run_dir(args.out_root / spec.arm_id / run_stamp())
+    manifest = asyncio.run(_embed_run(args, spec, probe_set, run_dir, deps()))
+    print(f'run: {run_dir}')
+    _print_checks(manifest.check_results)
+    return _checks_exit_code(manifest.check_results)
+
+
+async def _embed_run(
+    args: argparse.Namespace,
+    spec: EmbeddingArmSpec,
+    probe_set: ProbeSet,
+    run_dir: Path,
+    live: HarnessDeps,
+) -> EmbeddingRunManifest:
+    embedder = live.build_arm_embedder(spec, live.base_config, settings=EMBED_SETTINGS)
+    async with (
+        live.open_falkordb() as falkor,
+        live.open_qdrant() as qdrant,
+        live.open_embedding_arm_backend(
+            spec, live.base_config, QueryEmbedder(embedder)
+        ) as backend,
+    ):
+        return await run_embedding_arm(
+            spec,
+            args.probe_set,
+            graph_client=falkor,
+            backend=backend,
+            qdrant=qdrant,
+            embedder=embedder,
+            mem0_snapshot=args.mem0_snapshot,
+            mem0_project_id=MEM0_PROJECT_ID,
+            rank_mem0=_mem0_ranker(probe_set.mem0_known_items),
+            base_config=live.base_config,
+            run_dir=run_dir,
+            repo_root=args.repo_root,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _PinnedTopic:
+    """A registry topic as the probe set pinned it: the part of an entry canonical_hit matches on."""
+
+    topic: str
+    canonical: Any
+
+
+def _mem0_ranker(items: Sequence[Mem0KnownItem]) -> Mem0Ranker:
+    """E1's own canonical_hit, over the canonical the probe set pinned for each topic."""
+    probe = load_probe_module()
+    topics = {
+        item.topic: _PinnedTopic(
+            topic=item.topic,
+            canonical=probe.Canonical(
+                content_hash=item.canonical_content_hash,
+                last_known_id=item.canonical_last_known_id,
+            ),
+        )
+        for item in items
+    }
+
+    def rank(topic: str, hits: Sequence[ReplicaHit]) -> Rank:
+        return probe.canonical_hit(list(hits), topics[topic], SEARCH_K).rank
+
+    return rank
+
+
+def _cmd_embed_preregister(args: argparse.Namespace, deps: DepsFactory) -> int:
+    out = _fresh_output(args.out)
+    run_a, records_a = _load_embedding_run(args.run_a)
+    run_b, records_b = _load_embedding_run(args.run_b)
+    inputs = derive_embedding_preregistration_inputs(run_a, records_a, run_b, records_b)
+    atomic_write_text(out, serialize_embedding_preregistration_inputs(inputs), mkdir=True)
+    _print_margins(inputs.margins)
+    envelope = inputs.query_latency_envelope
+    print(
+        f'query-latency envelope: warm p95 under load < {envelope.p95_bound_ms} ms '
+        f'(search timeout {envelope.search_timeout_s} s / headroom {envelope.headroom}); '
+        f'incumbent p95 {inputs.incumbent_query_latency_p95_ms} ms'
+    )
+    print(f'wrote: {out}')
+    return EXIT_OK
+
+
+def _cmd_embed_compare(args: argparse.Namespace, deps: DepsFactory) -> int:
+    inputs = _read_embedding_preregistration(args.preregistration)
+    comparisons = [
+        compare_embedding_arm(inputs, *_load_embedding_run(run_dir)) for run_dir in args.run
+    ]
+    print('| arm | metric | index configuration | reference | margin | candidate | admits |')
+    print('|---|---|---|---|---|---|---|')
+    for comparison in comparisons:
+        _print_margin_rows(comparison)
+    for comparison in comparisons:
+        _print_comparison_verdict(comparison)
+    return EXIT_OK
+
+
+def _read_embedding_preregistration(path: Path) -> EmbeddingPreregistrationInputs:
+    try:
+        return load_embedding_preregistration_inputs(path)
+    except (OSError, ValueError) as error:
+        raise _Refusal(
+            EXIT_REFUSED, f'{path} is not a readable embedding pre-registration: {error}'
+        ) from error
+
+
+def _print_margin_rows(comparison: EmbeddingComparison) -> None:
+    for row in comparison.margins:
+        configuration = row.index_configuration.value if row.index_configuration else '-'
+        print(
+            f'| {comparison.arm_id} | {row.metric_id} | {configuration} | {row.reference_value} '
+            f'| {row.margin} | {row.candidate_value} | {row.admits} |'
+        )
+
+
+def _print_comparison_verdict(comparison: EmbeddingComparison) -> None:
+    arm_id, envelope = comparison.arm_id, comparison.envelope
+    print(
+        f'envelope {arm_id}: p95 {envelope.candidate_p95_ms} ms, '
+        f'{envelope.failed_queries} failed queries, bound {envelope.p95_bound_ms} ms, '
+        f'admits {envelope.admits}'
+    )
+    for row in comparison.reported:
+        print(f'reported {arm_id} {row.metric_id}: {row.value} (n {row.n})')
+    print(f'non_inferior {arm_id}: {comparison.non_inferior}')
 
 
 # --- parser and entry point -----------------------------------------------------------
@@ -817,7 +1340,64 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_arm_spec(teardown)
     teardown.add_argument('--collection', action='store_true', help='also its Qdrant replica')
     teardown.set_defaults(handler=_cmd_teardown)
+    _add_embedding_commands(commands)
     return parser
+
+
+def _add_embedding_commands(commands: Any) -> None:
+    snapshot = commands.add_parser(
+        'mem0-snapshot', help='a frozen, read-only snapshot of one Mem0 collection'
+    )
+    snapshot.add_argument('--collection', required=True, help='the live collection to read')
+    snapshot.add_argument('--out', type=Path, required=True, help='JSONL to write; never overwritten')
+    snapshot.set_defaults(handler=_cmd_mem0_snapshot)
+
+    probe = commands.add_parser('probe-set', help='the embedding probe set (reads the reference)')
+    probe.add_argument('--reference-json', type=Path, required=True, help="ζ's frozen-reference.json")
+    probe.add_argument(
+        '--control-a-outcomes',
+        type=Path,
+        required=True,
+        help="control A's outcomes.jsonl; the run.json beside it names the corpus and graph",
+    )
+    probe.add_argument(
+        '--transcript-corpus', type=Path, required=True, help='a transcript corpus-<STAMP>.jsonl'
+    )
+    probe.add_argument('--mem0-snapshot', type=Path, required=True, help="mem0-snapshot's JSONL")
+    probe.add_argument('--registry', type=Path, required=True, help="E1's topic registry JSON")
+    probe.add_argument('--out', type=Path, required=True, help='JSON to write; never overwritten')
+    probe.set_defaults(handler=_cmd_probe_set)
+
+    specs = commands.add_parser('embed-specs', help='the control and slate embedding arm specs')
+    specs.add_argument('--arms-manifest', type=Path, required=True, help='the arms.yaml slate')
+    specs.add_argument('--probe-set', type=Path, required=True, help='its sha is every corpus_sha')
+    specs.add_argument('--code-sha', required=True, help='the clean commit every arm runs at')
+    specs.add_argument('--preregistration-sha', required=True, help="the candidates' prereg commit")
+    specs.add_argument('--out-dir', type=Path, required=True, help='<arm_id>.json each; never overwritten')
+    specs.set_defaults(handler=_cmd_embed_specs)
+
+    embed_run = commands.add_parser('embed-run', help='one embedding arm, end to end')
+    _add_arm_spec(embed_run)
+    embed_run.add_argument('--probe-set', type=Path, required=True)
+    embed_run.add_argument('--mem0-snapshot', type=Path, required=True, help='the pinned snapshot')
+    embed_run.add_argument('--out-root', type=Path, required=True)
+    embed_run.add_argument('--repo-root', type=Path, default=REPO_ROOT, help='checkout code_sha names')
+    embed_run.set_defaults(handler=_cmd_embed_run)
+
+    preregister = commands.add_parser(
+        'embed-preregister', help='the embedding pre-registration inputs of a control pair'
+    )
+    preregister.add_argument('--run-a', type=Path, required=True, help='a control run dir')
+    preregister.add_argument('--run-b', type=Path, required=True, help='the other control run dir')
+    preregister.add_argument('--out', type=Path, required=True, help='JSON to write; never overwritten')
+    preregister.set_defaults(handler=_cmd_embed_preregister)
+
+    compare = commands.add_parser(
+        'embed-compare', help='candidate runs against the embedding pre-registration (offline)'
+    )
+    compare.add_argument('--preregistration', type=Path, required=True, help="embed-preregister's JSON")
+    compare.add_argument('--run', type=Path, action='append', required=True, help='a candidate run')
+    compare.set_defaults(handler=_cmd_embed_compare)
 
 
 def _report(exit_code: int, message: str) -> int:
@@ -851,11 +1431,23 @@ def main(argv: list[str] | None = None, *, deps: DepsFactory = build_live_deps) 
         TelemetryWindowError,
         TelemetryAccountingError,
         IncumbentCostError,
+        EmbeddingRunRefused,
+        ProbeSetError,
+        EmbeddingPreregistrationError,
     ) as error:
         return _report(EXIT_REFUSED, _named(error))
+    except EmbeddingRunCheckFailed as error:
+        return _report(EXIT_CHECK_FAILED, _named(error))
     except (CorpusIntegrityError, build_corpus.CorpusBuildError) as error:
         return _report(EXIT_CORPUS_INTEGRITY, _named(error))
-    except (IndexBuildError, ProbeCleanupError, RedisError) as error:
+    except (
+        IndexBuildError,
+        IndexDropError,
+        ReembedCensusError,
+        VectorInvariantError,
+        ProbeCleanupError,
+        RedisError,
+    ) as error:
         return _report(EXIT_RUN_FAILED, _named(error))
 
 

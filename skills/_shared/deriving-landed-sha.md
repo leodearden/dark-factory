@@ -105,7 +105,7 @@ restricted to merge commits, matches any commit merely *mentioning* the task, an
 returns any ordinary commit whose *body* happens to quote the marker string — a documentation
 commit describing this very mechanism, a revert, a commit message citing another task's merge.
 That is a live hazard in this repo, not a hypothetical: measured 2026-09-22,
-`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H`
+`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H` <!-- marker-search-guard: counterexample -->
 returns `d0d67f0c53`, a **non-merge** docs commit from task 4612 whose body quotes the subject,
 rather than the true train merge `d25b24468c` — which the command above does return. The
 substring-safety argument covers only the `task/1`-inside-`task/10` collision; it says nothing
@@ -135,9 +135,13 @@ walk. Measured 2026-09-22 over main's ~68k commits, against a marker a few hundr
 ~2.1s (range 1.3–3.0s). On a query with **no** match the two are indistinguishable — both walk
 everything — so benchmarking a missing marker will wrongly suggest the flag is free to restore.
 Roughly two seconds, once, at the moment a task is stamped, is the price of not recording a
-documentation commit as a merge. Note that **nothing enforces this mechanically** — no test greps
-these snippets for the flag, so this paragraph is the only thing standing between a plausible-looking
-optimization and a wrong `done_provenance`.
+documentation commit as a merge. `tests/scripts/test_merge_marker_search_snippets.py` enforces
+this: it runs every marker search in `skills/` — any `git log` or `git rev-list` that greps for
+`$S` or a merge subject, with or without `--fixed-strings` — against a history where a newer body
+match shadows the genuine marker, so putting the flag back — or any other take-the-newest-hit
+shortcut — turns it red. A snippet that quotes a bare form on purpose, like the measured one above,
+carries `<!-- marker-search-guard: counterexample -->` right after its closing backtick and is not
+run.
 
 The shadowing is common and it is *growing*, because this repo's own commits about this mechanism
 quote the subject they document. Measured 2026-09-22 over all 68,279 commits on main: 12 branches
@@ -283,14 +287,22 @@ fi
 `--ancestry-path task/<TASK_ID>..main` lists every merge that *descends from* this branch, so
 once the branch is on main it also lists every unrelated merge landed afterwards, and `tail -1`
 returns the **oldest** of them. That oldest descendant is the merge that brought this branch in
-when one exists, and an unrelated later merge only when the branch was already in main before it
+only when no other merge descends from the branch first. A merge made on a branch **stacked** on
+this one — dark-factory makes these, e.g. a carry branch that merged main in to resolve
+conflicts before landing — sorts older, so `tail -1` returns that sync merge; its `^1` already
+contains this branch, so the containment check exits 0 and the arm falls through to the citation
+gate instead of stamping it (safe: never a wrong stamp, at worst the citing commit instead of the
+landing merge). It is an unrelated later merge only when the branch was already in main before it
 — which is exactly the distinction the containment check below is there to make.
 
 **`--topo-order` is REQUIRED, not decoration.** `git rev-list` orders by **commit date** by
 default, *not* topologically, so the "oldest" claim above holds only while dates happen to agree
-with topology. A merge whose committer date is skewed or was rewritten — a rebase, a replayed
-patch, a clock-skewed machine — can sort out of position, and `tail -1` then returns a *later*
-merge instead of the one that brought this branch in. Dropping `--topo-order` fails **silently**:
+with topology. Two things break that: commits that share one committer-date second (the
+realistic single-machine case — scripted commits and a busy merge lane land several per second;
+no skew involved), and a committer clock skewed across machines, which can date a commit older
+than the commit it descends from. Either can sort a merge out of position, and `tail -1` then
+returns a *later* merge instead of the one that brought this branch in.
+Dropping `--topo-order` fails **silently**:
 `$c^1` is then that later merge's parent, which already contains the branch, so the check reports
 `contained-before rc=0`, the arm reads "unrelated later merge, do not stamp", and the real group
 merge is skipped — the procedure degrades to the citation gate below and stamps a citing commit
@@ -301,23 +313,24 @@ The containment check on `$c`'s **first parent** decides — but read the caveat
 
 **`$c^1` is main-just-before-the-merge only when `$c` was created ON main.**
 `orchestrator/src/orchestrator/git_ops.py::GitOps.merge_to_main` merges with `git merge --no-ff`
-*from* main, so that holds for every dark-factory landing. It is **not** guaranteed for a target
-project reached via [`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site, where the
-project's own merge convention decides parent order: a merge built on the branch side (e.g. an
-integration branch cut from the task branch, then fast-forwarded onto main) has the **task tip**
-at `$c^1`, the containment check exits 0 trivially, and this arm falsely concludes "unrelated
-later merge, do not stamp" — discarding a merge sha you were already holding. On a project whose
-merge direction you do not know, confirm the parent order before trusting the rc:
-`git rev-list --parents -n 1 "$c"` (or `git log --format=%P -n 1 "$c"`) — the first parent listed
-must itself be on main *before* `$c`; if it is the branch side, read `$c^2` instead.
+*from* main, so that holds for every dark-factory landing. On a target project reached via
+[`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site whose merge direction you do not
+know, parent order is **not recoverable**: git records no merge direction. A merge built on the
+branch side and fast-forwarded onto main is the same commit graph, sha for sha, as a
+fast-forward landing followed by an unrelated merge made on main, so no parent-order,
+first-parent or containment check can tell them apart. On such a project read
+`contained-before rc=0` as **undecided** rather than as "unrelated later merge", and take the
+same exit: do not stamp `$c`, continue to the citation gate.
+(`orchestrator/tests/test_group_merge_candidate_ordering.py` pins the identity against real git.)
 
 - **contained-before rc=1** → the branch was not in main before `$c`, so `$c` **is** the merge
   that brought it in. Stamp `{"kind": "<merged|found_on_main>", "commit": "$c", "note": "absorbed
   into group merge; sha verified by ancestry containment"}` — `$c` is a merge commit that brought
   this branch in, so the same `kind` rule as [step 2](#step-2) applies. Carry the note here too.
-- **contained-before rc=0** (or `$c` empty) → the branch was already in main before `$c`, so
-  `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp
-  yet** — continue to the citation gate below, whose only stampable sha is the citing commit.
+- **contained-before rc=0** (or `$c` empty) → **do not stamp `$c`**. Where `$c` was created on
+  main, the branch was already in main before it and `$c` is an unrelated later merge; where
+  merge direction is unknown, rc=0 is undecided. Either way, continue to the citation gate
+  below, whose only stampable sha is the citing commit.
 
 **The citation gate (phantom-branch check).** rc=0 does not by itself prove this branch carries
 any work: a branch that never advanced past its creation point has main's own old base commit as
@@ -405,12 +418,12 @@ verdict.
 
 Instead follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
 successor" rules 2–3: check the **TIP's** merge marker and this task's own scheduler status, and
-on either landing signal the verdict is **landed** rather than not-landed. **Rule 2b licenses no
-write on this arm** — there is no self-stamp — exactly as rule 2a licenses none on the rc=128 arm
-below; the two arms agree. Rule 2b is the authority for the whole disposition — read which exit
-each scheduler status yields, its **landed-but-not-credited** report, and the `git cherry main
-task/<TASK_ID>` content proof (including why that proof cannot discharge the veto) from there, not
-from here. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
+on either landing signal the verdict is **landed** rather than not-landed. **Rule 2v (the veto, both
+arms) licenses no write on this arm** — there is no self-stamp — exactly as it licenses none on the
+rc=128 arm below; the two arms agree. Rules 2v and 2b are the authority for the whole disposition —
+read which exit each scheduler status yields, its **landed-but-not-credited** report, and why a
+content proof cannot discharge the veto from 2v, and the `git cherry main task/<TASK_ID>` content
+proof itself from 2b, not from here. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
 
 Only outside that arm — no train absorption anywhere in this task's history — is rc=1 a genuine
 not-landed outcome. What to do with it there is the call site's own disposition (`unblock` and
@@ -429,11 +442,11 @@ to prevent, and the one call sites act on hardest, since a not-landed reading he
 On that arm, follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
 successor" **rule 2a**, which governs precisely rc=128-with-empty-marker: check the **TIP's**
 merge marker on main and this task's own scheduler status, and on either landing signal the
-verdict is **landed** rather than not-landed. **Rule 2a licenses no write on this arm** — there
-is no self-stamp — exactly as rule 2b licenses none on the rc=1 arm; the two arms agree. Rule 2a
-is the authority for the whole disposition — read which exit each scheduler status yields, its
-**landed-but-not-credited** report, and why the `git cherry` content proof is unavailable on
-this arm from there, not from here.
+verdict is **landed** rather than not-landed. **Rule 2v (the veto, both arms) licenses no write on this arm** —
+there is no self-stamp — exactly as it licenses none on the rc=1 arm; the two arms agree. Rules 2v
+and 2a are the authority for the whole disposition — read which exit each scheduler status yields,
+its **landed-but-not-credited** report from 2v, and why the `git cherry` content proof is
+unavailable on this arm from 2a, not from here.
 [`unblock/SKILL.md`](../unblock/SKILL.md) states the same for its own resumed loop: *"Neither an
 empty rc=128 marker search nor rc=1 means 'not landed' here."* **rc=128-with-empty-marker is NOT
 not-landed on the `coalesce-*` arm.**

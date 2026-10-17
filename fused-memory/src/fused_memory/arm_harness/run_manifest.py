@@ -61,7 +61,7 @@ class RunManifest(FrozenModel):
         return self
 
 
-def _null_convention_payload(model: BaseModel) -> dict[str, object]:
+def null_convention_payload(model: BaseModel) -> dict[str, object]:
     """``model`` as JSON data, omitting None-valued optional fields at every nested model."""
     dumped = model.model_dump(mode='json')
     payload: dict[str, object] = {}
@@ -70,12 +70,12 @@ def _null_convention_payload(model: BaseModel) -> dict[str, object]:
         if value is None and not field.is_required():
             continue
         nested = isinstance(value, BaseModel)
-        payload[name] = _null_convention_payload(value) if nested else dumped[name]
+        payload[name] = null_convention_payload(value) if nested else dumped[name]
     return payload
 
 
 def serialize_run_manifest(manifest: RunManifest) -> str:
-    return canonical_json_text(_null_convention_payload(manifest))
+    return canonical_json_text(null_convention_payload(manifest))
 
 
 def load_run_manifest(path: Path | str) -> RunManifest:

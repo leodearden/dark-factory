@@ -529,8 +529,8 @@ def _heartbeat(delta: timedelta) -> str:
     return (datetime.now(UTC) + delta).isoformat()
 
 
-# Stale/fresh relative to live_workflow_detector.DEFAULT_HEARTBEAT_TTL (10
-# minutes). Both margins are wide enough that real-clock drift during the test
+# Stale/fresh relative to shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL
+# (10 minutes). Both margins are wide enough that real-clock drift during the test
 # can never flip the verdict, which is why check() needs no `now` seam.
 _STALE_HEARTBEAT = timedelta(minutes=-30)
 _FRESH_HEARTBEAT = timedelta(seconds=-5)

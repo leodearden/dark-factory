@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
+from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
 
 logger = logging.getLogger(__name__)
 
@@ -327,8 +328,8 @@ def residue_detail(
         'residue.',
         '',
         'Recover the payload below for the caller if it is still needed, then '
-        'chase the harness serialization leak that produced it against '
-        'plans/toolcall-markup-containment-prd.md.',
+        'chase the harness serialization leak that produced it and '
+        f'{MARKUP_RECURRENCE_ROUTING}.',
         '',
         'RAW PAYLOAD (verbatim, the only surviving copy):',
         str(record.get('raw_value')),
@@ -340,8 +341,8 @@ def storm_detail(
 ) -> str:
     """The burst alarm's body — who leaked, the window's numbers, what to do.
 
-    Points at ``plans/toolcall-markup-containment-prd.md`` and NOT at DF 3083,
-    which is done and CLOSED to appends: nothing reads what is attached there.
+    The routing sentence is
+    ``shared/src/shared/mcp_markup_middleware.py::MARKUP_RECURRENCE_ROUTING``.
 
     ``subject_task_id`` leads for the same reason it leads in
     :func:`residue_detail` — the record's own ``task_id`` field is the
@@ -400,8 +401,7 @@ def storm_detail(
         'The caller is named ABOVE: subject_task_id is whose plan this server '
         'was serving, crossing_* names the one call that crossed the '
         'threshold, and callers lists every distinct caller seen in the '
-        'window. Start there, then report it against '
-        'plans/toolcall-markup-containment-prd.md.',
+        f'window. Start there, then {MARKUP_RECURRENCE_ROUTING}.',
         '',
         # BOUNDARY-SCOPED, not universal, and no longer this filer's to
         # phrase. The route to a per-event answer differs per registration
@@ -615,9 +615,8 @@ def file_storm(
             f'the record names its caller: subject_task_id={subject_task_id!r}, '
             'with crossing_* naming the call that crossed the threshold and '
             'callers listing every caller seen in the window — read those off '
-            'the detail and report it against '
-            'plans/toolcall-markup-containment-prd.md (DF task 3083 is done '
-            'and closed to appends). For per-event corroboration, '
+            f'the detail and {MARKUP_RECURRENCE_ROUTING}. For per-event '
+            'corroboration, '
             + spec.attribution_source
         ),
         worktree=str(worktree),

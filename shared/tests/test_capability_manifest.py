@@ -12,6 +12,8 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
     checked-in sidecar (not just the one committed exemplar TestLoader
     covers), built on the sibling test-support module
     shared/tests/capability_manifest_corpus.py (task 3362).
+  - TestSidecarPath: the PRD key → sidecar path rule, over examples and the
+    checked-in corpus (task 6582).
   - TestDeliveredCheckMeta / TestMechanicalCheckKinds / TestMetadataRegistration:
     the metadata.delivered_checks registered sub-model and the derived
     MECHANICAL_CHECK_KINDS vocabulary its consumers import.
@@ -52,6 +54,7 @@ from shared.capability_manifest import (
     ManifestTask,
     load_capability_manifest,
     parse_capability_manifest,
+    sidecar_path,
 )
 from shared.task_metadata import parse_metadata
 
@@ -508,13 +511,13 @@ class TestManifestTask:
     def test_both_task_id_and_external_task_id_rejected(self):
         """A block binds exactly one producer, in exactly one registry.
 
-        Guards the concrete path in ``manifest_stamping`` step 4: it stamps
-        any label present in the current ``commit_planning`` batch without
-        consulting the block's existing contents, so a future dark-factory
-        decompose re-using a label already bound to a foreign producer
-        would write a local ``task_id`` alongside the ``external_task_id``.
-        Failing loudly at load is the point — the corpus sweep turns it
-        into a red CI signal naming the file.
+        ``manifest_stamping`` step 4 skips a batch label whose block is
+        bound to a foreign producer, and its re-validation of the stamped
+        sidecar before writing it is the backstop: a stamp that slipped past
+        the skip is refused rather than written alongside the
+        ``external_task_id``. Failing loudly at load is the point — the
+        corpus sweep also turns a hand-made violation into a red CI signal
+        naming the file.
         """
         with pytest.raises(ValidationError) as exc_info:
             ManifestTask(label='η', task_id=5613, external_task_id='reify:5613', capabilities=[])
@@ -562,9 +565,10 @@ class TestManifestTask:
     def test_external_task_id_normalisation_is_idempotent(self):
         """Re-validating a stored value is a no-op, so a round-trip is stable.
 
-        ``manifest_stamping``'s write-back re-dumps and the corpus sweep
-        re-loads; if normalisation were not idempotent, a sidecar would
-        churn on every pass.
+        ``manifest_stamping``'s write-back re-parses and validates the
+        stamped sidecar and the corpus sweep re-loads it; if normalisation
+        were not idempotent, the same value would validate differently on
+        each pass.
         """
         once = ManifestTask(label='η', external_task_id=' reify:5613 ', capabilities=[])
         twice = ManifestTask(
@@ -647,6 +651,51 @@ class TestCapabilityManifestDoc:
                 tasks=[bad_task],
             )
         assert 'task label must be non-empty' in str(exc_info.value)
+
+    @staticmethod
+    def _doc_with_signal_leaves(signal_leaves):
+        return parse_capability_manifest(
+            {
+                'prd': 'plans/example-prd.md',
+                'schema_version': 1,
+                'tasks': [_task_dict('α'), _task_dict('β')],
+                'signal_leaves': signal_leaves,
+            }
+        )
+
+    def test_signal_leaves_naming_known_labels_load(self):
+        assert self._doc_with_signal_leaves(['β']).signal_leaves == ['β']
+        assert self._doc_with_signal_leaves(['β', 'α']).signal_leaves == ['β', 'α']
+
+    def test_signal_leaves_defaults_to_none(self):
+        doc = parse_capability_manifest(
+            {
+                'prd': 'plans/example-prd.md',
+                'schema_version': 1,
+                'tasks': [_task_dict('α')],
+            }
+        )
+        assert doc.signal_leaves is None
+
+    def test_signal_leaves_unknown_label_raises_naming_it_and_the_known_labels(self):
+        with pytest.raises(ValidationError) as exc_info:
+            self._doc_with_signal_leaves(['ω'])
+        message = str(exc_info.value)
+        assert 'ω' in message
+        assert 'α' in message
+        assert 'β' in message
+
+    def test_signal_leaves_mixing_known_and_unknown_names_the_unknown_one(self):
+        with pytest.raises(ValidationError) as exc_info:
+            self._doc_with_signal_leaves(['α', 'ω'])
+        assert "'ω'" in str(exc_info.value)
+
+    def test_empty_signal_leaves_raises(self):
+        with pytest.raises(ValidationError) as exc_info:
+            self._doc_with_signal_leaves([])
+        message = str(exc_info.value)
+        assert 'signal_leaves' in message
+        assert 'non-empty' in message
 
 
 #: The one committed exemplar sidecar TestLoader validates directly, and the
@@ -732,8 +781,8 @@ tasks:
         # A LOAD test, deliberately not named "round_trips": it proves the
         # YAML path decodes `note:` into the model, nothing more. The claim
         # ManifestTask's docstring actually rests on — that a declared field
-        # survives manifest_stamping's yaml.safe_dump write-back where a
-        # comment would not — can only be asserted on the stamping side, in
+        # survives manifest_stamping's write-back — can only be asserted on
+        # the stamping side, in
         # fused-memory/tests/test_manifest_stamping.py, which is outside this
         # task's lock scope. Filed as tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD
         # (follow-up from task 4471); the round-trip name is reserved for it.
@@ -746,6 +795,27 @@ tasks:
         assert task.note.startswith('SPLIT 2026-08-19.')
         assert 'this leaf carries fused-memory' in task.note
         assert task.capabilities[0].verdict == 'OPEN'
+
+    #: The minimal sidecar a legacy, chain-only PRD gets (plans/dashboard-prd-lanes-prd.md
+    #: §9 ε): one hand-bound block, no capabilities, and its signal leaf named.
+    _MINIMAL_SIGNAL_LEAF_YAML = """\
+prd: plans/legacy-prd.md
+schema_version: 1
+signal_leaves:
+  - "ζ"
+tasks:
+  - label: "ζ"
+    task_id: 1234
+    capabilities: []
+"""
+
+    def test_minimal_sidecar_with_only_the_signal_leaf_block_loads(self, tmp_path):
+        sidecar = tmp_path / 'legacy-prd.capability-manifest.yaml'
+        sidecar.write_text(self._MINIMAL_SIGNAL_LEAF_YAML, encoding='utf-8')
+        doc = load_capability_manifest(sidecar)
+        assert doc.signal_leaves == ['ζ']
+        assert doc.tasks[0].task_id == 1234
+        assert doc.tasks[0].capabilities == []
 
     def test_load_capability_manifest_accepts_str_path(self, tmp_path):
         sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
@@ -1517,6 +1587,53 @@ class TestCheckedInManifestCorpus:
         expected_prd = rel[: -len(MANIFEST_SUFFIX)] + '.md'
         assert doc.prd == expected_prd
         assert (REPO_ROOT / doc.prd).is_file()
+
+
+class TestSidecarPath:
+    """sidecar_path — the single PRD key → sidecar path rule (task 6582).
+
+    Defined after TestCheckedInManifestCorpus, not beside TestLoader: the
+    corpus case parametrizes over ``_MANIFEST_PATHS``, which is bound at
+    module level further down than TestLoader.
+    """
+
+    @pytest.mark.parametrize(
+        ('prd_key', 'expected'),
+        [
+            pytest.param(
+                'plans/x-prd.md', 'plans/x-prd.capability-manifest.yaml', id='plans'
+            ),
+            pytest.param(
+                'docs/prds/memory-metadata-vocabulary.md',
+                'docs/prds/memory-metadata-vocabulary.capability-manifest.yaml',
+                id='docs_prds',
+            ),
+            pytest.param(
+                'plans/x-prd', 'plans/x-prd.capability-manifest.yaml', id='no_md_suffix'
+            ),
+            pytest.param(
+                'plans/a.md-notes.md',
+                'plans/a.md-notes.capability-manifest.yaml',
+                id='only_trailing_md_stripped',
+            ),
+        ],
+    )
+    def test_maps_a_prd_key_to_its_sidecar(self, prd_key, expected):
+        assert sidecar_path(prd_key) == expected
+
+    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
+    def test_every_checked_in_sidecar_lives_where_its_prd_derives(self, manifest_path):
+        # The property the stamper and the dashboard reader both rely on:
+        # resolving a sidecar from its PRD key lands on this very file.
+        try:
+            doc = load_capability_manifest(manifest_path)
+        except FileNotFoundError:
+            pytest.fail(_missing_from_worktree_message(manifest_path))
+        rel = str(manifest_path.relative_to(REPO_ROOT))
+        derived = sidecar_path(doc.prd)
+        assert derived == rel, (
+            f'{rel}: prd {doc.prd!r} derives sidecar {derived!r}, not this file {rel!r}'
+        )
 
 
 class TestCheckedInOpenVerdictEvidence:

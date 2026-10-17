@@ -19,7 +19,6 @@ from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
 from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
-from dashboard.data.write_journal import MemoryOps
 
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
@@ -228,11 +227,13 @@ def _shape_memory(status, queue=None, **kwargs):
 
 
 def test_shape_memory_offline_keeps_required_keys():
+    """fused-memory unreachable means its stores went unmeasured: neither
+    connected nor disconnected is honest, so ``connected`` is null."""
     body = _shape_memory(_OFFLINE_STATUS)
     ms = body['MEMORY_STATUS']
-    assert ms['graphiti']['connected'] is False
-    assert ms['mem0']['connected'] is False
-    assert ms['taskmaster']['connected'] is False
+    assert ms['graphiti']['connected'] is None
+    assert ms['mem0']['connected'] is None
+    assert 'taskmaster' not in ms, 'get_status serves no taskmaster key; any value is invented'
     assert ms['queue']['stats']['value']['pending'] == 0
     assert ms['offline'] is True
 
@@ -330,12 +331,31 @@ def test_shape_memory_online_passes_through_plus_defaults():
         _queue_datum(pending=4, oldest=12.5),
     )
     ms = body['MEMORY_STATUS']
-    assert ms['graphiti']['connected'] is True
     assert ms['graphiti']['node_count'] == 100
-    assert ms['mem0']['connected'] is True
     assert ms['queue']['stats']['value']['pending'] == 4
     assert ms['queue']['stats']['value']['oldest_pending_age_seconds'] == 12.5
     assert ms['projects']['dark_factory']['graphiti_nodes'] == 100
+
+
+def test_shape_memory_online_serves_connectivity_as_get_status_measured_it():
+    body = _shape_memory({
+        'graphiti': {'connected': True},
+        'mem0': {'connected': False, 'error': 'qdrant down'},
+    })
+    ms = body['MEMORY_STATUS']
+    assert ms['graphiti']['connected'] is True
+    assert ms['mem0']['connected'] is False
+    assert ms['mem0']['error'] == 'qdrant down'
+
+
+def test_shape_memory_online_never_invents_connectivity():
+    """An absent flag is unmeasured (null), never True; and get_status serves
+    no taskmaster key, so none is served."""
+    body = _shape_memory({'graphiti': {}, 'mem0': {}})
+    ms = body['MEMORY_STATUS']
+    assert ms['graphiti']['connected'] is None
+    assert ms['mem0']['connected'] is None
+    assert 'taskmaster' not in ms
 
 
 # ---------------------------------------------------------------------------
@@ -582,71 +602,6 @@ def test_shape_wal_status_no_now_brackets_real_clock():
     lower = int((before - ts).total_seconds())
     upper = int((after - ts).total_seconds()) + 1
     assert lower <= age <= upper
-
-
-# ---------------------------------------------------------------------------
-# shape_memory_graphs
-# ---------------------------------------------------------------------------
-
-
-def _memory_ops() -> MemoryOps:
-    return MemoryOps(
-        labels=('11:00', '12:00'),
-        reads=(3, 7),
-        writes=(1, 2),
-        other=(0, 2),
-        by_operation=(('search', 10), ('add_memory', 3), ('compact', 2)),
-    )
-
-
-def test_shape_memory_graphs_serves_one_memory_ops_key():
-    body = redux_api.shape_memory_graphs(_memory_ops())
-
-    assert list(body) == ['MEMORY_OPS'], (
-        'one query, one datum, one key: MEMORY_TIMESERIES and '
-        'MEMORY_OPS_BREAKDOWN are retired'
-    )
-    ops = body['MEMORY_OPS']
-    assert set(ops) == {
-        'labels', 'reads', 'writes', 'other', 'total', 'totals', 'by_operation',
-    }
-    assert ops['labels'] == ['11:00', '12:00']
-    assert ops['reads'] == [3, 7]
-    assert ops['writes'] == [1, 2]
-    assert ops['other'] == [0, 2]
-
-
-def test_shape_memory_graphs_hourly_total_sums_the_three_series():
-    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
-
-    assert ops['total'] == [
-        r + w + o for r, w, o in zip(ops['reads'], ops['writes'], ops['other'], strict=True)
-    ]
-    assert ops['total'] == [4, 11]
-
-
-def test_shape_memory_graphs_window_totals_reconcile_with_by_operation():
-    """PRD sketch #11: the caption's three numbers sum to the donut's total."""
-    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
-    totals = ops['totals']
-
-    assert totals == {'reads': 10, 'writes': 3, 'other': 2, 'total': 15}
-    assert totals['reads'] == sum(ops['reads'])
-    assert totals['writes'] == sum(ops['writes'])
-    assert totals['other'] == sum(ops['other'])
-    assert totals['total'] == totals['reads'] + totals['writes'] + totals['other']
-    assert totals['total'] == sum(row['value'] for row in ops['by_operation'])
-    assert totals['total'] == sum(ops['total'])
-
-
-def test_shape_memory_graphs_by_operation_keeps_memory_ops_order():
-    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
-
-    assert ops['by_operation'] == [
-        {'label': 'search', 'value': 10},
-        {'label': 'add_memory', 'value': 3},
-        {'label': 'compact', 'value': 2},
-    ]
 
 
 # ---------------------------------------------------------------------------

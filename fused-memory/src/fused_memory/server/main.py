@@ -11,7 +11,7 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
     from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -689,16 +691,14 @@ async def run_server():
     # be noticed any other way. Pure data, no lifetime coupling, same injection
     # pattern ReconciliationHarness and TicketJanitor already use.
     #
-    # KNOWINGLY UNCOVERED, and the asymmetry is the reason. Those two components
-    # need no wiring test because each DEFENDS ITSELF — omit the kwarg and it
-    # calls build_known_projects_map. This escalator has no such fallback (a
-    # safe fallback source is an open question: the module docstring forbids
-    # config.taskmaster.project_root, which defaults to '.'), so it depends on
-    # this one call. Deleting or reordering the line degrades the storm alarm to
-    # a WARN with no test failure. Do NOT "cover" it with a grep- or ast-based
-    # meta-test: that shape was deleted from this repo in fb3c47dccf on a
-    # CONFIRMED review finding. The real fix is tracked as a follow-up to task
-    # 3088 (escalation agent-followup-3088).
+    # MemoryService already seeds this registry from DASHBOARD_KNOWN_PROJECT_ROOTS,
+    # so this call adds the primary root rather than enabling the alarm. Tests pin
+    # the seed and set_known_projects' replace-on-set behaviour, but NO test
+    # exercises this call site: deleting or reordering it leaves every test
+    # green while a primary root the env var does not list loses its storm,
+    # dead-letter and entity-mint alarms. Do NOT "cover" it with a grep- or
+    # ast-based meta-test: that shape was deleted from this repo in fb3c47dccf
+    # on a CONFIRMED review finding.
     memory_service.set_known_projects(_known_projects_map)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
@@ -1133,13 +1133,29 @@ async def run_server():
         recon_ledger=recon_ledger,
     )
     if _checkpoint_targets:
+        from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+
+        growth_alarm = JournalGrowthAlarm(
+            write_journal,
+            config.write_journal_growth_alarm,
+            project_root=_primary_root or None,
+        )
         checkpoint_task = asyncio.create_task(
-            _periodic_checkpoint_loop(_checkpoint_targets),
+            _periodic_checkpoint_loop(_checkpoint_targets, growth_alarm=growth_alarm),
         )
         logger.info(
             '  Checkpoint loop: enabled (interval=%.0fs, targets=%s)',
             _CHECKPOINT_INTERVAL,
             [name for name, _ in _checkpoint_targets],
+        )
+        logger.info(
+            '  Write-journal growth alarm: max_file_bytes=%d '
+            'max_rows_inserted_per_day=%d interval=%.0fs, '
+            'rounded up to whole %.0fs checkpoint ticks',
+            config.write_journal_growth_alarm.max_file_bytes,
+            config.write_journal_growth_alarm.max_rows_inserted_per_day,
+            config.write_journal_growth_alarm.check_interval_seconds,
+            _CHECKPOINT_INTERVAL,
         )
     else:
         logger.info('  Checkpoint loop: no SQLite targets — skipped')
@@ -1161,6 +1177,12 @@ async def run_server():
         )
     else:
         logger.info('  Summary rebuild loop: disabled')
+
+    remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
+        taskmaster,
+        task_interceptor.remint_broken_recurrence_chains,
+        _known_projects_map.values(),
+    )
 
     # Run transport
     transport = config.server.transport
@@ -1335,6 +1357,10 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        if remint_sweep_task is not None:
+            remint_sweep_task.cancel()
+            with contextlib.suppress(BaseException):
+                await remint_sweep_task
         loop_lag_task.cancel()
         with contextlib.suppress(BaseException):
             await loop_lag_task
@@ -1608,6 +1634,36 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
+def _start_remint_sweep(
+    task_backend: TaskBackendProtocol | None,
+    remint: Callable[[str], Awaitable[object]],
+    project_roots: Iterable[str],
+) -> asyncio.Task[None] | None:
+    """Spawn the recurrence re-mint sweep (task 6572) and RETURN its handle for teardown.
+
+    The sweep repairs chains left done with no successor by a failed mint or a
+    crash between the done write and the mint. Without a task backend there
+    is no chain to repair, so nothing is spawned.
+    """
+    from fused_memory.middleware.recurrence_mint import (
+        REMINT_SWEEP_INTERVAL_SECS,
+        run_remint_sweep_loop,
+    )
+
+    if task_backend is None:
+        logger.info('  Recurrence re-mint sweep: disabled (no task backend)')
+        return None
+    roots = tuple(project_roots)
+    logger.info(
+        '  Recurrence re-mint sweep: enabled (at startup, then every %.0fs, %d project root(s))',
+        REMINT_SWEEP_INTERVAL_SECS,
+        len(roots),
+    )
+    return asyncio.create_task(
+        run_remint_sweep_loop(remint, roots), name='recurrence_remint_sweep',
+    )
+
+
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     """One pass of WAL TRUNCATE checkpoints over every target.
 
@@ -1669,20 +1725,32 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
                 )
 
 
-async def _periodic_checkpoint_loop(targets: list[tuple[str, object]]) -> None:
-    """Run ``_run_checkpoint_cycle`` every :data:`_CHECKPOINT_INTERVAL` s.
+async def _periodic_checkpoint_loop(
+    targets: list[tuple[str, object]],
+    *,
+    growth_alarm: JournalGrowthAlarm | None = None,
+    interval: float = _CHECKPOINT_INTERVAL,
+) -> None:
+    """Run ``_run_checkpoint_cycle`` every *interval* s (:data:`_CHECKPOINT_INTERVAL`).
 
     Bounds the un-flushed WAL window so a stalled PASSIVE auto-checkpoint
     (the 2026-05-13 failure mode) can't accumulate indefinitely. The
     cycle is independent of the per-project write lock — SQLite serialises
-    the checkpoint against writers internally.
+    the checkpoint against writers internally. After each cycle the
+    write-journal *growth_alarm* gets its tick; its failure is logged and
+    never stops checkpointing.
     """
     while True:
         try:
-            await asyncio.sleep(_CHECKPOINT_INTERVAL)
+            await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
         await _run_checkpoint_cycle(targets)
+        if growth_alarm is not None:
+            try:
+                await growth_alarm.maybe_check()
+            except Exception:
+                logger.exception('write_journal growth alarm failed; checkpointing continues')
 
 
 async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -891,7 +891,7 @@ class TestLeaseClaimCliRecordSlug:
         ],
         ids=['bare', 'explicit-slug-and-pid'],
     )
-    def test_the_session_pid_is_resolved_at_most_once_and_only_on_demand(
+    def test_the_session_identity_is_resolved_at_most_once_and_only_on_demand(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -902,13 +902,13 @@ class TestLeaseClaimCliRecordSlug:
         _link_pid(self._PID, 'watcher-own-record', tmp_path)
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
         calls: list[object] = []
-        real = sr.resolve_session_pid
+        real = sr.resolve_session_identity
 
-        def counting(env: object = None) -> int:
+        def counting(env: Mapping[str, str] | None = None) -> sr.SessionIdentity:
             calls.append(env)
-            return real()
+            return real(env)
 
-        monkeypatch.setattr(sr, 'resolve_session_pid', counting)
+        monkeypatch.setattr(sr, 'resolve_session_identity', counting)
 
         assert sr.main(argv) == 0
 

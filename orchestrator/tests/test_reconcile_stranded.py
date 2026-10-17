@@ -9,13 +9,18 @@ import shutil
 import time as _time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import mock_lock_table, pydantic_spec, wire_scheduler_liveness_mock
+from _orch_helpers import (
+    mock_lock_table,
+    pydantic_spec,
+    wire_clear_claim_then_set_status,
+    wire_scheduler_liveness_mock,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -228,6 +233,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # directly) so the mid-run sweep and stranded-blocked gate tests below
     # exercise real semantics instead of an auto-mocked (always-truthy) stub.
     wire_scheduler_liveness_mock(h.scheduler)
+    wire_clear_claim_then_set_status(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
@@ -959,7 +965,8 @@ class TestReconcileStrandedInProgress:
         reverted above) — the pre-2243 sweep's actual root cause for the
         2588 un-claim (a live task reverted out from under its own live
         claimant). But get_task returns a FRESH db claimant
-        (claimant_run_id + heartbeat within _RECONCILE_HEARTBEAT_TTL), so
+        (claimant_run_id + heartbeat within
+        shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL), so
         recovery_for's live_claimant resolution defers to the db signal and
         classifies LEAVE: _revert_in_progress_if_no_live_claimant must
         never be dispatched — no revert, no un-claim, lock preserved.
@@ -4875,3 +4882,74 @@ class TestDedupGuardDoesNotSwallowAnOrderedReFile:
         assert result is None
         assert _pending_ids(harness, '9') == [(seeded.id, 0, 'stranded_blocked')]
         assert spy.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4623 — a claimant stale past the TTL no longer vetoes row (g).
+#
+# The resolver's liveness read is status-agnostic
+# (docs/prds/claimant-invariant-enforcement.md D4 / C4-E6), so the next
+# reconcile sweep re-files a stranded blocked row that a crash left claimed.
+# ---------------------------------------------------------------------------
+
+
+def _claimed_blocked_row(*, heartbeat_age: timedelta) -> dict:
+    """A blocked row still carrying a claimant last heard from *heartbeat_age* ago.
+
+    Wall-clock relative: the harness builds its resolver with the real clock
+    and the shared default TTL.
+    """
+    return {
+        'status': 'blocked',
+        'metadata': {},
+        'claimant_run_id': 'run-dead/sess-dead/pid=1',
+        'heartbeat_at': (datetime.now(UTC) - heartbeat_age).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+class TestStaleClaimantBlockedStrandIsReFiled:
+
+    async def _sweep_claimed_blocked(
+        self, harness: Harness, tmp_path: Path, *, heartbeat_age: timedelta,
+    ) -> tuple[EscalationQueue, AsyncMock]:
+        """Reconcile one claimed GONE_NO_MARKER blocked row into a real queue.
+
+        Returns the bound queue and the ``set_task_status`` mock every status
+        flip routes through, for asserting that nothing was re-pended.
+        """
+        harness.config.stranded_blocked_escalate_enabled = True
+        _gone_no_marker_blocked(harness, '4623')
+        queue = _bind_queue(harness, tmp_path / 'esc')
+        harness.scheduler.get_task = AsyncMock(
+            return_value=_claimed_blocked_row(heartbeat_age=heartbeat_age),
+        )
+        set_task_status = AsyncMock()
+        harness.scheduler.set_task_status = set_task_status
+
+        await _reconcile_stranded(harness, '4623', 'blocked')
+
+        return queue, set_task_status
+
+    async def test_stale_claimant_blocked_strand_gets_one_reaper_l1(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        queue, set_task_status = await self._sweep_claimed_blocked(
+            harness, tmp_path, heartbeat_age=timedelta(hours=12),
+        )
+
+        set_task_status.assert_not_called()
+        filed = [
+            (e.level, e.category, e.agent_role) for e in _pending(queue, '4623')
+        ]
+        assert filed == [(1, 'stranded_blocked', 'harness-stranded-blocked-reaper')]
+
+    async def test_fresh_claimant_blocked_strand_files_nothing(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        queue, set_task_status = await self._sweep_claimed_blocked(
+            harness, tmp_path, heartbeat_age=timedelta(minutes=1),
+        )
+
+        set_task_status.assert_not_called()
+        assert _pending(queue, '4623') == []

@@ -151,11 +151,10 @@ fused_memory:
     - "--transport"
     - "http"
 
-# Sandbox — disabled due to Bun segfault inside bwrap on this kernel (6.17).
-# A landlock backend now exists (SandboxConfig.backend: landlock) that sidesteps
-# the bwrap/userns issue — flip to `enabled: true, backend: landlock` when ready.
+# OS sandbox: landlock pinned (γ7, task 2915); why: docs/sandbox-fleet-status.md
 sandbox:
-  enabled: false
+  enabled: true
+  backend: landlock
 
 # Escalation — port 8102
 escalation:

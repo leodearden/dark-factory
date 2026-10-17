@@ -152,6 +152,7 @@ class TestAnAdjudicatedVerdictPlansAHeal:
         assert run.writes is False
         assert report.plan_path == tmp_path / 'p.json'
         assert report.plan_sha256 is not None
+        assert run.plan_path == tmp_path / 'p.json'
 
 
 class TestOnlyVerdictRowLinksAreSent:

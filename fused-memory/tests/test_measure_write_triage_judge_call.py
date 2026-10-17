@@ -242,7 +242,7 @@ class TestProvenanceAndReport:
         provenance = _mod().probe_provenance(service, calls_per_width=20)
         assert provenance['field_chars'] == 4_000
         assert provenance['judge_provider'] == 'openai'
-        assert provenance['judge_model'] == 'gpt-4o-mini'
+        assert provenance['judge_model'] == 'gpt-6.1-sol'
         assert provenance['widths'] == [5, 10, 20]
         assert provenance['calls_per_width'] == 20
 

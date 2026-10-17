@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from shared.branch_names import canonical_queued_branch_name
 
+from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
@@ -894,6 +895,17 @@ class MergeRequest:
 
     Default ``False`` remains a strict no-op: no payload is built, no probe is
     run, and every retry path behaves byte-identically."""
+    awaited_by_workflow: bool = field(default=False, kw_only=True)
+    """True when a TaskWorkflow awaits this request's result and parks the task
+    at merge-deferred on a 'superseded' outcome
+    (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_superseded``).
+
+    The coalescing pass absorbs only such requests: a coalesce train lands only
+    once every member is merge-deferred, and only a workflow parks a task
+    there. The default covers the MCP ``merge_request``, the stranded-branch
+    reaper and journal recovery, whose submitters never park. Not journaled: a
+    recovered request's workflow died with the process. Read only on single
+    requests; a GroupMergeRequest is never a coalesce candidate."""
 
 
 @dataclass(frozen=True)
@@ -973,6 +985,11 @@ class GroupMergeRequest(MergeRequest):
     """Optional async callback: re-drive an absorbed member still merge-deferred
     after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
     None when not wired (back-compat with existing test constructions)."""
+
+    member_pre_stack_tips: tuple[PreStackTip, ...] = field(default=(), kw_only=True)
+    """The tip each stacked member had before the coalescing pass stacked it,
+    so a train that does not land can hand its members back.  Empty on a
+    declared train, whose tip workflow re-fires it."""
 
 
 @dataclass
@@ -1244,6 +1261,14 @@ class Decided:
     merge_result: MergeResult | None = None
 
 
+ChainTruncationReason: TypeAlias = Literal[
+    'conflict', 'train_request', 'already_merged', 'merge_error', 'lane_base_mismatch',
+]
+CHAIN_FAULT_REASONS: frozenset[ChainTruncationReason] = frozenset(
+    {'merge_error', 'lane_base_mismatch'},
+)
+
+
 @dataclass
 class ChainResult:
     """Result of a deep merge-ahead chain build (``plans/deep-merge-ahead-prd.md``
@@ -1267,18 +1292,25 @@ class ChainResult:
     * ``truncated_at`` — ``task_id`` of the first item that did NOT chain, or
       ``None``.  **A depth stop is NOT a truncation**: when the walk stopped
       because it reached ``target_depth``/``cap``, or ran the whole snapshot
-      clean, ``truncated_at`` is ``None``.
+      clean, ``truncated_at`` is ``None``.  On ``'lane_base_mismatch'`` it
+      names the snapshot's FIRST item, which was never attempted.
     * ``truncated_reason`` — ``'conflict'`` (genuine textual conflict — an
       expected, benign chain outcome), ``'train_request'`` (a
       :class:`GroupMergeRequest`, which ``_do_train_merge`` owns),
       ``'already_merged'`` (the item's work is ALREADY in the base, so
       ``git merge --no-ff`` was a no-op — benign: it caps the chain but
       signals no fault, and the item's real verdict is rendered by the
-      sequential path's ``_is_genuinely_merged`` guard), or ``'merge_error'``
-      (a non-conflict merge failure: missing ref, hook rejection).  **Only
-      ``'merge_error'`` denotes a genuine fault** — the other three are
-      expected outcomes and are deliberately NOT collapsed into it, so ε's
-      deep-fail reader is not inflated with non-faults.
+      sequential path's ``_is_genuinely_merged`` guard), ``'merge_error'``
+      (a non-conflict merge failure: missing ref, hook rejection), or
+      ``'lane_base_mismatch'`` (the acquired lane's HEAD was not
+      ``head_merge_commit``, or could not be read, so nothing was stacked —
+      a lane-provisioning fault, distinct from ``'merge_error'``, which is
+      an ITEM's merge failing).  **Only ``'merge_error'`` and
+      ``'lane_base_mismatch'`` denote genuine faults**
+      (``CHAIN_FAULT_REASONS``) — conflict /
+      train_request / already_merged are benign caps and are deliberately
+      NOT collapsed into them, so ε's deep-fail reader is not inflated with
+      non-faults.
     * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
     * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
       caller (``_deep_chain_placement``) rather than by ``build_chain``
@@ -1310,7 +1342,7 @@ class ChainResult:
     links: list[tuple[str, str]]
     tip: str
     truncated_at: str | None = None
-    truncated_reason: str | None = None
+    truncated_reason: ChainTruncationReason | None = None
     lane: Path | None = None
     lane_warm: bool = False
     build_ms: int | None = None

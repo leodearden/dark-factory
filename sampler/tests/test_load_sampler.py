@@ -8,23 +8,31 @@ from pathlib import Path
 
 import pytest
 
+from sampler.metrics import SampleKey
+
 # ---------------------------------------------------------------------------
 # Fake data
 # ---------------------------------------------------------------------------
 
 FAKE_PSI = {
-    'psi_cpu_some_avg10': 2.50,
-    'psi_cpu_full_avg10': 0.30,
-    'psi_mem_some_avg10': 1.23,
-    'psi_mem_full_avg10': 0.00,
-    'psi_io_some_avg10': 0.75,
-    'psi_io_full_avg10': 0.45,
+    SampleKey('psi_cpu_some_avg10'): 2.50,
+    SampleKey('psi_cpu_full_avg10'): 0.30,
+    SampleKey('psi_mem_some_avg10'): 1.23,
+    SampleKey('psi_mem_full_avg10'): 0.00,
+    SampleKey('psi_io_some_avg10'): 0.75,
+    SampleKey('psi_io_full_avg10'): 0.45,
 }
 
+OCCT_QUEUE_DEPTH = SampleKey('occt_queue_depth')
+VERIFY_CONCURRENCY = SampleKey('verify_concurrency')
+VERIFY_RSS_TOTAL_BYTES = SampleKey('verify_rss_total_bytes')
+RUNQUEUE_RATIO = SampleKey('runqueue_ratio')
+REIFY = 'orchestrator-reify.service'
+
 FAKE_PROCESS_METRICS = {
-    'occt_queue_depth': 3.0,
-    'verify_concurrency': 2.0,
-    'verify_rss_total_bytes': 1048576.0,
+    OCCT_QUEUE_DEPTH: 3.0,
+    VERIFY_CONCURRENCY: 2.0,
+    VERIFY_RSS_TOTAL_BYTES: 1048576.0,
 }
 
 
@@ -160,9 +168,9 @@ class TestRunTick:
 
         # Second tick with different process metrics
         second_metrics = {
-            'occt_queue_depth': 5.0,
-            'verify_concurrency': 4.0,
-            'verify_rss_total_bytes': 2_097_152.0,
+            OCCT_QUEUE_DEPTH: 5.0,
+            VERIFY_CONCURRENCY: 4.0,
+            VERIFY_RSS_TOTAL_BYTES: 2_097_152.0,
         }
         run_tick(
             store, 1_000_005,
@@ -192,7 +200,7 @@ class TestRunTick:
         # Pre-insert a very old row (older than the 30-day retention window,
         # widened from 24h by task 3592 step-14).
         very_old_ts = 1_000_000 - 2_592_001
-        store.insert_sample(very_old_ts, 'psi_cpu_some_avg10', 0.0)
+        store.insert_sample(very_old_ts, SampleKey('psi_cpu_some_avg10'), 0.0)
 
         now = 1_000_000
         run_tick(
@@ -209,76 +217,87 @@ class TestRunTick:
 
 
 # ---------------------------------------------------------------------------
-# Task 3592 step-9: the exact-or-stem metric-name guard (detail B)
+# Task 3592 step-9 / task 6772: the exact-or-per-leaf key guard (detail B)
 # ---------------------------------------------------------------------------
 
 
-class TestUnexpectedMetricNames:
+class TestUnexpectedKeys:
     """The guard's purpose is unchanged: a typo must still fail.
 
-    What changed is that it must now also admit names with a DYNAMIC tail —
-    ``own_cpu_some10:<cgroup-leaf>`` is generated per discovered cgroup, so no
-    fixed frozenset can ever list them. A stem set is the smallest extension
-    that admits the tail while keeping a misspelling rejected.
+    A per-leaf metric is recorded once per cgroup leaf DISCOVERED at
+    collection time, so no fixed set can list its keys. The guard admits a
+    host-level key by exact metric name with no leaf, and a per-leaf key by
+    metric name plus a non-empty leaf; the leaf itself is opaque data.
     """
 
     EXACT = frozenset({'runqueue_ratio', 'runqueue_read_ok'})
-    STEMS = frozenset({'own_cpu_some10', 'own_read_ok'})
+    PER_LEAF = frozenset({'own_cpu_some10', 'own_read_ok'})
 
-    def _unexpected(self, *names):
-        from sampler.sampler import unexpected_metric_names
+    def _unexpected(self, *keys: SampleKey) -> set[SampleKey]:
+        from sampler.sampler import unexpected_keys
 
-        return unexpected_metric_names(set(names), exact=self.EXACT, stems=self.STEMS)
+        return unexpected_keys(set(keys), exact=self.EXACT, per_leaf=self.PER_LEAF)
 
     def test_exact_name_accepted(self):
-        assert self._unexpected('runqueue_ratio', 'runqueue_read_ok') == set()
+        assert self._unexpected(RUNQUEUE_RATIO, SampleKey('runqueue_read_ok')) == set()
 
     @pytest.mark.parametrize(
-        'name',
+        'key',
         [
-            'own_cpu_some10:orchestrator-dark-factory.service',
-            'own_read_ok:df-dark_factory.slice',
-            'own_cpu_some10:df-reify.slice',
+            SampleKey('own_cpu_some10', 'orchestrator-dark-factory.service'),
+            SampleKey('own_read_ok', 'df-dark_factory.slice'),
+            SampleKey('own_cpu_some10', 'df-reify.slice'),
         ],
     )
-    def test_stem_with_a_tail_accepted(self, name):
-        assert self._unexpected(name) == set()
+    def test_per_leaf_metric_with_a_leaf_accepted(self, key):
+        assert self._unexpected(key) == set()
 
-    def test_bare_stem_without_a_tail_rejected(self):
-        """A stem is not itself a metric — nothing ever emits a bare one."""
-        assert self._unexpected('own_cpu_some10') == {'own_cpu_some10'}
+    def test_per_leaf_metric_without_a_leaf_rejected(self):
+        """A per-leaf metric with no leaf is evidence about no cgroup."""
+        assert self._unexpected(SampleKey('own_cpu_some10')) == {SampleKey('own_cpu_some10')}
 
-    def test_misspelled_stem_rejected(self):
-        assert self._unexpected('own_cpu_some_10:leaf') == {'own_cpu_some_10:leaf'}
+    def test_per_leaf_metric_with_an_empty_leaf_rejected(self):
+        """An empty leaf names no cgroup either."""
+        key = SampleKey('own_read_ok', '')
+        assert self._unexpected(key) == {key}
 
-    def test_stem_with_an_empty_tail_rejected(self):
-        """``own_read_ok:`` names no cgroup, so it is evidence about nothing."""
-        assert self._unexpected('own_read_ok:') == {'own_read_ok:'}
+    def test_misspelled_metric_rejected(self):
+        key = SampleKey('own_cpu_some_10', 'leaf')
+        assert self._unexpected(key) == {key}
 
-    def test_only_the_first_colon_splits_the_stem(self):
-        """A leaf name may itself contain ':' — the tail is everything after."""
-        assert self._unexpected('own_read_ok:weird:leaf.slice') == set()
+    def test_exact_metric_carrying_a_leaf_rejected(self):
+        """A host-level metric is not per-leaf, so a leaf on it is a collector bug."""
+        key = SampleKey('runqueue_ratio', 'leaf.service')
+        assert self._unexpected(key) == {key}
 
-    def test_empty_stem_set_degenerates_to_exact_membership(self):
-        """PSI keeps its current strictness: no dynamic tail is possible there."""
-        from sampler.sampler import unexpected_metric_names
+    def test_a_leaf_containing_a_colon_is_accepted(self):
+        """The leaf is opaque data: nothing parses it, so ':' in it is just a character."""
+        assert self._unexpected(SampleKey('own_read_ok', 'weird:leaf.slice')) == set()
+
+    def test_empty_per_leaf_set_degenerates_to_exact_membership(self):
+        """PSI keeps its current strictness: no per-leaf metric exists there."""
+        from sampler.sampler import unexpected_keys
 
         psi_exact = frozenset({'psi_cpu_some_avg10'})
-        assert unexpected_metric_names(
-            {'psi_cpu_some_avg10'}, exact=psi_exact, stems=frozenset()
+        assert unexpected_keys(
+            {SampleKey('psi_cpu_some_avg10')}, exact=psi_exact, per_leaf=frozenset()
         ) == set()
-        assert unexpected_metric_names(
-            {'psi_cpu_some_avg10x'}, exact=psi_exact, stems=frozenset()
-        ) == {'psi_cpu_some_avg10x'}
-        # A colon name cannot sneak past an empty stem set either.
-        assert unexpected_metric_names(
-            {'psi_cpu_some_avg10:leaf'}, exact=psi_exact, stems=frozenset()
-        ) == {'psi_cpu_some_avg10:leaf'}
+        assert unexpected_keys(
+            {SampleKey('psi_cpu_some_avg10x')}, exact=psi_exact, per_leaf=frozenset()
+        ) == {SampleKey('psi_cpu_some_avg10x')}
+        # A per-leaf-shaped key cannot sneak past an empty per-leaf set either.
+        per_leaf_shaped = SampleKey('psi_cpu_some_avg10', 'leaf')
+        assert unexpected_keys(
+            {per_leaf_shaped}, exact=psi_exact, per_leaf=frozenset()
+        ) == {per_leaf_shaped}
 
     def test_every_offender_is_reported_not_just_the_first(self):
         assert self._unexpected(
-            'runqueue_ratio', 'runqueu_ratio', 'own_read_ok:', 'own_read_ok:leaf'
-        ) == {'runqueu_ratio', 'own_read_ok:'}
+            RUNQUEUE_RATIO,
+            SampleKey('runqueu_ratio'),
+            SampleKey('own_read_ok', ''),
+            SampleKey('own_read_ok', 'leaf'),
+        ) == {SampleKey('runqueu_ratio'), SampleKey('own_read_ok', '')}
 
     def test_empty_input_is_accepted(self):
         """A degraded collection group hands run_tick {} — never an error."""
@@ -290,20 +309,20 @@ class TestUnexpectedMetricNames:
 # ---------------------------------------------------------------------------
 
 FAKE_LOAD_METRICS = {
-    'runqueue_ratio': 4.0625,
-    'runqueue_read_ok': 1.0,
-    'own_cpu_some10:orchestrator-reify.service': 1.77,
-    'own_read_ok:orchestrator-reify.service': 1.0,
+    RUNQUEUE_RATIO: 4.0625,
+    SampleKey('runqueue_read_ok'): 1.0,
+    SampleKey('own_cpu_some10', REIFY): 1.77,
+    SampleKey('own_read_ok', REIFY): 1.0,
 }
 
 
-def _rows(db_path: Path, metric: str) -> list[tuple]:
+def _rows(db_path: Path, key: SampleKey) -> list[tuple]:
     conn = sqlite3.connect(str(db_path))
     try:
         return conn.execute(
             'SELECT ts, value, window_mean, window_max FROM samples'
-            ' WHERE metric = ? ORDER BY ts',
-            (metric,),
+            ' WHERE metric = ? AND leaf IS ? ORDER BY ts',
+            (key.metric, key.leaf),
         ).fetchall()
     finally:
         conn.close()
@@ -329,11 +348,11 @@ class TestRunTickLoadGroup:
             load_metrics=FAKE_LOAD_METRICS,
         )
 
-        for metric in FAKE_LOAD_METRICS:
-            (_ts, _value, window_mean, window_max), = _rows(db_path, metric)
-            assert window_mean is not None, f'{metric} window_mean is NULL'
-            assert window_max is not None, f'{metric} window_max is NULL'
-        (_ts, _v, psi_mean, psi_max), = _rows(db_path, 'psi_cpu_some_avg10')
+        for key in FAKE_LOAD_METRICS:
+            (_ts, _value, window_mean, window_max), = _rows(db_path, key)
+            assert window_mean is not None, f'{key} window_mean is NULL'
+            assert window_max is not None, f'{key} window_max is NULL'
+        (_ts, _v, psi_mean, psi_max), = _rows(db_path, SampleKey('psi_cpu_some_avg10'))
         assert psi_mean is None and psi_max is None
 
     def test_second_tick_window_reflects_both_samples(self, tmp_path: Path):
@@ -346,35 +365,36 @@ class TestRunTickLoadGroup:
 
         run_tick(
             store, 1_000_000, psi={}, process_metrics={},
-            load_metrics={'runqueue_ratio': 2.0},
+            load_metrics={RUNQUEUE_RATIO: 2.0},
         )
         run_tick(
             store, 1_000_005, psi={}, process_metrics={},
-            load_metrics={'runqueue_ratio': 6.0},
+            load_metrics={RUNQUEUE_RATIO: 6.0},
         )
 
-        _first, (_ts, value, window_mean, window_max) = _rows(db_path, 'runqueue_ratio')
+        _first, (_ts, value, window_mean, window_max) = _rows(db_path, RUNQUEUE_RATIO)
         assert value == pytest.approx(6.0)
         assert window_mean == pytest.approx(4.0)
         assert window_max == pytest.approx(6.0)
 
-    def test_dynamic_keys_round_trip_into_the_metric_column_verbatim(
-        self, tmp_path: Path
-    ):
+    def test_a_per_leaf_key_lands_in_the_metric_and_leaf_columns(self, tmp_path: Path):
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'db.sqlite'
         store = LoadSampleStore(db_path)
-        metric = 'own_cpu_some10:orchestrator-reify.service'
 
         run_tick(
             store, 1_000_000, psi={}, process_metrics={},
-            load_metrics={metric: 1.77},
+            load_metrics={SampleKey('own_cpu_some10', REIFY): 1.77},
         )
 
-        (_ts, value, _mean, _max), = _rows(db_path, metric)
-        assert value == pytest.approx(1.77)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute('SELECT metric, leaf, value FROM samples').fetchall()
+        finally:
+            conn.close()
+        assert rows == [('own_cpu_some10', REIFY, pytest.approx(1.77))]
 
     def test_unexpected_load_key_raises_naming_it(self, tmp_path: Path):
         from sampler.sampler import run_tick
@@ -385,7 +405,7 @@ class TestRunTickLoadGroup:
         with pytest.raises(AssertionError, match='runqueu_ratio'):
             run_tick(
                 store, 1_000_000, psi={}, process_metrics={},
-                load_metrics={'runqueu_ratio': 1.0},
+                load_metrics={SampleKey('runqueu_ratio'): 1.0},
             )
 
     def test_degraded_load_group_writes_zero_load_rows(self, tmp_path: Path):
@@ -419,10 +439,12 @@ class TestRunTickLoadGroup:
 # ---------------------------------------------------------------------------
 
 
-def _metrics_written(db_path: Path) -> set[str]:
+def _metrics_written(db_path: Path) -> set[SampleKey]:
     conn = sqlite3.connect(str(db_path))
     try:
-        return {row[0] for row in conn.execute('SELECT DISTINCT metric FROM samples')}
+        return {
+            SampleKey(*row) for row in conn.execute('SELECT DISTINCT metric, leaf FROM samples')
+        }
     finally:
         conn.close()
 
@@ -433,7 +455,7 @@ def _run_main(monkeypatch, tmp_path: Path, **raising: bool):
 
     monkeypatch.setenv('DARK_FACTORY_ROOT', str(tmp_path))
 
-    def collector(name: str, value: dict[str, float]):
+    def collector(name: str, value: dict[SampleKey, float]):
         def collect(**_kwargs):
             if raising.get(name):
                 raise RuntimeError(f'{name} is down')
@@ -475,7 +497,7 @@ class TestMainDegradesEachGroupIndependently:
         written = _metrics_written(db_path)
         assert set(FAKE_PSI) <= written
         assert set(FAKE_PROCESS_METRICS) <= written
-        assert not [m for m in written if m.startswith(('runqueue', 'own_'))], (
+        assert not [m for m in written if m.metric.startswith(('runqueue', 'own_'))], (
             'a failed load group must write zero rows, not a 0.0-valued one'
         )
         messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
@@ -524,18 +546,19 @@ class TestMainDegradesEachGroupIndependently:
 
         from sampler.store import LoadSampleStore
 
-        store = LoadSampleStore(db_path)
-        stamped = store._get_meta('last_vacuum_ts')
-        assert stamped is not None, (
-            'main() left the vacuum clock unset, so maybe_vacuum was never called'
-        )
-
         conn = sqlite3.connect(str(db_path))
         try:
             tick_ts = conn.execute('SELECT MAX(ts) FROM samples').fetchone()[0]
         finally:
             conn.close()
-        assert int(stamped) == tick_ts
+
+        # _is_due reads "due" as elapsed outside [0, interval), so this boundary
+        # pair holds only for a stamp of exactly tick_ts.
+        store = LoadSampleStore(db_path)
+        assert store.should_vacuum(tick_ts + 86399) is False, (
+            'main() left the vacuum clock unset, so maybe_vacuum was never called'
+        )
+        assert store.should_vacuum(tick_ts + 86400) is True
 
     def test_the_tick_log_line_reports_the_load_group(self, monkeypatch, tmp_path: Path, caplog):
         """An operator watching journalctl must be able to see the new group."""
@@ -547,6 +570,9 @@ class TestMainDegradesEachGroupIndependently:
         ]
         assert tick_lines, [r.getMessage() for r in caplog.records]
         assert any('runqueue_ratio' in line for line in tick_lines), tick_lines
+        # The journal renders key labels, not NamedTuple reprs.
+        assert any(f'own_cpu_some10:{REIFY}' in line for line in tick_lines), tick_lines
+        assert not [line for line in tick_lines if 'SampleKey(' in line], tick_lines
 
 
 # ---------------------------------------------------------------------------
@@ -570,21 +596,24 @@ class TestTickCostIsFlatInTheMetricCount:
         run_tick(
             store,
             now,
-            psi={'psi_cpu_some_avg10': 1.0},
-            process_metrics={'verify_concurrency': 2.0},
+            psi={SampleKey('psi_cpu_some_avg10'): 1.0},
+            process_metrics={VERIFY_CONCURRENCY: 2.0},
             load_metrics={
-                'runqueue_ratio': 0.5,
-                **{f'own_cpu_some10:leaf{i}': float(i) for i in range(leaves)},
+                RUNQUEUE_RATIO: 0.5,
+                **{SampleKey('own_cpu_some10', f'leaf{i}'): float(i) for i in range(leaves)},
             },
         )
 
-    def test_one_leaf_and_a_hundred_leaves_cost_the_same_connections(
-        self, tmp_path: Path, monkeypatch
-    ):
-        import sampler.store as store_module
-        from sampler.store import LoadSampleStore
+    def test_one_leaf_and_a_hundred_leaves_cost_the_same_connections(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore, connect_durably
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        opened: list[int] = []
+
+        def counting_connect(db_path: Path, *, autocommit: bool = False):
+            opened.append(1)
+            return connect_durably(db_path, autocommit=autocommit)
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=counting_connect)
         # Prime the retention clock first. On a VIRGIN store the first tick
         # also runs the interval-gated cleanup, which opens its own
         # connections — comparing a cleanup tick against a steady-state one
@@ -592,14 +621,7 @@ class TestTickCostIsFlatInTheMetricCount:
         # this test went red on exactly that before the priming tick existed.
         self._tick(store, 999_995, leaves=1)
 
-        real_connect = store_module.sqlite3.connect
-        opened: list[int] = []
-        monkeypatch.setattr(
-            store_module.sqlite3,
-            'connect',
-            lambda *a, **kw: (opened.append(1), real_connect(*a, **kw))[1],
-        )
-
+        opened.clear()
         self._tick(store, 1_000_000, leaves=1)
         few = len(opened)
         opened.clear()
@@ -607,9 +629,9 @@ class TestTickCostIsFlatInTheMetricCount:
         many = len(opened)
 
         # A FLOOR before the equality, because both sides are spy counts: if the
-        # monkeypatched seam ever stops being the one write_tick uses — a
-        # connection helper, a pool, a module-level alias — both stay 0 and
-        # `0 == many` holds while measuring nothing.
+        # injected connect ever stops being the one write_tick uses — a cached
+        # connection, a pool — both stay 0 and `0 == many` holds while
+        # measuring nothing.
         assert few >= 1, 'the connect spy never fired — the seam has detached'
         assert few == many, (
             f'a 4-metric tick opened {few} connections and a 103-metric tick '

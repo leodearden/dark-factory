@@ -68,7 +68,7 @@ import contextlib
 import json
 import logging
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -77,7 +77,8 @@ from typing import Any, Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.task_metadata import DoneProvenance, parse_metadata
-from shared.task_statuses import TERMINAL
+from shared.task_statuses import TERMINAL, owner_liveness
+from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 logger = logging.getLogger(__name__)
 
@@ -739,17 +740,16 @@ NEVER_WIDEN_A_TIMEOUT = (
     'and structural asserts (assert on state, not on log/prose output).'
 )
 
-# §5.9's invariant names TWO responsibilities, and both belong to the SAME task.  Split
-# into two constants because a task carrying only the first would fix the defect and
-# leave the ledger row open forever — which is precisely what task θ's class-2 AGE
-# backstop then escalates on, turning a successful fix into a false non-convergence
-# signal.
+# Rationale: plans/flake-ledger-prd.md §5.9 ("Removing the test from the ledger").
 RESPONSIBILITY_FIX_ROOT_DEFECT = (
     'You are responsible for finding and fixing the ROOT DEFECT behind this observation'
 )
 RESPONSIBILITY_REMOVE_FROM_LEDGER = (
-    'You are ALSO responsible for removing this test from the flake ledger once it is '
-    'fixed (resolve its debt row), which is what closes the cycle'
+    'You do NOT write to the flake ledger, and must not ask anyone to: the ledger '
+    'closes this debt cycle itself once it observes this task done. Your part is to '
+    'keep the test\'s pytest node-id byte-identical (no rename, no parametrize, no '
+    'move into a class), because the ledger keys its debt row on that id and a '
+    'changed id orphans the row and hides a recurrence'
 )
 
 
@@ -867,16 +867,6 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
-# `submit_task`'s TWO-PHASE (non-planning) response names a ticket, not a task:
-# `{"ticket": "tkt_<id>"}`, which the curator resolves into a task asynchronously.
-# `chronic_flake::extract_task_id` accepts that key as a fallback, so the prefix is the
-# one machine-checkable signal that `planning_mode: True` did NOT take effect and the id
-# in hand can never be resolved by `get_statuses`.  Kept as a constant, beside the
-# Protocol whose `submit_task` docstring states the "not a ticket id" requirement in
-# prose, so the guard and the contract it enforces are read together.
-_TICKET_ID_PREFIX = 'tkt_'
-
-
 class FlakeLedgerTaskClient(Protocol):
     """The task seam :func:`open_debt` needs to enforce §5.9, and :func:`resolve_debt`
     needs to corroborate a resolution — declared STRUCTURALLY (``typing.Protocol``) so
@@ -899,12 +889,13 @@ class FlakeLedgerTaskClient(Protocol):
     docstrings).
     """
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         """File the task described by *arguments* (see
-        :func:`build_deflake_task_arguments`) and return its id.  The block carries
-        ``planning_mode: True``, so this must return a REAL, synchronously-known task id
-        — not a ticket id — or the invariant it backs is hollow.  A falsy return is
-        treated as a failed filing."""
+        :func:`build_deflake_task_arguments`) and return its typed outcome.  The block
+        carries ``planning_mode: True``, so a ``SubmittedTask`` is required: the
+        invariant is stored against its id.  A ``SubmittedTicket``, a ``SubmitFailed``,
+        and a ``combined`` task whose status is terminal or unknown are failed filings
+        (:func:`_owner_from_submission`)."""
         ...
 
     async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
@@ -962,56 +953,6 @@ class _OwnerRead:
     @property
     def status(self) -> str | None:
         return None if self.task is None else self.task.get('status')
-
-
-def _owner_liveness(status: str | None) -> str:
-    """Four-way verdict on a stored owner's LIVE status:
-    ``open`` | ``deferred`` | ``done`` | ``closed``.
-
-    Mirrors ``orchestrator/src/orchestrator/chronic_flake.py::_is_open_status``'s
-    ``status not in TERMINAL and status != 'deferred'`` predicate against the same source
-    of truth (``shared.task_statuses.TERMINAL``), REFINED from a boolean to four values
-    so ``deferred`` and ``done`` stay distinguishable.
-
-    Why that refinement is load-bearing and not a nicety: ``planning_mode=True`` creates
-    the task ``deferred``, so between ``submit_task`` and ``commit_planning`` there is a
-    real window in which a crash or a failed second round-trip leaves a task that EXISTS
-    but will never be dispatched.  The boolean predicate classifies that as NOT open, so
-    every subsequent suppression of the same test would file another orphan — a
-    duplicate-generating loop that gets worse the more the test flakes.  The
-    ``deferred`` branch finishes the half-done filing instead.
-
-    ``done`` is split out of ``closed`` (task η) for the same reason: its correct action
-    differs.  With a ``task_client`` wired, :func:`open_debt`'s lazy close resolves a
-    done owner's cycle and the re-entry upsert discharges that owner, so a done owner on
-    an OPEN row can only mean that resolution did not land: ``get_task`` failed, raised,
-    timed out or is missing and the ``get_statuses`` fallback read the owner done, or
-    the stamp itself failed.  Replacing it would overwrite the only pointer to the fix
-    that did not hold, so the cycle would never close, ``prior_resolving_commit`` would
-    never be written, and no ``regressed_after_resolution`` L2 would fire.  ``closed``
-    therefore means only a non-done terminal status (``cancelled``) or an absent owner.
-
-    Empty/absent is ``closed``: a SUCCESSFUL read that finds no such task — ``get_task``
-    answering ``TaskNotFoundError``, or ``get_statuses`` silently OMITTING the id — is a
-    corroborated absence (the task was deleted).  A FAILED read never reaches here — see
-    :func:`_ensure_owner_task`, where an unreadable status is explicitly not treated as
-    evidence of anything.
-
-    That last sentence is a GUARANTEE, not an aspiration, and it rests on both reads
-    reporting failure in band — ``get_task``'s ``(task, error)`` and
-    :class:`FlakeLedgerTaskClient.get_statuses`' ``(statuses, error)`` pair: the caller
-    returns early on a non-``None`` error, so only a successful read is classified here.
-    It was NOT true while the adapter swallowed failures into a bare ``{}`` — that
-    arrived indistinguishable from an absence and was classified ``closed``, filing a
-    replacement task for an owner that was alive and merely unread.
-    """
-    if not status:
-        return 'closed'
-    if status == 'deferred':
-        return 'deferred'
-    if status == 'done':
-        return 'done'
-    return 'closed' if status in TERMINAL else 'open'
 
 
 class _OwnerClaimLost(RuntimeError):
@@ -1110,6 +1051,53 @@ async def _owner_status(
     return statuses.get(owner_task_id), None
 
 
+@dataclass(frozen=True)
+class _SubmittedOwner:
+    task_id: str
+    needs_commit_planning: bool
+    combined: bool
+
+
+@dataclass(frozen=True)
+class _FailedFiling:
+    reason: str
+
+
+def _owner_from_submission(outcome: SubmitOutcome) -> _SubmittedOwner | _FailedFiling:
+    """The task a ``submit_task`` *outcome* makes the debt row's owner, or the reason
+    the filing failed.
+
+    A ``combined`` outcome means the server folded the filing into an existing task.
+    A live one owns the debt as it stands; it needs ``commit_planning`` only while it is
+    still ``deferred``, since committing an open task would run ``set_task_status``
+    gates on it.  A terminal or unknown one swallowed the filing: nothing open owns the
+    debt.
+    """
+    match outcome:
+        case SubmittedTask(task_id=task_id, combined=False):
+            return _SubmittedOwner(task_id, needs_commit_planning=True, combined=False)
+        case SubmittedTask(task_id=task_id, status=status) if status is None or status in TERMINAL:
+            return _FailedFiling(
+                f'submit_task combined the filing into task {task_id} '
+                f'(status={status!r}), which cannot own it — the filing was swallowed'
+            )
+        case SubmittedTask(task_id=task_id, status=status):
+            return _SubmittedOwner(
+                task_id, needs_commit_planning=status == 'deferred', combined=True,
+            )
+        case SubmittedTicket(ticket_id=ticket_id):
+            return _FailedFiling(
+                f'submit_task returned ticket {ticket_id!r}, not a task — '
+                'planning_mode did not take effect'
+            )
+        case SubmitFailed(reason=reason):
+            return _FailedFiling(reason)
+        case _:
+            return _FailedFiling(
+                f'submit_task answered a {type(outcome).__name__}, not a SubmitOutcome'
+            )
+
+
 async def _ensure_owner_task(
     db_path: Path,
     project_id: str,
@@ -1138,7 +1126,34 @@ async def _ensure_owner_task(
     *owner_read* when :func:`open_debt`'s lazy close made one of this owner, so each call
     reads its owner once (:func:`_owner_status`).  Only a cancelled or absent owner is
     REPLACED: a done one is kept, because on an open row it means the lazy close did not
-    land and the next suppression retries it (:func:`_owner_liveness`).
+    land and the next suppression retries it (the ``done`` verdict below).
+
+    Why :func:`shared.task_statuses.owner_liveness` has four verdicts and not a boolean.
+    ``planning_mode=True`` creates the task ``deferred``, so between ``submit_task`` and
+    ``commit_planning`` a crash or a failed second round-trip leaves a task that EXISTS
+    but will never be dispatched.  A boolean "open" predicate classifies that as not
+    open, so every subsequent suppression of the same test would file another orphan —
+    a duplicate-generating loop that gets worse the more the test flakes.  The
+    ``deferred`` branch finishes the half-done filing instead.
+
+    ``done`` is split out of ``closed`` (task η) because its correct action differs.
+    With a ``task_client`` wired, :func:`open_debt`'s lazy close resolves a done owner's
+    cycle and the re-entry upsert discharges that owner, so a done owner on an OPEN row
+    can only mean that resolution did not land: ``get_task`` failed, raised, timed out
+    or is missing and the ``get_statuses`` fallback read the owner done, or the stamp
+    itself failed.  Replacing it would overwrite the only pointer to the fix that did
+    not hold, so the cycle would never close, ``prior_resolving_commit`` would never be
+    written, and no ``regressed_after_resolution`` L2 would fire.
+
+    A SUCCESSFUL read that finds no such task — ``get_task`` answering
+    ``TaskNotFoundError``, or ``get_statuses`` silently OMITTING the id — is a
+    corroborated absence (the task was deleted) and classifies ``closed``.  A FAILED read
+    never reaches the classification: both reads report failure in band — ``get_task``'s
+    ``(task, error)`` and :class:`FlakeLedgerTaskClient.get_statuses`' ``(statuses,
+    error)`` pair — and the code below returns early on a non-``None`` error.  That was
+    NOT true while the adapter swallowed failures into a bare ``{}``: it arrived
+    indistinguishable from an absence and was classified ``closed``, filing a replacement
+    task for an owner that was alive and merely unread.
 
     COUPLING RULE, binding (§5.9): the ledger READS task status but never WRITES it,
     except the initial filing.  It never marks a task done, never blocks one, never
@@ -1174,9 +1189,9 @@ async def _ensure_owner_task(
         # next suppression of the same test retries, and θ's age backstop catches a row
         # that stays stuck; a duplicate task tree is not.
         #
-        # It is the TYPED PAIR, not the caller's exception discipline, that now makes
-        # `_owner_liveness`'s standing claim ("a FAILED read never reaches here") true
-        # through the production composition rather than merely aspirational.
+        # It is the TYPED PAIR, not the caller's exception discipline, that makes "a
+        # FAILED read never reaches the classification" true through the production
+        # composition rather than merely aspirational.
         status, read_error = await _owner_status(task_client, row.owner_task_id, owner_read)
         if read_error is not None:
             logger.warning(
@@ -1188,7 +1203,7 @@ async def _ensure_owner_task(
                 exc_info=read_error,
             )
             return row
-        liveness = _owner_liveness(status)
+        liveness = owner_liveness(status)
         if liveness == 'open':
             logger.debug(
                 'flake_ledger: debt for test_id=%s is already owned by live task %s',
@@ -1198,8 +1213,8 @@ async def _ensure_owner_task(
             return row
         if liveness == 'deferred':
             # A half-completed initial filing, not a closed one.  Finish it — filing a
-            # SECOND task here is the duplicate-generating loop _owner_liveness exists
-            # to prevent.  Completing the initial filing is explicitly exempted from
+            # SECOND task here is the duplicate-generating loop the deferred
+            # verdict exists to prevent.  Completing the initial filing is explicitly exempted from
             # §5.9's coupling rule; this is still never lifecycle management.
             logger.info(
                 'flake_ledger: completing the half-filed de-flake task %s for test_id=%s '
@@ -1219,7 +1234,7 @@ async def _ensure_owner_task(
                 )
             return row
         if liveness == 'done':
-            # The resolution did not land this call (see `_owner_liveness`).  Keep the
+            # The resolution did not land this call (see this function's docstring).  Keep the
             # pointer and file nothing, the unreadable-status branch's fail-safe
             # direction: the next lazy resolve_debt closes the cycle through it, where a
             # replacement would erase it for good.
@@ -1245,28 +1260,7 @@ async def _ensure_owner_task(
     # the other side-effects — the "independently guarded side-effects" discipline
     # `orchestrator/src/orchestrator/flake_recorder.py::_guarded` established.
     try:
-        new_id = str(await task_client.submit_task(build_deflake_task_arguments(row)) or '')
-        if not new_id:
-            # A falsy id is a FAILED filing, not a filing with an empty name.  Storing
-            # '' would hide the breach behind a truthy-looking column value; leaving the
-            # column NULL is what `flake_report` renders as the invariant breach it is.
-            raise ValueError('submit_task returned no task id')
-        if new_id.startswith(_TICKET_ID_PREFIX):
-            # A STRUCTURALLY WRONG id is also a failed filing, and the falsy guard above
-            # does not catch it because a ticket id is truthy.  `chronic_flake
-            # ::extract_task_id` falls back to submit_task's NON-planning two-phase
-            # response key, `{'ticket': 'tkt_<id>'}`; if `planning_mode` is ever dropped,
-            # rejected, or the server falls back to that path, a `tkt_...` string arrives
-            # here.  Storing it is strictly WORSE than storing nothing: a ticket id is not
-            # a task id, so every later `get_statuses(['tkt_...'])` legitimately OMITS it,
-            # `_owner_liveness` reads the omission as a CORROBORATED ABSENCE, and a
-            # REPLACEMENT is filed -- on every suppression, unbounded, on a path with no
-            # rate limit (see this function's own note).  Refused here, the row simply
-            # stays unowned and the next suppression RETRIES the filing, which terminates.
-            raise ValueError(
-                f'submit_task returned a ticket id ({new_id!r}), not a task id -- '
-                'planning_mode did not take effect'
-            )
+        outcome = await task_client.submit_task(build_deflake_task_arguments(row))
     except Exception:
         logger.warning(
             'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s) '
@@ -1277,6 +1271,18 @@ async def _ensure_owner_task(
             exc_info=True,
         )
         return row
+    owner = _owner_from_submission(outcome)
+    if isinstance(owner, _FailedFiling):
+        logger.warning(
+            'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s): '
+            '%s — the debt row stays UNOWNED and §5.9 is breached for it until the next '
+            'suppression retries',
+            row.test_id,
+            project_id,
+            owner.reason,
+        )
+        return row
+    new_id = owner.task_id
 
     # The pointer is written BEFORE commit_planning is awaited, and the order picks
     # which failure is survivable.  Written last, a commit_planning failure would orphan
@@ -1323,7 +1329,8 @@ async def _ensure_owner_task(
     # PHASE of the initial filing, not lifecycle management, and without it the task
     # exists but is never dispatched.
     try:
-        await task_client.commit_planning([new_id])
+        if owner.needs_commit_planning:
+            await task_client.commit_planning([new_id])
     except Exception:
         logger.warning(
             'flake_ledger: filed de-flake task %s for test_id=%s but could not release it '
@@ -1333,12 +1340,21 @@ async def _ensure_owner_task(
             row.test_id,
             exc_info=True,
         )
-    logger.info(
-        'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
-        new_id,
-        row.test_id,
-        project_id,
-    )
+    if owner.combined:
+        logger.info(
+            'flake_ledger: de-flake filing for test_id=%s was combined into live task %s, '
+            'now its owner (project_id=%s)',
+            row.test_id,
+            new_id,
+            project_id,
+        )
+    else:
+        logger.info(
+            'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
+            new_id,
+            row.test_id,
+            project_id,
+        )
     # No re-read.  After a ROWCOUNT-CHECKED conditional UPDATE, `new_id` is exactly what
     # is in that column on disk — so patching the one column this function owns is not a
     # "local copy" of the row, it is the row.
@@ -1728,7 +1744,7 @@ def _finished_task(owner: _OwnerRead, test_id: str) -> dict | None:
     return owner.task
 
 
-def _resolving_commit(task: dict) -> str | None:
+def resolving_commit(task: Mapping[str, Any]) -> str | None:
     """The commit that landed *task*'s fix, from its ``metadata.done_provenance``, read
     with the one typed metadata parser.  ``None`` when none was recorded: a task that
     predates ``done_provenance``, or a commitless kind.
@@ -1740,6 +1756,21 @@ def _resolving_commit(task: dict) -> str | None:
     metadata, _warnings = parse_metadata(task.get('metadata'), direction='read')
     provenance = metadata.done_provenance
     return provenance.commit if isinstance(provenance, DoneProvenance) else None
+
+
+def fix_contained(task: Mapping[str, Any], ancestry: bool | None) -> bool | None:
+    """Whether *task*'s fix is contained in the head the caller asked about: ``True``,
+    ``False``, or ``None`` when that is undecided.
+
+    ``True`` when *task* recorded no fix commit (:func:`resolving_commit` is ``None``):
+    a done task with nothing to be missing from the head is contained.  Otherwise
+    *ancestry* decides: it is the caller's already-performed
+    ``is_ancestor_checked(commit, head)`` read for that commit, and ``None`` there (the
+    read failed) leaves the answer ``None``.
+    """
+    if resolving_commit(task) is None:
+        return True
+    return ancestry
 
 
 def _stamp_resolution(
@@ -1862,7 +1893,7 @@ async def _resolve(
         task = None if owner is None else _finished_task(owner, test_id)
         if task is None:
             return False, owner
-        commit = _resolving_commit(task)
+        commit = resolving_commit(task)
         if not _stamp_resolution(
             db_path, test_id, owner_task_id=owner_task_id, resolving_commit=commit, stamp=stamp,
         ):

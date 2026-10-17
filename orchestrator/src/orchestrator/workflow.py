@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
@@ -31,12 +32,14 @@ from pydantic import ValidationError
 from shared.cli_invoke import (
     AgentFailureKind,
     AllAccountsCappedException,
+    PromptBuilder,
     classify_agent_failure,
     classify_cap_kill,
     invoke_with_cap_retry,
     is_server_error_status,
     is_timed_out_with_progress,
     is_zero_output_timeout,
+    no_mcp_servers_config,
     read_transcript_records,
     transcript_exists,
 )
@@ -2203,23 +2206,23 @@ class TaskWorkflow:
         the state machine stays under pyright's complexity threshold.
 
         Returns ``WorkflowOutcome.DONE`` on success; ``BLOCKED`` (with L1)
-        when the persistence layer refuses or ``_merge_sha`` is missing.
+        when the persistence layer refuses.  The DONE phase is entered only
+        once the done write has landed, so a refused write reaches
+        ``_mark_blocked`` from a working machine and leaves a 'blocked' row
+        plus an L1.  A missing ``_merge_sha`` exits DONE without writing the
+        row (task 3113).
         """
         await self._reconcile_metadata_files_for_done()
         if not self._merge_sha:
-            # Should never happen on the happy path — _submit_to_merge_queue
-            # always populates _merge_sha on success.  Defensive bail-out
-            # rather than passing done_provenance=None (which the server
-            # gate now rejects with done_provenance_required).
+            # Eval mode and the coalesced already_merged case reach here; task 3113 owns this exit.
             logger.error(
                 'Task %s: SUCCESS path reached without _merge_sha — '
-                'cannot construct done_provenance',
+                'cannot construct done_provenance; exiting DONE without '
+                'writing the done row',
                 self.task_id,
             )
-            return await self._mark_blocked(
-                'Internal: SUCCESS without merge_sha — provenance unconstructable',
-                escalate_to_human=True,
-            )
+            self._enter_phase(WorkflowState.DONE)
+            return WorkflowOutcome.DONE
         # task 3057: this stamp is DELIBERATELY NOT routed through
         # `gate_mark_done_on_delivered_checks`, unlike the eleven
         # attribution-shaped seams in this module, harness.py and
@@ -2251,6 +2254,7 @@ class TaskWorkflow:
                 f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         # task 2681/ζ: consume the write-ahead LandedRow on the happy path so it
         # no longer survives to the next startup (closing the RC-3 stale-row
         # window); only after a SUCCESSFUL mark_done — a rejected done-write
@@ -2773,11 +2777,9 @@ class TaskWorkflow:
                     # _execute_iterations will see no pending steps and
                     # return cleanly, allowing VERIFY to take over.
                     pass  # fall through to the post-PLAN section below
-                elif simple_outcome == WorkflowOutcome.DONE:
-                    # SIMPLE_TASK reported task_already_done.
-                    return simple_outcome
-                elif simple_outcome == WorkflowOutcome.BLOCKED:
-                    # SIMPLE_TASK reported unactionable_task — terminal.
+                elif simple_outcome != WorkflowOutcome.REQUEUED:
+                    # An exit handler's verdict (DONE, BLOCKED, ESCALATED,
+                    # CANCELLED) ends this dispatch.
                     return simple_outcome
                 else:
                     # Fallthrough sentinel — drop the plan so the
@@ -2824,34 +2826,16 @@ class TaskWorkflow:
             else:
                 self._enter_phase(WorkflowState.PLAN)
                 plan_outcome = await self._plan()
-                if plan_outcome == WorkflowOutcome.REQUEUED:
-                    return WorkflowOutcome.REQUEUED
-                if plan_outcome == WorkflowOutcome.BLOCKED:
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.waste_detected,
-                            task_id=self.task_id, phase='plan',
-                            data={'waste_type': 'replan_after_failure'},
-                        )
-                    return plan_outcome  # _plan() already called _mark_blocked
-                if plan_outcome == WorkflowOutcome.DONE:
-                    # _handle_already_done_report set status=done with provenance
-                    # and returned DONE.  Falling through to EXECUTE/VERIFY/MERGE
-                    # wastes effort and (per the 2026-05-04 incident) can orphan a
-                    # merge-queue halt if the workflow gets soft-cancelled
-                    # mid-merge.
+                if plan_outcome == WorkflowOutcome.BLOCKED and self.event_store:
+                    self.event_store.emit(
+                        EventType.waste_detected,
+                        task_id=self.task_id, phase='plan',
+                        data={'waste_type': 'replan_after_failure'},
+                    )
+                if plan_outcome != WorkflowOutcome.PLANNED:
+                    # Only PLANNED continues to execute/verify/review; any other
+                    # outcome already settled this dispatch (tasks 2911, 6052).
                     return plan_outcome
-                if plan_outcome == WorkflowOutcome.ESCALATED:
-                    # _mark_blocked returned ESCALATED: status='blocked' was already
-                    # written, an L1 escalation is open, the steward handed off to
-                    # a human.  Falling through to the post-PLAN ghost-loop guard
-                    # would mistake any architect scratch in the worktree for
-                    # "prior merge survived" and try to flip status to 'done'
-                    # (the done_provenance gate currently blocks the DB write but
-                    # the workflow logs a fake DONE — don't lie).  See task 2911
-                    # incident 2026-05-06; mirrors 9760ba74bf for the DONE case.
-                    return plan_outcome
-                # WorkflowOutcome.PLANNED falls through to execute/verify/review.
 
             # ── Ghost-loop early exit (before EXECUTE) ───────────
             # Journal-first (PRD workflow-state-machine α, MP-1/MP-2): a
@@ -2990,12 +2974,17 @@ class TaskWorkflow:
 
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
-                    resume_prompt = await self.briefing.build_resume_prompt(
-                        self.task, self.plan,
-                        '\n'.join(e.summary for e in self._check_escalations()),
-                        resolution, self.worktree,
-                    )
-                    await self._invoke(IMPLEMENTER, resume_prompt, self.worktree)
+                    async def build_resume_prompt(
+                        resolution: str = resolution,
+                    ) -> str:
+                        assert self.worktree is not None
+                        return await self.briefing.build_resume_prompt(
+                            self.task, self._live_plan(),
+                            '\n'.join(e.summary for e in self._check_escalations()),
+                            resolution, self.worktree,
+                        )
+
+                    await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
                     continue
                 if outcome != WorkflowOutcome.DONE:
                     return outcome
@@ -3042,29 +3031,24 @@ class TaskWorkflow:
                 # Not 'cancelled' (must be 'done' given TERMINAL_STATUSES).
                 # Reuse the bypass-discrimination helper: returns BLOCKED when a
                 # bypass is detected (reopen + bypass_done L1 already filed), or
-                # None when provenance is legitimate (commit reachable from main).
-                bypass_outcome = await self._handle_terminal_exit_on_block(
+                # DONE when provenance is legitimate (commit reachable from main).
+                terminal_outcome = await self._handle_terminal_exit_on_block(
                     exc,
                     reason=(
                         f'terminal at dispatch (old_status={exc.old_status!r})'
                     ),
                     detail='preempt: task terminal at dispatch',
                 )
-                if bypass_outcome is not None:
-                    # Bypass done detected — helper already reopened the row and
-                    # filed an L1 with category='bypass_done'.
-                    return bypass_outcome
-
-                # Legitimate done: provenance commit is reachable from main.
-                # The row is already terminal-done out-of-band (e.g. a human
-                # marked done during the ~3s acquire→dispatch window). Accept it.
-                logger.info(
-                    'Task %s: already legitimately done at dispatch (old_status=%r) '
-                    '— accepting, no reopen, no escalation',
-                    self.task_id, exc.old_status,
-                )
-                self._enter_phase(WorkflowState.DONE)
-                return WorkflowOutcome.DONE
+                if terminal_outcome is WorkflowOutcome.DONE:
+                    # The row is already terminal-done out-of-band (e.g. a human
+                    # marked done during the ~3s acquire→dispatch window).
+                    logger.info(
+                        'Task %s: already legitimately done at dispatch '
+                        '(old_status=%r) — accepting, no reopen, no escalation',
+                        self.task_id, exc.old_status,
+                    )
+                    self._enter_phase(WorkflowState.DONE)
+                return terminal_outcome
 
             # A persistence-layer rejection escaped one of the workflow's
             # set_task_status / mark_done call sites without an explicit
@@ -3478,12 +3462,16 @@ class TaskWorkflow:
           release and DONE-cleanup gate carry);
         * a hard cancel: ``_enter_phase`` never persists status, so a
           forcibly-torn-down workflow leaves the row as it was — the harness
-          R3 grace window and reconcile sweep own it.
+          R3 grace window and reconcile sweep own it;
+        * an in-flight Table-B action teardown (restart/abandon), which owns
+          the row: ``orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status``.
 
         A raising ``get_status`` (its contract is ``str | None``, so only a
         non-conforming double does this) reads as an unknown row.
         """
         if self._worktree_external or cancel_kind == 'hard':
+            return None, None
+        if self.scheduler.blocked_writes_suppressed(self.task_id) is True:
             return None, None
         try:
             status_row = await self.scheduler.get_status(self.task_id)
@@ -3556,7 +3544,6 @@ class TaskWorkflow:
         # Wait for steward to finish any pending work (suggestion triage, etc.)
         await self._ensure_steward_started()
         await self._await_steward_completion(skip_if_idle=True)
-        self._enter_phase(WorkflowState.DONE)
         return await self._finalise_merged_done()
 
     async def _resume_merge_retry_if_pending(
@@ -3857,6 +3844,8 @@ class TaskWorkflow:
                         # re-verify (the implement-phase site is covered
                         # separately by TestTaskLaneVerifyHoldsLease).
                         role='task',
+                        task_id=self.task_id,
+                        event_store=self.event_store,
                     )
                 if not verify.passed:
                     if verify.timed_out:
@@ -4392,6 +4381,15 @@ class TaskWorkflow:
         worktree's source code rather than the main tree's editable installs.
         Local ``[tool.uv.sources]`` dependencies (e.g. ``shared``) are
         pulled in automatically via relative editable paths.
+
+        Never uninstalls, and covers the whole workspace (task 3443): a
+        workspace shares one root ``.venv`` and a bare ``uv sync`` is exact,
+        so it prunes that venv down to one member's closure. ``--inexact``
+        makes it never uninstall, so it cannot undo what
+        ``verify_cold_preprovision_command`` or a steward provisioned, and the
+        parallel per-prefix syncs commute; ``--all-packages`` installs every
+        workspace member, which also heals a venv an earlier exact sync
+        stripped.
         """
         assert self.worktree is not None
 
@@ -4412,6 +4410,7 @@ class TaskWorkflow:
             project_dir = str(worktree / prefix)
             proc = await asyncio.create_subprocess_exec(
                 'uv', 'sync', '--project', project_dir,
+                '--inexact', '--all-packages',
                 cwd=str(self.worktree),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -4761,6 +4760,7 @@ class TaskWorkflow:
         try:
             await self.scheduler.set_task_status(self.task_id, 'pending')
         except TerminalExitRejection as exc:
+            self._note_exit_status_write('pending', None)
             return self._observed_terminal_outcome(exc.old_status)
         except SetTaskStatusRejected as exc:
             logger.error(
@@ -4843,6 +4843,7 @@ class TaskWorkflow:
         # so the architect can confirm, update, or recreate the plan.
         revalidation = False
         revalidation_changed_files: list[str] = []
+        build_prompt: PromptBuilder
         existing_plan = self.artifacts.read_plan()
         if (
             existing_plan
@@ -4860,9 +4861,13 @@ class TaskWorkflow:
                 'via the completion pass',
                 self.task_id, len(existing_plan.get('steps', [])),
             )
-            prompt = await self.briefing.build_plan_completion_prompt(
-                self.task, existing_plan, worktree=self.worktree,
-            )
+            async def build_completion_prompt() -> str:
+                return await self.briefing.build_plan_completion_prompt(
+                    self.task, self._live_plan() or existing_plan,
+                    worktree=self.worktree,
+                )
+
+            build_prompt = build_completion_prompt
         elif (
             existing_plan
             and existing_plan.get('steps')
@@ -4900,10 +4905,15 @@ class TaskWorkflow:
                 # Pre-flight check failed inside _apply_revalidation_skip
                 # (e.g. blast-radius lock denied) — fall through.
 
-            prompt = await self.briefing.build_revalidation_prompt(
-                self.task, existing_plan, revalidation_changed_files,
-                worktree=self.worktree,
-            )
+            changed_files = revalidation_changed_files
+
+            async def build_revalidation_prompt() -> str:
+                return await self.briefing.build_revalidation_prompt(
+                    self.task, self._live_plan() or existing_plan, changed_files,
+                    worktree=self.worktree,
+                )
+
+            build_prompt = build_revalidation_prompt
             revalidation = True
         else:
             # include_prior_proposals=True only when an existing_plan fell
@@ -4934,20 +4944,25 @@ class TaskWorkflow:
             # Belt-and-braces best-effort: the detector already swallows its own
             # exceptions and returns [], but a failure here must NEVER sink
             # PLAN, so the call site falls back to [] too.
-            try:
-                committed_work = await self._detect_committed_branch_work()
-            except Exception:
-                logger.warning(
-                    'Task %s: committed-branch-work detection raised at the '
-                    '_plan call site; briefing without it (task 3033)',
-                    self.task_id, exc_info=True,
+            include_prior_proposals = bool(existing_plan)
+
+            async def build_fresh_prompt() -> str:
+                try:
+                    committed_work = await self._detect_committed_branch_work()
+                except Exception:
+                    logger.warning(
+                        'Task %s: committed-branch-work detection raised at the '
+                        '_plan call site; briefing without it (task 3033)',
+                        self.task_id, exc_info=True,
+                    )
+                    committed_work = []
+                return await self.briefing.build_architect_prompt(
+                    self.task, worktree=self.worktree,
+                    include_prior_proposals=include_prior_proposals,
+                    committed_work=committed_work,
                 )
-                committed_work = []
-            prompt = await self.briefing.build_architect_prompt(
-                self.task, worktree=self.worktree,
-                include_prior_proposals=bool(existing_plan),
-                committed_work=committed_work,
-            )
+
+            build_prompt = build_fresh_prompt
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
         # detect "architect filed an L0 in lieu of writing a plan."  This is
@@ -4967,7 +4982,7 @@ class TaskWorkflow:
         rebase_retry_used = False
         for _outer_attempt in range(2):  # at most one rebase-retry round-trip
             for attempt in range(2):
-                result = await self._invoke(ARCHITECT, prompt, self.worktree)
+                result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
 
                 if not result.success:
                     cls = classify_agent_failure(result)
@@ -5464,12 +5479,13 @@ class TaskWorkflow:
         """
         assert self.worktree is not None and self.artifacts is not None
 
-        prompt = await self.briefing.build_simple_task_prompt(
+        build_prompt = partial(
+            self.briefing.build_simple_task_prompt,
             self.task, worktree=self.worktree,
         )
 
         try:
-            result = await self._invoke(SIMPLE_TASK, prompt, self.worktree)
+            result = await self._invoke(SIMPLE_TASK, build_prompt, self.worktree)
         except Exception as exc:  # noqa: BLE001 — fall through to architect
             logger.warning(
                 'Task %s: SIMPLE_TASK invocation failed (%s) — '
@@ -5731,9 +5747,9 @@ class TaskWorkflow:
         if not self.artifacts.read_plan():
             return False
 
-        prompt = await self.briefing.build_plan_schema_repair_prompt(self.task)
+        build_prompt = partial(self.briefing.build_plan_schema_repair_prompt, self.task)
         try:
-            await self._invoke(ARCHITECT, prompt, self.worktree)
+            await self._invoke(ARCHITECT, build_prompt, self.worktree)
         except Exception as e:
             logger.warning(
                 'Task %s: repair prompt invocation failed: %s',
@@ -6921,7 +6937,6 @@ class TaskWorkflow:
             'setting status done with provenance',
             self.task_id, commit[:12],
         )
-        self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done()
         try:
             await self.scheduler.mark_done(
@@ -6945,6 +6960,7 @@ class TaskWorkflow:
                 f'Architect already_done rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _hold_unattributed_already_done(
@@ -7172,9 +7188,11 @@ class TaskWorkflow:
                         'marker': marker,
                     },
                 )
-            await self._persist_blocked_row(
+            observed = await self._persist_blocked_row(
                 why=f'architect-desync merge already in flight for {tip[:12]}',
             )
+            if observed is not None:
+                return observed
             self._enter_phase(WorkflowState.BLOCKED)
             return WorkflowOutcome.BLOCKED
 
@@ -7230,13 +7248,17 @@ class TaskWorkflow:
         # replan it while this MergeRequest is still queued.  'blocked' with no
         # escalation is instead LEAVE-shaped, and the merge callback (or the
         # found_on_main reconciler) flips it done once main actually moves.
-        await self._persist_blocked_row(
+        observed = await self._persist_blocked_row(
             why=f'architect-desync merge enqueued for {tip[:12]}',
         )
+        if observed is not None:
+            return observed
         self._enter_phase(WorkflowState.BLOCKED)
         return WorkflowOutcome.BLOCKED
 
-    async def _persist_blocked_row(self, *, why: str, status: str = 'blocked') -> None:
+    async def _persist_blocked_row(
+        self, *, why: str, status: str = 'blocked',
+    ) -> WorkflowOutcome | None:
         """Durably write the park *status* for a non-escalating terminal exit.
 
         ``_handle_ready_to_merge_report``'s two success-shaped exits (merge
@@ -7261,11 +7283,17 @@ class TaskWorkflow:
 
         * :class:`TerminalExitRejection` is the BENIGN already-terminal race —
           the merge done-callback or the found_on_main reconciler beat us to
-          ``mark_done``.  That row is correct; log at info and leave it
-          terminal.  Never reopen, never retry (unlike ``_mark_blocked``'s
-          bypass trip-wire, a terminal row here is the EXPECTED good outcome).
+          ``mark_done``, or the task was cancelled.  That row is correct; log
+          at info and leave it terminal.  Never reopen, never retry (unlike
+          ``_mark_blocked``'s bypass trip-wire, a terminal row here is the
+          EXPECTED good outcome).
         * Any other exception is logged at warning and swallowed; the
           found_on_main reconciler remains the durable backstop.
+
+        Same contract as :meth:`_repend_for_requeue`: a non-None return is the
+        observed terminal (:meth:`_observed_terminal_outcome`), and it WINS
+        over the park — the caller returns it instead of BLOCKED/ESCALATED.
+        ``None`` means the write landed or its failure was ledgered.
         """
         try:
             await self.scheduler.set_task_status(self.task_id, status)
@@ -7276,6 +7304,8 @@ class TaskWorkflow:
                 'leaving it (%s)',
                 self.task_id, status, exc.old_status, why,
             )
+            self._note_exit_status_write(status, None)
+            return self._observed_terminal_outcome(exc.old_status)
         except Exception as exc:
             logger.warning(
                 'Task %s: %s-row write failed (%s): %s — continuing; the '
@@ -7285,6 +7315,7 @@ class TaskWorkflow:
             self._note_exit_status_write(status, exc)
         else:
             self._note_exit_status_write(status, None)
+        return None
 
     def _schedule_architect_merge_done(
         self, fut: asyncio.Future, *, tip: str, evidence: str,
@@ -8525,8 +8556,6 @@ class TaskWorkflow:
             await self._reconcile_done_step_commits()
             self.plan = self.artifacts.read_plan()
 
-            wip_notice = await self._detect_tip_wip_commits()
-
             # Snapshot completed steps before invocation
             completed_before = {
                 s['id']
@@ -8535,12 +8564,12 @@ class TaskWorkflow:
                 if isinstance(s, dict) and s.get('status') == 'done'
             }
 
-            prompt = await self.briefing.build_implementer_prompt(
-                self.plan, rebase_notice=rebase_notice,
-                task_id=self.task_id, wip_notice=wip_notice,
-            )
             pre_head = await self._get_head_commit()
-            result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
+            result = await self._invoke(
+                IMPLEMENTER,
+                partial(self._build_implementer_prompt, rebase_notice),
+                self.worktree,
+            )
 
             self.metrics.execute_iterations += 1
 
@@ -8599,6 +8628,14 @@ class TaskWorkflow:
                     self.task_id,
                 )
             self.artifacts.stamp_plan_provenance(self.session_id)
+
+            if result.retry_aborted:
+                logger.info(
+                    'Task %s: implementer retry cancelled — no pending steps '
+                    'remain; not classifying the cancelled attempt',
+                    self.task_id,
+                )
+                continue
 
             if not result.success:
                 logger.warning(
@@ -9016,12 +9053,13 @@ class TaskWorkflow:
             )
             return None
 
-        prompt = await self.briefing.build_completion_judge_prompt(
-            plan=self.plan,
-            iteration_log=iteration_log,
-            diff=diff,
-            task_id=self.task_id,
-        )
+        async def build_prompt() -> str:
+            return await self.briefing.build_completion_judge_prompt(
+                plan=self._live_plan(),
+                iteration_log=iteration_log,
+                diff=diff,
+                task_id=self.task_id,
+            )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors the merger/reviewer pre-spawn clear,
@@ -9030,7 +9068,7 @@ class TaskWorkflow:
 
         pre_cost = self.metrics.total_cost_usd
         try:
-            result = await self._invoke(JUDGE, prompt, self.worktree)
+            result = await self._invoke(JUDGE, build_prompt, self.worktree)
         except Exception as exc:
             logger.warning(
                 f'Task {self.task_id}: judge invocation raised '
@@ -9221,12 +9259,11 @@ class TaskWorkflow:
         (the documented manual `git show <wip-sha>` verification), never
         sinks the iteration loop.
 
-        Callers should re-read ``self.plan = self.artifacts.read_plan()``
-        immediately after this so a reconciled commit is picked up before
-        ``_detect_tip_wip_commits`` runs (see ``_execute_iterations``) — that
-        ordering lets the detector's own done-step dedup correctly exclude
-        the now-reconciled sha instead of re-surfacing it as unattributed
-        pending work.
+        Callers run this before the implementer prompt builder re-reads
+        plan.json for ``_detect_tip_wip_commits`` (see
+        ``_execute_iterations``) — that ordering lets the detector's own
+        done-step dedup correctly exclude the now-reconciled sha instead of
+        re-surfacing it as unattributed pending work.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return
@@ -9412,7 +9449,27 @@ class TaskWorkflow:
         )
         self.escalation_queue.submit(esc)
 
-    async def _detect_tip_wip_commits(self) -> list[dict]:
+    def _live_plan(self) -> dict:
+        """plan.json as it is on disk NOW — what every prompt builder renders.
+
+        Never ``self.plan``: that is whatever was last read, and a builder is
+        awaited again before every retry, possibly after a long cap wait.
+        """
+        assert self.artifacts is not None
+        return self.artifacts.read_plan()
+
+    async def _build_implementer_prompt(self, rebase_notice: dict | None) -> str | None:
+        """The execute loop's implementer prompt, or None once no step is pending."""
+        assert self.artifacts is not None
+        if not self.artifacts.get_pending_steps():
+            return None
+        plan = self._live_plan()
+        return await self.briefing.build_implementer_prompt(
+            plan, rebase_notice=rebase_notice,
+            task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
+        )
+
+    async def _detect_tip_wip_commits(self, plan: dict) -> list[dict]:
         """Detect a contiguous run of WIP safety-commits sitting at HEAD.
 
         Several harness paths auto-commit uncommitted work as a safety net
@@ -9434,7 +9491,7 @@ class TaskWorkflow:
         Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for the
         contiguous run of WIP safety-commits at HEAD (stops at the first
         non-WIP commit), excluding any SHA already recorded as the
-        ``commit`` of a done plan step (dedup against ``self.plan``).
+        ``commit`` of a done step of *plan*.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return []
@@ -9453,7 +9510,7 @@ class TaskWorkflow:
             recorded = {
                 s['commit']
                 for col in ('prerequisites', 'steps')
-                for s in self.plan.get(col, [])
+                for s in plan.get(col, [])
                 if isinstance(s, dict) and s.get('status') == 'done' and s.get('commit')
             }
             # Prefix-match rather than exact-match: the prompt shows an
@@ -9931,6 +9988,7 @@ class TaskWorkflow:
                         archive_root=self.config.project_root / 'data' / 'verify-logs',
                         force_workspace=self._train is not None,
                         role='task',
+                        event_store=self.event_store,
                     )
             except VerifyInfraError as exc:
                 last_infra_exc = exc
@@ -10189,11 +10247,15 @@ class TaskWorkflow:
 
             # Invoke debugger
             self.plan = self.artifacts.read_plan()
-            prompt = await self.briefing.build_debugger_prompt(
-                result.failure_report(), self.plan, task_id=self.task_id,
-            )
+            failure_report = result.failure_report()
+
+            async def build_prompt(failure_report: str = failure_report) -> str:
+                return await self.briefing.build_debugger_prompt(
+                    failure_report, self._live_plan(), task_id=self.task_id,
+                )
+
             pre_head = await self._get_head_commit()
-            debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
+            debug_result = await self._invoke(DEBUGGER, build_prompt, self.worktree)
 
             # Write debugger iteration log entry
             self.artifacts.append_iteration_log({
@@ -10333,7 +10395,10 @@ class TaskWorkflow:
         if n == 0:
             return []
         fail_safe = [NOT_SETTLED] * n
-        prompt = build_resettled_adjudicator_prompt(current_list, prior_settled)
+
+        async def build_prompt() -> str:
+            return build_resettled_adjudicator_prompt(current_list, prior_settled)
+
         schema = {
             'type': 'object',
             'properties': {
@@ -10357,7 +10422,7 @@ class TaskWorkflow:
         try:
             assert self.worktree is not None
             result = await self._invoke(
-                _RESETTLED_ADJUDICATOR, prompt, self.worktree,
+                _RESETTLED_ADJUDICATOR, build_prompt, self.worktree,
                 output_schema=schema,
             )
         except Exception as exc:
@@ -10619,7 +10684,8 @@ class TaskWorkflow:
         scope section into the reviewer prompt (task 2750).
         """
         assert self.worktree is not None and self.artifacts is not None
-        prompt = await self.briefing.build_reviewer_prompt(
+        build_prompt = partial(
+            self.briefing.build_reviewer_prompt,
             role.name, diff, amendment_suggestions=amendment_suggestions,
             task=self.task,
         )
@@ -10641,7 +10707,7 @@ class TaskWorkflow:
         # verdicts/ artifact and an ERROR reviews/ mirror seconds later.
         # Salvage must therefore run here, BEFORE any respawn.
         try:
-            result = await self._invoke(role, prompt, self.worktree)
+            result = await self._invoke(role, build_prompt, self.worktree)
         except (
             TimeoutError,
             AllAccountsCappedException,
@@ -10838,10 +10904,11 @@ class TaskWorkflow:
         """Feed review feedback back to architect for re-planning."""
         assert self.worktree is not None and self.artifacts is not None
         self.plan = self.artifacts.read_plan()
-        prompt = await self.briefing.build_replan_prompt(
+        build_prompt = partial(
+            self.briefing.build_replan_prompt,
             self.task, reviews.format_for_replan(),
         )
-        await self._invoke(ARCHITECT, prompt, self.worktree)
+        await self._invoke(ARCHITECT, build_prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
 
     async def _commit_amendment_wip(self, amendment_round: int) -> str | None:
@@ -10920,14 +10987,18 @@ class TaskWorkflow:
         if corrupted:
             self._escalate_corruption(corrupted)
 
-        prompt = await self.briefing.build_amender_prompt(
-            plan=self.plan,
-            suggestions=in_scope,
-            locked_modules=list(self.modules),
-            task_id=self.task_id,
-        )
+        locked_modules = list(self.modules)
+
+        async def build_prompt() -> str:
+            return await self.briefing.build_amender_prompt(
+                plan=self._live_plan(),
+                suggestions=in_scope,
+                locked_modules=locked_modules,
+                task_id=self.task_id,
+            )
+
         pre_head = await self._get_head_commit()
-        await self._invoke(IMPLEMENTER, prompt, self.worktree)
+        await self._invoke(IMPLEMENTER, build_prompt, self.worktree)
 
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
@@ -10974,12 +11045,15 @@ class TaskWorkflow:
         self._plan_tightened = True
 
         before = set(self.plan.get('files', []))
-        prompt = await self.briefing.build_plan_tightening_prompt(
-            self.task, self.plan, not_touched, worktree=self.worktree,
-        )
+
+        async def build_prompt() -> str:
+            return await self.briefing.build_plan_tightening_prompt(
+                self.task, self._live_plan(), not_touched, worktree=self.worktree,
+            )
+
         assert self.worktree is not None
         assert self.artifacts is not None
-        result = await self._invoke(ARCHITECT, prompt, self.worktree)
+        result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
         if not result.success:
             return False
 
@@ -11314,6 +11388,7 @@ class TaskWorkflow:
             result=future,
             lane=lane_for_task_metadata(self.task.get('metadata')),
             merge_first_enqueued_at=first_enqueued_at,
+            awaited_by_workflow=True,
         )
 
         attached = False
@@ -11859,8 +11934,8 @@ class TaskWorkflow:
             f"Task: {self.task.get('title', '')}\n"
             f"{self.task.get('description', '')}"
         )
-        prompt = await self.briefing.build_merger_prompt(
-            conflict_details, task_intent,
+        build_prompt = partial(
+            self.briefing.build_merger_prompt, conflict_details, task_intent,
         )
 
         # Rebase onto current main so MERGER works on up-to-date state
@@ -11868,7 +11943,7 @@ class TaskWorkflow:
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors steward.py's pre-triage clear).
         self.artifacts.clear_verdict('merger')
-        merger_result = await self._invoke(MERGER, prompt, self.worktree)
+        merger_result = await self._invoke(MERGER, build_prompt, self.worktree)
 
         # Read the merger's structured disposition instead of grepping its
         # free-text output for "BLOCKED" (task 2483 / PRD task γ). Defensive
@@ -13407,11 +13482,23 @@ class TaskWorkflow:
     async def _invoke(
         self,
         role: AgentRole,
-        prompt: str,
+        build_prompt: PromptBuilder,
         cwd: Path,
         output_schema: dict | None = None,
     ) -> AgentResult:
-        """Invoke an agent with role-specific configuration."""
+        """Invoke an agent with role-specific configuration.
+
+        *build_prompt* is awaited for the first dispatch and again before
+        every retry, so a retry is briefed from current state; it may return
+        None only to cancel a retry.
+        """
+        prompt = await build_prompt()
+        if prompt is None:
+            raise ValueError(
+                f'Task {self.task_id} [{role.name}]: the prompt builder declined '
+                f'the first dispatch; a prompt builder may decline only a retry '
+                f'— check for work before invoking'
+            )
         timeouts_cfg = self.config.timeouts
         backends_cfg = self.config.backends
 
@@ -13548,6 +13635,12 @@ class TaskWorkflow:
         if 'verdict_tools' in role.mcp_families and cwd:
             mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
+        # Strict scoping (EVAL_PROFILE, task 4757) is a no-op without a truthy
+        # --mcp-config, so a role whose families composed none gets the
+        # zero-server one rather than keeping the worktree's ambient .mcp.json.
+        if self.config.strict_mcp_config and not mcp_config:
+            mcp_config = no_mcp_servers_config()
+
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
         # by passing resume_session_id to invoke_with_cap_retry.  Otherwise,
@@ -13556,10 +13649,8 @@ class TaskWorkflow:
         # subprocess starts and cleared in the finally below — its presence
         # ⇔ "agent was in flight when the orchestrator exited".
         #
-        # Prompt-substitution ownership: cli_invoke owns the resume-continuation
-        # prompt swap (CRASH_RECOVERY_RESUME_PROMPT = 'continue').  Workflow
-        # always passes the real task prompt so that cli_invoke's
-        # original_prompt capture is correct for any fresh-fallback invocation.
+        # cli_invoke owns the resume-continuation prompt swap; a fresh
+        # fallback is briefed by build_prompt, handed down as rebuild_prompt.
         resume_session_id: str | None = None
         if (
             self._pending_resume_session_id
@@ -13834,6 +13925,7 @@ class TaskWorkflow:
                 config_dir=self._config_dir,
                 invoke_fn=invoke_agent,
                 prompt=prompt,
+                rebuild_prompt=build_prompt,
                 system_prompt=self._resolve_role_system_prompt(role, model),
                 cwd=cwd,
                 model=model,
@@ -13842,6 +13934,7 @@ class TaskWorkflow:
                 allowed_tools=role.allowed_tools or None,
                 disallowed_tools=role.disallowed_tools or None,
                 mcp_config=mcp_config,
+                strict_mcp_config=self.config.strict_mcp_config,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
                 sandbox_extras=sandbox_extras,
@@ -14119,6 +14212,9 @@ class TaskWorkflow:
                     # false-positive rate computable from runs.db, since a
                     # True-only key leaves the denominator unknowable.
                     'ended_awaiting_background': result.ended_awaiting_background,
+                    # Present-and-false too: the rate at which a prompt
+                    # builder cancels a retry of finished work (task 5730).
+                    'retry_aborted': result.retry_aborted,
                     # Same present-and-false rationale for the cap pair, so
                     # ceiling saturation is computable.  model_id is the exact
                     # CLI-served version beside the alias in `model`; None
@@ -15041,7 +15137,6 @@ class TaskWorkflow:
         ) is not None:
             return None
         self._merge_recovery_basis = basis
-        self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done(override_files=files)
         try:
             await self.scheduler.mark_done(
@@ -15056,6 +15151,7 @@ class TaskWorkflow:
                 f'Recovery-DONE rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _discovered_landing_sha(
@@ -15965,7 +16061,7 @@ class TaskWorkflow:
         exc: TerminalExitRejection,
         reason: str,
         detail: str,
-    ) -> WorkflowOutcome | None:
+    ) -> WorkflowOutcome:
         """Detect ``update_task(status='done')`` bypass after a terminal-exit rejection.
 
         When ``set_task_status('blocked')`` raises ``TerminalExitRejection``
@@ -15977,8 +16073,7 @@ class TaskWorkflow:
            ``WorkflowOutcome.CANCELLED`` immediately (before any ``get_task``
            round-trip or provenance read).
         1. Legitimate done (``old_status == 'done'``, provenance commit reachable
-           from main) — return ``None`` so the existing flow continues; the
-           post-steward branch at ``current == 'done'`` returns DONE.
+           from main) — return ``WorkflowOutcome.DONE``; nothing is filed.
         2. Bypass (``old_status == 'done'``, provenance missing or commit not on
            main) — reopen the row via
            ``set_task_status('blocked', reopen_reason='bypass detected: …')``,
@@ -16009,7 +16104,7 @@ class TaskWorkflow:
                         'commit %s is reachable from main — legitimate done',
                         self.task_id, commit[:12],
                     )
-                    return None
+                    return WorkflowOutcome.DONE
             except Exception:
                 logger.warning(
                     'Task %s: ancestor check failed during bypass detection',
@@ -16252,50 +16347,45 @@ class TaskWorkflow:
                 detail=(detail or reason),
                 category=(disposition.category if disposition is not None else None),
                 blocked_from_phase=pre_block_state,
+                block_category=category,
             )
             return outcome
 
         if not merge_phase:
             self._enter_phase(WorkflowState.BLOCKED)
-            _status_set_ok = False
             try:
                 await self.scheduler.set_task_status(self.task_id, block_status)
-                _status_set_ok = True
             except TerminalExitRejection as exc:
-                bypass_outcome = await self._handle_terminal_exit_on_block(
+                self._note_exit_status_write(block_status, None)
+                return _record(await self._handle_terminal_exit_on_block(
                     exc, reason, detail or reason,
+                ))
+            # Best-effort staleness-reference stamp (task 2557): records
+            # the confirmed block transition so BriefingAssembler can
+            # tell a stale persisted dry_run_proposals entry (from a
+            # PRIOR block cycle, re-blocked without a fresh investigation)
+            # apart from a fresh one. Awaited synchronously here, BEFORE
+            # the fire-and-forget _spawn_dry_run_unblock below appends its
+            # own later-timestamped proposal — so a fresh investigation's
+            # proposal.timestamp always lands after last_blocked_at.
+            # Default metadata_mode ('merge') preserves sibling keys
+            # (incl. dry_run_proposals). Never raises — mirrors the
+            # existing best-effort dry_run proposal-list trim in
+            # dry_run_unblock.py.
+            try:
+                await self.scheduler.update_task(
+                    self.task_id, {'last_blocked_at': datetime.now(UTC).isoformat()},
                 )
-                if bypass_outcome is not None:
-                    return _record(bypass_outcome)
-                # Legitimate done — fall through; the existing post-steward
-                # flow below handles current==done by returning DONE.
-            if _status_set_ok:
-                # Best-effort staleness-reference stamp (task 2557): records
-                # the confirmed block transition so BriefingAssembler can
-                # tell a stale persisted dry_run_proposals entry (from a
-                # PRIOR block cycle, re-blocked without a fresh investigation)
-                # apart from a fresh one. Awaited synchronously here, BEFORE
-                # the fire-and-forget _spawn_dry_run_unblock below appends its
-                # own later-timestamped proposal — so a fresh investigation's
-                # proposal.timestamp always lands after last_blocked_at.
-                # Default metadata_mode ('merge') preserves sibling keys
-                # (incl. dry_run_proposals). Never raises — mirrors the
-                # existing best-effort dry_run proposal-list trim in
-                # dry_run_unblock.py.
-                try:
-                    await self.scheduler.update_task(
-                        self.task_id, {'last_blocked_at': datetime.now(UTC).isoformat()},
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        '_mark_blocked: last_blocked_at stamp failed for task %s '
-                        '(best-effort, continuing): %s',
-                        self.task_id, exc,
-                    )
-                self._spawn_dry_run_unblock(
-                    reason, detail or reason,
-                    block_class=(disposition.block_class if disposition is not None else None),
+            except Exception as exc:
+                logger.warning(
+                    '_mark_blocked: last_blocked_at stamp failed for task %s '
+                    '(best-effort, continuing): %s',
+                    self.task_id, exc,
                 )
+            self._spawn_dry_run_unblock(
+                reason, detail or reason,
+                block_class=(disposition.block_class if disposition is not None else None),
+            )
         elif spawn_dry_run:
             # Post-merge red-main class: merge_phase suppressed the status
             # transition and the spawn above, but this IS the mechanically
@@ -16370,11 +16460,13 @@ class TaskWorkflow:
                     reason, detail or reason, category=category,
                     root_cause=root_cause,
                 )
-                await self._park_merge_phase_row(
+                observed = await self._park_merge_phase_row(
                     merge_phase, block_status,
                     why=f'escalate_to_human short-circuit: {reason[:80]}',
                 )
-                return _record(WorkflowOutcome.BLOCKED)
+                return _record(
+                    observed if observed is not None else WorkflowOutcome.BLOCKED,
+                )
 
             # Don't create a duplicate if level-1 already pending — but only a
             # SAME-signature L1 should suppress the steward-facing L0 (task 2757):
@@ -16524,10 +16616,12 @@ class TaskWorkflow:
                     # which is what makes run()'s ESCALATED-branch comment
                     # ("status='blocked' was already written") true on every
                     # path rather than only the non-merge ones.
-                    await self._park_merge_phase_row(
+                    observed = await self._park_merge_phase_row(
                         merge_phase, block_status,
                         why=f'steward re-escalated to human: {reason[:80]}',
                     )
+                    if observed is not None:
+                        return _record(observed)
                     logger.info(
                         'Task %s: L1 escalation open — steward handed '
                         'off to human; exiting ESCALATED',
@@ -16692,15 +16786,17 @@ class TaskWorkflow:
                     '(steward consumer dead; L1 already filed)',
                     self.task_id, len(orphan_l0),
                 )
-        await self._park_merge_phase_row(
+        observed = await self._park_merge_phase_row(
             merge_phase, block_status,
             why=f'BLOCKED fall-through: {reason[:80]}',
         )
-        return _record(WorkflowOutcome.BLOCKED)
+        return _record(
+            observed if observed is not None else WorkflowOutcome.BLOCKED,
+        )
 
     async def _park_merge_phase_row(
         self, merge_phase: bool, block_status: str, *, why: str,
-    ) -> None:
+    ) -> WorkflowOutcome | None:
         """Write the park status for a ``merge_phase=True`` SLOT-EXITING return.
 
         Called from all three of :meth:`_mark_blocked`'s slot-exiting returns —
@@ -16732,13 +16828,19 @@ class TaskWorkflow:
         time, so entering BLOCKED here keeps SM-2's ``report.phase ==
         machine.state`` check satisfied.
 
+        Returns ``_persist_blocked_row``'s observed terminal, which the caller
+        reports instead of its BLOCKED/ESCALATED; BLOCKED is entered only when
+        there is none.  ``None`` when *merge_phase* is False.
+
         See spec §8-E2 and the MERGE_PHASE_RATIONALE paragraph in
         :meth:`_mark_blocked`'s docstring for why the entry gate stays.
         """
         if not merge_phase:
-            return
-        await self._persist_blocked_row(why=why, status=block_status)
-        self._enter_phase(WorkflowState.BLOCKED)
+            return None
+        observed = await self._persist_blocked_row(why=why, status=block_status)
+        if observed is None:
+            self._enter_phase(WorkflowState.BLOCKED)
+        return observed
 
     def _durable_ref_suffix(self) -> str:
         """Durable git identifiers to append to an L1 escalation's detail.

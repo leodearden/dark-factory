@@ -142,6 +142,10 @@ _UPSERT_SQL = """
         entity_uuid = excluded.entity_uuid
 """
 
+# _UPSERT_SQL whose overwrite applies only while the stored row is in the bound
+# state; built from it so the column list and SET clause stay single-sourced.
+_UPSERT_IF_STATE_SQL = _UPSERT_SQL + '    WHERE recon_ledger.state = ?\n'
+
 
 @dataclass(frozen=True)
 class ReconLedgerRecord:
@@ -384,6 +388,19 @@ class ReconLedgerStore:
         async with self._require_access().write() as db:
             await db.execute(_UPSERT_SQL, self._upsert_params(record))
 
+    async def upsert_if_state(self, record: ReconLedgerRecord, *, existing_state: str) -> bool:
+        """Insert *record*, or overwrite its identity's row only while that row is in *existing_state*.
+
+        One statement, so the row cannot change state between the check and the
+        write. Returns ``False`` when a row in another state was left untouched.
+        """
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                _UPSERT_IF_STATE_SQL, (*self._upsert_params(record), existing_state)
+            )
+            written = cursor.rowcount
+        return written > 0
+
     async def upsert_many(self, records: Sequence[ReconLedgerRecord]) -> int:
         """Insert or update many records in ONE transaction (task 3041 amendment).
 
@@ -465,19 +482,53 @@ class ReconLedgerStore:
             project_id, RECORD_KIND_MEM0_TOMBSTONE, task_id=memory_id
         )
 
-    async def list_suppressions(self, project_id: str) -> list[ReconLedgerRecord]:
-        """Return the active ``stage1_flag_suppression`` rows for a project.
+    async def mem0_tombstones_with_prefix(
+        self, project_id: str, prefix: str
+    ) -> list[ReconLedgerRecord]:
+        """Return the tombstones in *project_id* whose memory id starts with *prefix*, by id.
 
-        Satisfied by the ``(project_id, record_kind, state)`` index.
+        The uuid-prefix miss report's reach into a store keyed by the full id
+        (task 5323), in one query: each row is the record
+        :meth:`get_mem0_tombstone` returns for its id. ``substr`` equality,
+        not ``LIKE``: LIKE folds case and reads ``%``/``_`` as wildcards, and
+        a prefix is a literal.
         """
         rows = await self._require_access().read_all(
             """
             SELECT * FROM recon_ledger
-            WHERE project_id = ? AND record_kind = 'stage1_flag_suppression' AND state = 'active'
+            WHERE project_id = ? AND record_kind = ? AND substr(task_id, 1, ?) = ?
+            ORDER BY task_id
             """,
-            (project_id,),
+            (project_id, RECORD_KIND_MEM0_TOMBSTONE, len(prefix), prefix),
         )
         return [_record_from_row(row) for row in rows]
+
+    async def list_by_kind(
+        self, project_id: str, record_kind: str, state: str
+    ) -> list[ReconLedgerRecord]:
+        """Return every *record_kind* row in *state* for *project_id*.
+
+        The generic kind/state reader, served by the ``(project_id,
+        record_kind, state)`` index; ordered by ``created_at`` then identity.
+        Returns raw records: decoding a payload is its kind's owner's job.
+
+        Does NOT filter on ``expires_at``. A kind gets TTL by its writer always
+        stamping ``expires_at`` and :meth:`gc` reaping it; a consumer that
+        acts on a row re-checks expiry at use.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND state = ?
+            ORDER BY created_at, task_id, flag_type, run_id
+            """,
+            (project_id, record_kind, state),
+        )
+        return [_record_from_row(row) for row in rows]
+
+    async def list_suppressions(self, project_id: str) -> list[ReconLedgerRecord]:
+        """Return the active ``stage1_flag_suppression`` rows for a project."""
+        return await self.list_by_kind(project_id, 'stage1_flag_suppression', 'active')
 
     async def is_suppressed(self, project_id: str, task_id: str, flag_type: str) -> bool:
         """Return True if ``task_id``/``flag_type`` is actively suppressed.

@@ -37,13 +37,13 @@ import httpx
 import pytest
 from openai import RateLimitError
 from pydantic import BaseModel
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.graphiti_client import (
     INCOMPLETE_KINDS,
     PagedRead,
     ReadCompleteness,
 )
-from fused_memory.utils.target_store_preflight import task_store_path
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -2037,7 +2037,7 @@ def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
     file; agreement with the real backend is pinned once, in
     tests/test_target_store_preflight.py.
     """
-    db = task_store_path(project_root)
+    db = tasks_db(project_root)
     db.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db)
     try:
@@ -2055,7 +2055,7 @@ def make_zero_byte_task_store(project_root: pathlib.Path) -> pathlib.Path:
     The residue shape ``target_store_preflight``'s guard must refuse, and the
     counterpart of :func:`make_populated_task_store`.
     """
-    db = task_store_path(project_root)
+    db = tasks_db(project_root)
     db.parent.mkdir(parents=True)
     db.touch()
     return db

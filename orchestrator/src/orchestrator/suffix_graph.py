@@ -44,6 +44,7 @@ import collections
 import dataclasses
 import functools
 import logging
+import secrets
 from collections.abc import Callable
 
 from orchestrator.git_ops import GitOps
@@ -204,6 +205,37 @@ class SuffixConflictTracker:
         self.signature: tuple[tuple[str, ...], str] | None = None
         self.last_known_main_sha: str | None = None
         self.bounce_registry: MergeBounceRegistry = MergeBounceRegistry()
+        self._escalations_issued: int = 0
+        self._incarnation: str = secrets.token_hex(4)
+
+    def _escalate(self, req: MergeRequest, detail: str) -> int:
+        """Divert *req* out of its lane and resolve it blocked; return the ordinal.
+
+        Its reason never repeats, not even across a restart (guard and why:
+        ``orchestrator/tests/test_merge_queue_bounce.py::TestBounceEscalationsNeverFeedTheThrashLadder``).
+
+        Trade-off note (robustness_premature_escalation): the frozen tip is
+        speculative — the frozen items are still verifying and may fail.  A
+        branch clean vs bare main can thus be escalated for a collision with an
+        item that never lands.  Accepted: the steward resolves it, and if the
+        frozen item fails, the branch requeues without prejudice.
+        """
+        _, _, NEEDS_REBASE_REASON_PREFIX = _merge_queue_constants()
+        self._escalations_issued += 1
+        ordinal = self._escalations_issued
+        branch = req.branch.bare_id
+        self._lane_buffers()[req.lane].remove(req)
+        self.bounce_registry.clear(branch)  # fresh slate on resubmission
+        outcome = MergeOutcome(
+            status='blocked',
+            reason=(
+                f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} {detail} '
+                f'(bounce escalation #{ordinal} of tracker {self._incarnation})'
+            ),
+        )
+        if not req.result.done():
+            req.result.set_result(outcome)
+        return ordinal
 
     async def recompute(self) -> None:
         """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
@@ -477,12 +509,14 @@ class SuffixConflictTracker:
            TRAIN_REBASE_CONFLICT path).
         2. Emit a structured ``needs_rebase`` log line.
         3. Bump the bounce registry; if the count exceeds :data:`MERGE_BOUNCE_CAP`
-           → escalate WITHOUT rebasing (cap exceeded).
+           → escalate via :meth:`_escalate` (ordinal-bearing reason) WITHOUT
+           rebasing.
         4. Else: attempt a mechanical rebase onto the frozen tip via
            ``rebase_onto_main(req.worktree, onto=frozen_tip)``.
            - True (clean) → leave the item in the lane buffer (re-queue);
              the future and ``merge_first_enqueued_at`` are untouched.
-           - False (real conflict) → remove from the lane buffer and escalate.
+           - False (real conflict) → escalate via :meth:`_escalate`
+             (ordinal-bearing reason).
 
         After processing any bounce, set ``signature = None`` so the next
         :meth:`recompute` call re-probes reality (prevents a successfully-
@@ -497,7 +531,7 @@ class SuffixConflictTracker:
         """
         # Deferred reach-back, memoized after the first call — see
         # _merge_queue_constants() (amend: reviewer performance).
-        MERGE_LANES, MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX = _merge_queue_constants()
+        MERGE_LANES, MERGE_BOUNCE_CAP, _ = _merge_queue_constants()
 
         if not self.graph.conflicts_with_main:
             return  # nothing to bounce — leave signature intact
@@ -552,30 +586,14 @@ class SuffixConflictTracker:
 
             if count > MERGE_BOUNCE_CAP:
                 # Cap exceeded — escalate WITHOUT rebasing.
-                #
-                # Trade-off note (robustness_premature_escalation): frozen_tip
-                # is speculative — the frozen items are still verifying and may
-                # themselves fail verification.  A branch that is clean vs bare
-                # main but conflicts with frozen_tip may be escalated for a
-                # collision with an item that never lands.  This is accepted: the
-                # steward resolves it, and if the frozen item later fails, the
-                # branch can be cleanly requeued without prejudice.
-                self._lane_buffers()[req.lane].remove(req)
-                self.bounce_registry.clear(branch)  # fresh slate on resubmission
-                outcome = MergeOutcome(
-                    status='blocked',
-                    reason=(
-                        f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} '
-                        f'bounce cap exceeded (count={count}, cap={MERGE_BOUNCE_CAP})'
-                    ),
+                ordinal = self._escalate(
+                    req, f'bounce cap exceeded (count={count}, cap={MERGE_BOUNCE_CAP})',
                 )
                 logger.warning(
                     '_bounce_conflicting_suffix_items: cap exceeded task_id=%s '
-                    'branch=%s count=%d cap=%d; escalating without rebase',
-                    req.task_id, branch, count, MERGE_BOUNCE_CAP,
+                    'branch=%s count=%d cap=%d escalation=#%d; escalating without rebase',
+                    req.task_id, branch, count, MERGE_BOUNCE_CAP, ordinal,
                 )
-                if not req.result.done():
-                    req.result.set_result(outcome)
                 continue
 
             # Attempt mechanical rebase onto the frozen tip.
@@ -601,28 +619,14 @@ class SuffixConflictTracker:
                 )
             else:
                 # Real conflict — remove from lane buffer and escalate.
-                #
-                # Trade-off note (robustness_premature_escalation): frozen_tip
-                # is speculative — frozen items are still verifying and may fail.
-                # A branch clean vs bare main can thus be escalated for a
-                # collision with an item that never lands.  Accepted: the steward
-                # resolves it; if the frozen item fails, the branch requeues.
-                self._lane_buffers()[req.lane].remove(req)
-                self.bounce_registry.clear(branch)  # fresh slate on resubmission
-                outcome = MergeOutcome(
-                    status='blocked',
-                    reason=(
-                        f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} '
-                        f'has a real rebase conflict onto frozen tip {frozen_tip!r}'
-                    ),
+                ordinal = self._escalate(
+                    req, f'has a real rebase conflict onto frozen tip {frozen_tip!r}',
                 )
                 logger.warning(
                     '_bounce_conflicting_suffix_items: rebase conflict task_id=%s '
-                    'branch=%s onto=%s; escalating',
-                    req.task_id, branch, frozen_tip,
+                    'branch=%s onto=%s escalation=#%d; escalating',
+                    req.task_id, branch, frozen_tip, ordinal,
                 )
-                if not req.result.done():
-                    req.result.set_result(outcome)
 
         if _any_bounced:
             # Invalidate the debounce signature so the next recompute re-probes

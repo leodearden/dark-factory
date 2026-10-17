@@ -2702,8 +2702,16 @@ class EscalationQueue:
         *,
         resolved_by: str | None = None,
         resolution_turns: int | None = None,
+        append_to_resolution: str | None = None,
     ) -> Escalation | None:
-        """Patch resolved_by and/or resolution_turns on an already-resolved escalation.
+        """Patch resolution fields on an already-closed escalation.
+
+        ``append_to_resolution`` appends a note to the resolution text after a
+        blank line.  It is append-only, and idempotent on the EXACT note text:
+        when that text already occurs anywhere in the resolution (a substring
+        test), nothing is appended or written.  A note that differs in any
+        character, for example one carrying a different pause reason, is a
+        new note and is appended.
 
         Updates the existing file in place wherever it lives (root or archive); never
         resurrects an archived file into the queue root.  The tmp file used for the
@@ -2719,7 +2727,7 @@ class EscalationQueue:
         already resolved/dismissed it.
 
         Returns the updated Escalation on success, or the unmodified Escalation when
-        called with no patch arguments (both resolved_by and resolution_turns are None).
+        there is nothing to patch (every argument None, or the note already present).
 
         Locking: the WHOLE read-modify-write — locate, parse, guard, mutate,
         write — is serialized per-id by ``escalation_id_lock``, matching every
@@ -2754,8 +2762,12 @@ class EscalationQueue:
             if esc.status not in ('resolved', 'dismissed'):
                 return None
 
-            # No-op early return: nothing to patch — avoid disk I/O when both args are None.
-            if resolved_by is None and resolution_turns is None:
+            note_needed = (
+                append_to_resolution is not None
+                and append_to_resolution not in (esc.resolution or '')
+            )
+            # No-op early return: nothing to patch — avoid disk I/O.
+            if resolved_by is None and resolution_turns is None and not note_needed:
                 return esc
 
             # Apply patches
@@ -2763,6 +2775,11 @@ class EscalationQueue:
                 esc.resolved_by = resolved_by
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
+            if note_needed:
+                esc.resolution = (
+                    f'{esc.resolution}\n\n{append_to_resolution}'
+                    if esc.resolution else append_to_resolution
+                )
 
             # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root).
             self._atomic_write_path(path, esc.to_json())

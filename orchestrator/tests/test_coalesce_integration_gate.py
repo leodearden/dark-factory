@@ -7,7 +7,8 @@ build_train_callback_factory(FakeScheduler).  Fakes are restricted to:
   • scheduler edge — FakeScheduler (no HTTP calls)
 
 Four boundary scenarios + one speculative-cap bookkeeping assertion:
-  Scenario 1: 3 disjoint stackable singles coalesce, MCP member merge_status-observable
+  Scenario 1: 3 disjoint stackable singles coalesce; the member entered via
+              enqueue_merge_request is merge_status-observable
   Scenario 2: partial stackability — overlap keeps 3rd as solo
   Scenario 3: confidence-gate exclusion visible in train_coalesced event
   Scenario 4: in-flight + detached-waiter exclusion invariants
@@ -58,11 +59,9 @@ def _solo_gate(target_task_id: str, gate_release: asyncio.Event) -> FakeVerifier
     wrong request (train instead of solo → train never lands → mark_done never
     fires → all_done/train_done never set → the release never triggers).
 
-    The TRAIN's own verify does not pass through here at all:
-    ``merge_queue.py::_do_train_merge`` calls ``_run_post_merge_verify``
-    without a ``verifier=``, so it takes the production verifier — bound by
-    conftest's autouse ``_mock_merge_queue_verification`` to passed=True — and
-    lands while the gate is still held.
+    The TRAIN's own verify passes through here too, under its tip's task id,
+    which the script does not hold: it verifies green and lands while the gate
+    is still held.
     """
     return FakeVerifier(scripts={target_task_id: hangs_until(gate_release)})
 
@@ -131,8 +130,8 @@ class TestScenario1:
       (d) the train entry is visible in worker.snapshot() while gated (verifying state)
       (e) after gate_release all 3 member files appear on main
       (f) FakeScheduler.provenance has kind='merged' + shared SHA for all 3 members (β)
-      (h) MCP member is merge_status-observable via event-store tier: the member
-          entered via enqueue_merge_request has a merge_finalized record with
+      (h) the member entered via enqueue_merge_request is merge_status-observable
+          via the event-store tier: it has a merge_finalized record with
           state='superseded' + superseded_by=train_id; the train has a train_merged event.
 
     GREEN (step-2): scheduler.statuses pre-seeded for ig1/ig2/ig3 so that

@@ -290,12 +290,24 @@ def test_sketch_10_each_ttl_generation_is_its_own_walk(served_bodies):
 
 
 def test_sketch_11_every_journal_row_is_counted_once_in_the_totals(served_bodies):
-    totals = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    served = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    assert served['state'] == 'fresh', served
+    totals = served['value']
     kinds = [kind for _operation, kind in MEMORY_OPS]
 
     assert totals['reads'] + totals['writes'] + totals['other'] == totals['total'] == len(MEMORY_OPS)
     assert (totals['reads'], totals['writes']) == (kinds.count('read'), kinds.count('write'))
     assert totals['other'] == 1, 'the kind outside read and write is counted, as other'
+
+
+def test_sketch_11_a_missing_journal_is_unknown_not_a_quiet_day(served_bodies):
+    ops = served_bodies['memory_ops_missing']['MEMORY_OPS']
+
+    for reading in ('totals', 'newest_hour_total'):
+        assert ops[reading]['state'] == 'unknown', ops[reading]
+        assert (ops[reading]['reason'] or '').strip(), f'an unknown {reading} must say why'
+    for series in ('labels', 'reads', 'writes', 'other', 'total', 'by_operation'):
+        assert ops[series] == [], f'a hole serves no {series} to draw as a flat zero line'
 
 
 def test_sketch_12_an_offline_scheduler_is_named_while_its_tasks_are_still_served(served_bodies):

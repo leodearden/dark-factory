@@ -3,6 +3,7 @@
 import json
 
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
+from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
@@ -55,13 +56,13 @@ future change to it cannot leave stale prompt text behind.  Pinned by
 ``tests/test_recon_escalation_probe_precondition.py``.
 """
 
-#: The cluster-fold execution section's title and heading (task 3134), exported
-#: so a rename moves the prompt and the wiring pins in
+#: The cluster-proposal section's title and heading (task 5239), exported so a
+#: rename moves the prompt and the wiring pins in
 #: ``tests/test_stage1_consolidation_guidance.py`` together.  Those tests slice
 #: the prompt by this heading; without the shared constant a pure rename with a
 #: byte-identical body turns them red for no behavioural reason.
-EXECUTING_A_CLUSTER_FOLD_TITLE = 'Executing a Cluster Fold'
-EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
+PROPOSING_A_CONSOLIDATION_TITLE = 'Proposing a Cluster Consolidation'
+PROPOSING_A_CONSOLIDATION_HEADING = f'## {PROPOSING_A_CONSOLIDATION_TITLE}'
 
 #: The live-state freshness section's heading (task 5271), exported for the
 #: same reason, for ``tests/reconciliation/test_stage1.py``.
@@ -81,8 +82,7 @@ CHILD_MEMORY_AUTHORITY_RULE = (
     f'- A Mem0 memory whose metadata carries `{PARENT_ID_KEY}` with a `kind` of '
     f'{_CHILD_KIND_NAMES} is a CHILD of the memory that `{PARENT_ID_KEY}` names, not a '
     f"duplicate of it; the payload shows that link beside the memory's id. Never delete a "
-    f'child to dedupe it against its parent or a sibling child — neither via '
-    f"`delete_memory` nor by listing it in `consolidate_memories`' `supersedes`. This "
+    f'child with `delete_memory` to dedupe it against its parent or a sibling child. This '
     f'overrides the duplicate rule above: a sighting restates its parent by design and is '
     f"what the parent's sighting count counts, and an amendment holds the only copy of its "
     f'newer text.'
@@ -113,10 +113,9 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
-- `mcp__fused-memory__consolidate_memories` — the SANCTIONED path for folding a \
-duplicate Mem0 cluster into one canonical entry, in place of a hand-rolled \
-`add_memory`/`update_memory` plus N `delete_memory` sequence; see the \
-**{EXECUTING_A_CLUSTER_FOLD_TITLE}** section below for the contract.
+- `mcp__fused-memory__propose_consolidation` — propose a near-duplicate Mem0 cluster \
+for consolidation; code decides and executes. See the \
+**{PROPOSING_A_CONSOLIDATION_TITLE}** section below.
 - `mcp__fused-memory__get_memory_by_id` — read one Mem0 entry by id, returning its \
 RAW stored payload under `metadata` (including the `agent_id` that wrote it, which \
 search results do NOT carry)
@@ -134,7 +133,7 @@ against the ReconLedgerStore `cycle_summary` row (the source of truth written by
 `write_cycle_summary` / `write_stage1_cycle_summary`), as opposed to \
 `count_memories_by_metadata`'s best-effort Mem0 mirror query. Returns \
 `{{'present': bool, 'ledger_available': bool, 'project_id': ..., 'run_id': ..., \
-'stage': ..., 'remediation': bool|null, 'reason': str, 'expected': bool|null, \
+'stage': ..., 'remediation': bool|null, 'agent_outcome': str|null, 'reason': str, 'expected': bool|null, \
 'run_lookup_available': bool, 'run_status': str|null}}`. \
 `present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
 `expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
@@ -154,7 +153,9 @@ You do not have access to task *write* tools — task reconciliation is Stage 2'
 {render_escalation_boundary_note(can_escalate=False)}
 
 ## Your Consolidation Tasks
-1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. Merge or delete.
+1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. PROPOSE a \
+duplicate cluster (see the **{PROPOSING_A_CONSOLIDATION_TITLE}** section below) rather \
+than merging it by hand; delete or amend stale and contradicted entries.
 2. **Within Graphiti**: Review entity consistency and superseded temporal facts via episodes.
 3. **Cross-store**: Check for contradictions between stores. Promote solidified patterns from \
 observations to preferences/procedures when warranted.
@@ -165,77 +166,40 @@ invalidates task assumptions, completed work not reflected in tasks).
 
 {render_consolidation_gate_section(can_file_tasks=False)}
 
-{EXECUTING_A_CLUSTER_FOLD_HEADING}
-The section above states WHAT a folded cluster must look like when you are done. \
-This one states HOW to get there. Do not hand-roll it.
+{PROPOSING_A_CONSOLIDATION_HEADING}
+The section above states WHAT a consolidated cluster must look like. This one states \
+how you put one forward: you PROPOSE a cluster, and code DECIDES whether to consolidate \
+it and EXECUTES the ratified retain arm. You do not hold `consolidate_memories`, and you \
+must not hand-roll a fold either: an `add_memory` plus N `update_memory`/`delete_memory` \
+sequence nets +1 entry per failed pass.
 
-**Call the op, not the choreography.** To fold a duplicate Mem0 cluster, call \
-`mcp__fused-memory__consolidate_memories(canonical_content=..., topic=<slug>, \
-project_id=..., supersedes=[full 36-char UUIDs to FOLD AND DELETE], \
-retain=[full 36-char UUIDs to TAG IN PLACE], run_id=<the run_id from your \
-## Reconciliation Context>)` instead of a hand-rolled `update_memory` plus N \
-`delete_memory` sequence. List each id ONCE across both arms: a repeat is refused by \
-name, never de-duplicated for you.
+To propose a duplicate Mem0 cluster, call \
+`mcp__fused-memory__propose_consolidation(project_id=..., run_id=<the run_id from your \
+## Reconciliation Context>, topic=<slug>, member_ids=[<full 36-char UUID>, ...], \
+category=..., claim=..., rationale=..., seeded_from=..., \
+agent_id='recon-stage-memory_consolidator')`.
 
-**`topic` is REQUIRED.** It is a positional parameter of the op, so a fold cannot mint \
-an unstamped canonical — the shared `metadata.topic` scroll the closure check reads is \
-written by construction rather than by a step a prompt can forget. Retained ids are \
-stamped with that same topic and become PEERS of the canonical: they keep their point \
-ids, are never deleted, and never receive `canonical` or `parent_id`.
+**`claim` is ONE assertion** and becomes the canonical's first paragraph verbatim. A \
+`ValidationError` names every offender in the call at once, and its `hint` states the \
+shape rules: fix them all and call again in this turn. `rationale` and `seeded_from` \
+are for the reviewer and never reach the canonical. Re-calling for the same `topic` in \
+this run overwrites your earlier proposal. The tool takes no `metadata`.
 
-**ORDERING IS THE CONTRACT.** The op runs: validate → authorize → citation pre-flight \
-(a non-mutating `scan_only` pass over the whole delete set) → WRITE THE CANONICAL → \
-and only THEN tag the retained peers and delete each supersede. A refusal from any of \
-those first four steps leaves the corpus BYTE-IDENTICAL, which is why a bad argument \
-set costs you nothing. Know the limit of that guarantee: it does NOT extend to a \
-per-id refusal BELOW the canonical write. The mutating repoint pass runs over the whole \
-delete set immediately after the canonical is written, before it is known whether any \
-given id's delete can be earned — so an id refused later has already had its live task \
-citations rewritten onto the canonical while it is still in the corpus. That is the \
-recoverable direction, but it is a mutation: a partial run is not a no-op.
-
-**`survivors` is the load-bearing outcome.** Closure is corroborated by a deterministic \
-re-read, never inferred from "the delete returned ok". `survivors` names ids whose \
-delete reported success but which STILL RESOLVE on that re-read — a non-empty \
-`survivors` means the fold did NOT close. `survivor_check_failed` names ids proven \
-NEITHER gone NOR alive; re-read those with `get_memory_by_id` before acting on them. \
-Read both before reporting a consolidation as complete.
-
-**`'partial'` IS NOT A RETRY SIGNAL.** There is no resume arm. The op takes no existing \
-canonical id, so a second `consolidate_memories` call for the same (project, topic) \
-writes a SECOND canonical — which is precisely the +1-per-pass ratchet this op exists \
-to end, and it is admitted rather than refused wherever canonical uniqueness is still \
-in warn mode. Finish the named ids BY HAND instead: read `failed_deletes`, \
-`reparent_failures` and `retain_failures` for what did not happen and why, fix the \
-cause, then `delete_memory` per still-listed id and `update_memory` to tag any peer \
-that was not retained. The response's `hint` carries that procedure.
-
-**`run_id` names the run PERFORMING the deletion** — yours, stamped as each tombstone's \
-`deleting_run_id`. It is deliberately NOT the victims' own `metadata.run_id`, which \
-names the run that WROTE them. Conflating the two is what makes a deletion audit \
-unreadable, so a delete that cannot be attributed is refused rather than guessed at. \
-It is required whenever `supersedes` is non-empty.
-
-**The near-duplicate guards now apply to YOU.** Your own \
-`add_memory(category='procedural_knowledge')` writes are no longer exempt from the \
-write-time near-duplicate and topic-cluster guards: as of task 3134 they bind you \
-exactly as they bind every other caller. The exemption existed because a merged \
-canonical necessarily resembles the duplicates it replaces and nothing guaranteed those \
-duplicates were deleted first — both are the op's problem now rather than yours, and \
-`consolidate_memories` writes its canonical by a path that never meets this guard at \
-all, so the sanctioned route above is unaffected. A \
+**The near-duplicate guards apply to YOU.** Your own \
+`add_memory(category='procedural_knowledge')` writes meet the write-time near-duplicate \
+and topic-cluster guards exactly as every other caller's do. A \
 `ProceduralKnowledgeNearDuplicateWriteRejected` or a \
 `ProceduralKnowledgeKnownTopicClusterWriteRejected` is therefore a SIGNAL, not an \
 obstacle: the block NAMES the incumbent record, which is to say the cluster you were \
-about to add to already exists. Fold it with `consolidate_memories`, or amend that \
+about to add to already exists. Propose it with `propose_consolidation`, or amend that \
 incumbent in place with `mcp__fused-memory__update_memory` — do not add one more \
 paraphrase beside it. Do NOT answer a soft-block with \
 `metadata={{'allow_near_duplicate': True}}` as a reflex: that flag is for content \
 genuinely DISTINCT from the record the block named, and reaching for it in a loop is \
-precisely how the cluster you are now folding grew in the first place. Where \
-`write_triage.enabled` is on nothing is soft-blocked at all — your write is ROUTED like \
-any other caller's, coming back with `routed` set to `stored`, `restated`, `amended` or \
-`contested`; a `restated` ack is a successful outcome and needs no retry.
+precisely how the cluster grew in the first place. Where `write_triage.enabled` is on \
+nothing is soft-blocked at all — your write is ROUTED like any other caller's, coming \
+back with `routed` set to `stored`, `restated`, `amended` or `contested`; a `restated` \
+ack is a successful outcome and needs no retry.
 
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
@@ -333,13 +297,6 @@ every citer it strands. Take it as an individually-reasoned decision per delete,
 a loop default: reaching for it reflexively across a run of refusals is how genuine live \
 pointers get destroyed silently, and a consolidation delete — which has a survivor by \
 definition — must name that survivor instead.
-
-**`consolidate_memories` exposes NO dangling-citation escape at all,** and needs none: \
-its canonical IS the repoint target by construction, so the "you named no survivor" \
-refusal is unreachable there. The reachable citation refusal is `CitationScanFailed`, \
-which fails CLOSED — an unreadable task DB must never be read as "no citations" before \
-an irreversible delete. Retry it once the task backend is reachable; do not look for a \
-flag to bypass it, because there isn't one.
 
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
@@ -1015,19 +972,19 @@ lifecycle; the rules below say how to confirm it.
 
 **For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
 `{NOT_LIVE_TOKEN}`), do NOT emit a stranded-work or blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
-`severity='moderate'` with `actionable=true`.** A task under an active live pipeline is \
-mid-flight, not stranded — asserting a moderate/actionable disposition for it contradicts \
+`severity='{FindingSeverity.moderate}'` with `actionable=true`.** A task under an active live pipeline is \
+mid-flight, not stranded — asserting a {FindingSeverity.moderate}/actionable disposition for it contradicts \
 Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contradictory \
 disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
 
 Instead, for a task with a live row, do one of:
-1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
+1. **Downgrade** the flag to `severity='{FindingSeverity.minor}'` and `actionable=false`, or
 2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
    and leave the final disposition to Stage 2, which has direct access to live scheduler \
    state.
 
 Either remediation is acceptable; what is NOT acceptable is emitting the flag at \
-`severity='moderate'` with `actionable=true` as though the task were genuinely stranded.
+`severity='{FindingSeverity.moderate}'` with `actionable=true` as though the task were genuinely stranded.
 
 **Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
 is present** — i.e., the task has no live row in `### Live-Workflow Signals`, or \
@@ -1055,7 +1012,7 @@ verdicts on this exact question; read each row's prose. Use this scroll rather t
 `search`, whose top-N cutoff can drop the one row that matters.
 
 If either names the task as a preserved / validation specimen, do NOT recommend a status \
-reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \
+reset, a redispatch, or an operator gate task. Emit the finding at `severity='{FindingSeverity.minor}'` with \
 `actionable=false`, or omit it, and say in the description which citation you read.
 
 **The deterministic gate is enforced in code** by \

@@ -21,16 +21,30 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 
-import coder as coder_mod
 import digest as mod
 import pytest
 import yaml
+from legibility import detectors, reingestion
 from legibility import inventory as inventory_mod
+from legibility_carrier_fixtures import (
+    CENSUS_MEMORY_CONTEXT_TURN,
+    NON_HUMAN_ORIGIN_IDS,
+    NON_HUMAN_ORIGIN_TURNS,
+    TASK_NOTIFICATION_TEXT,
+    TRICKLE_CODER_PREAMBLE,
+    UNKNOWN_PROVENANCE_TEXT,
+    briefing_text,
+    coder_judgment,
+    json_fenced,
+    merger_prompt,
+    recon_run_review_text,
+    with_origin,
+)
 from orchestrator.agents.memory_recall import (
     MEMORY_CONTEXT_CAVEAT,
     MEMORY_DEGRADED_STORES_NOTICE,
@@ -401,9 +415,9 @@ class TestIterUserTurns:
         "is this re-ingested?" with ONE predicate. The genuine and briefing
         turns pin that sharing it neither widens nor narrows the filter."""
         records = [
-            _user_text(_coder_judgment()),
+            _user_text(coder_judgment()),
             _user_text('please redo the merge'),
-            _user_text(_briefing_text()),
+            _user_text(briefing_text()),
         ]
 
         turns = mod.iter_user_turns(records)
@@ -640,166 +654,19 @@ class TestErrorNeighborhoodPartition:
 
 
 # ---------------------------------------------------------------------------
-# _extract_exit_code / classify_designed_outcome — the 07-31 census cluster
-# 1.3 finding (plans/confusion-census-2026-07-31.md:97): watcher-rearm.sh's
-# bounded-wait CEILING is a DESIGNED loop-continuation outcome that the
-# extractor counted as a tool_error, inflating session a189558e's error
-# signal 4x and burying the one genuine failure among false positives.
-# Recognition is two-tier: the machine-readable self-declaration first
-# (scripts/watcher-rearm.sh:228-237), the bare exit code second.
+# Designed outcomes -- the 07-31 census cluster 1.3 finding
+# (plans/confusion-census-2026-07-31.md:97). The classifier itself is pinned
+# in test_legibility_detectors.py; these tests pin its digest consequences.
 # ---------------------------------------------------------------------------
 
 _CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
 """The sighted line verbatim (plans/confusion-census-2026-07-31.md:97)."""
 
 
-class TestDesignedOutcomeRecognition:
-    def test_extracts_exit_equals_form(self):
-        assert mod._extract_exit_code(_CEILING_DECLARATION) == 124
-
-    def test_extracts_exit_code_prose_form(self):
-        assert mod._extract_exit_code('command failed with exit code 2') == 2
-
-    def test_extracts_exit_status_prose_form(self):
-        assert mod._extract_exit_code('exit status 137') == 137
-
-    def test_extraction_is_case_insensitive(self):
-        assert mod._extract_exit_code('Exit Code 2') == 2
-
-    def test_returns_none_when_no_code_present(self):
-        assert mod._extract_exit_code('something went wrong') is None
-
-    def test_first_match_wins_when_several_appear(self):
-        text = 'exit=124\nlater the retry gave exit code 2\n'
-
-        assert mod._extract_exit_code(text) == 124
-
-    def test_declared_ceiling_is_designed(self):
-        exit_code, label = mod.classify_error_content(_CEILING_DECLARATION)
-
-        assert exit_code == 124
-        assert label is not None
-
-    def test_declared_fired_is_designed(self):
-        _, label = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
-
-        assert label is not None
-
-    def test_declared_fired_reports_its_own_zero_exit_code(self):
-        # exit=0 is falsy: the deciding-marker code must be selected with an
-        # explicit None check, never a truthiness fallback.
-        exit_code, _ = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
-
-        assert exit_code == 0
-
-    def test_declared_killed_is_a_genuine_failure(self):
-        # scripts/watcher-rearm.sh:234 classes 137|143|144 as KILLED -- a
-        # REAL failure the census should still see, not a designed outcome.
-        assert mod.classify_error_content(
-            'WATCHER_REARM_OUTCOME: KILLED exit=137',
-        ) == (137, None)
-
-    def test_declared_error_is_a_genuine_failure(self):
-        # scripts/watcher-rearm.sh:237's catch-all ERROR branch.
-        assert mod.classify_error_content(
-            'WATCHER_REARM_OUTCOME: ERROR exit=2',
-        ) == (2, None)
-
-    def test_bare_exit_124_is_a_designed_bounded_wait(self):
-        _, label = mod.classify_error_content('command timed out after 600s, exit=124')
-
-        assert label is not None
-
-    def test_ordinary_failure_is_not_designed(self):
-        assert mod.classify_error_content('boom, exit code 2') == (2, None)
-
-    def test_empty_content_with_no_exit_code_is_not_designed(self):
-        assert mod.classify_error_content('') == (None, None)
-
-    def test_declaration_and_bare_124_labels_are_distinct(self):
-        # Which rule fired must stay legible to a digest reader.
-        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
-        _, bare = mod.classify_error_content('timed out, exit=124')
-
-        assert declared != bare
-
-    def test_accepts_a_raw_block_list_content_field(self):
-        # The public entry point takes a tool_result 'content' field as-is
-        # (str OR list of blocks), so no caller -- in this module or in
-        # sampling.py -- needs digest's private text flattener.
-        blocks = [{'type': 'text', 'text': _CEILING_DECLARATION}]
-
-        assert (
-            mod.classify_error_content(blocks)
-            == mod.classify_error_content(_CEILING_DECLARATION)
-        )
-
-    def test_bounded_wait_exit_code_constant_is_timeout_ceiling(self):
-        assert mod.BOUNDED_WAIT_EXIT_CODE == 124
-
-
 class TestCoMingledDesignedAndGenuineContent:
-    """A designed classification must hold for the WHOLE content.
-
-    One tool_result can carry both a designed declaration and a real
-    failure: a Bash call that loops scripts/watcher-rearm.sh, or that
-    tails its log beside a failing command. The script writes its marker
-    to STDERR (:228-237), so it co-mingles with any other stderr in the
-    same result. Classifying on the first designed marker alone deletes
-    the genuine failure from BOTH ``signal_counts['tool_error']`` and the
-    Error Neighborhoods section, and renders it under Designed Outcomes
-    with the wrong exit code -- exactly the under-count that
-    DESIGNED_OUTCOME_PATTERNS' own docstring refuses to trade for.
-    """
-
-    def test_ceiling_followed_by_an_error_marker_is_genuine(self):
-        text = (
-            'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
-            'WATCHER_REARM_OUTCOME: ERROR exit=2'
-        )
-
-        assert mod.classify_error_content(text) == (2, None)
-
-    def test_fired_followed_by_a_killed_marker_is_genuine(self):
-        text = (
-            'WATCHER_REARM_OUTCOME: FIRED exit=0\n'
-            'WATCHER_REARM_OUTCOME: KILLED exit=137'
-        )
-
-        assert mod.classify_error_content(text) == (137, None)
-
-    def test_a_dissenting_marker_decides_even_when_it_comes_first(self):
-        text = (
-            'WATCHER_REARM_OUTCOME: ERROR exit=2\n'
-            'WATCHER_REARM_OUTCOME: CEILING exit=124'
-        )
-
-        assert mod.classify_error_content(text) == (2, None)
-
-    def test_repeated_designed_markers_stay_designed(self):
-        text = _CEILING_DECLARATION + '\nWATCHER_REARM_OUTCOME: CEILING exit=124'
-
-        exit_code, label = mod.classify_error_content(text)
-
-        assert exit_code == 124
-        assert label is not None
-
-    def test_unaccounted_failure_code_beside_a_ceiling_is_genuine(self):
-        # A declaration speaks only for its OWN invocation: a fatal code
-        # that no declaration accounts for outvotes it.
-        text = (
-            'tail of watcher.log: WATCHER_REARM_OUTCOME: CEILING exit=124\n'
-            'fatal: repo corrupt, exit code 128'
-        )
-
-        assert mod.classify_error_content(text) == (128, None)
-
-    def test_bare_ceiling_code_beside_a_failure_code_is_genuine(self):
-        # The same rule one tier down: a bare 124 classifies only when it
-        # is the ONLY outcome code in the content.
-        text = 'poll timed out, exit=124\nthe retry then died, exit code 2'
-
-        assert mod.classify_error_content(text) == (2, None)
+    """The digest consequences of classify_error_content's whole-content
+    rule: a co-mingled result is a genuine tool_error, rendered with the
+    code that decided it."""
 
     def test_co_mingled_result_counts_as_a_tool_error(self):
         records = [
@@ -887,26 +754,26 @@ class TestIterSelfCorrections:
     def test_ignores_a_whole_block_coder_judgment(self):
         # The b203a05c record-22 sighting: a prior trickle-coder answer whose
         # note quotes "that's wrong" from the digest it coded.
-        records = [_assistant(_text(_coder_judgment()))]
+        records = [_assistant(_text(coder_judgment()))]
 
         assert mod.iter_self_corrections(records) == []
 
     def test_ignores_a_json_fenced_coder_judgment(self):
-        records = [_assistant(_text(_json_fenced(_coder_judgment())))]
+        records = [_assistant(_text(json_fenced(coder_judgment())))]
 
         assert mod.iter_self_corrections(records) == []
 
     def test_ignores_a_coder_judgment_quoting_i_was_wrong(self):
         # The 6a527d51 record-10 marker.
         records = [_assistant(_text(
-            _coder_judgment(note='I was wrong to keep reporting it as stuck'),
+            coder_judgment(note='I was wrong to keep reporting it as stuck'),
         ))]
 
         assert mod.iter_self_corrections(records) == []
 
     def test_coder_judgment_does_not_mask_a_prose_self_correction(self):
         records = [
-            _assistant(_text(_coder_judgment())),
+            _assistant(_text(coder_judgment())),
             _assistant(_text('My mistake, the lease check belongs in the watcher.')),
         ]
 
@@ -1018,10 +885,10 @@ def _trickle_coder_session_records():
     the one user turn, and the coder's answer as the one assistant text
     block. Every signal literal in it is re-ingested."""
     prompt = (
-        f'{_TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
+        f'{TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
         '## Guard Trips\n- (turn 21) blocked:\n'
     )
-    answer = _coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
+    answer = coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
     return [
         _with_session_meta(_user_text(prompt)),
         _with_session_meta(_assistant(_text(answer))),
@@ -1030,12 +897,12 @@ def _trickle_coder_session_records():
 
 class TestReingestedContentIsBucketAgnostic:
     def test_df_guard_ignores_the_digest_a_coder_prompt_embeds(self):
-        records = [_user_text(f'{_TRICKLE_CODER_PREAMBLE}\n\n- (turn 21) blocked:')]
+        records = [_user_text(f'{TRICKLE_CODER_PREAMBLE}\n\n- (turn 21) blocked:')]
 
         assert mod.iter_df_guards(records) == []
 
     def test_df_guard_ignores_a_coder_judgment_quoting_a_trip(self):
-        records = [_assistant(_text(_coder_judgment(note='its turn 21 reads blocked:')))]
+        records = [_assistant(_text(coder_judgment(note='its turn 21 reads blocked:')))]
 
         assert mod.iter_df_guards(records) == []
 
@@ -1053,13 +920,13 @@ class TestReingestedContentIsBucketAgnostic:
         # dropped WHOLE, so a genuine error printed beside the marker would
         # go too: the accepted trade-off _dialogue_text_sources states.
         records = [_tool_result(
-            'tu-1', f'{_TRICKLE_CODER_PREAMBLE}\n## Not Found\n- (turn 3) no such file or directory',
+            'tu-1', f'{TRICKLE_CODER_PREAMBLE}\n## Not Found\n- (turn 3) no such file or directory',
         )]
 
         assert mod.iter_not_found(records) == []
 
     def test_not_found_ignores_a_tool_result_that_is_a_coder_judgment(self):
-        records = [_tool_result('tu-1', _coder_judgment(note='cat: x.py: No such file or directory'))]
+        records = [_tool_result('tu-1', coder_judgment(note='cat: x.py: No such file or directory'))]
 
         assert mod.iter_not_found(records) == []
 
@@ -1100,7 +967,7 @@ class TestReingestedContentIsBucketAgnostic:
 
     def test_interrupt_ignores_the_digest_a_harness_prompt_embeds(self):
         records = [_user_text(
-            f'{_TRICKLE_CODER_PREAMBLE}\n\n## Interrupts\n- (turn 7) request interrupted by user',
+            f'{TRICKLE_CODER_PREAMBLE}\n\n## Interrupts\n- (turn 7) request interrupted by user',
         )]
 
         assert mod.iter_interrupts(records) == []
@@ -1116,13 +983,13 @@ class TestReingestedContentIsBucketAgnostic:
         markers: reading the filtered layer would delete its own evidence and
         collapse this orchestrated session to 'interactive'. The first
         assertion is the premise that makes the second one discriminate."""
-        text = _briefing_text(
+        text = briefing_text(
             body_filler='Task ID: 42\nWorktree: /home/leo/src/dark-factory/.worktrees/42',
         )
         records = [_user_text(text)]
 
-        assert mod.is_reingested_content(text) is True
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert reingestion.is_reingested_content(text) is True
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
 
 class TestTrickleCoderSessionDigest:
@@ -1381,7 +1248,7 @@ class TestRetryLoopDesignedOutcomeJoin:
 
         assert rearm['designed_outcomes'] == [(124, 'watcher-rearm-declared')]
         assert rearm['designed_outcomes'] == [
-            mod.classify_error_content(_CEILING_DECLARATION)
+            detectors.classify_error_content(_CEILING_DECLARATION)
         ]
 
     def test_two_distinct_rules_are_ordered_by_first_appearance(self):
@@ -1719,78 +1586,77 @@ class TestSignalCountsAndScore:
             assert one_user_turn_score > mod.score_signals(single_signal, n_user_turns=0)
 
 
+def _one_record_per_text_class():
+    return [
+        _assistant(_text('My mistake, let me redo this.')),
+        _tool_result('tu-2', 'command not found', is_error=False),
+        _tool_result('tu-3', 'BLOCKED: real block', is_error=False),
+        _user_text('[Request interrupted by user for tool use]'),
+        _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+        _tool_result('tu-1', 'Exit code 1', is_error=True),
+    ]
+
+
+_PER_CLASS_READERS = [
+    mod.iter_self_corrections, mod.iter_not_found, mod.iter_df_guards, mod.iter_interrupts,
+    mod.signal_counts,
+]
+
+
+class TestPrecomputedRecordHits:
+    """Every per-class reader takes ``hits=``, one detectors.record_hits
+    result per record, so a caller reading several classes pays one
+    detector pass rather than one per class."""
+
+    @pytest.mark.parametrize('reader', _PER_CLASS_READERS, ids=lambda reader: reader.__name__)
+    def test_a_reader_given_hits_answers_as_it_does_from_records(self, reader):
+        records = _one_record_per_text_class()
+        hits = [detectors.record_hits(record) for record in records]
+
+        assert reader(hits=hits) == reader(records)
+        assert reader(records)
+
+    @pytest.mark.parametrize('reader', _PER_CLASS_READERS, ids=lambda reader: reader.__name__)
+    def test_a_reader_given_neither_raises(self, reader):
+        with pytest.raises(TypeError):
+            reader()
+
+    def test_render_digest_runs_the_detectors_once_per_record(self, monkeypatch):
+        records = _one_record_per_text_class()
+        calls = []
+        original = mod.record_hits
+
+        def counting(record):
+            calls.append(record)
+            return original(record)
+
+        monkeypatch.setattr(mod, 'record_hits', counting)
+        mod.render_digest(records, agent_class='interactive')
+
+        assert len(calls) == len(records)
+
+
 # ---------------------------------------------------------------------------
-# classify_agent_class — best-effort marker heuristics grounded in real
-# system-prompt/injection literals, with an 'unknown' empty-transcript
-# fallback and 'interactive' as the no-marker-matched default. A caller
-# override always wins verbatim (beta owns the authoritative class).
+# build_digest's agent_class_override: a caller-supplied class (beta's
+# already-authoritative stratum) is rendered verbatim, never re-derived.
 # ---------------------------------------------------------------------------
 
-class TestClassifyAgentClass:
-    def test_empty_transcript_is_unknown(self):
-        assert mod.classify_agent_class([]) == 'unknown'
+class TestBuildDigestAgentClassOverride:
+    def test_override_is_rendered_verbatim_even_with_a_marker_present(self, tmp_path):
+        path = _write_jsonl(tmp_path, [_assistant(_text('operating in sleep mode'))])
 
-    def test_task_id_worktree_injection_is_orchestrated_task(self):
-        # Literal orchestrator task-briefing preamble
-        # (orchestrator/src/orchestrator/dry_run_unblock.py).
-        records = [_meta_user(
-            'Task ID: 2572\nWorktree: /home/leo/src/dark-factory/.worktrees/2572\n'
-        )]
+        digest = mod.build_digest(path, agent_class_override='beta-authoritative-class')
 
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert yaml.safe_load(_split_frontmatter(digest)[0])['agent_class'] == (
+            'beta-authoritative-class'
+        )
 
-    def test_bare_worktree_mention_alone_is_not_orchestrated_task(self):
-        # 'Worktree:' alone (without its paired 'Task ID:' preamble line) is
-        # ordinary interactive prose -- e.g. this very project's docs and
-        # sessions mention worktrees constantly -- and must not by itself
-        # trigger a false-positive orchestrated-task classification. Both
-        # preamble lines must co-occur (PRD Sec 13.2-adjacent decoy-style
-        # false-positive guard, owned here).
-        records = [_assistant(_text(
-            'The worktree: /home/leo/src/dark-factory/.worktrees/2572 is where this runs.'
-        ))]
+    def test_override_wins_even_on_an_empty_transcript(self, tmp_path):
+        path = _write_jsonl(tmp_path, [])
 
-        assert mod.classify_agent_class(records) == 'interactive'
+        digest = mod.build_digest(path, agent_class_override='custom')
 
-    def test_recon_stage_marker_is_recon(self):
-        # Shared phrase across all reconciliation stage system prompts
-        # (fused_memory/reconciliation/prompts/stage{1,2,3}.py).
-        records = [_assistant(_text(
-            'You are a Memory Consolidator agent operating in sleep mode.'
-        ))]
-
-        assert mod.classify_agent_class(records) == 'recon'
-
-    def test_watcher_marker_is_watcher(self):
-        # Canonical auto-watcher identity string
-        # (escalation/src/escalation/authority.py: _WATCHER_AUTO_IDENTITY).
-        records = [_tool_result('tu-1', 'resolved_by=orchestrator-escalation-watcher-auto')]
-
-        assert mod.classify_agent_class(records) == 'watcher'
-
-    def test_curator_classifier_marker_is_curator_classifier(self):
-        # Literal task-curator system-prompt fragment
-        # (fused_memory/middleware/task_curator.py).
-        records = [_assistant(_text(
-            'You are the task curator for the dark-factory orchestrator.'
-        ))]
-
-        assert mod.classify_agent_class(records) == 'curator-classifier'
-
-    def test_no_marker_falls_back_to_interactive(self):
-        records = [_user_text('just a normal conversation, please fix this bug')]
-
-        assert mod.classify_agent_class(records) == 'interactive'
-
-    def test_override_returned_verbatim_even_with_a_marker_present(self):
-        records = [_assistant(_text('operating in sleep mode'))]
-
-        result = mod.classify_agent_class(records, override='beta-authoritative-class')
-
-        assert result == 'beta-authoritative-class'
-
-    def test_override_wins_even_on_empty_transcript(self):
-        assert mod.classify_agent_class([], override='custom') == 'custom'
+        assert yaml.safe_load(_split_frontmatter(digest)[0])['agent_class'] == 'custom'
 
 
 # ---------------------------------------------------------------------------
@@ -1802,15 +1668,15 @@ class TestClassifyAgentClass:
 # key order, explicit formatting, deterministic byte-stable output).
 #
 # n_user_turns is present because of confusion-census-2026-07-31 R2 / §1.2:
-# score_signals adds SIGNAL_WEIGHTS['user_turn'] * n_user_turns on top of the
+# score_signals adds USER_TURN_WEIGHT * n_user_turns on top of the
 # weighted signal_counts, but the frontmatter used to render only the five
 # counts -- so a session whose single "user turn" was a pasted report showed
 # `score: 5.0` beside an all-zero `signal_counts` and a reader could not
 # reconstruct the score from the rendered fields. It is a top-level key, NOT
 # a sixth signal_counts entry: signal_counts is specifically signal_counts()'s
-# five detector hit-counts (mirrored by sampling.SignalCounts and read by
-# _warn_if_body_evicted's any(counts.values()) guard), and n_user_turns is
-# neither produced by that function nor a detector hit count.
+# per-class detector hit counts (read by _warn_if_body_evicted's
+# any(counts.values()) guard), and n_user_turns is neither produced by that
+# function nor a detector hit count.
 # ---------------------------------------------------------------------------
 
 def _frontmatter_meta():
@@ -1974,6 +1840,8 @@ class TestRenderFrontmatter:
 # path is given.
 # ---------------------------------------------------------------------------
 
+_MAIN_DIR_PATH = Path('/root/-home-leo-src-dark-factory/sess.jsonl')
+
 _DIGEST_SESSION_ID = '000a8a42-3ca1-44f2-aa82-7f7ed46231fd'
 _DIGEST_CWD = '/home/leo/src/dark-factory'
 _DIGEST_TIMESTAMP = '2026-07-11T06:02:29.796Z'
@@ -2040,49 +1908,6 @@ def _split_frontmatter(digest):
 # excluded by a plain case-insensitive substring match
 # (HARNESS_PROMPT_MARKERS).
 # ---------------------------------------------------------------------------
-
-def _briefing_text(body_filler='Project overview and recent decisions go here.'):
-    """Build the text of an orchestrator-briefing-shaped user turn -- the
-    literal shape ``BriefingAssembler`` injects as the harness preamble of
-    every dispatched-agent session
-    (orchestrator/src/orchestrator/agents/briefing.py): a '# Context'
-    heading (``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``,
-    emits '# Context\\n\\n...'), a
-    '## Agent Identity' heading with an agent_id bullet
-    (``_agent_identity``), and a '# Task' heading with a task block (the
-    per-role prompt templates, e.g. ``build_architect_prompt``)."""
-    return (
-        f'# Context\n\n{body_filler}\n\n'
-        '## Agent Identity\n\n'
-        '- **agent_id:** `claude-task-3278-implementer`\n'
-        '- **project_id:** `dark_factory`\n\n'
-        '# Task\n\n'
-        '**Task:** Some task title\n'
-        '**Description:** Do the thing.\n'
-    )
-
-
-_CENSUS_MEMORY_CONTEXT_TURN = (
-    '# Context\n\n'
-    '## Project Context\n\n'
-    '{ "results": [ { "id": "ccf73ca4-8240-4f9a-8abf-32b210e5b35b", '
-    '"content": "Task 1470 wired /audit into /review Phase-2 Architectural '
-    'Coherence." } ] }\n'
-)
-"""The 07-31 census cluster 1.1(b) sighting verbatim
-(plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing injection
-that the all-three-headings rule admitted into the gold section."""
-
-
-_TRICKLE_CODER_PREAMBLE = (
-    'You are the trickle coder for the dark-factory agent-confusion '
-    'codebook (plans/confusion-reduction-prd.md §7.3). Read the '
-    'session digest below and decide which existing codebook entries '
-    'it matches.'
-)
-"""Literal prefix of scripts/legibility/coder.py:174 build_prompt's
-harness-authored preamble."""
-
 
 def _memory_context_block(body='## Project Context\n\n{...}'):
     """Build the real shape of a LONE '# Context' memory-context block --
@@ -2163,34 +1988,6 @@ def _recalled_sections_with_trailing_unavailable_note():
     )
 
 
-def _merger_prompt(tmp_path):
-    """The real text ``BriefingAssembler.build_merger_prompt`` injects
-    (orchestrator/src/orchestrator/agents/briefing.py), built by calling the
-    production builder rather than restating its headings here — the same
-    lockstep discipline ``test_resume_prompt_is_excluded_lockstep`` applies
-    to the cli_invoke resume constants.
-
-    The builder is async and touches no I/O and no config, so a throwaway
-    assembler over *tmp_path* and a plain ``asyncio.run`` suffice; this file
-    is otherwise synchronous and stays that way."""
-    from orchestrator.agents.briefing import BriefingAssembler
-    from orchestrator.config import GitConfig, OrchestratorConfig
-
-    assembler = BriefingAssembler(OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    ))
-    return asyncio.run(assembler.build_merger_prompt(
-        conflicts='<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs',
-        task_intent='Rescope the briefing memory block.',
-    ))
-
-
 def _resume_and_context_block_records():
     """The confusion-census sighting shape (session b976febe), minus its
     one genuine correction: a turn-0 lone '# Context' memory block,
@@ -2209,18 +2006,18 @@ def _resume_and_context_block_records():
 
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
-        records = [_user_text(_briefing_text())]
+        records = [_user_text(briefing_text())]
 
         assert mod.iter_user_turns(records) == []
 
     def test_trickle_coder_preamble_turn_is_excluded(self):
-        records = [_user_text(_TRICKLE_CODER_PREAMBLE)]
+        records = [_user_text(TRICKLE_CODER_PREAMBLE)]
 
         assert mod.iter_user_turns(records) == []
 
     def test_ordinary_correction_retained_after_briefing_turn_index_preserved(self):
         records = [
-            _user_text(_briefing_text()),
+            _user_text(briefing_text()),
             _user_text('This is wrong, please redo it.'),
         ]
 
@@ -2235,9 +2032,8 @@ class TestHarnessInjectedTurnFilter:
         # injection -- '# Context' + '## Project Context' + the memory-search
         # JSON dump. It carries NEITHER '## Agent Identity' NOR '# Task', so
         # the old all-three rule let it through into the gold section.
-        text = _CENSUS_MEMORY_CONTEXT_TURN
+        text = CENSUS_MEMORY_CONTEXT_TURN
 
-        assert mod.is_harness_injected_turn(text) is True
         assert mod.iter_user_turns([_user_text(text)]) == []
 
     def test_context_plus_conventions_subheading_is_excluded(self):
@@ -2281,7 +2077,6 @@ class TestHarnessInjectedTurnFilter:
             '## Conventions\n\nplease stop using tabs, this is wrong'
         )
 
-        assert mod.is_harness_injected_turn(text) is False
         assert len(mod.iter_user_turns([_user_text(text)])) == 1
 
     def test_human_task_plus_action_prose_turn_is_retained(self):
@@ -2298,17 +2093,7 @@ class TestHarnessInjectedTurnFilter:
             '# Action\n\nStart with the tests, then the loop itself.\n'
         )
 
-        assert mod.is_harness_injected_turn(text) is False
         assert len(mod.iter_user_turns([_user_text(text)])) == 1
-
-    def test_every_corroborator_is_a_double_hash_subblock(self):
-        # Structural guard, so a future agent does not re-add a top-level
-        # heading to the corroborator tuple: a '# '-level corroborator pairs
-        # with the '# task' anchor to clear the >=2 threshold on its own,
-        # which is exactly the human shape above.
-        assert all(
-            heading.startswith('## ') for heading in mod.HARNESS_BRIEFING_SUBHEADINGS
-        )
 
     def test_lone_context_anchor_with_prose_is_retained(self):
         # The relaxation's boundary: ONE anchor and NO corroborating
@@ -2353,7 +2138,7 @@ class TestHarnessInjectedTurnFilter:
 
     def test_render_digest_excludes_briefing_turn_from_body_and_score(self):
         records = [
-            _with_session_meta(_user_text(_briefing_text())),
+            _with_session_meta(_user_text(briefing_text())),
             _with_session_meta(_user_text('This is wrong, please redo it.')),
         ]
 
@@ -2376,69 +2161,30 @@ class TestHarnessInjectedTurnFilter:
         # (_signal_text_sources, never filtered by iter_user_turns) so it
         # must be unaffected by the exclusion.
         text = (
-            _briefing_text()
+            briefing_text()
             + 'Task ID: 3278\nWorktree: /home/leo/src/dark-factory/.worktrees/3278\n'
         )
         records = [_user_text(text)]
 
         assert mod.iter_user_turns(records) == []
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
     def test_signal_counts_unaffected_by_signal_free_briefing_turn(self):
         # The filter must not leak into _signal_text_sources: adding a
         # briefing turn with no NOT_FOUND/DF_GUARD/INTERRUPT pattern must
         # not perturb any of the five signal_counts.
         base = _all_signals_records()
-        with_briefing = [_user_text(_briefing_text())] + base
+        with_briefing = [_user_text(briefing_text())] + base
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
 
-    @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
-    )
-    def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
-        # LOCKSTEP: asserted against each canonical constant, not a
-        # restated literal, so a harness rewording of either resume prompt
-        # turns this suite red instead of silently drifting out of
-        # coverage. One parametrize row per resume prompt -- a future
-        # resume prompt is covered by adding one more row.
-        assert mod.is_harness_injected_turn(resume_prompt) is True
-
-    def test_merger_prompt_is_excluded_lockstep(self, tmp_path):
-        # LOCKSTEP: built by the REAL prompt builder, not a hand-copied
-        # literal, the same way test_resume_prompt_is_excluded_lockstep
-        # pins the cli_invoke constants -- so a future merger-prompt
-        # rewording turns this red instead of silently dropping the role
-        # out of coverage.
-        #
-        # The merger is the one dispatched role with NO memory block
-        # (task 3659, D7), so it emits no '# Context' anchor and the
-        # briefing anchor+corroborator rule cannot see it at all. Before
-        # 3659 it was classified via that anchor; MERGER_HEADINGS is what
-        # keeps merge-conflict dispatches (7 per 14 days, measured) out of
-        # the digest's gold user_corrections section.
-        assert mod.is_harness_injected_turn(_merger_prompt(tmp_path)) is True
-
     def test_merger_prompt_is_excluded_from_iter_user_turns(self, tmp_path):
-        # The end-to-end consequence of the lockstep pin above: a merger
+        # The end-to-end consequence of the merger-prompt lockstep pin in
+        # test_legibility_reingestion.py: a merger
         # dispatch transcript presents no user turn to mine.
-        records = [_user_text(_merger_prompt(tmp_path))]
+        records = [_user_text(merger_prompt(tmp_path))]
 
         assert mod.iter_user_turns(records) == []
-
-    def test_human_turn_with_one_merger_heading_is_retained(self, tmp_path):
-        # The all-of guard MERGER_HEADINGS is matched under: a human turn
-        # writing '# Action' (an ordinary spec-writing heading, emitted by
-        # every role template and deliberately NOT a briefing corroborator
-        # since task 3610) must stay gold.
-        human = (
-            '# Action\n\n'
-            'Please resolve the conflict in briefing.py by hand -- the '
-            'merge queue keeps picking the wrong side.\n'
-        )
-
-        assert mod.is_harness_injected_turn(human) is False
 
     def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
         # The sibling of the usage-limit resume prompt: same defect class
@@ -2611,7 +2357,7 @@ class TestHarnessInjectedTurnFilter:
         records = [_user_text(text)]
 
         assert mod.iter_user_turns(records) == []
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
 
 # ---------------------------------------------------------------------------
@@ -2621,39 +2367,10 @@ class TestHarnessInjectedTurnFilter:
 # and origin={'kind': 'task-notification'} -- so no text rule saw it, and it
 # rendered as a gold "User Correction". Census sighting: reify session
 # 50e12d17's only gold turn was record 196, a sub-agent's weekly-limit
-# failure notification (_TASK_NOTIFICATION_TEXT, verbatim).
+# failure notification (TASK_NOTIFICATION_TEXT, verbatim).
 # ---------------------------------------------------------------------------
 
-_TASK_NOTIFICATION_TEXT = (
-    '<task-notification>\n'
-    '<task-id>a1ab810a169bbb353</task-id>\n'
-    '<tool-use-id>toolu_019A8emLVkosytrg3s2up7AD</tool-use-id>\n'
-    '<output-file>/tmp/claude-1000/-home-leo-src-warm-lanes-worktrees--lane-20/'
-    '50e12d17-9e73-4686-a364-7ae08109140c/tasks/a1ab810a169bbb353.output</output-file>\n'
-    '<status>failed</status>\n'
-    '<summary>Agent "Find .ri fixture test harness patterns" failed: Agent terminated'
-    " early due to an API error: You've hit your weekly limit · resets Aug 26, 11am"
-    ' (Europe/London)</summary>\n'
-    '<note>A task-notification fires each time this agent stops with no live background'
-    ' children of its own. The user can send it another message and resume it, so the'
-    ' same task-id may notify more than once.</note>\n'
-    '<result>Now the harness and builtin tests.</result>\n'
-    '</task-notification>'
-)
-
 _GENUINE_CORRECTION = 'This is wrong, please redo it.'
-
-_UNKNOWN_PROVENANCE_TEXT = 'please redo the merge'
-
-
-def _with_origin(rec, kind):
-    """Return a copy of *rec* stamped with Claude Code's structured
-    provenance ``origin={'kind': kind}`` and with its 'isMeta' key REMOVED:
-    a real origin-stamped record carries isMeta absent, not False."""
-    out = dict(rec)
-    out.pop('isMeta', None)
-    out['origin'] = {'kind': kind}
-    return out
 
 
 _TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
@@ -2667,95 +2384,55 @@ _TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
 )
 
 
-def _task_notification(text=_TASK_NOTIFICATION_TEXT):
+def _task_notification(text=TASK_NOTIFICATION_TEXT):
     """A background-task notification record, shaped like census record 196."""
-    return _with_origin(_user_text(text), 'task-notification')
+    return with_origin(_user_text(text), 'task-notification')
 
 
 class TestNonHumanOriginFilter:
     def test_census_task_notification_is_excluded_from_iter_user_turns(self):
         assert mod.iter_user_turns([_task_notification()]) == []
 
-    @pytest.mark.parametrize(
-        ('kind', 'text'),
-        [
-            ('task-notification', _TASK_NOTIFICATION_TEXT),
-            (
-                'auto-continuation',
-                'Implement the following plan:\n\n# Fix: the laptop verify host is benched'
-                '\n\n## Objective\n\nMake the sync find uv on the remote host.',
-            ),
-            (
-                'auto-continuation',
-                'Your claude.ai usage limit has reset. Continue the task you were working on'
-                ' when the limit was reached; do not repeat work that is already complete.',
-            ),
-            (
-                'coordinator',
-                'The coordinator sent a message while you were working:\n'
-                'Task 5878 has landed; stop now and make no further changes.',
-            ),
-            (
-                'peer',
-                'Another Claude session sent a message:\n'
-                '<cross-session-message from="uds:/run/user/1000/cc-socks/1.sock"'
-                ' from-name="dark-factory-19">\nplease pick up the dedup scope\n'
-                '</cross-session-message>',
-            ),
-            ('a-future-kind', _UNKNOWN_PROVENANCE_TEXT),
-        ],
-        ids=[
-            'task_notification', 'auto_continuation_plan',
-            'auto_continuation_usage_limit_reset', 'coordinator', 'peer',
-            'unseen_future_kind',
-        ],
-    )
+    @pytest.mark.parametrize(('kind', 'text'), NON_HUMAN_ORIGIN_TURNS, ids=NON_HUMAN_ORIGIN_IDS)
     def test_every_non_human_origin_kind_is_excluded(self, kind, text):
-        # The text alone is ordinary dialogue to the content classifier, so
-        # only the record's provenance can exclude it -- and the rule is
-        # "anything but human", never an allowlist of known machine kinds.
-        rec = _with_origin(_user_text(text), kind)
+        rec = with_origin(_user_text(text), kind)
 
-        assert mod.is_reingested_content(text) is False
-        assert mod.has_non_human_origin(rec) is True
         assert mod.iter_user_turns([rec]) == []
 
     def test_human_origin_record_quoting_a_notification_mid_prose_is_kept(self):
         text = 'why did the <task-notification> for the lint run say failed? please look again'
-        rec = _with_origin(_user_text(text), 'human')
+        rec = with_origin(_user_text(text), 'human')
 
-        assert mod.has_non_human_origin(rec) is False
         assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
 
     def test_human_origin_record_opening_with_a_pasted_notification_is_kept(self):
         # PROVENANCE decides, not text: there is no '<task-notification>'
         # prefix fallback, so a human who pastes one to ask about it stays gold.
-        text = _TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
-        rec = _with_origin(_user_text(text), 'human')
+        text = TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
+        rec = with_origin(_user_text(text), 'human')
 
         assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
 
     @pytest.mark.parametrize(
         'record',
         [
-            _user_text(_UNKNOWN_PROVENANCE_TEXT),
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
-            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
+            _user_text(UNKNOWN_PROVENANCE_TEXT),
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
+            {**_user_text(UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
         ],
         ids=['absent', 'bare_string', 'empty_dict', 'none_kind', 'no_kind_key'],
     )
     def test_unknown_provenance_falls_through_to_text_rules(self, record):
-        assert mod.has_non_human_origin(record) is False
         assert [t['text'] for t in mod.iter_user_turns([record])] == [
-            _UNKNOWN_PROVENANCE_TEXT,
+            UNKNOWN_PROVENANCE_TEXT,
         ]
 
     def test_genuine_turn_between_notifications_keeps_its_record_index(self):
         records = [
             _task_notification(),
-            _with_origin(_user_text(_GENUINE_CORRECTION), 'human'),
+            with_origin(_user_text(_GENUINE_CORRECTION), 'human'),
             _task_notification(),
         ]
 
@@ -2780,7 +2457,7 @@ class TestNonHumanOriginFilter:
     def test_render_digest_keeps_only_the_genuine_correction_beside_notifications(self):
         records = [
             _with_session_meta(_task_notification()),
-            _with_session_meta(_with_origin(_user_text(_GENUINE_CORRECTION), 'human')),
+            _with_session_meta(with_origin(_user_text(_GENUINE_CORRECTION), 'human')),
             _with_session_meta(_task_notification()),
         ]
 
@@ -2801,7 +2478,7 @@ class TestNonHumanOriginFilter:
 
     def test_same_literals_under_human_origin_still_fire(self):
         # The carrier filter keys on provenance, not on the text.
-        records = [_with_origin(_user_text(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS), 'human')]
+        records = [with_origin(_user_text(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS), 'human')]
 
         assert len(mod.iter_df_guards(records)) == 1
         assert len(mod.iter_interrupts(records)) == 1
@@ -2810,7 +2487,7 @@ class TestNonHumanOriginFilter:
         # Provenance is a property of the RECORD, so it filters every carrier
         # the record holds -- not only its user text.
         content = 'BLOCKED: gate refused\nls: cannot access x: No such file or directory'
-        stamped = [_with_origin(_tool_result('tool-1', content), 'task-notification')]
+        stamped = [with_origin(_tool_result('tool-1', content), 'task-notification')]
         unstamped = [_tool_result('tool-1', content)]
 
         assert mod.iter_df_guards(stamped) == []
@@ -2827,157 +2504,13 @@ class TestNonHumanOriginFilter:
     def test_classify_agent_class_still_reads_markers_inside_a_notification(self):
         # classify_agent_class reads the RAW carriers, which stay unfiltered.
         text = (
-            _TASK_NOTIFICATION_TEXT
+            TASK_NOTIFICATION_TEXT
             + 'Task ID: 5956\nWorktree: /home/leo/src/dark-factory/.worktrees/5956\n'
         )
         records = [_task_notification(text)]
 
         assert mod.iter_user_turns(records) == []
-        assert mod.classify_agent_class(records) == 'orchestrated-task'
-
-
-# ---------------------------------------------------------------------------
-# is_coder_judgment_payload -- the re-ingestion content classifier's
-# machine-answer half (task 5685). A prior trickle-coder answer re-enters a
-# transcript as ONE carrier holding the coder's whole {"matches",
-# "candidates"} object (scripts/legibility/coder.py::build_prompt), and its
-# notes quote the digest being coded, so every signal literal they carry
-# used to fire as this session's own. The classifier PARSES the whole
-# carrier, bare or inside one outer ```json fence; it never substring-matches
-# or brace-slices, so prose that merely quotes the schema stays dialogue.
-# ---------------------------------------------------------------------------
-
-def _coder_judgment(note="that's wrong: the watcher re-armed on a stale lease"):
-    """A trickle-coder answer as it lands in a transcript: the whole
-    judgment on ONE line, shaped after session b203a05c record 22. *note*
-    rides inside a match, where a real coder quotes the digest it codes."""
-    return json.dumps({
-        'matches': [{
-            'entry_id': 'watcher-loop-harness-mismatch',
-            'origin_phase': 'unknown',
-            'manifested_phase': 'recon',
-            'invariant_violated': None,
-            'note': note,
-        }],
-        'candidates': [{
-            'title': 'Recon reaper closes a filed task with its escalation',
-            'cause': 'closure keys off escalation linkage, not task merit',
-            'area': 'recon',
-            'origin_phase': 'unknown',
-            'manifested_phase': 'recon',
-            'evidence_quote': 'Re-filing without an escalation_id.',
-        }],
-    })
-
-
-def _json_fenced(payload):
-    """*payload* inside one outer ```json fence, trailing newline included."""
-    return f'```json\n{payload}\n```\n'
-
-
-class TestCoderJudgmentPayloadClassifier:
-    @pytest.mark.parametrize(
-        'text',
-        [
-            _coder_judgment(),
-            '{"matches": [], "candidates": []}',
-            _json_fenced(_coder_judgment()),
-            f'\n\n  {_coder_judgment()}  \n\n',
-            json.dumps({'matches': [], 'candidates': [], 'rationale': 'nothing fits'}),
-        ],
-        ids=['bare', 'empty_judgment', 'json_fenced', 'surrounding_whitespace', 'extra_key'],
-    )
-    def test_whole_carrier_judgment_is_recognised(self, text):
-        assert mod.is_coder_judgment_payload(text) is True
-
-    def test_the_reply_the_coder_prompt_prescribes_is_recognised_lockstep(self):
-        """LOCKSTEP with scripts/legibility/coder.py::build_prompt, the one
-        copy of the response schema CODER_JUDGMENT_KEYS restates. The reply
-        is read out of the prompt, never hand-built: a hand-built reply stays
-        green when that schema is renamed, and a rename is the drift this
-        pins."""
-        prompt = coder_mod.build_prompt(digest_text='', codebook_index='', invariant_slugs=())
-        [prescribed_reply] = [line for line in prompt.splitlines() if line.startswith('{')]
-
-        assert mod.is_coder_judgment_payload(prescribed_reply) is True
-
-    def test_prose_quoting_the_schema_inline_is_not_a_payload(self):
-        # A genuine self-correction that merely MENTIONS the schema is this
-        # session's own dialogue and must never be suppressed.
-        text = (
-            'The coder answers with {"matches": [], "candidates": []} '
-            "— that's wrong, it should be a single object per session."
-        )
-
-        assert mod.is_coder_judgment_payload(text) is False
-
-    @pytest.mark.parametrize(
-        'text',
-        [
-            '{"matches": []}',
-            '{"candidates": []}',
-            '[{"matches": [], "candidates": []}]',
-            '{"results": [{"id": "ccf73ca4", "content": "Task 1470 wired /audit."}]}',
-            'not json at all',
-            '',
-        ],
-        ids=[
-            'matches_only', 'candidates_only', 'top_level_array',
-            'unrelated_object', 'non_json', 'empty',
-        ],
-    )
-    def test_anything_but_a_judgment_object_is_not_a_payload(self, text):
-        assert mod.is_coder_judgment_payload(text) is False
-
-    def test_pathologically_nested_object_answers_false_without_raising(self):
-        # json.loads raises RecursionError, which is not a ValueError, on
-        # this input under CPython 3.13. The predicate runs on every carrier
-        # of arbitrary transcripts, tool_results included, so it must
-        # answer rather than abort the whole digest.
-        text = '{"a":' * 200_000 + '1' + '}' * 200_000
-
-        assert mod.is_coder_judgment_payload(text) is False
-
-
-# ---------------------------------------------------------------------------
-# is_reingested_content -- the ONE predicate every signal bucket consults
-# (task 5685). It answers "is this carrier machine content re-ingested as
-# session material rather than this session's own dialogue?", and its two
-# known members are a prior coder judgment and a harness-injected prompt or
-# briefing.
-# ---------------------------------------------------------------------------
-
-class TestReingestedContentClassifier:
-    @pytest.mark.parametrize(
-        'text', [_coder_judgment(), _json_fenced(_coder_judgment())],
-        ids=['bare', 'json_fenced'],
-    )
-    def test_a_coder_judgment_is_reingested(self, text):
-        assert mod.is_reingested_content(text) is True
-
-    @pytest.mark.parametrize(
-        'text', [_briefing_text(), _CENSUS_MEMORY_CONTEXT_TURN, _TRICKLE_CODER_PREAMBLE],
-        ids=['briefing', 'census_memory_context', 'trickle_coder_prompt'],
-    )
-    def test_a_harness_prompt_or_briefing_is_reingested(self, text):
-        assert mod.is_reingested_content(text) is True
-
-    @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
-    )
-    def test_resume_prompt_is_reingested_lockstep(self, resume_prompt):
-        # LOCKSTEP, as in test_resume_prompt_is_excluded_lockstep: asserted
-        # against each canonical constant, never a restated literal.
-        assert mod.is_reingested_content(resume_prompt) is True
-
-    @pytest.mark.parametrize(
-        'text',
-        ['please fix the bug in the merge worker', "Actually, that's wrong — use the other branch", ''],
-        ids=['ordinary_turn', 'genuine_self_correction', 'empty'],
-    )
-    def test_dialogue_is_not_reingested(self, text):
-        assert mod.is_reingested_content(text) is False
+        assert detectors.classify_agent_class(_MAIN_DIR_PATH, records) == 'orchestrated-task'
 
 
 # ---------------------------------------------------------------------------
@@ -3007,50 +2540,15 @@ class TestReingestedContentClassifier:
 # human turn is strictly the worse error.
 # ---------------------------------------------------------------------------
 
-def _recon_run_review_text():
-    """Build the text of an injected reconciliation-run-review user turn --
-    the literal shape ``ReconciliationJudge._build_review_prompt`` emits
-    (fused-memory/src/fused_memory/reconciliation/judge.py:411-476): a
-    '## Reconciliation Run Review' heading, a '### Run Metadata' block whose
-    first bullet is '- Run ID: {run.id}', a '### Stage Reports' block of
-    ``json.dumps`` output, and '### MCP Actions (N total)' / '### Journal
-    Entries (N total)' blocks. The run id matches the one the census quotes
-    verbatim at §1.1 (:85).
-
-    Deliberately free of every detector literal (NOT_FOUND_PATTERNS,
-    DF_GUARD_PATTERNS, INTERRUPT_PATTERN, SELF_CORRECTION_PATTERNS) so
-    test_signal_counts_unaffected_by_pasted_report_turn isolates the
-    iter_user_turns filter rather than an incidental pattern hit.
-    """
-    return (
-        '## Reconciliation Run Review\n\n'
-        '### Run Metadata\n'
-        '- Run ID: 84e6ce03-1f2a-4c7b-9d84-6b0f1a2e35cc\n'
-        '- Project: dark_factory\n'
-        '- Type: targeted\n'
-        '- Trigger: task_status_change\n'
-        '- Events processed: 12\n'
-        '- Status: completed\n\n'
-        '### Stage Reports\n'
-        '[\n  {\n    "stage": 1,\n    "status": "completed",\n'
-        '    "summary": "consolidated 4 memories"\n  }\n]\n\n'
-        '### MCP Actions (2 total)\n'
-        '[\n  {\n    "tool": "add_memory",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
-        '### Journal Entries (5 total)\n'
-        '[\n  {\n    "kind": "stage_start",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
-        'Review this run and provide your verdict as JSON.\n'
-    )
-
-
 class TestRunReviewPromptTurnFilter:
     def test_recon_run_review_turn_is_excluded(self):
-        records = [_user_text(_recon_run_review_text())]
+        records = [_user_text(recon_run_review_text())]
 
         assert mod.iter_user_turns(records) == []
 
     def test_ordinary_correction_after_pasted_report_retained_with_index(self):
         records = [
-            _user_text(_recon_run_review_text()),
+            _user_text(recon_run_review_text()),
             _user_text('This is wrong, please redo it.'),
         ]
 
@@ -3086,7 +2584,7 @@ class TestRunReviewPromptTurnFilter:
 
     def test_render_digest_excludes_pasted_report_from_body_and_n_user_turns(self):
         records = [
-            _with_session_meta(_user_text(_recon_run_review_text())),
+            _with_session_meta(_user_text(recon_run_review_text())),
             _with_session_meta(_user_text('This is wrong, please redo it.')),
         ]
 
@@ -3108,40 +2606,9 @@ class TestRunReviewPromptTurnFilter:
         # The filter must not leak into _signal_text_sources: prepending a
         # signal-free pasted report must not perturb any of the five counts.
         base = _all_signals_records()
-        with_report = [_user_text(_recon_run_review_text())] + base
+        with_report = [_user_text(recon_run_review_text())] + base
 
         assert mod.signal_counts(with_report) == mod.signal_counts(base)
-
-    def test_run_review_prompt_is_classified_as_harness_injected(self):
-        # The run-review block IS harness-injected -- the judge's own prompt,
-        # recorded as the session's sole user record by `claude --print`
-        # (verified on all five census sightings) -- so it belongs to
-        # is_harness_injected_turn rather than to a separate predicate whose
-        # name would assert a human typed it.
-        assert mod.is_harness_injected_turn(_recon_run_review_text()) is True
-        assert mod.is_harness_injected_turn(_briefing_text()) is True
-
-    def test_each_harness_heading_set_is_matched_independently(self):
-        # HARNESS_HEADING_SETS is an any()-over-sets fan-out with two real
-        # entries: a turn carrying ONE set's headings is excluded without
-        # needing the other's. Cross-set heading mixtures are not a match.
-        assert mod.HARNESS_BRIEFING_HEADINGS in mod.HARNESS_HEADING_SETS
-        assert mod.RECON_RUN_REVIEW_HEADINGS in mod.HARNESS_HEADING_SETS
-
-        crossed = '\n\n'.join(
-            ('# Context', '### Stage Reports', 'so what should I do here?'),
-        )
-        assert mod.is_harness_injected_turn(crossed) is False
-
-    def test_both_heading_sets_use_the_same_line_anchoring(self):
-        # One shared normalization (_has_all_heading_lines), so the two sets
-        # cannot silently diverge on what counts as a heading line: leading
-        # and trailing whitespace and case are stripped for both alike.
-        for headings in mod.HARNESS_HEADING_SETS:
-            padded = '\n'.join(f'  {heading.upper()}  ' for heading in headings)
-
-            assert mod.is_harness_injected_turn(padded) is True
-            assert mod.is_harness_injected_turn(' | '.join(headings)) is False
 
 
 class TestRenderDigest:
@@ -3196,7 +2663,7 @@ class TestRenderDigest:
 
     def test_frontmatter_score_is_reconstructible_from_rendered_fields(self):
         # confusion-census-2026-07-31 R2 / §1.2: score_signals' dominant
-        # component is SIGNAL_WEIGHTS['user_turn'] * n_user_turns, which the
+        # component is USER_TURN_WEIGHT * n_user_turns, which the
         # frontmatter used to omit entirely -- so `score` could not be
         # checked against `signal_counts` by a reader of the digest alone.
         # With n_user_turns rendered, the score is fully reconstructible.
@@ -3653,7 +3120,7 @@ class TestDesignedOutcomesSection:
     def test_designed_outcome_line_names_the_rule_that_fired(self):
         # Distinct labels per rule keep which-rule-fired legible: a
         # self-declared CEILING must not read the same as a bare 124.
-        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
+        _, declared = detectors.classify_error_content(_CEILING_DECLARATION)
         assert declared is not None
 
         digest = mod.render_digest(
@@ -3961,7 +3428,7 @@ class TestEmitConsistencyGuard:
         # non-empty, briefing-free digest with an intact frontmatter
         # contract.
         records = [
-            _with_session_meta(_user_text(_briefing_text('x' * 21000))),
+            _with_session_meta(_user_text(briefing_text('x' * 21000))),
             _with_session_meta(_user_text('This is wrong, please redo it.')),
             _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
             _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),

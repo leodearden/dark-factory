@@ -1,0 +1,27 @@
+# INV-12 ratification table: the closed world of operator rulings (PRD D3,
+# plans/inv12-exceptions-owned-or-ratified-prd.md). A Policy names a row of
+# this table; nothing else is a valid ratification.
+#
+# Loaded ONLY by scripts/exception_register.py, which refuses the whole file
+# (exit 2) when any row breaks the schema below.
+#
+# One row per ruling, with exactly the keys {id, date, source, covers}:
+#   id      unique, kebab-case (lower-case alphanumeric segments joined by
+#           single hyphens), conventionally prefixed `inv12-`. It is the FIRST
+#           key of its row, and rows are written block-style, because the
+#           delivered check of the rulings task greps `^- id: inv12-`.
+#   date    an UNQUOTED ISO date, YYYY-MM-DD.
+#   source  provenance: an escalation id, a sitting ruling, or a document
+#           path. Never liveness-checked.
+#   covers  one non-blank sentence naming what the ruling covers.
+#
+# An example row, kept behind `#` so that no ruling is read as delivered
+# before the operator makes one:
+#
+#   - id: inv12-example-ruling
+#     date: 2026-10-09
+#     source: esc-0000-1
+#     covers: What this ruling keeps, in one sentence.
+#
+# An empty table is written `[]`.
+[]

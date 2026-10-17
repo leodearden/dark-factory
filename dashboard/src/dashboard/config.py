@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -134,7 +135,7 @@ def _discover_root_escalation_url(root: Path) -> str | None:
     return None
 
 
-def _discover_escalation_urls(roots: list[Path]) -> dict[str, str]:
+def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     """Derive each root's escalation MCP URL from its orchestrator config.
 
     Keyed by project basename — the same key the Merge UI uses. Prefers the
@@ -214,9 +215,12 @@ class DashboardConfig:
         self.project_root = self.project_root.resolve()
         self.known_project_roots = [p.resolve() for p in self.known_project_roots]
         if not self.escalation_urls:
-            self.escalation_urls = _discover_escalation_urls(
-                [self.project_root, *self.known_project_roots],
-            )
+            self.escalation_urls = _discover_escalation_urls(self.all_project_roots)
+
+    @property
+    def all_project_roots(self) -> tuple[Path, ...]:
+        """Every configured project root, ``project_root`` first, each named once."""
+        return tuple(dict.fromkeys((self.project_root, *self.known_project_roots)))
 
     def _runtime_data_dir(self, env_var: str, subdir: str) -> Path:
         """Resolve a managed fused-memory runtime data dir, env-var first.

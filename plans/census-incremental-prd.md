@@ -152,6 +152,7 @@ The runner computes "standing, no new evidence" from the codebook and renders it
 - **No max-interval condition** (decided, R8). Today's calendar backstop is deleted by L8b. The trigger fires on (a) or (b) only, each subject to the floor. A project with no completion signal (no previous run id, or a previous run that filed nothing) therefore fires only on (b) or by hand (`skills/census/SKILL.md`).
 - **Floor:** `floor_days` is the minimum transcript window, and the calendar's only role (R2). It never fires a census by itself. No condition fires until `now − session_watermark ≥ floor_days`. It is anchored on the watermark, not the date, and a never-censused project measures it from its earliest codebook date. `tasks_landed_*` and `last_census_done_count` are retired by L8b.
 - Every threshold remains an unquoted non-negative int, validated by `census_trigger.py::CensusConfig.from_mapping`.
+  > Superseded mechanism (2026-10-10): `plans/review-all-s21-legibility-pipeline-prd.md` D8 (task 6749, ζ) deletes `CensusConfig.from_mapping`; thresholds are validated once by a strict `config.Census` (`StrictInt`, `ge=0`) at `load_config`, and the trigger reads `LegibilityConfig.census`. The semantics above, including L8b's deprecated-key WARNING, are unchanged.
 
 ### 4.8 Boundary-test sketch
 
@@ -326,7 +327,7 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Signal:** `similarity.py queue --project-root /home/leo/src/dark-factory` (embedding spend only, no verify) prints the queue depth and the top clusters over the live codebook. G (`## Adjudication` with an audit line per attach).
 - **L10: structured synthesis** (normal; deps L7; ~700 LOC).
   - **Files:** new `scripts/legibility/synthesis.py` (schema, validation, deterministic renderer); `census.py` (`_synthesis_prompt` input: this run's verified, screened and attached findings plus counts, never prior reports; the guidance block; apply `phase_refinements` and `corrections`); tests.
-  - **Behaviour:** C6. Heuristic 12: prose is rendered from data. The report's per-slug invariant counts come from L9's sightings.
+  - **Behaviour:** C6. Heuristic 12: prose is rendered from data. The report's per-slug invariant counts come from L9's sightings. Reconcile task 5692's interim `census.py::SYNTHESIS_NOT_APPLIED_NOTICE` and `::SYNTHESIS_PROPOSALS_HEADING`: once `corrections` and `phase_refinements` are applied, the notice must name what was applied, not deny it.
   - **Tests:** row 14, plus a golden render.
   - **Consumer:** operator.
   - **Signal:** G (`## Synthesis` has "New" and "Re-observed" sub-blocks; a standing count; the matrix reflects refinements).

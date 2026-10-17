@@ -131,7 +131,7 @@ def _write_recording_script(lane: Path, name: str) -> Path:
         argv_file = script.parent / (script.name + '.argv')
         ...
         recorded = argv_file.read_text().strip()
-        assert recorded == f'{base_target} {lane} --reset-in-place'
+        assert recorded == f'{base_target} {lane} --fresh-checkout'
     """
     scripts_dir = lane / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -329,7 +329,7 @@ async def _add_recording_seed_to_repo(repo: Path) -> None:
 
 @pytest.mark.asyncio
 class TestAcquireSpecLane:
-    """GitOps.acquire_spec_lane: create-once path seeds lane with '--reset-in-place'."""
+    """GitOps.acquire_spec_lane: create-once path seeds lane with '--fresh-checkout'."""
 
     async def test_acquire_spec_lane_returns_warm_tuple(self, spec_git_repo: Path):
         """acquire_spec_lane returns (lane_path, warm=True) for the assigned _spec- lane."""
@@ -367,10 +367,10 @@ class TestAcquireSpecLane:
         assert git_ops.spec_warm_lane_pool is not None
         assert git_ops.spec_warm_lane_pool.state(lane_path) == LaneState.ASSIGNED
 
-    async def test_acquire_spec_lane_invokes_seed_reset_in_place(
+    async def test_acquire_spec_lane_invokes_seed_fresh_checkout(
         self, spec_git_repo: Path,
     ):
-        """acquire_spec_lane invokes seed-warm-lane.sh with base_target + '--reset-in-place'."""
+        """acquire_spec_lane invokes seed-warm-lane.sh with base_target + '--fresh-checkout'."""
         await _add_recording_seed_to_repo(spec_git_repo)
         cfg = _make_spec_git_config(on=True)
         git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
@@ -389,7 +389,7 @@ class TestAcquireSpecLane:
         )
         recorded = argv_file.read_text().strip()
         base_target = str(git_ops.warm_lane_base_target_path)
-        expected = f'{base_target} {lane_path} --reset-in-place'
+        expected = f'{base_target} {lane_path} --fresh-checkout'
         assert recorded == expected, (
             f'Wrong seed argv: got {recorded!r}, expected {expected!r}'
         )

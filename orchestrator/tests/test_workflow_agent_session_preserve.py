@@ -21,7 +21,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
@@ -154,7 +154,7 @@ class TestSidecarV2Wiring:
             new_callable=AsyncMock,
             side_effect=_side_effect,
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert seen['task_id'] == str(workflow.task_id)
         assert seen['schema_version'] == 2
@@ -202,7 +202,7 @@ class TestSidecarV2Wiring:
             new_callable=AsyncMock,
             side_effect=_side_effect,
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # base count 2 + 1 for this adopted resume = 3
         assert seen['resume_count'] == 3
@@ -241,7 +241,7 @@ class TestPreserveOnCancellation:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # Completion → sidecar cleared, and NO preserve fact was emitted.
         assert workflow.artifacts is not None
@@ -261,7 +261,7 @@ class TestPreserveOnCancellation:
             new_callable=AsyncMock,
             side_effect=asyncio.CancelledError,
         ), pytest.raises(asyncio.CancelledError):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # CancelledError from the invoke → the sidecar SURVIVES (still in-flight),
         # carrying the durable v2 binding.
@@ -302,7 +302,7 @@ class TestPreserveOnCancellation:
             new_callable=AsyncMock,
             side_effect=RuntimeError('boom'),
         ), pytest.raises(RuntimeError, match='boom'):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         # Non-CancelledError → sidecar cleared (session_preserved stayed False),
         # and NO preserve fact was emitted.

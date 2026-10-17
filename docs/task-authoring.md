@@ -843,6 +843,13 @@ dependency gate as every other task (§3).
 }
 ```
 
+A relative `script` (even when `cwd` is set) and a relative `cwd` resolve
+against the orchestrator's **configured** `project_root` — the `project_root` in its
+`dark-factory-orchestrator.yaml`, the same root `submit_task`'s guard
+validates the script under — never against the orchestrator process's
+working directory. See
+`shared/src/shared/before_done_paths.py::resolve_before_done_paths`.
+
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
 action); task goes `blocked` until resolved.
@@ -1215,13 +1222,27 @@ same-files successor would be refused as a duplicate of its own predecessor
 (`fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title`).
 `cancelled` ends the chain, and an existing non-terminal link with the same
 `key` suppresses the mint. A mint failure never fails the status write: it
-logs `recurrence_mint_failed:` and leaves the link `done` with no successor,
-the *broken* state the chain-state gauge (a separate PRD task, not yet live)
-will surface. A request cancelled after its `done` write committed does not
-abandon the mint, which runs on to completion; a mint that is itself cancelled
-logs that same line. A link completed inside the same wall-clock second as its
-predecessor would give its successor its own run label, so that mint fails
-the same way.
+logs `recurrence_mint_failed:`. A request cancelled after its `done` write
+committed does not abandon the mint, which runs on to completion; a mint that
+is itself cancelled logs that same line. A link completed inside the same
+wall-clock second as its predecessor would give its successor its own run
+label, so that mint fails the same way.
+
+A failed mint, or a crash between the `done` write and the mint, leaves the
+chain *broken*: its current link is `done` and no live link exists
+(`shared/src/shared/recurrence_chains.py::current_links` is the one
+definition of a chain's current link). It stays broken until fused-memory's
+re-mint sweep
+(`fused-memory/src/fused_memory/middleware/recurrence_mint.py::run_remint_sweep_loop`)
+repairs it. The sweep runs at startup and then hourly. Under the write lock it
+re-reads each chain it found and leaves alone one that is no longer broken,
+then mints through the same C-2-checked path, so a re-run never double-mints
+and a chain ended since the sweep looked stays ended. It anchors the
+successor's `at` on the predecessor's stored terminal time. Each repair logs a
+`recurrence_remint:` WARNING and journals a `task_created` event with
+`trigger='remint_sweep'`. A chain that still cannot be minted, such as the
+same-second run-label collision or a carrier that no longer verifies, logs
+`recurrence_mint_failed:` on every sweep.
 
 ---
 
@@ -1635,6 +1656,20 @@ metadata key — that just adds another `code=unknown_key` census line. Use
 the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
+
+`x_inv12_finding` and `x_inv12_owns` are the Tier-C keys of the INV-12
+sweep (exceptions are owned or ratified; PRD
+`plans/inv12-exceptions-owned-or-ratified-prd.md`, D11).
+`x_inv12_finding` is the sweep's idempotence key, one per
+`(scope, dead owner)` where scope is a governed `list_id` or `inline`; the
+sweep skips filing while a live task or pending escalation carries it.
+`x_inv12_owns` is a note the sweep merges into a live owner task, saying
+which exception entries cite it. A sweep-filed task asks the implementer to
+re-dispose each entry whose owner is dead: fix the underlying type or code so
+the suppression can go, or cite a live follow-up ticket on the marker. The
+accepted marker and declaration spellings are
+`shared.governed_exceptions.INLINE_MARKER_FORMS` and `DECLARATION_FORMS`;
+read them there rather than from a copy here.
 
 ### `allow_mcp_markup`: a write-time flag, not a metadata key
 

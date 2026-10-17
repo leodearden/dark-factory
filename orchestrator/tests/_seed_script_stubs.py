@@ -1,8 +1,9 @@
-"""Real-git fixtures plus a stub of reify's ``seed-warm-lane.sh`` locking contract.
+"""Real-git fixtures plus stubs of reify's ``seed-warm-lane.sh`` contracts.
 
-Shared by the lane-lock re-entrancy suite and the main-tip-sweep seed-mode
-suite, so the one model of how today's seed script takes, refuses and accepts
-an asserted ``<lane_dir>.lock`` lives in one place.
+Shared by the lane-lock re-entrancy, main-tip-sweep seed-mode and spec-lane
+re-acquire suites, so the one model of how today's seed script takes, refuses
+and accepts an asserted ``<lane_dir>.lock``, and of how each mode treats an
+existing ``<lane_dir>/target``, lives in one place.
 """
 
 from __future__ import annotations
@@ -44,6 +45,25 @@ elif flock -n "${lane_dir}.lock" true; then
 fi
 mkdir -p "$lane_dir/target"
 echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
+# Models reify seed-warm-lane.sh's MODE SPLIT over an existing <lane_dir>/target.
+TARGET_MODE_SEED_SCRIPT = """#!/usr/bin/env bash
+set -u
+target="$2/target"
+if [ -d "$target" ] && [ -n "$(ls -A "$target")" ]; then
+    case "$3" in
+        --reset-in-place)
+            echo "Clobber guard: $target already exists and is non-empty" >&2
+            exit 1
+            ;;
+        --fresh-checkout) rm -rf "$target" ;;
+        *) exit 2 ;;
+    esac
+fi
+rmdir "$target" 2>/dev/null || true
+cp -a "$1" "$target"
 exit 0
 """
 

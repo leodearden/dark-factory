@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 from _recording_event_store import _RecordingEventStore
+from _workflow_helpers import fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
@@ -161,7 +162,7 @@ async def _invoke_implementer(wf: TaskWorkflow, cwd: Path, *, prompt: str = 'x')
         ),
         patch.object(wf, '_build_agent_env', return_value=None),
     ):
-        await wf._invoke(IMPLEMENTER, prompt=prompt, cwd=cwd)
+        await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt(prompt), cwd=cwd)
 
 
 @pytest.mark.asyncio
@@ -321,7 +322,7 @@ class TestInvokeAdoptsResolveRoute:
             ) as mock_invoke,
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         mock_resolve.assert_called_once()
         route_inputs = mock_resolve.call_args.args[0]
@@ -359,7 +360,7 @@ class TestInvokeThreadsConfigPrices:
             ) as mock_invoke,
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         assert mock_invoke.call_args.kwargs.get('prices') is wf.config.prices
 
@@ -390,7 +391,7 @@ class TestInvokeRoutingDecisionRejectedField:
             ),
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         entries = _routing_decision_entries(rec)
         assert len(entries) == 1
@@ -473,7 +474,7 @@ class TestInvokeThreadsScopeCapacity:
             ),
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         route_inputs = mock_resolve.call_args.args[0]
         assert route_inputs.scope_capacity == {'claude-fable-5': False}
@@ -504,7 +505,7 @@ class TestInvokeThreadsScopeCapacity:
             ),
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         route_inputs = mock_resolve.call_args.args[0]
         assert route_inputs.scope_capacity is None
@@ -530,7 +531,7 @@ class TestInvokeThreadsScopeCapacity:
             ) as mock_invoke,
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
-            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+            await wf._invoke(IMPLEMENTER, build_prompt=fixed_prompt('x'), cwd=tmp_path)
 
         entries = _routing_decision_entries(rec)
         assert len(entries) == 1

@@ -175,9 +175,9 @@ filterwarnings = [
 # is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
 # starved of CPU on a loaded 32-core host trips it and — under thread mode
 # plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
-# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
-# clock under real fleet load x the 8x headroom factor — and no longer
-# judgement-picked; see
+# 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock under
+# real fleet load x the 8x headroom factor — and no longer judgement-picked;
+# the measurement and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N) — but N is NOT free, and
 # that line used to imply it was. A marker OVERRIDES the budget in BOTH
@@ -190,20 +190,20 @@ filterwarnings = [
 # actually governs a merge-gating run.
 # That inversion cost tasks 4176, 4384 and 4405. Write either N <= 60 (a
 # DELIBERATE tight bound, for a test asserting something happens FAST) or
-# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py
-# — whose comment block on that constant is the SINGLE home of this rationale,
-# including why the marker beats this setting. Enforced by
+# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py.
+# The SINGLE home of this rationale, including why the marker beats this
+# setting, is shared/src/shared/testing_timeout_markers.py. Enforced by
 # tests/test_timeout_marker_inversion_guard.py.
 # timeout_method: thread is RETAINED. Its original premise, that xdist worker
 # subprocesses run pytest in a thread so signal cannot reach the test, is
 # falsified by tests/scripts/test_timeout_method_policy.py, where the
 # signal-vs-thread trade lives.
-# UNCHANGED by the 60→300 and 300→540 raises, deliberately: a raise attacks the
+# UNCHANGED by every change of the value, deliberately: a raise attacks the
 # trigger, not the two safety mechanisms.
 # MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants asserts against
 # this value with tomllib at runtime — edit the two together.
-timeout = 540
+timeout = 420
 timeout_method = "thread"
 # A test still running after this many seconds dumps every thread's stack to
 # the worker's stderr, which the verify log carries, so a hang whose kill comes

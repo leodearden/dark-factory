@@ -98,6 +98,7 @@ class TestModuleLevelAll:
             'AgentFailureClass',
             'AgentFailureKind',
             'AgentResult',
+            'PromptBuilder',
             'AllAccountsCappedException',
             'TranscriptEvidence',
             'build_failure_message',

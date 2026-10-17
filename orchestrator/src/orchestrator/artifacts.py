@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from shared import safe_io
+from shared.plan_deviation import DeviationRecord
 
 from orchestrator.config import TASK_META_DIRNAME
 
@@ -793,7 +794,13 @@ class TaskArtifacts:
     def update_step_status(
         self, step_id: str, status: str, commit: str | None = None
     ) -> None:
-        """Update ONLY status and commit fields in plan.json. Structure is immutable."""
+        """Update ONLY the status and commit fields of one step in plan.json.
+
+        Plan structure changes only through the architect-role revalidation
+        tools (``orchestrator/mcp/plan_tools.py::_remove_plan_step`` /
+        ``::_replace_plan_step``), and only on steps that are not done.
+        Per-step deviation records go through :meth:`append_step_deviation`.
+        """
         plan = self.read_plan()
 
         for collection in ('prerequisites', 'steps'):
@@ -808,6 +815,39 @@ class TaskArtifacts:
                     return
 
         logger.warning(f'Step {step_id} not found in plan')
+
+    def append_step_deviation(
+        self, step_id: str, record: DeviationRecord
+    ) -> int | None:
+        """Append *record* to the matching step's ``deviations`` list.
+
+        Returns the list's new length, or ``None`` (with a warning, and no
+        write) when no step or prerequisite has ``id == step_id``. Any step
+        status is accepted, including ``done``.
+
+        Append-only: this class never edits or removes a record. ``status``,
+        ``commit``, ``type`` and ``description`` are never touched, so
+        :meth:`update_step_status` stays "status and commit only".
+
+        Markup-repair limits: ``plans/plan-deviation-recording-prd.md`` D4.
+        """
+        plan = self.read_plan()
+
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get('id') == step_id:
+                    existing = item.get('deviations')
+                    item['deviations'] = [
+                        *(existing if isinstance(existing, list) else []),
+                        record.to_dict(),
+                    ]
+                    self.write_plan(plan)
+                    return len(item['deviations'])
+
+        logger.warning(f'Step {step_id} not found in plan')
+        return None
 
     def mark_step_committed(self, step_id: str, sha: str) -> bool:
         """Pre-satisfy a plan step/prerequisite at AUTHORING time.
@@ -1378,7 +1418,12 @@ class TaskArtifacts:
     def clear_stale_plan_lock(
         self, current_task_id: str, stale_threshold_secs: float = 600.0
     ) -> bool:
-        """Remove plan.lock if it's stale. Returns True if lock was cleared."""
+        """Remove plan.lock if it's stale. Returns True if lock was cleared.
+
+        *stale_threshold_secs* is plan.lock's own eviction window; its default
+        equals ``shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL`` only
+        coincidentally and is deliberately not derived from it.
+        """
         lock_data = self.read_plan_lock()
         if lock_data is None:
             return False

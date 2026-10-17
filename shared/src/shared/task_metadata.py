@@ -23,6 +23,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
+from shared.task_deferral import DeferralRecord
+
 __all__ = [
     'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
     'HUMAN_CURATOR_GATE_KEY',
@@ -824,6 +827,12 @@ register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality
 # task-4142 cardinality gate — so a list-shaped value is REJECTED under
 # write+enforce instead of silently validating element-wise.
 register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
+
+# deferral: plans/deferral-flip-condition-prd.md §5.1.
+register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
+
+# strand_converted: shared/src/shared/strand_conversion.py.
+register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:

@@ -24,6 +24,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from shared.task_submit import SubmitOutcome, SubmittedTask
 
 from orchestrator import flake_recorder
 from orchestrator.flake_ledger import (
@@ -158,7 +159,7 @@ class _FakeLedgerTaskClient:
         self._statuses_error = statuses_error
         self._statuses_raises = statuses_raises
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         self.order.append('submit_task')
         self.submit_calls.append(arguments)
         if self._submit_raises is not None:
@@ -166,7 +167,7 @@ class _FakeLedgerTaskClient:
         self._n += 1
         new_id = f'deflake-{self._n}'
         self._statuses.setdefault(new_id, self._status_after_submit)
-        return new_id
+        return SubmittedTask(new_id, self._status_after_submit)
 
     async def get_statuses(
         self, ids: list[str],
@@ -699,7 +700,7 @@ class TestRecordOpensDebt:
         never = asyncio.Event()
 
         class _HangsOnSecond(_FakeLedgerTaskClient):
-            async def submit_task(self, arguments: dict) -> str:
+            async def submit_task(self, arguments: dict) -> SubmitOutcome:
                 if self.submit_calls:
                     self.submit_calls.append(arguments)
                     await never.wait()
@@ -736,10 +737,10 @@ class TestRecordOpensDebt:
         never = asyncio.Event()
 
         class _Hanging(_FakeLedgerTaskClient):
-            async def submit_task(self, arguments: dict) -> str:
+            async def submit_task(self, arguments: dict) -> SubmitOutcome:
                 self.submit_calls.append(arguments)
                 await never.wait()
-                return 'unreachable'
+                return SubmittedTask('unreachable', 'deferred')
 
         client = _Hanging()
         with caplog.at_level(logging.WARNING):

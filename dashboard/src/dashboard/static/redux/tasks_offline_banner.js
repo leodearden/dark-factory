@@ -153,7 +153,21 @@ function tasksBannerNotices(state) {
   return notices
 }
 
-const TASKS_OFFLINE_BANNER_API = { tasksBannerNotices }
+// The ONE mapping from DF_DATA's /tasks keys to tasksBannerNotices' state, so
+// the Tasks-tab banner and the System health Taskmaster row cannot disagree.
+// Every key is defaulted, so a pre-fetch DF_DATA yields no notice.
+function tasksBannerNoticesFor(data) {
+  const d = data || {}
+  return tasksBannerNotices({
+    offline: !!d.TASKS_OFFLINE,
+    offlineProjects: d.TASKS_OFFLINE_PROJECTS || [],
+    degradedProjects: d.TASKS_DEGRADED_PROJECTS || [],
+    countUnknownProjects: d.TASKS_COUNT_UNKNOWN_PROJECTS || [],
+    totalProjects: d.TASKS_PROJECT_COUNT || 0,
+  })
+}
+
+const TASKS_OFFLINE_BANNER_API = { tasksBannerNotices, tasksBannerNoticesFor }
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = TASKS_OFFLINE_BANNER_API

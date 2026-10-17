@@ -913,13 +913,13 @@ async def test_snapshot_lists_pin_reservations_apart_from_fairness_parks(tmp_pat
 
     snapshot = w.scheduler.get_state_snapshot()
 
-    pin_reservations = snapshot['pin_reservations']
+    pin_reservations = snapshot.pin_reservations
     assert list(pin_reservations) == ['P'], "C's fairness park is not a pin reservation"
-    assert pin_reservations['P']['modules'] == ['w.py', 'x.py']
-    assert isinstance(pin_reservations['P']['installed_at'], str)
-    assert pin_reservations['P']['installed_at']
-    assert 'P' in snapshot['parks'], '`parks` still reports every active top (INV-7)'
+    assert pin_reservations['P'].modules == ('w.py', 'x.py')
+    assert isinstance(pin_reservations['P'].installed_at, str)
+    assert pin_reservations['P'].installed_at
+    assert 'P' in snapshot.parks, '`parks` still reports every active top (INV-7)'
     on_disk = json.loads(state_path.read_text())
-    assert on_disk['pin_reservations'] == pin_reservations, (
+    assert on_disk['pin_reservations'] == snapshot.to_json()['pin_reservations'], (
         'the tick-end snapshot write carries the same pin reservations'
     )

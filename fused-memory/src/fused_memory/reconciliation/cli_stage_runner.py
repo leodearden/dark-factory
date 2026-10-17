@@ -6,17 +6,24 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
-from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
 
+from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
     resolve_recon_sandbox_wrap,
 )
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -72,8 +79,8 @@ DISALLOW_MEMORY_WRITES = [
     # adds the tool, deliberately: it writes a canonical, patches N retained
     # peers, re-homes their children and DELETES its supersedes, so shipping
     # it unlisted would repeat the update_memory incident above with a larger
-    # blast radius. Stage 1's ADVERTISEMENT of the op is task 3134's — this
-    # is the safety classification, which belongs with the tool.
+    # blast radius. This is its safety classification; DISALLOW_CONSOLIDATION_OP
+    # below additionally denies it to Stages 1 and 2 (task 5239).
     'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__delete_episode',
     'mcp__fused-memory__redact_episode_content',
@@ -113,8 +120,7 @@ DISALLOW_MEMORY_WRITES = [
     #
     # Stage 1 and the curator are the sanctioned callers, so STAGE1_DISALLOWED
     # and STAGE2_DISALLOWED are deliberately untouched (neither folds this list).
-    # Stage 1's ADVERTISEMENT of the op in the stage prompts is separate work —
-    # the same split the consolidate_memories entry above records for task 3134;
+    # Stage 1's ADVERTISEMENT of the op in the stage prompts is separate work;
     # this is the safety classification, which belongs with the tool.
     'mcp__fused-memory__ensure_entity_node',
 ]
@@ -158,7 +164,7 @@ DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
 #
 # Every registered fused-memory tool must be in a deny bucket or reviewed as
 # read-only — see
-# tests/test_recon_stage_fused_memory_tool_classification.py::test_every_fused_memory_server_tool_is_classified.
+# tests/test_stages.py::TestDisallowedToolLists::test_every_fused_memory_tool_is_classified.
 DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
     'mcp__fused-memory__trigger_reconciliation',
     'mcp__fused-memory__unhalt_reconciliation',
@@ -170,6 +176,25 @@ DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
     'mcp__fused-memory__clear_task_priority_override',
     'mcp__fused-memory__reorder_pin_queue',
     'mcp__fused-memory__request_park_eviction',
+]
+
+# Consolidation PROPOSALS (disallowed in Stage 2 and Stage 3 — task 5239, PRD
+# plans/memory-auto-consolidation-prd.md D12/C1): Stage 1 is the one proposer of
+# a near-duplicate cluster; code decides and executes. An additive sublist on
+# the DISALLOW_RECON_REPORT_LEDGER_WRITES pattern, since no existing bucket
+# denies a tool to exactly Stages 2 and 3.
+DISALLOW_CONSOLIDATION_PROPOSALS = [
+    'mcp__fused-memory__propose_consolidation',
+]
+
+# consolidate_memories, denied to Stage 1 and Stage 2 (task 5239, PRD
+# plans/memory-auto-consolidation-prd.md D12). A stage-scoping OVERLAY, not a
+# classification bucket: the tool stays classified in DISALLOW_MEMORY_WRITES,
+# which already carries it into Stage 3, so this folds into Stages 1 and 2 only.
+# Auto-consolidation's executor and the curator sitting (curator- agents) are
+# the op's callers now; Stage 1 proposes through propose_consolidation instead.
+DISALLOW_CONSOLIDATION_OP = [
+    'mcp__fused-memory__consolidate_memories',
 ]
 
 # Escalation READ tools (disallowed in every stage — task 3163,
@@ -253,22 +278,29 @@ DISALLOW_ESCALATION_WRITES = [
 # Per-stage disallowed lists
 STAGE1_DISALLOWED = (
     DISALLOW_TASK_WRITES
+    + DISALLOW_CONSOLIDATION_OP
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
-# Stage 2 keeps full memory + task write access; only built-ins, the escalation
-# reads and the fused-memory control-plane mutators are blocked.
+# Stage 2 keeps its memory + task write access except the consolidation op and
+# the proposal tool; built-ins, the escalation reads and the fused-memory
+# control-plane mutators are blocked too.
 STAGE2_DISALLOWED = (
-    DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES + DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+    DISALLOW_CONSOLIDATION_OP
+    + DISALLOW_CONSOLIDATION_PROPOSALS
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+    + DISALLOW_ESCALATION_READS
+    + DISALLOW_BUILTIN
 )
 STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+    + DISALLOW_CONSOLIDATION_PROPOSALS
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_ESCALATION_WRITES
@@ -336,7 +368,7 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
         },
         'severity': {
             'type': 'string',
-            'enum': ['minor', 'moderate', 'serious'],
+            'enum': list(FINDING_SEVERITY_VALUES),
             'description': 'Severity level of the finding',
         },
         'actionable': {
@@ -473,9 +505,13 @@ STAGE3_REPORT_SCHEMA: dict[str, Any] = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class StageResult:
-    """Result from a single CLI stage invocation."""
+    """Result from a single CLI stage invocation.
+
+    ``outcome`` is ``declared_outcome`` when one is given, else derived from
+    ``success``; only a successful agent is ever ``completed``.
+    """
 
     report: dict = field(default_factory=dict)
     llm_calls: int = 0
@@ -485,6 +521,28 @@ class StageResult:
     model: str = ''
     success: bool = False
     error: str = ''
+    declared_outcome: InitVar[StageAgentOutcome | None] = None
+    outcome: StageAgentOutcome = field(init=False)
+
+    def __post_init__(self, declared_outcome: StageAgentOutcome | None) -> None:
+        derived = StageAgentOutcome.completed if self.success else StageAgentOutcome.failed
+        outcome = derived if declared_outcome is None else declared_outcome
+        if (outcome is StageAgentOutcome.completed) != self.success:
+            raise ValueError(
+                f'StageResult outcome={outcome.value!r} contradicts '
+                f'success={self.success}: only a successful agent is completed.'
+            )
+        object.__setattr__(self, 'outcome', outcome)
+
+
+def _classify_agent_outcome(agent_result: AgentResult) -> StageAgentOutcome:
+    if agent_result.success:
+        return StageAgentOutcome.completed
+    if is_zero_output_timeout(agent_result):
+        return StageAgentOutcome.zero_output_timeout
+    if agent_result.timed_out:
+        return StageAgentOutcome.timed_out
+    return StageAgentOutcome.failed
 
 
 def recon_config_base_dir(data_dir: Path) -> Path:
@@ -736,6 +794,7 @@ async def run_stage_via_cli(
                 error=str(exc),
                 duration_ms=duration_ms,
                 model=effective_model,
+                declared_outcome=StageAgentOutcome.not_launched,
             )
 
     try:
@@ -753,6 +812,7 @@ async def run_stage_via_cli(
             output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
+            startup_grace_secs=config.stage_startup_grace_secs,
             cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
@@ -772,6 +832,7 @@ async def run_stage_via_cli(
             error=str(e),
             duration_ms=duration_ms,
             model=effective_model,
+            declared_outcome=StageAgentOutcome.failed,
         )
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -788,7 +849,19 @@ async def run_stage_via_cli(
         model=effective_model,
         success=agent_result.success,
         error='' if agent_result.success else (agent_result.output or 'Agent failed'),
+        declared_outcome=_classify_agent_outcome(agent_result),
     )
+
+
+# The stats flag on a report whose agent reply was prose rather than a JSON report.
+RAW_TEXT_FALLBACK_STAT = 'raw_text_fallback'
+_FALLBACK_SUMMARY_CHARS = 2000
+
+
+def _raw_text_fallback_report(output: str) -> dict:
+    clip = elide_text(output, _FALLBACK_SUMMARY_CHARS, field='summary')
+    stats = {RAW_TEXT_FALLBACK_STAT: True, **truncation_fields(clip.fact)}
+    return {'summary': clip.text, 'flagged_items': [], 'stats': stats}
 
 
 def _normalize_report(report: dict) -> dict:
@@ -848,8 +921,7 @@ def _extract_report(result: AgentResult) -> dict:
         except json.JSONDecodeError:
             pass
 
-        # Fallback: wrap raw text as summary
-        return {'summary': result.output[:2000]}
+        return _raw_text_fallback_report(result.output)
 
     # PRD γ: return {} instead of a placeholder so BaseStage.run's recon_report
     # fallback path (empty assembled dict) triggers cleanly rather than masking

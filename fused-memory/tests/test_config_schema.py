@@ -1,5 +1,6 @@
 """Tests for config schema Literal type validation."""
 
+import json
 import os
 import re
 import sys
@@ -3788,27 +3789,37 @@ class TestWriteTriageConfig:
         assert factory().enabled is False  # type: ignore[call-arg]
         assert factory().candidate_k > 5  # type: ignore[call-arg]
 
-    def test_the_shipped_config_yaml_ships_the_flag_off_and_k_wide(self, monkeypatch):
+    def test_the_shipped_config_yaml_ships_the_flag_on_with_the_selected_judge(self, monkeypatch):
         """The pin must hold on the REAL deployment file, not just the model.
 
-        The schema default is what a deployment gets only if config.yaml stays
-        silent. config.yaml carries an explicit `write_triage:` block, so the
-        shipped values there are what the running server actually reads — and
-        they are what an operator (and the next calibration run) can edit.
-        Asserting the class default alone would pass while the deployed file
-        said `enabled: true`.
+        config.yaml carries an explicit `write_triage:` block, so the shipped
+        values there are what the running server reads. Task 3169 flipped the
+        flag on (Leo, 2026-10-11) with the judge that gate Γ3 selected; the
+        judge keys are compared against the committed selection because a null
+        judge_model inherits llm.model, which the comparative scores worse than
+        leaving triage off.
         """
-        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        config_dir = Path(__file__).resolve().parent.parent
+        yaml_path = config_dir / 'config' / 'config.yaml'
         assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
-        cfg = FusedMemoryConfig()
+        triage = FusedMemoryConfig().write_triage
+        selection = json.loads(
+            (config_dir / 'calibration' / 'write_triage_best_config.json').read_text()
+        )['selection']
 
-        assert cfg.write_triage.enabled is False, (
-            'fused-memory/config/config.yaml must ship write_triage.enabled: '
-            'false — the D10 staged-rollout flag is flipped by task 3169, not '
-            'by the merge that lands the skeleton'
-        )
-        assert cfg.write_triage.candidate_k > 5, (
+        assert triage.enabled is True
+        assert {
+            'judge_provider': triage.judge_provider,
+            'judge_model': triage.judge_model,
+            'judge_reasoning_effort': triage.judge_reasoning_effort,
+            'judge_candidate_count': triage.judge_candidate_count,
+            'field_chars': triage.judge_field_chars,
+        } == {key: selection[key] for key in (
+            'judge_provider', 'judge_model', 'judge_reasoning_effort',
+            'judge_candidate_count', 'field_chars',
+        )}
+        assert triage.candidate_k > 5, (
             'fused-memory/config/config.yaml must ship a candidate_k wider than '
             "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
         )
@@ -4194,6 +4205,56 @@ class TestWriteJournalConfig:
         # Unmentioned leaves keep their defaults rather than being clobbered.
         assert section.write_retention_days == 730.0
         assert section.prune_batch_size == 5000
+
+
+class TestWriteJournalGrowthAlarmConfig:
+    """Task 3311: the write_journal growth alarm's ceilings are operator-tunable.
+
+    The measured basis of the defaults lives in the
+    ``write_journal_growth_alarm`` block of ``fused-memory/config/config.yaml``.
+    """
+
+    def test_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+        assert isinstance(section, WriteJournalGrowthAlarmConfig), (
+            'RED: write_journal_growth_alarm must be a BARE (non-Optional) '
+            'submodel — reload.py descends only into required submodels'
+        )
+        assert section.max_file_bytes == 19_327_352_832
+        assert section.max_rows_inserted_per_day == 1_500_000
+        assert section.check_interval_seconds == 3600.0
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal_growth_alarm': {
+                'max_file_bytes': 1024,
+                'check_interval_seconds': 60.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+
+        assert section.max_file_bytes == 1024, 'RED: the section must be tunable'
+        assert section.check_interval_seconds == 60.0
+        assert section.max_rows_inserted_per_day == 1_500_000
+
+    @pytest.mark.parametrize(
+        'field',
+        ['max_file_bytes', 'max_rows_inserted_per_day', 'check_interval_seconds'],
+    )
+    def test_non_positive_values_are_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalGrowthAlarmConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a ceiling of 0 fires permanently; the rejection must name the field'
+        )
 
 
 class TestDedupOutageDetectorConfig:

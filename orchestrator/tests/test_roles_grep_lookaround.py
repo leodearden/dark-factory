@@ -42,10 +42,10 @@ from __future__ import annotations
 import pytest
 from _role_splice_contract import (
     BASH_CAPABLE_UNPINNED_ROLES,
-    MARKDOWN_HEADING,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    assert_opens_own_section,
     bash_capable_unpinned,
     bash_capable_unpinned_contract,
 )
@@ -137,10 +137,10 @@ def test_public_splice_units_open_their_own_section(name):
     compares the unit's offset against the prompt's first `##` heading: a unit
     that does not begin with a heading can never satisfy that comparison.
     """
-    assert _PUBLIC_SPLICE_UNITS[name].startswith(MARKDOWN_HEADING), (
-        f'{name} does not start with MARKDOWN_HEADING, so it reads as an '
-        'unheaded continuation of whatever block precedes it rather than as '
-        'its own section. Give it a leading blank line and a `## ` heading.'
+    assert_opens_own_section(
+        name,
+        _PUBLIC_SPLICE_UNITS[name],
+        remedy='Give it a leading blank line and a `## ` heading.',
     )
 
 

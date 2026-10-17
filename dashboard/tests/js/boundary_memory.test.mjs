@@ -1,9 +1,10 @@
 // Boundary family 4b, memory operations: sketch #11.
 //
-// The REAL /memory-graphs route served this body over a write journal holding
-// reads, writes and one kind that is neither (test_boundary_js.py builds it).
-// It lands through data.js's real refreshOne and is read the way the Overview
-// caption and the Memory tab's caption and donut read it.
+// The REAL /memory-graphs route served these bodies, one over a write journal
+// holding reads, writes and one kind that is neither, one with no journal on
+// disk at all (test_boundary_js.py builds both). Each lands through data.js's
+// real refreshOne and is read the way the Overview caption and the Memory tab's
+// caption and donut read it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -30,4 +31,21 @@ test('sketch #11: reads, writes and other sum to the donut total, and every surf
   assert.equal(opsTotalText(D), String(total), 'the donut centre');
   const slices = D.MEMORY_OPS.by_operation.reduce((sum, slice) => sum + slice.value, 0);
   assert.equal(slices, total, 'the donut slices are the same rows the centre counts');
+});
+
+test('sketch #11: a missing journal reads — on every memory-ops surface, with the server\'s reason', async () => {
+  const client = loadClient();
+  const body = payload('memory_ops_missing');
+  assert.equal(await applyServed(client, MEMORY_GRAPHS, body, { receivedAt: RECEIVED_AT }), 'applied');
+  const D = client.window.DF_DATA;
+  const { opsTotals, opsCaption, opsTotalText, newestHourOps } = client.window.DF_MEMORY_READINGS;
+  const served = body.MEMORY_OPS.totals;
+
+  for (const reading of [opsTotals(D), newestHourOps(D)]) {
+    assert.equal(reading.state, 'unknown');
+    assert.equal(reading.reason, served.reason, 'the hole carries the server\'s reason verbatim');
+  }
+  assert.equal(opsTotalText(D), '—', 'the donut centre');
+  const caption = client.window.DF_DATUM.datumView(opsTotals(D), { now: RECEIVED_AT, format: opsCaption }).text;
+  assert.equal(caption, '—', 'the caption never runs over a hole');
 });

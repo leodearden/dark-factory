@@ -54,7 +54,7 @@ async def test_an_owner_that_leaves_pending_loses_its_parks_and_its_skip_count(t
     )
     assert await w.scheduler.acquire_next() is None
     assert _stack_owners(w.scheduler, 'm.py') == ['L', 'X'], 'premise: X parks m above L'
-    assert 'X' in w.scheduler.get_state_snapshot()['skip_counts'], 'premise: X was skipped'
+    assert 'X' in w.scheduler.get_state_snapshot().skip_counts, 'premise: X was skipped'
     w.store.events.clear()
 
     w.scheduler.get_tasks = AsyncMock(
@@ -69,7 +69,7 @@ async def test_an_owner_that_leaves_pending_loses_its_parks_and_its_skip_count(t
         {'restored_owner': 'L', 'modules': ['m.py'], 'source': 'fairness'},
     ]
     assert 'X' not in w.scheduler.lock_table.snapshot_parks()
-    assert 'X' not in w.scheduler.get_state_snapshot()['skip_counts']
+    assert 'X' not in w.scheduler.get_state_snapshot().skip_counts
 
 
 # ---------------------------------------------------------------------------

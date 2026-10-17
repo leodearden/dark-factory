@@ -25,8 +25,9 @@ THE STAGE-2 SECTION CENSUS — why every other conditional section stays out:
   branch is report-only.
 * Stale Flags Requiring Escalation — presence-conditional only; nothing is
   inferred when it is missing.
-* Done-Task Completion-Memory Audit, Proactive Task Sample, Tasks Needing
-  Memory Hint Attention — omitted on remediation passes BY DESIGN.
+* Done-Task Completion-Memory Audit, Blocked Gate-Task Review Audit, Proactive
+  Task Sample, Tasks Needing Memory Hint Attention — omitted on remediation
+  passes BY DESIGN.
 * Done-task Provenance — every done task carries an explicit label, so absence
   is never read as evidence.
 * Unconditional literal headers — always present; nothing to guard.

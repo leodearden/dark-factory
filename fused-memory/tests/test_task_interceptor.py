@@ -2527,18 +2527,62 @@ async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buff
     taskmaster.add_task.assert_called_once()
 
 
+_REEMBED_STORED_FILES = {'files': ['src/parser.py', 'tests/test_parser.py']}
+
+
 @pytest.mark.asyncio
-async def test_update_task_reembeds_on_title_change(
+@pytest.mark.parametrize(
+    'stored_metadata',
+    [_REEMBED_STORED_FILES, json.dumps(_REEMBED_STORED_FILES)],
+    ids=['dict', 'json-string'],
+)
+async def test_update_task_reembed_preserves_metadata_files(
     curator_interceptor,
     taskmaster,
+    stored_metadata,
 ):
-    """update_task triggers fire-and-forget reembed when title/details change."""
+    """The update re-embed carries the stored task's metadata.files and priority."""
     curator_mock = _mock_curator(CuratorDecision(action='create'))
     curator_interceptor._curator = curator_mock
     taskmaster.get_task.return_value = {
         'id': '7',
         'status': 'pending',
         'title': 'Updated title',
+        'description': 'desc',
+        'details': 'details',
+        'priority': 'high',
+        'metadata': stored_metadata,
+    }
+
+    await curator_interceptor.update_task(
+        '7',
+        '/project',
+        prompt='rename title to updated',
+    )
+    await asyncio.sleep(0)  # let fire-and-forget run
+    await curator_interceptor.drain()
+
+    curator_mock.reembed_task.assert_called_once()
+    task_id, candidate, _project_id = curator_mock.reembed_task.call_args.args
+    assert task_id == '7'
+    assert candidate.files_to_modify == ['src/parser.py', 'tests/test_parser.py']
+    assert candidate.title == 'Updated title'
+    assert candidate.description == 'desc'
+    assert candidate.priority == 'high'
+
+
+@pytest.mark.asyncio
+async def test_update_task_reembed_skips_blank_stored_title(
+    curator_interceptor,
+    taskmaster,
+):
+    """A stored task whose title is only whitespace is not re-embedded."""
+    curator_mock = _mock_curator(CuratorDecision(action='create'))
+    curator_interceptor._curator = curator_mock
+    taskmaster.get_task.return_value = {
+        'id': '7',
+        'status': 'pending',
+        'title': '   ',
         'description': 'desc',
         'details': 'details',
     }
@@ -2551,7 +2595,7 @@ async def test_update_task_reembeds_on_title_change(
     await asyncio.sleep(0)  # let fire-and-forget run
     await curator_interceptor.drain()
 
-    curator_mock.reembed_task.assert_called_once()
+    curator_mock.reembed_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -12153,6 +12197,58 @@ async def test_planning_mode_candidate_key_collision_returns_combined(
     }
 
 
+_SUBMIT_TASK_RESPONSES = json.loads(
+    (
+        Path(__file__).parents[2] / 'shared' / 'tests' / 'fixtures' / 'submit_task_responses.json'
+    ).read_text()
+)['cases']
+_LIVE_SUBMIT_TASK_CASES = [
+    name for name, case in _SUBMIT_TASK_RESPONSES.items() if case.get('live')
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case_name', _LIVE_SUBMIT_TASK_CASES)
+async def test_submit_task_returns_the_fixture_payload(
+    case_name,
+    interceptor_facade,
+    taskmaster,
+):
+    """The real ``submit_task`` returns each live payload pinned in
+    ``shared/tests/fixtures/submit_task_responses.json`` — the same file the
+    orchestrator's ``Scheduler.submit_task`` tests parse.  Every value, error text
+    included, is compared exactly; only generated ids are compared by shape.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    expected = _SUBMIT_TASK_RESPONSES[case_name]['payload']
+    submit: dict[str, Any] = {'title': 'T'}
+    if case_name == 'planning_create':
+        submit['planning_mode'] = True
+    elif case_name == 'planning_collision_terminal':
+        submit['planning_mode'] = True
+        taskmaster.add_task.side_effect = DuplicateCandidateKeyError(
+            existing_id=int(expected['task_id']), existing_status=expected['status'],
+        )
+    elif case_name == 'tool_error_structured':
+        await interceptor_facade.close()
+    elif case_name == 'tool_error_add_task_raised':
+        submit['planning_mode'] = True
+        taskmaster.add_task.side_effect = RuntimeError(expected['error'])
+
+    actual = await interceptor_facade.submit_task('/project', **submit)
+
+    assert actual.keys() == expected.keys()
+    generated = {'ticket': lambda v: v.startswith('tkt_')}
+    if case_name == 'planning_create':
+        generated['task_id'] = lambda v: isinstance(v, str) and bool(v)
+    for key, value in actual.items():
+        if key in generated:
+            assert generated[key](value), (key, value)
+        else:
+            assert value == expected[key], key
+
+
 # ─────────────────────────────────────────────────────────────────────
 # index_committed_tasks — write-time curator indexing for commit_planning
 # (task 2562 item 1: planning_mode tasks bypass the ticket/curator record
@@ -12499,11 +12595,6 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
     async def fake_set_status(
         task_id, status, project_root, tag=None, *, pending_since_now=None,
     ):
-        # `pending_since_now` is the one batch clock the CSV branch computes
-        # once and threads to every id (task 3816); this fake mirrors the real
-        # backend signature rather than swallowing it with **kwargs, so a
-        # future mis-spelled pass-through still fails here. Its VALUE is
-        # asserted against a real backend in test_pending_since_anchor.py.
         statuses[task_id] = status
         return {'success': True, 'task_id': task_id, 'status': status}
 

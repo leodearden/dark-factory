@@ -69,100 +69,12 @@ def tab_overview_jsx_code(tab_overview_jsx_body):
     file's `alarmed_open` / `clear` assertions once passed while matching only
     explanatory prose.
 
-    It matters here because the phantom branch below is necessarily accompanied
-    by a comment explaining what a phantom IS, and that comment names both
-    `is_phantom` and `unreviewed` — so the branch-scoping regex in
-    `_phantom_branch` would otherwise anchor on the comment's first mention of
-    `is_phantom` rather than on the `if (v?.is_phantom)` render site.
-
     The stripping itself is delegated to `_dashboard_helpers.strip_js_comments`,
     which is quote-aware (it will not eat a `//` inside a string literal) and
     whose contract is pinned by `TestStripJsComments` in
     test_jsx_source_helpers.py.
     """
     return strip_js_comments(tab_overview_jsx_body)
-
-
-class TestReconciliationHealthRowPhantom:
-    """The Reconciliation System-health row must not paint a PHANTOM verdict red.
-
-    A phantom is the placeholder the reconciliation judge fabricates when it
-    could not parse its own model output — the run went UNREVIEWED.  It is
-    stored with `severity='serious'`, so the row's `ok: sev !== 'serious'`
-    renders a red `bad` dot reading `verdict: serious · halt`: a serious
-    finding no judge ever made.  `get_latest_verdict` now ships `is_phantom`
-    (task 3287 step-8); this is the renderer that has to consume it, or the
-    user-visible defect stays in place and the payload field is dead weight.
-
-    Measured caveat, recorded honestly: the newest verdict on the live DB
-    today is an ordinary `ok`, so this is a LATENT mis-render.  It was visible
-    across the 2026-07-20..29 stretch and returns the next time a phantom is
-    the newest row.
-    """
-
-    @staticmethod
-    def _phantom_branch(code: str) -> str:
-        """The `is_phantom` branch body, isolated from the rest of the file.
-
-        Every assertion below is scoped to this slice rather than grepping the
-        whole 400-line file.  A file-wide `'unreviewed' in code` /
-        `'is_phantom' in code` grep keeps passing if the branch is edited back
-        to ``sub: `verdict: ${sev}` `` as long as the word survives ANYWHERE
-        else — in a different health row, an unrelated label, or (before the
-        comment-stripping fixture) a comment.  Those greps pinned wording, not
-        behaviour, so they are gone; this is the one scope with teeth.
-
-        The scope terminator is `};` — the end of the branch's `return {...};`
-        — NOT a bare `}`.  A bare `}` stops at the first `${...}` template
-        interpolation in the `sub` string, truncating the match before the
-        `ok:` / `warn:` keys these assertions exist to inspect, which would
-        leave them scanning text that can never contain them.
-        """
-        match = re.search(r'is_phantom[\s\S]{0,400}?\};', code)
-        assert match, 'no is_phantom branch found in tab_overview.jsx render code'
-        return match.group(0)
-
-    def test_ordinary_severity_path_survives(self, tab_overview_jsx_code):
-        """(a) Positive anchor: the non-phantom branch is unchanged.
-
-        A genuine `severity=serious` verdict must still paint red — suppressing
-        that would be strictly worse than the over-report being fixed.
-        """
-        assert "sev !== 'serious'" in tab_overview_jsx_code
-
-    def test_phantom_branch_does_not_paint_red(self, tab_overview_jsx_code):
-        """(b) Negative guard: the phantom branch must not set `ok: false`.
-
-        A phantom is `warn` (yellow): the run genuinely went unreviewed, which
-        is degraded, but no judge found anything serious.
-        """
-        branch = self._phantom_branch(tab_overview_jsx_code)
-        assert not re.search(r'\bok:\s*false\b', branch), (
-            'the is_phantom branch must not render a red `bad` row — a phantom '
-            f'is a fabricated placeholder, not a serious finding; got: {branch!r}'
-        )
-        assert re.search(r'\bwarn:\s*true\b', branch), (
-            'the is_phantom branch must render `warn: true` (yellow) — the run '
-            f'genuinely went unreviewed, which is degraded; got: {branch!r}'
-        )
-
-    def test_phantom_branch_labels_the_run_unreviewed(self, tab_overview_jsx_code):
-        """(c) The operator-facing text in THIS branch must say `unreviewed`.
-
-        `verdict: serious` is the exact lie being fixed, so the substitute
-        label has to name what actually happened — and the `verdict: ${sev}`
-        template the ordinary path uses must NOT survive inside the phantom
-        branch, which is what an edit reverting the fix would leave behind.
-        """
-        branch = self._phantom_branch(tab_overview_jsx_code)
-        assert 'unreviewed' in branch, (
-            'the is_phantom branch must label the row unreviewed rather than '
-            f'reporting a verdict no judge made; got: {branch!r}'
-        )
-        assert 'verdict: ${sev}' not in branch, (
-            'the is_phantom branch must not fall back to the ordinary '
-            f'`verdict: ${{sev}}` label; got: {branch!r}'
-        )
 
 
 @pytest.fixture(scope='module')
@@ -392,3 +304,121 @@ class TestOverviewReadsTheMemoryReadings:
             r'<DatumReading\s+datum=\{\s*opsTotals\(\s*D\s*\)\s*\}\s+format=\{\s*opsCaption\s*\}',
             panel,
         ), f'the Activity timeline meta does not render opsCaption over opsTotals(D):\n{panel}'
+
+
+
+class TestOverviewReadsTheSpendReading:
+    """The Spend (today) tile reads today's spend through spend_readings.js, as the topbar does.
+
+    One reader for both surfaces, so they cannot disagree; the hole before
+    /costs delivers is executed in dashboard/tests/js/spend_readings.test.mjs.
+    """
+
+    def test_destructures_the_spend_reader_without_fallback(self, tab_overview_jsx_code):
+        destructure = re.search(
+            r'const\s*\{([^}]*)\}\s*=\s*window\.DF_SPEND_READINGS\s*;', tab_overview_jsx_code,
+        )
+        assert destructure, 'tab_overview.jsx does not destructure window.DF_SPEND_READINGS at module scope.'
+        assert not re.search(r'window\.DF_SPEND_READINGS\s*(\|\||&&|\?\?)', tab_overview_jsx_code)
+        bound = set(re.findall(r'\w+', destructure.group(1)))
+        assert {'todaySpend', 'spendText'} <= bound
+
+    def test_the_spend_tile_reads_todays_spend(self, overview_code):
+        tile = _stat_tile(overview_code, 'Spend (today)')
+        assert re.search(r'datum=\{\s*todaySpend\(\s*D\s*\)\s*\}\s+format=\{\s*spendText\s*\}', tile), (
+            f'the Spend (today) tile is not todaySpend(D) formatted by spendText:\n{tile}'
+        )
+
+def _health_rows_const(code):
+    """The one const array holding the System health rows: (name, array text)."""
+    bound = []
+    for match in re.finditer(r'\bconst\s+(\w+)\s*=\s*\[', code):
+        array = walk_balanced(code, match.end() - 1, '[', ']')
+        if re.search(r"\bl:\s*'Graphiti'", array):
+            bound.append((match.group(1), array))
+    assert len(bound) == 1, f'expected the health rows bound to ONE const array, found {len(bound)}'
+    return bound[0]
+
+
+def _health_rows_map(panel, rows):
+    """The ``<rows>.map(<param> => ...)`` call in the System health panel: (param, call text)."""
+    match = re.search(rf'\b{rows}\.map\(\s*(\w+)\s*=>', panel)
+    assert match, f'the System health panel does not draw its rows with {rows}.map(...)'
+    return match.group(1), walk_balanced(panel, panel.index('(', match.start()), '(', ')')
+
+
+class TestSystemHealthIsDerived:
+    """Every System health row and the header are derived, never hardcoded (task 6309).
+
+    Before: the header read a literal 'all ok'; the Graphiti and Mem0 rows were
+    `ok: true` over counts get_status never serves; the Taskmaster row was the
+    literal 'mcp v0.18 · responsive'; the fused-memory row was green before
+    /memory had ever arrived; the Reconciliation row was green with no verdict
+    served. The decisions now live in system_health.js and are executed in
+    dashboard/tests/js/system_health.test.mjs, phantom verdicts included; these
+    pins cover only the wiring.
+    """
+
+    _HELPERS = {
+        'graphitiHealth', 'mem0Health', 'taskStoreHealth', 'fusedMemoryHealth', 'reconHealth', 'walHealth',
+        'healthTone', 'healthSummary',
+    }
+
+    def test_destructures_the_health_decisions_without_fallback(self, tab_overview_jsx_code):
+        destructure = re.search(
+            r'const\s*\{([^}]*)\}\s*=\s*window\.DF_SYSTEM_HEALTH\s*;', tab_overview_jsx_code,
+        )
+        assert destructure, 'tab_overview.jsx does not destructure window.DF_SYSTEM_HEALTH at module scope.'
+        assert not re.search(r'window\.DF_SYSTEM_HEALTH\s*(\|\||&&|\?\?)', tab_overview_jsx_code)
+        bound = set(re.findall(r'\w+', destructure.group(1)))
+        unbound = self._HELPERS - bound
+        assert not unbound, f'tab_overview.jsx reads {sorted(unbound)} without binding them'
+
+    def test_the_header_summarises_exactly_the_rows_drawn(self, overview_code):
+        rows, _ = _health_rows_const(overview_code)
+        panel = _panel(overview_code, 'System health')
+        assert re.search(rf'<span className="meta">\s*\{{\s*healthSummary\(\s*{rows}\s*\)\s*\}}\s*</span>', panel), (
+            f'the System health header is not healthSummary({rows}):\n{panel}'
+        )
+        _health_rows_map(panel, rows)
+
+    def test_no_hardcoded_verdict_remains(self, overview_code):
+        assert not re.search(r'\ball ok\b', overview_code), "OverviewTab still hardcodes 'all ok'."
+        assert 'v0.18' not in overview_code, 'OverviewTab still hardcodes the Taskmaster version.'
+
+    @pytest.mark.parametrize(
+        'label, helper, retired',
+        [
+            ('Graphiti', 'graphitiHealth', 'node_count'),
+            ('Mem0', 'mem0Health', 'memory_count'),
+            ('Taskmaster', 'taskStoreHealth', 'mcp v'),
+            ('fused-memory', 'fusedMemoryHealth', None),
+            ('Reconciliation', 'reconHealth', 'RECON_STATE'),
+            ('SQLite WAL', 'walHealth', 'MEMORY_STATUS'),
+        ],
+    )
+    def test_the_row_spreads_its_derived_health(self, overview_code, label, helper, retired):
+        _, rows_array = _health_rows_const(overview_code)
+        row = _health_row(rows_array, label)
+        assert re.search(rf'\.\.\.\s*{helper}\(\s*D\s*\)', row), f'the {label} row does not spread {helper}(D):\n{row}'
+        assert not re.search(r'\bok\s*:', row), f'the {label} row still sets its own `ok:`:\n{row}'
+        if retired:
+            assert retired not in row, f'the {label} row still reads {retired!r}:\n{row}'
+
+    def test_the_dot_and_badge_read_one_tone(self, overview_code):
+        rows, _ = _health_rows_const(overview_code)
+        panel = _panel(overview_code, 'System health')
+        param, call = _health_rows_map(panel, rows)
+        tone = rf'healthTone\(\s*{param}\s*\)'
+        assert re.search(rf'className=\{{`dot \$\{{{tone}\}}`\}}', call), f'the row dot is not healthTone({param}):\n{call}'
+        assert re.search(rf'className=\{{`badge \$\{{{tone}\}}`\}}>\{{{tone}\}}</span>', call), (
+            f'the row badge class and text are not healthTone({param}):\n{call}'
+        )
+        assert not re.search(r'\.ok\s*\?', panel), f'the System health panel still inlines a tone ternary:\n{panel}'
+
+    def test_the_row_renders_its_title(self, overview_code):
+        rows, _ = _health_rows_const(overview_code)
+        param, call = _health_rows_map(_panel(overview_code, 'System health'), rows)
+        assert re.search(rf'\btitle=\{{\s*{param}\.title\b', call), (
+            f'the health row never renders {param}.title, so a hole reason never reaches the operator:\n{call}'
+        )

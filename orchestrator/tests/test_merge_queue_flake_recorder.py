@@ -26,6 +26,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.task_submit import SubmitOutcome
 from test_flake_recorder import _FakeLedgerTaskClient
 from test_merge_boundary_effective_module_configs import (
     _ALPHA_TEST,
@@ -563,7 +564,7 @@ class _ExplodingTaskClient:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def submit_task(self, arguments: dict) -> str:
+    async def submit_task(self, arguments: dict) -> SubmitOutcome:
         self.calls.append('submit_task')
         raise RuntimeError('mcp dispatch failed')
 

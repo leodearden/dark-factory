@@ -182,6 +182,8 @@ CREATE TABLE tasks (
     priority      TEXT,
     metadata      TEXT,
     updated_at    TEXT NOT NULL,
+    claimant_run_id TEXT,
+    heartbeat_at    TEXT,
     PRIMARY KEY (tag, id)
 );
 """
@@ -194,7 +196,8 @@ def make_tasks_db(tmp_path):
     Each row is a dict of column -> value. ``id`` is required; ``tag``,
     ``title``, ``status``, ``priority`` and ``updated_at`` (the NOT NULL
     columns, plus priority) fall back to placeholders, and the nullable
-    columns stay NULL when omitted.
+    columns — ``claimant_run_id`` and ``heartbeat_at`` included — stay NULL
+    when omitted.
 
     ``metadata`` is passed through VERBATIM when it is a str or None — so a
     test can insert deliberately malformed JSON to exercise a decoder's error
@@ -214,8 +217,9 @@ def make_tasks_db(tmp_path):
                     metadata = json.dumps(metadata)
                 conn.execute(
                     'INSERT INTO tasks (tag, id, title, description, details, '
-                    'test_strategy, status, priority, metadata, updated_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'test_strategy, status, priority, metadata, updated_at, '
+                    'claimant_run_id, heartbeat_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         row.get('tag', 'master'),
                         row['id'],
@@ -227,6 +231,8 @@ def make_tasks_db(tmp_path):
                         row.get('priority', 'medium'),
                         metadata,
                         row.get('updated_at', '2026-07-30T00:00:00+00:00'),
+                        row.get('claimant_run_id'),
+                        row.get('heartbeat_at'),
                     ),
                 )
             conn.commit()

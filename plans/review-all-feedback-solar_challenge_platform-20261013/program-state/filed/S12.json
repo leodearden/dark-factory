@@ -1,0 +1,237 @@
+{
+ "stream": "S12",
+ "prd_path": "docs/prds/review-all-validation-topology-as-a-value.md",
+ "sidecar_path": "docs/prds/review-all-validation-topology-as-a-value.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha",
+   "task_id": "1238",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-eed29a123924"
+   ],
+   "depends_on": [],
+   "note": "NO_SIGNAL verdict record; sandbox-weekly HELD (Q2)"
+  },
+  {
+   "label": "beta",
+   "task_id": "1248",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-eed29a123924",
+    "fk-02724ab0788a"
+   ],
+   "depends_on": [
+    "1238",
+    "1016",
+    "1066",
+    "308",
+    "437"
+   ],
+   "note": "flips INV-2 to enforced"
+  },
+  {
+   "label": "gamma",
+   "task_id": "1242",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-ad4422108390",
+    "fk-8e67094cbf75"
+   ],
+   "depends_on": [
+    "308",
+    "1016",
+    "437",
+    "1090",
+    "1072",
+    "1180",
+    "1188"
+   ]
+  },
+  {
+   "label": "delta",
+   "task_id": "1250",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-3fbdfe49527a",
+    "fk-ad4422108390",
+    "fk-bd4d1dff3a9e"
+   ],
+   "depends_on": [
+    "1242",
+    "1137",
+    "1151",
+    "1093"
+   ]
+  },
+  {
+   "label": "epsilon1",
+   "task_id": "1253",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-51ba9c380dda",
+    "fk-bd4d1dff3a9e"
+   ],
+   "depends_on": [
+    "1250",
+    "1248"
+   ]
+  },
+  {
+   "label": "epsilon2",
+   "task_id": "1256",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-e372d19d4b28",
+    "fk-26422a44d694"
+   ],
+   "depends_on": [
+    "1253"
+   ]
+  },
+  {
+   "label": "zeta",
+   "task_id": "1259",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-3b0a6ec1b9ba",
+    "fk-df1e3d3911b9"
+   ],
+   "depends_on": [
+    "1253",
+    "1248",
+    "1174"
+   ],
+   "note": "core drills (Q4); subsumes 514/708"
+  },
+  {
+   "label": "eta",
+   "task_id": "1261",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-51ba9c380dda",
+    "fk-bff07c10dcf4",
+    "fk-bd4d1dff3a9e"
+   ],
+   "depends_on": [
+    "1259",
+    "1186",
+    "1188"
+   ]
+  },
+  {
+   "label": "theta",
+   "task_id": "1246",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-c9f49b0690d4"
+   ],
+   "depends_on": [
+    "1170",
+    "308"
+   ]
+  },
+  {
+   "label": "iota",
+   "task_id": "809",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-2b47ea2764a9",
+    "fk-2614d330cf39",
+    "fk-3fbdfe49527a"
+   ],
+   "depends_on": [
+    "437",
+    "443",
+    "308"
+   ],
+   "note": "amended in place; priority low->medium"
+  },
+  {
+   "label": "kappa",
+   "task_id": "1263",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-a0e05b54bec6",
+    "fk-0f99e5a2f37a"
+   ],
+   "depends_on": [
+    "1238",
+    "1125",
+    "1132",
+    "308"
+   ]
+  },
+  {
+   "label": "lambda",
+   "task_id": "1266",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-1ea710a1b8ad"
+   ],
+   "depends_on": [
+    "1263",
+    "1248"
+   ],
+   "note": "hold per capstone (Q3)"
+  },
+  {
+   "label": "mu",
+   "task_id": "1247",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-d3edd21f9a53"
+   ],
+   "depends_on": [
+    "1079"
+   ]
+  },
+  {
+   "label": "nu",
+   "task_id": "1274",
+   "priority": "high",
+   "x_finding_key": [],
+   "depends_on": [
+    "1238",
+    "1248",
+    "1242",
+    "1250",
+    "1253",
+    "1256",
+    "1259",
+    "1261",
+    "1246",
+    "809",
+    "1263",
+    "1266",
+    "1247"
+   ],
+   "note": "integration gate"
+  },
+  {
+   "label": "xi",
+   "task_id": "1275",
+   "priority": "medium",
+   "x_finding_key": [],
+   "depends_on": [
+    "1266"
+   ],
+   "note": "deterministic always_escalates operator act: install the dispatch-capstone-weekly timer"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1238",
+  "1248",
+  "1253",
+  "1259",
+  "1261",
+  "1274"
+ ],
+ "commit_planning_result": "all 15 pending; sidecar stamped",
+ "lead_rulings": [
+  "Lead 2026-10-15: 514 cancelled naming 1259 + 1248 + 1016; 708 cancelled naming 1259; fk-e507cf236576 stamped on 1016 and fk-8e67094cbf75 on 308; edges 471/472 -> 1259 and 984 -> 1263 with notes; notes on 411, 416, 213, 1072 (Q1), 1170 (Q5).",
+  "D1-derived edges onto the unmerged branches 308/437/1016 (1248, 1242, 1246, 809, 1263); 308, 437 and 1016 must be re-driven through the merge queue once its restart drain lifts.",
+  "Briefing (interactive on main): drills now fault the live platform; NO_SIGNAL semantics; cadence = LANES only."
+ ]
+}

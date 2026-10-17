@@ -68,16 +68,13 @@ anything — it renders text into a file setup-host.sh names, and setup-host.sh
 still owns the install. A checker that stays a checker keeps being believable
 when it fires, which is the only thing it has.
 
-WHY THIS DOES NOT IMPORT check_dashboard_unit_parity, even though that is where
-the Environment= reader used to live. tests/scripts/test_check_dashboard_unit_parity.py
-builds the section-8 tmp repo with ``write_checker(body=...)``, which REPLACES
-check_dashboard_unit_parity.py with an argparse-usage-error STUB — and with
-``with_checker=False`` omits it and its siblings altogether — precisely to test
-that the install still happens when the parity gate did not run. A renderer
-importing that module would ImportError under exactly those two tests, turning
-them red for a reason unrelated to what they assert. So the shared dependency
-was pushed DOWN into scripts/systemd_unit_parity.py (``environment_map``)
-rather than sideways. Do not "tidy" this into a cross-module import.
+IT DOES NOT IMPORT check_dashboard_unit_parity, or any checker. The section-8
+harness in tests/scripts/test_check_dashboard_unit_parity.py replaces that
+checker with a stub (``write_checker(body=...)``) or omits it
+(``with_checker=False``) to test that the install still happens when the gate
+did not run, and an import would ImportError there. What the renderer shares
+with the checkers (``environment_map``, ``ENV_POLICY``) lives in
+scripts/systemd_unit_parity.py instead.
 
 Stdlib-only, so it stays runnable under a plain ``python3`` with no environment
 set up — the same rule its ``check_*_unit_parity.py`` neighbours follow, and a
@@ -139,108 +136,24 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
     )
 
 
-# The Environment= variables that are HOST-LOCAL and must therefore SURVIVE a
-# re-render. This is the host-local SUBSET of
-# check_dashboard_unit_parity.DIVERGENCE_ALLOWLIST — NOT that allowlist itself,
-# and the difference is the whole design.
-#
-# That allowlist has two entries, on it for OPPOSITE reasons:
-#
-#   * DASHBOARD_KNOWN_PROJECT_ROOTS — the declared HOLE. The committed unit's
-#     own comment says "additional project roots are LOCAL settings, added to
-#     the installed unit, not committed here", and the checker's entry calls it
-#     "A HOLE IN THE GATE". Genuinely host-local; preserving it is the point.
-#   * DASHBOARD_PROJECT_ROOT — NOT host-local, despite sitting on the same list.
-#     Its value is RENDERED from __REPO_ROOT__ per host, and the checker still
-#     CHECKS it — intra-copy, against the SAME file's WorkingDirectory=
-#     (UnitSpec.env_matches_directive). Preserving a PREVIOUS host's value would
-#     pin the dashboard's data root at the OLD repo root while WorkingDirectory=
-#     moved to the new one, manufacturing precisely the intra-copy drift
-#     _compare_env_matches_directive exists to report — on a host that had just
-#     been correctly reinstalled.
-#
-# So: adding a name here that is NOT on DIVERGENCE_ALLOWLIST turns the parity
-# gate permanently red (the checker would value-compare a variable this
-# installer deliberately makes differ), and adding DASHBOARD_PROJECT_ROOT
-# specifically breaks the unit in the way just described. Neither failure is
-# hypothetical and neither is visible in this file alone.
-#
-# THE SUBSET RELATION AND THE EXCLUSION ARE HELD BY TESTS, NOT BY AN IMPORT:
-# tests/scripts/test_render_systemd_unit.py::
-# test_host_local_environment_is_a_subset_of_the_divergence_allowlist and
-# ::test_host_local_environment_excludes_project_root, plus a staleness guard
-# asserting every name here is really declared in the committed template.
-#
-# The concrete obstacle to importing the checker instead — do not "tidy" this
-# into a cross-module import: tests/scripts/test_check_dashboard_unit_parity.py's
-# section-8 harness builds a tmp repo where write_checker(body=...) REPLACES
-# check_dashboard_unit_parity.py with an argparse stub, and with_checker=False
-# omits it and its siblings entirely. An import here would ImportError under
-# test_section_8_missing_checker_does_not_read_as_not_yet_installed and
-# test_section_8_usage_error_does_not_read_as_not_yet_installed, turning both
-# red for a reason unrelated to what they assert. This is the same
-# held-by-a-test-rather-than-shared-code arrangement the checker's own UNITS
-# registry has with setup-host.sh's _orch_units array.
-HOST_LOCAL_ENVIRONMENT: tuple[str, ...] = ("DASHBOARD_KNOWN_PROJECT_ROOTS",)
-
-# The fused-memory unit's preserve set (task 4796). ONE NAME, and the exclusions
-# are the design rather than an oversight — "preserve the host's Environment=
-# values" is the wrong generalisation and would break the unit it is protecting.
-# scripts/fused-memory.service.template declares five other Environment= names,
-# every one of them deliberately absent from here:
-#
-#   * CONFIG_PATH, PROJECT_ROOT, TASKMASTER_DIR are RENDERED from __REPO_ROOT__.
-#     Preserving them across a re-render would pin the fused-memory server's
-#     config and project root at the OLD checkout while WorkingDirectory= moved
-#     to the new one — the identical hazard the DASHBOARD_PROJECT_ROOT paragraph
-#     above describes, and the reason that name is on the dashboard checker's
-#     DIVERGENCE_ALLOWLIST yet still not preserved.
-#   * MEM0_TELEMETRY=false is host-INVARIANT, and it is on
-#     check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES — which that
-#     checker exact-matches and --fix synthesizes. Preserving it would put a
-#     preserved name on the checker's exact-match list, the disjointness
-#     violation described in the WARNING below.
-#   * FUSED_MEMORY_PREDONE_HOOK_REIFY is the interesting near-miss: it carries a
-#     literal host path (/home/leo/.cargo/bin/reify-audit), which makes it LOOK
-#     host-local. But it is committed VERBATIM in the template with no sentinel,
-#     so a re-render reproduces it byte-identically and there is nothing to lose.
-#     Adding it would start pinning whatever a host happened to have — including
-#     a stale hook path — over the committed one: an unrequested behaviour
-#     change, not a safety improvement.
-#
-# WARNING — THE DISJOINTNESS INVARIANT, and the one edit that would invert it.
-# No name preserved here may ever appear as the variable of an exact
-# `Environment=<NAME>=...` entry in
-# check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES. That constant's own
-# comment invites the edit ("Extend this list to guard additional safety flags"),
-# and adding DASHBOARD_KNOWN_PROJECT_ROOTS there would make `find_drift` — which
-# tests exact WHOLE-LINE membership — report a correctly-preserved MULTI-root
-# line as missing, so `--fix` appends the single-root line after the last
-# [Service] line, where systemd's LAST-WINS silently beats the value this
-# renderer had just preserved. Invisibly, since the checker then exits 0.
-# Held by tests/scripts/test_check_fused_memory_unit_parity.py::
-# test_preserved_names_are_disjoint_from_required_service_directives, with the
-# hazard demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
-FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT: tuple[str, ...] = ("DASHBOARD_KNOWN_PROJECT_ROOTS",)
-
-
 @dataclasses.dataclass(frozen=True)
 class UnitRenderSpec:
     """Everything about rendering ONE unit that is not shared by both.
 
-    The preservation core (``render_template`` / ``preserved_values`` /
-    ``_environment_token`` / ``apply_preserved`` / ``render_unit``) is already
-    unit-neutral: it is parameterised by ``names``, and --template/--output are
-    CLI flags. Exactly two things were dashboard-specific, and they are the two
-    fields here. Adding a third unit is therefore a registry entry, not a fork.
+    The preservation mechanism (``render_template`` / ``preserved_values`` /
+    ``_environment_token`` / ``apply_preserved``) is unit-neutral: it is
+    parameterised by ``names``, which ``render_unit`` reads off a spec, and
+    --template/--output are CLI flags. What is unit-specific is the log tag and
+    the policy family whose host-local ENV_POLICY rows are the preserve set (why
+    each row is so: plans/review-all-s25-scripts-instruments-prd.md D5). Adding
+    a third unit is therefore a registry entry, not a fork.
 
-    FROZEN: the preserve set is POLICY, pinned by tests and reasoned about in the
-    comments above. A spec mutated per invocation would make "which names does
-    this host preserve?" depend on argument-parsing order.
+    FROZEN: a spec mutated per invocation would make "which names does this host
+    preserve?" depend on argument-parsing order.
     """
 
     log_tag: str
-    host_local_environment: tuple[str, ...]
+    family: systemd_unit_parity.UnitFamily
 
     # The committed template this unit is rendered FROM, REPO-RELATIVE. It is
     # what makes the registry self-describing rather than a bare tag/preserve-set
@@ -266,17 +179,14 @@ class UnitRenderSpec:
     # class of wrong-checkout bug the preserve set excludes PROJECT_ROOT to avoid.
     template: str
 
+    @property
+    def host_local_environment(self) -> tuple[str, ...]:
+        """The names this unit preserves: ENV_POLICY's host-local rows for its family."""
+        return systemd_unit_parity.ENV_POLICY.host_local_names(self.family)
+
 
 # The registry --unit selects from. Keys are the operator-facing unit NAMES as
 # setup-host.sh spells them on the command line.
-#
-# The "dashboard" entry is built FROM the module-level constants rather than
-# duplicating their values, so the registry is an ADDITION to this module's
-# public surface rather than a rename of it: task 4793's suite asserts on
-# LOG_TAG and HOST_LOCAL_ENVIRONMENT directly, and setup-host.sh section 8
-# passes no --unit at all. Identity is pinned by
-# tests/scripts/test_render_systemd_unit.py::
-# test_dashboard_spec_is_the_modules_existing_public_surface.
 #
 # THE TAGS MUST STAY DISTINCT. Both units are rendered by this same script in
 # the same bring-up run, and setup-host.sh routes an operator to a report BY TAG
@@ -285,29 +195,19 @@ class UnitRenderSpec:
 UNITS: "dict[str, UnitRenderSpec]" = {
     "dashboard": UnitRenderSpec(
         log_tag=LOG_TAG,
-        host_local_environment=HOST_LOCAL_ENVIRONMENT,
+        family=systemd_unit_parity.UnitFamily.DASHBOARD,
         template="scripts/dashboard.service.template",
     ),
-    # RECIPROCAL POINTER: this unit's preserve set and
-    # check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES must stay
-    # DISJOINT by variable name. That checker's --fix appends a missing required
-    # line after the last [Service] line, where systemd's last-wins would beat
-    # anything preserved here — see the WARNING above
-    # FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT, and the matching warning at the point
-    # of the edit in check_fused_memory_unit_parity.py.
     "fused-memory": UnitRenderSpec(
         log_tag="fused_memory_unit_render",
-        host_local_environment=FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT,
+        family=systemd_unit_parity.UnitFamily.FUSED_MEMORY,
         template="scripts/fused-memory.service.template",
     ),
 }
 
-# The section every Environment= directive of BOTH units lives in. Named rather
-# than searched: check_dashboard_unit_parity's UnitSpec pins the same
-# `environment_section="Service"`, and the two must agree or the installer
-# preserves out of a section the gate does not read. The fused-memory template
-# puts its Environment= lines in [Service] too, so one constant still serves.
-_ENVIRONMENT_SECTION = "Service"
+# What a call that names no unit renders, on the CLI and in render_unit alike:
+# setup-host.sh section 8 predates --unit and passes none.
+_DEFAULT_UNIT = "dashboard"
 
 # Reasons a name in the preserve set did NOT survive into the render. Both are
 # legitimate, and both are REPORTED rather than taken silently — see the module
@@ -371,7 +271,7 @@ def preserved_values(
     """
     env = systemd_unit_parity.environment_map(
         systemd_unit_parity.parse_unit_directives(installed_text),
-        _ENVIRONMENT_SECTION,
+        systemd_unit_parity.SERVICE_SECTION,
     )
 
     preserved: dict[str, str] = {}
@@ -417,9 +317,9 @@ def _environment_token(name: str, value: str) -> str:
     token = shlex.quote(f"{name}={value}")
     roundtrip = systemd_unit_parity.environment_map(
         systemd_unit_parity.parse_unit_directives(
-            f"[{_ENVIRONMENT_SECTION}]\nEnvironment={token}\n"
+            f"[{systemd_unit_parity.SERVICE_SECTION}]\nEnvironment={token}\n"
         ),
-        _ENVIRONMENT_SECTION,
+        systemd_unit_parity.SERVICE_SECTION,
     )
     if roundtrip.get(name) != value:
         raise ValueError(
@@ -485,7 +385,8 @@ def render_unit(
     repo_root: str,
     uv_path: str,
     installed_text: str = "",
-    names: "tuple[str, ...] | list[str]" = HOST_LOCAL_ENVIRONMENT,
+    spec: UnitRenderSpec = UNITS[_DEFAULT_UNIT],
+    preserve: bool = True,
 ) -> "tuple[str, dict[str, str], dict[str, str]]":
     """Render *template_text*, then put this host's local values back.
 
@@ -495,17 +396,22 @@ def render_unit(
     rather than merely doing it.
 
     *installed_text* is the unit ALREADY on the host (``""`` on a greenfield
-    one). Only names in *names* are read from it; everything else in the output
-    comes from the freshly rendered template. That asymmetry is the design:
-    DASHBOARD_PROJECT_ROOT is on the parity checker's DIVERGENCE_ALLOWLIST too,
-    but it is a RENDERED value that must equal the same copy's
-    WorkingDirectory=, so preserving it would pin the data root at the previous
-    checkout. See HOST_LOCAL_ENVIRONMENT above for the full argument.
+    one). Only *spec*'s ``host_local_environment`` is read from it; everything
+    else in the output comes from the freshly rendered template. That asymmetry
+    is the design: DASHBOARD_PROJECT_ROOT is on the parity checker's
+    DIVERGENCE_ALLOWLIST too, but it is a RENDERED value that must equal the
+    same copy's WorkingDirectory=, so preserving it would pin the data root at
+    the previous checkout. Each name's policy: systemd_unit_parity.py::ENV_POLICY.
+
+    ``preserve=False`` empties the preserve SET rather than merely reading
+    nothing, so the names are not then reported as absent from an installed
+    unit nobody read (``main``'s --no-preserve).
 
     PURE TEXT — no filesystem access at all. ``main`` owns the reading and the
     atomic write, so the entire preservation contract stays testable without
     touching a unit dir, which is the rule every sibling suite states.
     """
+    names = spec.host_local_environment if preserve else ()
     rendered = render_template(template_text, repo_root=repo_root, uv_path=uv_path)
     preserved, skipped = preserved_values(installed_text, names)
     return apply_preserved(rendered, preserved), preserved, skipped
@@ -584,7 +490,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     parser.add_argument(
         "--unit",
         choices=sorted(UNITS),
-        default="dashboard",
+        default=_DEFAULT_UNIT,
         help=(
             "Which unit is being rendered. Selects the preserve set and the log "
             "tag from the UNITS registry. Defaults to the dashboard, so the "
@@ -642,12 +548,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     # The installed side. An absent --output is the greenfield case, not an
     # error: there is simply nothing to preserve.
     installed_text = ""
-    names: tuple[str, ...] = spec.host_local_environment
     if args.no_preserve:
-        # Not merely "read nothing": the preserve SET is emptied too, so the
-        # names do not then get reported as absent-from-the-installed-unit,
-        # which would be a true sentence about a file this run never read.
-        names = ()
         _log(
             f"--no-preserve: rendering the template as-is; no host-local "
             f"Environment= values were read from {output_path}",
@@ -676,7 +577,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             repo_root=args.repo_root,
             uv_path=args.uv_path,
             installed_text=installed_text,
-            names=names,
+            spec=spec,
+            preserve=not args.no_preserve,
         )
     except ValueError as exc:
         _log(f"FAILED: {exc}", stream=sys.stderr, log_tag=log_tag)

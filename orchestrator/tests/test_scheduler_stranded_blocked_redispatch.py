@@ -128,9 +128,8 @@ class TestRedispatchStrandedBlockedCore:
             'T1', 'pending'
         )
         # The stale (already-null) claimant is explicitly cleared alongside
-        # the flip, mirroring the slot-release NULL-claimant convention
-        # (harness.py:5693-5696) so a redispatched task never carries a
-        # claimant that no longer owns it.
+        # the flip (Scheduler.clear_claim_then_set_status) so a redispatched
+        # task never carries a claimant that no longer owns it.
         scheduler.set_task_claimant.assert_awaited_once_with(  # type: ignore[attr-defined]
             'T1', claimant_run_id=None, heartbeat_at=None,
         )

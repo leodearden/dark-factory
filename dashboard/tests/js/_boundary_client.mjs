@@ -28,7 +28,7 @@ export function payload(name) {
 
 // Every classic script index.html loads, in its order, into ONE fresh window
 // shim. With no `document` defined data.js stays inert: it never starts
-// polling (data_poll.test.mjs::loadDataJs). Each call replaces the global
+// polling (_data_loader.mjs::loadDataJs). Each call replaces the global
 // window, so one client is live at a time.
 export function loadClient() {
   const win = { dispatchEvent() {} };

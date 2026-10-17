@@ -11,13 +11,24 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from shared.memory_eval_metrics import Metric
 from shared.safe_io import atomic_write_text
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, LlmParams
 from fused_memory.arm_harness.conformance import ConformanceCounts
+from fused_memory.arm_harness.embedding_run_manifest import (
+    EmbeddingRunManifest,
+    serialize_embedding_run_manifest,
+)
 from fused_memory.arm_harness.instrument_checks import PREREGISTRATION_DOC_PATH
 from fused_memory.arm_harness.llm_metrics import llm_axis_records
-from fused_memory.arm_harness.metrics_record import MetricsRecord, write_metrics_record
+from fused_memory.arm_harness.metrics_record import (
+    EmbeddingMetricId,
+    IndexConfiguration,
+    MetricsRecord,
+    record_for,
+    write_metrics_record,
+)
 from fused_memory.arm_harness.preregistration import PreregistrationInputs, latency_envelope
 from fused_memory.arm_harness.replay_types import ArmAbort, ArmRunResult, EpisodeOutcome
 from fused_memory.arm_harness.run import RUN_MANIFEST_FILENAME, write_outcomes
@@ -34,7 +45,13 @@ from fused_memory.arm_harness.screening_evidence import (
     write_arm_commands,
     write_screening_spec,
 )
-from fused_memory.arm_harness.slate import SlateArm, arm_endpoint, candidate_spec
+from fused_memory.arm_harness.slate import (
+    EmbeddingSlateArm,
+    SlateArm,
+    arm_endpoint,
+    candidate_spec,
+    embedding_control_spec,
+)
 from fused_memory.arm_harness.usage_tap import CallRecord
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
@@ -312,6 +329,26 @@ def slate_arm(**overrides) -> SlateArm:
         'max_model_len': 32768,
     }
     return SlateArm.model_validate(data | overrides)
+
+
+QWEN_QUERY_PREFIX = (
+    'Instruct: Given a search query, retrieve relevant memory records that answer the query\n'
+    'Query: '
+)
+
+
+def embedding_slate_arm(**overrides) -> EmbeddingSlateArm:
+    """qwen3-embedding-0.6b as arms.yaml declares it; override any field by keyword."""
+    data = {
+        'arm_id': 'qwen3-embedding-0.6b',
+        'stack': 'vllm',
+        'port': 8414,
+        'served_model_name': 'qwen3-embedding-0.6b',
+        'quant': 'none',
+        'dims': 1024,
+        'query_prefix': QWEN_QUERY_PREFIX,
+    }
+    return EmbeddingSlateArm.model_validate(data | overrides)
 
 
 def screening_spec(arm: SlateArm) -> LlmArmSpec:
@@ -684,3 +721,128 @@ def write_arm_evidence(
             paths.runs / stamp, run, outcomes if outcomes is not None else screening_outcomes()
         )
     return paths
+
+
+# --- ι embedding runs ------------------------------------------------------------------
+
+EMBEDDING_KNOWN_ITEMS = 200
+EMBEDDING_MEM0_KNOWN_ITEMS = 40
+
+KnownItemValues = tuple[float, float, float]
+"""(recall@5, recall@10, mrr) of one known-item probe."""
+
+
+def embedding_control(arm_id: str = 'incumbent-embed-a', **overrides) -> EmbeddingArmSpec:
+    """An incumbent embedding control as embed-specs derives it; override any field by keyword."""
+    data = {
+        'model_id': 'text-embedding-3-small',
+        'embedding_dim': 1536,
+        'code_sha': CODE_SHA,
+        'corpus_sha': CORPUS_SHA,
+        'scratch_group_id': 'evalmem_lme_emb_ctl_a',
+    }
+    return embedding_control_spec(arm_id, **(data | overrides))
+
+
+def write_embedding_run(
+    run_dir: Path, manifest: EmbeddingRunManifest, records: Sequence[MetricsRecord]
+) -> Path:
+    """A committed embedding run directory, through the harness writers."""
+    for record in records:
+        write_metrics_record(record, run_dir)
+    atomic_write_text(
+        run_dir / RUN_MANIFEST_FILENAME, serialize_embedding_run_manifest(manifest), mkdir=True
+    )
+    return run_dir
+
+
+def embedding_run_manifest(spec: EmbeddingArmSpec, /, **overrides) -> EmbeddingRunManifest:
+    """A committed embedding run of ``spec`` at the default settings; override any field."""
+    data = {
+        'schema_version': 1,
+        'spec': spec,
+        'settings': {
+            'embed_batch_size': 64,
+            'embed_concurrency': 4,
+            'query_concurrency': 3,
+            'search_k': 10,
+            'transcript_queries': 500,
+            'mem0_project_id': 'dark_factory',
+            'search_timeout_s': 30.0,
+        },
+        'effective_embedder': {'model': spec.model_id, 'dimensions': spec.embedding_dim},
+        'graph_reembed': {
+            'entity_count': 1634, 'edge_count': 1087, 'written': 2721, 'failures': (),
+            'raw_norms': None, 'embed_seconds': 30.0, 'write_seconds': 5.0,
+        },
+        'replica_reembed': {
+            'points': 30941, 'written': 30941, 'failures': (), 'raw_norms': None,
+            'embed_seconds': 300.0, 'write_seconds': 20.0,
+        },
+        'query_failures': {
+            'known_item': {'embedding-only': 0, 'with-indices': 0},
+            'mem0_known_item': 0,
+            'query_latency': 0,
+        },
+        'check_results': (),
+        'started_at': STARTED_AT,
+        'finished_at': FINISHED_AT,
+    }
+    return EmbeddingRunManifest.model_validate(data | overrides)
+
+
+def _known_item_metrics(
+    ids: tuple[EmbeddingMetricId, EmbeddingMetricId, EmbeddingMetricId],
+    values: KnownItemValues,
+    n: int,
+) -> tuple[Metric, ...]:
+    at_5, at_10, mrr = values
+    recalls = (
+        Metric(metric_id=metric_id, kind='proportion', value=value, n=n, denominator=n,
+               direction='lower_is_worse')
+        for metric_id, value in ((ids[0], at_5), (ids[1], at_10))
+    )
+    return (*recalls, Metric(metric_id=ids[2], kind='scalar', value=mrr, n=n))
+
+
+def embedding_records(
+    spec: EmbeddingArmSpec,
+    *,
+    with_indices: KnownItemValues = (0.80, 0.90, 0.70),
+    embedding_only: KnownItemValues = (0.70, 0.85, 0.60),
+    mem0: KnownItemValues = (0.50, 0.75, 0.40),
+    latency_p95_ms: float = 120.0,
+    throughput: float = 90.0,
+) -> tuple[MetricsRecord, ...]:
+    """The eleven records an embedding run writes, at the given values."""
+    graph_ids = (
+        EmbeddingMetricId.KNOWN_ITEM_RECALL_AT_5,
+        EmbeddingMetricId.KNOWN_ITEM_RECALL_AT_10,
+        EmbeddingMetricId.MRR,
+    )
+    mem0_ids = (
+        EmbeddingMetricId.MEM0_KNOWN_ITEM_RECALL_AT_5,
+        EmbeddingMetricId.MEM0_KNOWN_ITEM_RECALL_AT_10,
+        EmbeddingMetricId.MEM0_MRR,
+    )
+    per_configuration = [
+        record_for(spec, metric, measured_at=FINISHED_AT, incomplete=False,
+                   index_configuration=configuration)
+        for configuration, values in (
+            (IndexConfiguration.WITH_INDICES, with_indices),
+            (IndexConfiguration.EMBEDDING_ONLY, embedding_only),
+        )
+        for metric in _known_item_metrics(graph_ids, values, EMBEDDING_KNOWN_ITEMS)
+    ]
+    store_level = (
+        *_known_item_metrics(mem0_ids, mem0, EMBEDDING_MEM0_KNOWN_ITEMS),
+        Metric(metric_id=EmbeddingMetricId.QUERY_EMBED_LATENCY_P95, kind='scalar',
+               value=latency_p95_ms, n=500),
+        Metric(metric_id=EmbeddingMetricId.REEMBED_THROUGHPUT, kind='scalar',
+               value=throughput, n=33662),
+    )
+    return (
+        *per_configuration,
+        *(record_for(spec, metric, measured_at=FINISHED_AT, incomplete=False)
+          for metric in store_level),
+    )

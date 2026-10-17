@@ -46,12 +46,11 @@ async def api_orchestrators(request: Request) -> JSONResponse:
         discover_orchestrators(config),
         get_orchestrators_running_series(metrics_db, days=1),
     )
-    known_roots = [config.project_root, *config.known_project_roots]
     return JSONResponse(
         {
             **redux_api.shape_orchestrators(
                 orchestrators,
-                known_project_roots=known_roots,
+                known_project_roots=config.all_project_roots,
                 running_spark=running_spark,
             ),
             'served_at': served_at.isoformat(),

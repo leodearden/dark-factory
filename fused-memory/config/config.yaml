@@ -218,6 +218,38 @@ write_journal:
   prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
+# check_interval_seconds the checkpoint loop samples write_journal.db; a crossed
+# ceiling logs a WARNING naming the measured size and files an escalation. The
+# alarm DELETES NOTHING: rows are bounded by the write_journal prune above, and
+# the volume fix and reclaim are task 5405's. Task 5405 must re-anchor both
+# ceilings after it lands.
+#
+# MEASURED BASIS (2026-10-09, live journal, read-only):
+#   file      17,296,526,128 B including -wal/-shm, 366.8 MB of it on the freelist
+#   net file  +901.8 MB over ~29.5 days (~30.6 MB/day), despite the task-5247
+#             prune running throughout
+#   inserts   trailing-7d mean 931,647 rows/day; highest 24 h window 1,108,612;
+#             d-10..d-21 ran 412k-642k/day, so a ~1.9x step around 2026-09-30
+#
+# max_file_bytes = 18 GiB is ~2.03 GB above today's file. If the prune stopped
+# deleting, inserts (~439 MB/day = 931,647 rows x 471 B/row, the last exact
+# bytes/row measurement, 2026-09-10) would absorb the freelist and cross it in
+# ~5.5 days; at today's ~30.6 MB/day net creep it is crossed in ~66 days.
+# `auto_vacuum` is NONE, so the file never shrinks without an offline VACUUM: a
+# size breach stays breached until an operator VACUUMs or deliberately raises
+# this ceiling, recording the reason here.
+#
+# max_rows_inserted_per_day = 1.5M is 1.35x the highest 24 h window and 1.61x
+# the 7-day mean. A repeat of the late-September step would cross it within a
+# day. It clears by itself when the rate falls.
+# ─────────────────────────────────────────────────────────────────────────────
+write_journal_growth_alarm:
+  max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:19327352832}
+  max_rows_inserted_per_day: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY:1500000}
+  check_interval_seconds: ${WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS:3600}
+
 
 # task_metadata.enforce — RED-TIER / restart-only (task 2162, W3-β). warn-mode
 # (false) logs a task_metadata.schema_warning line per SchemaWarning and lets
@@ -491,7 +523,8 @@ mem0_update:
 #   misfile_share_ceiling: 0.25
 #   # Apply writes nothing past this adjudicated CORRECTS share (link-heal-corrects-share).
 #   corrects_share_ceiling: 0.60
-#   # Consecutive failed adjudicator shards that stop adjudicating (link-heal-adjudicator).
+#   # Consecutive failed adjudicator shards that stop adjudicating; a plan run records
+#   # link-heal-adjudicator as would_escape, a writing run files it.
 #   shard_failure_streak: 3
 
 # Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
@@ -619,7 +652,7 @@ mem0_update:
 write_triage:
   # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the
   # CALIBRATION OUTPUT fence are the ones a human is meant to edit — these two
-  # and the eight judge knobs below them; everything below the fence is
+  # and the judge knobs below them; everything below the fence is
   # derived. All of them are green-tier hot-reloadable, and
   # scripts/calibrate_write_triage.py --write-config preserves them when it
   # rewrites the calibrated keys below.
@@ -630,7 +663,7 @@ write_triage:
   # Flipped by task 3169, after the judge (leaf gamma) lands — until then the
   # middle band is answered by a deliberate stub. Also the lever that stops an
   # in-flight triage incident.
-  enabled: false
+  enabled: true
   # candidate_k: retrieval WIDTH, not a threshold — it caps what any band can
   # achieve, since an unretrieved candidate cannot be scored at all. 20 is the
   # measured 69.4% same-category recall point (26.1% @5, 43.9% @10, 69.4% @20,
@@ -639,8 +672,8 @@ write_triage:
   candidate_k: 20
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
-  # them. All eight are green-tier hot-reloadable and read live per middle-band
-  # write.
+  # them. Every judge knob is green-tier hot-reloadable and read live per
+  # middle-band write.
   #
   # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
   # unlike `enabled` above, because the judge is inert while triage is off —
@@ -653,8 +686,13 @@ write_triage:
   # the judge follows the model this deployment already trusts for add_memory
   # auto-classification. "haiku-class" in the PRD is a cost/size class, not a
   # vendor pin.
-  judge_provider: null
-  judge_model: null
+  # Set at the task 3169 flip from calibration/write_triage_best_config.json
+  # `selection` (gate Γ3, task 5808). Leaving judge_model null would inherit
+  # llm.model, which scored worse than the status quo on the comparative.
+  judge_provider: openai
+  judge_model: gpt-6.1-sol
+  # judge_api_url: the judge's OWN endpoint (null inherits llm.providers.<provider>.api_url); see plans/write-triage-flip-readiness-prd.md task σ.
+  judge_api_url: null
   # judge_timeout_seconds: NOT optional. No LLM call elsewhere in fused-memory
   # sets a timeout and the openai SDK default is 600s; on the synchronous
   # add_memory write path that is a wedge, not a degradation. A timeout
@@ -669,7 +707,7 @@ write_triage:
   # 'openai') can send it — elsewhere a set value is a counted fail-open. Set
   # together with judge_model at the 3169 flip; see
   # plans/write-triage-flip-readiness-prd.md §11.3 C1''.
-  judge_reasoning_effort: null
+  judge_reasoning_effort: low
   # judge_candidate_count: how many of the `candidate_k` retrieved records
   # reach the prompt — PRD C1's "top 3-5". The band's own winner is always
   # included regardless of this cap.
@@ -725,3 +763,19 @@ write_triage:
   # withheld from `--apply` deletion (`ann_cutoff_not_evidenced_for_category`):
   # still reported, never irreversibly acted on with a cutoff measured
   # elsewhere.
+  # - Per-project cutoffs for these two categories (task 5547, measured on
+  #   the dark_factory corpus) live in write_triage_project_calibrations
+  #   below; a run whose --project-id matches reads them before this map.
+  #   The reify statements above are unchanged.
+
+write_triage_project_calibrations:
+  # CALIBRATION OUTPUT — machine-owned; do not hand-edit.
+  # Per-project per-category cutoffs, each measured on that project's own
+  # fixture by scripts/calibrate_write_triage.py --write-project-config.
+  # Read only by scripts/audit_duplicate_memories.py for a run whose
+  # --project-id equals the key; never pooled with write_triage's bands.
+  # Hand edits inside this section are not preserved.
+  dark_factory:
+    calibration_report_path: calibration/write_triage_calibration_report_dark_factory.json
+    t_high_by_category:
+      observations_and_summaries: 0.8578402160989046

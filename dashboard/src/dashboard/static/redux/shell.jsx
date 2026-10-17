@@ -140,7 +140,7 @@ function StatStrip({ live, lastUpdate, summary }) {
       </span>
       <span className="stat-pill">
         <span className="lbl">spend 24h</span>
-        <span className="val">${summary.spend24h.toFixed(2)}</span>
+        <span className="val">{summary.spend24h}</span>
       </span>
     </div>
   );

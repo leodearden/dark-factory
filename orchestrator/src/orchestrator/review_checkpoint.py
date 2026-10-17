@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -18,6 +19,13 @@ from shared.cli_invoke import (
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
+from orchestrator.review_working_tree import (
+    Phase1WorkingTree,
+    attribute_phase1,
+    qualified_phase1_summary,
+    read_working_tree_state,
+    render_working_tree_section,
+)
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.verify import VerifyResult, run_full_verification
@@ -70,6 +78,7 @@ class ReviewReport:
     cost_usd: float = 0.0
     duration_ms: int = 0
     parse_failed: bool = False
+    phase1_working_tree: Phase1WorkingTree | None = None
 
 
 class ReviewCheckpoint:
@@ -190,16 +199,16 @@ class ReviewCheckpoint:
             review_id, mode, modules or 'all',
         )
 
-        # Phase 1: mechanical verification
-        logger.info('Review [%s]: Phase 1 — running full verification', review_id)
-        phase1 = await run_full_verification(self.config.project_root, self.config)
-        logger.info('Review [%s]: Phase 1 complete — %s', review_id, phase1.summary)
+        phase1, working_tree = await self._run_phase1(review_id)
 
         # Load review briefing
         briefing_content = self._load_briefing()
 
         # Phase 2+3: architectural coherence + triage (Opus agent)
-        prompt = self._build_prompt(mode, phase1, modules, briefing_content, review_id)
+        prompt = self._build_prompt(
+            mode, phase1, modules, briefing_content, review_id,
+            working_tree=working_tree,
+        )
 
         # Build MCP config for fused-memory + escalation access
         escalation_url = None
@@ -276,6 +285,7 @@ class ReviewCheckpoint:
                 escalated_findings=0,
                 cost_usd=0.0,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                phase1_working_tree=working_tree,
             )
         completed_at = datetime.now(UTC).isoformat()
 
@@ -357,6 +367,7 @@ class ReviewCheckpoint:
             cost_usd=result.cost_usd,
             duration_ms=elapsed_ms,
             parse_failed=parse_failed,
+            phase1_working_tree=working_tree,
         )
 
         self._save_report(report, result.output)
@@ -369,6 +380,27 @@ class ReviewCheckpoint:
         )
 
         return report
+
+    async def _run_phase1(
+        self, review_id: str,
+    ) -> tuple[VerifyResult, Phase1WorkingTree | None]:
+        """Mechanical verification, plus the working-tree state it measured."""
+        logger.info('Review [%s]: Phase 1 — running full verification', review_id)
+        state = await read_working_tree_state(self.config.project_root)
+        # A periodic project-wide review of the main checkout, not a task's verify: it queues as background.
+        phase1 = await run_full_verification(
+            self.config.project_root, self.config, role='background', event_store=self.event_store,
+        )
+        working_tree = None if state is None else await asyncio.to_thread(
+            attribute_phase1, phase1, state,
+            root=self.config.project_root,
+            run_dirs=tuple(self.config.module_configs_or_empty),
+        )
+        logger.info(
+            'Review [%s]: Phase 1 complete — %s',
+            review_id, qualified_phase1_summary(phase1, working_tree),
+        )
+        return phase1, working_tree
 
     def _promote_reviewer_escalations(self, review_id: str) -> int:
         """Promote pending L0 escalations from this review run to level 1.
@@ -445,6 +477,8 @@ class ReviewCheckpoint:
         modules: list[str],
         briefing_content: str,
         review_id: str,
+        *,
+        working_tree: Phase1WorkingTree | None = None,
     ) -> str:
         """Assemble the user prompt for the deep review agent."""
         project_root = str(self.config.project_root)
@@ -490,8 +524,9 @@ These tests/lint/typecheck results were run automatically. Use them as input —
 do NOT re-run these checks yourself.
 
 **Status:** {'PASSED' if phase1.passed else 'FAILED'}
-**Summary:** {phase1.summary}
+**Summary:** {qualified_phase1_summary(phase1, working_tree)}
 """
+        phase1_block += render_working_tree_section(phase1, working_tree)
         if not phase1.passed:
             if phase1.test_output:
                 phase1_block += f"""
@@ -581,7 +616,9 @@ violations are always bugs. Pay special attention to `stability_concerns`.
             'mode': report.mode,
             'changed_modules': report.changed_modules,
             'phase1_passed': report.phase1.passed,
-            'phase1_summary': report.phase1.summary,
+            'phase1_summary': qualified_phase1_summary(
+                report.phase1, report.phase1_working_tree,
+            ),
             'findings_count': report.findings_count,
             'parse_failed': report.parse_failed,
             'tasks_created': report.tasks_created,
@@ -590,6 +627,8 @@ violations are always bugs. Pay special attention to `stability_concerns`.
             'duration_ms': report.duration_ms,
             'agent_output': agent_output[:10000],  # truncate for storage
         }
+        if report.phase1_working_tree is not None:
+            data['phase1_working_tree'] = report.phase1_working_tree.to_dict()
 
         path = reports_dir / f'review-{report.review_id}.json'
         path.write_text(json.dumps(data, indent=2))

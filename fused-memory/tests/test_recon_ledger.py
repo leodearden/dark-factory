@@ -1615,6 +1615,65 @@ async def test_get_mem0_tombstone_absent_returns_none(store):
 
 
 @pytest.mark.asyncio
+async def test_mem0_tombstones_with_prefix_lists_only_this_projects_matching_tombstones(store):
+    """A uuid prefix reaches the tombstone rows whose memory id starts with it (task 5323).
+
+    The store is keyed by the FULL memory id, so a prefix needs its own
+    listing. Project, record kind and the prefix itself each scope it, and
+    each row is the same record the exact-id read returns.
+    """
+    reify_b = 'bff81530-0000-4000-8000-00000000000b'
+    reify_a = 'bff81530-0000-4000-8000-00000000000a'
+    for project_id, memory_id in (
+        ('reify', reify_b),
+        ('reify', reify_a),
+        ('other', 'bff81530-0000-4000-8000-00000000000c'),
+        ('reify', 'cafe0000-0000-4000-8000-000000000001'),
+    ):
+        await record_mem0_deletion_tombstone(
+            _tombstone_ms(store),
+            project_id,
+            memory_id,
+            victim_metadata={},
+            victim_created_at=None,
+            deleter='stage1_cycle_summary_trim',
+            deleting_run_id='run-deleter',
+        )
+    await store.upsert(ReconLedgerRecord(
+        project_id='reify',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='bff81530-0000-4000-8000-00000000000d',
+        flag_type='f1',
+    ))
+
+    rows = await store.mem0_tombstones_with_prefix('reify', 'bff81530')
+
+    assert [row.task_id for row in rows] == [reify_a, reify_b]
+    assert rows == [await store.get_mem0_tombstone('reify', memory_id) for memory_id in (reify_a, reify_b)]
+
+
+@pytest.mark.asyncio
+async def test_mem0_tombstones_with_prefix_is_a_literal_case_sensitive_match(store):
+    """LIKE would fold case and read %/_ as wildcards; the prefix must not."""
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'reify',
+        'bff81530-0000-4000-8000-00000000000a',
+        victim_metadata={},
+        victim_created_at=None,
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-deleter',
+    )
+
+    assert await store.mem0_tombstones_with_prefix('reify', 'BFF81530') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff8153_') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff%') == []
+
+
+@pytest.mark.asyncio
 async def test_repeat_tombstone_for_same_victim_keeps_one_row(store):
     """A second tombstone for the same victim upserts in place (row count 1).
 
@@ -1965,3 +2024,153 @@ async def test_tombstone_round_trips_from_writer_to_memory_service(store, mock_c
     # The ROW's own timestamps, kept separate so neither clobbers the victim's.
     assert tombstone['tombstone_created_at'] == '2026-07-20T00:00:00+00:00'
     assert tombstone['tombstone_expires_at'] == '2026-08-19T00:00:00+00:00'
+
+
+# ---------------------------------------------------------------------------
+# list_by_kind: the generic (project, kind, state) reader (task 5239), and the
+# TTL contract a kind gets for free by always stamping expires_at.
+# ---------------------------------------------------------------------------
+
+
+def _kind_row(
+    *,
+    project: str = 'proj-p',
+    kind: str = 'kind-a',
+    state: str = 'proposed',
+    task_id: str = '',
+    flag_type: str = 'topic-a',
+    run_id: str = 'run-1',
+    created_at: str = '2026-07-01T00:00:00+00:00',
+    expires_at: str | None = '2026-07-08T00:00:00+00:00',
+    payload: str = '{"k": 1}',
+) -> ReconLedgerRecord:
+    return ReconLedgerRecord(
+        project_id=project,
+        record_kind=kind,
+        task_id=task_id,
+        flag_type=flag_type,
+        run_id=run_id,
+        payload_json=payload,
+        state=state,
+        created_at=created_at,
+        expires_at=expires_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_returns_only_rows_matching_project_kind_and_state(store):
+    """Each of the three selectors excludes a row that differs only in it."""
+    wanted = _kind_row()
+    other_project = _kind_row(project='proj-q')
+    other_kind = _kind_row(kind='kind-b')
+    other_state = _kind_row(state='executed', flag_type='topic-b')
+    await store.upsert_many([wanted, other_project, other_kind, other_state])
+
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [wanted]
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_round_trips_every_field(store):
+    record = _kind_row(
+        task_id='',
+        flag_type='topic-x',
+        run_id='run-9',
+        payload='{"member_ids": ["a", "b"], "claim": "c"}',
+        created_at='2026-07-02T03:04:05+00:00',
+        expires_at='2026-07-09T03:04:05+00:00',
+    )
+    await store.upsert(record)
+
+    (fetched,) = await store.list_by_kind('proj-p', 'kind-a', 'proposed')
+
+    assert isinstance(fetched, ReconLedgerRecord)
+    assert fetched == record
+    assert fetched.payload_json == record.payload_json
+    assert fetched.created_at == '2026-07-02T03:04:05+00:00'
+    assert fetched.expires_at == '2026-07-09T03:04:05+00:00'
+    assert fetched.flag_type == 'topic-x'
+    assert fetched.run_id == 'run-9'
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_is_empty_when_nothing_matches(store):
+    await store.upsert(_kind_row(kind='kind-b'))
+
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_orders_by_created_at_then_identity(store):
+    late = _kind_row(flag_type='topic-0', created_at='2026-07-03T00:00:00+00:00')
+    early_b = _kind_row(flag_type='topic-b', created_at='2026-07-01T00:00:00+00:00')
+    early_a_run2 = _kind_row(
+        flag_type='topic-a', run_id='run-2', created_at='2026-07-01T00:00:00+00:00'
+    )
+    early_a_run1 = _kind_row(
+        flag_type='topic-a', run_id='run-1', created_at='2026-07-01T00:00:00+00:00'
+    )
+    await store.upsert_many([late, early_b, early_a_run2, early_a_run1])
+
+    listed = await store.list_by_kind('proj-p', 'kind-a', 'proposed')
+
+    assert listed == [early_a_run1, early_a_run2, early_b, late]
+
+
+@pytest.mark.asyncio
+async def test_gc_reaps_an_expired_consolidation_proposal_row_and_keeps_a_live_one(store):
+    """A kind that always stamps expires_at needs no reaper of its own."""
+    expired = _kind_row(
+        kind='consolidation_proposal',
+        flag_type='topic-old',
+        created_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-07-08T00:00:00+00:00',
+    )
+    live = _kind_row(
+        kind='consolidation_proposal',
+        flag_type='topic-new',
+        created_at='2026-07-10T00:00:00+00:00',
+        expires_at='2026-07-17T00:00:00+00:00',
+    )
+    await store.upsert_many([expired, live])
+
+    await store.gc('proj-p', now='2026-07-12T00:00:00+00:00', terminal_task_ids=[])
+
+    assert await store.list_by_kind('proj-p', 'consolidation_proposal', 'proposed') == [live]
+
+
+# ---------------------------------------------------------------------------
+# upsert_if_state: an overwrite that applies only while the stored row is
+# still in the named state (task 5239 amendment).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_inserts_a_row_that_does_not_exist(store):
+    record = _kind_row()
+
+    assert await store.upsert_if_state(record, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [record]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_overwrites_a_row_in_that_state(store):
+    await store.upsert(_kind_row(payload='{"k": 1}'))
+    newer = _kind_row(payload='{"k": 2}', created_at='2026-07-02T00:00:00+00:00')
+
+    assert await store.upsert_if_state(newer, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [newer]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_leaves_a_row_in_another_state_untouched(store):
+    acted_on = _kind_row(state='executed', payload='{"k": 1}')
+    await store.upsert(acted_on)
+
+    written = await store.upsert_if_state(
+        _kind_row(payload='{"k": 2}'), existing_state='proposed'
+    )
+
+    assert written is False
+    assert await store.get_by_identity(
+        'proj-p', 'kind-a', flag_type='topic-a', run_id='run-1'
+    ) == acted_on

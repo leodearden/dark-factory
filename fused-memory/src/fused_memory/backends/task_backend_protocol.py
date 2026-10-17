@@ -129,6 +129,7 @@ class TaskBackendProtocol(Protocol):
         *,
         claimant_run_id: str | None = None,
         heartbeat_at: str | None = None,
+        pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Update ``status``, optionally stamping the claimant columns.
 
@@ -137,6 +138,13 @@ class TaskBackendProtocol(Protocol):
         (a sentinel default leaves the column untouched); the protocol exposes
         them as ``None``-defaulted so callers may supply them and backends stay
         assignable to this shape.
+
+        ``pending_since_now`` supplies the clock for the ``metadata.pending_since``
+        stamp (task 3816); ``None`` means the backend reads its own clock. A
+        string is used verbatim and must be shaped like
+        ``fused_memory/backends/sqlite_task_backend.py::task_timestamp_now``,
+        never a ``datetime.isoformat()`` string. It supplies only the clock:
+        whether a stamp is owed is still the backend's transition table.
 
         Returns :class:`StatusWriteNotPersistedResult` instead of a fabricated
         success (task 2649) when a post-write read-back shows the status
