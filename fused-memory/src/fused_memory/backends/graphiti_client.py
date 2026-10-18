@@ -631,6 +631,21 @@ INCOMPLETE_KINDS = INCOMPLETE_STRUCTURAL_KINDS | {
 """Every incompleteness kind: the vocabulary ``incomplete_kind`` is drawn from."""
 
 
+# An edge is ACTIVE iff `invalid_at` IS NULL.  `expired_at` is deliberately NOT
+# part of it: graphiti_core never sets `expired_at` without also setting
+# `invalid_at` (graphiti_core/utils/maintenance/edge_operations.py::
+# resolve_extracted_edge and ::resolve_edge_contradictions), so it retires
+# nothing `invalid_at` misses — while the restore hooks clear `invalid_at` and
+# keep `expired_at` as the restored-edge signature (redirect_node_edges), so an
+# `expired_at` clause would hide exactly the edges they restore (task 4714,
+# esc-4714-9).
+#
+# Every read answering "what is currently true?" interpolates this constant.
+# Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
+# retired edges; `count_foreign_relationships` most emphatically so.
+_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL'
+
+
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and
 # are therefore directly comparable.
@@ -641,7 +656,7 @@ INCOMPLETE_KINDS = INCOMPLETE_STRUCTURAL_KINDS | {
 # reshuffle at a boundary drops rows permanently and silently.
 _ALL_VALID_EDGES_MATCH = (
     'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
+    f'WHERE {_ACTIVE_EDGE_PREDICATE} '
 )
 _VALID_EDGE_ROWS_PAGE_TAIL = (
     'RETURN n.uuid, e.uuid, e.fact, e.name '
@@ -1439,7 +1454,7 @@ _UUID_MEANS_LOAD = (
 # tests/test_write_time_identity.py::TestEnumerateRankedEntityNodesLiveFalkorDB,
 # which checks the two agree on a real server.
 _PROVENANCE_RANK_CLAUSE = (
-    'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+    f'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE {_ACTIVE_EDGE_PREDICATE} '
     'WITH n, count(DISTINCT e) AS edge_count '
     'OPTIONAL MATCH (:Episodic)-[m:MENTIONS]->(n) '
     'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
@@ -2776,8 +2791,8 @@ class GraphitiBackend:
     async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
-        Matches the node as either source or target (undirected) and filters
-        edges where invalid_at IS NULL (i.e. not yet invalidated).
+        Matches the node as either source or target (undirected) and excludes
+        retired edges per ``_ACTIVE_EDGE_PREDICATE`` (``invalid_at`` set).
 
         Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
         unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
@@ -2796,7 +2811,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -2836,7 +2851,7 @@ class GraphitiBackend:
         WHAT IT ANSWERS, contrasted with its neighbour above.
         :meth:`get_valid_edges_for_node` answers "does this node still carry
         LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
-        ``invalid_at IS NULL``.  This one answers a different question:
+        ``_ACTIVE_EDGE_PREDICATE``.  This one answers a different question:
         "would deleting this node DESTROY ANYTHING?"  It is therefore
         deliberately UNTYPED and UNFILTERED, because
         :meth:`delete_entity_node` issues a bare
@@ -2940,8 +2955,8 @@ class GraphitiBackend:
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
-        Queries all RELATES_TO edges where invalid_at IS NULL and excludes the
-        node itself (self-loops excluded via ``m.uuid <> $uuid``).
+        Queries all active RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``) and
+        excludes the node itself (self-loops excluded via ``m.uuid <> $uuid``).
 
         Collects neighbours BEFORE deletion so the caller can refresh their
         summaries after the target node is removed (edges vanish with DETACH DELETE).
@@ -2959,7 +2974,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL AND m.uuid <> $uuid '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
             'RETURN DISTINCT m.uuid'
         )
         result = await graph.ro_query(cypher, {'uuid': uuid})
@@ -3197,8 +3212,8 @@ class GraphitiBackend:
         ``resolve_extracted_edges`` fast-path can catch, since those only
         see the edges before they converge onto the same node pair.
 
-        Queries the node's currently-valid (``invalid_at IS NULL``)
-        incident edges (undirected, so directed and reverse-directed exact
+        Queries the node's active (``_ACTIVE_EDGE_PREDICATE``) incident
+        edges (undirected, so directed and reverse-directed exact
         duplicates both collapse), delegates grouping + survivor selection
         to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
         ``bulk_remove_edges``.
@@ -3218,7 +3233,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -4708,7 +4723,7 @@ class GraphitiBackend:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
-        (non-invalidated) RELATES_TO edges, deduplicates their facts
+        RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``), deduplicates their facts
         (preserving order), joins them with newlines, and writes the result
         back to the node's summary property.
 

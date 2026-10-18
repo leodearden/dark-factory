@@ -1729,6 +1729,15 @@ def _edge_to_dict(e: Any) -> dict:
     }
 
 
+def _edge_is_retired(edge: Any) -> bool:
+    """True when a graphiti-core ``EntityEdge``'s ``invalid_at`` is set — the
+    Python mirror of backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, which
+    explains why ``expired_at`` is deliberately not consulted (a restored edge
+    keeps it).
+    """
+    return getattr(edge, 'invalid_at', None) is not None
+
+
 # Defensive: resolve the embedding-provider's RateLimitError class at module
 # load. If the openai SDK is absent or its exception hierarchy is renamed,
 # _is_rate_limit_or_quota_error still works via its duck-typed fallback checks
@@ -7994,17 +8003,18 @@ class MemoryService:
 
         results = []
         for edge in edges:
-            fact = getattr(edge, 'fact', str(edge))
-            valid_at = getattr(edge, 'valid_at', None)
-            invalid_at = getattr(edge, 'invalid_at', None)
-
             # Skip superseded edges (invalid_at set means the fact has been
             # replaced by a newer edge).  Check this before anything else to
-            # avoid unnecessary work on edges that will be discarded.
-            if invalid_at is not None:
+            # avoid unnecessary work on edges that will be discarded, and so a
+            # dropped edge consumes no rank.
+            if _edge_is_retired(edge):
                 continue
 
-            temporal = _serialize_temporal(valid_at, invalid_at)
+            fact = getattr(edge, 'fact', str(edge))
+            temporal = _serialize_temporal(
+                getattr(edge, 'valid_at', None),
+                getattr(edge, 'invalid_at', None),
+            )
 
             # Extract entity names from source/target nodes
             entities = []
@@ -8176,11 +8186,12 @@ class MemoryService:
         search() call. The exact-match branch does NOT use edge_limit: its
         get_valid_edges_for_node traversal returns every valid edge for the
         resolved node uuid(s), uncapped. Both branches exclude invalidated
-        edges (invalid_at set): the exact branch at the Cypher level (WHERE
-        e.invalid_at IS NULL), and the fuzzy branch via an explicit
-        invalid_at filter applied to the search() results, mirroring
-        search()'s own drop (task 312) — so neither branch surfaces
-        superseded facts (task 2726).
+        edges (invalid_at set): the exact branch at the Cypher level
+        (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE), and the fuzzy
+        branch via `_edge_is_retired` applied to the search() results,
+        mirroring search()'s own drop (task 312) — so neither branch surfaces
+        superseded facts (task 2726). Neither filters on `expired_at`: a
+        restored edge keeps it (task 4714).
 
         EXACT vs. FUZZY edge sets are fundamentally different — TOPOLOGICAL
         vs. SEMANTIC — and comparing them across branches will produce
@@ -8300,10 +8311,10 @@ class MemoryService:
         node_data = [_node_to_dict(n) for n in nodes]
         # Drop superseded edges (invalid_at set) so the fuzzy/semantic branch
         # presents the same valid-edge semantics as the exact/topological branch
-        # (get_valid_edges_for_node's Cypher WHERE invalid_at IS NULL) and as
-        # search() (task 312, ~line 2588) — otherwise an agent resolving via the
-        # fuzzy fallback could silently act on a stale fact (task 2726).
-        edge_data = [_edge_to_dict(e) for e in edges if getattr(e, 'invalid_at', None) is None]
+        # (get_valid_edges_for_node's Cypher _ACTIVE_EDGE_PREDICATE) and as
+        # search() (task 312) — otherwise an agent resolving via the fuzzy
+        # fallback could silently act on a stale fact (task 2726).
+        edge_data = [_edge_to_dict(e) for e in edges if not _edge_is_retired(e)]
 
         return {'nodes': node_data, 'edges': edge_data}
 

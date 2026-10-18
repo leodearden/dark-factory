@@ -4269,6 +4269,49 @@ class TestGetEntity:
             'branch (task 2726)'
         )
 
+    @pytest.mark.asyncio
+    async def test_fuzzy_branch_keeps_restored_edges(self, service):
+        """FUZZY branch keeps a restored edge — ``invalid_at`` None, ``expired_at``
+        set — while still dropping a superseded one (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature; graphiti_core never sets ``expired_at`` without
+        ``invalid_at``.  So ``expired_at`` alone marks a RESTORED fact, not a
+        retired one, and dropping it would hide exactly what the hooks restored.
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        # Empty exact-name result forces the FUZZY fallback.  search_nodes and
+        # search are awaited concurrently through gather_or_raise, so both must
+        # be stubbed or the gather raises.
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Svc', uuid='n1')]
+        )
+        retired = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Svc valid fact', uuid='e-valid', invalid_at=None, expired_at=None),
+            MockEdge(
+                fact='Svc superseded fact',
+                uuid='e-superseded',
+                invalid_at=retired,
+                expired_at=retired,
+            ),
+            MockEdge(
+                fact='Svc restored fact',
+                uuid='e-restored',
+                invalid_at=None,
+                expired_at=retired,
+            ),
+        ])
+
+        result = await service.get_entity('Svc', project_id='test')
+
+        assert [e['uuid'] for e in result['edges']] == ['e-valid', 'e-restored'], (
+            'FUZZY branch must drop the superseded edge (invalid_at set) and keep '
+            'the restored one (invalid_at None, expired_at set) — esc-4714-9'
+        )
+
     # ------------------------------------------------------------------
     # exact-first lookup (task-1975): get_nodes_by_exact_name precedes fuzzy search_nodes
     # ------------------------------------------------------------------
@@ -7830,6 +7873,63 @@ class TestSearchGraphitiInvalidatedFiltering:
         scores = [r.relevance_score for r in results]
         assert scores == sorted(scores, reverse=True) and len(set(scores)) == 3, (
             'RRF scores must be strictly decreasing in rank order'
+        )
+
+    @pytest.mark.asyncio
+    async def test_restored_edge_with_expired_at_alone_is_returned(self, service):
+        """A restored edge — ``invalid_at`` None, ``expired_at`` set — surfaces
+        (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature, and graphiti_core never sets ``expired_at``
+        without ``invalid_at``, so ``expired_at`` alone marks a restored fact.
+        Three edges go in: one fully active, one superseded via ``invalid_at``
+        (task 312), and one restored.  The active and restored facts come back,
+        ranked contiguously over the survivors.
+        """
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_retired = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Current fact',
+                uuid='edge-active',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Superseded fact',
+                uuid='edge-invalid-at',
+                valid_at=dt_valid,
+                invalid_at=dt_retired,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Restored fact',
+                uuid='edge-restored',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=dt_retired,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert [r.id for r in results] == ['edge-active', 'edge-restored'], (
+            'the superseded edge must be dropped (task 312) and the restored '
+            'edge kept: expired_at alone does not retire an edge (esc-4714-9)'
+        )
+        assert [r.content for r in results] == ['Current fact', 'Restored fact']
+
+        assert [r.metadata['store_rank'] for r in results] == [1, 2], (
+            'store_rank must be contiguous over survivors — the dropped '
+            'superseded edge must not consume a rank'
         )
 
 
