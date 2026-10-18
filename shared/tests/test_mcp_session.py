@@ -1,4 +1,4 @@
-"""Tests for shared.mcp_session.McpSession, the async MCP client every package uses.
+"""Tests for shared.mcp_session.McpSession, the async MCP client.
 
 Transport retry behaviour is driven through ``patch('httpx.AsyncClient')`` with
 scripted answers: ConnectError/ReadTimeout/OSError sequences cannot be produced
@@ -114,11 +114,22 @@ class TestRequestRetry:
         assert transport.session_header(3) == 'new-session'
 
     async def test_retries_on_503(self):
-        with _scripted([*_handshake(), _response(status_code=503), _response()]) as transport:
+        answers = [*_handshake(), _response(status_code=503), *_handshake(), _response()]
+        with _scripted(answers) as transport:
             result = await _session((1.0,)).call_tool('t', {})
 
         assert result['result'] == {'ok': True}
-        assert transport.posted_methods()[2:] == ['tools/call', 'tools/call']
+        assert transport.posted_methods().count('tools/call') == 2
+
+    async def test_an_exhausted_gateway_status_is_an_http_status_failure(self):
+        """A 503 that outlasts the schedule is a server answer, not a lost connection."""
+        answers = [*_handshake(), _response(status_code=503), *_handshake(), _response(status_code=503)]
+        with _scripted(answers), pytest.raises(McpCallError) as excinfo:
+            await _session((0.0,)).call_tool('t', {})
+
+        assert excinfo.value.kind is McpFailureKind.HTTP_STATUS
+        assert excinfo.value.status == 503
+        assert '2 attempts' in str(excinfo.value)
 
     async def test_no_retry_on_400(self):
         with (
@@ -148,12 +159,12 @@ class TestRequestRetry:
         assert 'ConnectError' in str(err)
         assert isinstance(err.__cause__, httpx.ConnectError)
 
-    async def test_transient_failure_drops_the_session_and_reinitializes(self):
+    async def test_a_transient_failure_re_handshakes_before_the_retry(self):
         answers = [
             *_handshake('old'),
             httpx.ConnectError('refused'),
-            _response(),
             *_handshake('fresh'),
+            _response(),
             _response(),
         ]
         with _scripted(answers) as transport:
@@ -162,12 +173,36 @@ class TestRequestRetry:
             await session.call_tool('t', {})
 
         assert transport.posted_methods() == [
-            'initialize', 'notifications/initialized', 'tools/call', 'tools/call',
             'initialize', 'notifications/initialized', 'tools/call',
+            'initialize', 'notifications/initialized', 'tools/call', 'tools/call',
         ]
         assert transport.session_header(2) == 'old'
         assert transport.session_header(3) is None
+        assert transport.session_header(5) == 'fresh'
         assert transport.session_header(6) == 'fresh'
+
+    async def test_one_schedule_covers_the_handshake_and_the_request(self):
+        answers = [
+            httpx.ConnectError('refused'),
+            *_handshake(),
+            httpx.ConnectError('refused'),
+            *_handshake(),
+            _response(),
+        ]
+        with _scripted(answers) as transport:
+            await _session((0.5, 1.5)).call_tool('t', {})
+
+        assert [c.args[0] for c in transport.sleep.call_args_list] == [0.5, 1.5]
+
+    async def test_a_handshake_failure_spends_the_calls_schedule(self):
+        answers = [httpx.ConnectError('refused'), *_handshake(), httpx.ConnectError('refused')]
+        with _scripted(answers) as transport, pytest.raises(McpCallError) as excinfo:
+            await _session((0.5,)).call_tool('t', {})
+
+        assert transport.posted_methods() == [
+            'initialize', 'initialize', 'notifications/initialized', 'tools/call',
+        ]
+        assert '2 attempts' in str(excinfo.value)
 
     @pytest.mark.parametrize(
         'transient',
@@ -177,7 +212,7 @@ class TestRequestRetry:
     async def test_retries_on_timeout_and_raw_oserror(self, transient):
         """ReadTimeout (empty str) and a raw OSError that httpx did not re-wrap
         both retry instead of escaping the loop (2026-04-20 incidents)."""
-        answers = [*_handshake(), transient, transient, _response()]
+        answers = [*_handshake(), transient, *_handshake(), transient, *_handshake(), _response()]
         with _scripted(answers) as transport:
             result = await _session((0.0, 0.0)).call_tool('t', {})
 
@@ -273,7 +308,7 @@ class TestClientOpIdInjection:
     async def test_same_client_op_id_across_transport_retries(self):
         """Bodies are snapshotted per post(): the payload is re-serialized each attempt."""
         bodies: list[dict] = []
-        answers = iter([*_handshake(), httpx.ConnectError('x'), _response()])
+        answers = iter([*_handshake(), httpx.ConnectError('x'), *_handshake(), _response()])
 
         async def capture_post(*args, **kwargs):
             bodies.append(copy.deepcopy(kwargs['json']))
@@ -314,7 +349,7 @@ class TestClientOpIdInjection:
         assert all('client_op_id' in body['params']['arguments'] for body in transport.posted()[2:])
 
 
-class TestNotifyRetry:
+class TestHandshakeRetry:
     async def test_notification_is_the_second_post_and_carries_no_id(self):
         with _scripted(_handshake()) as transport:
             await _session().initialize()
@@ -323,14 +358,17 @@ class TestNotifyRetry:
         assert notification['method'] == 'notifications/initialized'
         assert 'id' not in notification
 
-    async def test_retries_on_connect_error(self):
-        answers = [_response(), httpx.ConnectError('refused'), _response(status_code=200)]
+    async def test_a_failed_notification_restarts_the_handshake(self):
+        """The session it would have confirmed is dropped, so initialize runs again."""
+        answers = [_response(session_id='lost'), httpx.ConnectError('refused'), *_handshake('kept')]
         with _scripted(answers) as transport:
             await _session((0.0,)).initialize()
 
         assert transport.posted_methods() == [
-            'initialize', 'notifications/initialized', 'notifications/initialized',
+            'initialize', 'notifications/initialized', 'initialize', 'notifications/initialized',
         ]
+        assert transport.session_header(2) is None
+        assert transport.session_header(3) == 'kept'
 
 
 class TestInjectedRetrySchedule:
@@ -339,12 +377,12 @@ class TestInjectedRetrySchedule:
     FIXED = (0.5, 1.5, 3.0, 6.0)
 
     async def test_request_consumes_the_schedule_until_recovery(self):
-        answers = [*_handshake(), *[httpx.ConnectError('refused')] * 4, _response()]
+        answers = [*_handshake(), *[httpx.ConnectError('refused')] * 4, *_handshake(), _response()]
         with _scripted(answers) as transport:
             result = await _session(self.FIXED).call_tool('t', {})
 
         assert result['result'] == {'ok': True}
-        assert transport.posted_methods().count('tools/call') == 5
+        assert transport.posted_methods()[-1] == 'tools/call'
         assert [c.args[0] for c in transport.sleep.call_args_list] == list(self.FIXED)
 
     async def test_request_exhausts_the_schedule(self):
@@ -357,12 +395,12 @@ class TestInjectedRetrySchedule:
         assert transport.client.post.call_count == 5
         assert '5 attempts' in str(excinfo.value)
 
-    async def test_notify_consumes_the_schedule(self):
-        answers = [_response(), *[httpx.ConnectError('refused')] * 4, _response(status_code=202)]
+    async def test_the_handshake_consumes_the_schedule(self):
+        answers = [_response(), *[httpx.ConnectError('refused')] * 4, *_handshake()]
         with _scripted(answers) as transport:
             await _session(self.FIXED).initialize()
 
-        assert transport.client.post.call_count == 6
+        assert transport.client.post.call_count == 7
         assert [c.args[0] for c in transport.sleep.call_args_list] == list(self.FIXED)
 
     async def test_the_default_schedule_is_a_single_attempt(self):
@@ -441,6 +479,21 @@ class TestAgainstStubServer:
 
         assert methods == ['initialize', 'notifications/initialized', 'tools/list']
         assert body['result'] == {'tools': []}
+
+    async def test_a_stateful_retry_lands_in_a_fresh_session(self):
+        """The dropped session is re-handshaken, so the retry is not refused 'Missing session ID'."""
+        with StubMcpServer(stateful=True, unavailable_tool_calls=1) as server:
+            session = McpSession(server.url, client_name='c', retry_backoffs=(0.0,))
+            body = await session.call_tool('update_task', {'id': '7'})
+            requests = server.requests
+            minted = server.minted_session_ids
+
+        tool_calls = [r for r in requests if r.body['method'] == 'tools/call']
+        assert body['result']['structuredContent'] == {'success': True}
+        assert len(minted) == 2
+        assert [r.headers.get('mcp-session-id') for r in tool_calls] == list(minted)
+        op_ids = {r.body['params']['arguments']['client_op_id'] for r in tool_calls}
+        assert len(op_ids) == 1
 
     async def test_an_undecodable_body_is_a_typed_failure(self):
         with (

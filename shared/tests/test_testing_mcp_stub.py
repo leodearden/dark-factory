@@ -167,6 +167,16 @@ class TestEitherMode:
             first.path = "/elsewhere"  # type: ignore[misc]
 
 
+    def test_unavailable_tool_calls_are_503_then_served(self, stateful):
+        with StubMcpServer(stateful=stateful, unavailable_tool_calls=1) as server:
+            session_id = _open_session(server)
+            refused = _post(server, TOOLS_CALL, session_id=session_id)
+            served = _post(server, TOOLS_CALL, session_id=session_id)
+        assert refused.status_code == 503
+        assert served.status_code == 200
+        assert decode_mcp_response_body(served)["result"]["structuredContent"]
+
+
 @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
 class TestFailureAnswers:
     """A scripted answer replaces only the tools/call reply; the handshake still works."""

@@ -356,7 +356,8 @@ async def call_mcp_tool(
 
     Returns ``None``, always with a warning, when no reply dict arrived: any
     failure :func:`check_mcp_post_response` reports, or any shape
-    ``parse_tool_result`` refuses — a ``result.isError`` answer
+    ``parse_tool_result`` refuses — a JSON-RPC error
+    (``EnvelopeShape.JSON_RPC_ERROR``), a ``result.isError`` answer
     (``EnvelopeShape.IS_ERROR``) or a text block that is not a JSON object.
     Propagates a transport exception from ``client.post``, as
     :func:`post_mcp_tool_call` does.

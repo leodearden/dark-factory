@@ -69,6 +69,9 @@ class EnvelopeShape(enum.StrEnum):
     IS_ERROR = 'IS_ERROR'
     """``result.isError`` is set; an error reply is never a value."""
 
+    JSON_RPC_ERROR = 'JSON_RPC_ERROR'
+    """The JSON-RPC body carries an ``error`` member, so there is no tool result."""
+
 
 # ---------------------------------------------------------------------------
 # EnvelopeParseError
@@ -130,6 +133,8 @@ def _first_text_block(content: Any) -> dict | None:
 
 def _payload_of(result: dict, key: str | None) -> tuple[Any, EnvelopeParseError | None]:
     """The tool's decoded payload: a dict ``structuredContent``, else the first text block."""
+    if result.get('error') is not None:
+        return _fail(EnvelopeShape.JSON_RPC_ERROR, key, result)
     inner_result = result.get('result')
     if not isinstance(inner_result, dict):
         return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
@@ -160,8 +165,9 @@ def parse_tool_result(
     **Standard mode** (``key`` is a non-``None`` string):
 
     Returns ``(value, None)`` **only** when:
-    - *result* is a dict whose ``result.isError`` is not set (``IS_ERROR`` is
-      checked before anything else, so an error reply is never a value),
+    - *result* is a dict with no JSON-RPC ``error`` member (``JSON_RPC_ERROR``)
+      and whose ``result.isError`` is not set (``IS_ERROR``) — both are
+      checked before anything else, so an error reply is never a value,
     - the payload is ``result.structuredContent`` when that is a dict, or
       otherwise ``json.loads`` of the first ``type=='text'`` block's ``text``,
     - the payload (after optional ``{data:{…}}`` unwrap) is a dict,
@@ -174,8 +180,9 @@ def parse_tool_result(
     the inner payload is a dict and ``isinstance(inner, expected_type)`` holds
     (callers should pass ``expected_type=dict``; a mismatched type fails with
     ``WRONG_TYPE``).  ``KEY_ABSENT`` does not apply — the entire inner dict is
-    returned as-is.  ``IS_ERROR``, ``NO_TEXT_BLOCK``, ``JSON_DECODE_ERROR``,
-    ``INNER_NOT_DICT``, ``WRONG_TYPE``, and ``RAISED`` still fail loud.
+    returned as-is.  ``JSON_RPC_ERROR``, ``IS_ERROR``, ``NO_TEXT_BLOCK``,
+    ``JSON_DECODE_ERROR``, ``INNER_NOT_DICT``, ``WRONG_TYPE``, and ``RAISED``
+    still fail loud.
 
     For **every** other outcome (including non-raising malformed payloads)
     exactly **one** ``logger.warning`` is emitted naming the shape, and the
@@ -184,8 +191,8 @@ def parse_tool_result(
     The invariant ``err is not None`` whenever ``value is None`` (and vice
     versa) is guaranteed — callers may branch on ``err is not None`` safely.
 
-    Processes only the **first** ``type=='text'`` block ("first text block
-    wins"), mirroring the scheduler's ``_parse_tool_text_result``.
+    When ``structuredContent`` is not a dict, only the first ``type=='text'``
+    block is read.
     """
     try:
         if not isinstance(result, dict):

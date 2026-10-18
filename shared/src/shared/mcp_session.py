@@ -1,4 +1,6 @@
-"""The one MCP client every package uses, async and sync.
+"""The MCP client the orchestrator and scripts use, async and sync.
+
+The dashboard still carries its own twin; ``shared/mcp_post.py`` tracks it.
 
 :class:`McpSession` serves long-lived async processes: a Streamable-HTTP
 session with the ``initialize`` handshake, transport retries on a schedule the
@@ -19,9 +21,9 @@ import asyncio
 import enum
 import json
 import logging
-from collections.abc import Mapping, Sequence
-from types import TracebackType
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from types import MappingProxyType, TracebackType
+from typing import Any, TypeVar
 
 import httpx
 
@@ -40,6 +42,8 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+_T = TypeVar('_T')
+
 MCP_PROTOCOL_VERSION = '2025-03-26'
 
 
@@ -48,7 +52,7 @@ class McpFailureKind(enum.StrEnum):
     """No usable HTTP answer: connection or timeout after retries, or a redirect loop."""
 
     HTTP_STATUS = 'HTTP_STATUS'
-    """A non-2xx answer."""
+    """A non-2xx answer, ``status`` naming it: a 502/503/504 only once retries run out."""
 
     UNDECODABLE = 'UNDECODABLE'
     """The body is neither JSON nor SSE-framed JSON, an empty answer included."""
@@ -123,9 +127,9 @@ def is_timeout_failure(exc: BaseException) -> bool:
 
     Inverts the wrap performed below: ``McpSession`` retries
     ``httpx.TimeoutException`` along with the rest of
-    ``_RETRYABLE_EXCEPTIONS`` and, on exhaustion, re-raises a plain
-    ``McpCallError(...) from last_exc``. That erases the timeout from the
-    exception's TYPE while preserving it as ``__cause__`` — so a caller
+    ``_RETRYABLE_EXCEPTIONS`` and, on exhaustion, raises a plain
+    ``McpCallError`` from the last failure's cause. That erases the timeout
+    from the exception's TYPE while preserving it as ``__cause__`` — so a caller
     holding the raised error cannot tell a service that is alive and slow
     from one that is unreachable by an ``isinstance`` check, only by
     unwrapping. This is that unwrap, and it lives here, beside the wrap it
@@ -177,11 +181,31 @@ def _decoded(method: str, resp: httpx.Response) -> Any:
         ) from exc
 
 
+class _Transient(Exception):
+    """One attempt's retryable failure; ``status`` is set when it was a gateway answer."""
+
+    def __init__(self, cause: Exception, *, status: int | None = None) -> None:
+        super().__init__(f'{type(cause).__name__}: {cause}')
+        self.cause = cause
+        self.status = status
+
+    def exhausted(self, label: str, attempts: int) -> McpCallError:
+        kind = McpFailureKind.TRANSPORT if self.status is None else McpFailureKind.HTTP_STATUS
+        return McpCallError(
+            kind, f'MCP {label} failed after {attempts} attempts: {self}', status=self.status,
+        )
+
+
 class McpSession:
     """An MCP Streamable-HTTP session for a long-lived async process.
 
     *retry_backoffs* is the sleep before each retry of a transient failure, so
     ``len(retry_backoffs) + 1`` attempts are made; the default ``()`` makes one.
+    One schedule covers a whole logical call, its handshake included. A
+    transient failure drops the session, since a restarted server has
+    forgotten it, so the next attempt runs the handshake again before it
+    re-posts the same request, ``client_op_id`` and all.
+
     ``call_tool`` returns the JSON-RPC body as the server sent it, a JSON-RPC
     error or ``result.isError`` reply included: reading the tool's verdict is
     ``shared.mcp_envelope.parse_tool_result``'s job.
@@ -204,13 +228,7 @@ class McpSession:
 
     async def initialize(self) -> None:
         """Run the ``initialize`` + ``notifications/initialized`` handshake, once."""
-        if self._initialized:
-            return
-        result = await self._request('initialize', _initialize_params(self._client_name))
-        logger.debug('MCP initialize response: %s', json.dumps(result)[:200])
-        await self._notify('notifications/initialized')
-        self._initialized = True
-        logger.info('MCP session initialized (session_id=%s)', self._session_id)
+        await self._with_retries('initialize', self._ensure_handshake)
 
     async def call(
         self,
@@ -219,37 +237,63 @@ class McpSession:
         *,
         timeout: float = 30,
     ) -> dict:
-        """Send one JSON-RPC request, initializing the session first if needed."""
-        await self.initialize()
-        return await self._request(method, _detached(params), timeout=timeout)
+        """Send one JSON-RPC request, running the handshake first if needed."""
+        detached = _detached(params)
+        # Once per logical call, before any attempt, so every retry posts the
+        # same key.
+        maybe_inject_client_op_id(method, detached)
+        payload = self._message(method, detached)
+
+        async def attempt() -> dict:
+            await self._ensure_handshake()
+            return await self._exchange(payload, timeout)
+
+        return await self._with_retries(method, attempt)
 
     async def call_tool(
         self,
         name: str,
         arguments: Mapping[str, Any],
+        *,
         timeout: float = 30,
     ) -> dict:
         """Call the MCP tool *name* and return the JSON-RPC body."""
         return await self.call('tools/call', {'name': name, 'arguments': arguments}, timeout=timeout)
 
-    def _next_id(self) -> int:
+    def _message(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
         self._request_id += 1
-        return self._request_id
-
-    async def _request(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout: float = 30,
-    ) -> dict:
-        payload: dict[str, Any] = {'jsonrpc': '2.0', 'id': self._next_id(), 'method': method}
+        message: dict[str, Any] = {'jsonrpc': '2.0', 'id': self._request_id, 'method': method}
         if params is not None:
-            payload['params'] = params
-        # Once per logical call, before the retry loop, so every retry posts
-        # the same key (payload holds params by reference).
-        maybe_inject_client_op_id(method, params)
-        resp = await self._send(method, payload, timeout=timeout, retry_statuses=_RETRYABLE_STATUS)
+            message['params'] = params
+        return message
+
+    async def _with_retries(self, label: str, attempt: Callable[[], Awaitable[_T]]) -> _T:
+        attempts = len(self._retry_backoffs) + 1
+        made = 0
+        while True:
+            made += 1
+            try:
+                return await attempt()
+            except _Transient as failure:
+                self._drop_session(label, made, attempts, failure)
+                if made == attempts:
+                    raise failure.exhausted(label, attempts) from failure.cause
+            await asyncio.sleep(self._retry_backoffs[made - 1])
+
+    async def _ensure_handshake(self) -> None:
+        if self._initialized:
+            return
+        initialize = self._message('initialize', _initialize_params(self._client_name))
+        result = await self._exchange(initialize, 30)
+        logger.debug('MCP initialize response: %s', json.dumps(result)[:200])
+        await self._notify('notifications/initialized')
+        self._initialized = True
+        logger.info('MCP session initialized (session_id=%s)', self._session_id)
+
+    async def _exchange(self, message: dict[str, Any], timeout: float) -> Any:
+        """POST *message* once and decode the answer, capturing a minted session id."""
+        method = message['method']
+        resp = await self._post(method, message, timeout, transient_statuses=_RETRYABLE_STATUS)
         result = _decoded(method, resp)
         session_id = resp.headers.get('mcp-session-id')
         if session_id:
@@ -257,62 +301,47 @@ class McpSession:
         return result
 
     async def _notify(self, method: str) -> None:
-        payload = {'jsonrpc': '2.0', 'method': method}
-        resp = await self._send(
-            f'notify {method}', payload, timeout=10, retry_statuses=frozenset(),
-        )
+        label = f'notify {method}'
+        message = {'jsonrpc': '2.0', 'method': method}
+        resp = await self._post(label, message, 10, transient_statuses=frozenset())
         if resp.status_code not in (200, 202, 204):
             logger.warning(
                 'Notification %s returned %d: %s', method, resp.status_code, resp.text[:200],
             )
 
-    async def _send(
+    async def _post(
         self,
         label: str,
-        payload: dict[str, Any],
-        *,
+        message: dict[str, Any],
         timeout: float,
-        retry_statuses: frozenset[int],
+        *,
+        transient_statuses: frozenset[int],
     ) -> httpx.Response:
-        """POST *payload*, retrying transient failures on the injected schedule."""
-        attempts = len(self._retry_backoffs) + 1
-        last_exc: Exception | None = None
-        for attempt in range(attempts):
-            try:
-                resp = await self._post_once(payload, timeout)
-            except _RETRYABLE_EXCEPTIONS as exc:
-                last_exc = exc
-            except httpx.HTTPError as exc:
-                raise McpCallError(
-                    McpFailureKind.TRANSPORT, f'MCP {label} failed: {type(exc).__name__}: {exc}',
-                ) from exc
-            else:
-                if resp.status_code not in retry_statuses:
-                    return resp
-                last_exc = httpx.HTTPStatusError(
-                    f'{resp.status_code}', request=resp.request, response=resp,
+        """POST *message* once; a retryable failure raises :class:`_Transient`."""
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                resp = await client.post(
+                    self.mcp_endpoint,
+                    json=message,
+                    headers=_request_headers(self._session_id),
+                    timeout=timeout,
                 )
-            self._drop_session(label, attempt, attempts, last_exc)
-            if attempt < len(self._retry_backoffs):
-                await asyncio.sleep(self._retry_backoffs[attempt])
-        raise McpCallError(
-            McpFailureKind.TRANSPORT,
-            f'MCP {label} failed after {attempts} attempts: {type(last_exc).__name__}: {last_exc}',
-        ) from last_exc
-
-    async def _post_once(self, payload: dict[str, Any], timeout: float) -> httpx.Response:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            return await client.post(
-                self.mcp_endpoint,
-                json=payload,
-                headers=_request_headers(self._session_id),
-                timeout=timeout,
+        except _RETRYABLE_EXCEPTIONS as exc:
+            raise _Transient(exc) from exc
+        except httpx.HTTPError as exc:
+            raise McpCallError(
+                McpFailureKind.TRANSPORT, f'MCP {label} failed: {type(exc).__name__}: {exc}',
+            ) from exc
+        if resp.status_code in transient_statuses:
+            cause = httpx.HTTPStatusError(
+                f'HTTP {resp.status_code}', request=resp.request, response=resp,
             )
+            raise _Transient(cause, status=resp.status_code)
+        return resp
 
-    def _drop_session(self, label: str, attempt: int, attempts: int, exc: Exception) -> None:
+    def _drop_session(self, label: str, made: int, attempts: int, failure: _Transient) -> None:
         logger.warning(
-            'MCP %s transient failure (attempt %d/%d): %s: %s',
-            label, attempt + 1, attempts, type(exc).__name__, exc,
+            'MCP %s transient failure (attempt %d/%d): %s', label, made, attempts, failure,
         )
         self._session_id = None
         self._initialized = False
@@ -327,11 +356,17 @@ def _rpc_result(method: str, resp: httpx.Response) -> Any:
     return body
 
 
+# Every other shape parse_tool_result refuses is a REPLY_SHAPE failure.
+_REFUSAL_KINDS: Mapping[EnvelopeShape, McpFailureKind] = MappingProxyType({
+    EnvelopeShape.JSON_RPC_ERROR: McpFailureKind.JSON_RPC_ERROR,
+    EnvelopeShape.IS_ERROR: McpFailureKind.TOOL_ERROR,
+})
+
+
 def _tool_reply(name: str, body: Any) -> dict:
     reply, err = parse_tool_result(body, None, dict)
     if err is not None:
-        is_error = err.shape is EnvelopeShape.IS_ERROR
-        kind = McpFailureKind.TOOL_ERROR if is_error else McpFailureKind.REPLY_SHAPE
+        kind = _REFUSAL_KINDS.get(err.shape, McpFailureKind.REPLY_SHAPE)
         raise McpCallError(
             kind, f'MCP tool {name} reply refused ({err.shape}): {err.payload_prefix}',
         ) from err
@@ -381,7 +416,7 @@ class SyncMcpSession:
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict:
         """Call the MCP tool *name* and return its reply dict."""
         payload = self._request('tools/call', {'name': name, 'arguments': dict(arguments)})
-        return _tool_reply(name, _rpc_result('tools/call', self._post('tools/call', payload)))
+        return _tool_reply(name, _decoded('tools/call', self._post('tools/call', payload)))
 
     def _handshake(self) -> None:
         payload = self._request('initialize', _initialize_params(self._client_name))

@@ -23,7 +23,7 @@ ASYNC_EXPECTED: dict[StubAnswer, McpFailureKind | EnvelopeShape] = {
     StubAnswer.NON_JSON_TEXT: EnvelopeShape.JSON_DECODE_ERROR,
     StubAnswer.EMPTY_202: McpFailureKind.UNDECODABLE,
     StubAnswer.REDIRECT_307: McpFailureKind.TRANSPORT,
-    StubAnswer.JSON_RPC_ERROR: EnvelopeShape.NO_TEXT_BLOCK,
+    StubAnswer.JSON_RPC_ERROR: EnvelopeShape.JSON_RPC_ERROR,
 }
 
 SYNC_EXPECTED: dict[StubAnswer, McpFailureKind] = {

@@ -147,6 +147,13 @@ _ABNORMAL_CASES = [
     (EnvelopeShape.WRONG_TYPE, _env({"ptr": None}), "ptr", dict),
     # IS_ERROR — result.isError is set, even though the text looks like success
     (EnvelopeShape.IS_ERROR, _is_error_env(), "k", dict),
+    # JSON_RPC_ERROR — the body carries an error member instead of a result
+    (
+        EnvelopeShape.JSON_RPC_ERROR,
+        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "Invalid params"}},
+        "k",
+        dict,
+    ),
 ]
 
 # Build the JSON_DECODE_ERROR case properly (None slot was placeholder)
@@ -170,6 +177,7 @@ _ABNORMAL_CASES[5] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", di
         "wrong_type",
         "wrong_type_none_value",
         "is_error",
+        "json_rpc_error",
     ],
 )
 class TestAbnormalShapes:

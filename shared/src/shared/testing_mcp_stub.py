@@ -6,7 +6,9 @@ session ID', an unknown id is 404, answers are SSE-framed, and DELETE releases
 the session. STATELESS mode imitates fused-memory: no session, JSON answers.
 Both redirect ``/mcp/`` to ``/mcp`` with a 307 and refuse a POST whose Accept
 lacks the needed media types with a 406. ``tools/call`` can be scripted to fail
-in each way a client must not mistake for success (:class:`StubAnswer`).
+in each way a client must not mistake for success (:class:`StubAnswer`), and
+its first *unavailable_tool_calls* requests can be answered 503, as a gateway
+answers while the server behind it restarts.
 
 Real sockets rather than patching a client's modules: the session header, path
 and Accept a client sends are wire facts the server observes in
@@ -86,9 +88,11 @@ class StubMcpServer:
         stateful: bool,
         answer: StubAnswer = StubAnswer.OK,
         payload: Mapping[str, Any] = _DEFAULT_PAYLOAD,
+        unavailable_tool_calls: int = 0,
     ) -> None:
         self._stateful = stateful
         self._answer = answer
+        self._unavailable_left = unavailable_tool_calls
         self._payload_text = json.dumps(dict(payload))
         self._lock = threading.Lock()
         self._requests: list[RecordedRequest] = []
@@ -162,6 +166,8 @@ class StubMcpServer:
         message = request.body
         if not isinstance(message, dict) or not isinstance(message.get('method'), str):
             return _rpc_error(400, 'Parse error')
+        if self._gateway_unavailable(message['method']):
+            return _Reply(503, b'Service Unavailable', 'text/plain')
         session_id, refusal = self._session_for(message['method'], request.headers)
         if refusal is not None:
             return refusal
@@ -176,6 +182,15 @@ class StubMcpServer:
         if not has_json:
             return _rpc_error(406, 'Not Acceptable: Client must accept application/json')
         return None
+
+    def _gateway_unavailable(self, method: str) -> bool:
+        if method != 'tools/call':
+            return False
+        with self._lock:
+            if self._unavailable_left == 0:
+                return False
+            self._unavailable_left -= 1
+            return True
 
     def _session_for(
         self, method: str, headers: Mapping[str, str],
