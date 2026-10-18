@@ -4075,13 +4075,11 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
-            # Every key written here is an ATTACH_OWNED_KEY except
-            # TRIAGE_CONTESTED_METADATA_KEY, which is safe to overwrite because
-            # any caller value was discarded above (the gate suite's pin unions
-            # it in). Overwriting the others is safe ONLY because
-            # `caller_owns_attach_keys` force-stored every write that carried
-            # any one of them — so none can be present here. Adding a key to
-            # this dict without adding it to
+            # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
+            # marker excepted: TestOnlyTriageWritesTheTriageContestMarker), and
+            # overwriting them is safe ONLY because `caller_owns_attach_keys`
+            # force-stored every write that carried any one of them — so none
+            # can be present here. Adding a key to this dict without adding it to
             # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
             # pins the two sets against each other for exactly that reason,
             # unioned across the outcomes because they no longer write the

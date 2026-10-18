@@ -136,11 +136,9 @@ FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 #: flagged in a way nothing reads.
 #: ``tests/server/test_add_memory_write_triage_gate.py`` pins this set against
 #: the keys ``tools.py`` actually writes, so a FOURTH key added to the attach
-#: without widening this set fails there rather than silently. The one
-#: deliberate exception is ``memory_metadata.TRIAGE_CONTESTED_METADATA_KEY``:
-#: the contested attach writes it, but it is never caller-owned because
-#: ``tools.py`` discards a caller's value, so it is NOT in this set and the pin
-#: unions it in.
+#: without widening this set fails there rather than silently. The
+#: triage-contest marker is the one exception: see that suite's
+#: ``TestOnlyTriageWritesTheTriageContestMarker``.
 ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
     PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY,
 })
