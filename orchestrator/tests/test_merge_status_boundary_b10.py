@@ -19,6 +19,7 @@ import json
 import os
 import sqlite3
 import statistics
+import time
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import closing
 from dataclasses import dataclass
@@ -28,7 +29,6 @@ from types import MappingProxyType
 from typing import Any
 
 import pytest
-from _latency_windows import remeasure_until_p99_within, time_window
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from fastmcp.tools.function_tool import FunctionTool
@@ -40,8 +40,6 @@ pytestmark = pytest.mark.xdist_group('merge_status_boundary_b10')
 
 _BOUND_MS = 50.0
 _SAMPLES = 200
-_REMEASURE_BUDGET_S = 90.0
-_REMEASURE_PAUSE_S = 1.0
 _ABSENT = 'absent-from-every-run'
 
 
@@ -232,6 +230,16 @@ _SHAPES: Mapping[str, _Shape] = MappingProxyType({
 
 def _replay(store: EventStore, reads: tuple[_Read, ...]) -> list[object]:
     return [read.issue(store) for read in reads]
+
+
+def _replay_durations_ms(store: EventStore, reads: tuple[_Read, ...], samples: int) -> list[float]:
+    """Replays *reads* *samples* times back to back, timing each replay on the wall clock."""
+    durations_ms: list[float] = []
+    for _ in range(samples):
+        start = time.perf_counter()
+        _replay(store, reads)
+        durations_ms.append((time.perf_counter() - start) * 1000.0)
+    return durations_ms
 
 
 async def _recorded_reads(store: EventStore, shape: str, escalations: Path) -> tuple[_Read, ...]:
