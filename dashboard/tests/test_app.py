@@ -546,7 +546,9 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
     assert len(_bug_warnings(caplog)) == 1, _bug_warnings(caplog)
 
 
-def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client, caplog):
+def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
+    client, monkeypatch, tmp_path, caplog,
+):
     """The window degrades to unknown by the same rule as a root's snapshot.
 
     A ``lower_bound`` datum with no reason breaks the envelope. The key still
@@ -555,6 +557,8 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client,
     import logging
     from datetime import UTC, datetime
 
+    from _canned_mcp import CannedMCP
+
     from dashboard.data.datum import Datum, DatumInvariant, DatumState
     from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
 
@@ -562,15 +566,15 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client,
     unexplained = Datum(
         [], datetime.now(UTC), DatumState.LOWER_BOUND, None, FRESHNESS_BOUND_SECONDS,
     )
-    _install_roots(client, [Path('/proj') / label])
+    _install_terminal_roots(client, tmp_path, [label])
     with patch(
-        'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], _snapshots([label]))),
-    ), patch(
         'dashboard.api.tasks.acquire_terminal_window',
         new=AsyncMock(return_value=unexplained),
     ), caplog.at_level(logging.WARNING):
-        resp = client.get(f'/api/v2/dashboard/tasks?terminal={label}')
+        resp = _get_over_the_substrate(
+            client, monkeypatch, CannedMCP(),
+            f'/api/v2/dashboard/tasks?terminal={label}',
+        )
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -946,51 +950,84 @@ def _terminal_row(task_id, status='done'):
     }
 
 
-def _terminal_render(
-    client, monkeypatch, *, terminal, labels=('dark-factory',),
-    terminal_rows=(), done=None, window=None, count_unknown=(),
-):
-    """``GET /tasks?terminal=<terminal>`` over a canned substrate; ``(body, calls)``.
+def _install_terminal_roots(client, tmp_path, labels):
+    """One real directory per label under *tmp_path*, installed as the running roster.
 
-    The collector and the roster are canned so the CENSUS the window
-    is positioned from is known exactly — the window's offset is a function of
-    the terminal population, so a test that cannot state that population
-    cannot check the offset. ``mcp_tool_call`` is left REAL underneath, so the
-    terminal read is asserted at the wire: "the handler discards the rows
-    afterwards" is precisely the defect, and which rows the server was asked
-    for is observable nowhere else.
+    ``dataclasses.replace`` of the running config rather than a fresh one, so
+    the ``client`` fixture's dead-port fused-memory URL is kept: a seam the
+    canned substrate does not cover fails fast instead of dialing a live
+    service.
     """
+    roots = [tmp_path / label for label in labels]
+    for root in roots:
+        root.mkdir(parents=True, exist_ok=True)
+    client.app.state.config = dataclasses.replace(
+        client.app.state.config,
+        project_root=roots[0], known_project_roots=list(roots[1:]),
+    )
+    return roots
+
+
+def _get_over_the_substrate(client, monkeypatch, canned, url):
+    """GET *url* with only ``mcp_tool_call`` canned and the runtime probe empty, on a cold unit.
+
+    Everything above the substrate is real: the handler, the collectors,
+    ``acquire_snapshot`` and its cache. The probe is stubbed because the full
+    collector still runs it and it must dial no orchestrator. The unit cache
+    and the root rotation start, and are left, empty.
+    """
+    import dashboard.data.active_tasks as active_tasks_mod
+    import dashboard.data.task_snapshot as snapshot_mod
+
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_runtime', AsyncMock(return_value={}),
+    )
+    snapshot_mod._snapshot_cache_clear()
+    active_tasks_mod._reset_root_rotation()
+    try:
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            return client.get(url)
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+        active_tasks_mod._reset_root_rotation()
+
+
+def _terminal_render(
+    client, monkeypatch, tmp_path, *, terminal, labels=('dark-factory',),
+    terminal_rows=(), window=None, count_unknown=(),
+):
+    """``GET /tasks?terminal=<terminal>`` over the canned substrate; ``(body, calls)``.
+
+    The CENSUS the window is positioned from is measured from *terminal_rows*
+    themselves, so the census and the rows cannot disagree — the window's
+    offset is a function of the terminal population, so a test that cannot
+    state that population cannot check the offset. Every *count_unknown*
+    root's status-map read times out, which leaves its census UNKNOWN.
+
+    The terminal read is asserted at the wire: "the handler discards the rows
+    afterwards" is precisely the defect, and which rows the server was asked
+    for is observable nowhere else. ``conftest.py::client`` runs with the
+    samplers off, so the call log holds only this request's own reads.
+    """
+    from _canned_mcp import CannedMCP
+
     import dashboard.data.task_snapshot as snapshot_mod
 
     if window is not None:
         monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
-
-    roots = [Path('/proj') / label for label in labels]
-    calls: list[dict] = []
-
-    async def _mcp(http_client, url, tool, args, **kwargs):
-        # kwargs is kept: the per-request budget rides as ``timeout=`` and is
-        # assertable at the wire nowhere else.
-        calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
-        if tool == 'get_statuses':
-            return {'statuses': {}}
-        rows = sorted(terminal_rows, key=lambda row: int(row['id']))  # ORDER BY id ASC
-        statuses = args.get('statuses')
-        if statuses is not None:
-            rows = [row for row in rows if row.get('status') in statuses]
-        page_size = args.get('page_size')
-        if page_size is not None:
-            start = args.get('offset') or 0
-            rows = rows[start:start + page_size]
-        return {'tasks': rows}
-
-    snapshots = _snapshots(labels, count_unknown=count_unknown, done=done)
-    _install_roots(client, roots)
-    with patch(
-        'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], snapshots)),
-    ), patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
-        resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
+    _install_terminal_roots(client, tmp_path, labels)
+    canned = CannedMCP(
+        rows=terminal_rows,
+        status_map={int(row['id']): row['status'] for row in terminal_rows},
+    )
+    unmeasured = {str(tmp_path / label) for label in count_unknown}
+    canned.fail_when = lambda call: (
+        call['tool'] == 'get_statuses'
+        and call['args'].get('project_root') in unmeasured
+    )
+    resp = _get_over_the_substrate(
+        client, monkeypatch, canned, f'/api/v2/dashboard/tasks?terminal={terminal}',
+    )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     # data.js::ON_DEMAND_KEYS.terminal.key names the body key AND the DF_DATA
@@ -1001,7 +1038,7 @@ def _terminal_render(
         'the window must answer under the ONE flat key the client reads, and '
         f'under no other terminal key; got {_terminal_keys(body)}'
     )
-    return body, calls
+    return body, canned.calls
 
 
 def _terminal_keys(body):
@@ -1009,8 +1046,23 @@ def _terminal_keys(body):
     return sorted(key for key in body if key.startswith('TASKS_TERMINAL'))
 
 
+def _reads_terminal_rows(statuses):
+    """Whether a task read filtered to *statuses* can return a terminal row.
+
+    ``None`` is the whole tree, terminal rows included.
+    """
+    from shared.task_statuses import TERMINAL
+
+    return statuses is None or bool(TERMINAL & set(statuses))
+
+
 def _terminal_get_tasks(calls):
-    return [call for call in calls if call['tool'] == 'get_tasks']
+    """The ``get_tasks`` calls that read terminal rows: the window, never the unit's ACTIVE read."""
+    return [
+        call for call in calls
+        if call['tool'] == 'get_tasks'
+        and _reads_terminal_rows(call['args'].get('statuses'))
+    ]
 
 
 # The REAL client's on-demand path, run over a body handed in on stdin. The
@@ -1067,7 +1119,7 @@ class TestTerminalWindow:
     """
 
     def test_the_window_is_a_lower_bound_datum_naming_the_bound(
-        self, client, monkeypatch
+        self, client, monkeypatch, tmp_path
     ):
         """(a) The disclosure IS the state: a windowed read under-reports, and says so.
 
@@ -1081,9 +1133,8 @@ class TestTerminalWindow:
         from dashboard.data.task_snapshot import _TERMINAL_FETCH_WINDOW
 
         body, _calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
+            client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
         )
 
         entry = body['TASKS_TERMINAL:dark-factory']
@@ -1111,7 +1162,9 @@ class TestTerminalWindow:
             f'newest {_TERMINAL_FETCH_WINDOW}"; got {entry["reason"]!r}'
         )
 
-    def test_the_window_reaches_the_high_id_end(self, client, monkeypatch):
+    def test_the_window_reaches_the_high_id_end(
+        self, client, monkeypatch, tmp_path
+    ):
         """(b) ``offset`` must select the NEWEST terminal rows, not the oldest.
 
         Relocated from ``TestShapeOneProjectNarrowing``. ``page_size``/
@@ -1119,9 +1172,9 @@ class TestTerminalWindow:
         the oldest terminal rows — the opposite of what the tab renders.
         """
         body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
+            client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10}, window=3,
+            window=3,
         )
 
         page = _terminal_get_tasks(calls)
@@ -1139,15 +1192,16 @@ class TestTerminalWindow:
         )
 
     def test_the_terminal_window_goes_through_fetch_task_page(
-        self, client, monkeypatch
+        self, client, monkeypatch, tmp_path
     ):
         """(b) The read that wants a PARTIAL answer names itself one.
 
         Relocated from ``TestShapeOneProjectNarrowing``. After task 5018 the
         partial-answer intent lives in the function name rather than in an
         argument combination, so a reader cannot mistake this for a whole-tree
-        read — and ``fetch_tasks``, the whole-set read, must not be reached at
-        all on this path.
+        read — and ``fetch_tasks``, the whole-set read, must not be asked for
+        a terminal row on this path. The unit's ACTIVE read is a whole-set
+        read of its own, and may go through it.
         """
         from shared.task_statuses import TERMINAL
 
@@ -1168,8 +1222,8 @@ class TestTerminalWindow:
         monkeypatch.setattr(snapshot_mod, 'fetch_task_page', _one_page)
 
         _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            done={'dark-factory': 10},
+            client, monkeypatch, tmp_path, terminal='dark-factory',
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
         )
 
         assert len(paged) == 1, f'exactly one windowed read, got {paged}'
@@ -1178,21 +1232,24 @@ class TestTerminalWindow:
         assert paged[0]['offset'] == max(
             0, 10 - snapshot_mod._TERMINAL_FETCH_WINDOW
         )
-        assert whole == [], (
+        terminal_whole = [
+            kwargs for kwargs in whole if _reads_terminal_rows(kwargs.get('statuses'))
+        ]
+        assert terminal_whole == [], (
             'the terminal window is a PARTIAL read and must not borrow the '
-            f'whole-set read to make it, got {whole}'
+            f'whole-set read to make it, got {terminal_whole}'
         )
 
     def test_no_truncation_warning_when_the_population_fits(
-        self, client, monkeypatch, caplog
+        self, client, monkeypatch, tmp_path, caplog
     ):
         """(c) n_terminal <= window → offset 0, every terminal row, no WARNING."""
         import logging
 
         body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
+            client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 106)],
-            done={'dark-factory': 6}, window=10,
+            window=10,
         )
 
         assert _terminal_get_tasks(calls)[0]['args'].get('offset') == 0
@@ -1204,7 +1261,7 @@ class TestTerminalWindow:
         ], 'no truncation WARNING may fire when the population fits the window'
 
     def test_truncation_warns_naming_project_and_counts(
-        self, client, monkeypatch, caplog
+        self, client, monkeypatch, tmp_path, caplog
     ):
         """(c) n_terminal > window → a WARNING naming project, count and window.
 
@@ -1216,9 +1273,9 @@ class TestTerminalWindow:
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.task_snapshot'):
             _terminal_render(
-                client, monkeypatch, terminal='dark-factory',
+                client, monkeypatch, tmp_path, terminal='dark-factory',
                 terminal_rows=[_terminal_row(i) for i in range(100, 112)],
-                done={'dark-factory': 12}, window=3,
+                window=3,
             )
 
         messages = [
@@ -1232,7 +1289,7 @@ class TestTerminalWindow:
         ), f'expected a truncation WARNING naming project/count/window, got {messages}'
 
     def test_an_unpositionable_window_is_unknown_not_the_oldest_rows(
-        self, client, monkeypatch
+        self, client, monkeypatch, tmp_path
     ):
         """(d) No census, no offset — and offset 0 would serve the OLDEST rows.
 
@@ -1244,7 +1301,7 @@ class TestTerminalWindow:
         newest. Emitting nothing and saying why is the honest failure.
         """
         body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
+            client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
             count_unknown=['dark-factory'], window=3,
         )
@@ -1267,7 +1324,7 @@ class TestTerminalWindow:
         assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['dark-factory']
 
     def test_an_unconfigured_project_is_unknown_not_a_500(
-        self, client, monkeypatch
+        self, client, monkeypatch, tmp_path
     ):
         """(e) A name that resolves to no root is answered, not crashed on.
 
@@ -1276,9 +1333,8 @@ class TestTerminalWindow:
         made.
         """
         body, calls = _terminal_render(
-            client, monkeypatch, terminal='no-such-project',
+            client, monkeypatch, tmp_path, terminal='no-such-project',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
         )
 
         entry = body['TASKS_TERMINAL:no-such-project']
@@ -1289,21 +1345,26 @@ class TestTerminalWindow:
         )
         assert _terminal_get_tasks(calls) == []
 
-    def test_no_terminal_query_carries_no_terminal_key(self, client):
+    def test_no_terminal_query_carries_no_terminal_key(
+        self, client, monkeypatch, tmp_path
+    ):
         """(f) No terminal key at all, bare or per-project — an empty one is a claim."""
-        with patch(
-            'dashboard.api.tasks.collect_tasks_with_counts',
-            new=AsyncMock(return_value=([], _snapshots(['dark-factory']))),
-        ):
-            resp = client.get('/api/v2/dashboard/tasks')
+        from _canned_mcp import CannedMCP
 
-        assert resp.status_code == 200
+        _install_terminal_roots(client, tmp_path, ['dark-factory'])
+        resp = _get_over_the_substrate(
+            client, monkeypatch, CannedMCP(), '/api/v2/dashboard/tasks',
+        )
+
+        assert resp.status_code == 200, resp.text
         body = resp.json()
         assert _terminal_keys(body) == []
-        assert set(body) == _TASKS_KEYS
+        assert 'dark-factory' in body['TASKS_SNAPSHOT'], (
+            f'no parameter is the default render: {sorted(body)}'
+        )
 
     def test_the_terminal_fetch_spends_the_third_roster_slot(
-        self, client, monkeypatch
+        self, client, monkeypatch, tmp_path
     ):
         """(g) The window is bounded by the budget the roster reserved for it.
 
@@ -1320,9 +1381,8 @@ class TestTerminalWindow:
         )
 
         _body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
+            client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
         )
 
         page = _terminal_get_tasks(calls)
@@ -1338,7 +1398,7 @@ class TestTerminalWindow:
         assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= _TASKS_PER_PROJECT_BUDGET
 
     def test_the_real_client_applies_the_window_this_endpoint_serves(
-        self, client, monkeypatch
+        self, client, monkeypatch, tmp_path
     ):
         """(h) Both halves of the key contract, run against each other.
 
@@ -1353,9 +1413,8 @@ class TestTerminalWindow:
         ``requestOnDemand`` fails on a rename on either side.
         """
         body, _calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
+            client, monkeypatch, tmp_path, terminal='dark-factory',
             terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
         )
 
         outcome, stored = _request_on_demand(body, 'dark-factory')
