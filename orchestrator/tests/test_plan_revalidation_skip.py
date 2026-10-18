@@ -523,7 +523,7 @@ async def _plan_falls_through_to_architect(f: _Fixture) -> None:
     assert f.invoke_called == [True]
 
 
-def _confirm_plan_architect(f: _Fixture) -> AsyncMock:
+def _confirm_plan_architect(f: _Fixture, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     """An architect that only calls confirm_plan(): every plan key is kept."""
     async def _confirm(_role, build_prompt, *args, **kwargs) -> AgentResult:
         await build_prompt()
@@ -537,7 +537,7 @@ def _confirm_plan_architect(f: _Fixture) -> AsyncMock:
         )
 
     invoke = AsyncMock(side_effect=_confirm)
-    f.wf._invoke = invoke  # type: ignore[method-assign]
+    monkeypatch.setattr(f.wf, '_invoke', invoke)
     return invoke
 
 
@@ -571,7 +571,9 @@ async def test_amended_description_declines_skip_6820(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_details_corrected_after_finalize_replans_and_restamps_4822(tmp_path: Path):
+async def test_details_corrected_after_finalize_replans_and_restamps_4822(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     """The 4822 incident (ADDED SCOPE): details corrected after the plan was
     finalized. The architect only confirms, yet the plan leaves _plan()
     carrying the fingerprint of the text it was just shown."""
@@ -580,7 +582,7 @@ async def test_details_corrected_after_finalize_replans_and_restamps_4822(tmp_pa
         task_details='Original scope. ADDED SCOPE: a 4822-shaped regression test.',
         plan_text_fp=task_text_fingerprint('d', 'Original scope.'),
     )
-    _confirm_plan_architect(f)
+    _confirm_plan_architect(f, monkeypatch)
 
     outcome = await f.wf._plan()
 
@@ -597,7 +599,7 @@ async def test_details_corrected_after_finalize_replans_and_restamps_4822(tmp_pa
         'plan_text_fp': plan['_task_text_fp'],
         'plan_authored_at': plan['_created_at'],
     }
-    assert mirror.kwargs['metadata_mode'] == 'merge'
+    assert mirror.kwargs == {}  # update_task's default: a shallow merge
     assert f.wf.task['metadata']['plan_text_fp'] == current_fp
 
 
@@ -683,14 +685,16 @@ async def test_gate_off_restores_the_pre_4031_skip(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_gate_off_still_stamps_authored_plans(tmp_path: Path):
+async def test_gate_off_still_stamps_authored_plans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     f = _make(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
         changed_files=['mod_a/file.py'],
         task_description='d, amended',
         plan_text_fp_gate_enabled=False,
     )
-    _confirm_plan_architect(f)
+    _confirm_plan_architect(f, monkeypatch)
 
     outcome = await f.wf._plan()
 
@@ -721,7 +725,9 @@ async def test_architect_is_told_of_drift_when_skip_is_disabled(tmp_path: Path):
     ids=['refused', 'raises'],
 )
 @pytest.mark.asyncio
-async def test_mirror_failure_never_fails_the_plan(tmp_path: Path, mirror_failure):
+async def test_mirror_failure_never_fails_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mirror_failure,
+):
     f = _make(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
         task_description='d, amended',
@@ -735,7 +741,7 @@ async def test_mirror_failure_never_fails_the_plan(tmp_path: Path, mirror_failur
         return True
 
     f.update_task.side_effect = _update_task
-    _confirm_plan_architect(f)
+    _confirm_plan_architect(f, monkeypatch)
 
     outcome = await f.wf._plan()
 
@@ -752,7 +758,9 @@ def _finalize_fixture_plan(f: _Fixture) -> None:
     plan_path.write_text(json.dumps(plan))
 
 
-def _untouching_architect(f: _Fixture, *, success: bool) -> None:
+def _untouching_architect(
+    f: _Fixture, monkeypatch: pytest.MonkeyPatch, *, success: bool,
+) -> None:
     """An architect that never calls confirm_plan(): budget-capped, or done early."""
     async def _leave_plan(_role, build_prompt, *args, **kwargs) -> AgentResult:
         await build_prompt()
@@ -760,7 +768,7 @@ def _untouching_architect(f: _Fixture, *, success: bool) -> None:
             success=success, output='', cost_usd=3.0, duration_ms=60_000, turns=40,
         )
 
-    f.wf._invoke = AsyncMock(side_effect=_leave_plan)  # type: ignore[method-assign]
+    monkeypatch.setattr(f.wf, '_invoke', AsyncMock(side_effect=_leave_plan))
 
 
 @pytest.mark.parametrize('success', [False, True], ids=['capped', 'no_confirm'])
@@ -769,7 +777,7 @@ def _untouching_architect(f: _Fixture, *, success: bool) -> None:
 )
 @pytest.mark.asyncio
 async def test_unconfirmed_revalidation_never_mints_a_fingerprint(
-    tmp_path: Path, success: bool, stale_fp: str | None,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, success: bool, stale_fp: str | None,
 ):
     """The amended text must not be certified onto a plan no architect re-read,
     or the drift would self-clear and the stale plan would skip forever."""
@@ -779,7 +787,7 @@ async def test_unconfirmed_revalidation_never_mints_a_fingerprint(
         plan_text_fp=stale_fp,
     )
     _finalize_fixture_plan(f)
-    _untouching_architect(f, success=success)
+    _untouching_architect(f, monkeypatch, success=success)
 
     outcome = await f.wf._plan()
 

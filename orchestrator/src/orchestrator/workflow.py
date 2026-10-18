@@ -5274,12 +5274,12 @@ class TaskWorkflow:
 
     async def _mirror_plan_text_fp(self, fp: str, authored_at: object) -> None:
         mirror = {'plan_text_fp': fp, 'plan_authored_at': authored_at}
+        # Best-effort: plan.json is authoritative. update_task's default is a
+        # shallow merge, so this two-key payload clobbers no sibling key.
         try:
-            if not await self.scheduler.update_task(
-                self.task_id, mirror, metadata_mode='merge',  # type: ignore[reportCallIssue]
-            ):
+            if not await self.scheduler.update_task(self.task_id, mirror):
                 logger.warning('Task %s: plan_text_fp mirror write refused', self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort; plan.json is authoritative
+        except Exception as exc:
             logger.warning('Task %s: plan_text_fp mirror write failed: %s', self.task_id, exc)
         self._mutable_task_metadata().update(mirror)
 

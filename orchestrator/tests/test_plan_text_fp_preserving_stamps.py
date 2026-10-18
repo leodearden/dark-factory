@@ -42,7 +42,9 @@ def _plan(task_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_iteration_stamp_keeps_the_authored_fingerprint(tmp_path: Path):
+async def test_iteration_stamp_keeps_the_authored_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     wf = _make_mock_workflow(tmp_path=tmp_path, max_execute_iterations=1)
     artifacts = wf.artifacts
     assert artifacts is not None
@@ -50,16 +52,19 @@ async def test_iteration_stamp_keeps_the_authored_fingerprint(tmp_path: Path):
     artifacts.stamp_plan_provenance(wf.session_id, task_text_fp=_AUTHORED_FP)
     wf.task['description'] = 'd, amended mid-execute'
     stamp = MagicMock(wraps=artifacts.stamp_plan_provenance)
-    artifacts.stamp_plan_provenance = stamp  # type: ignore[method-assign]
-    artifacts.get_pending_steps = MagicMock(return_value=[{'id': 'step-1'}])  # type: ignore[method-assign]
-    artifacts.validate_plan_owner = MagicMock(return_value=True)  # type: ignore[method-assign]
-    wf._invoke = AsyncMock(return_value=AgentResult(  # type: ignore[method-assign]
-        success=True, output='ok', timed_out=False, turns=2, cost_usd=0.0,
-    ))
-    wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
-    wf._get_head_commit = AsyncMock(return_value='const_sha')  # type: ignore[method-assign]
-    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)  # type: ignore[attr-defined]
-    wf.briefing.build_implementer_prompt = AsyncMock(return_value='impl-prompt')  # type: ignore[attr-defined]
+    for target, name, value in (
+        (artifacts, 'stamp_plan_provenance', stamp),
+        (artifacts, 'get_pending_steps', MagicMock(return_value=[{'id': 'step-1'}])),
+        (artifacts, 'validate_plan_owner', MagicMock(return_value=True)),
+        (wf, '_invoke', AsyncMock(return_value=AgentResult(
+            success=True, output='ok', timed_out=False, turns=2, cost_usd=0.0,
+        ))),
+        (wf, '_check_escalations', MagicMock(return_value=[])),
+        (wf, '_get_head_commit', AsyncMock(return_value='const_sha')),
+        (wf.git_ops, 'has_uncommitted_work', AsyncMock(return_value=False)),
+        (wf.briefing, 'build_implementer_prompt', AsyncMock(return_value='impl-prompt')),
+    ):
+        monkeypatch.setattr(target, name, value)
 
     await wf._execute_iterations()
 
@@ -79,7 +84,7 @@ def _wiping_replan(wf: TaskWorkflow) -> AsyncMock:
 @pytest.mark.parametrize('stamped_fp', [_AUTHORED_FP, None], ids=['stamped', 'unstamped'])
 @pytest.mark.asyncio
 async def test_post_review_replan_restores_the_prior_fingerprint(
-    tmp_path: Path, stamped_fp: str | None,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stamped_fp: str | None,
 ):
     files = ['a/b/c/d/e.py']
     wf, scheduler = _make_replan_workflow(
@@ -88,14 +93,15 @@ async def test_post_review_replan_restores_the_prior_fingerprint(
     assert wf.artifacts is not None
     wf.artifacts.stamp_plan_provenance(wf.session_id, task_text_fp=stamped_fp)
     wf.task['description'] = 'd, amended before review'
-    wf._execute_iterations = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
-    wf._review = _blocking_then_pass_reviews()  # type: ignore[method-assign]
-    wf._replan = _wiping_replan(wf)  # type: ignore[method-assign]
+    replan = _wiping_replan(wf)
+    monkeypatch.setattr(wf, '_execute_iterations', AsyncMock(return_value=WorkflowOutcome.DONE))
+    monkeypatch.setattr(wf, '_review', _blocking_then_pass_reviews())
+    monkeypatch.setattr(wf, '_replan', replan)
 
     outcome = await wf._execute_verify_review_loop()
 
     assert outcome == WorkflowOutcome.DONE
-    wf._replan.assert_awaited_once()
+    replan.assert_awaited_once()
     assert wf.artifacts.read_plan().get(PLAN_TASK_TEXT_FP_KEY) == stamped_fp
     assert not [md for _tid, md in scheduler.update_task_calls
                 if isinstance(md, dict) and 'plan_text_fp' in md]
@@ -105,7 +111,9 @@ class _StopAfterStamp(Exception):
     pass
 
 
-def _recovering_workflow(tmp_path: Path, initial_plan: dict) -> TaskWorkflow:
+def _recovering_workflow(
+    tmp_path: Path, initial_plan: dict, lock_plan: MagicMock, monkeypatch: pytest.MonkeyPatch,
+) -> TaskWorkflow:
     assignment = MagicMock()
     assignment.task_id = '4031'
     assignment.task = {'id': '4031', 'title': 'T', 'description': 'd, amended', 'metadata': {}}
@@ -134,20 +142,21 @@ def _recovering_workflow(tmp_path: Path, initial_plan: dict) -> TaskWorkflow:
     wf.worktree = worktree
     wf.artifacts = TaskArtifacts(worktree)
     wf.artifacts.init('4031', 'T', 'd')
-    wf.artifacts.lock_plan = MagicMock(side_effect=_StopAfterStamp)  # type: ignore[method-assign]
-    wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+    monkeypatch.setattr(wf.artifacts, 'lock_plan', lock_plan)
+    monkeypatch.setattr(wf, '_mark_blocked', AsyncMock(return_value=WorkflowOutcome.BLOCKED))
     return wf
 
 
 @pytest.mark.parametrize('recovered_fp', [_AUTHORED_FP, None], ids=['stamped', 'unstamped'])
 @pytest.mark.asyncio
 async def test_recovered_initial_plan_keeps_its_own_fingerprint(
-    tmp_path: Path, recovered_fp: str | None,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovered_fp: str | None,
 ):
     initial_plan = _plan('4031')
     if recovered_fp is not None:
         initial_plan[PLAN_TASK_TEXT_FP_KEY] = recovered_fp
-    wf = _recovering_workflow(tmp_path, initial_plan)
+    lock_plan = MagicMock(side_effect=_StopAfterStamp)
+    wf = _recovering_workflow(tmp_path, initial_plan, lock_plan, monkeypatch)
 
     with (
         patch.object(wf, '_setup_worktree_and_artifacts', new=AsyncMock()),
@@ -157,7 +166,7 @@ async def test_recovered_initial_plan_keeps_its_own_fingerprint(
         await wf.run()
 
     assert wf.artifacts is not None
-    wf.artifacts.lock_plan.assert_called_once()  # type: ignore[attr-defined]
+    lock_plan.assert_called_once()
     plan = wf.artifacts.read_plan()
     assert plan['_session_id'] == wf.session_id
     assert plan.get(PLAN_TASK_TEXT_FP_KEY) == recovered_fp
