@@ -9930,7 +9930,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # graph over the unfrozen suffix, debounce signature, cached main SHA,
         # per-branch bounce counter) now live on a SuffixConflictTracker
         # (orchestrator.suffix_graph), owned here as self._suffix_tracker.
-        # git_ops/lane_buffers/frozen_prefix/frozen_prefix_tip are ALL injected
+        # git_ops/lane_buffers/frozen_prefix/frozen_prefix_tip/retire_item are ALL injected
         # as narrow callables that RE-READ the live attribute on `self` on
         # every call (not `self` itself, and not a value/bound-method
         # snapshot captured once here) so the tracker is unit-testable
@@ -9953,6 +9953,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             lane_buffers=lambda: self._lane_buffers,
             frozen_prefix=lambda: self.frozen_prefix(),
             frozen_prefix_tip=lambda main_sha: self.frozen_prefix_tip(main_sha),
+            retire_item=lambda rid: self._retire_item(rid),
         )
         # Resume signal: set by every unhalt method so a blocked merger
         # (waiting with no pickable item) wakes up to re-check lanes.

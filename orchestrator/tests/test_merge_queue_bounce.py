@@ -31,9 +31,9 @@ injected ``FakeVerifier`` was asked to verify. The frozen prefix is a real
 one: the first request's verify is held open by ``hangs_until``, which is
 what puts its merge commit at the tip while the second request is probed
 against it. The bookkeeping tests drive ``SuffixConflictTracker`` — the
-bounce layer's own class (``orchestrator.suffix_graph``) — through the four
-accessor callables it is constructed with, so the lane buffers they assert
-on belong to the test.
+bounce layer's own class (``orchestrator.suffix_graph``) — through the five
+accessor callables it is constructed with, so the lane buffers and the
+retirements they assert on belong to the test.
 
 The core bounce paths (clean rebase re-queues, real conflict escalates, cap
 exceeded escalates without rebasing, trains are skipped, an empty
@@ -281,15 +281,9 @@ def _make_tracker(
     retirement is recorded there with whether the request was still buffered
     when it was retired.
     """
-    if retired is None:
-        return SuffixConflictTracker(
-            git_ops=lambda: git_ops,
-            lane_buffers=lambda: lane_buffers,
-            frozen_prefix=lambda: (),
-            frozen_prefix_tip=lambda _main_sha: frozen_tip,
-        )
-
     def _record(rid: str) -> None:
+        if retired is None:
+            return
         buffered = any(r.request_id == rid for lane in lane_buffers.values() for r in lane)
         retired.append((rid, buffered))
 
