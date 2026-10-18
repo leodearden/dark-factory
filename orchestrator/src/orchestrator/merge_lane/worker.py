@@ -46,7 +46,6 @@ from escalation.models import Escalation
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.task_metadata import RetryLedger
 
-from orchestrator import chronic_flake
 from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
@@ -2348,7 +2347,6 @@ async def _record_flake_observation(
     merge_sha: str,
     event_store: EventStore | None,
     escalation_queue: Any,
-    task_client: Any,
 ) -> None:
     """Record whatever flake observation *result* carries (PRD task ε, §5.8).
 
@@ -2371,14 +2369,6 @@ async def _record_flake_observation(
     at all, the remote host has no event store, and its streak counter died with
     its process.
 
-    Task ζ binds a FOURTH effect on the same seam — the ``flake_debt`` row and the
-    de-flake task filed against it (PRD §5.9) — and that is exactly why the binding
-    stays here rather than at the three call sites.  ``task_client`` is the only
-    piece of context the three could plausibly disagree on, since it rides on the
-    WORKER rather than on the verify: a site that forgot it would silently stop
-    enforcing the invariant for whichever observations flow through it, with no
-    failure anywhere.  One seam, one answer to who owns the debt row.
-
     Never raises (the recorder owns that guarantee), so a lost measurement can
     never fail a verify or stall the merge queue.
     """
@@ -2390,7 +2380,6 @@ async def _record_flake_observation(
         task_id=req.task_id,
         event_store=event_store,
         escalation_queue=escalation_queue,
-        task_client=task_client,
     )
 
 
@@ -2413,7 +2402,6 @@ async def _run_post_merge_verify(
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
-    task_client: Any = None,
     halt_hook: Callable[[str], None] | None = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
@@ -2435,11 +2423,6 @@ async def _run_post_merge_verify(
     raised verify to a ``'Verification error: ...'`` outcome.
 
     Args:
-        task_client: Optional task client (``submit_task`` / ``get_statuses`` /
-            ``commit_planning``) threaded to the flake recorder so a suppressed
-            merge red acquires a de-flake task at write time (PRD task ζ, §5.9).
-            Threaded like ``escalation_queue``; with ``None`` the recorder opens
-            no debt row.
         max_narrowed: Budget for the classified-infra-transient retry loop
             (task 2835) when this call's failed-only retry was actually
             NARROWED — i.e. the D2 producer inside that branch built a
@@ -2977,7 +2960,6 @@ async def _run_post_merge_verify(
     record_observation = functools.partial(
         _record_flake_observation, req=req, merge_sha=merge_sha,
         event_store=event_store, escalation_queue=escalation_queue,
-        task_client=task_client,
     )
     for superseded in superseded_observations:
         await record_observation(superseded)
@@ -5526,7 +5508,6 @@ class _TrainMergeHost(Protocol):
     _clock: ClockPort
     _runner_quarantine: set[str]
     _escalation_queue: Any
-    _flake_task_client: Any
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
@@ -7106,7 +7087,6 @@ async def _leased_train_verify(
         quarantine=worker._runner_quarantine,
         halt_hook=worker.operator_halt,
         escalation_queue=worker._escalation_queue,
-        task_client=worker._flake_task_client,
         verifier=worker._verifier,
     )
     host = await _TrainVerifyHost.acquire(worker, req, merge_wt)
@@ -9551,37 +9531,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._shadow_state_path: Path | None = (
             _root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
         ) if _root is not None else None
-        # Task ζ (PRD §5.9): the task client `_run_post_merge_verify` threads to the
-        # flake recorder, so a suppressed merge red acquires a de-flake task AT WRITE
-        # TIME.  Built here because this is the only scope holding both a scheduler
-        # and a project root; `Any` deliberately, so the worker's "never imports the
-        # scheduler" layering note stays honest — the adapter is duck-typed over
-        # `dispatch_tool` exactly as `_dry_run_handles` is over its handles.
-        #
-        # No import cycle: `chronic_flake` imports only `config`/`shared`, never
-        # `merge_queue`.  It is REUSED rather than re-derived because task 2358
-        # already built this adapter over the same seam and ζ only needed it to grow
-        # `get_statuses`/`commit_planning` — a second client would be the
-        # two-implementations-that-must-agree drift INV-5 exists to prevent.
-        #
-        # None on a bare-harness worker (no scheduler) or a mock git_ops with no
-        # project_root, mirroring `_shadow_state_path` above.  The recorder then
-        # opens no debt row at all rather than an unowned one — see
-        # `orchestrator/src/orchestrator/flake_recorder.py::record_merge_flake_suppression`.
-        #
-        # Read at TWO sites: `_run_inflight_verify`'s `_run_post_merge_verify`
-        # dispatch (the VERIFY HALF of `_verify_and_advance` — grep the former, it
-        # is the name that exists), and `_leased_train_verify`'s (a declared
-        # `_TrainMergeHost` attribute).  Both are covered by
-        # `orchestrator/tests/test_merge_queue_flake_recorder.py::TestWorkerBuildsTheFlakeTaskClient`
-        # — this construction is the one seam whose failure mode is SILENT (a site that
-        # never supplies a client stops enforcing §5.9 with nothing anywhere going red),
-        # so "the parameter is honoured" is not the same test as "the worker supplies it".
-        self._flake_task_client: Any = (
-            chronic_flake.SchedulerChronicFlakeTaskClient(scheduler, _root)
-            if scheduler is not None and _root is not None
-            else None
-        )
         # Drift-check cadence persistence (task 2886 fix 1a) — same None-safe
         # project_root-derived pattern as _shadow_state_path above.  Persisting
         # the drift land counter here (authoritative over the in-memory
@@ -18726,7 +18675,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
-                task_client=self._flake_task_client,
                 # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
                 # all-lane halt so a CONCLUDED cross-check divergence stops the
                 # queue the instant it is detected — BEFORE any further adoption —

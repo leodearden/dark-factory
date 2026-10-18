@@ -8,6 +8,8 @@
 write-time enforcement, and **ledger-health escalation**. Explicitly does **not** own the main-health
 escalation's *instruction* — that is task **3774** (§7).
 
+> **Amended 2026-10-18** by plans/offline-lane-red-path-prd.md (ε0, task 6934): the §5.9 owner is still filed inside `open_debt()`, but no longer on the observation path — the recorder (§8.3) writes a suppression's occurrence rows and one item per suppressed test on the ledger's due list (`flake_debt_due`) in one local transaction, and the ledger's drain (`orchestrator/src/orchestrator/flake_debt_drain.py`) calls `open_debt()` for each item afterwards, so task 4974's per-observation filing cap and 120-second budget are retired. `open_debt()` gains one rule: when the stored owner is done and the observation's head does not contain its fix commit, the cycle closes and is not re-opened, and no `regressed_after_resolution` escalation fires.
+
 Goal, in Leo's words: *not to accept flaky tests, but to efficiently detect them, track them, limit
 the damage for as long as they exist, and de-flake them conclusively* — as a **mostly-unattended
 orchestrator subsystem** that escalates only on exceptional difficulty.
