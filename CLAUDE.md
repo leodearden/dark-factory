@@ -167,6 +167,11 @@ command text does not show where the command will run: in the transcript behind
 `plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
 session carried different tracked cwds.
 
+Measured 2026-10-18 on CLI 2.1.302 in a dispatched session (task 5987):
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR` reached the shell as `1`, a `cd` was
+undone silently before the next call, and a relative `Grep` path and `Glob`
+pattern both resolved from the worktree root afterwards.
+
 So a bare or repo-relative path in an ad-hoc probe is a guess, and a wrong guess
 arrives as a bare `FileNotFoundError: [Errno 2] No such file or directory:
 'test_foo.py'`, which names neither the directory you assumed nor the one you
