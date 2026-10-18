@@ -417,9 +417,8 @@ def _format_reescalation_detail(escalations: list[Escalation]) -> str:
     resolution turn count (``resolution_turns``), then the full ``summary``
     and ``detail`` text. Multiple escalations (a burst may hold more than
     one) are joined with a blank line between them. Returns ``''`` for an
-    empty list — defensive; the two raise sites in ``_wait_for_resolution``
-    (``_GatedByOpenL2`` and the steward-gave-up ``_StewardReescalated``) both
-    guarantee a non-empty list, and ``''`` preserves ``_mark_blocked``'s
+    empty list — defensive; every ``_HumanHandoff`` raise site in
+    ``_wait_for_resolution`` guarantees a non-empty list, and ``''`` preserves ``_mark_blocked``'s
     ``detail or reason`` fallback rather than emitting an empty-but-present
     detail.  The header is disposition-neutral: the block reason names which
     hand-off fired, so the detail must not claim a steward acted.
@@ -460,22 +459,30 @@ class _HumanHandoff(Exception):
 
 
 class _StewardReescalated(_HumanHandoff):
-    """The steward handed off: an open L1 remains once the level-0 wait ends
+    """The steward re-escalated during this wait, and hand-off L1s remain open
     (consumed by the auto-watcher, which may promote to L2 for a human)."""
 
     def __init__(self, escalations: list[Escalation]):
         super().__init__(escalations, 'Steward re-escalated to human')
 
 
-class _GatedByOpenL2(_HumanHandoff):
-    """Stop-the-line: records that :func:`_needs_human` says no steward can
-    resolve, raised before the wait ever awaits."""
+class _NoStewardApplicable(_HumanHandoff):
+    """Open records end the wait that no steward acted on: the stop-the-line
+    ``'L2'`` records :func:`_needs_human` selects, raised before the wait ever
+    awaits, or ``'L1'`` hand-offs left open by anyone but this wait's steward."""
 
-    def __init__(self, escalations: list[Escalation]):
+    def __init__(self, escalations: list[Escalation], tier: Literal['L1', 'L2']):
         ids = ', '.join(e.id for e in escalations)
         super().__init__(
-            escalations, f'Gated by open L2 {ids}; no steward applicable',
+            escalations, f'Gated by open {tier} {ids}; no steward applicable',
         )
+
+
+def _reescalations_by(steward: Any | None) -> int:
+    """How many escalations *steward* has re-escalated to L1 so far — 0 for no
+    steward, or a double that keeps no ``StewardMetrics``."""
+    count = getattr(getattr(steward, 'metrics', None), 'escalations_reescalated', 0)
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
 
 if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
@@ -4194,7 +4201,7 @@ class TaskWorkflow:
         # waiting on while a DIFFERENT gating record is open — most sharply a
         # born-at-L2 filed mid-resolution, which the wait cannot see at all
         # (its loop polls level-0, its stop-the-line check ran at entry before
-        # the record existed, and its tail's has_open_l1 matches level-1).
+        # the record existed, and its tail reads level-1 queue handoffs).
         # Without this, such a record is merged straight past.  Re-uses the
         # SAME _is_gating_escalation predicate rather than an equivalent
         # inline condition, so there is exactly one gate policy in this file.
@@ -4221,7 +4228,7 @@ class TaskWorkflow:
             # 12623) use.  Unlike the sibling exits, this one reaches
             # _mark_blocked with the steward STILL LIVE — the expiry branch's
             # steward was already stopped by the wait itself, and the
-            # _GatedByOpenL2 branch's L2 is out of the steward's reach —
+            # _NoStewardApplicable branch's records are out of its reach —
             # and _mark_blocked(escalate_to_human=True) fires
             # _spawn_dry_run_unblock, which runs run_dry_run_unblock against
             # self.worktree: the SAME worktree TaskSteward invokes its agent in
@@ -14423,14 +14430,17 @@ class TaskWorkflow:
         stop-the-line events — they cannot be resolved by the
         auto-watcher/steward and require immediate human intervention.
         Rather than waiting (which would either spin or block forever with
-        no resolver), they immediately raise ``_GatedByOpenL2`` so
+        no resolver), they immediately raise ``_NoStewardApplicable`` so
         that ``run()`` calls ``_mark_blocked`` and halts.
 
         Raises a ``_HumanHandoff``:
-        - ``_GatedByOpenL2`` if any pending escalation needs a human —
-          immediate terminal, stop the line, before any await; OR
-        - ``_StewardReescalated`` if the steward re-escalated to level-1
-          (consumed by auto-watcher).
+        - ``_NoStewardApplicable('L2')`` if any pending escalation needs a
+          human — immediate terminal, stop the line, before any await; OR,
+          once the level-0 wait ends with level-1 queue handoffs open (never
+          an info record, PRD D3):
+        - ``_StewardReescalated`` if this wait's steward re-escalated, else
+        - ``_NoStewardApplicable('L1')`` — the L1s predate the wait or came
+          from elsewhere, so no steward acted on them (PRD D13).
 
         When no escalation queue is available (e.g. eval mode), returns
         an empty string immediately — the caller treats this as "no
@@ -14504,9 +14514,9 @@ class TaskWorkflow:
         worktree (``cwd = self.worktree``, steward.py:542, 590) that the
         resumed implementer edits and commits in, so dismissing or resuming
         beside a live steward agent means two agents committing in one git
-        worktree.  The tail then yields exactly two dispositions:
-        ``_StewardReescalated`` (blocking, with the already-open L1) when one
-        is open, or the collected resolutions (resuming) when none is.  It
+        worktree.  The tail then yields exactly two dispositions: a
+        ``_HumanHandoff`` (blocking, with the open level-1 queue handoffs) when
+        one is open, or the collected resolutions (resuming) when none is.  It
         deliberately does NOT call :meth:`_mark_blocked`, which would file a
         fresh L0 and could add a SECOND full grace window for what is a pure
         wait-timeout.
@@ -14537,14 +14547,16 @@ class TaskWorkflow:
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
         # fires → _wait_for_resolution returns '' → resume → gate fires again).
         # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
-        # human intervention rather than looping; _GatedByOpenL2's reason says
-        # no steward was applicable (D13).
+        # human intervention rather than looping; the reason says no steward
+        # was applicable (D13).
         pending_l2 = [
             e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
             if _needs_human(e)
         ]
         if pending_l2:
-            raise _GatedByOpenL2(pending_l2)
+            raise _NoStewardApplicable(pending_l2, 'L2')
+        steward = self._steward
+        reescalations_at_entry = _reescalations_by(steward)
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
         # window (task 3170, fix C + review fix D1).  See the method docstring
@@ -14706,12 +14718,16 @@ class TaskWorkflow:
         # outcome out of _await_steward_completion.
         self._drain_steward_outcomes()
 
-        # Check for level-1 re-escalation (steward gave up)
-        if self.escalation_queue.has_open_l1(self.task_id):
-            pending_l1 = self.escalation_queue.get_by_task(
+        handoff_l1 = [
+            e for e in self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=1,
             )
-            raise _StewardReescalated(pending_l1)
+            if is_queue_handoff(e)
+        ]
+        if handoff_l1:
+            if _reescalations_by(steward) > reescalations_at_entry:
+                raise _StewardReescalated(handoff_l1)
+            raise _NoStewardApplicable(handoff_l1, 'L1')
 
         # Collect resolutions (filter ensures resolution is non-None str for join)
         resolutions = [

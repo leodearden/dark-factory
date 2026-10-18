@@ -6400,7 +6400,7 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
     already-on-main branch-check (fresh worktree HEAD == main SHA → break),
     then reaches the MERGE gate which returns ESCALATED — so the outcome is
     ESCALATED rather than BLOCKED.  With the fix _wait_for_resolution raises
-    _GatedByOpenL2 for a non-info level≥2 or born-at-L2 record, causing run()
+    _NoStewardApplicable for a non-info level≥2 or born-at-L2 record, causing run()
     to call _mark_blocked and return BLOCKED.
 
     This tests the wait/gate handshake at the run() level, not just the
@@ -6453,7 +6453,7 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 
         outcome = (await workflow.run()).outcome
 
-        # With the fix: _wait_for_resolution raises _GatedByOpenL2 for the
+        # With the fix: _wait_for_resolution raises _NoStewardApplicable for the
         # pending level-2 escalation → _mark_blocked → BLOCKED.
         # Without the fix: _wait_for_resolution returns '' (no L0 pending) →
         # git ancestry check breaks (fresh branch at main HEAD) → MERGE gate
@@ -6485,14 +6485,14 @@ class TestReescalationDetailPropagatedToBlockReport:
     hand-offs fired (PRD info-l0-disposition-router D13, task 5222): an open
     non-info L2 short-circuits before any steward work, so its reason is
     ``Gated by open L2 <ids>; no steward applicable`` and its detail must not
-    claim a steward acted; an open L1 is the steward's own hand-off, whose
-    reason stays ``Steward re-escalated to human``.
+    claim a steward acted; an open L1 no steward filed during the wait reads
+    ``Gated by open L1 <ids>; no steward applicable`` for the same reason.
     """
 
     @pytest.mark.parametrize(('severity', 'level', 'expected_reason'), [
         ('critical', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
         ('blocking', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
-        ('blocking', 1, 'Steward re-escalated to human'),
+        ('blocking', 1, 'Gated by open L1 {esc_id}; no steward applicable'),
     ])
     async def test_detail_contains_escalation_payload(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
@@ -6547,8 +6547,7 @@ class TestReescalationDetailPropagatedToBlockReport:
         assert esc_id in report.detail
         assert report.reason == expected_reason.format(esc_id=esc_id)
         assert report.detail != report.reason
-        if level >= 2:
-            assert 'Steward re-escalated' not in report.detail, report.detail
+        assert 'Steward re-escalated' not in report.detail, report.detail
 
 
 @pytest.mark.asyncio
