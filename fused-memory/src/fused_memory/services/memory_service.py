@@ -8581,6 +8581,20 @@ class MemoryService:
             for ep in episodes
         ]
 
+    def earliest_unfinished_graphiti_write_start(self, project_id: str) -> datetime | None:
+        """When the earliest Graphiti write still executing for *project_id* began.
+
+        graphiti_core stamps an episode's created_at when add_episode BEGINS
+        and persists the node only after extraction, so an episode created at
+        or after this instant may not be readable yet. mem0 queue writes run on
+        their own queue group and are never counted.
+        """
+        if self.durable_queue is None:
+            return None
+        return self.durable_queue.earliest_executing_start(
+            Scope(project_id=project_id).graphiti_group_id
+        )
+
     # ------------------------------------------------------------------
     # Read: get_episode_content
     # ------------------------------------------------------------------
