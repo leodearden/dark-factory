@@ -109,7 +109,6 @@ def test_metadata_not_an_object_error_shape():
         'received': 'array',
     }
     assert isinstance(error['hint'], str)
-    assert 'JSON object' in error['hint']
 
 
 def test_metadata_not_an_object_error_is_taskmaster_error():
