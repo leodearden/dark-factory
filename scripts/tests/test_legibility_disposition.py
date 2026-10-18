@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -1097,3 +1098,130 @@ def test_an_abandoned_task_carrying_the_key_still_counts_as_absent_for_step_one(
     decision = _only(disposition.dispose([_filing()], store=store, submit=_Submit()))
 
     assert (decision.standing, decision.task_id) == (Standing.DONE, 9)
+
+
+# ---------------------------------------------------------------------------
+# Typing one re-verify result (D8, INV-3): only a refuting Verdict is "gone"
+# ---------------------------------------------------------------------------
+
+
+def _parsed(*, verified: bool, route: str = "mechanical") -> verdict.Verdict:
+    return verdict.parse_verdict(
+        {
+            "verified": verified,
+            "reason": "checked at as_of_sha",
+            "anchor": "orchestrator/x.py::f",
+            "tags": ["h13", verdict.KIND_TAG],
+            "severity": "medium",
+            "severity_reason": "r",
+            "route": route,
+        },
+        title="a confusion",
+        project_root=_ROOT,
+    )
+
+
+def _due(entry_id: str = "entry-a", task_id: int = 5120) -> disposition.Reverify:
+    return disposition.Reverify(entry_id, disposition.TaskRef(_ROOT, task_id))
+
+
+def _reverify_cluster(entry_id: str = "entry-a", found: verdict.Verdict | None = None) -> dict:
+    cluster: dict[str, Any] = {"title": "a confusion", disposition.REVERIFY_ENTRY: entry_id}
+    if found is not None:
+        cluster["verdict"] = found
+    return cluster
+
+
+def _verify_result(*, verified: Sequence[dict] = (), rejected: Sequence[dict] = ()) -> dict:
+    return {"verified": list(verified), "rejected": list(rejected), "fixed": [], "headroom_probes": 0}
+
+
+def _typed(result: dict, *offered: disposition.Reverify, deferred=(), error=None) -> dict:
+    return dict(disposition.reverifications(result, offered=offered, deferred=deferred, error=error))
+
+
+def test_a_verified_reverify_is_present_with_its_verdict() -> None:
+    found = _parsed(verified=True)
+
+    (typed,) = _typed(_verify_result(verified=[_reverify_cluster(found=found)]), _due()).values()
+
+    assert (typed.entry_id, typed.task, typed.result, typed.found) == (
+        "entry-a", disposition.TaskRef(_ROOT, 5120), disposition.ReverifyResult.PRESENT, found,
+    )
+
+
+def test_a_refuting_verdict_is_gone() -> None:
+    found = _parsed(verified=False)
+
+    typed = _typed(_verify_result(rejected=[_reverify_cluster(found=found)]), _due())["entry-a"]
+
+    assert (typed.result, typed.found) == (disposition.ReverifyResult.GONE, found)
+
+
+def test_a_rejection_without_a_verdict_is_inconclusive_never_gone() -> None:
+    typed = _typed(_verify_result(rejected=[_reverify_cluster()]), _due())["entry-a"]
+
+    assert typed.result is disposition.ReverifyResult.INCONCLUSIVE
+    assert typed.found is None
+    assert typed.reason is not None
+    assert "fail" in typed.reason
+
+
+def test_an_offered_entry_the_result_never_mentions_is_inconclusive() -> None:
+    typed = _typed(_verify_result(verified=[_reverify_cluster("entry-other", _parsed(verified=True))]), _due())
+
+    assert typed["entry-a"].result is disposition.ReverifyResult.INCONCLUSIVE
+    assert "entry-other" not in typed
+
+
+def test_a_reverify_the_cap_left_unoffered_is_deferred_to_the_next_run() -> None:
+    typed = _typed(_verify_result(), deferred=[_due("entry-b", 7)])
+
+    assert typed["entry-b"].result is disposition.ReverifyResult.DEFERRED
+    assert typed["entry-b"].task == disposition.TaskRef(_ROOT, 7)
+    assert typed["entry-b"].reason is not None
+    assert "cap" in typed["entry-b"].reason
+
+
+def test_an_errored_reverify_call_leaves_every_offered_entry_inconclusive_with_the_error() -> None:
+    error = "headroom exhausted: verify reports no capacity"
+    result = _verify_result(rejected=[_reverify_cluster(found=_parsed(verified=False))])
+
+    typed = _typed(result, _due("entry-a"), _due("entry-b", 7), deferred=[_due("entry-c", 8)], error=error)
+
+    assert [(each.result, error in (each.reason or "")) for each in (typed["entry-a"], typed["entry-b"])] == [
+        (disposition.ReverifyResult.INCONCLUSIVE, True), (disposition.ReverifyResult.INCONCLUSIVE, True),
+    ]
+    assert typed["entry-c"].result is disposition.ReverifyResult.DEFERRED
+
+
+@pytest.mark.parametrize(
+    "result",
+    [{}, {"verified": None, "rejected": "x"}, {"verified": [{"title": "no marker"}, 3], "rejected": [None]}],
+    ids=["empty", "wrong-types", "no-marker"],
+)
+def test_a_malformed_result_never_raises_and_types_nothing_as_gone(result) -> None:
+    typed = _typed(result, _due())
+
+    assert typed["entry-a"].result is disposition.ReverifyResult.INCONCLUSIVE
+
+
+def test_a_verified_cluster_whose_verdict_refutes_is_not_gone() -> None:
+    typed = _typed(_verify_result(verified=[_reverify_cluster(found=_parsed(verified=False))]), _due())
+
+    assert typed["entry-a"].result is disposition.ReverifyResult.INCONCLUSIVE
+
+
+@pytest.mark.parametrize(
+    ("result", "found"),
+    [("gone", None), ("gone", "verified"), ("present", None), ("present", "refuted")],
+)
+def test_a_reverification_holds_gone_and_present_to_their_verdicts(result, found) -> None:
+    verdicts = {None: None, "verified": _parsed(verified=True), "refuted": _parsed(verified=False)}
+
+    with pytest.raises(ValueError, match="entry-a") as excinfo:
+        disposition.Reverification(
+            "entry-a", disposition.TaskRef(_ROOT, 5120), disposition.ReverifyResult(result), verdicts[found], None,
+        )
+
+    assert "INV-3" in str(excinfo.value)
