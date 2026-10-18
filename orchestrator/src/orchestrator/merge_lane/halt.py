@@ -105,16 +105,17 @@ class HaltState:
         Backs the ``halt_merge_queue`` escalation tool.  Unlike
         :meth:`halt_for_wip` (the automatic WIP-conflict halt, which intentionally
         lets the verifier keep draining the items behind it), this ALSO raises the
-        dedicated ``_operator_halt`` signal.  The verifier's abort-poll loop and
-        verifier-loop top check that signal: the in-flight verify is cancelled
-        (killing its subprocess via the existing CancelledError seam) and its merge
-        is re-queued so it re-verifies after un-halt — the waiter's future is left
-        pending and per-task retry counters are untouched (a halt is not a failure).
+        dedicated operator-halt signal, read through :meth:`is_operator_halted`.
+        The verifier's abort-poll loop and verifier-loop top check it: the
+        in-flight verify is cancelled (killing its subprocess via the existing
+        CancelledError seam) and its merge is re-queued so it re-verifies after
+        un-halt — the waiter's future is left pending and per-task retry
+        counters are untouched (a halt is not a failure).
 
         Halts every lane with no owner (like ``halt_for_wip``), so
         ``is_wip_halted`` reports True and ``halt_owner_esc_id`` is None; the
         existing ``unhalt_merge_queue`` / ``force_unhalt_merge_queue`` path
-        (→ ``unhalt_all_lanes``, which clears ``_operator_halt``) cleanly reverses
+        (→ ``unhalt_all_lanes``, which clears that signal) cleanly reverses
         it without tripping the active-owner refusal.  Synchronous: the verify
         abort happens asynchronously in the verifier within one
         ``VERIFY_ABANDON_POLL_SECS`` interval.

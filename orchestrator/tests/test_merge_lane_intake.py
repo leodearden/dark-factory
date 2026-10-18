@@ -32,9 +32,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import intake
 from orchestrator.merge_lane.intake import (
     coalesce_or_enqueue_merge_request,
-    line_ranges_stackable,
     register_and_enqueue_merge_request,
-    select_train_members,
 )
 from orchestrator.merge_lane.types import (
     InFlightMergeRegistry,
@@ -501,24 +499,3 @@ async def test_the_registry_verifying_flag_alone_rejects_a_newer_tip(
     )
     assert not verifying.result.done()
     assert queue.empty()
-
-
-# ---------------------------------------------------------------------------
-# (D) Train-member selection, moved down from workflow.py
-# ---------------------------------------------------------------------------
-
-
-def test_disjoint_candidates_join_the_anchor_up_to_the_cap() -> None:
-    ranges = {
-        'a': {'f.py': [(1, 5)]},
-        'b': {'f.py': [(10, 12)]},
-        'c': {'g.py': [(1, 5)]},
-    }
-    assert select_train_members('a', ['c', 'b'], ranges, max_members=3) == ['a', 'b', 'c']
-    assert select_train_members('a', ['c', 'b'], ranges, max_members=2) == ['a', 'b']
-
-
-def test_an_anchor_alone_is_no_train() -> None:
-    ranges = {'a': {'f.py': [(1, 5)]}, 'b': {'f.py': [(5, 9)]}}
-    assert not line_ranges_stackable(ranges['a'], ranges['b'])
-    assert select_train_members('a', ['b'], ranges, max_members=3) == []

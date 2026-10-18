@@ -19,7 +19,7 @@ this batch:
       every loser attaches as a peer waiter whose future mirrors the
       winner's terminal outcome.
   delta (2927) -- coalesce_or_enqueue_merge_request's duplicate_in_verify
-      reject (merge_queue.py, reject code _C3_DUPLICATE_IN_VERIFY_CODE): a
+      reject (merge_lane/intake.py, reject code _C3_DUPLICATE_IN_VERIFY_CODE): a
       newer SHA submitted while the earlier SHA is IN VERIFY is structurally
       REJECTed, not coalesced or replaced.
   epsilon (2928) -- retire_cancelled_merge_request (see

@@ -537,7 +537,7 @@ class TestTrainIntegrationB3B4:
         parse_diff_line_ranges maps pure insertions to point ranges at their
         old-side anchor: (3,3) vs (21,21) → non-overlapping → co-selected.
         """
-        from orchestrator.merge_lane.intake import select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
 
         repo = await seed_workspace_repo(tmp_path)
         config = make_train_config(repo, tmp_path / "target_b3")
@@ -602,7 +602,7 @@ class TestTrainIntegrationB3B4:
         (the ``value`` field) → both get range (3,3) on the old side →
         overlapping → select_train_members returns [].
         """
-        from orchestrator.merge_lane.intake import select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
 
         repo = await seed_workspace_repo(tmp_path)
         config = make_train_config(repo, tmp_path / "target_b4")

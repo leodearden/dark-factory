@@ -18,7 +18,7 @@ from escalation.models import Escalation
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.halt import HaltState
-from orchestrator.merge_lane.intake import _aging_key, _emit_merge_coalesced, _normalize_lane
+from orchestrator.merge_lane.intake import emit_merge_coalesced, normalize_lane
 from orchestrator.merge_lane.types import (
     ItemLifecycleState,
     MergeBounceRegistry,
@@ -121,8 +121,8 @@ def _alarm_coalesce_live_original(
         'is already live in the lifecycle registry (matched by result-future '
         'identity), not a distinct journal-recovery twin. That means a requeue '
         'site put this request back on _queue WITHOUT returning the registry to '
-        'QUEUED, so _buffer_owned_request classified a genuinely live request '
-        'as a duplicate and coalesced it away.\n'
+        'QUEUED, so MergeIntake.buffer_owned_request classified a genuinely '
+        'live request as a duplicate and coalesced it away.\n'
         '\n'
         'The request was NOT buffered and its Future was deliberately left '
         'PENDING — resolving it would hand the real waiter a fabricated '
@@ -166,6 +166,27 @@ def _alarm_coalesce_live_original(
                 'category': 'merge_coalesce_live_original',
             },
         )
+
+
+def _aging_key(req: MergeRequest) -> tuple[float, str]:
+    """Aging sort key for a merge request (ζ=1891).
+
+    Returns a ``(wall_clock, request_id)`` tuple:
+
+    * **wall_clock** — ``merge_first_enqueued_at`` (persisted epoch of the
+      *first* merge submission, survives restart) with ``enqueued_at`` as
+      the legacy fallback for requests created before α=1886 was deployed
+      (field is ``None``).  Smaller = older = higher priority.
+
+    * **request_id** — lexical tie-break for equal timestamps (PRD §5.4 /
+      §11.3).  Lexically smaller wins.
+
+    Used by :meth:`MergeIntake.pop_next_pickable` to identify the
+    clique-minimal item within a footprint clique — the buffered item whose
+    footprint-clique peers all have an equal-or-larger aging key.
+    """
+    ts = req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
+    return (ts, req.request_id)
 
 
 class MergeIntake:
@@ -317,7 +338,7 @@ class MergeIntake:
         that point, so it always fires), matching this method's own
         postcondition (the item is now sitting in a lane buffer).
         """
-        lane = _normalize_lane(item.lane)
+        lane = normalize_lane(item.lane)
         self._assert_merger_owns('_lane_buffers')
         rid = item.request_id
         current = self._lifecycle.current(rid)
@@ -441,7 +462,7 @@ class MergeIntake:
         ``_note_requeue``, so it fires only if a requeue site regresses.
 
         In BOTH cases a ``merge_coalesced`` observability event is emitted via
-        the shared :func:`_emit_merge_coalesced` helper (None-safe when no
+        the shared :func:`emit_merge_coalesced` helper (None-safe when no
         event store is wired) — observability must not depend on which branch
         was taken. The ``source`` DISCRIMINATES them, because the two
         conditions are not the same event: ``'duplicate_submission'`` for a
@@ -497,7 +518,7 @@ class MergeIntake:
         # on which one was taken — but with a DISCRIMINATING source, since only
         # the twin was actually coalesced onto a merge that will deliver it an
         # outcome (see the docstring).
-        _emit_merge_coalesced(
+        emit_merge_coalesced(
             self._event_store, item,
             source='live_original_redrain' if _is_live_original else 'duplicate_submission',
             eta=None,

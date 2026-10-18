@@ -125,10 +125,10 @@ def _make(
 
 
 class TestLineRangesStackable:
-    """Unit tests for the line_ranges_stackable pure predicate in merge_lane/intake.py."""
+    """Unit tests for the line_ranges_stackable pure predicate in merge_lane/train_selection.py."""
 
     def _fn(self):
-        from orchestrator.merge_lane.intake import line_ranges_stackable
+        from orchestrator.merge_lane.train_selection import line_ranges_stackable
         return line_ranges_stackable
 
     def test_disjoint_files_are_stackable(self):
@@ -197,7 +197,7 @@ class TestSelectTrainMembers:
     """Unit tests for select_train_members pure selection function."""
 
     def _fn(self):
-        from orchestrator.merge_lane.intake import select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
         return select_train_members
 
     def _ranges(self, file: str, start: int, end: int) -> dict[str, list[tuple[int, int]]]:

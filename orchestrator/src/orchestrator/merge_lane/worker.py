@@ -92,9 +92,8 @@ from orchestrator.merge_lane.gates import (
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
-    _normalize_lane,
     enqueue_merge_request,
-    select_train_members,
+    normalize_lane,
 )
 from orchestrator.merge_lane.intake_buffers import (
     MERGE_WORKER_SHUTDOWN_REASON,
@@ -154,6 +153,7 @@ from orchestrator.merge_lane.tip_relation import (
     classify_tip_relation,
     resolve_divergent,
 )
+from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import (
     CHAIN_FAULT_REASONS,
     CapPermit,
@@ -476,12 +476,12 @@ def is_auto_heal_eligible(
 def lane_for_task_metadata(metadata: dict | None) -> Literal['normal', 'high']:
     """Return the merge lane to use based on task metadata.
 
-    Reads ``metadata['merge_lane']`` and validates via :func:`_normalize_lane`
+    Reads ``metadata['merge_lane']`` and validates via :func:`normalize_lane`
     (unknown/missing → 'normal').  Passing ``None`` or an empty dict returns
     the default 'normal' lane.
     """
     value = (metadata or {}).get('merge_lane', '')
-    return _normalize_lane(value or '')  # type: ignore[return-value]
+    return normalize_lane(value or '')  # type: ignore[return-value]
 
 
 _FIX_BRIEF_TITLE_MAX = 100

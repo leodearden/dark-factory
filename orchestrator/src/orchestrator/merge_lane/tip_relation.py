@@ -199,13 +199,6 @@ async def resolve_attach_action(
     return decide_attach_action(relation, verifying=verifying)
 
 
-# Structured reject code surfaced by the merge_request MCP tool when a NEWER
-# SHA is submitted for a branch whose EARLIER SHA is already in verify
-# (PRD merge-worktree-lifecycle-integrity §5 D3).  Consumed by the escalation
-# server's merge_request handler to build the {error, code, …} envelope.
-_C3_DUPLICATE_IN_VERIFY_CODE = 'duplicate_in_verify'
-
-
 class C3SubmitAction(Enum):
     """Action for the SHA-sensitive merge_request submit gate (PRD §4 C3 / §5 D1-D3).
 

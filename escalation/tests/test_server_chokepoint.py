@@ -2763,7 +2763,7 @@ class TestBoundaryTableMcpSurface:
         """
         coalesced_spy: list[int] = []
         monkeypatch.setattr(
-            'orchestrator.merge_lane.intake._emit_merge_coalesced',
+            'orchestrator.merge_lane.intake.emit_merge_coalesced',
             lambda *a, **kw: coalesced_spy.append(1),
         )
 

@@ -4,8 +4,7 @@
 merge queue. The workflow reaches it through
 :func:`register_and_enqueue_merge_request`, the ``merge_request`` MCP tool
 through :func:`coalesce_or_enqueue_merge_request`, which first coalesces a
-request onto a live merge of the same branch, or rejects it. Train-member
-selection (:func:`select_train_members`) lives here too.
+request onto a live merge of the same branch, or rejects it.
 """
 from __future__ import annotations
 
@@ -21,7 +20,6 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.liveness import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 from orchestrator.merge_lane.tip_relation import (
-    _C3_DUPLICATE_IN_VERIFY_CODE,
     C3SubmitAction,
     TipRelation,
     classify_tip_relation,
@@ -40,37 +38,20 @@ from orchestrator.merge_lane.types import (
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
+# Structured reject code surfaced by the merge_request MCP tool when a NEWER
+# SHA is submitted for a branch whose EARLIER SHA is already in verify
+# (PRD merge-worktree-lifecycle-integrity §5 D3).  Consumed by the escalation
+# server's merge_request handler to build the {error, code, …} envelope.
+_C3_DUPLICATE_IN_VERIFY_CODE = 'duplicate_in_verify'
 
 MERGE_LANES: tuple[str, ...] = ('high', 'normal')
-"""Priority-ordered lane names (high first).  Used by SpeculativeMergeWorker to
-drain and pick requests: the first non-halted non-empty lane wins."""
+"""Priority-ordered lane names (high first).  ``MergeIntake`` drains and picks
+requests in this order: the first non-halted non-empty lane wins."""
 
 
-
-def _normalize_lane(lane: str) -> str:
+def normalize_lane(lane: str) -> str:
     """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
     return lane if lane in MERGE_LANES else 'normal'
-
-
-def _aging_key(req: MergeRequest) -> tuple[float, str]:
-    """Aging sort key for a merge request (ζ=1891).
-
-    Returns a ``(wall_clock, request_id)`` tuple:
-
-    * **wall_clock** — ``merge_first_enqueued_at`` (persisted epoch of the
-      *first* merge submission, survives restart) with ``enqueued_at`` as
-      the legacy fallback for requests created before α=1886 was deployed
-      (field is ``None``).  Smaller = older = higher priority.
-
-    * **request_id** — lexical tie-break for equal timestamps (PRD §5.4 /
-      §11.3).  Lexically smaller wins.
-
-    Used by ``MergeIntake.pop_next_pickable`` to identify the
-    clique-minimal item within a footprint clique — the buffered item whose
-    footprint-clique peers all have an equal-or-larger aging key.
-    """
-    ts = req.merge_first_enqueued_at if req.merge_first_enqueued_at is not None else req.enqueued_at
-    return (ts, req.request_id)
 
 
 def _emit_merge_queued(
@@ -313,7 +294,7 @@ async def register_and_enqueue_merge_request(
     return acquired
 
 
-def _emit_merge_coalesced(
+def emit_merge_coalesced(
     event_store: EventStore | None,
     req: MergeRequest,
     source: str,
@@ -917,7 +898,7 @@ def _coalesce_onto_entry(
     if retention is not None and entry is not None and entry.request_id is not None:
         retention.record_alias(submission.req.request_id, entry.request_id)
     submission.registry.record_coalesced(branch, submission.req.request_id)
-    _emit_merge_coalesced(submission.event_store, submission.req, source='registry', eta=eta)
+    emit_merge_coalesced(submission.event_store, submission.req, source='registry', eta=eta)
     return MergeDispatchResult(
         dispatched=False,
         in_flight=True,
@@ -950,7 +931,7 @@ async def _disk_scan_path(
         # a different process, so there is no in-process registry entry
         # to alias onto.  Callers polling the coalesced id fall through
         # to the event-store / git-authority tiers on a ring miss.
-        _emit_merge_coalesced(submission.event_store, submission.req, source='worktree', eta=None)
+        emit_merge_coalesced(submission.event_store, submission.req, source='worktree', eta=None)
         return MergeDispatchResult(
             dispatched=False,
             in_flight=True,
@@ -1090,62 +1071,3 @@ async def _dispatch(submission: _Submission) -> MergeDispatchResult:
         in_flight=False,
         branch=submission.branch,
     )
-
-
-def line_ranges_stackable(
-    ranges_a: dict[str, list[tuple[int, int]]],
-    ranges_b: dict[str, list[tuple[int, int]]],
-) -> bool:
-    """Return True iff tasks A and B are line-level stackable.
-
-    Two tasks are stackable iff no file they both touch has overlapping changed
-    line ranges relative to BASE (main).  Crate/file-disjointness is NOT
-    required for stackability — same file, different lines is fine (PRD §A.2).
-
-    Uses closed-interval intersection: range (s1,e1) intersects (s2,e2)
-    iff s1 <= e2 and s2 <= e1.
-    """
-    shared_files = set(ranges_a) & set(ranges_b)
-    for fname in shared_files:
-        for s1, e1 in ranges_a[fname]:
-            for s2, e2 in ranges_b[fname]:
-                if s1 <= e2 and s2 <= e1:
-                    return False
-    return True
-
-
-def select_train_members(
-    anchor_id: str,
-    candidate_ids: list[str],
-    ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]],
-    max_members: int,
-) -> list[str]:
-    """Select a mutually-stackable subset of candidates capped at max_members.
-
-    Greedy selection: start with the anchor, then iterate candidates in
-    deterministic (id-sorted) order, adding each that is line_ranges_stackable
-    against ALL already-selected members.  Stops when len(selected) == max_members.
-
-    Returns [] when the result has fewer than 2 members — the sentinel for
-    "no viable train" (a single-member train is meaningless).
-
-    The anchor is always first (order-0) in the returned list.
-    """
-    selected: list[str] = [anchor_id]
-
-    for candidate_id in sorted(candidate_ids):
-        if len(selected) >= max_members:
-            break
-        candidate_ranges = ranges_by_id.get(candidate_id, {})
-        # Must be stackable with every already-selected member (mutual stackability).
-        stackable_with_all = all(
-            line_ranges_stackable(candidate_ranges, ranges_by_id.get(sel_id, {}))
-            for sel_id in selected
-        )
-        if stackable_with_all:
-            selected.append(candidate_id)
-
-    # A single-member "train" is a no-op — return the empty sentinel.
-    if len(selected) < 2:
-        return []
-    return selected

@@ -106,7 +106,6 @@ from orchestrator.git_ops import (
     is_wip_safety_commit,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
-from orchestrator.merge_lane.intake import select_train_members
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
@@ -115,6 +114,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_landing_evidence,
     validate_reported_landing,
 )
+from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
@@ -10953,7 +10953,7 @@ class TaskWorkflow:
         from orchestrator.merge_lane.disposition import MergeFailureDisposition
         from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
         from orchestrator.merge_lane.intake import (
-            _emit_merge_coalesced,
+            emit_merge_coalesced,
             register_and_enqueue_merge_request,
         )
         from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
@@ -11314,7 +11314,7 @@ class TaskWorkflow:
                     # classify await (I10 await-gap).  Fall through to enqueue in that case.
                     attached = _registry.attach(branch_name, waiter)
                     if attached:
-                        _emit_merge_coalesced(
+                        emit_merge_coalesced(
                             self.event_store, merge_request, 'workflow',
                             _registry.eta_seconds(branch_name),
                         )

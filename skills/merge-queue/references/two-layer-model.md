@@ -152,7 +152,7 @@ occupant when two entries share a host.
 |--------|----------|-------------|
 | `NEEDS_REBASE_REASON_PREFIX` | merge_lane/worker.py | Prefix of the `needs_rebase` bounce reason string |
 | `MERGE_BOUNCE_CAP` | merge_lane/worker.py | Max bounce count before thrash-backstop triggers (= 3) |
-| `_aging_key(req)` | merge_lane/intake.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
+| `_aging_key(req)` | merge_lane/intake_buffers.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
 | `merge_first_enqueued_at` | merge_lane/types.py | Write-once field: epoch of first submission to the merge queue |
 | `SuffixConflictGraph` | suffix_graph.py | In-memory conflict graph over the unfrozen suffix |
 | `NoLandingsCircuitBreaker` | merge_lane/worker.py | No-landings circuit-breaker decision object (θ=1893) |
@@ -409,13 +409,16 @@ Protocol (the narrow statement of what the train pipeline touches), `_run_post_m
 Task 5305 moved three concerns out of `merge_lane/worker.py`, and none of the three modules
 imports the worker:
 
-- `intake.py` is the caller-side request door. It holds the request entry points, the
-  decomposed coalesce gate, and train-member selection, which moved in from `workflow.py`.
+- `intake.py` is the caller-side request door. It holds the request entry points and the
+  decomposed coalesce gate.
 - `intake_buffers.py` holds `MergeIntake`, the merger-side sole writer of the lane buffers, the
   redispatch park and the suffix-conflict tracker. The worker composes one, hands it re-reading
   ports, and asks it for every buffer and park change. It is a separate module from `intake.py`
   so both stay under the 1500-line new-file ceiling (esc-5305-1).
 - `tip_relation.py` holds the C3 tip-relation decisions that coalesce consults.
+
+`train_selection.py` holds train-member selection by changed line ranges. It moved down from
+`workflow.py`, so the worker no longer imports the workflow.
 
 `halt.py::HaltState` owns the lane and operator halt state, and the worker keeps its public halt
 API as one-statement delegators.
@@ -424,13 +427,14 @@ API as one-statement delegators.
 |--------|----------|--------------|
 | `enqueue_merge_request()` / `register_and_enqueue_merge_request()` | merge_lane/intake.py | Enqueue a request and emit `merge_queued`; the workflow-path variant first registers the branch in the in-flight registry |
 | `coalesce_or_enqueue_merge_request()` | merge_lane/intake.py | De-dup gate for the `merge_request` MCP chokepoint, decomposed into named steps (registry fast path, C3 submit gate, disk scan, enqueue); façade-exported |
-| `MERGE_LANES` / `_normalize_lane()` / `_aging_key()` | merge_lane/intake.py | Lane pick order (high → normal), lane-name normalization, clique-aging sort key |
-| `_emit_merge_queued()` / `_emit_merge_coalesced()` | merge_lane/intake.py | `merge_queued` / `merge_coalesced` event emitters |
-| `select_train_members()` / `line_ranges_stackable()` | merge_lane/intake.py | Select a mutually-stackable train subset, capped at `max_members` (moved from `workflow.py`) |
+| `MERGE_LANES` / `normalize_lane()` | merge_lane/intake.py | Lane pick order (high → normal) and lane-name normalization |
+| `_emit_merge_queued()` / `emit_merge_coalesced()` | merge_lane/intake.py | `merge_queued` / `merge_coalesced` event emitters |
+| `select_train_members()` / `line_ranges_stackable()` | merge_lane/train_selection.py | Select a mutually-stackable train subset, capped at `max_members` (moved from `workflow.py`) |
 | `MergeIntake` | merge_lane/intake_buffers.py | Sole writer of the lane buffers, the redispatch park and the `SuffixConflictTracker` |
 | `IntakeLifecycle` | merge_lane/intake_buffers.py | Frozen port of the five lifecycle-registry operations the intake drives |
 | `MergeIntake.buffer_owned_request()` | merge_lane/intake_buffers.py | Register at QUEUED, advance to LANE_BUFFERED, buffer and journal a fresh request; coalesces a re-entrant drain |
 | `MergeIntake.drain_into_lanes()` | merge_lane/intake_buffers.py | Non-blocking queue drain; returns whether it consumed the shutdown sentinel |
+| `MergeIntake.pop_next_pickable()` / `_aging_key()` | merge_lane/intake_buffers.py | The one pick from the lane buffers: lane priority, then the clique-minimal item by aging key |
 | `MergeIntake.take_buffered()` / `restore_buffered()` | merge_lane/intake_buffers.py | δ chain-link walk: take a buffered link by task id, put it back at its exact slot |
 | `MergeIntake.request_redispatch()` / `next_redispatch()` | merge_lane/intake_buffers.py | Park an item for re-dispatch (back, or front with `front=True`) and pop the next one |
 | `MERGE_WORKER_SHUTDOWN_REASON` | merge_lane/intake_buffers.py | Shutdown reason whose `blocked` outcome keeps a request in the durable journal |

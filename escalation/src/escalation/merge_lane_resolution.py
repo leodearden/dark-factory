@@ -31,7 +31,7 @@ orchestrator's own submit path uses (``orchestrator/src/orchestrator/
 workflow.py::TaskWorkflow::_submit_to_merge_queue``), so the two submit paths
 cannot drift apart, and the loud-reject path tests membership against the
 exact tuple the silent-normalise path keys on.  Deliberately NOT routed
-through ``_normalize_lane``, whose defining behaviour — map anything
+through ``normalize_lane``, whose defining behaviour — map anything
 unrecognised to ``'normal'`` — is right for an inherited value and would
 reproduce this task's defect one level up for a caller-supplied one.
 
@@ -138,7 +138,7 @@ def resolve_merge_lane(
 
     The metadata arm delegates to ``orchestrator.merge_lane.worker::
     lane_for_task_metadata`` — see the module docstring for why that, and not
-    ``_normalize_lane``, is the right normaliser here.  ``source`` is
+    ``normalize_lane``, is the right normaliser here.  ``source`` is
     ``'task_metadata'`` iff the ``'merge_lane'`` key is PRESENT — presence,
     not truthiness, and not "the result differs from ``'normal'``" — because
     a task that asked for ``'normal'`` and a task that asked for nothing are
