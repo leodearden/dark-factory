@@ -64,7 +64,7 @@ test('the caps are positive integers', () => {
   }
   assert.ok(
     MAX_RESCUED_COLS < MAX_HEATMAP_COLS,
-    'the stranded-lock rescue can never take the whole grid',
+    'the abandoned-lock rescue can never take the whole grid',
   );
 });
 
@@ -166,9 +166,9 @@ function serverSorted(modules) {
     (b.contention - a.contention) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
-// The two stranded-lock shapes a column is rescued for (lockIsStranded).
-function strandedPark(path) {
-  return makeModule(path, 0, {
+// The two abandoned-lock shapes a column is rescued for (lockIsAbandoned).
+function strandedPark(path, contention = 0) {
+  return makeModule(path, contention, {
     parked_by: 'T-dead',
     parked_owner_live: false,
     park_stack: [{ owner: 'T-dead', live: false }],
@@ -255,8 +255,7 @@ test('a held module with NO live waiter earns nothing — one cell is not conten
 test('a held module whose holder is LIVE earns nothing at contention 1 — the one row counted is the holder itself', () => {
   // Contention cannot tell the holder from a waiter: a live holder is a row
   // whose own lock_set holds the path, so it scores 1 with nobody waiting.
-  // On the 2026-10-12 live snapshot 203 of the 204 held contention-1 modules
-  // were this shape; rescuing them would bury the one departed holder.
+  // Rescuing this shape would bury the departed holders among it.
   const out = boundHeatmapAxes({
     rows: [],
     modules: [makeModule('src/i/self.py', 1, {
@@ -281,9 +280,8 @@ test('a held module of UNKNOWN holder liveness earns nothing at contention 1', (
 });
 
 test('a live park earns no column of its own at contention 1 — only a dead owner rescues', () => {
-  // 99 modules on the 2026-10-12 live snapshot carried a park stack, every
-  // owner live. ParkStacksSection lists each of them; on the grid, one
-  // coloured cell is not contention.
+  // ParkStacksSection lists every park stack; on the grid, one coloured cell
+  // is not contention.
   const out = boundHeatmapAxes({
     rows: [],
     modules: [makeModule('src/j/livepark.py', 1, {
@@ -297,10 +295,10 @@ test('a live park earns no column of its own at contention 1 — only a dead own
   assert.deepEqual(out.modules, []);
 });
 
-test('a live-top park with a dead SHADOWED owner is stranded too', () => {
-  // has_dead_park is the server's definition of stranded — any dead entry in
-  // the stack, not just the active top — and the stranded-parks banner reads
-  // it. Narrowing to parked_owner_live would miss this module.
+test('a live-top park with a dead SHADOWED owner is abandoned too', () => {
+  // has_dead_park — any dead entry in the stack, not just the active top — is
+  // what the stranded-parks banner reads, so every module it flags is
+  // abandoned. Narrowing to parked_owner_live would miss this module.
   const shadowed = makeModule('src/j/shadowed.py', 0, {
     parked_by: 'T-5',
     parked_owner_live: true,
@@ -444,44 +442,67 @@ test('row selection drops a row whose lock set only hits dropped columns', () =>
   assert.equal(out.rowsTruncated, true);
 });
 
-test('row selection keeps a parked row even when it touches no surviving module', () => {
-  // A parked task is the most operationally interesting row on the tab — it is
-  // what the stranded-parks banner is pointing at — and the live snapshot has
-  // only 7 of them, so keeping them costs nothing against the cap.
-  const parked = makeRow('T-7', ['src/c/solo.py'], {
-    park_state: { modules: ['src/c/solo.py'] },
-  });
-  const out = boundHeatmapAxes({ rows: [parked], modules: COLUMN_FIXTURE });
+function parkedOn(taskId, path) {
+  return makeRow(taskId, [path], { park_state: { modules: [path] } });
+}
+
+test('row selection keeps a row parked on an abandoned lock even when it touches no contended module', () => {
+  // The dead owner is what the stranded-parks banner points at; its lock earns
+  // a rescued column, and the row is kept to colour it.
+  const modules = serverSorted([...COLUMN_FIXTURE, strandedPark('src/e/stranded.py')]);
+  const out = boundHeatmapAxes({ rows: [parkedOn('T-7', 'src/e/stranded.py')], modules });
 
   assert.deepEqual(out.rows.map(r => r.task_id), ['T-7']);
 });
 
-test('row selection puts parked rows FIRST and keeps the rest in server order', () => {
+test('row selection drops a live-parked row whose park earns no column — it would render blank', () => {
+  // The row-axis twin of 'a live park earns no column of its own at
+  // contention 1': a live park is not a stuck lock, so it lifts no row past
+  // the rule every other row meets, and this row touches no kept column.
+  const modules = [
+    ...COLUMN_FIXTURE.filter(m => m.path !== 'src/c/solo.py'),
+    makeModule('src/c/solo.py', 1, {
+      parked_by: 'T-7',
+      parked_owner_live: true,
+      park_stack: [{ owner: 'T-7', live: true }],
+    }),
+  ];
+  const out = boundHeatmapAxes({ rows: [parkedOn('T-7', 'src/c/solo.py')], modules: serverSorted(modules) });
+
+  assert.deepEqual(out.rows, []);
+});
+
+test('row selection puts rows parked on an abandoned lock FIRST and keeps the rest in server order', () => {
   // The row axis's only ordering guarantee, stated executably — the column
   // axis has had one since `column selection preserves the input order`, and
   // the "showing N of M" caption is written against this. Note what is NOT
   // claimed: nothing orders rows by contention, which is why the caption's
-  // most-contended superlative sits on the COLUMN axis alone. Parked first is
-  // what makes the carve-out survive the cap (below); the rest follow the
-  // tier of rows waiting on a rescued column, empty in this fixture.
+  // most-contended superlative sits on the COLUMN axis alone. A live-parked
+  // row (T-live) is not stuck, so it keeps its server position.
+  const modules = serverSorted([...COLUMN_FIXTURE, strandedPark('src/e/stranded.py')]);
   const rows = [
     makeRow('T-1', ['src/a/hot.py']),
+    parkedOn('T-live', 'src/b/warm.py'),
     makeRow('T-2', ['src/b/warm.py']),
-    makeRow('T-parked', ['src/c/solo.py'], { park_state: { modules: ['src/c/solo.py'] } }),
+    parkedOn('T-dead', 'src/e/stranded.py'),
     makeRow('T-3', ['src/a/hot.py']),
   ];
-  const out = boundHeatmapAxes({ rows, modules: COLUMN_FIXTURE });
+  const out = boundHeatmapAxes({ rows, modules });
 
-  assert.deepEqual(out.rows.map(r => r.task_id), ['T-parked', 'T-1', 'T-2', 'T-3']);
+  assert.deepEqual(out.rows.map(r => r.task_id), ['T-dead', 'T-1', 'T-live', 'T-2', 'T-3']);
 });
 
-test('row selection: parked rows first, then rows waiting on a rescued column, then the rest in server order', () => {
-  // A row blocked on a stranded lock is as stuck as a parked one.
-  const modules = serverSorted([...COLUMN_FIXTURE, departedHolder('src/k/ghost.py', 1)]);
+test('row selection: parked on an abandoned lock first, then rows waiting on a rescued column, then the rest in server order', () => {
+  // A row blocked on an abandoned lock is as stuck as a parked one.
+  const modules = serverSorted([
+    ...COLUMN_FIXTURE,
+    departedHolder('src/k/ghost.py', 1),
+    strandedPark('src/e/stranded.py'),
+  ]);
   const rows = [
     makeRow('T-1', ['src/a/hot.py']),
     makeRow('T-blocked', ['src/k/ghost.py']),
-    makeRow('T-parked', ['src/c/solo.py'], { park_state: { modules: ['src/c/solo.py'] } }),
+    parkedOn('T-parked', 'src/e/stranded.py'),
     makeRow('T-2', ['src/b/warm.py']),
   ];
   const out = boundHeatmapAxes({ rows, modules });
@@ -637,22 +658,21 @@ test('BOUND: rows are selected against the columns that will ACTUALLY render', (
   assert.deepEqual(out.rows.map(r => r.task_id), ['T-keep']);
 });
 
-test('BOUND: a parked row survives the cap even when ordinary rows would fill it', () => {
+test('BOUND: a row parked on an abandoned lock survives the cap even when ordinary rows would fill it', () => {
   // The parked carve-out is only real if it beats the SLICE, not merely the
   // filter — and the single-row fixture above cannot see the difference.
   // `shape_scheduler` appends the synthetic stranded-park rows after every
   // project's ordinary rows, so at production scale the parked rows are
   // exactly the ones a positional prefix always cuts: the one shape where the
-  // carve-out is load-bearing is the one shape it used to fail.
+  // carve-out is load-bearing is the one shape it used to fail. The dead park
+  // is contended here, so its column is in the head rather than rescued, and
+  // only the parked tier can keep this row.
   const ordinary = Array.from({ length: MAX_HEATMAP_ROWS + 5 }, (_, i) =>
     makeRow(`T-ord-${i}`, ['src/a/hot.py']),
   );
-  const parked = makeRow('T-stranded', ['src/c/solo.py'], {
-    park_state: { modules: ['src/c/solo.py'] },
-  });
   const out = boundHeatmapAxes({
-    rows: [...ordinary, parked],
-    modules: COLUMN_FIXTURE,
+    rows: [...ordinary, parkedOn('T-stranded', 'src/e/stranded.py')],
+    modules: serverSorted([...COLUMN_FIXTURE, strandedPark('src/e/stranded.py', 3)]),
   });
 
   assert.equal(out.rows.length, MAX_HEATMAP_ROWS, 'the cap still binds');
@@ -664,22 +684,21 @@ test('BOUND: a parked row survives the cap even when ordinary rows would fill it
 });
 
 // ---------------------------------------------------------------------------
-// COLUMN BUDGET — stranded locks reach the rendered set at cap scale
+// COLUMN BUDGET — abandoned locks reach the rendered set at cap scale
 // ---------------------------------------------------------------------------
 //
-// The server sorts modules `(-contention, path)`, so a stranded lock (a dead
+// The server sorts modules `(-contention, path)`, so an abandoned lock (a dead
 // park at contention 0, a departed holder with a handful of waiters) sorts to
 // the tail, and a positional prefix of 60 never reaches it at live scale. The
-// columns are therefore a contended HEAD plus a rescued TAIL of stranded
+// columns are therefore a contended HEAD plus a rescued TAIL of abandoned
 // modules the head did not reach — the column-axis twin of 'BOUND: a parked
 // row survives the cap even when ordinary rows would fill it'.
 
-const STRANDED_PARK_PATH = 'src/stranded/park.py';
-const DEPARTED_HOLDER_PATH = 'src/stranded/ghost.py';
+const STRANDED_PARK_PATH = 'src/abandoned/park.py';
+const DEPARTED_HOLDER_PATH = 'src/abandoned/ghost.py';
 
-// The task's measured shape: makeFixture's realistic distribution (1,845
-// contended of 4,302, the head bottoming out at contention 6) plus one of
-// each carve-out, server-sorted.
+// makeFixture's realistic distribution plus one of each carve-out,
+// server-sorted.
 let liveShapedModules = null;
 function getLiveShapedModules() {
   liveShapedModules = liveShapedModules || serverSorted([
@@ -727,7 +746,7 @@ test('BOUND: both carve-outs reach the rendered set on a live-shaped snapshot', 
 });
 
 test('the rendered columns stay in server order: the contended head, then the rescued tail', () => {
-  // The property the caption's 'the N most contended ..., then R stranded'
+  // The property the caption's 'the N most contended ..., then R abandoned'
   // rests on.
   const input = getLiveShapedModules();
   const out = boundHeatmapAxes({ rows: [], modules: input });
@@ -748,7 +767,7 @@ test('the rendered columns stay in server order: the contended head, then the re
   );
 });
 
-test('a stranded module already inside the contended head takes no reserved slot', () => {
+test('an abandoned module already inside the contended head takes no reserved slot', () => {
   const input = [departedHolder(DEPARTED_HOLDER_PATH, 99), ...contendedColumns(65)];
   const out = boundHeatmapAxes({ rows: [], modules: input });
 
@@ -756,7 +775,7 @@ test('a stranded module already inside the contended head takes no reserved slot
   assert.equal(out.modulesRescued, 0);
 });
 
-test('a stranded module at the edge of the head is not squeezed out by a rescue behind it', () => {
+test('an abandoned module at the edge of the head is not squeezed out by a rescue behind it', () => {
   // Reserving the dead park's slot shrinks the head to 59, which pushes the
   // departed holder at index 59 out of it, which needs a slot of its own: the
   // head length is a fixed point (58 here), and a one-pass greedy drops the
@@ -777,7 +796,7 @@ test('a stranded module at the edge of the head is not squeezed out by a rescue 
 test('rescued columns never take more than MAX_RESCUED_COLS slots', () => {
   const contended = contendedColumns(70);
   const parks = Array.from({ length: MAX_RESCUED_COLS + 5 }, (_, i) =>
-    strandedPark(`src/stranded/park${String(i).padStart(2, '0')}.py`));
+    strandedPark(`src/abandoned/park${String(i).padStart(2, '0')}.py`));
   const out = boundHeatmapAxes({ rows: [], modules: [...contended, ...parks] });
   const headLen = MAX_HEATMAP_COLS - MAX_RESCUED_COLS;
 
@@ -787,9 +806,8 @@ test('rescued columns never take more than MAX_RESCUED_COLS slots', () => {
 });
 
 test('BOUND: a row waiting on a rescued column survives the row cap', () => {
-  // Without this the rescued column renders as 60 blank cells: on the live
-  // 2026-10-12 payload only 1 of 5 rescued columns had a coloured cell, its
-  // waiters sitting ~2,208th of 2,223 touching rows.
+  // Without this the rescued column renders as 60 blank cells: its waiters
+  // arrive late in server order, after ordinary rows have filled the cap.
   const ordinary = Array.from({ length: MAX_HEATMAP_ROWS + 5 }, (_, i) =>
     makeRow(`T-ord-${i}`, ['src/wide/mod0.py']),
   );
@@ -833,7 +851,7 @@ test('BOUND: on a live-shaped snapshot every rescued column has a rendered row t
 // rescued tail' (above) is what makes 'the N most contended' and 'then' true;
 // these tests pin the copy against the counts the selection reports.
 
-const STRANDED_SUFFIX = 'stranded (dead park owner or departed holder)';
+const ABANDONED_SUFFIX = 'abandoned (dead park owner or departed holder)';
 
 test('describeHeatmapCap is null when neither axis was truncated', () => {
   const out = boundHeatmapAxes({
@@ -857,7 +875,7 @@ test('with no rescued columns the caption keeps its most-contended claim', () =>
   );
 });
 
-test('with rescued columns the superlative covers the head only, and the stranded tail is named', () => {
+test('with rescued columns the superlative covers the head only, and the abandoned tail is named', () => {
   realisticFixture = realisticFixture
     || makeFixture({ nRows: LIVE_ROWS, nModules: LIVE_MODULES, dense: false });
   const out = boundHeatmapAxes({ rows: realisticFixture.rows, modules: getLiveShapedModules() });
@@ -865,7 +883,7 @@ test('with rescued columns the superlative covers the head only, and the strande
   assert.equal(
     describeHeatmapCap(out),
     `Showing ${out.rows.length} of ${out.rowsTotal} tasks and the ${MAX_HEATMAP_COLS - 2} ` +
-      `most contended of ${out.modulesTotal} modules, then 2 ${STRANDED_SUFFIX}.`,
+      `most contended of ${out.modulesTotal} modules, then 2 ${ABANDONED_SUFFIX}.`,
   );
 });
 
@@ -889,6 +907,6 @@ test('with no contended columns at all the caption does not claim a contention r
   assert.equal(out.modulesTruncated, true);
   assert.equal(
     describeHeatmapCap(out),
-    `Showing 1 of 1 tasks and 1 of 3 modules, all ${STRANDED_SUFFIX}.`,
+    `Showing 1 of 1 tasks and 1 of 3 modules, all ${ABANDONED_SUFFIX}.`,
   );
 });

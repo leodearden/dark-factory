@@ -25,9 +25,9 @@
 // number these already determine, with no caller of its own to serve.
 const MAX_HEATMAP_ROWS = 60
 const MAX_HEATMAP_COLS = 60
-// At most this many of MAX_HEATMAP_COLS go to stranded locks the contention
-// cut would hide, so the head always keeps >= 50 columns; the 2026-10-12 live
-// snapshot had 5.
+// At most this many of MAX_HEATMAP_COLS go to abandoned locks the contention
+// cut would hide, so the head always keeps at least
+// MAX_HEATMAP_COLS - MAX_RESCUED_COLS columns.
 const MAX_RESCUED_COLS = 10
 
 // Does this task row contend for this lock module — i.e. would its cell be
@@ -48,27 +48,32 @@ function rowTouchesModule(row, module) {
   return (row.lock_set || []).includes(module.path)
 }
 
-// A stranded lock is one no live task can release: a park with a dead owner
+// An abandoned lock is one no live task can release: a park with a dead owner
 // anywhere in its stack, or a holder that has left the active task set while
 // a waiter still queues behind it. Both facts come from the server
 // (has_dead_park, holder_live); `=== false` keeps unknown liveness inert.
-function lockIsStranded(module) {
+// Deliberately not called "stranded": the Scheduler tab's stranded-parks
+// banner counts dead parks only, and this set adds departed holders.
+//
+// THE SINGLE SOURCE of "is this lock stuck?" for both axes: it rescues a
+// column, and it is what lifts a parked row ahead of the rest.
+function lockIsAbandoned(module) {
   return !!module.has_dead_park
     || (!!module.holder && module.holder_live === false && (module.contention || 0) > 0)
 }
 
 // The columns: a contended HEAD (a prefix of the contention > 1 modules in
-// server order) plus a rescued TAIL (stranded modules the head did not reach).
-// A slot is reserved only when a stranded module falls outside the head.
+// server order) plus a rescued TAIL (abandoned modules the head did not reach).
+// A slot is reserved only when an abandoned module falls outside the head.
 function selectHeatmapColumns(allModules) {
   const contended = allModules.filter(m => (m.contention || 0) > 1)
-  const stranded = allModules.filter(lockIsStranded)
+  const abandoned = allModules.filter(lockIsAbandoned)
   const rankOf = new Map(contended.map((m, i) => [m, i]))
-  const rescuedPast = headLen => stranded
+  const rescuedPast = headLen => abandoned
     .filter(m => !(rankOf.has(m) && rankOf.get(m) < headLen))
     .slice(0, MAX_RESCUED_COLS)
   let headLen = Math.min(contended.length, MAX_HEATMAP_COLS)
-  // Shrinking the head can push a stranded module out of it, so the length
+  // Shrinking the head can push an abandoned module out of it, so the length
   // is a fixed point; it settles within MAX_RESCUED_COLS steps, because at
   // MAX_HEATMAP_COLS - MAX_RESCUED_COLS the sum is always within budget.
   while (headLen + rescuedPast(headLen).length > MAX_HEATMAP_COLS) headLen--
@@ -102,34 +107,34 @@ function rowTouchesAnyIndexed(row, modulesByPath) {
   return false
 }
 
-// A parked row is kept whatever its columns do — it is what the Scheduler
-// tab's stranded-parks banner is pointing at — and it is taken FIRST,
-// because a carve-out that only survives the filter does not survive this
-// function.  `shape_scheduler` appends the synthetic stranded-park rows
-// after every project's ordinary rows, so on a list the size of the live
-// snapshot a positional prefix fills up long before it reaches them and
-// drops precisely the rows the carve-out was written to keep.  A row waiting
-// on a rescued column comes next: it is blocked on a stranded lock, as stuck
-// as a parked one, and without it the rescued column renders blank.  That
-// tier is bounded by MAX_RESCUED_COLS columns, each no more contended than
-// the head's minimum (15 rows on the live snapshot).
+// Rows come in three tiers, then the cap. Every tier is a row that colours a
+// kept column, so none of them can bring a blank row:
 //
-// Ordinary rows therefore yield to parked ones when the cap binds.  That
-// trade is one-sided in practice (the live snapshot has 7 parked rows
-// against 2,991) and is the right way round when it is not: a row is on
-// this tab to be diagnosed, and a parked one is already stuck.
+//   1. a parked row blocked on an abandoned lock, such as the dead owner the
+//      stranded-parks banner points at. `shape_scheduler` appends the dead
+//      owners' synthetic rows after every project's ordinary rows, so a
+//      positional prefix would cut exactly these;
+//   2. a row waiting on a rescued column, without which that column renders
+//      blank. There are at most MAX_RESCUED_COLS such columns, each no more
+//      contended than the head's least contended column;
+//   3. every other row touching a kept column.
+//
+// Each tier keeps server order. A live park earns no priority, just as it
+// earns no column.
 function selectHeatmapRows(allRows, keptModules, rescued) {
   const keptByPath = heatmapModulesByPath(keptModules)
+  const abandonedByPath = heatmapModulesByPath(keptModules.filter(lockIsAbandoned))
   const rescuedByPath = heatmapModulesByPath(rescued)
-  const parkedRows = []
-  const waitingRows = []
-  const touchingRows = []
+  const parkedOnAbandoned = []
+  const waitingOnRescued = []
+  const touching = []
   for (const row of allRows) {
-    if (((row.park_state || {}).modules || []).length > 0) parkedRows.push(row)
-    else if (rowTouchesAnyIndexed(row, rescuedByPath)) waitingRows.push(row)
-    else if (rowTouchesAnyIndexed(row, keptByPath)) touchingRows.push(row)
+    const parked = ((row.park_state || {}).modules || []).length > 0
+    if (parked && rowTouchesAnyIndexed(row, abandonedByPath)) parkedOnAbandoned.push(row)
+    else if (rowTouchesAnyIndexed(row, rescuedByPath)) waitingOnRescued.push(row)
+    else if (rowTouchesAnyIndexed(row, keptByPath)) touching.push(row)
   }
-  return parkedRows.concat(waitingRows, touchingRows).slice(0, MAX_HEATMAP_ROWS)
+  return parkedOnAbandoned.concat(waitingOnRescued, touching).slice(0, MAX_HEATMAP_ROWS)
 }
 
 // Choose the rows and columns the heatmap will actually render.
@@ -172,10 +177,10 @@ function describeHeatmapCap(bounded) {
   const contended = bounded.modules.length - bounded.modulesRescued
   const rescued = bounded.modulesRescued
   const of = `of ${bounded.modulesTotal} modules`
-  const stranded = 'stranded (dead park owner or departed holder)'
+  const abandoned = 'abandoned (dead park owner or departed holder)'
   if (rescued === 0) return `${tasks} and the ${contended} most contended ${of}.`
-  if (contended === 0) return `${tasks} and ${rescued} ${of}, all ${stranded}.`
-  return `${tasks} and the ${contended} most contended ${of}, then ${rescued} ${stranded}.`
+  if (contended === 0) return `${tasks} and ${rescued} ${of}, all ${abandoned}.`
+  return `${tasks} and the ${contended} most contended ${of}, then ${rescued} ${abandoned}.`
 }
 
 const SCHEDULER_HEATMAP_BOUNDS_API = {
