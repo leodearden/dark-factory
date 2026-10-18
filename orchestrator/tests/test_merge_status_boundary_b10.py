@@ -1,17 +1,17 @@
 """B10 of ``plans/merge-status-durable-non-landed-prd.md``'s Boundary-test sketch: cross-run lookup cost.
 
 The sibling of ``escalation/tests/test_merge_status_boundary.py`` (rows B1-B9).
-The bound, p99 < 50 ms on a store of at least 300k events and 2,500
-merge_finalized rows, is kept as written by Leo's ruling on esc-4834-2 and is
-met by task 6927's partial indexes.  It is WALL time because INV-8
-(``docs/legibility/design-invariants.md``) bounds event-loop wall time, and
-merge_status's cross-run reads run synchronously inside its async resolver.
-The timed reads are the ones the real merge_status issues for each poll,
-recorded off the store and replayed.  Git is deliberately not touched: B10 is
-scoped to the cross-run read.  Each window of replays is the ruled bound in
-full; a window that misses it is re-measured after a pause, within a time
-budget, because host scheduling stalls lift the tail of a ~2 ms read, and a
-window whose median misses is not re-measured (task 7090).
+On a store of at least 300k events and 2,500 merge_finalized rows, B10 replays
+the cross-run reads the real merge_status issues for each poll, recorded off
+the store.  It asserts two bounds.  Each read's query plan SEARCHes one of task
+6927's partial indexes, which fails on a dropped index whatever the host load.
+The median of 200 wall-clock replays is under 50 ms; it is WALL time because
+INV-8 (``docs/legibility/design-invariants.md``) bounds event-loop wall time,
+and merge_status's cross-run reads run synchronously inside its async resolver.
+These replace esc-4834-2's p99 < 50 ms, superseded by Leo's 2026-10-18 ruling
+(b) on cockpit decision dark_factory-b10-flake-7090, because host scheduling
+stalls on the merge host lift the tail of a ~2 ms read (task 7090).  Git is
+deliberately not touched: B10 is scoped to the cross-run read.
 """
 from __future__ import annotations
 
