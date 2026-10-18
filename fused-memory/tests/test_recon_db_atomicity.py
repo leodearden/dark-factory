@@ -597,6 +597,35 @@ async def _buffer_a_late_event(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+async def _hold_the_lock_with_an_old_heartbeat(
+    buffer: EventBuffer, conn: aiosqlite.Connection
+) -> float:
+    """Take ``buffer``'s lock, backdate its heartbeat from ``conn``, and return that age.
+
+    Half the stale-lock window: old enough that a heartbeat which lands visibly
+    resets it, young enough that ``get_lock_status``'s stale-lock sweep keeps
+    the row.
+    """
+    assert await buffer.mark_run_active(PROJECT_ID), 'the lock was already held'
+    aged_seconds = buffer.stale_lock_seconds / 2
+    heartbeat_at = (datetime.now(UTC) - timedelta(seconds=aged_seconds)).isoformat()
+    async with conn.execute(
+        'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+        (heartbeat_at, PROJECT_ID),
+    ):
+        pass
+    await conn.commit()
+    return aged_seconds
+
+
+async def _assert_the_heartbeat_landed(buffer: EventBuffer, aged_seconds: float) -> None:
+    holder, age = await buffer.get_lock_status(PROJECT_ID)
+    assert holder == buffer.instance_id and age is not None and age < aged_seconds, (
+        f'the heartbeat did not land: the lock is held by {holder!r} with a heartbeat '
+        f'{age!r}s old, against {aged_seconds}s before the collision'
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
     journal, event_buffer, buffer_tap, second_connection
@@ -605,7 +634,8 @@ async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
 
     Constructed, not raced: the production ``peek_buffered`` is parked with its
     snapshot pinned, a foreign connection buffers ``late``, and the heartbeat is
-    queued into that window.
+    queued into that window.  The buffer holds the lock with an old heartbeat, so
+    a heartbeat that survives but changes nothing fails the arm too.
 
     ``heartbeat`` is the probe because its unit is a SINGLE ``UPDATE`` with no
     preceding SELECT — the same property that makes ``record_run_session`` the
@@ -613,6 +643,7 @@ async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
     without re-checking it.
     """
     await _seed_buffered_events(second_connection, count=SEEDED_EVENTS)
+    aged_seconds = await _hold_the_lock_with_an_old_heartbeat(event_buffer, second_connection)
 
     peeked, error = await _collide_with_a_pinned_read(
         buffer_tap.connection,
@@ -629,6 +660,7 @@ async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
         f'the peek returned {[event.id for event in peeked]!r}: it was not pinned '
         "before the foreign commit buffered 'late', so this run did not collide at all"
     )
+    await _assert_the_heartbeat_landed(event_buffer, aged_seconds)
 
 
 @pytest.mark.asyncio
@@ -642,6 +674,7 @@ async def test_a_legacy_multi_hop_peek_kills_the_heartbeat(
     connection.  That it kills the heartbeat is what proves arm D discriminates.
     """
     await _seed_buffered_events(second_connection, count=SEEDED_EVENTS)
+    await _hold_the_lock_with_an_old_heartbeat(event_buffer, second_connection)
 
     rows, error = await _collide_with_a_pinned_read(
         buffer_tap.connection,
