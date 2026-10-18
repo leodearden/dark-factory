@@ -50,6 +50,7 @@ from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
     OrchestratorConfig,
+    PsiAdmissionConfig,
     coerce_tier,
 )
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
@@ -2156,6 +2157,25 @@ def _reject_contradictory_metadata_mode(
 
 def _park_records(parks_by_owner: Mapping[str, Mapping[str, Any]]) -> dict[str, ParkRecord]:
     return {owner: ParkRecord.model_validate(rec) for owner, rec in parks_by_owner.items()}
+
+
+def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> tuple[str, ...]:
+    """Name each degraded load component whose loss disables a LIVE gate arm.
+
+    Host PSI always counts: an unreadable host sample makes every arm inert
+    this tick (DA-D6 fail-open). The runqueue and own-cgroup components count
+    only while their arm is on, because a degraded component behind an off arm
+    costs the gate nothing (PRD plans/load-throttle-harmonisation-prd.md D2).
+    """
+    degraded: list[str] = []
+    if not sample.read_ok:
+        degraded.append('host PSI /proc/pressure: failing open, heavy dispatch is NOT throttled')
+    if cfg.runqueue_ratio is not None and not sample.runqueue_read_ok:
+        degraded.append('/proc/stat runqueue: runqueue_ratio arm inert')
+    if cfg.own_cpu_some_avg10 is not None and not sample.own_read_ok:
+        own_cgroup = sample.own_cgroup or '(unresolved)'
+        degraded.append(f'own cgroup {own_cgroup}: own_cpu_some_avg10 arm inert')
+    return tuple(degraded)
 
 
 class Scheduler:
@@ -7515,6 +7535,11 @@ class Scheduler:
         before this tick's own dispatch can mutate it (stable floor
         comparison). Runs after the empty-candidate short-circuit so an
         idle tick never pays for a PSI read. Always continues.
+
+        A degraded load component never holds: ``saturated()`` treats its
+        arm as inert (every arm, when host PSI is unreadable — DA-D6). The
+        loud operator signal is one rate-limited WARNING naming each
+        degraded component behind a live arm (``_psi_degradations``).
         """
         cfg_psi = self.config.psi_admission
         psi_sample: PsiSample | None = None
@@ -7522,15 +7547,13 @@ class Scheduler:
         psi_in_flight = 0
         if cfg_psi.enabled:
             psi_sample = self._read_psi_sample()
-            if not psi_sample.read_ok:
-                # Fail-open (DA-D6): saturated() is False whenever read_ok is
-                # False, so psi_hold stays False and dispatch proceeds
-                # normally — this WARNING is only the loud operator signal.
+            degraded = _psi_degradations(psi_sample, cfg_psi)
+            if degraded:
                 _now = self._time_source()
                 if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
                     logger.warning(
-                        'Dispatch-admission gate: PSI sample unreadable — '
-                        'failing open (heavy dispatch is NOT throttled this tick)'
+                        'Dispatch-admission gate: load component unreadable — %s',
+                        '; '.join(degraded),
                     )
                     self._last_psi_read_fail_log = _now
             psi_in_flight = len(self._dispatched)
