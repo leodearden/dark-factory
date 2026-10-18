@@ -1568,18 +1568,11 @@ class GraphitiBackend:
     (named after the project_id / group_id).  The driver is cloned per-request
     so every operation targets the correct graph.
 
-    TIMEOUT POSTURE (task 5699, the twin of ``Mem0Backend``'s from task 5265).
-    Every read and write budgeted by ``_read_timeout`` / ``_write_timeout``
-    goes through :meth:`_timed_read` / :meth:`_timed_write` to
-    ``backends/timeout_budget.py::await_within``: a timeout PROPAGATES as a
-    ``TimeoutError`` naming the store, the operation and the budget, and is
-    never degraded into a falsy return.  This paragraph is the canonical
-    statement of the rule; a method's ``Raises:`` line adds only the
-    consequence specific to it.
-
-    The one deliberate exception is index provisioning (``_ensure_indices``,
-    ``provision_registered_graphs``).  It runs on its own
-    ``_index_provision_timeout`` budget and never raises, per
+    TIMEOUT POSTURE.  Every budgeted read and write goes through
+    :meth:`_timed_read` / :meth:`_timed_write`, so it follows the rule stated
+    in ``backends/timeout_budget.py``.  The one exception is index
+    provisioning (``_ensure_indices``, ``provision_registered_graphs``): it
+    runs on its own ``_index_provision_timeout`` budget and never raises, per
     docs/prds/falkordb-index-provisioning.md D4-D6.
     """
 
