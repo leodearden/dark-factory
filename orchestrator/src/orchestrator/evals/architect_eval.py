@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 CreateWorktree = Callable[..., Awaitable[tuple[Path, str]]]
 CleanupWorktree = Callable[[Path, Path], Awaitable[None]]
 OpenArtifacts = Callable[[Path], TaskArtifacts]
+BuildPrompt = Callable[[OrchestratorConfig, dict, Path, str], Awaitable[str]]
 InvokeAgent = Callable[..., Awaitable[AgentResult]]
 JudgePlan = Callable[[dict, str, dict], Awaitable[Scored[PlanQualityVerdict] | Unmeasured]]
 ReadDiff = Callable[[Path, str, str], Awaitable[str]]
@@ -88,6 +89,14 @@ def open_eval_artifacts(worktree: Path) -> TaskArtifacts:
     return TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
 
 
+async def build_eval_architect_prompt(
+    orch_config: OrchestratorConfig, task_def: dict, worktree: Path, base_commit: str,
+) -> str:
+    """The production architect briefing for *task_def*, ending in the replay frame."""
+    briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=base_commit)
+    return await briefing.build_architect_prompt(task_def, worktree=worktree)
+
+
 def cell_label(task: dict, config: EvalConfig) -> str:
     return f"{task['id']} × {config.name}"
 
@@ -100,6 +109,7 @@ class ArchitectEvalDeps:
     create_worktree: CreateWorktree = create_eval_worktree
     cleanup_worktree: CleanupWorktree = cleanup_eval_worktree
     open_artifacts: OpenArtifacts = open_eval_artifacts
+    build_prompt: BuildPrompt = build_eval_architect_prompt
     invoke: InvokeAgent = invoke_agent
     judge: JudgePlan = judge_plan_quality
     read_reference_diff: ReadDiff = get_diff_between_commits
@@ -108,28 +118,9 @@ class ArchitectEvalDeps:
 
 
 @dataclass(frozen=True)
-class ArchitectAttempt:
-    """What invoking the architect left behind, before any scoring."""
+class ArchitectUsage:
+    """The architect's usage: tokens and turns of its last attempt, winning duration."""
 
-    address: CellName
-    worktree: Path
-    outcome: str
-    plan: dict
-    declines: Mapping[str, dict | None]
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_create_tokens: int = 0
-    turns: int = 0
-    duration_ms: int = 0
-    cost_usd: float = 0.0
-    cost_source: str = 'cli'
-    is_local_model: bool = False
-    unmeasured: Unmeasured | None = None
-
-
-@dataclass(frozen=True)
-class _Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
@@ -138,7 +129,7 @@ class _Usage:
     duration_ms: int = 0
 
     @classmethod
-    def of(cls, result: AgentResult) -> _Usage:
+    def of(cls, result: AgentResult) -> ArchitectUsage:
         """The last attempt's usage; a provider that did not report one counts 0."""
         return cls(
             input_tokens=result.input_tokens or 0,
@@ -151,13 +142,41 @@ class _Usage:
 
 
 @dataclass(frozen=True)
+class ArchitectAttempt:
+    """What invoking the architect left behind, before any scoring."""
+
+    address: CellName
+    worktree: Path
+    outcome: str
+    plan: dict
+    declines: Mapping[str, dict | None]
+    usage: ArchitectUsage = dataclasses.field(default_factory=ArchitectUsage)
+    cost_usd: float = 0.0
+    cost_source: str = 'cli'
+    is_local_model: bool = False
+    unmeasured: Unmeasured | None = None
+
+
+@dataclass
+class _Progress:
+    """How far one architect call has got, filled in as each of its effects lands."""
+
+    artifacts: TaskArtifacts | None = None
+    prices: dict[str, Any] | None = None
+    spent_usd: float = 0.0
+
+
+@dataclass(frozen=True)
 class _Exit:
-    """How the architect invoke ended, before declines and cost are attached."""
+    """How the architect call ended, and what it had reached by then."""
 
     outcome: str
     plan: dict
-    usage: _Usage = dataclasses.field(default_factory=_Usage)
+    usage: ArchitectUsage = dataclasses.field(default_factory=ArchitectUsage)
     unmeasured: Unmeasured | None = None
+    artifacts: TaskArtifacts | None = None
+    prices: dict[str, Any] | None = None
+    spent_usd: float = 0.0
 
 
 async def invoke_architect(
@@ -181,27 +200,21 @@ async def invoke_architect(
     )
     try:
         ended = await call.run()
+        declines = _read_declines(ended.artifacts, call.label)
     finally:
-        declines = _read_declines(call.artifacts, call.label)
         await deps.cleanup_worktree(project_root, worktree)
     is_local_model = is_proxied_endpoint(config.env_overrides)
     cost_usd, cost_source = _architect_cost(
-        ended.usage, model=config.model, prices=call.prices,
-        spent_usd=call.spent_usd, is_local_model=is_local_model,
+        ended.usage, model=config.model, prices=ended.prices,
+        spent_usd=ended.spent_usd, is_local_model=is_local_model,
     )
-    usage = ended.usage
     return ArchitectAttempt(
         address=address,
         worktree=worktree,
         outcome=ended.outcome,
         plan=ended.plan,
         declines=declines,
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        cache_read_tokens=usage.cache_read_tokens,
-        cache_create_tokens=usage.cache_create_tokens,
-        turns=usage.turns,
-        duration_ms=usage.duration_ms,
+        usage=ended.usage,
         cost_usd=cost_usd,
         cost_source=cost_source,
         is_local_model=is_local_model,
@@ -209,9 +222,9 @@ async def invoke_architect(
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class _ArchitectCall:
-    """One architect invocation in an existing worktree, and how far it got."""
+    """One architect invocation in an existing worktree."""
 
     task: dict
     config: EvalConfig
@@ -220,37 +233,51 @@ class _ArchitectCall:
     build_orch_config: Callable[[], OrchestratorConfig]
     usage_gate: InjectedGate
     timeout_minutes: float
-    artifacts: TaskArtifacts | None = None
-    prices: dict[str, Any] | None = None
-    spent_usd: float = 0.0
 
     @property
     def label(self) -> str:
         return cell_label(self.task, self.config)
 
     async def run(self) -> _Exit:
+        """Every way the call can end, as an ``_Exit`` carrying how far it got."""
+        progress = _Progress()
         try:
-            result, artifacts = await self._ask()
+            result, artifacts = await self._ask(progress)
         except TimeoutError:
-            return _timed_out(self.label, self.timeout_minutes, self.spent_usd)
+            ended = _timed_out(self.label, self.timeout_minutes, progress.spent_usd)
         except AllAccountsCappedException as e:
-            return _cap_exhausted(self.label, e, self.artifacts, self.spent_usd)
+            ended = _cap_exhausted(self.label, e, progress.artifacts, progress.spent_usd)
         except Exception as e:
-            return _harness_error(self.label, e, self.spent_usd)
-        return _read_the_answer(self.label, result, artifacts, self.config, self.spent_usd)
+            ended = _harness_error(self.label, e, progress.spent_usd)
+        else:
+            ended = _read_the_answer(
+                self.label, result, artifacts, self.config, progress.spent_usd,
+            )
+        return dataclasses.replace(
+            ended, artifacts=progress.artifacts, prices=progress.prices,
+            spent_usd=progress.spent_usd,
+        )
 
-    async def _ask(self) -> tuple[AgentResult, TaskArtifacts]:
+    async def _ask(self, progress: _Progress) -> tuple[AgentResult, TaskArtifacts]:
         orch_config = self.build_orch_config()
-        self.prices = orch_config.prices
-        artifacts = self.artifacts = self.deps.open_artifacts(self.worktree)
+        progress.prices = orch_config.prices
+        artifacts = progress.artifacts = self.deps.open_artifacts(self.worktree)
         pre = self.task['pre_task_commit']
         task_def = self.task.get('task_definition', {})
         artifacts.init(
             self.task['id'], task_def.get('title', ''), task_def.get('description', ''),
             base_commit=pre,
         )
-        briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
-        prompt = await briefing.build_architect_prompt(task_def, worktree=self.worktree)
+        prompt = await self.deps.build_prompt(orch_config, task_def, self.worktree, pre)
+
+        async def timed_attempt(**kwargs: Any) -> AgentResult:
+            """One attempt bounded by the operator's timeout, its spend banked as it returns."""
+            result = await asyncio.wait_for(
+                self.deps.invoke(**kwargs), timeout=self.timeout_minutes * 60,
+            )
+            progress.spent_usd += coerce_cost_usd(result.cost_usd)
+            return result
+
         async with owned_usage_gate(
             self.usage_gate, orch_config, factory=self.deps.gate_factory, label=self.label,
         ) as gate:
@@ -258,19 +285,11 @@ class _ArchitectCall:
                 gate,
                 f'Architect eval {self.label}',
                 cap_wait_sanity_secs=self.deps.cap_wait_secs,
-                invoke_fn=self._timed_attempt,
+                invoke_fn=timed_attempt,
                 backend=self.config.backend,
                 **_architect_invocation(self.task, self.config, prompt, self.worktree),
             )
         return result, artifacts
-
-    async def _timed_attempt(self, **kwargs: Any) -> AgentResult:
-        """One attempt bounded by the operator's timeout, its spend banked as it returns."""
-        result = await asyncio.wait_for(
-            self.deps.invoke(**kwargs), timeout=self.timeout_minutes * 60,
-        )
-        self.spent_usd += coerce_cost_usd(result.cost_usd)
-        return result
 
 
 def _architect_invocation(
@@ -299,7 +318,7 @@ def _read_the_answer(
     config: EvalConfig,
     spent_usd: float,
 ) -> _Exit:
-    usage = _Usage.of(result)
+    usage = ArchitectUsage.of(result)
     refusal = _refusal(label, result, config, spent_usd)
     try:
         plan = artifacts.read_plan() or {}
@@ -395,7 +414,7 @@ def _read_declines(
 
 
 def _architect_cost(
-    usage: _Usage,
+    usage: ArchitectUsage,
     *,
     model: str,
     prices: dict[str, Any] | None,
@@ -433,10 +452,16 @@ def classify_attempt(attempt: ArchitectAttempt) -> PlanScoring:
 
 @dataclass(frozen=True)
 class PlanJudgement:
-    """The plan judge's outcome, and whether it judged without a reference diff."""
+    """The plan judge's outcome; ``blind`` when it had no reference diff, and
+    ``reached`` unless it raised, which leaves whether it was ever called unknown."""
 
     outcome: Scored[PlanQualityVerdict] | Unmeasured
     blind: bool
+    reached: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.reached and isinstance(self.outcome, Scored):
+            raise ValueError('a scored plan judgement was necessarily reached')
 
 
 async def read_reference_diff(task: dict, deps: ArchitectEvalDeps) -> str:
@@ -474,10 +499,11 @@ async def judge_plan(
             f"plan judge raised for {task['id']}; degrading to structural floor",
             exc_info=True,
         )
-        outcome = Unmeasured(
+        raised = Unmeasured(
             MeasurementStage.JUDGE, UnmeasuredCause.RAISED,
             exception_reason(e), cost_usd=0.0,
         )
+        return PlanJudgement(raised, blind=blind, reached=False)
     return PlanJudgement(outcome, blind=blind)
 
 
@@ -497,7 +523,7 @@ def _judge_share(judgement: PlanJudgement) -> _JudgeShare:
             plan_quality=outcome.value.plan_quality, invocations=1,
             cost_usd=outcome.cost_usd, without_reference=judgement.blind,
         )
-    if outcome.cause is UnmeasuredCause.RAISED:
+    if not judgement.reached:
         return _JudgeShare(unmeasured=outcome)
     return _JudgeShare(unmeasured=outcome, invocations=1, cost_usd=outcome.cost_usd)
 
@@ -525,7 +551,8 @@ def assemble_metrics(
         )
     share = _judge_share(judgement) if judgement is not None else _JudgeShare()
     plan = attempt.plan
-    duration_secs = attempt.duration_ms / 1000
+    usage = attempt.usage
+    duration_secs = usage.duration_ms / 1000
     records = [
         u.to_record() for u in (attempt.unmeasured, share.unmeasured) if u is not None
     ]
@@ -540,16 +567,16 @@ def assemble_metrics(
         cost_source=compose_cost_source(
             attempt.cost_source, secondary_cost_usd=share.cost_usd,
         ),
-        input_tokens=attempt.input_tokens,
-        output_tokens=attempt.output_tokens,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
         is_local_model=attempt.is_local_model,
-        cache_read_tokens=attempt.cache_read_tokens,
-        cache_create_tokens=attempt.cache_create_tokens,
-        turns_used=attempt.turns,
+        cache_read_tokens=usage.cache_read_tokens,
+        cache_create_tokens=usage.cache_create_tokens,
+        turns_used=usage.turns,
         tokens_per_second=(
-            round(attempt.output_tokens / duration_secs, 2) if duration_secs > 0 else 0.0
+            round(usage.output_tokens / duration_secs, 2) if duration_secs > 0 else 0.0
         ),
-        workflow_duration_ms=attempt.duration_ms,
+        workflow_duration_ms=usage.duration_ms,
         invocation_errors=records or None,
         cap_tainted=scoring is PlanScoring.TAINTED,
         judge_cost_usd=share.cost_usd,

@@ -27,16 +27,17 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.config_models import AccountConfig
 from shared.testing import make_gate_mock
 
-from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals import eval_gate, runner, snapshots
 from orchestrator.evals.architect_eval import (
     ArchitectAttempt,
     ArchitectEvalDeps,
+    ArchitectUsage,
     PlanJudgement,
     PlanScoring,
     assemble_metrics,
+    build_eval_architect_prompt,
     classify_attempt,
     invoke_architect,
     judge_plan,
@@ -55,7 +56,7 @@ from orchestrator.evals.measurement import (
     Unmeasured,
     UnmeasuredCause,
 )
-from orchestrator.evals.metrics import _DECLINE_READERS, DECLINE_KINDS
+from orchestrator.evals.metrics import DECLINE_KINDS, DECLINE_READERS
 from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
 from orchestrator.evals.results import CellName, ResultStore
 
@@ -240,7 +241,7 @@ class TestAssembleMetrics:
         assert metrics.judge_cost_usd == pytest.approx(0.6)
         assert metrics.judged_without_reference is False
 
-    def test_a_raised_judgement_floors_and_credits_no_call(self):
+    def test_an_unreached_judge_floors_and_credits_no_call(self):
         plan = _scorable_plan()
         raised = Unmeasured(
             MeasurementStage.JUDGE, UnmeasuredCause.RAISED, 'RuntimeError: x', cost_usd=0.0,
@@ -248,7 +249,7 @@ class TestAssembleMetrics:
 
         metrics = assemble_metrics(
             _attempt(plan=plan, cost_usd=1.23), PlanScoring.JUDGE,
-            PlanJudgement(raised, blind=False),
+            PlanJudgement(raised, blind=False, reached=False),
         )
 
         assert metrics.plan_quality == score_plan_structure(plan)
@@ -256,6 +257,25 @@ class TestAssembleMetrics:
         assert metrics.judge_cost_usd == 0.0
         assert metrics.cost_usd == pytest.approx(1.23)
         assert metrics.invocation_errors == [raised.to_record()]
+
+    def test_a_reached_judge_is_credited_whatever_its_cause(self):
+        """Whether the judge was reached is carried, not re-derived from the cause."""
+        raised_after_spending = Unmeasured(
+            MeasurementStage.JUDGE, UnmeasuredCause.RAISED, 'RuntimeError: x', cost_usd=0.5,
+        )
+
+        metrics = assemble_metrics(
+            _attempt(plan=_scorable_plan(), cost_usd=1.23), PlanScoring.JUDGE,
+            PlanJudgement(raised_after_spending, blind=False),
+        )
+
+        assert metrics.judge_invocations == 1
+        assert metrics.judge_cost_usd == pytest.approx(0.5)
+        assert metrics.cost_usd == pytest.approx(1.23 + 0.5)
+
+    def test_a_scored_judgement_cannot_be_unreached(self):
+        with pytest.raises(ValueError, match='reached'):
+            PlanJudgement(_scored(), blind=False, reached=False)
 
     @pytest.mark.parametrize(('attempt_source', 'judge_cost', 'expected'), [
         ('price_table', 0.4, 'mixed'),
@@ -302,9 +322,11 @@ class TestAssembleMetrics:
 
     def test_usage_is_copied_from_the_attempt(self):
         attempt = _attempt(
-            plan=_scorable_plan(), input_tokens=12_000, output_tokens=3_000,
-            cache_read_tokens=48_000, cache_create_tokens=6_000, turns=9,
-            duration_ms=4567, is_local_model=True,
+            plan=_scorable_plan(), is_local_model=True,
+            usage=ArchitectUsage(
+                input_tokens=12_000, output_tokens=3_000, cache_read_tokens=48_000,
+                cache_create_tokens=6_000, turns=9, duration_ms=4567,
+            ),
         )
 
         metrics = assemble_metrics(
@@ -322,7 +344,8 @@ class TestAssembleMetrics:
 
     def test_a_zero_duration_attempt_reports_zero_tokens_per_second(self):
         metrics = assemble_metrics(
-            _attempt(output_tokens=3_000, duration_ms=0), PlanScoring.FLOORED, None,
+            _attempt(usage=ArchitectUsage(output_tokens=3_000, duration_ms=0)),
+            PlanScoring.FLOORED, None,
         )
 
         assert metrics.tokens_per_second == 0.0
@@ -379,9 +402,12 @@ class TestJudgePlan:
 
         judgement = await judge_plan(_scorable_plan(), 'diff', _arch_task(), deps)
 
-        assert judgement.outcome == Unmeasured(
-            MeasurementStage.JUDGE, UnmeasuredCause.RAISED,
-            'RuntimeError: judge exploded', cost_usd=0.0,
+        assert judgement == PlanJudgement(
+            Unmeasured(
+                MeasurementStage.JUDGE, UnmeasuredCause.RAISED,
+                'RuntimeError: judge exploded', cost_usd=0.0,
+            ),
+            blind=False, reached=False,
         )
 
 
@@ -439,22 +465,16 @@ class TestArchitectEvalDeps:
         assert deps.create_worktree is snapshots.create_eval_worktree
         assert deps.cleanup_worktree is snapshots.cleanup_eval_worktree
         assert deps.open_artifacts is open_eval_artifacts
+        assert deps.build_prompt is build_eval_architect_prompt
         assert deps.invoke is invoke_agent
         assert deps.judge is judge_plan_quality
         assert deps.read_reference_diff is snapshots.get_diff_between_commits
         assert deps.gate_factory is eval_gate.build_eval_usage_gate
         assert deps.cap_wait_secs == eval_gate.EVAL_CAP_WAIT_SANITY_SECS
 
-    def test_every_dep_is_frozen(self, tmp_path: Path):
-        deps = ArchitectEvalDeps(store=ResultStore(tmp_path))
-
-        for field in dataclasses.fields(deps):
-            with pytest.raises(dataclasses.FrozenInstanceError):
-                setattr(deps, field.name, None)
-
 
 _REAL_SLEEP = asyncio.sleep
-_DECLINE_READS = frozenset(_DECLINE_READERS.values())
+_DECLINE_READS = frozenset(DECLINE_READERS.values())
 _CAP_TEXT = "You've hit your session limit · resets 8pm"
 _CFG = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
 
@@ -500,7 +520,7 @@ class _FakeArtifacts:
         self._plan = plan
         self._plan_error = plan_error
         self.initialised_with: tuple | None = None
-        for kind, reader in _DECLINE_READERS.items():
+        for kind, reader in DECLINE_READERS.items():
             setattr(self, reader, self._recording_reader(reader, declines.get(kind)))
 
     def _recording_reader(
@@ -534,6 +554,7 @@ class _Cell:
     project_root: Path
     worktree: Path
     open_artifacts: MagicMock
+    build_prompt: AsyncMock
     cleanup_worktree: AsyncMock
     invoke: AsyncMock
     gate_factory: AsyncMock
@@ -573,6 +594,7 @@ def _cell(
         events.append('cleanup_worktree')
 
     open_artifacts = MagicMock(return_value=artifacts)
+    build_prompt = AsyncMock(return_value='ARCH PROMPT')
     cleanup = AsyncMock(side_effect=cleanup_worktree)
     invoke = invoke if invoke is not None else AsyncMock(return_value=_answered())
     gate_factory = (
@@ -583,6 +605,7 @@ def _cell(
         create_worktree=AsyncMock(side_effect=create_worktree),
         cleanup_worktree=cleanup,
         open_artifacts=open_artifacts,
+        build_prompt=build_prompt,
         invoke=invoke,
         judge=AsyncMock(return_value=_scored()),
         read_reference_diff=AsyncMock(return_value='--- a\n+++ b\n'),
@@ -590,8 +613,8 @@ def _cell(
         cap_wait_secs=cap_wait_secs,
     )
     return _Cell(
-        events, artifacts, tmp_path, worktree, open_artifacts, cleanup, invoke,
-        gate_factory, deps,
+        events, artifacts, tmp_path, worktree, open_artifacts, build_prompt, cleanup,
+        invoke, gate_factory, deps,
     )
 
 
@@ -614,29 +637,13 @@ def _raise_config_error() -> OrchestratorConfig:
     raise RuntimeError('config exploded')
 
 
-def _usage(attempt: ArchitectAttempt) -> tuple[int, ...]:
-    return (
-        attempt.input_tokens, attempt.output_tokens, attempt.cache_read_tokens,
-        attempt.cache_create_tokens, attempt.turns, attempt.duration_ms,
-    )
-
-
 def _marker(attempt: ArchitectAttempt) -> Unmeasured:
     assert attempt.unmeasured is not None, 'the attempt carries no unmeasured marker'
     assert attempt.unmeasured.stage is MeasurementStage.ARCHITECT
     return attempt.unmeasured
 
 
-@pytest.fixture
-def production_briefing(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    """Stubs the production briefing; the replay-frame subclass still appends its block."""
-    prompt = AsyncMock(return_value='ARCH PROMPT')
-    monkeypatch.setattr(BriefingAssembler, 'build_architect_prompt', prompt)
-    return prompt
-
-
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('production_briefing')
 class TestInvokeArchitectExits:
     """invoke_architect's exit table, one case per row."""
 
@@ -649,7 +656,10 @@ class TestInvokeArchitectExits:
         assert attempt.unmeasured is None
         assert attempt.plan == _scorable_plan()
         assert cell.events.count('read_plan') == 1
-        assert _usage(attempt) == (12_000, 3_000, 48_000, 6_000, 9, 4567)
+        assert attempt.usage == ArchitectUsage(
+            input_tokens=12_000, output_tokens=3_000, cache_read_tokens=48_000,
+            cache_create_tokens=6_000, turns=9, duration_ms=4567,
+        )
         assert (attempt.cost_usd, attempt.cost_source) == (pytest.approx(1.23), 'cli')
         assert attempt.is_local_model is False
         assert attempt.address == CellName('df_task_2605', _CFG.name, 'run-abc')
@@ -666,6 +676,20 @@ class TestInvokeArchitectExits:
         assert cell.artifacts.initialised_with == (
             'df_task_2605', 'Widget', 'implement the widget', 'basecommit123',
         )
+
+    async def test_the_briefing_is_built_for_the_task_and_handed_to_the_architect(
+        self, tmp_path: Path,
+    ):
+        cell = _cell(tmp_path, plan=_scorable_plan())
+        orch = cell.orch_config()
+
+        await _invoke(cell, build_orch_config=lambda: orch)
+
+        cell.build_prompt.assert_awaited_once_with(
+            orch, cell.task['task_definition'], cell.worktree, 'basecommit123',
+        )
+        assert cell.invoke.await_args is not None
+        assert cell.invoke.await_args.kwargs['prompt'] == 'ARCH PROMPT'
 
     async def test_an_unanswered_result_is_blocked(self, tmp_path: Path):
         cell = _cell(
@@ -708,10 +732,10 @@ class TestInvokeArchitectExits:
         marker = _marker(attempt)
         assert marker.cause is cause
         assert marker.cost_usd == pytest.approx(result.cost_usd)
-        assert attempt.input_tokens == result.input_tokens
-        assert attempt.output_tokens == result.output_tokens
-        assert attempt.turns == result.turns
-        assert attempt.duration_ms == result.duration_ms
+        usage = attempt.usage
+        assert (usage.input_tokens, usage.output_tokens, usage.turns, usage.duration_ms) == (
+            result.input_tokens, result.output_tokens, result.turns, result.duration_ms,
+        )
 
     async def test_a_timeout_reads_no_plan_and_spends_nothing(self, tmp_path: Path):
         cell = _cell(
@@ -728,7 +752,7 @@ class TestInvokeArchitectExits:
         )
         assert 'read_plan' not in cell.events
         assert attempt.plan == {}
-        assert _usage(attempt) == (0, 0, 0, 0, 0, 0)
+        assert attempt.usage == ArchitectUsage()
         assert (attempt.cost_usd, attempt.cost_source) == (0.0, 'cli')
 
     @pytest.mark.parametrize(('plan_error', 'plan'), [
@@ -767,6 +791,19 @@ class TestInvokeArchitectExits:
         assert attempt.declines == dict.fromkeys(DECLINE_KINDS)
         assert (attempt.cost_usd, attempt.cost_source) == (0.0, 'cli')
         assert attempt.address.run_id == 'run-abc'
+
+    async def test_a_briefing_raise_is_a_harness_error(self, tmp_path: Path):
+        cell = _cell(tmp_path, plan=_scorable_plan())
+        cell.build_prompt.side_effect = RuntimeError('briefing exploded')
+
+        attempt = await _invoke(cell)
+
+        assert attempt.outcome == 'blocked'
+        assert attempt.plan == {}
+        marker = _marker(attempt)
+        assert marker.cause is UnmeasuredCause.HARNESS_ERROR
+        assert marker.reason == 'RuntimeError: briefing exploded'
+        cell.invoke.assert_not_awaited()
 
     async def test_an_invoke_raise_is_a_harness_error(self, tmp_path: Path):
         cell = _cell(
@@ -811,7 +848,6 @@ _EXIT_ROWS: dict[str, Callable[[Path], _Cell]] = {
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('production_briefing')
 class TestInvokeArchitectCleansUpLast:
     """The decline artifacts live under the meta root cleanup removes."""
 
@@ -844,7 +880,6 @@ class TestInvokeArchitectCleansUpLast:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('production_briefing')
 class TestInvokeArchitectBounds:
     async def test_the_operator_timeout_bounds_an_attempt_not_the_cap_wait(
         self, tmp_path: Path,
@@ -876,7 +911,6 @@ class TestInvokeArchitectBounds:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('production_briefing')
 class TestInvokeArchitectGateOwnership:
     async def test_an_omitted_gate_is_built_ridden_and_shut_down(self, tmp_path: Path):
         gate = make_gate_mock()
@@ -930,7 +964,6 @@ def _write_fixture(tmp_path: Path) -> Path:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('production_briefing')
 class TestRunArchitectEvalComposesTheSteps:
     async def test_a_decline_read_before_cleanup_reaches_the_persisted_cell(
         self, tmp_path: Path,

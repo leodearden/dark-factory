@@ -1489,16 +1489,16 @@ async def _run_architect_eval_hermetic(
     # mapping is taken from PRODUCTION rather than re-derived as
     # ``f'read_{kind}'``, which is wrong for ``unactionable``
     # (``read_unactionable_task``) and would silently stop pinning that kind.
-    from orchestrator.evals.metrics import _DECLINE_READERS
+    from orchestrator.evals.metrics import DECLINE_READERS
 
-    for _reader in _DECLINE_READERS.values():
+    for _reader in DECLINE_READERS.values():
         getattr(artifacts_instance, _reader).return_value = None
     for _kind, _artifact in (declines or {}).items():
-        assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
-        getattr(artifacts_instance, _DECLINE_READERS[_kind]).return_value = _artifact
+        assert _kind in DECLINE_READERS, f'unknown decline kind {_kind!r}'
+        getattr(artifacts_instance, DECLINE_READERS[_kind]).return_value = _artifact
     for _kind, _exc in (decline_reader_errors or {}).items():
-        assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
-        getattr(artifacts_instance, _DECLINE_READERS[_kind]).side_effect = _exc
+        assert _kind in DECLINE_READERS, f'unknown decline kind {_kind!r}'
+        getattr(artifacts_instance, DECLINE_READERS[_kind]).side_effect = _exc
 
     # Stubs the PRODUCTION briefing only; the replay-frame subclass the runner
     # builds still appends its block for real (task 4844).

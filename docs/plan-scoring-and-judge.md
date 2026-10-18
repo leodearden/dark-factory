@@ -1169,7 +1169,7 @@ a reader who tests presence directly; no consumer has to.
 
 The five decline kinds (`metrics.py::DECLINE_KINDS`) are single-sourced against
 the `artifacts.TaskArtifacts.read_*` readers that produce them via
-`metrics.py::_DECLINE_READERS`, so the vocabulary cannot drift away from the
+`metrics.py::DECLINE_READERS`, so the vocabulary cannot drift away from the
 artifacts it names.
 
 **A DECLINE IS NOT A FAILURE.** It is the architect reading the fixture and
@@ -1238,11 +1238,11 @@ explicit, server-accepted decline calls — none silent, none capped — made af
 a median of 41–98 assistant turns of real investigation. Establishing that took
 manual forensics over `~/.claude/projects/*run-<id>/` transcripts, because the
 decline artifacts themselves were already gone: `snapshots.py::cleanup_eval_worktree`
-`rmtree`s the relocated meta root from `runner.py::run_architect_eval`'s
-`finally`. The runner therefore reads the decline artifacts **inside that
-`finally`, immediately before the cleanup call** — the one site reached by all
-four exits (success, timeout, cap exhaustion, harness error) and the last moment
-the artifacts exist.
+`rmtree`s the relocated meta root once the architect invoke ends. The cell
+therefore reads the decline artifacts **immediately before the cleanup call**
+(`architect_eval.py::invoke_architect`, below) — a site reached by all four
+exits (success, timeout, cap exhaustion, harness error) and the last moment the
+artifacts exist.
 
 ### The architect cell: invoke, classify, assemble (task 6737)
 
@@ -1258,10 +1258,12 @@ The plan judge is asked (`judge_plan`) only when that decision is `JUDGE`.
 `assemble_metrics` builds the persisted `EvalMetrics`, and
 `log_architect_cell` writes the route's warning and the completion line.
 `classify_attempt` and `assemble_metrics` are pure. Every effect boundary of a
-cell (worktree, artifacts, invoke, judge, reference-diff read, gate factory,
-cap-wait patience, store) is a field of `ArchitectEvalDeps`, whose defaults are
-the production collaborators, so a test injects fakes rather than patching
-module paths.
+cell (worktree, artifacts, briefing, invoke, judge, reference-diff read, gate
+factory, cap-wait patience, store) is a field of `ArchitectEvalDeps`, whose
+defaults are the production collaborators, so a test injects fakes rather than
+patching module paths. The orchestrator config the cell runs under is an
+input, not a boundary: `invoke_architect` takes it as `build_orch_config`,
+because the runner derives it from the base config and the candidate.
 
 **The invoke step (`invoke_architect`).** It is the only step with effects on
 the architect, and it drives only the architect: the worktree at the fixture's
@@ -1315,10 +1317,12 @@ the cell unmarked rather than losing it.
 - A transport refusal outranks a later harness error: when `read_plan` raises
   after a classified refusal, the refusal is the more specific statement of
   why the cell is not measured.
-- The decline artifacts are read in the step's `finally`, after every exit and
+- The decline artifacts are read once the call has ended, on every exit and
   before `cleanup_worktree`, which removes the meta root they live under: it
-  is the last moment they exist. A read that raises costs the declines, never
-  the cell.
+  is the last moment they exist. The call turns every `Exception` into an exit
+  row, so the read is reached on each one; the artifacts it reads travel on
+  that exit, with the prices and the banked spend. A read that raises costs
+  the declines, never the cell.
 
 The architect component's cost is resolved per Invariant P5 through
 `metrics.resolve_cost_usd`, the seam `collect_metrics` uses. Its model is
@@ -1388,8 +1392,11 @@ persists the structural floor, which never consults a reference.
 called, even for a $0.00 refusal or an unparseable answer. A judge that raised
 is recorded as `raised` with `cost_usd=0.0` and credits no call, because
 whether the judge was ever reached is unknowable from the caller; its record
-keeps the cell from reading as judge-free. `judge_cost_usd` is a subset of the
-cell's `cost_usd`, as "Spend" above states.
+keeps the cell from reading as judge-free. `judge_plan` states that on the
+judgement itself (`PlanJudgement.reached` is false only on that raise), and
+crediting routes on it rather than re-deriving it from the cause.
+`judge_cost_usd` is a subset of the cell's `cost_usd`, as "Spend" above
+states.
 
 **`tests_pass` is `None`.** No test signal exists for a plan-only cell:
 implementer, debugger, reviewer and verify are frozen, so verification never

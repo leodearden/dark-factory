@@ -30,7 +30,6 @@ from _git_fixtures import seed_repo
 from _workflow_helpers import FakeBriefing, FakeScheduler, fixed_prompt
 from shared.cli_invoke import AgentResult, build_claude_argv
 
-from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import ARCHITECT, AgentRole
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.evals import runner
@@ -99,17 +98,16 @@ def _write_fixture(tmp_path: Path) -> Path:
     return task_path
 
 
-async def _drive_architect_eval(monkeypatch, tmp_path: Path) -> dict:
+async def _drive_architect_eval(tmp_path: Path) -> dict:
     """Run the REAL ``run_architect_eval`` up to its invoke; return the kwargs its injected invoke received."""
     worktree = tmp_path / 'wt'
     worktree.mkdir()
-    monkeypatch.setattr(BriefingAssembler, 'build_architect_prompt',
-                        AsyncMock(return_value='P'))
     mock_invoke = AsyncMock(return_value=AgentResult(success=True, output=''))
     deps = ArchitectEvalDeps(
         store=MagicMock(spec=ResultStore),
         create_worktree=AsyncMock(return_value=(worktree, 'run-abc')),
         cleanup_worktree=AsyncMock(),
+        build_prompt=AsyncMock(return_value='P'),
         invoke=mock_invoke,
         read_reference_diff=AsyncMock(return_value=''),
     )
@@ -128,10 +126,10 @@ async def _drive_architect_eval(monkeypatch, tmp_path: Path) -> dict:
 
 @pytest.mark.asyncio
 async def test_architect_eval_invoke_is_strictly_scoped_to_plan_tools(
-    monkeypatch, tmp_path: Path, pinned_claude: str,
+    tmp_path: Path, pinned_claude: str,
 ) -> None:
     """The eval architect reaches plan-tools and nothing else, through the real cap-retry forwarding."""
-    kw = await _drive_architect_eval(monkeypatch, tmp_path)
+    kw = await _drive_architect_eval(tmp_path)
 
     assert kw.get('strict_mcp_config') is True
     assert set(kw['mcp_config']['mcpServers']) == {'plan-tools'}

@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 # Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Terminal outcome vocabulary (task 4760) — what the architect's LAST statement
 # about the task actually was.
 #
-# ``_DECLINE_READERS`` single-sources the kind <-> artifact correspondence: each
+# ``DECLINE_READERS`` single-sources the kind <-> artifact correspondence: each
 # key is a member of DECLINE_KINDS, each value the ``TaskArtifacts`` reader that
 # answers "did the architect take that exit?".  It is the ONE place the two
 # vocabularies below and :func:`read_decline_artifacts` all derive from, so a
@@ -48,18 +49,19 @@ logger = logging.getLogger(__name__)
 # pins every value against the real class, so a rename there fails the suite
 # instead of silently degrading that kind to ``'none'``.
 # ---------------------------------------------------------------------------
-_DECLINE_READERS: dict[str, str] = {
+DECLINE_READERS: Mapping[str, str] = MappingProxyType({
     'already_done': 'read_already_done',
     'blocking_dependency': 'read_blocking_dependency',
     'false_premise': 'read_false_premise',
     'unactionable': 'read_unactionable_task',
     'ready_to_merge': 'read_ready_to_merge',
-}
+})
+_DECLINE_READERS = DECLINE_READERS  # debt: ticket tkt_0RVYEEFK2SX009GRQZ75FVM0Z2
 
 # The five EXPLICIT plan-tools decline exits (plan_tools._report_* →
 # artifacts.TaskArtifacts.write_*), in the fixed order that breaks a
 # same-timestamp tie in :func:`resolve_terminal_kind`.
-DECLINE_KINDS: tuple[str, ...] = tuple(_DECLINE_READERS)
+DECLINE_KINDS: tuple[str, ...] = tuple(DECLINE_READERS)
 
 # The CLOSED terminal vocabulary: a scorable plan, the five declines, or
 # neither.  :func:`resolve_terminal_kind` always returns a member of this tuple.
@@ -420,10 +422,11 @@ def read_decline_artifacts(
     logs — the raise, the missing reader, and a file whose JSON parses but is
     not an OBJECT (``[]``, ``"x"``, ``3``), which no ``except`` would catch.
     Only a kind the architect never reported goes quiet, because that ``None``
-    is a measurement, not a degradation. This matters because the SOLE caller
-    is inside ``architect_eval.invoke_architect``'s ``finally`` block — the only
-    place the artifacts still exist, since the next statement ``rmtree``s the
-    meta root — where a raise would turn an already-scored cell into a lost run.
+    is a measurement, not a degradation. This matters because the SOLE caller,
+    ``architect_eval.invoke_architect``, reads immediately before
+    ``cleanup_worktree`` ``rmtree``s the meta root — the last moment the
+    artifacts exist — where a raise would turn an already-scored cell into a
+    lost run.
 
     ``artifacts is None`` (the harness-error path, where it was never
     constructed) and an object missing a reader (a legacy or monkeypatched
@@ -432,7 +435,7 @@ def read_decline_artifacts(
     out: dict[str, dict | None] = dict.fromkeys(DECLINE_KINDS)
     if artifacts is None:
         return out
-    for kind, reader_name in _DECLINE_READERS.items():
+    for kind, reader_name in DECLINE_READERS.items():
         reader = getattr(artifacts, reader_name, None)
         if not callable(reader):
             logger.warning(
