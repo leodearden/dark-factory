@@ -25,7 +25,13 @@ from dashboard.data.active_tasks import (
     collect_tasks_with_counts,
     shape_terminal_rows,
 )
-from dashboard.data.datum import Datum, DatumContractError, DatumState, validate_datum
+from dashboard.data.datum import (
+    Datum,
+    DatumContractError,
+    DatumState,
+    unknown_datum,
+    validate_datum,
+)
 from dashboard.data.task_snapshot import (
     FRESHNESS_BOUND_SECONDS,
     SnapshotFailure,
@@ -65,6 +71,28 @@ def _unknown_after_contract_break(what: str, broken: DatumContractError) -> Datu
     return Datum(
         None, None, DatumState.UNKNOWN,
         f'{what} broke the {broken.invariant.value} invariant: {broken}',
+        FRESHNESS_BOUND_SECONDS,
+    )
+
+
+def _unknown_after_unexpected_error(what: str) -> Datum[Any]:
+    """The UNKNOWN stand-in for *what*, whose read raised instead of degrading.
+
+    Call it only inside an ``except`` clause: the WARNING carries that
+    exception's traceback. Every I/O failure is already a degraded half by
+    the time it reaches this layer (``task_snapshot._bounded``), so an
+    exception here is our own code raising. It is logged, with the same
+    sentence, as the fan-out's catch-all in
+    ``dashboard/src/dashboard/data/active_tasks.py::_serve_roots_within_budget``
+    logs one.
+    """
+    logger.warning(
+        'unexpected error while reading %s, which is served as UNKNOWN for '
+        'this render; this is a BUG, not an outage',
+        what, exc_info=True,
+    )
+    return unknown_datum(
+        f'unexpected error while reading {what} (see the WARNING and its traceback)',
         FRESHNESS_BOUND_SECONDS,
     )
 
@@ -150,20 +178,21 @@ async def _terminal_answer(
 ) -> dict[str, object]:
     """The whole ``?terminal=<label>`` answer: the window under its key, and ``served_at``.
 
-    Two instants, in the default render's order and for its reason: the
-    window and the unit it is positioned from are read at render_at, and
-    served_at is resolved only after both reads return, so the age a client
-    derives from the receipt includes the read time and can never be negative.
+    Its two instants are ordered as ``api_tasks`` orders them, for the reason given there.
+    A bug anywhere under the window read costs this one key, as an explained
+    unknown, and never the response.
     """
+    what = f'the terminal window for {label}'
     render_at = resolve_now(None)
-    window = await _terminal_window(client, config, label, now=render_at)
+    try:
+        window = await _terminal_window(client, config, label, now=render_at)
+    except Exception:
+        window = _unknown_after_unexpected_error(what)
     served_at = resolve_now(None)
     try:
         validate_datum(window, served_at)
     except DatumContractError as broken:
-        window = _unknown_after_contract_break(
-            f'the terminal window for {label}', broken,
-        )
+        window = _unknown_after_contract_break(what, broken)
     return {_terminal_key(label): window.to_wire(), 'served_at': served_at.isoformat()}
 
 

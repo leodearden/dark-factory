@@ -645,3 +645,37 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
     assert DatumInvariant.REASON_REQUIRED.value in window['reason']
     assert set(body) == {key, 'served_at'}, sorted(body)
     assert len(bug_warnings(caplog)) == 1, bug_warnings(caplog)
+
+
+def test_a_bug_in_the_window_read_is_unknown_not_a_500(
+    client, monkeypatch, tmp_path, caplog,
+):
+    """Our own code raising under the window read costs that one key, never the response.
+
+    Every I/O failure is already a degraded half by the time it gets here, so
+    an exception that reaches the handler is a bug. The key still answers, as
+    an explained unknown with its receipt, and the bug is logged as one.
+    """
+    import logging
+
+    label = 'p0'
+    _install_terminal_roots(client, tmp_path, [label])
+    canned = CannedMCP()
+    with patch(
+        'dashboard.api.tasks.acquire_snapshot',
+        new=AsyncMock(side_effect=RuntimeError('a shaping bug')),
+    ), caplog.at_level(logging.WARNING), _over_the_substrate(monkeypatch, canned):
+        resp = client.get(f'/api/v2/dashboard/tasks?terminal={label}')
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    key = f'TASKS_TERMINAL:{label}'
+    assert set(body) == {key, 'served_at'}, sorted(body)
+    window = body[key]
+    assert window['state'] == 'unknown', window
+    assert window['value'] is None and window['as_of'] is None
+    assert (window['reason'] or '').strip(), 'an unknown datum must say why'
+    assert canned.calls == [], (
+        f'a window that cannot be positioned must not be fetched: {canned.calls}'
+    )
+    assert len(bug_warnings(caplog)) == 1, bug_warnings(caplog)
