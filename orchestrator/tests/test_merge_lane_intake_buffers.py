@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -105,8 +106,21 @@ class Scene:
     admission: list[bool]
 
 
+def any_writer(structure: str) -> None:
+    """The owner port of a worker with no merger task yet: every writer may write."""
+
+
+def refuse_writer(structure: str) -> None:
+    """The owner port when the caller is not the running merger task."""
+    raise AssertionError(f'{structure} mutated from non-owner coroutine')
+
+
 @pytest.fixture
 def scene(tmp_path: Path) -> Scene:
+    return build_scene(tmp_path, assert_merger_owns=any_writer)
+
+
+def build_scene(tmp_path: Path, *, assert_merger_owns: Callable[[str], None]) -> Scene:
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lifecycle = RecordingLifecycle()
     halt = HaltState(LANES, on_resume=lambda: None)
@@ -125,7 +139,7 @@ def scene(tmp_path: Path) -> Scene:
         git_ops=lambda: git_ops,
         frozen_prefix=lambda: (),
         frozen_prefix_tip=lambda sha: sha,
-        assert_merger_owns=lambda structure: None,
+        assert_merger_owns=assert_merger_owns,
     )
     return Scene(
         intake, queue, lifecycle, halt, events,
@@ -337,6 +351,15 @@ async def test_replacing_a_lane_rebuilds_it_in_the_given_order(scene: Scene) -> 
 
     assert scene.intake.buffered('normal') == (second, first)
     scene.intake.replace_lane('normal', [])
+    assert scene.intake.buffered('normal') == ()
+
+
+async def test_a_lane_replacement_off_the_merger_task_is_refused(tmp_path: Path) -> None:
+    scene = build_scene(tmp_path, assert_merger_owns=refuse_writer)
+
+    with pytest.raises(AssertionError, match='_lane_buffers'):
+        scene.intake.replace_lane('normal', [request(scene, '101')])
+
     assert scene.intake.buffered('normal') == ()
 
 

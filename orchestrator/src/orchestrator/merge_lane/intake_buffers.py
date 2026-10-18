@@ -689,6 +689,7 @@ class MergeIntake:
 
     def replace_lane(self, lane: str, requests: Iterable[MergeRequest]) -> None:
         """Rebuild *lane*'s buffer as *requests*, in order (the coalesce queue surgery)."""
+        self._assert_merger_owns('_lane_buffers')
         self._lane_buffers[lane] = collections.deque(requests)
 
     def drain_lanes_for_shutdown(self) -> tuple[MergeRequest, ...]:
