@@ -53,7 +53,9 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
     @dataclass and other reflection-based decorators work correctly (they
     call sys.modules.get(cls.__module__)).  Both keys are SHARED — with
     ``test_bake_off_storage_shape.py``, with ``test_bake_off_fetch_cache.py``
-    and with the script-side ``read_transform_selection._load_script`` — which
+    and with the shared
+    ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``,
+    reached from ``read_transform_selection`` only via ``bake_off()`` — which
     is what makes reuse, rather than an unconditional re-exec, correct here.
 
     A named seam rather than a direct call at each use site, so the
@@ -77,7 +79,8 @@ class TestTheScriptsAreLoadedOnceNotReExecuted:
 
     An unconditional re-exec mints a SECOND module object under the same
     ``sys.modules`` key, and whichever loader ran last wins.  The concrete
-    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
+    hazard: ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``,
+    reached from ``read_transform_selection`` only via ``bake_off()``, returns
     ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
     serves whichever object a test module last registered under
     ``'bake_off_storage_shape'``.  Three test modules register that key, and

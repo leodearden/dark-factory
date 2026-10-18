@@ -47,7 +47,6 @@ import argparse
 import asyncio
 import collections
 import hashlib
-import importlib.util
 import json
 import logging
 import math
@@ -88,35 +87,18 @@ from fused_memory.server.write_triage_judge import (
     resolve_judge_timeout,
     select_judge_candidates,
 )
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
 _PACKAGE_ROOT = _SCRIPTS.parent
 
 
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_freeze = _load_script(
+_freeze = load_script(
     _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
 )
-_wording = _load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
-_scorer = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
-_calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+_wording = load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
+_scorer = load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
+_calibrate = load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
 
 logger = logging.getLogger(__name__)
 
