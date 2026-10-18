@@ -5880,15 +5880,6 @@ class Scheduler:
         continuity = cfg.continuity_credit if has_work_product else 0.0
         return float(TIER_BASE[coerce_tier(tier)]) + cpm + age + continuity
 
-    def _has_work_product(self, task: dict) -> bool:
-        """Whether *task* already carries work worth resuming (PRD C3).
-
-        Task γ owns the real predicate.  Until it lands this is False for every
-        task, the fail-safe: no live score gains ``continuity_credit`` before
-        γ's zero-progress gating exists.
-        """
-        return False
-
     def _emit_override_diff_events(
         self,
         prev: dict[str, OverrideRow],
@@ -7934,7 +7925,11 @@ class Scheduler:
 
     def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
         """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3)."""
-        return WorkProductSnapshot(branches=self._branch_work_reader(), zero_progress=frozenset())
+        stalled = store.fetch_events_by_type_all_runs(EventType.zero_progress_requeue)
+        return WorkProductSnapshot(
+            branches=self._branch_work_reader(),
+            zero_progress=frozenset(str(row['task_id']) for row in stalled if row['task_id'] is not None),
+        )
 
     def _poll_work_product(self) -> None:
         """Start a continuity-probe refresh when one is due; with no event store there is no gate to read."""
@@ -7959,6 +7954,8 @@ class Scheduler:
         task_ids = [str(t.get('id', '')) for t in ctx.candidates]
         readings = [read_pending_age(t, now) for t in ctx.candidates]
         armed = self._note_anchor_coverage(task_ids, readings)
+        work = self.work_product.snapshot
+        max_age = self.config.scoring.continuity_credit_max_age_secs
 
         scored: list[tuple[float, str, dict, str]] = []
         for tid, t, reading in zip(task_ids, ctx.candidates, readings, strict=True):
@@ -7969,7 +7966,7 @@ class Scheduler:
                     pri,
                     age_secs=reading.age_secs,
                     transitive_count=transitive,
-                    has_work_product=self._has_work_product(t),
+                    has_work_product=work.has_work_product(tid, now=now.timestamp(), max_age_secs=max_age),
                 )
             else:
                 score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
