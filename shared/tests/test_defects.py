@@ -308,6 +308,7 @@ _OTHER_REF = mint_explore_ref('run-1', 4)
 _BASE_SHA = 'a' * 40
 _TIP_SHA = 'b' * 64
 _MEASURED_AT = datetime(2026, 10, 18, 13, 0, tzinfo=UTC)
+_LATER = _MEASURED_AT + timedelta(hours=1)
 _TICKET = 'tkt_0RSM2ECX'
 
 
@@ -832,7 +833,7 @@ def _sighting() -> Sighting:
 
 
 def _proof_event(outcome: ProofOutcome = ProofOutcome.PROVEN) -> Proof:
-    return Proof(proof=_proof(outcome))
+    return Proof(proof=_proof(outcome, measured_at=_LATER))
 
 
 def _rule(ruling: Ruling = _ACCEPTED) -> Rule:
@@ -1044,6 +1045,39 @@ def test_i2_sweep(state_name: str, event_name: str) -> None:
     assert _REF in message
     assert (from_status.value if from_status is not None else 'absent') in message
     assert kind.value in message
+
+
+# I2's "a later proof": an entry's proof is replaced only by one measured after it.
+_PROOF_HOLDERS = {
+    'PROVEN': lambda: _declaration(status=_PR, proof=_proof()),
+    'OPEN_AFTER_FIX_FINDING': lambda: _declaration(proof=_proof(ProofOutcome.PASSES_AT_BASE)),
+}
+_NOT_LATER = [
+    pytest.param(_MEASURED_AT, id='same-instant'),
+    pytest.param(
+        _MEASURED_AT.astimezone(timezone(timedelta(hours=2))), id='same-instant-other-offset'
+    ),
+    pytest.param(_MEASURED_AT - timedelta(seconds=1), id='earlier'),
+]
+
+
+@pytest.mark.parametrize('state_name', list(_PROOF_HOLDERS))
+@pytest.mark.parametrize('outcome', list(ProofOutcome), ids=str)
+@pytest.mark.parametrize('measured_at', _NOT_LATER)
+def test_a_proof_not_measured_after_the_latest_is_refused(
+    state_name: str, outcome: ProofOutcome, measured_at: datetime
+) -> None:
+    entry = _PROOF_HOLDERS[state_name]()
+    with pytest.raises(IllegalDefectTransition) as excinfo:
+        apply_event(entry, Proof(proof=_proof(outcome, measured_at=measured_at)))
+    refusal = excinfo.value
+    assert (refusal.ref, refusal.from_status, refusal.event) == (
+        _REF,
+        entry.status,
+        DefectEventKind.PROOF,
+    )
+    assert measured_at.isoformat() in str(refusal)
+    assert _MEASURED_AT.isoformat() in str(refusal)
 
 
 def _assign_item(container, key, value) -> None:

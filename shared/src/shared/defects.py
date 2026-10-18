@@ -1038,6 +1038,9 @@ DEFECT_TRANSITIONS: Mapping[tuple[DefectStatus | None, DefectTrigger], DefectSta
 
 Every pair not listed is refused. The rows that keep the status are explicit:
 a sighting in every status, and a proof that is recorded without a transition.
+I2's "later proof" is the one rule a (status, trigger) key cannot carry:
+:func:`apply_event` also refuses a proof measured no later than the entry's
+latest one.
 """
 
 
@@ -1177,6 +1180,22 @@ def _destination(
     return to_status
 
 
+def _require_later_proof(
+    entry: DefectDeclaration | None, event: _EntryEvent, trigger: DefectTrigger
+) -> None:
+    if not isinstance(event, Proof) or entry is None or entry.proof is None:
+        return
+    offered, latest = event.proof.measured_at, entry.proof.measured_at
+    if offered <= latest:
+        raise _defect_refusal(
+            entry,
+            event,
+            trigger,
+            f'PRD I2 replaces a proof only with a later one; this one was measured at '
+            f'{offered.isoformat()}, not after the latest, measured at {latest.isoformat()}',
+        )
+
+
 def _effect(
     entry: DefectDeclaration | None, event: _EntryEvent, to_status: DefectStatus
 ) -> DefectDeclaration:
@@ -1207,14 +1226,17 @@ def apply_event(
 
     Raises:
         IllegalDefectTransition: the event concerns another ref, is not a
-            defects-entry event, or I2 has no transition for it from the
-            entry's status.
+            defects-entry event, I2 has no transition for it from the
+            entry's status, or it is a proof not measured after the entry's
+            latest proof.
     """
     if entry is not None:
         _require_event_ref(entry.ref, entry.status, event, DEFECT_TRANSITIONS)
     entry_event = _entry_event(entry, event)
     trigger = _trigger(entry, entry_event)
-    return _effect(entry, entry_event, _destination(entry, entry_event, trigger))
+    to_status = _destination(entry, entry_event, trigger)
+    _require_later_proof(entry, entry_event, trigger)
+    return _effect(entry, entry_event, to_status)
 
 
 # --- Retirement lifecycle ----------------------------------------------------
