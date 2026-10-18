@@ -19,7 +19,6 @@ F2: F1 + a never-landed task D.
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -268,78 +267,49 @@ class TestFormatReportChainItems:
 # main(argv) — end-to-end CLI smoke test against a tmp sqlite runs.db
 # ---------------------------------------------------------------------------
 
-_EVENTS_SCHEMA = """
-CREATE TABLE events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL
-);
-"""
-
-
-def _seed_events_db(path, *, merge_verify_events, merge_attempt_events):
-    """Write a tiny events table (mirrors event_store.py's real schema).
+def _recent_events(*, merge_verify_events, merge_attempt_events) -> list[dict]:
+    """Turn synthetic event dicts into ``make_runs_db`` events rows.
 
     Rows are timestamped within the last day so a --since window of 30 (or
     even 1) days includes them.
     """
-    conn = sqlite3.connect(path)
-    conn.executescript(_EVENTS_SCHEMA)
     now = datetime.now(UTC)
-    rows = []
-    for i, ev in enumerate(merge_verify_events):
-        ts = (now - timedelta(minutes=i)).isoformat()
-        rows.append(
-            (ts, 'run-1', ev['task_id'], 'merge_verify', None, None,
-             json.dumps(ev['data']), None)
-        )
-    for i, ev in enumerate(merge_attempt_events):
-        ts = (now - timedelta(minutes=i)).isoformat()
-        rows.append(
-            (ts, 'run-1', ev['task_id'], 'merge_attempt', None, None,
-             json.dumps(ev['data']), None)
-        )
-    conn.executemany(
-        'INSERT INTO events '
-        '(timestamp, run_id, task_id, event_type, phase, role, data, cost_usd) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        rows,
-    )
-    conn.commit()
-    conn.close()
+    events = []
+    for event_type, source in (
+        ('merge_verify', merge_verify_events),
+        ('merge_attempt', merge_attempt_events),
+    ):
+        for i, ev in enumerate(source):
+            events.append({
+                'event_type': event_type,
+                'task_id': ev['task_id'],
+                'timestamp': (now - timedelta(minutes=i)).isoformat(),
+                'data': ev['data'],
+            })
+    return events
 
 
 class TestMainCLI:
     """main([db_path, '--since', '30']) end-to-end against a tmp sqlite DB."""
 
-    def test_main_smoke_reports_per_attempt_rate(self, tmp_path, capsys):
-        db_path = str(tmp_path / 'runs.db')
-        _seed_events_db(
-            db_path,
+    def test_main_smoke_reports_per_attempt_rate(self, make_runs_db, capsys):
+        db_path = make_runs_db(_recent_events(
             merge_verify_events=F2_MERGE_VERIFY,
             merge_attempt_events=F2_MERGE_ATTEMPT,
-        )
+        ))
 
-        ret = mod.main([db_path, '--since', '30'])
+        ret = mod.main([str(db_path), '--since', '30'])
 
         captured = capsys.readouterr()
         assert ret == 0
         assert '0.5' in captured.out  # F2 per-attempt pass rate == 3/6 == 0.5
 
-    def test_main_opens_db_read_only(self, tmp_path, monkeypatch):
+    def test_main_opens_db_read_only(self, make_runs_db, monkeypatch):
         """main's handle is opened with a mode=ro URI, so a write on it raises."""
-        db_path = tmp_path / 'runs.db'
-        _seed_events_db(
-            str(db_path),
+        db_path = make_runs_db(_recent_events(
             merge_verify_events=F1_MERGE_VERIFY,
             merge_attempt_events=[],
-        )
+        ))
         monkeypatch.setattr(mod, 'load_events', _load_events_attempting_write)
 
         with pytest.raises(sqlite3.OperationalError, match='readonly'):
