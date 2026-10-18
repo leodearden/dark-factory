@@ -260,5 +260,5 @@ async def test_b10_cross_run_lookup_p99_is_under_50_ms(
     assert remeasured.met, (
         f'{shape}: no window of {_SAMPLES} replays of {len(reads)} read(s) had p99 < {_BOUND_MS} ms '
         f'on a store of {seeded.events} events / {seeded.merge_finalized} merge_finalized rows; '
-        f'windows (p50/p99/max ms): {remeasured.describe()}; load average {os.getloadavg()}'
+        f'{remeasured.describe()}; load average {os.getloadavg()}'
     )
