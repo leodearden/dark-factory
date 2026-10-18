@@ -762,6 +762,100 @@ def read_outcomes(
     return Outcomes(entries, statuses_error)
 
 
+REVERIFY_ENTRY = "x_reverify_entry"
+_CAP_DEFERRAL = "deferred by the operator verify cap (max_verify_clusters); re-queued next run"
+
+
+class ReverifyResult(enum.StrEnum):
+    GONE = "gone"
+    PRESENT = "present"
+    INCONCLUSIVE = "inconclusive"
+    DEFERRED = "deferred"
+
+
+_VERIFIED_BY_RESULT = {ReverifyResult.GONE: False, ReverifyResult.PRESENT: True}
+
+
+@dataclass(frozen=True)
+class Reverification:
+    """One due entry's re-verify at as_of_sha (D8). INV-3: GONE carries a
+    refuting Verdict and PRESENT a verified one, so a failed verify call can
+    never read as a landed fix."""
+
+    entry_id: str
+    task: TaskRef
+    result: ReverifyResult
+    found: verdict.Verdict | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        required = _VERIFIED_BY_RESULT.get(self.result)
+        if required is not None and (self.found is None or self.found.verified is not required):
+            carried = "no Verdict" if self.found is None else f"a Verdict with verified={self.found.verified}"
+            raise ValueError(
+                f"reverification of entry {self.entry_id!r}: INV-3 requires {self.result.value} to carry "
+                f"a Verdict with verified={required}, got {carried}"
+            )
+
+
+def _clusters_by_entry(clusters: object) -> dict[str, Mapping[str, Any]]:
+    if not isinstance(clusters, list | tuple):
+        return {}
+    return {
+        cluster[REVERIFY_ENTRY]: cluster
+        for cluster in clusters
+        if isinstance(cluster, Mapping) and isinstance(cluster.get(REVERIFY_ENTRY), str)
+    }
+
+
+def _reverification(
+    due: Reverify, lists: Sequence[tuple[str, Mapping[str, Mapping[str, Any]]]], error: str | None,
+) -> Reverification:
+    if error is not None:
+        return Reverification(
+            due.entry_id, due.task, ReverifyResult.INCONCLUSIVE, reason=f"the re-verify call did not complete: {error}",
+        )
+    for name, clusters in lists:
+        cluster = clusters.get(due.entry_id)
+        if cluster is None:
+            continue
+        found = cluster.get("verdict")
+        result = ReverifyResult.PRESENT if name == "verified" else ReverifyResult.GONE
+        if isinstance(found, verdict.Verdict) and found.verified is _VERIFIED_BY_RESULT[result]:
+            return Reverification(due.entry_id, due.task, result, found)
+        reason = (
+            f"{name} without a verdict: the verify call failed"
+            if not isinstance(found, verdict.Verdict)
+            else f"{name}, but its verdict says verified={found.verified}"
+        )
+        return Reverification(due.entry_id, due.task, ReverifyResult.INCONCLUSIVE, reason=reason)
+    return Reverification(
+        due.entry_id, due.task, ReverifyResult.INCONCLUSIVE, reason="the verifier returned no result for it",
+    )
+
+
+def reverifications(
+    result: object,
+    *,
+    offered: Sequence[Reverify],
+    deferred: Sequence[Reverify],
+    error: str | None = None,
+) -> dict[str, Reverification]:
+    """Each re-verify, by entry id, typed from one verify_fn *result* whose
+    clusters carry REVERIFY_ENTRY: *offered* ones by what the verifier
+    answered (*error* set when the call did not complete), *deferred* ones as
+    the verify cap left them. Never raises on a malformed or partial result."""
+    answered: Mapping[str, Any] = result if isinstance(result, Mapping) else {}
+    lists = (
+        ("verified", _clusters_by_entry(answered.get("verified"))),
+        ("rejected", _clusters_by_entry(answered.get("rejected"))),
+    )
+    typed = {due.entry_id: _reverification(due, lists, error) for due in offered}
+    for due in deferred:
+        typed[due.entry_id] = Reverification(due.entry_id, due.task, ReverifyResult.DEFERRED, reason=_CAP_DEFERRAL)
+    return typed
+
+
 @dataclass(frozen=True)
 class StructuralFinding:
     entry_id: str

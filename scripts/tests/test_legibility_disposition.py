@@ -1197,8 +1197,8 @@ def test_an_errored_reverify_call_leaves_every_offered_entry_inconclusive_with_t
 
 @pytest.mark.parametrize(
     "result",
-    [{}, {"verified": None, "rejected": "x"}, {"verified": [{"title": "no marker"}, 3], "rejected": [None]}],
-    ids=["empty", "wrong-types", "no-marker"],
+    [{}, {"verified": None, "rejected": "x"}, {"verified": [{"title": "no marker"}, 3], "rejected": [None]}, None],
+    ids=["empty", "wrong-types", "no-marker", "not-a-mapping"],
 )
 def test_a_malformed_result_never_raises_and_types_nothing_as_gone(result) -> None:
     typed = _typed(result, _due())
