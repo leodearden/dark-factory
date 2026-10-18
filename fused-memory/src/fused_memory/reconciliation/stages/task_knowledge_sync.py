@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
@@ -5172,6 +5174,24 @@ def _needs_hint_attention(task: dict) -> bool:
     if isinstance(task_hints, list):
         return True
     return not task_hints
+
+
+def select_tasks_needing_hint_attention(
+    tasks: Iterable[dict], *, claims_read_at: datetime
+) -> list[dict]:
+    """The tasks rendered as ``### Tasks Needing Memory Hint Attention``.
+
+    A task claimed by a live orchestrator run is left out, because a Stage 2
+    hint write would race that run's own metadata writers (task 5093). Claim
+    freshness is judged at *claims_read_at*, the instant the task snapshot was
+    read, not at wall clock.
+    """
+    return [
+        t
+        for t in tasks
+        if _needs_hint_attention(t)
+        and not has_live_claimant(t, claims_read_at, DEFAULT_CLAIMANT_HEARTBEAT_TTL)
+    ]
 
 
 async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dict] | None:
