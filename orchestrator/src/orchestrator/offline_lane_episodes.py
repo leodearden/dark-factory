@@ -508,15 +508,14 @@ class LaneEngine:
             record_dir=record_dir,
         )
         changed = _answer(answer) != _answer(previous) or record.probe_record_behind
-        behind = False
+        record = await self._stale_records_released(replace(record, probe_record_behind=False))
         filed: list[str] = []
+        behind = record.probe_record_behind
         for kind in _PROBE_RECORDS:
-            if kind.kind != answer.result:
-                record, failed = await self._released(record, kind, _release_reason(answer))
-            else:
+            if kind.kind == answer.result:
                 record, opened, failed = await self._kept(self._queue, record, kind, report, source, changed)
                 filed.extend([opened] if opened else [])
-            behind = behind or failed
+                behind = behind or failed
         return replace(record, probe_record_behind=behind), tuple(filed)
 
     async def _kept(
