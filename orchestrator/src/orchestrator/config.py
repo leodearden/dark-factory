@@ -3952,6 +3952,16 @@ class OrchestratorConfig(BaseSettings):
     # files. The orchestrator updates _revalidated_at and base_commit
     # directly, mirroring the confirm_plan MCP write semantics.
     revalidation_skip_enabled: bool = Field(default=True)
+    plan_text_fp_gate_enabled: bool = Field(
+        default=True,
+        description=(
+            'Task 4031: when the task description/details no longer '
+            'fingerprint to the plan _task_text_fp (or the plan has none), '
+            'decline the Lever-B revalidation skip and tell the revalidating '
+            'architect. OFF restores the pre-4031 skip; plans are still '
+            'stamped.'
+        ),
+    )
     max_revalidation_age_hours: float = Field(
         default=24.0,
         description=(
@@ -6211,6 +6221,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # merge's breadth, and is read fresh off req.config at each gate
         # evaluation.  A safety kill switch behind a restart is not one.
         'merge_disjoint_skip_requires_verified_drift',
+        # Task-text amendment gate on the Lever-B skip (task 4031) — read off
+        # self.config at each revalidation decision and never captured, so a
+        # flip affects only the next decision.
+        'plan_text_fp_gate_enabled',
         # Merge-verify host selection order (task 5097, Lever C) — green-tier
         # because the policy is read per HostAllocator.acquire call and never
         # captured on the allocator, so a flip only changes which host the NEXT

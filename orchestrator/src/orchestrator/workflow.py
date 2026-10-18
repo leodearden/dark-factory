@@ -50,6 +50,11 @@ from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
+from shared.task_text_fingerprint import (
+    TaskTextDrift,
+    task_text_drift,
+    task_text_fingerprint,
+)
 from shared.transcript_archive import (
     archive_before_delete,
     archive_task_transcripts,
@@ -81,6 +86,7 @@ from orchestrator.agents.write_set import (
 )
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    PLAN_TASK_TEXT_FP_KEY,
     ReviewAggregation,
     TaskArtifacts,
 )
@@ -534,6 +540,7 @@ class _BriefingLike(Protocol):
         self, task: dict, existing_plan: dict,
         changed_files: list[str], worktree: Path | None = ...,
         context: str | None = ...,
+        *, text_drift: TaskTextDrift | None = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
@@ -4805,6 +4812,7 @@ class TaskWorkflow:
                 '(%d changed files, %d overlap with plan)',
                 self.task_id, len(revalidation_changed_files), len(overlap),
             )
+            text_drift = self._check_plan_text_drift(existing_plan)
 
             # ── Lever B: revalidation skip ────────────────────────────
             # When main has gained no changes that touch the plan's files,
@@ -4815,6 +4823,7 @@ class TaskWorkflow:
             if (
                 self.config.revalidation_skip_enabled
                 and not overlap
+                and text_drift is None
                 and await self._can_skip_revalidation(existing_plan)
             ):
                 skipped = await self._apply_revalidation_skip(
@@ -4830,7 +4839,7 @@ class TaskWorkflow:
             async def build_revalidation_prompt() -> str:
                 return await self.briefing.build_revalidation_prompt(
                     self.task, self._live_plan() or existing_plan, changed_files,
-                    worktree=self.worktree,
+                    worktree=self.worktree, text_drift=text_drift,
                 )
 
             build_prompt = build_revalidation_prompt
@@ -5150,7 +5159,7 @@ class TaskWorkflow:
             return outcome
 
         # Stamp provenance and acquire lock (run_id — task 3563; see _drive)
-        self.artifacts.stamp_plan_provenance(self.session_id)
+        await self._stamp_authored_plan()
         self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
@@ -5208,6 +5217,52 @@ class TaskWorkflow:
             f'{len(self.plan.get("steps", []))} steps'
         )
         return WorkflowOutcome.PLANNED
+
+    def _current_task_text_fp(self) -> str:
+        return task_text_fingerprint(self.task.get('description'), self.task.get('details'))
+
+    def _check_plan_text_drift(self, plan: dict) -> TaskTextDrift | None:
+        """The plan's task-text drift, or None when current or the gate is off; a drift is emitted."""
+        if not self.config.plan_text_fp_gate_enabled:
+            return None
+        current_fp = self._current_task_text_fp()
+        plan_fp = plan.get(PLAN_TASK_TEXT_FP_KEY)
+        drift = task_text_drift(plan_fp, current_fp)
+        if drift is TaskTextDrift.CURRENT:
+            return None
+        logger.info(
+            'Task %s: plan task-text %s (plan %r, task %s) — revalidating',
+            self.task_id, drift.value, plan_fp, current_fp,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.plan_text_drift, task_id=self.task_id, phase='plan',
+                data={
+                    'drift': drift.value,
+                    'plan_text_fp': plan_fp if isinstance(plan_fp, str) else None,
+                    'task_text_fp': current_fp,
+                    'plan_session_id': str(plan.get('_session_id') or ''),
+                },
+            )
+        return drift
+
+    async def _stamp_authored_plan(self) -> None:
+        """Provenance-stamp a plan just authored against ``self.task`` and mirror its text fingerprint."""
+        assert self.artifacts is not None
+        fp = self._current_task_text_fp()
+        self.artifacts.stamp_plan_provenance(self.session_id, task_text_fp=fp)
+        await self._mirror_plan_text_fp(fp, self.artifacts.read_plan().get('_created_at'))
+
+    async def _mirror_plan_text_fp(self, fp: str, authored_at: object) -> None:
+        mirror = {'plan_text_fp': fp, 'plan_authored_at': authored_at}
+        try:
+            if not await self.scheduler.update_task(
+                self.task_id, mirror, metadata_mode='merge',  # type: ignore[reportCallIssue]
+            ):
+                logger.warning('Task %s: plan_text_fp mirror write refused', self.task_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort; plan.json is authoritative
+            logger.warning('Task %s: plan_text_fp mirror write failed: %s', self.task_id, exc)
+        self._mutable_task_metadata().update(mirror)
 
     async def _can_skip_revalidation(self, plan: dict) -> bool:
         """Lever B pre-flight checks for the revalidation skip.
@@ -5475,7 +5530,7 @@ class TaskWorkflow:
 
         # Stamp provenance + acquire plan lock (same shape as _plan()).
         try:
-            self.artifacts.stamp_plan_provenance(self.session_id)
+            await self._stamp_authored_plan()
         except ValueError as exc:
             logger.warning(
                 'Task %s: SIMPLE_TASK provenance stamp failed (%s) — '
@@ -8147,7 +8202,7 @@ class TaskWorkflow:
                 )
             if outcome := await self._validate_prerequisites_or_block('replan'):
                 return outcome
-            self.artifacts.stamp_plan_provenance(self.session_id)
+            await self._stamp_authored_plan()
             # Task 2874: the architect may have WIDENED plan.files while
             # addressing review feedback ("you may add new steps"), so route
             # the possibly-widened files through the same scope-

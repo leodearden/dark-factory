@@ -5,6 +5,9 @@ plan was stamped does not overlap any plan files, the architect's
 revalidation pass is short-circuited. The orchestrator stamps
 ``_revalidated_at`` and bumps ``base_commit`` directly (mirroring
 ``confirm_plan``), then returns PLANNED without invoking the architect.
+
+Task 4031 adds a fifth precondition: the plan's ``_task_text_fp`` must equal
+the fingerprint of the task's current description/details.
 """
 
 from __future__ import annotations
@@ -18,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
+from shared.cli_invoke import AgentResult
+from shared.task_text_fingerprint import TaskTextDrift, task_text_fingerprint
 
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -37,8 +42,12 @@ class _Fixture:
     invoke_called: list[bool]
     event_emit: MagicMock
     build_architect_prompt: AsyncMock
+    build_revalidation_prompt: AsyncMock
     # Opt-in merge-faithful backend (task 3579); None unless the test passed one.
     metadata_backend: FakeMetadataBackend | None = None
+
+
+_FP_OF_D = task_text_fingerprint('d', None)
 
 
 def _make(
@@ -60,6 +69,10 @@ def _make(
     modules: list[str] | None = None,
     create_plan_files_on_disk: bool = True,
     metadata_backend: FakeMetadataBackend | None = None,
+    task_description: str = 'd',
+    task_details: str | None = None,
+    plan_text_fp: str | None = _FP_OF_D,
+    plan_text_fp_gate_enabled: bool = True,
 ) -> _Fixture:
     if plan_files is None:
         plan_files = ['mod_a/file.py']
@@ -98,6 +111,8 @@ def _make(
         ).isoformat(),
         '_schema_version': schema_version,
     }
+    if plan_text_fp is not None:
+        plan['_task_text_fp'] = plan_text_fp
     # Write directly (bypassing artifacts.write_plan, which clobbers
     # _schema_version) so the schema-mismatch test can stage stale plans.
     (artifacts.root / 'plan.json').write_text(json.dumps(plan))
@@ -105,7 +120,8 @@ def _make(
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {
-        'id': task_id, 'title': 'T', 'description': 'd',
+        'id': task_id, 'title': 'T', 'description': task_description,
+        'details': task_details,
         'metadata': task_metadata or {},
     }
     assignment.modules = list(modules)
@@ -121,6 +137,7 @@ def _make(
     config.project_root = project_root
     config.revalidation_skip_enabled = revalidation_skip_enabled
     config.max_revalidation_age_hours = max_revalidation_age_hours
+    config.plan_text_fp_gate_enabled = plan_text_fp_gate_enabled
 
     handle_blast_radius_expansion = AsyncMock(
         return_value=BlastRadiusResult(applied=blast_radius_grants),
@@ -184,6 +201,7 @@ def _make(
         invoke_called=invoke_called,
         event_emit=event_emit,
         build_architect_prompt=briefing.build_architect_prompt,
+        build_revalidation_prompt=briefing.build_revalidation_prompt,
         metadata_backend=metadata_backend,
     )
 
@@ -227,6 +245,10 @@ async def test_overlap_zero_short_circuits(tmp_path: Path):
     # Single-key payload: a regression that re-broadens it to a whole blob
     # would clobber sibling keys such as metadata.files.
     assert set(update_calls[-1].args[1]) == {'optimistic_path'}
+
+    # Task 4031: a current fingerprint is silent and the skip re-stamps nothing.
+    assert _drift_events(f) == []
+    assert _mirror_writes(f) == []
 
 
 @pytest.mark.asyncio
@@ -469,3 +491,255 @@ async def test_optimistic_stamp_preserves_narrowed_files(tmp_path: Path):
     # missing stamp.
     assert backend.blob['optimistic_path'] == 'revalidation_skip'
     assert f.wf.task['metadata']['optimistic_path'] == 'revalidation_skip'
+
+
+# ---------------------------------------------------------------------------
+# Task 4031: the task-text fingerprint gates the skip.
+# ---------------------------------------------------------------------------
+
+def _events(f: _Fixture, event_type: EventType) -> list[dict]:
+    return [c.kwargs['data'] for c in f.event_emit.call_args_list
+            if c.args and c.args[0] == event_type]
+
+
+def _drift_events(f: _Fixture) -> list[dict]:
+    return _events(f, EventType.plan_text_drift)
+
+
+def _mirror_writes(f: _Fixture) -> list:
+    return [c for c in f.update_task.call_args_list
+            if len(c.args) >= 2 and isinstance(c.args[1], dict)
+            and 'plan_text_fp' in c.args[1]]
+
+
+def _revalidation_drift(f: _Fixture) -> TaskTextDrift | None:
+    f.build_revalidation_prompt.assert_awaited_once()
+    return f.build_revalidation_prompt.call_args.kwargs['text_drift']
+
+
+async def _plan_falls_through_to_architect(f: _Fixture) -> None:
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert f.invoke_called == [True]
+
+
+def _confirm_plan_architect(f: _Fixture) -> AsyncMock:
+    """An architect that only calls confirm_plan(): every plan key is kept."""
+    async def _confirm(_role, build_prompt, *args, **kwargs) -> AgentResult:
+        await build_prompt()
+        plan_path = f.artifacts.root / 'plan.json'
+        plan = json.loads(plan_path.read_text())
+        plan['_finalized_at'] = datetime.now(UTC).isoformat()
+        plan_path.write_text(json.dumps(plan))
+        return AgentResult(
+            success=True, output='confirmed', cost_usd=0.5,
+            duration_ms=1_000, turns=3,
+        )
+
+    invoke = AsyncMock(side_effect=_confirm)
+    f.wf._invoke = invoke  # type: ignore[method-assign]
+    return invoke
+
+
+@pytest.mark.asyncio
+async def test_amended_description_declines_skip_6820(tmp_path: Path):
+    """The 6820 incident: items 1-3 were planned, then item 4 and an
+    ACCEPTANCE clause were folded into the description."""
+    original = 'WORK: items 1-3.'
+    amended = 'WORK: items 1-3. Item 4: transcript secret scanner. ACCEPTANCE: scan clean.'
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_description=amended,
+        plan_text_fp=task_text_fingerprint(original, None),
+    )
+
+    await _plan_falls_through_to_architect(f)
+
+    f.build_architect_prompt.assert_not_awaited()
+    assert 'Item 4: transcript secret scanner' in (
+        f.build_revalidation_prompt.call_args.args[0]['description']
+    )
+    assert _revalidation_drift(f) is TaskTextDrift.AMENDED
+    assert not [d for d in _events(f, EventType.phase_skipped)
+                if d.get('reason') == 'revalidation_skipped_no_overlap']
+    assert _drift_events(f) == [{
+        'drift': 'amended',
+        'plan_text_fp': task_text_fingerprint(original, None),
+        'task_text_fp': task_text_fingerprint(amended, None),
+        'plan_session_id': 'prior-session-aaa',
+    }]
+
+
+@pytest.mark.asyncio
+async def test_details_corrected_after_finalize_replans_and_restamps_4822(tmp_path: Path):
+    """The 4822 incident (ADDED SCOPE): details corrected after the plan was
+    finalized. The architect only confirms, yet the plan leaves _plan()
+    carrying the fingerprint of the text it was just shown."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_details='Original scope. ADDED SCOPE: a 4822-shaped regression test.',
+        plan_text_fp=task_text_fingerprint('d', 'Original scope.'),
+    )
+    _confirm_plan_architect(f)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert _events(f, EventType.plan_revalidated)
+    assert _events(f, EventType.phase_skipped) == []
+    plan = f.artifacts.read_plan()
+    current_fp = task_text_fingerprint(
+        'd', 'Original scope. ADDED SCOPE: a 4822-shaped regression test.',
+    )
+    assert plan['_task_text_fp'] == current_fp
+    [mirror] = _mirror_writes(f)
+    assert mirror.args[1] == {
+        'plan_text_fp': plan['_task_text_fp'],
+        'plan_authored_at': plan['_created_at'],
+    }
+    assert mirror.kwargs['metadata_mode'] == 'merge'
+    assert f.wf.task['metadata']['plan_text_fp'] == current_fp
+
+
+@pytest.mark.asyncio
+async def test_kwargless_stamp_keeps_the_fingerprint_so_an_amendment_still_declines(
+    tmp_path: Path,
+):
+    """The per-iteration stamp shape must never refresh the fingerprint, or a
+    mid-EXECUTE amendment would self-clear before the next dispatch."""
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    stamped = task_text_fingerprint('d', None)
+    f.artifacts.stamp_plan_provenance('prior-session-aaa', task_text_fp=stamped)
+    f.wf.task['description'] = 'd, amended mid-execute'
+
+    f.artifacts.stamp_plan_provenance('prior-session-aaa')
+
+    assert f.artifacts.read_plan()['_task_text_fp'] == stamped
+    await _plan_falls_through_to_architect(f)
+    assert [d['drift'] for d in _drift_events(f)] == ['amended']
+
+
+@pytest.mark.asyncio
+async def test_unstamped_plan_declines_skip_once(tmp_path: Path):
+    """A legacy plan with no fingerprint (Leo's LEO-A ruling, option i)."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_text_fp=None,
+    )
+
+    await _plan_falls_through_to_architect(f)
+
+    assert _revalidation_drift(f) is TaskTextDrift.UNSTAMPED
+    [event] = _drift_events(f)
+    assert event['drift'] == 'unstamped'
+    assert event['plan_text_fp'] is None
+
+
+@pytest.mark.asyncio
+async def test_reflowed_description_still_skips(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_description='fix the  bug\n\nin foo  ',
+        plan_text_fp=task_text_fingerprint('fix the bug in foo', None),
+    )
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+    assert _drift_events(f) == []
+
+
+@pytest.mark.asyncio
+async def test_case_change_declines_skip(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_description='Foo',
+        plan_text_fp=task_text_fingerprint('foo', None),
+    )
+
+    await _plan_falls_through_to_architect(f)
+
+    assert [d['drift'] for d in _drift_events(f)] == ['amended']
+
+
+@pytest.mark.asyncio
+async def test_gate_off_restores_the_pre_4031_skip(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_description='d, amended',
+        plan_text_fp_gate_enabled=False,
+    )
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+    assert [d['reason'] for d in _events(f, EventType.phase_skipped)] == [
+        'revalidation_skipped_no_overlap',
+    ]
+    assert f.wf.task['metadata']['optimistic_path'] == 'revalidation_skip'
+    assert _drift_events(f) == []
+
+
+@pytest.mark.asyncio
+async def test_gate_off_still_stamps_authored_plans(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        changed_files=['mod_a/file.py'],
+        task_description='d, amended',
+        plan_text_fp_gate_enabled=False,
+    )
+    _confirm_plan_architect(f)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.artifacts.read_plan()['_task_text_fp'] == task_text_fingerprint(
+        'd, amended', None,
+    )
+    assert _revalidation_drift(f) is None
+    assert _drift_events(f) == []
+
+
+@pytest.mark.asyncio
+async def test_architect_is_told_of_drift_when_skip_is_disabled(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        revalidation_skip_enabled=False,
+        task_description='d, amended',
+    )
+
+    await _plan_falls_through_to_architect(f)
+
+    assert _revalidation_drift(f) is TaskTextDrift.AMENDED
+    assert [d['drift'] for d in _drift_events(f)] == ['amended']
+
+
+@pytest.mark.parametrize(
+    'mirror_failure', [False, RuntimeError('fused-memory down')],
+    ids=['refused', 'raises'],
+)
+@pytest.mark.asyncio
+async def test_mirror_failure_never_fails_the_plan(tmp_path: Path, mirror_failure):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_description='d, amended',
+    )
+
+    async def _update_task(_task_id, payload, **_kwargs):
+        if isinstance(payload, dict) and 'plan_text_fp' in payload:
+            if isinstance(mirror_failure, Exception):
+                raise mirror_failure
+            return mirror_failure
+        return True
+
+    f.update_task.side_effect = _update_task
+    _confirm_plan_architect(f)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.artifacts.read_plan()['_task_text_fp'] == task_text_fingerprint(
+        'd, amended', None,
+    )

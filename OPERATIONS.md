@@ -1133,6 +1133,8 @@ takes no arguments: it always re-reads that process's own
   `mem0_update.enabled` bullet below both give: a kill switch you can only
   pull by restarting the unit is not a kill switch. Enable, retune and
   kill all land on the next dispatch round.
+- `plan_text_fp_gate_enabled` (task 4031 amendment gate; OFF = pre-4031
+  Lever-B skip).
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
