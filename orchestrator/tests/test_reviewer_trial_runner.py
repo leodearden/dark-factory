@@ -690,7 +690,7 @@ class TestPanelBriefsLikeProduction:
         async with fixture_checkout(diff) as checkout:
             assert checkout.change_base == source.base
             subject = await gather_review_subject(
-                checkout.root, checkout.change_base,
+                checkout.root, source.base,
                 task=diff.context.task.as_task_dict(),
                 plan=diff.context.plan,
                 plan_absent_reason=diff.context.plan_reason or '',

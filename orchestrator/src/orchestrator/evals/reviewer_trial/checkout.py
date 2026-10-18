@@ -55,6 +55,17 @@ class FixtureNotMaterialisable(Exception):
         self.reason = reason
 
 
+class FixtureEnrichmentMissing(Exception):
+    """Fixtures lack the ``context`` block a context-complete review is briefed from."""
+
+    def __init__(self, diff_ids: Sequence[str]) -> None:
+        super().__init__(
+            'a context-complete (d2) review is briefed from a fixture\'s `context` block, '
+            f'which these fixtures lack: {", ".join(diff_ids)}',
+        )
+        self.diff_ids = tuple(diff_ids)
+
+
 @asynccontextmanager
 async def fixture_checkout(
     diff: CorpusDiff, scratch_parent: Path | None = None,
