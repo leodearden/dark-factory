@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from _git_fixtures import README_SEED, _git, build_repo
 from orchestrator.work_product import (
     BranchProbeError,
     BranchWork,
+    WorkProductSnapshot,
     parse_branch_work,
     read_branch_work,
 )
@@ -152,3 +154,51 @@ class TestParseBranchWork:
             parse_branch_work(f'refs/heads/task/1 1 0 1760000000\n{line}\n', branch_prefix='task/')
 
         assert line in str(excinfo.value)
+
+
+NOW = 1_760_100_000.0
+MAX_AGE = 604800.0
+
+
+def _snapshot(*, ahead: int = 2, tip: float = NOW - 3600, zero_progress=frozenset()) -> WorkProductSnapshot:
+    return WorkProductSnapshot(
+        branches={'10': BranchWork(commits_ahead=ahead, tip_committed_at=tip)},
+        zero_progress=frozenset(zero_progress),
+    )
+
+
+def _credited(snapshot: WorkProductSnapshot, task_id: str = '10') -> bool:
+    return snapshot.has_work_product(task_id, now=NOW, max_age_secs=MAX_AGE)
+
+
+class TestHasWorkProduct:
+    def test_a_fresh_branch_ahead_of_main_is_work_product(self):
+        assert _credited(_snapshot(ahead=2))
+
+    def test_a_branch_with_nothing_ahead_is_not(self):
+        assert not _credited(_snapshot(ahead=0))
+
+    def test_a_task_without_a_branch_is_not(self):
+        assert not _credited(_snapshot(), task_id='11')
+
+    def test_the_zero_progress_gate_wins_over_fresh_work(self):
+        assert not _credited(_snapshot(zero_progress={'10'}))
+
+    def test_another_tasks_zero_progress_does_not_gate_this_one(self):
+        assert _credited(_snapshot(zero_progress={'99'}))
+
+    def test_credit_lapses_only_after_the_max_age(self):
+        assert _credited(_snapshot(tip=NOW - MAX_AGE))
+        assert not _credited(_snapshot(tip=NOW - MAX_AGE - 1))
+
+    def test_a_tip_in_the_future_is_credited(self):
+        assert _credited(_snapshot(tip=NOW + 600))
+
+    @pytest.mark.parametrize('task_id', ['10', '11', ''])
+    def test_the_empty_snapshot_credits_nothing(self, task_id):
+        assert not _credited(WorkProductSnapshot.EMPTY, task_id=task_id)
+
+    @pytest.mark.parametrize('field_name', ['branches', 'zero_progress'])
+    def test_the_snapshot_is_immutable(self, field_name):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(_snapshot(), field_name, frozenset({'10'}))
