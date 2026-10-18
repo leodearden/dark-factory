@@ -39,7 +39,7 @@ Mapping:
                 + self._finalizing_head when phase in {'verifying',
                   'gate_reverify', 'finalizing'}
   {landed}    = main (its SHA reflects landed items)
-  unfrozen    = self._lane_buffers (pick order high→normal, FIFO)
+  unfrozen    = the intake's lane buffers (pick order high→normal, FIFO)
 """
 
 from __future__ import annotations
@@ -236,7 +236,7 @@ def _seed_suffix(
     replace: bool = False,
 ) -> None:
     """Admit *reqs* to *lane*'s buffer; *replace* reorders the lane wholesale."""
-    buffer = worker._lane_buffers[lane]
+    buffer = worker._intake.buffered(lane)
     if replace:
         buffer.clear()
     buffer.extend(reqs)
@@ -359,7 +359,7 @@ class TestFrozenAndUnfrozenAccessors:
     async def test_lane_buffers_appear_in_unfrozen_suffix(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """Requests in _lane_buffers appear in unfrozen_suffix(), high before normal."""
+        """Requests in lane buffers appear in unfrozen_suffix(), high before normal."""
         worker = _make_worker(git_ops)
         req_hi = _make_req('t-hi', 'task/t-hi', config, git_repo, lane='high')
         req_n1 = _make_req('t-n1', 'task/t-n1', config, git_repo)
@@ -528,7 +528,7 @@ class TestFrozenPrefixPropertyTest:
 
     RED until step-10 GREEN adds the frozen-rid exclusion filter to
     recompute_suffix_conflict_graph().  The immutability assertion (a) already
-    holds (emergent from δ's _lane_buffers-only recompute); only the exclusion
+    holds (emergent from δ's lane buffers-only recompute); only the exclusion
     assertion (b) fails RED.
     """
 
@@ -537,7 +537,7 @@ class TestFrozenPrefixPropertyTest:
     ) -> None:
         """(a) In-flight entries are unchanged after suffix reorder + recompute.
 
-        Setup: D/E in _inflight (verifying); F/G in _lane_buffers['normal'].
+        Setup: D/E in _inflight (verifying); F/G in lane buffers['normal'].
         Capture state, reverse F/G, recompute, assert:
           - D/E base_sha UNCHANGED
           - D/E inflight identity/order UNCHANGED
@@ -576,7 +576,7 @@ class TestFrozenPrefixPropertyTest:
 
         # ── Reorder: F, G → G, F ─────────────────────────────────────────────
         _seed_suffix(worker, req_g, req_f, replace=True)
-        await worker.recompute_suffix_conflict_graph()
+        await worker._intake.recompute_suffix_conflict_graph()
 
         # ── Assert inflight immutability ──────────────────────────────────────
         assert item_d.base_sha == pre_d_base, 'D.base_sha mutated by reorder'
@@ -600,7 +600,7 @@ class TestFrozenPrefixPropertyTest:
 
         # ── Assert no frozen rid appears in suffix graph nodes ────────────────
         # NOTE: this loop is trivially satisfied here because D/E are only ever
-        # in _inflight and are never pushed into _lane_buffers, so they could
+        # in _inflight and are never pushed into lane buffers, so they could
         # not appear in the suffix graph regardless of the exclusion filter.
         # The genuine RED→GREEN coverage for the exclusion filter lives in
         # test_frozen_rid_excluded_from_suffix_graph below.
@@ -613,14 +613,14 @@ class TestFrozenPrefixPropertyTest:
     async def test_frozen_rid_excluded_from_suffix_graph(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """(b) Exclusion filter: a frozen rid pushed into _lane_buffers is excluded.
+        """(b) Exclusion filter: a frozen rid pushed into lane buffers is excluded.
 
         This is the genuine RED→GREEN delta: before step-10 adds the exclusion
-        filter, a frozen request that is also in _lane_buffers appears in
+        filter, a frozen request that is also in lane buffers appears in
         suffix_conflict_graph.nodes.  After step-10, it is excluded.
 
         Setup: item D in _inflight (verifying); also D's request pushed into
-        _lane_buffers.  Recompute → D's rid must NOT appear in nodes.
+        lane buffers.  Recompute → D's rid must NOT appear in nodes.
         """
         main_sha = 'fake-main-sha'
         worker = _make_worker(git_ops)
@@ -630,7 +630,7 @@ class TestFrozenPrefixPropertyTest:
                                         config=config, git_repo=git_repo)
         _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
-        # Intentionally push the SAME request into _lane_buffers (simulates the
+        # Intentionally push the SAME request into lane buffers (simulates the
         # bug this filter guards against: a frozen rid leaking into the suffix).
         _seed_suffix(worker, req_d)
 
@@ -639,7 +639,7 @@ class TestFrozenPrefixPropertyTest:
         req_innocent = _make_req('t-innocent', 'task/t-innocent', config, git_repo)
         _seed_suffix(worker, req_innocent)
 
-        await worker.recompute_suffix_conflict_graph()
+        await worker._intake.recompute_suffix_conflict_graph()
 
         g_nodes = _suffix_graph_nodes(worker)
         assert req_d.request_id not in g_nodes, (

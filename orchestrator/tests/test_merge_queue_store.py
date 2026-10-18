@@ -1942,7 +1942,7 @@ class TestUnrecoverableModuleSetStaysLoudAcrossRestarts:
     THE FAILURE THIS PINS.  A legacy record with nothing to re-derive from
     reconstructs to ``[]`` with the loud "unrecoverable" WARNING.  The
     recovered request is then re-journaled by
-    ``SpeculativeMergeWorker._buffer_owned_request``.  If that write persisted
+    ``MergeIntake.buffer_owned_request``.  If that write persisted
     a plain ``[]``, the NEXT crash+recovery would take the "task genuinely had
     no assigned modules" early-return and say NOTHING — so a request still
     verifying narrower than its original goes silent from the second restart
@@ -1955,7 +1955,7 @@ class TestUnrecoverableModuleSetStaysLoudAcrossRestarts:
     ) -> tuple[MergeRequest, MergeQueueStore]:
         """One full crash-recovery cycle: read the journal, reconstruct, and
         re-journal the recovered request exactly as the worker's
-        ``_buffer_owned_request`` does."""
+        ``buffer_owned_request`` does."""
         store = MergeQueueStore(store_path)
         [record] = store.load()
         req = reconstruct_merge_request(record, config)

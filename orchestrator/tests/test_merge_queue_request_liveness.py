@@ -64,6 +64,7 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
@@ -3662,7 +3663,7 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._drain_queue_into_lanes()
 
-        buffered = [it for buf in worker._lane_buffers.values() for it in buf]
+        buffered = [it for lane in MERGE_LANES for it in worker._intake.buffered(lane)]
         assert req in buffered, (
             f'the re-queued request must be buffered by the next drain, not '
             f'coalesce-dropped; lane buffers hold {buffered!r}'
@@ -3847,7 +3848,7 @@ class _HangThenPassVerify(FakeVerifier):
     fires and the request is RE-QUEUED.  Call 2 passes, so the re-dispatched
     merge actually lands.  ``.calls`` is the surface-1 assertion: it must
     reach 2, proving the re-queued request genuinely re-entered the pipeline
-    rather than being swallowed by ``_coalesce_reentrant_drain``.
+    rather than being swallowed by ``the intake's re-entrant coalesce``.
 
     A per-CALL sequence, which ``FakeVerifier``'s per-task scripts cannot
     express — hence the subclass rather than a script.
@@ -3973,7 +3974,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         messages = [r.getMessage() for r in caplog.records]
 
         # ── (1) the request ACTUALLY re-enters the live queue and is
-        #        re-dispatched — not swallowed by _coalesce_reentrant_drain.
+        #        re-dispatched — not swallowed by the intake's re-entrant coalesce.
         #
         # task 3927: exact equality (calls == 2) is load-sensitive. Under
         # host CPU oversubscription, the no-progress watchdog's independent

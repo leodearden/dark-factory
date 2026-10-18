@@ -224,8 +224,8 @@ class MergeQueueStore:
         A legacy record whose module set could not be recovered reconstructs
         to ``[]`` with the loud "unrecoverable" WARNING from
         :func:`_reconstruct_module_configs`.  That recovered request is then
-        re-journaled by ``merge_queue::SpeculativeMergeWorker.
-        _buffer_owned_request``.  Writing a plain ``[]`` there would rewrite an
+        re-journaled by ``merge_lane/intake_buffers.py::MergeIntake.
+        buffer_owned_request``.  Writing a plain ``[]`` there would rewrite an
         UNKNOWN module set as an AUTHORITATIVE EMPTY one — collapsing the very
         ``None``-vs-``[]`` distinction this design rests on — so on the NEXT
         crash+recovery the ``prefixes == []`` early-return would fire and the

@@ -546,7 +546,7 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
     """
     drained: set[str] = set()
     for lane in ('high', 'normal'):
-        buf = worker._lane_buffers[lane]
+        buf = worker._intake.buffered(lane)
         while buf:
             req = buf.popleft()  # a deque, not a list — `pop(0)` is a TypeError
             drained.add(req.task_id)

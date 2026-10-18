@@ -7,18 +7,17 @@ sentinel empty instance) — plus a NEW :class:`SuffixConflictTracker` class
 that owns the state (``graph`` / ``signature`` / ``last_known_main_sha`` /
 ``bounce_registry``) and logic (``recompute()`` /
 ``bounce_conflicting_suffix_items()``) that previously lived directly on
-``SpeculativeMergeWorker``.  The worker imports all three names from here at
-module level; the pre-package alias module that also re-exported them is
-gone (task 5037).  This module is a lane component kept outside the package.
+``SpeculativeMergeWorker``.  The pre-package alias module that also
+re-exported them is gone (task 5037).  This module is a lane component kept
+outside the package.
 
-``SpeculativeMergeWorker`` delegates to a ``SuffixConflictTracker`` instance
-(``self._suffix_tracker``) via thin property/method wrappers that preserve
-the worker's original attribute names (``_suffix_conflict_graph``,
-``_suffix_conflict_signature``, ``_last_known_main_sha``,
-``_bounce_registry``) and method signatures
-(``recompute_suffix_conflict_graph()``, ``_bounce_conflicting_suffix_items()``)
-so the existing conflict-graph and bounce test suites keep passing with zero
-churn.  The tracker itself never holds a worker reference: GitOps access,
+``orchestrator.merge_lane.intake_buffers::MergeIntake`` owns the one
+``SuffixConflictTracker`` instance, beside the lane buffers it reads, and
+exposes its state as read properties (``suffix_conflict_graph``,
+``suffix_conflict_signature``, ``last_known_main_sha``, ``bounce_registry``)
+and two thin async methods (``recompute_suffix_conflict_graph()``,
+``bounce_conflicting_suffix_items()``).  The tracker itself never holds a
+worker reference: GitOps access,
 lane-buffer access, and frozen-prefix reads are injected as narrow
 *re-reading* callables (``git_ops``, ``lane_buffers``, ``frozen_prefix``,
 ``frozen_prefix_tip``) that look up the caller's live attribute on every
@@ -524,7 +523,7 @@ class SuffixConflictTracker:
         rebased item from being re-bounced off a stale graph).
 
         Called by :meth:`SpeculativeMergeWorker._acquire_next_request`
-        immediately after :meth:`recompute` and before ``_pop_next_pickable()``,
+        immediately after :meth:`recompute` and before ``MergeIntake.pop_next_pickable()``,
         so bounced/escalated items are diverted before consuming a verify slot.
 
         Fail-open: if ``get_main_sha()`` raises, log a warning and return
@@ -604,7 +603,7 @@ class SuffixConflictTracker:
                 # Future and merge_first_enqueued_at are untouched.
                 #
                 # Downstream path note (design_double_rebase): the next call to
-                # _pop_next_pickable() may pick this item for dispatch.  The
+                # MergeIntake.pop_next_pickable() may pick this item for dispatch.  The
                 # dispatch loop calls merge_to_main() which performs a
                 # ``git merge --no-ff`` — NOT another rebase — so there is no
                 # double-rebase hazard.  If actual_main has advanced past

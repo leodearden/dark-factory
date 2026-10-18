@@ -20,6 +20,7 @@ from typing import Any
 _WORKER = 'orchestrator.merge_lane.worker'
 _GATES = 'orchestrator.merge_lane.gates'
 _INTAKE = 'orchestrator.merge_lane.intake'
+_INTAKE_BUFFERS = 'orchestrator.merge_lane.intake_buffers'
 _LANDING_EVIDENCE = 'orchestrator.merge_lane.landing_evidence'
 _MEMBER_REDRIVE = 'orchestrator.merge_lane.member_redrive'
 _PORTS = 'orchestrator.merge_lane.ports'
@@ -57,7 +58,7 @@ _EXPORTS = _ExportTable({
     'CROSS_REPO_DELIVERABLE_REASON_PREFIX': (_GATES, 'CROSS_REPO_DELIVERABLE_REASON_PREFIX'),
     'DROPPED_PLAN_TARGETS_REASON_PREFIX': (_GATES, 'DROPPED_PLAN_TARGETS_REASON_PREFIX'),
     'MAIN_HEALTH_RED_REASON_PREFIX': (_WORKER, 'MAIN_HEALTH_RED_REASON_PREFIX'),
-    'MERGE_WORKER_SHUTDOWN_REASON': (_WORKER, 'MERGE_WORKER_SHUTDOWN_REASON'),
+    'MERGE_WORKER_SHUTDOWN_REASON': (_INTAKE_BUFFERS, 'MERGE_WORKER_SHUTDOWN_REASON'),
     'NEEDS_REBASE_REASON_PREFIX': (_WORKER, 'NEEDS_REBASE_REASON_PREFIX'),
     'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX': (_GATES, 'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX'),
     'POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX': (

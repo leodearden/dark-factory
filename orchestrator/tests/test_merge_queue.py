@@ -1757,7 +1757,8 @@ class TestRecomputeSuffixConflictGraphErrorHandling:
             'rsce-err', 'rsce-err', git_ops.project_root, config,
             request_id='mr-rsce-err',
         )
-        worker._lane_buffers['normal'].append(req)
+        intake = worker._intake
+        intake.buffer_owned_request(req)
 
         # Make every resolve_branch_sha call raise
         async def _raising_sha(_branch_name: str) -> str | None:
@@ -1765,9 +1766,9 @@ class TestRecomputeSuffixConflictGraphErrorHandling:
 
         with patch.object(git_ops, 'resolve_branch_sha', new=_raising_sha):
             # Must complete without raising despite the per-item error
-            await worker.recompute_suffix_conflict_graph()
+            await intake.recompute_suffix_conflict_graph()
 
-        graph = worker._suffix_conflict_graph
+        graph = intake.suffix_conflict_graph
         # The item must appear in the ordered node list (it was in the suffix)
         assert 'mr-rsce-err' in graph.nodes, f'nodes={graph.nodes}'
         # With head=None there is nothing to compare — no edges
@@ -2211,7 +2212,7 @@ class TestSpeculativeMergeWorker:
         """N merges cleanly; N+1 conflicts with the frozen-prefix tip.
 
         task-1892 reclassification: a suffix item that conflicts with the
-        frozen-prefix tip is diverted by _bounce_conflicting_suffix_items and
+        frozen-prefix tip is diverted by bounce_conflicting_suffix_items and
         resolves 'blocked' (the speculative rebase-conflict escalation path)
         instead of the older out-of-band 'conflict' delivery.  The safety property
         is unchanged: N lands, the conflicting N+1 never lands on main.
@@ -2765,7 +2766,7 @@ class TestSpeculativeMergeWorker:
 
         Fault-injection note (task-1889/1892 reconcile): the merger's
         _acquire_next_request now calls get_main_sha() inside
-        recompute_suffix_conflict_graph() (and possibly _bounce_conflicting_suffix_items)
+        recompute_suffix_conflict_graph() (and possibly bounce_conflicting_suffix_items)
         BEFORE the request is dequeued — and those sites are fail-open (they catch and
         log, never raise into the loop body).  A plain "raise on the first call"
         fault is therefore swallowed there and never reaches the merger-loop body
@@ -3495,7 +3496,7 @@ class TestSpeculativeMergeWorker:
 
         Scenario A covers the already_merged outcome (a merger-phase merge_attempt).
         Scenario B covers a conflicting request: task-1892 diverts it via
-        _bounce_conflicting_suffix_items so it resolves 'blocked' and emits NO
+        bounce_conflicting_suffix_items so it resolves 'blocked' and emits NO
         merger-phase merge_attempt event at all (the bounce path emits nothing).
         The guard still holds — there must be no merge_attempt row with a NULL
         duration_ms in either scenario — and we additionally pin the new 'blocked'
@@ -3733,7 +3734,7 @@ class TestSpeculativeMergeWorker:
 
         task-1892 reclassification: a request that conflicts with the frozen-prefix
         tip (here the bare-main tip, since the prefix is empty) is diverted by
-        _bounce_conflicting_suffix_items inside _acquire_next_request — BEFORE it is
+        bounce_conflicting_suffix_items inside _acquire_next_request — BEFORE it is
         ever dequeued and built — and resolved 'blocked' (the rebase-conflict
         escalation path).  This supersedes the older out-of-band 'conflict'
         delivery: the conflicting item is never enqueued to the verifier queue at
@@ -3796,7 +3797,7 @@ class TestSpeculativeMergeWorker:
 
         Pre-load N (clean) + M (conflicting with the frozen prefix).
 
-        task-1892 reclassification: M is diverted by _bounce_conflicting_suffix_items
+        task-1892 reclassification: M is diverted by bounce_conflicting_suffix_items
         and resolved 'blocked' (the rebase-conflict escalation) — it is NEVER
         prefetched as a speculative item and never rides the verifier FIFO.  This
         supersedes the older behaviour where a speculative conflict rode the FIFO as
@@ -3880,7 +3881,7 @@ class TestSpeculativeMergeWorker:
         resolved on the merger's acquire path WITHOUT waiting for N's verify to
         finish (it bypasses the verifier FIFO delay).
 
-        task-1892 reclassification: M is diverted by _bounce_conflicting_suffix_items
+        task-1892 reclassification: M is diverted by bounce_conflicting_suffix_items
         and resolves 'blocked' (rebase-conflict escalation) rather than the older
         out-of-band 'conflict' delivery.  The latency/ordering property — fast
         resolution while the verifier is busy — is unchanged.
@@ -4155,7 +4156,7 @@ class TestSpeculativeMergeWorker:
         no phantom merge-phase event implies it merged.
 
         task-1892 reclassification: the conflicting request is diverted by
-        _bounce_conflicting_suffix_items BEFORE it is dequeued, so it resolves
+        bounce_conflicting_suffix_items BEFORE it is dequeued, so it resolves
         'blocked' (rebase-conflict escalation) and the merger emits no merge-phase
         event for it at all (no merge_dequeued, no merge_attempt).
 
@@ -4280,7 +4281,7 @@ class TestSpeculativeMergeWorker:
 
         The done-callback registered by enqueue_merge_request is scheduled via
         call_soon when req.result is set.  After the merger resolves the
-        conflicting request (now 'blocked' via _bounce_conflicting_suffix_items),
+        conflicting request (now 'blocked' via bounce_conflicting_suffix_items),
         the retention ring must contain a record for the request with the terminal
         state.
 
@@ -20003,7 +20004,7 @@ class TestPerLaneHaltMechanics:
 
 
 class TestLanePickOrderHelpers:
-    """Steps 5-6: _drain_queue_into_lanes and _pop_next_pickable."""
+    """Steps 5-6: _drain_queue_into_lanes and pop_next_pickable."""
 
     def _setup(self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path):
         """Return (worker, queue, loop) with the loop set as current event loop."""
@@ -20030,10 +20031,11 @@ class TestLanePickOrderHelpers:
             worker._drain_queue_into_lanes()
 
             # Pick order: high-C, normal-A, normal-B
-            assert worker._pop_next_pickable() is req_c
-            assert worker._pop_next_pickable() is req_a
-            assert worker._pop_next_pickable() is req_b
-            assert worker._pop_next_pickable() is None
+            intake = worker._intake
+            assert intake.pop_next_pickable() is req_c
+            assert intake.pop_next_pickable() is req_a
+            assert intake.pop_next_pickable() is req_b
+            assert intake.pop_next_pickable() is None
         finally:
             asyncio.set_event_loop(None)
             loop.close()
@@ -20041,7 +20043,7 @@ class TestLanePickOrderHelpers:
     def test_pop_skips_halted_lane(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ):
-        """_pop_next_pickable skips halted lanes; un-halting resumes them."""
+        """pop_next_pickable skips halted lanes; un-halting resumes them."""
         worker, queue, loop = self._setup(git_ops, config, git_repo)
         try:
             req_normal = _make_request('t-n', 't-n', git_repo, config, lane='normal')
@@ -20053,12 +20055,13 @@ class TestLanePickOrderHelpers:
 
             # Halt high lane — only normal should be available
             worker.halt_lane('high', 'test')
-            assert worker._pop_next_pickable() is req_normal
+            intake = worker._intake
+            assert intake.pop_next_pickable() is req_normal
 
             # Un-halt high lane — should return the high item
             worker.unhalt_lane('high')
-            assert worker._pop_next_pickable() is req_high
-            assert worker._pop_next_pickable() is None
+            assert intake.pop_next_pickable() is req_high
+            assert intake.pop_next_pickable() is None
         finally:
             asyncio.set_event_loop(None)
             loop.close()
@@ -20111,9 +20114,10 @@ class TestAgingPickOrder:
             )
 
             # Older first-submission (B, mfea=100) must win over FIFO head (A, mfea=300)
-            assert worker._pop_next_pickable() is req_b
-            assert worker._pop_next_pickable() is req_a
-            assert worker._pop_next_pickable() is None
+            intake = worker._intake
+            assert intake.pop_next_pickable() is req_b
+            assert intake.pop_next_pickable() is req_a
+            assert intake.pop_next_pickable() is None
         finally:
             asyncio.set_event_loop(None)
             loop.close()
@@ -20150,9 +20154,10 @@ class TestAgingPickOrder:
             )
 
             # FIFO (creation) order preserved via enqueued_at fallback
-            assert worker._pop_next_pickable() is req_x
-            assert worker._pop_next_pickable() is req_y
-            assert worker._pop_next_pickable() is None
+            intake = worker._intake
+            assert intake.pop_next_pickable() is req_x
+            assert intake.pop_next_pickable() is req_y
+            assert intake.pop_next_pickable() is None
         finally:
             asyncio.set_event_loop(None)
             loop.close()
@@ -20197,10 +20202,11 @@ class TestAgingPickOrder:
             )
 
             # Lexically smaller 'mr-aaaa' must win despite being the FIFO tail
-            assert worker._pop_next_pickable() is req_aaaa, (
+            intake = worker._intake
+            assert intake.pop_next_pickable() is req_aaaa, (
                 "request_id lexical tie-break must beat FIFO position on equal mfea"
             )
-            assert worker._pop_next_pickable() is req_zzzz
+            assert intake.pop_next_pickable() is req_zzzz
         finally:
             asyncio.set_event_loop(None)
             loop.close()
@@ -20236,10 +20242,10 @@ class TestAgingPickOrder:
             worker_a._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
 
             # FIFO must be preserved — disjoint items are never age-reordered
-            assert worker_a._pop_next_pickable() is req_y, (
+            assert worker_a._intake.pop_next_pickable() is req_y, (
                 "Disjoint items must preserve FIFO (younger head stays first)"
             )
-            assert worker_a._pop_next_pickable() is req_o
+            assert worker_a._intake.pop_next_pickable() is req_o
         finally:
             asyncio.set_event_loop(None)
             loop_a.close()
@@ -20273,7 +20279,7 @@ class TestAgingPickOrder:
             )
 
             # C (disjoint) must bypass head A (which is blocked by older B behind it)
-            assert worker_b._pop_next_pickable() is req_c, (
+            assert worker_b._intake.pop_next_pickable() is req_c, (
                 "Disjoint C must bypass head A (A blocked by older peer B)"
             )
         finally:
@@ -20297,10 +20303,10 @@ class TestAgingPickOrder:
             worker_c._suffix_conflict_graph = EMPTY_SUFFIX_CONFLICT_GRAPH
 
             # High-lane item must be picked first even though it's the youngest
-            assert worker_c._pop_next_pickable() is req_hi, (
+            assert worker_c._intake.pop_next_pickable() is req_hi, (
                 "High-lane item must beat normal-lane regardless of aging key"
             )
-            assert worker_c._pop_next_pickable() is req_lo
+            assert worker_c._intake.pop_next_pickable() is req_lo
         finally:
             asyncio.set_event_loop(None)
             loop_c.close()
@@ -20441,12 +20447,12 @@ class TestLanePickIntegration:
 
 @pytest.mark.asyncio
 class TestLaneSnapshotAndStop:
-    """Steps 9-10: snapshot and stop account for _lane_buffers items."""
+    """Steps 9-10: snapshot and stop account for lane buffers items."""
 
     async def test_snapshot_includes_lane_buffered_items(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ):
-        """snapshot() reports items in _lane_buffers as 'queued' with their lane.
+        """snapshot() reports items in lane buffers as 'queued' with their lane.
 
         RED before step-10 impl: snapshot() only reads self._queue, so
         lane-buffered items are invisible.
@@ -20492,7 +20498,7 @@ class TestLaneSnapshotAndStop:
     async def test_stop_resolves_lane_buffered_futures(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ):
-        """stop() resolves futures for items buffered in _lane_buffers.
+        """stop() resolves futures for items buffered in lane buffers.
 
         RED before step-10 impl: stop() only drains self._queue, so
         lane-buffered futures hang unresolved.
@@ -22642,7 +22648,7 @@ class TestSnapshotInflightCollection:
         entry is registry-sourced rather than field-sourced).
 
         During the dispatch-time remerge window the item is popped from
-        _redispatch/_verifier_queue but has not yet been appended to
+        redispatch park/_verifier_queue but has not yet been appended to
         _inflight — the registry (transitioned DISPATCHING -> MERGING by the
         real call site, mq:11095) is the ONLY surviving source of truth for
         this window now that _remerging_item is gone. Without a
@@ -22689,7 +22695,7 @@ class TestSnapshotInflightCollection:
         closes the task-2068 census gap).
 
         DISPATCHING brackets `await self._dispatch_item(item)` (mq:9203-9214,
-        9571-9580) — the item is off _redispatch/_verifier_queue but not yet
+        9571-9580) — the item is off redispatch park/_verifier_queue but not yet
         appended to _inflight. Historically this window was covered only by
         the census-only `_dispatching_item` field, which snapshot()'s
         'entries' section never read (task 2068 gap). Now that DISPATCHING

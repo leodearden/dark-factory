@@ -17,9 +17,9 @@ Covers:
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's drive mechanism. Every test here used to reach into the worker: it
 seeded ``_inflight`` with a hand-built ``InflightEntry`` carrying a fake
-merge commit, pushed requests straight into ``_lane_buffers``, assigned a
-``_suffix_conflict_graph``, then called the private
-``_bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
+merge commit, pushed requests straight into lane buffers, assigned a
+``suffix_conflict_graph``, then called the private
+``bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
 test going as far as replacing three private methods with stubs purely to
 pin the ORDER they are called in. That froze the lane's internals rather
 than its behaviour: none of it would have noticed the bounce being wired

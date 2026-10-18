@@ -271,7 +271,7 @@ def _stranded_finalize_head(
 # ── Reading the §5.3 main-SHA cache back through its only public consumer ────
 #
 # snapshot()['two_layer_invariants'] composes sub-check (iii) against the
-# CACHED main SHA (merge_queue.py's `self._last_known_main_sha or 'unknown'`),
+# CACHED main SHA (merge_queue.py's `self._intake.last_known_main_sha or 'unknown'`),
 # never against an argument — so a frozen head whose base is a SHA under no
 # test's control puts the cached value, verbatim, in the expected-base half of
 # the violation.  That makes the cache's exact value assertable without
@@ -342,7 +342,7 @@ class TestVerifyBaseFrozenTipPromotion:
 
         # snapshot()['two_layer_invariants'] must surface the same violation(s) —
         # set the cached main SHA so snapshot() computes against real main.
-        worker._last_known_main_sha = main_sha
+        worker._intake.note_main_sha(main_sha)
         snap_violations = worker.snapshot()['two_layer_invariants']
         assert all(v in snap_violations for v in violations), (
             f'expected snapshot()["two_layer_invariants"] to surface the same '
@@ -431,7 +431,7 @@ class TestRemergeCarveOutAtSnapshotSurface:
         # …and it must be absent from the SNAPSHOT surface too, not merely
         # from the argument-taking one (a carve-out that the snapshot path
         # re-derived for itself would still leak into operator health).
-        worker._last_known_main_sha = main_sha
+        worker._intake.note_main_sha(main_sha)
         snap_violations = worker.snapshot()['two_layer_invariants']
         assert not [v for v in snap_violations if _VERIFY_BASE_MARKER in v and rid in v], (
             f'expected no verify-base violation for the recovery entry in '
@@ -557,7 +557,7 @@ class TestRemergeCarveOutAtSnapshotSurface:
             )
 
 
-# ── DEFECT 2 (task 2357) RED: dequeue/dispatch-time refresh of _last_known_main_sha ──
+# ── DEFECT 2 (task 2357) RED: dequeue/dispatch-time refresh of last_known_main_sha ──
 
 
 def _fake_local_allocator() -> MagicMock:
@@ -600,7 +600,7 @@ class TestDispatchRefreshesLastKnownMainSha:
         new_main = 'NEW11111'
         git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
         worker = _make_worker(git_ops)
-        worker._last_known_main_sha = old_main
+        worker._intake.note_main_sha(old_main)
 
         # Non-speculative item whose base_sha == new_main so Mechanism 2's
         # main_advanced chain-remerge guard (merge_queue.py:10046) does not fire.
@@ -636,7 +636,7 @@ class TestDispatchRefreshesLastKnownMainSha:
         new_main = 'NEW11111'
         git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
         worker = _make_worker(git_ops)
-        worker._last_known_main_sha = old_main
+        worker._intake.note_main_sha(old_main)
 
         # A healthy frozen head already in _inflight, based on new_main.
         _, head_item = _make_fake_item(
@@ -647,7 +647,7 @@ class TestDispatchRefreshesLastKnownMainSha:
 
         # Before dispatch: cache is stale (old_main) → false positive.
         assert worker.snapshot()['two_layer_invariants'] != [], (
-            'expected a false positive while _last_known_main_sha is stale'
+            'expected a false positive while last_known_main_sha is stale'
         )
 
         _, item = _make_fake_item(
@@ -667,7 +667,7 @@ class TestDispatchRefreshesLastKnownMainSha:
         # to _inflight here — that is the caller's job on a successful dispatch).
         violations = worker.snapshot()['two_layer_invariants']
         assert violations == [], (
-            f'expected the false positive to clear once _last_known_main_sha '
+            f'expected the false positive to clear once last_known_main_sha '
             f'is refreshed by dispatch, got: {violations!r}'
         )
 
@@ -686,7 +686,7 @@ class TestDispatchRefreshesLastKnownMainSha:
             side_effect=[old_main, RuntimeError('simulated transient git error')]
         )
         worker = _make_worker(git_ops)
-        worker._last_known_main_sha = old_main
+        worker._intake.note_main_sha(old_main)
 
         # base_sha == old_main so Mechanism 2's staleness check (which fires
         # first and uses its own get_main_sha() call) does not trigger a remerge.
@@ -757,7 +757,7 @@ class TestNoOverCorrectionRegressionLock:
     ) -> None:
         """A healthy multi-entry chained frozen stack (head base==real main;
         each successor base==predecessor merge_commit) with
-        _last_known_main_sha set to the real current tip yields
+        last_known_main_sha set to the real current tip yields
         two_layer_invariants() == [] — the false positive is genuinely gone,
         not just papered over.
         """
@@ -785,7 +785,7 @@ class TestNoOverCorrectionRegressionLock:
         # invariant-surface assertion from the refresh call sites themselves
         # (those are covered by TestDispatchRefreshesLastKnownMainSha and
         # test_merge_queue_two_layer_integration.py's land tests).
-        worker._last_known_main_sha = real_main
+        worker._intake.note_main_sha(real_main)
 
         assert worker.two_layer_invariants(real_main) == [], (
             'expected a healthy chained frozen stack to have no violations '
@@ -794,7 +794,7 @@ class TestNoOverCorrectionRegressionLock:
 
         snap_violations = worker.snapshot()['two_layer_invariants']
         assert snap_violations == [], (
-            f'expected snapshot() to be clean once _last_known_main_sha is the '
+            f'expected snapshot() to be clean once last_known_main_sha is the '
             f'real tip for a healthy chained stack, got: {snap_violations!r}'
         )
 

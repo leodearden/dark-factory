@@ -331,7 +331,7 @@ async def test_worker_merge_store_record_and_clear(
     the queue item into a lane buffer, and removes it once the request reaches a
     terminal outcome ('done').
 
-    RED until step-14 adds the merge_store param + _buffer_owned_request seam.
+    RED until step-14 adds the merge_store param + buffer_owned_request seam.
     """
     store_path = tmp_path / 'data' / 'orchestrator' / 'merge_queue.json'
     store = MergeQueueStore(store_path)

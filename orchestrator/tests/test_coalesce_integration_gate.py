@@ -218,7 +218,7 @@ class TestScenario1:
 
             # Wait for gated verify.  When gate_entered fires:
             #   • _maybe_coalesce_waiting_singles has run — all 3 singles resolved
-            #     MergeOutcome('superseded') and the GroupMergeRequest is in _lane_buffers.
+            #     MergeOutcome('superseded') and the GroupMergeRequest is in lane buffers.
             #   • _do_train_merge has picked up the GroupMergeRequest (registry
             #     entry at ItemLifecycleState.MERGING),
             #     completed rebase + merge, and is now suspended inside
@@ -685,7 +685,7 @@ class TestScenario4:
       not req.result.cancelled()  — detached waiter
       not isinstance(req, GroupMergeRequest)
     Plus structural exclusion: a MERGING-registered request is absent from
-    _lane_buffers.
+    lane buffers.
 
     Setup:
       req_in_flight: MergeRequest registered at ItemLifecycleState.MERGING
@@ -698,19 +698,19 @@ class TestScenario4:
     direct _maybe_coalesce_waiting_singles() call level with real EventStore +
     factory, establishing that the pass correctly classifies each candidate type.
 
-    Driver: direct registry-registration + _lane_buffers manipulation → call
+    Driver: direct registry-registration + lane buffers manipulation → call
     _maybe_coalesce_waiting_singles() with real EventStore + factory.
 
     Assertions:
       (a) req_in_flight's future is UNRESOLVED after the pass (not touched)
       (b) req_in_flight's task_id is NOT in the train's member_task_ids
       (c) req_cancelled's future remains CANCELLED — set_result never called
-      (d) req_cancelled still in _lane_buffers (not absorbed)
+      (d) req_cancelled still in lane buffers (not absorbed)
       (e) train forms from req4a + req4b only; exactly 2 members
       (f) train_coalesced event records only req4a + req4b in member_task_ids
 
     GREEN (step-8): req_in_flight is registered at MERGING and NOT placed
-    in _lane_buffers (structural exclusion: absent from buffer).
+    in lane buffers (structural exclusion: absent from buffer).
     req_cancelled.result.cancel() is called before the pass so the cancelled()
     check filters it out.  Only req4a+req4b are eligible → 2-member train.
     """
@@ -755,7 +755,7 @@ class TestScenario4:
 
         # GREEN (step-8): req_in_flight is registered at MERGING — NOT in the buffer.
         # Structural exclusion: _maybe_coalesce_waiting_singles only scans
-        # _lane_buffers['normal']; a MERGING-registered request is invisible to the pass.
+        # lane buffers['normal']; a MERGING-registered request is invisible to the pass.
         worker._register_item(req_in_flight, initial=ItemLifecycleState.MERGING)
 
         # Simulate a detached waiter: cancel req_cancelled's future before
@@ -765,7 +765,7 @@ class TestScenario4:
         assert req_cancelled.result.cancelled(), 'precondition: future must be cancelled'
 
         # Lane buffer: cancelled request + 2 live singles (req_in_flight is absent).
-        worker._lane_buffers['normal'].extend([req_cancelled, req4a, req4b])
+        worker._intake.replace_lane('normal', [req_cancelled, req4a, req4b])
 
         result = await worker._maybe_coalesce_waiting_singles()
         assert result is True, 'pass must form a train from the eligible candidates'
@@ -777,7 +777,7 @@ class TestScenario4:
         )
 
         # (b) req_in_flight's task_id absent from the formed train.
-        buf = list(worker._lane_buffers['normal'])
+        buf = list(worker._intake.buffered('normal'))
         trains = [r for r in buf if isinstance(r, GroupMergeRequest)]
         assert len(trains) == 1, f'Expected 1 train; got {len(trains)}'
         assert 'ig_inf' not in trains[0].member_task_ids, (

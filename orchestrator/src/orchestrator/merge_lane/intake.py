@@ -68,7 +68,7 @@ def _aging_key(req: MergeRequest) -> tuple[float, str]:
     * **request_id** — lexical tie-break for equal timestamps (PRD §5.4 /
       §11.3).  Lexically smaller wins.
 
-    Used by ``SpeculativeMergeWorker._pop_next_pickable`` to identify the
+    Used by ``MergeIntake.pop_next_pickable`` to identify the
     clique-minimal item within a footprint clique — the buffered item whose
     footprint-clique peers all have an equal-or-larger aging key.
     """

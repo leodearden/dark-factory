@@ -15,7 +15,7 @@ SPOT smell (`docs/code-quality.md` heuristic 11) and leaves the family free to
 drift apart one file at a time.
 
 Not every lane test is on this module yet: a file that still reads placement
-off ``worker._lane_buffers`` directly is making the same claim a second way,
+off the intake's lane buffers directly is making the same claim a second way,
 and converging it is for whichever group owns that file — this module is the
 destination, not a completed migration.
 """

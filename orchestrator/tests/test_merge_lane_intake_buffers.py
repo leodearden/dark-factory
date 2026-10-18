@@ -20,13 +20,13 @@ from typing import Any
 import pytest
 from _git_fixtures import README_SEED, seed_repo
 from _merge_lane_fakes import lane_scene_config, make_lane, running_lane
-from orchestrator.merge_lane.intake_buffers import IntakeLifecycle, MergeIntake
 from test_merge_lane_coalesce_admission import _TrainHooks
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.halt import HaltState
+from orchestrator.merge_lane.intake_buffers import IntakeLifecycle, MergeIntake
 from orchestrator.merge_lane.types import (
     DecidedItem,
     ItemLifecycleState,
@@ -35,6 +35,8 @@ from orchestrator.merge_lane.types import (
     QueuedBranch,
 )
 from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
+
+pytestmark = pytest.mark.asyncio
 
 LANES = ('high', 'normal')
 _GIT = GitConfig(
@@ -319,7 +321,9 @@ async def test_a_taken_request_is_restored_to_its_exact_position(scene: Scene) -
     assert task_ids(scene.intake.buffered('normal')) == ['101', '103']
     assert scene.intake.take_buffered('102') is None
 
-    scene.intake.restore_buffered(*taken)
+    assert taken is not None
+    lane, index, req = taken
+    scene.intake.restore_buffered(lane, index, req)
     assert scene.intake.buffered('normal') == tuple(reqs)
 
 
