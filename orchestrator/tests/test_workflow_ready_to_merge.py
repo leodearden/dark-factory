@@ -30,6 +30,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 from shared.task_transitions import outcome_allows_status
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
@@ -128,6 +129,7 @@ def _make(
     config.project_root = tmp_path / 'proj'
     config.git.branch_prefix = 'task/'
     config.module_configs_or_empty = {}
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock(side_effect=set_task_status_side_effect)
