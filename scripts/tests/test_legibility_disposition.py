@@ -1035,13 +1035,70 @@ def test_a_ticket_without_a_task_is_listed_and_triggers_no_read() -> None:
     assert store.calls == []
 
 
-def test_a_ticket_only_row_beside_an_observed_task_does_not_block_its_governance() -> None:
-    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_9"), _task_row(5120)]))
+def test_a_resolved_ticket_only_row_beside_an_observed_task_does_not_block_its_governance() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_9", resolution=Resolution.REFUSED), _task_row(5120)]))
 
-    governing = _entry_outcome(_read(cb, {"5120": "done"}), "entry-a").governing
+    outcomes = _read(cb, {"5120": "done"})
 
+    governing = _entry_outcome(outcomes, "entry-a").governing
     assert governing is not None
     assert governing.ref == disposition.TaskRef(_ROOT, 5120)
+    assert outcomes.due == (disposition.Reverify("entry-a", disposition.TaskRef(_ROOT, 5120)),)
+    assert outcomes.awaiting == {}
+
+
+_HELD_TASKS = [
+    ({"5120": "done"}, {}),
+    ({"5120": "cancelled"}, {5120: _task(5120, "cancelled")}),
+    ({"5120": "cancelled"}, {5120: _accepting(5120)}),
+    ({"5120": "pending"}, {}),
+]
+
+
+def _held_codebook() -> dict:
+    return _codebook(_entry(
+        "entry-a", status="accepted", accepted_by=77, filed_tickets=[_row("tkt_9"), _task_row(5120)],
+    ))
+
+
+@pytest.mark.parametrize(("statuses", "tasks"), _HELD_TASKS, ids=["done", "abandoned", "accepting", "pending"])
+def test_a_ticket_awaiting_the_curator_beside_an_observed_task_holds_its_entry(statuses, tasks) -> None:
+    cb = _held_codebook()
+    before = copy.deepcopy(cb)
+
+    outcomes = _read(cb, statuses, FakeTaskStore(tasks=tasks))
+
+    outcome = _entry_outcome(outcomes, "entry-a")
+    assert outcome.governing is None
+    assert outcome.awaiting == ("tkt_9",)
+    assert outcomes.awaiting == {"entry-a": "tkt_9"}
+    assert outcomes.due == ()
+    assert disposition.refilings(outcomes, {}, sighted={"entry-a"}) == ()
+    projected, changes = disposition.project(cb, outcomes, {}, as_of_sha=_SHA)
+    assert changes == ()
+    assert projected == before
+
+
+def test_outcomes_awaiting_names_each_entrys_newest_pending_ticket() -> None:
+    cb = _codebook(
+        _entry("entry-a", filed_tickets=[_row("tkt_3", run_id=_OLD_RUN), _task_row(5120), _row("tkt_9")]),
+        _entry("entry-b", filed_tickets=[_row("tkt_4", resolution=Resolution.FAILED), _task_row(5121)]),
+        _entry("entry-c"),
+    )
+
+    outcomes = _read(cb, {"5120": "done", "5121": "done"})
+
+    assert _entry_outcome(outcomes, "entry-a").awaiting == ("tkt_3", "tkt_9")
+    assert _entry_outcome(outcomes, "entry-b").awaiting == ()
+    assert outcomes.awaiting == {"entry-a": "tkt_9"}
+
+
+def test_read_outcomes_never_resolves_a_ticket() -> None:
+    store = FakeTaskStore()
+
+    _read(_held_codebook(), {"5120": "done"}, store)
+
+    assert "resolve_ticket" not in store.tools_called()
 
 
 def test_the_reverify_queue_holds_each_unfixed_entry_governed_by_a_done_task_in_codebook_order() -> None:
@@ -1845,3 +1902,26 @@ def test_a_task_that_does_not_govern_its_entry_says_which_does() -> None:
     assert [(row["task_id"], row["outcome"]) for row in record["rows"]] == [(40, "outranked"), (41, "live")]
     cells = [row["outcome"] for row in _table(_dispositions(record))]
     assert "41" in cells[0]
+
+
+def test_a_task_held_by_a_ticket_awaiting_the_curator_says_which_ticket() -> None:
+    record = _outcome_record(_held_codebook(), {"5120": "done"})
+
+    rows = {row["task_id"]: row for row in record["rows"]}
+    assert rows[5120]["outcome"] == "held"
+    assert "tkt_9" in rows[5120]["detail"]
+    assert rows[None]["outcome"] == "ticket"
+    assert record["changes"] == []
+    assert record["reverify"]["due"] == 0
+
+
+def test_a_task_held_by_an_unobserved_sibling_names_no_ticket() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120), _task_row(5518)]))
+
+    record = _outcome_record(cb, {"5120": "done"})
+
+    rows = {row["task_id"]: row for row in record["rows"]}
+    assert rows[5120]["outcome"] == "held"
+    assert rows[5120]["detail"]
+    assert "tkt_" not in rows[5120]["detail"]
+    assert rows[5518]["outcome"] == "unobserved"
