@@ -80,6 +80,8 @@ from orchestrator.deterministic_runner import (
     build_milestone_gate_escalation_fields,
 )
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
+from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
@@ -2294,15 +2296,15 @@ class Harness:
         terminal-status-watcher, watcher-supervisor, stranded-reconcile,
         main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
         warm-lane-gc, stale-service-restart, merge-heartbeat,
-        verify-admission-watch.
+        verify-admission-watch, flake-debt-drain.
         escalation-server and merge-worker start first so the recovery block
         (which runs immediately after ``start_all()`` returns) can depend on
         both being live. The seven sweeps are conditionally registered on
         their own ``config.X_enabled`` gate — ``BackgroundService`` itself has
         no ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
-        absent from the registry. The last three always run: they must keep
+        absent from the registry. The last four always run: they must keep
         their cadence whatever the dispatch loop is doing (task 5344; the
-        verify-admission watch, task 5628).
+        verify-admission watch, task 5628; the flake-debt drain, task 6934).
         """
         if self._lifecycle is not None:
             return
@@ -2420,7 +2422,35 @@ class Harness:
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
         ))
+        drain_client = SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root)
+        registry.register(BackgroundService(
+            name='flake-debt-drain',
+            pass_fn=functools.partial(self._run_flake_debt_drain_pass, drain_client),
+            interval_secs=DRAIN_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
         self._lifecycle = registry
+
+    async def _run_flake_debt_drain_pass(
+        self, task_client: SchedulerChronicFlakeTaskClient,
+    ) -> None:
+        """One pass of the flake-debt drain (task 6934).
+
+        ``self._escalation_queue`` and ``self.git_ops`` are read when the pass
+        RUNS, not when the registry is built: the registry is built before
+        ``_start_escalation_server`` creates the queue, so a queue captured at
+        registration would stay ``None`` for the drain's whole life.
+        """
+        await run_drain_pass(
+            ledger_db_path(Path(self.config.project_root)),
+            self.config.fused_memory.project_id,
+            task_client=task_client,
+            git=self.git_ops,
+            escalation_queue=self._escalation_queue,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
 
     async def _run_verify_admission_watch_pass(self) -> None:
         """One tick of the task-verify admission watch on this process's gate.
