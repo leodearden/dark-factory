@@ -323,6 +323,63 @@ class TestDispatchAdmissionMetricRanking:
         assert data['metric'] == 'mem_full_avg10'
 
 
+@pytest.mark.asyncio
+class TestDispatchAdmissionV2Arms:
+    """The v2 vocabulary through the gate, PRD
+    plans/load-throttle-harmonisation-prd.md boundary rows 4, 5 and 7."""
+
+    async def test_default_config_ignores_host_cpu_runqueue_and_own_pressure(self) -> None:
+        """Row 4: the legacy CPU arm and both v2 arms are off by default."""
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig()),
+            event_store=event_store,  # type: ignore[arg-type]
+        )
+        scheduler.finish_startup()
+        scheduler._read_psi_sample = lambda: _psi(
+            cpu_some10=99.0,
+            runqueue_ratio=9.0,
+            runqueue_read_ok=True,
+            own_cpu_some10=99.0,
+            own_read_ok=True,
+        )
+        scheduler._dispatched = {'inflight1'}
+        scheduler.get_tasks = AsyncMock(return_value=[_heavy_task('H')])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'H'
+        assert [e for e in event_store.events if e[0] == 'dispatch_deferred'] == []
+
+    async def test_runqueue_arm_holds_and_outranks_mem_some(self) -> None:
+        """Row 5: a runqueue ratio over its threshold holds."""
+        sample = _psi(mem_some10=20.0, runqueue_ratio=4.3, runqueue_read_ok=True)
+
+        data = await _sole_deferral_data(sample, PsiAdmissionConfig(runqueue_ratio=4.0))
+
+        assert data['metric'] == 'runqueue_ratio'
+
+    async def test_mem_full_outranks_the_runqueue_arm(self) -> None:
+        sample = _psi(
+            mem_some10=20.0, mem_full10=5.0, runqueue_ratio=4.3, runqueue_read_ok=True,
+        )
+
+        data = await _sole_deferral_data(sample, PsiAdmissionConfig(runqueue_ratio=4.0))
+
+        assert data['metric'] == 'mem_full_avg10'
+
+    async def test_own_cgroup_arm_holds_on_an_idle_host(self) -> None:
+        """Row 7: the orchestrator's own cgroup pressure holds by itself."""
+        own_cgroup = '/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice'
+        sample = _psi(own_cpu_some10=55.0, own_read_ok=True, own_cgroup=own_cgroup)
+
+        data = await _sole_deferral_data(sample, PsiAdmissionConfig(own_cpu_some_avg10=50.0))
+
+        assert data['metric'] == 'own_cpu_some_avg10'
+        assert data['sample']['own_cgroup'] == own_cgroup
+
+
 # ---------------------------------------------------------------------------
 # step-4 — Robustness: disabled gate, fail-open, once-per-tick/rate-limit
 # ---------------------------------------------------------------------------
