@@ -35,6 +35,74 @@ from pydantic import (
 
 from shared.finding_key import KEY_PATTERN
 from shared.governed_exceptions import Debt, MalformedDisposition, owner_from_record, owner_record
+from shared.task_metadata import register_metadata_submodel
+
+__all__ = [
+    'Closure',
+    'DEFECTS_METADATA_KEY',
+    'DEFECT_TEST_RETIREMENTS_METADATA_KEY',
+    'DEFECT_TRANSITIONS',
+    'Declare',
+    'DeclareClosure',
+    'DeclareEvent',
+    'DeclareRetirement',
+    'DefectDeclaration',
+    'DefectEventKind',
+    'DefectMergeRefusal',
+    'DefectOrigin',
+    'DefectProof',
+    'DefectRefStr',
+    'DefectStatus',
+    'DefectTrigger',
+    'Exemption',
+    'ExemptionReason',
+    'FIX_FINDING_OUTCOMES',
+    'IllegalDefectTransition',
+    'IssueKind',
+    'IssueKindFlag',
+    'IssueKindReading',
+    'KeepCheck',
+    'KeepOutcome',
+    'MalformedDefectRef',
+    'MissingSymbol',
+    'NO_VERDICT_OUTCOMES',
+    'NodeId',
+    'OutcomeEvent',
+    'ParsedRef',
+    'PlanCheck',
+    'PlanCheckOutcome',
+    'Proof',
+    'ProofOutcome',
+    'RETIREMENT_TRANSITIONS',
+    'Retirement',
+    'RetirementCode',
+    'RetirementReason',
+    'RetirementState',
+    'Rule',
+    'RuledBy',
+    'Ruling',
+    'RulingSubject',
+    'SideOutcome',
+    'SideResult',
+    'Sighting',
+    'UnavailableReason',
+    'Withdrawal',
+    'WithdrawalCode',
+    'WithdrawalReason',
+    'apply_event',
+    'apply_retirement_event',
+    'issue_kind_of',
+    'mint_explore_ref',
+    'mint_finding_ref',
+    'mint_followup_ref',
+    'mint_human_ref',
+    'mint_portal_ref',
+    'mint_redmain_ref',
+    'mint_review_ref',
+    'parse_declare_event',
+    'parse_outcome_event',
+    'parse_ref',
+]
 
 
 class DefectOrigin(StrEnum):
@@ -1273,3 +1341,14 @@ def issue_kind_of(issue: Mapping[str, object]) -> IssueKindReading:
     if kind is None:
         return IssueKindReading(IssueKind.DEFECT, IssueKindFlag.UNRECOGNISED)
     return IssueKindReading(kind)
+
+
+# --- Metadata registration ---------------------------------------------------
+
+DEFECTS_METADATA_KEY = 'defects'
+DEFECT_TEST_RETIREMENTS_METADATA_KEY = 'defect_test_retirements'
+
+# An import side effect of THIS module, never of shared.task_metadata; why is
+# shared/src/shared/deploy_state.py::DeployState's module docstring.
+register_metadata_submodel(DEFECTS_METADATA_KEY, DefectDeclaration, cardinality='list')
+register_metadata_submodel(DEFECT_TEST_RETIREMENTS_METADATA_KEY, Retirement, cardinality='list')
