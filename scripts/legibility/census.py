@@ -1920,10 +1920,11 @@ def _with_refilings(
 
 def _read_statuses(status_fetcher) -> tuple[Mapping[str, Any] | None, str | None]:
     """The run's one get_statuses snapshot (``census_trigger.extract_statuses``),
-    or None and why it could not be read."""
+    or None and why it could not be read: an unread snapshot leaves every
+    outcome unobserved and the done-count null, and never fails the run."""
     try:
         return census_trigger.extract_statuses(status_fetcher()), None
-    except Exception as exc:  # noqa: BLE001 - an unread snapshot leaves outcomes unobserved, never fails the run
+    except Exception as exc:
         return None, str(exc)
 
 
@@ -2675,7 +2676,9 @@ def run_census(
     headroom cap there leaves them inconclusive and never defers the run);
     ``disposition.project`` re-derives each entry's status from its tasks
     (``fixed`` only from a re-verify that found it gone, INV-3); a finding
-    re-verified present files again superseding its done task ->
+    re-verified present files again superseding its done task, and one whose
+    task was cancelled without an acceptance reason files again once it
+    recurs (is sighted this run) ->
     ``_filing_queue``, which pairs
     each fileable cluster with the entry it was promoted to and adds every
     earlier-withheld entry that has since recurred, then the re-filings ->
@@ -3193,11 +3196,7 @@ def run_census(
     updated_codebook, status_changes = disposition.project(
         updated_codebook, outcomes, reverified, as_of_sha=as_of_sha,
     )
-    refiled = tuple(
-        refiling
-        for refiling in disposition.refilings(outcomes, reverified, sighted=())
-        if refiling.verified_present
-    )
+    refiled = disposition.refilings(outcomes, reverified, sighted=sighted)
 
     # Positioned BEFORE codebook.dump()/advance_census_state() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
@@ -3250,9 +3249,9 @@ def run_census(
     # merge check, so it is held to the schema again before any artifact.
     _require_valid(updated_codebook, "filing")
     filing_report = disposition.FilingReport(disposal, resolutions, backfilled, structural)
+    standings = disposition.task_standings(outcomes, disposal.resolved(resolutions).decisions)
     dispositions_record = disposition.OutcomeReport(
-        outcomes, reverified, status_changes, refiled,
-        disposition.entry_dispositions(updated_codebook, disposition.task_standings(outcomes, ())),
+        outcomes, reverified, status_changes, refiled, disposition.entry_dispositions(updated_codebook, standings),
     ).to_record()
     verify_calls = len(clusters_to_verify) + dispositions_record["reverify"]["offered"]
     filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
@@ -3333,7 +3332,7 @@ def run_census(
                 sighted=sighted,
                 run_id=run_id,
                 cause_of=functools.partial(_entry_text, updated_codebook, field="cause"),
-                disposition_of=lambda entry: str(disposition.disposition_of(entry, {})),
+                disposition_of=lambda entry: str(disposition.disposition_of(entry, standings)),
             )
         ],
         area_map=area_map.to_record(),
