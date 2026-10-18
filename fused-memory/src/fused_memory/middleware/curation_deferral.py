@@ -1,0 +1,116 @@
+"""The vocabulary and policy for a task submission the curator could not judge.
+
+Why it was deferred (:class:`DeferReason`), when it is retried and when
+deferral gives up (:class:`DeferralPolicy`), and how the create that ends a
+give-up is marked (:func:`dedupe_skipped_marker`). The bottom layer of the
+curator's defer seam: the curator, the ticket store and the interceptor
+import it; it imports none of them.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import TYPE_CHECKING, Final
+
+from shared.cli_invoke import AllAccountsCappedException
+from shared.usage_gate import PoolFrozen
+
+if TYPE_CHECKING:
+    from fused_memory.config.schema import CuratorConfig
+
+
+class DeferReason(StrEnum):
+    ALL_ACCOUNTS_CAPPED = 'all-accounts-capped'
+    ACCOUNTS_AUTH_FAILED = 'accounts-auth-failed'
+
+
+POOL_UNAVAILABLE_ERRORS: Final[tuple[type[Exception], ...]] = (
+    AllAccountsCappedException,
+    PoolFrozen,
+)
+
+
+def pool_defer_reason(exc: AllAccountsCappedException | PoolFrozen) -> DeferReason:
+    if (
+        isinstance(exc, PoolFrozen)
+        and exc.scope is None
+        and not exc.capped_account_names
+        and exc.auth_failed_account_names
+    ):
+        return DeferReason.ACCOUNTS_AUTH_FAILED
+    return DeferReason.ALL_ACCOUNTS_CAPPED
+
+
+def _require_aware(name: str, value: datetime) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f'{name} must be timezone-aware, got naive {value.isoformat()}')
+
+
+@dataclass(frozen=True)
+class DeferralPolicy:
+    backoff_base_seconds: float
+    backoff_max_seconds: float
+    max_defer_seconds: float
+
+    def __post_init__(self) -> None:
+        bounds = {
+            'backoff_base_seconds': self.backoff_base_seconds,
+            'backoff_max_seconds': self.backoff_max_seconds,
+            'max_defer_seconds': self.max_defer_seconds,
+        }
+        non_positive = {name: value for name, value in bounds.items() if not value > 0}
+        if non_positive:
+            raise ValueError(f'DeferralPolicy bounds must be > 0, got {non_positive}')
+        if self.backoff_max_seconds < self.backoff_base_seconds:
+            raise ValueError(
+                f'DeferralPolicy backoff_max_seconds ({self.backoff_max_seconds}) must be '
+                f'>= backoff_base_seconds ({self.backoff_base_seconds})'
+            )
+
+    @classmethod
+    def from_config(cls, curator: CuratorConfig) -> DeferralPolicy:
+        return cls(
+            backoff_base_seconds=curator.deferral_backoff_base_seconds,
+            backoff_max_seconds=curator.deferral_backoff_max_seconds,
+            max_defer_seconds=curator.deferral_max_seconds,
+        )
+
+    def deadline(self, submitted_at: datetime) -> datetime:
+        _require_aware('submitted_at', submitted_at)
+        return submitted_at + timedelta(seconds=self.max_defer_seconds)
+
+    def expired(self, submitted_at: datetime, now: datetime) -> bool:
+        _require_aware('now', now)
+        return now >= self.deadline(submitted_at)
+
+    def next_attempt_at(self, *, attempts: int, submitted_at: datetime, now: datetime) -> datetime:
+        if attempts < 1:
+            raise ValueError(f'attempts counts the deferral being recorded, so must be >= 1, got {attempts}')
+        _require_aware('now', now)
+        return min(now + timedelta(seconds=self._backoff_seconds(attempts)), self.deadline(submitted_at))
+
+    def give_up_justification(self, reason: DeferReason) -> str:
+        return f'curation-gave-up after {self.max_defer_seconds:g}s: {reason}'
+
+    def _backoff_seconds(self, attempts: int) -> float:
+        doublings = attempts - 1
+        if doublings >= math.log2(self.backoff_max_seconds / self.backoff_base_seconds):
+            return self.backoff_max_seconds
+        return self.backoff_base_seconds * 2**doublings
+
+
+DEDUPE_SKIPPED_KEY: Final = 'dedupe_skipped'
+_MARKER_REASON_MAX_CHARS: Final = 500
+
+
+def dedupe_skipped_marker(reason: str, *, at: datetime) -> dict[str, dict[str, str]]:
+    _require_aware('at', at)
+    return {
+        DEDUPE_SKIPPED_KEY: {
+            'reason': reason[:_MARKER_REASON_MAX_CHARS],
+            'at': at.astimezone(UTC).isoformat(),
+        },
+    }
