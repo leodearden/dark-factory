@@ -16,7 +16,7 @@ import pytest
 from _recording_event_store import _RecordingEventStore
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext, TickOutcome
 
@@ -675,7 +675,9 @@ class TestSelectionPhases:
         defers its own heavy candidate against the SAME ctx — exactly one
         event per tick, as when both loops lived in one method body."""
         event_store = _RecordingEventStore()
-        config = OrchestratorConfig(max_per_module=1)
+        config = OrchestratorConfig(
+            max_per_module=1, psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0),
+        )
         store = OverrideStore(tmp_path / 'o.db')
         scheduler = Scheduler(config, event_store=event_store, override_store=store)  # type: ignore[arg-type]
         scheduler.finish_startup()

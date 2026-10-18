@@ -818,16 +818,14 @@ class WarmBaseHardDownConfig(BaseModel):
 
 class PsiAdmissionConfig(BaseModel):
     """L3b dispatch-admission load-cap gate configuration (task 2327, PRD
-    docs/prds/dispatch-admission-load-cap.md, task DA2).
+    docs/prds/dispatch-admission-load-cap.md, task DA2; v2 task 3590).
 
     The dispatch-admission gate (DA3) reads these thresholds live each tick
-    to decide whether the host is saturated enough to hold new dispatch.
-    Memory ranks above io (DA-D1): ``mem_some_avg10`` is deliberately
-    TIGHTER than ``io_some_avg10``, and ``mem_full_avg10`` is a separate
-    memory `full` hard-trip. ``min_inflight_floor`` (DA-D3) is an
-    anti-deadlock floor — the gate must never hold when fewer than this many
-    tasks are in flight on this orchestrator, so a value < 1 (which could
-    wedge the queue with nothing running) is rejected at load.
+    to decide whether the host is saturated enough to hold new HEAVY
+    dispatch. Each threshold is one saturation arm of
+    ``shared.psi.PsiSample`` and ``None`` switches that arm off. The field
+    set, code defaults and ranges are owned by PRD
+    plans/load-throttle-harmonisation-prd.md §6.2.
 
     All fields are green-tier hot-tunable via RELOADABLE_FIELDS — an
     operator may adjust thresholds post-observation via
@@ -840,24 +838,47 @@ class PsiAdmissionConfig(BaseModel):
         default=True,
         description='Set to false to disable the dispatch-admission gate entirely.',
     )
-    cpu_some_avg10: float = Field(
-        default=85.0,
-        description='PSI cpu "some" avg10 (%) threshold — primary CPU saturation signal.',
+    cpu_some_avg10: float | None = Field(
+        default=None,
+        description=(
+            'PSI cpu "some" avg10 (%) threshold — the legacy CPU arm, off by '
+            'default because runqueue_ratio is the host CPU arm (PRD '
+            'load-throttle-harmonisation D1). None = arm off.'
+        ),
     )
-    mem_some_avg10: float = Field(
+    mem_some_avg10: float | None = Field(
         default=15.0,
         description=(
             'PSI memory "some" avg10 (%) threshold. Deliberately tighter than '
-            'io_some_avg10 — memory ranks above io per DA-D1.'
+            'io_some_avg10 — memory ranks above io per DA-D1. None = arm off.'
         ),
     )
-    mem_full_avg10: float = Field(
+    mem_full_avg10: float | None = Field(
         default=3.0,
-        description='PSI memory "full" avg10 (%) threshold — memory hard-trip.',
+        description='PSI memory "full" avg10 (%) threshold — memory hard-trip. None = arm off.',
     )
-    io_some_avg10: float = Field(
+    io_some_avg10: float | None = Field(
         default=40.0,
-        description='PSI io "some" avg10 (%) threshold — looser than mem_some_avg10.',
+        description=(
+            'PSI io "some" avg10 (%) threshold — looser than mem_some_avg10. '
+            'None = arm off.'
+        ),
+    )
+    runqueue_ratio: float | None = Field(
+        default=None,
+        description=(
+            'Host CPU arm (PRD load-throttle-harmonisation D1): procs_running '
+            'from /proc/stat divided by len(os.sched_getaffinity(0)). Any value '
+            'is provisional until calibrated (D9). None = arm off.'
+        ),
+    )
+    own_cpu_some_avg10: float | None = Field(
+        default=None,
+        description=(
+            'cpu "some" avg10 (%) of the orchestrator\'s own cgroup — its '
+            'df-<project_id>.slice when present, else its own unit (PRD '
+            'load-throttle-harmonisation D2). None = arm off.'
+        ),
     )
     min_inflight_floor: int = Field(
         default=1,
