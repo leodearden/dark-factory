@@ -69,7 +69,7 @@ from shared.defects import (
 )
 from shared.finding_key import finding_key
 from shared.governed_exceptions import Debt, TaskRef, TicketRef, owner_record
-from shared.task_metadata import RetryLedger
+from shared.task_metadata import RetryLedger, parse_metadata
 
 
 def _norm(text: str) -> str:
@@ -1249,3 +1249,64 @@ class TestIssueKindOf:
         before = copy.deepcopy(issue)
         issue_kind_of(issue)
         assert issue == before
+
+
+# --- Registration, through parse_metadata -----------------------------------------
+
+
+def _proven_entry() -> DefectDeclaration:
+    return _declaration(
+        ref=_OTHER_REF,
+        origin=DefectOrigin.EXPLORATORY,
+        status=_PR,
+        proof=_proof(ref=_OTHER_REF),
+    )
+
+
+def _accepted_retirement() -> Retirement:
+    return _retirement(_ruling(True, RulingSubject.RETIREMENT))
+
+
+_REGISTERED_KEYS = [
+    pytest.param('defects', _declaration, id='defects'),
+    pytest.param('defect_test_retirements', _accepted_retirement, id='defect_test_retirements'),
+]
+
+
+class TestMetadataRegistration:
+    def test_both_keys_parse_to_typed_slices(self) -> None:
+        fresh, proven, retirement = _declaration(), _proven_entry(), _accepted_retirement()
+        model, warnings = parse_metadata(
+            {
+                'defects': [fresh.model_dump(mode='json'), proven.model_dump(mode='json')],
+                'defect_test_retirements': [retirement.model_dump(mode='json')],
+            },
+            direction='write',
+            enforce=True,
+        )
+        assert warnings == []
+        assert model.model_extra is not None
+        assert model.model_extra['defects'] == [fresh, proven]
+        assert model.model_extra['defect_test_retirements'] == [retirement]
+
+    @pytest.mark.parametrize(('key', 'build'), _REGISTERED_KEYS)
+    def test_a_single_mapping_is_the_wrong_cardinality(self, key: str, build) -> None:
+        blob = {key: build().model_dump(mode='json')}
+        _model, warnings = parse_metadata(blob, direction='read')
+        assert [(w.field, w.code) for w in warnings] == [(key, 'wrong_cardinality')]
+        with pytest.raises(TypeError):
+            parse_metadata(blob, direction='write', enforce=True)
+
+    def test_an_entry_outside_the_grammar_is_an_invalid_submodel(self) -> None:
+        raw = [{**_declaration().model_dump(mode='json'), 'ref': 'bogus:1'}]
+        model, warnings = parse_metadata({'defects': raw}, direction='read')
+        assert [(w.field, w.code) for w in warnings] == [('defects', 'invalid_submodel')]
+        assert model.model_dump()['defects'] == raw
+        with pytest.raises(ValidationError):
+            parse_metadata({'defects': raw}, direction='write', enforce=True)
+
+    def test_a_malformed_owner_never_escapes_parse_metadata(self) -> None:
+        pending = _declaration(status=_PE, closure=_exemption()).model_dump(mode='json')
+        pending['closure']['owner'] = {'type': 'task', 'id': 0}
+        _model, warnings = parse_metadata({'defects': [pending]}, direction='read')
+        assert [(w.field, w.code) for w in warnings] == [('defects', 'invalid_submodel')]
