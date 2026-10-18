@@ -334,14 +334,13 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 class TestJudgePlan:
     async def test_the_judge_sees_the_plan_the_diff_and_the_task(self, tmp_path: Path):
         verdict = _scored()
-        deps = ArchitectEvalDeps(
-            store=ResultStore(tmp_path), judge=AsyncMock(return_value=verdict),
-        )
+        judge = AsyncMock(return_value=verdict)
+        deps = ArchitectEvalDeps(store=ResultStore(tmp_path), judge=judge)
         plan, task = _scorable_plan(), _arch_task()
 
         judgement = await judge_plan(plan, '--- a\n+++ b\n', task, deps)
 
-        deps.judge.assert_awaited_once_with(plan, '--- a\n+++ b\n', task)
+        judge.assert_awaited_once_with(plan, '--- a\n+++ b\n', task)
         assert judgement == PlanJudgement(verdict, blind=False)
 
     async def test_an_empty_reference_judges_blind_and_says_so_once(
@@ -378,15 +377,13 @@ class TestReadReferenceDiff:
     async def test_the_landed_diff_is_read_between_the_fixture_commits(
         self, tmp_path: Path,
     ):
-        deps = ArchitectEvalDeps(
-            store=ResultStore(tmp_path),
-            read_reference_diff=AsyncMock(return_value='the landed diff'),
-        )
+        reader = AsyncMock(return_value='the landed diff')
+        deps = ArchitectEvalDeps(store=ResultStore(tmp_path), read_reference_diff=reader)
 
         diff = await read_reference_diff(_arch_task(), deps)
 
         assert diff == 'the landed diff'
-        deps.read_reference_diff.assert_awaited_once_with(
+        reader.assert_awaited_once_with(
             Path('/fake/project'), 'basecommit123', 'postcommit456',
         )
 

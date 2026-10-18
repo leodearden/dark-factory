@@ -1244,6 +1244,95 @@ decline artifacts themselves were already gone: `snapshots.py::cleanup_eval_work
 four exits (success, timeout, cap exhaustion, harness error) and the last moment
 the artifacts exist.
 
+### The architect cell: invoke, classify, assemble (task 6737)
+
+Code: `orchestrator/src/orchestrator/evals/architect_eval.py`, composed by
+`runner.py::run_architect_eval`.
+
+`run_architect_eval` runs one architect cell as a short composition. The
+architect is invoked and its attempt recorded as a frozen `ArchitectAttempt`:
+outcome, plan, declines, usage, resolved architect cost and, when something
+went wrong, one architect `Unmeasured`. The reference diff is read
+(`read_reference_diff`). `classify_attempt` decides how the plan is scored.
+The plan judge is asked (`judge_plan`) only when that decision is `JUDGE`.
+`assemble_metrics` builds the persisted `EvalMetrics`, and
+`log_architect_cell` writes the route's warning and the completion line.
+`classify_attempt` and `assemble_metrics` are pure. Every effect boundary of a
+cell (worktree, artifacts, invoke, judge, reference-diff read, gate factory,
+cap-wait patience, store) is a field of `ArchitectEvalDeps`, whose defaults are
+the production collaborators, so a test injects fakes rather than patching
+module paths.
+
+**The taint table (`classify_attempt`).** "Never asked" means the attempt
+carries an architect `Unmeasured` whose cause is not candidate-attributable;
+`CANDIDATE_ATTRIBUTABLE_CAUSES` holds `timeout` alone. "Scorable" is
+`plan_predicates.is_scorable_plan`, the same predicate the floor and the
+judge's own refusal consult.
+
+| Never asked | Scorable plan | Scoring | `plan_quality` |
+|---|---|---|---|
+| yes | no | `TAINTED` | `None`, `cap_tainted=True` |
+| yes | yes | `FLOORED` | `score_plan_structure(plan)` |
+| no | no | `FLOORED` | `score_plan_structure(plan)`, i.e. `0.0` |
+| no | yes | `JUDGE` | the judge's score, or the floor when the judge is unmeasured |
+
+Per row, and why the line falls there (the general recorded-vs-tainted
+argument is in "Unmeasured cells: typed causes" above):
+
+- A transport refusal (cap hit, auth failure, model not found, body-less 429,
+  5xx, zero-output wedge), cap exhaustion or a harness error, with no scorable
+  plan, is tainted. The candidate was never asked, and charging a schedule,
+  a configuration or our own crash to it would be a fabricated score. "No
+  scorable plan" covers an absent artifact and the header-only stub
+  `create_plan` writes.
+- The same failures after a plan with steps landed (a cap landing mid-run,
+  after the architect wrote real steps through plan-tools) are floored, not
+  tainted: model content exists, so the structural floor is a genuine content
+  measurement. The judge is skipped, because inside the same cap window it
+  would 429 too.
+- A healthy architect with no scorable plan is floored to `0.0` and not marked
+  at all: that is a real reliability signal. The judge is skipped, so the
+  score is never the judge's opinion of an artifact with nothing to judge, and
+  the judge refuses such an artifact itself as well (task 3303).
+- A timeout is marked but is candidate-attributable, so it keeps scoring on
+  content: floored without a plan, judged with one.
+- A failure of the judge alone is recorded (stage `judge`) and never taints:
+  the cell falls back to the floor of a real plan.
+
+The table is today's ladder exactly. Deriving "never asked" from the cause,
+instead of carrying a second flag on the attempt, keeps one fact in one place,
+and a test sweeps every `UnmeasuredCause` so a new cause lands on a row
+deliberately.
+
+**The reference diff and the two warnings.** The reference diff is read on
+every route, so the fixture-level warning ("fixture carries no
+`reference.post_task_commit`") fires once per cell even when the cell is
+tainted and never reaches the judge. That warning states only the fixture-level
+fact. The claim that a score was judged blind is made separately, by
+`judge_plan`, exactly where the judge is invoked with an empty diff.
+`judged_without_reference` is set only where the judge's own number is kept
+(`Scored`), for the reasons in "The validity bound" above: every other path
+persists the structural floor, which never consults a reference.
+
+**Judge spend and calls.** `judge_invocations` is 1 whenever the judge was
+called, even for a $0.00 refusal or an unparseable answer. A judge that raised
+is recorded as `raised` with `cost_usd=0.0` and credits no call, because
+whether the judge was ever reached is unknowable from the caller; its record
+keeps the cell from reading as judge-free. `judge_cost_usd` is a subset of the
+cell's `cost_usd`, as "Spend" above states.
+
+**`tests_pass` is `None`.** No test signal exists for a plan-only cell:
+implementer, debugger, reviewer and verify are frozen, so verification never
+runs. `None` is the documented "unknown" value. The dataclass default `False`
+would read as "the tests failed" and hard-gate `blend_composite` to `0.0`,
+collapsing every architect row's composite and leaving `select_survivors`'
+alphabetical tie-break as the whole selection mechanism. `True` is wrong too:
+`build_composite_report` draws each fixture's cost and latency floor from
+passing trials, and `ofat_candidates()` mixes architect, implementer and judge
+candidates over the same fixtures, so a cheap plan-only cell marked passing
+would become the floor for full-workflow cells, and it would fabricate a 100%
+`tests_pass_rate` for a cell that never ran a test.
+
 ### Eval usage-gate lifecycle (task 6737)
 
 Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
