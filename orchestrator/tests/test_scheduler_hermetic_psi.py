@@ -37,7 +37,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _orch_helpers import idle_psi_sample
 from _psi_admission_yaml import write_config_with_nondefault_psi_admission
-from shared.psi import PsiSample
+from shared.psi import PsiSample, read_psi_sample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.scheduler import Scheduler
@@ -178,20 +178,18 @@ class TestNonDefaultPsiAdmissionYaml:
 
 @pytest.mark.real_psi_reader
 def test_real_psi_reader_marker_restores_real_reader() -> None:
-    """With the marker, the real ``shared.psi.read_psi_sample`` binding is in place.
+    """With the marker, the module seam holds the real ``shared.psi.read_psi_sample``.
 
     Companion guard for the opt-out branch of conftest's autouse
     ``_hermetic_psi_reader`` fixture (the default, patched branch is covered
     by ``TestAutouseFixtureDefaultsToIdlePsi`` above). We don't actually call
-    the bound reader — that would read real, and therefore non-deterministic,
+    the reader — that would read real, and therefore non-deterministic,
     ``/proc/pressure/*`` values, reintroducing exactly the host dependence
-    task 2418 removes. Identity to the unpatched module attribute is the only
-    host-independent way to confirm the marker skipped the monkeypatch.
+    task 2418 removes. Identity at the module seam the fixture patches is the
+    only host-independent way to confirm the marker skipped the monkeypatch;
+    the scheduler binds that seam (with its project_id) at construction.
     Mirrors ``test_dry_run_unblock_autouse.py::test_exercise_dry_run_unblock_marker_disables_noop``.
     """
     import orchestrator.scheduler as scheduler_module
 
-    scheduler = Scheduler(
-        OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
-    )
-    assert scheduler._read_psi_sample is scheduler_module.read_psi_sample
+    assert scheduler_module.read_psi_sample is read_psi_sample

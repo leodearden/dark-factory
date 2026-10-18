@@ -16,7 +16,7 @@ this file build a reusable multi-tick transition harness (``_PsiFeed`` +
 tracking, max_concurrent enforcement, and task completion via the REAL
 ``scheduler.release()``), since ``acquire_next()`` itself enforces neither.
 
-Covers three scenarios (see the ``TestPsiSaturationTransition`` class):
+Covers four scenarios (see the ``TestPsiSaturationTransition`` class):
   test_full_transition_idle_saturated_idle
       Scenario 1 — full idle -> saturated -> idle transition end-to-end.
   test_floor_holds_under_sustained_saturation
@@ -24,6 +24,10 @@ Covers three scenarios (see the ``TestPsiSaturationTransition`` class):
   test_recovery_restores_full_dispatch_up_to_cap
       Scenario 3 — work-conserving restore up to max_concurrent_tasks with
       NO residual hold after recovery.
+  test_runqueue_transition_through_the_real_reader
+      Scenario 4 — PRD plans/load-throttle-harmonisation-prd.md boundary
+      row 6: idle -> runqueue-saturated -> idle through the REAL reader over
+      a fixture cgroup tree (task 3590).
 
 Helpers are MODULE-LOCAL (not conftest.py) per the DA2/DA3 rationale: a
 conftest.py edit trips verify.py's has_conftest scoped-verify fallback.
@@ -31,14 +35,18 @@ conftest.py edit trips verify.py's has_conftest scoped-verify fallback.
 
 from __future__ import annotations
 
+import functools
+import os
+from collections.abc import Callable
 from dataclasses import asdict
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 from _psi_admission_yaml import write_config_with_nondefault_psi_admission
-from shared.psi import PsiSample
+from shared.psi import PsiSample, read_psi_sample
 
-from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
+from orchestrator.config import FusedMemoryConfig, OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.event_store import EventStore
 from orchestrator.scheduler import Scheduler
 
@@ -211,11 +219,13 @@ class _Driver:
         *,
         event_store: EventStore,
         time_source,
-        psi_feed: _PsiFeed,
+        psi_feed: _PsiFeed | None = None,
     ) -> _Driver:
+        """Without *psi_feed* the scheduler keeps the reader bound at construction."""
         scheduler = Scheduler(config, event_store=event_store, time_source=time_source)
         scheduler.finish_startup()
-        scheduler._read_psi_sample = psi_feed
+        if psi_feed is not None:
+            scheduler._read_psi_sample = psi_feed
         driver = cls(scheduler, event_store)
         driver._active = list(tasks)
         scheduler.get_tasks = AsyncMock(side_effect=driver._get_tasks)
@@ -280,6 +290,54 @@ class _Driver:
 
     def lock_acquired_events(self) -> list[dict]:
         return self.event_store.fetch_events_by_type('lock_acquired')
+
+
+_IDLE_PRESSURE = (
+    'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
+    'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
+)
+_VERIFY_SCOPE_CGROUP = (
+    '/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice/'
+    'df-verify-x-0123456789ab.scope'
+)
+
+
+class _LoadFixtureTree:
+    """A fixture /proc + sysfs tree for the REAL ``shared.psi.read_psi_sample``.
+
+    Host PSI reads idle. The reading process sits in a verify scope under
+    ``df-x.slice`` (PRD plans/load-throttle-harmonisation-prd.md §6.3 row 1),
+    with ``cpu.pressure`` at the slice and none at the scope leaf, so the own
+    reading succeeds only when the resolver is given project_id ``'x'``. The
+    test sets ``procs_running``.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.proc_stat = root / 'proc' / 'stat'
+        self.proc_cgroup = root / 'proc' / 'self' / 'cgroup'
+        self.cgroup_root = root / 'sys' / 'fs' / 'cgroup'
+        self.proc_cgroup.parent.mkdir(parents=True)
+        self.proc_cgroup.write_text(f'0::{_VERIFY_SCOPE_CGROUP}\n')
+        scope_dir = self.cgroup_root / _VERIFY_SCOPE_CGROUP.lstrip('/')
+        scope_dir.mkdir(parents=True)
+        (scope_dir.parent / 'cpu.pressure').write_text(
+            'some avg10=12.50 avg60=10.00 avg300=5.00 total=1000\n'
+            'full avg10=1.00 avg60=0.50 avg300=0.10 total=100\n'
+        )
+        self.set_procs_running(0)
+
+    def set_procs_running(self, running: int) -> None:
+        self.proc_stat.write_text(f'cpu  1 2 3 4\nprocs_running {running}\nprocs_blocked 0\n')
+
+    def reader(self) -> Callable[..., PsiSample]:
+        """The real reader over this tree; project_id is left to the caller."""
+        return functools.partial(
+            read_psi_sample,
+            read=lambda _name: _IDLE_PRESSURE,
+            proc_stat_path=self.proc_stat,
+            proc_cgroup_path=self.proc_cgroup,
+            cgroup_root=self.cgroup_root,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -523,3 +581,66 @@ class TestPsiSaturationTransition:
         assert driver.deferred_events_since(high_water_id) == [], (
             'no dispatch_deferred event may occur after the recovery flip'
         )
+
+    # -----------------------------------------------------------------------
+    # Scenario 4 — PRD plans/load-throttle-harmonisation-prd.md boundary row 6
+    # -----------------------------------------------------------------------
+
+    async def test_runqueue_transition_through_the_real_reader(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Scenario 4: idle -> runqueue-saturated -> idle, with no injected
+        feed: the scheduler reads through the REAL reader over a fixture tree.
+
+        The own-cgroup reading resolves to ``df-x.slice`` only if the
+        scheduler handed the reader its ``fused_memory.project_id``.
+        """
+        tree = _LoadFixtureTree(tmp_path / 'host')
+        # Before construction: the scheduler binds the module-level reader.
+        monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', tree.reader())
+        event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='row-6')
+        config = OrchestratorConfig(
+            max_per_module=1,
+            max_concurrent_tasks=6,
+            psi_admission=PsiAdmissionConfig(runqueue_ratio=4.0),
+            fused_memory=FusedMemoryConfig(project_id='x'),
+        )
+        heavy_ids = {'H1', 'H2', 'H3', 'H4'}
+        tasks = [
+            *(_heavy_task(t, priority='high', files=[f'src/{t}.py']) for t in sorted(heavy_ids)),
+            _det_task('D1', files=['src/d1.py']),
+        ]
+        driver = _Driver.build(config, tasks, event_store=event_store, time_source=_FakeClock())
+
+        # --- (A) idle ---
+        await driver.run_ticks(2)
+        assert driver.heavy_in_flight() == 2
+        assert driver.deferred_events() == []
+
+        # --- (B) runqueue-saturated: far above 4.0 for any affinity mask ---
+        tree.set_procs_running(1_000_000)
+        await driver.run_ticks(4)
+
+        assert driver.heavy_in_flight() == 2
+        assert 'D1' in driver.dispatched_ids()
+        deferred = driver.deferred_events()
+        assert deferred
+        assert all(e['task_id'] in heavy_ids for e in deferred)
+        first = deferred[0]['data']
+        assert first['metric'] == 'runqueue_ratio'
+        sample = first['sample']
+        assert sample['read_ok'] is True
+        assert sample['runqueue_read_ok'] is True
+        assert sample['runqueue_ratio'] == pytest.approx(
+            1_000_000 / len(os.sched_getaffinity(0))
+        )
+        assert sample['own_read_ok'] is True
+        assert sample['own_cgroup'].endswith('/df-x.slice')
+        assert sample['own_cpu_some10'] == 12.5
+
+        # --- (C) idle again: full dispatch restored, no new deferral ---
+        tree.set_procs_running(0)
+        await driver.run_ticks(2)
+
+        assert driver.heavy_in_flight() == 4
+        assert driver.deferred_events() == deferred
