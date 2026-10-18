@@ -2472,6 +2472,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_undatable_freshness_records': 0,
             # Always present (task 5499): None because no backlog payload was assembled.
             'stage1_assembled_budget': None,
+            # Always present (task 4620); None because assemble_payload never ran
+            # here, so Stage 1 took no unfinished-Graphiti-write sample.
+            'stage1_unfinished_graphiti_write_start': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2694,6 +2697,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_undatable_freshness_records': 0,
             # Always present (task 5499): None because no backlog payload was assembled.
             'stage1_assembled_budget': None,
+            # Always present (task 4620); None because assemble_payload never ran
+            # here, so Stage 1 took no unfinished-Graphiti-write sample.
+            'stage1_unfinished_graphiti_write_start': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -3605,6 +3611,7 @@ class TestTierConfig:
         memory_mock.mem0 = AsyncMock()
         memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
         memory_mock.get_status = AsyncMock(return_value={})
+        memory_mock.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             memory_mock, AsyncMock(), AsyncMock(), config,
@@ -3713,6 +3720,7 @@ class TestStagePayloadProjectIdGuideline:
         m.mem0 = AsyncMock()
         m.mem0.get_all = AsyncMock(return_value={'results': []})
         m.get_status = AsyncMock(return_value={})
+        m.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return m
 
     @pytest.fixture
@@ -4161,6 +4169,7 @@ class TestMemoryConsolidatorFilteredTaskTree:
         svc.get_status = AsyncMock(return_value={})
         svc.mem0 = AsyncMock()
         svc.mem0.get_all = AsyncMock(return_value={'results': []})
+        svc.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return svc
 
     @pytest.fixture
@@ -12255,6 +12264,7 @@ class TestMemoryConsolidatorPayloadIncludesProjectRoot:
         m.mem0 = AsyncMock()
         m.mem0.get_all = AsyncMock(return_value={'results': []})
         m.get_status = AsyncMock(return_value={})
+        m.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return m
 
     @pytest.fixture
@@ -15060,6 +15070,7 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         mem_svc.get_status = AsyncMock(return_value={})
         mem_svc.mem0 = AsyncMock()
         mem_svc.mem0.get_all = AsyncMock(return_value=get_all_return)
+        mem_svc.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             mem_svc, AsyncMock(), AsyncMock(), config,
