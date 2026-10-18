@@ -245,9 +245,17 @@ class _Rig:
         self.clock = [0.0]
         self.ttl = TTL
         self.filed: list[SentinelL1] = []
+        self.resolved: list[str] = []
         self.probe = WorkProductProbe(
-            ttl_secs=lambda: self.ttl, clock=lambda: self.clock[0], escalate=self.filed.append,
+            ttl_secs=lambda: self.ttl,
+            clock=lambda: self.clock[0],
+            escalate=self.filed.append,
+            resolve=self._record_resolution,
         )
+
+    def _record_resolution(self, sentinel: str, resolution: str) -> None:
+        assert resolution
+        self.resolved.append(sentinel)
 
     async def refresh(self, load: Callable[[], WorkProductSnapshot]) -> None:
         self.probe.poll(load)
@@ -431,3 +439,38 @@ class TestWorkProductProbeClose:
         await rig.probe.aclose()
 
         assert rig.probe.snapshot is FRESH
+
+
+@pytest.mark.asyncio
+class TestWorkProductProbeRecovery:
+    """The probe's L1 is resolved by the first refresh that succeeds after it may have been filed."""
+
+    async def test_a_new_probe_resolves_an_escalation_a_previous_process_may_have_left(self):
+        rig = _Rig()
+
+        await rig.refresh(_counting_load())
+        await rig.refresh_next_window(_counting_load())
+
+        assert rig.resolved == [PROBE_SENTINEL]
+
+    async def test_the_first_success_after_a_filed_streak_resolves_it(self):
+        rig = _Rig()
+        await rig.refresh(_counting_load())
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD):
+            await rig.refresh_next_window(_failing())
+        assert len(rig.filed) == 1
+
+        await rig.refresh_next_window(_counting_load())
+        await rig.refresh_next_window(_counting_load())
+
+        assert rig.resolved == [PROBE_SENTINEL, PROBE_SENTINEL]
+
+    async def test_a_streak_too_short_to_file_resolves_nothing(self):
+        rig = _Rig()
+        await rig.refresh(_counting_load())
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD - 1):
+            await rig.refresh_next_window(_failing())
+
+        await rig.refresh_next_window(_counting_load())
+
+        assert rig.resolved == [PROBE_SENTINEL]

@@ -18,6 +18,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig, ScoringConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.sentinel_l1 import SentinelL1, file_sentinel_l1
 from orchestrator.work_product import (
     FAILURE_STREAK_ESCALATION_THRESHOLD,
     PROBE_SENTINEL,
@@ -227,6 +228,52 @@ class TestProbeStormEscape:
         await failed_refresh()
         await failed_refresh()
         assert len(_probe_escalations(queue)) == 1
+
+    async def test_a_recovered_probe_resolves_its_l1_and_a_new_streak_files_afresh(self, tmp_path, store, clock):
+        queue = EscalationQueue(tmp_path / 'esc')
+        failing = [True]
+
+        def flaky_reader() -> dict[str, BranchWork]:
+            if failing[0]:
+                raise BranchProbeError(reason='git for-each-ref exited 128', returncode=128)
+            return {}
+
+        scheduler = _scheduler(flaky_reader, event_store=store, clock=clock)
+        scheduler.escalation_queue = queue
+        tasks = _tasks(3)
+
+        async def refreshes(count: int) -> None:
+            for _ in range(count):
+                await _tick_and_settle(scheduler, tasks)
+                clock[0] += TTL
+
+        await refreshes(FAILURE_STREAK_ESCALATION_THRESHOLD)
+        [first] = _probe_escalations(queue)
+
+        failing[0] = False
+        await refreshes(1)
+        assert _probe_escalations(queue) == []
+        resolved = queue.get(first.id)
+        assert resolved is not None and resolved.status == 'resolved'
+
+        failing[0] = True
+        await refreshes(FAILURE_STREAK_ESCALATION_THRESHOLD)
+        [second] = _probe_escalations(queue)
+        assert second.id != first.id
+
+    async def test_the_first_success_resolves_an_l1_left_by_a_previous_process(self, tmp_path, store, clock):
+        queue = EscalationQueue(tmp_path / 'esc')
+        file_sentinel_l1(queue, SentinelL1(
+            sentinel=PROBE_SENTINEL, category='infra_issue', summary='left by a previous process',
+            detail='the probe was failing when that process stopped', suggested_action='none',
+        ))
+        assert len(_probe_escalations(queue)) == 1
+        scheduler = _scheduler(_reader(), event_store=store, clock=clock)
+        scheduler.escalation_queue = queue
+
+        await _tick_and_settle(scheduler, _tasks(3))
+
+        assert _probe_escalations(queue) == []
 
 
 def _fresh(commits_ahead: int = 2, *, age_secs: float = HOUR) -> BranchWork:

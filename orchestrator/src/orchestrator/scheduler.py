@@ -2520,12 +2520,13 @@ class Scheduler:
         # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
         self._anchor_gate = AnchorCoverageGate()
         # The continuity work-product probe (task 3820, PRD C3).  The lambdas
-        # close over self, so a hot TTL retune and the late attribute-injected
-        # escalation_queue are both honoured.
+        # and the bound method read self at call time, so a hot TTL retune and
+        # the late attribute-injected escalation_queue are both honoured.
         self.work_product = WorkProductProbe(
             ttl_secs=lambda: self.config.scoring.continuity_probe_ttl_secs,
             clock=self._time_source,
             escalate=lambda l1: file_sentinel_l1(self.escalation_queue, l1),
+            resolve=self._resolve_sentinel_l1,
         )
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
@@ -7923,6 +7924,18 @@ class Scheduler:
         if verdict.escalation is not None:
             file_sentinel_l1(self.escalation_queue, verdict.escalation)
         return verdict.armed
+
+    def _resolve_sentinel_l1(self, sentinel: str, resolution: str) -> None:
+        """Resolve each open L1 the scheduler filed under *sentinel*, its condition cleared; never raises."""
+        queue = self.escalation_queue
+        if queue is None:
+            return
+        try:
+            for esc in queue.get_by_task(sentinel, status='pending', level=1, agent_role='orchestrator-scheduler'):
+                queue.resolve(esc.id, resolution, resolved_by='orchestrator-scheduler')
+                logger.info('Auto-resolved L1 %s escalation %s', sentinel, esc.id)
+        except Exception:
+            logger.warning('Failed to resolve %s escalation', sentinel, exc_info=True)
 
     def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
         """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3).

@@ -27,6 +27,10 @@ _STDERR_SHOWN: int = 500
 # Three consecutive TTL-spaced failures are 10+ min of a fleet-wide zero continuity term; one transient git failure never pages.
 FAILURE_STREAK_ESCALATION_THRESHOLD: int = 3
 PROBE_SENTINEL: str = '__continuity_probe__'
+PROBE_RECOVERED_RESOLUTION: str = (
+    'A continuity-probe refresh succeeded, so task-branch work product earns continuity '
+    'credit again. Auto-resolved by the scheduler; a new failure streak files a fresh escalation.'
+)
 
 
 @dataclass(frozen=True)
@@ -165,7 +169,8 @@ def _as_text(output: str | bytes | None) -> str:
 class WorkProductProbe:
     """Owns the TTL window, the one in-flight refresh, the published snapshot and the failure streak.
 
-    The caller supplies the load (run on a worker thread) and delivers the escalation.
+    The caller supplies the load (run on a worker thread) and delivers the
+    escalation, and its resolution as ``resolve(sentinel, resolution)``.
     """
 
     def __init__(
@@ -174,14 +179,18 @@ class WorkProductProbe:
         ttl_secs: Callable[[], float],
         clock: Callable[[], float],
         escalate: Callable[[SentinelL1], None],
+        resolve: Callable[[str, str], None],
     ) -> None:
         self._ttl_secs = ttl_secs
         self._clock = clock
         self._escalate = escalate
+        self._resolve = resolve
         self._snapshot = WorkProductSnapshot.EMPTY
         self._attempted_at: float | None = None
         self._in_flight: asyncio.Task[None] | None = None
         self._failure_streak = 0
+        # True at start: a previous process may have stopped with its escalation open.
+        self._escalation_may_be_open = True
         self._closed = False
 
     @property
@@ -230,9 +239,13 @@ class WorkProductProbe:
             )
             if self._failure_streak >= FAILURE_STREAK_ESCALATION_THRESHOLD:
                 self._escalate(self._failure_escalation(exc))
+                self._escalation_may_be_open = True
         else:
             self._snapshot = snapshot
             self._failure_streak = 0
+            if self._escalation_may_be_open:
+                self._escalation_may_be_open = False
+                self._resolve(PROBE_SENTINEL, PROBE_RECOVERED_RESOLUTION)
         finally:
             self._in_flight = None
 
@@ -252,7 +265,8 @@ class WorkProductProbe:
                 'its work product (PRD C3, INV-4). Usual causes: git older than 2.41 lacks '
                 '%(ahead-behind); the configured main branch is missing; project_root is not a '
                 'repository root; the events DB holding the zero-progress record is unreadable. '
-                'The streak clears on the next successful refresh.'
+                'The next successful refresh resolves this escalation itself; a later failure '
+                'streak files a fresh one.'
             ),
             suggested_action='restore_the_continuity_branch_probe',
         )
