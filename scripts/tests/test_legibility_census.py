@@ -10323,7 +10323,9 @@ _LINKED_IDENTITY = census_findings.FindingIdentity.mint(
 )
 
 
-def _cancelled_store(*, acceptance_reason: str | None, keyed: bool = False) -> FakeTaskStore:
+def _cancelled_store(
+    *, acceptance_reason: str | None, keyed: bool = False, resolve_outcomes=None,
+) -> FakeTaskStore:
     metadata = {} if acceptance_reason is None else {disposition.ACCEPTANCE_REASON_METADATA: acceptance_reason}
     hits = {}
     if keyed:
@@ -10333,14 +10335,19 @@ def _cancelled_store(*, acceptance_reason: str | None, keyed: bool = False) -> F
     return FakeTaskStore(
         tasks={_LINKED_TASK: task_store.TaskRecord(_LINKED_TASK, "a cancelled census task", "cancelled", metadata)},
         metadata_hits=hits,
+        resolve_outcomes=resolve_outcomes,
     )
 
 
-def _cancelled_kwargs(tmp_path, *, acceptance_reason: str | None, keyed: bool = False, **entry_fields):
+def _cancelled_kwargs(
+    tmp_path, *, acceptance_reason: str | None, keyed: bool = False, resolve_outcomes=None, **entry_fields,
+):
     if keyed:
         entry_fields.update(_LINKED_IDENTITY.to_fields())
     kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "cancelled"}, **entry_fields)
-    kwargs["task_store"] = _cancelled_store(acceptance_reason=acceptance_reason, keyed=keyed)
+    kwargs["task_store"] = _cancelled_store(
+        acceptance_reason=acceptance_reason, keyed=keyed, resolve_outcomes=resolve_outcomes,
+    )
     return kwargs
 
 
@@ -10451,3 +10458,106 @@ def test_run_census_whose_live_linked_task_changes_nothing_says_so(tmp_path):
     [row] = _dispositions_table(kwargs)
     assert (row["task_id"], row["task_status"], row["outcome"]) == (str(_LINKED_TASK), "in-progress", "live")
     assert _persisted_entry_a(kwargs)["status"] == "open"
+
+
+# ---------------------------------------------------------------------------
+# task 6404 step-25: RED — a ticket run N filed that the curator has not
+# decided holds its entry in run N+1: no re-verify, no re-filing and no
+# second ticket (contract §8 dedup; INV-3)
+# ---------------------------------------------------------------------------
+
+
+def _undecided(ticket: str) -> dict[str, task_store.TicketOutcome]:
+    """FakeTaskStore resolve_outcomes leaving *ticket* undecided (TicketOutcome.undecided)."""
+    return {ticket: task_store.TicketOutcome(task_store.TicketStatus.FAILED, None, "timeout")}
+
+
+def _next_run(first) -> dict[str, Any]:
+    """The overrides that make a run_census call the run after *first*, over its persisted codebook."""
+    return {
+        "codebook_dict": codebook.load(first["codebook_path"]),
+        "date": "2026-07-21",
+        "run_id": "census-dark_factory-20260721",
+        "report_path": first["report_path"].with_name("confusion-census-2026-07-21.md"),
+    }
+
+
+def _rows_by_task(kwargs) -> dict[int | None, dict]:
+    return {row["task_id"]: row for row in _run_record(kwargs)["dispositions"]["rows"]}
+
+
+def test_run_census_neither_reverifies_nor_refiles_while_its_refiled_ticket_awaits_the_curator(tmp_path):
+    first = _outcome_kwargs(tmp_path, "present")
+    first["task_store"] = FakeTaskStore(resolve_outcomes=_undecided("tkt_1"))
+    mod.run_census(**first)
+    first_rows = _persisted_entry_a(first)["filed_tickets"]
+    assert [(row["ticket"], row["resolution"]) for row in first_rows] == [(None, "created"), ("tkt_1", None)]
+
+    later_store = FakeTaskStore(resolve_outcomes=_undecided("tkt_1"))
+    second = _duplicate_only_kwargs(
+        tmp_path, later_store,
+        status_fetcher=_counting_status_fetcher({str(_LINKED_TASK): "done"}),
+        verify_fn=_reverifying_verify_fn("present"),
+        **_next_run(first),
+    )
+
+    outcome = mod.run_census(**second)
+
+    assert outcome.status == "done"
+    assert _reverify_calls(second["verify_fn"]) == []
+    assert second["submit_fn"].calls == []
+    entry = _persisted_entry_a(second)
+    assert entry["filed_tickets"] == first_rows
+    assert (entry["status"], "fixed_at_sha" in entry) == ("open", False)
+    dispositions = _run_record(second)["dispositions"]
+    assert (dispositions["reverify"]["due"], dispositions["refiled"]) == (0, [])
+    rows = _rows_by_task(second)
+    assert rows[_LINKED_TASK]["outcome"] == "held"
+    assert "tkt_1" in rows[_LINKED_TASK]["detail"]
+    assert rows[None]["outcome"] == "ticket"
+    assert [arguments["ticket"] for arguments in later_store.arguments_of("resolve_ticket")] == ["tkt_1"]
+
+
+def test_run_census_does_not_refile_a_recurring_abandoned_entry_while_its_ticket_awaits_the_curator(tmp_path):
+    def abandoned_run(**overrides):
+        kwargs = _cancelled_kwargs(
+            tmp_path, acceptance_reason=None, keyed=True, status="accepted", accepted_by=_LINKED_TASK,
+            resolve_outcomes=_undecided("tkt_1"),
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    first = abandoned_run()
+    mod.run_census(**first)
+    first_rows = _persisted_entry_a(first)["filed_tickets"]
+    assert [row["ticket"] for row in first_rows] == [None, "tkt_1"]
+
+    second = abandoned_run(**_next_run(first))
+
+    outcome = mod.run_census(**second)
+
+    assert outcome.status == "done"
+    assert second["submit_fn"].calls == []
+    assert _run_record(second)["dispositions"]["refiled"] == []
+    assert _persisted_entry_a(second)["filed_tickets"] == first_rows
+
+
+def test_run_census_files_no_second_ticket_for_a_recurrence_whose_entry_awaits_the_curator(tmp_path):
+    cb = _codebook_with_standing("promoted")
+    cb["entries"].append({**_promoted_entry(), "id": "entry-same-title"})
+    pending_row = {
+        "ticket": "tkt_0", "project_root": str(tmp_path), "run_id": _EARLIER_RUN, "finding_key": None,
+        "task_id": None, "resolution": None, "step": "curator",
+    }
+    [spurious] = [entry for entry in cb["entries"] if entry["id"] == "entry-spurious"]
+    spurious["filed_tickets"] = [pending_row]
+    kwargs = _verified_run_kwargs(tmp_path, cb, task_store=FakeTaskStore(resolve_outcomes=_undecided("tkt_0")))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.filed_ticket_ids == []
+    assert kwargs["submit_fn"].calls == []
+    entries = {entry["id"]: entry for entry in codebook.load(kwargs["codebook_path"])["entries"]}
+    assert entries["entry-spurious"]["filed_tickets"] == [pending_row]
+    [row] = _filed_rows(kwargs)
+    assert row["disposition"] == "open (ticket tkt_0 pending)"
