@@ -85,7 +85,9 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         # Phase A: a saturated PSI sample — injected directly, never
         # sampled from the host — defers the non-deterministic candidate.
         # mem_some10=99.0 is over the default mem_some_avg10=15.0 threshold.
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
+        )
         scheduler.finish_startup()
         scheduler._dispatched.add('inflight')  # meets default min_inflight_floor=1
         scheduler._read_psi_sample = lambda: PsiSample(
@@ -104,7 +106,9 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         # and the gate stays *engaged* (psi_in_flight >= floor); otherwise
         # dispatch would succeed merely because the floor wasn't met, and
         # this phase would prove nothing about idle_psi_sample specifically.
-        scheduler2 = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler2 = Scheduler(
+            OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
+        )
         scheduler2.finish_startup()
         scheduler2._dispatched.add('inflight')  # meets default min_inflight_floor=1
         scheduler2._read_psi_sample = idle_psi_sample
@@ -129,7 +133,9 @@ class TestAutouseFixtureDefaultsToIdlePsi:
         ``test_scheduler_state.py::test_bare_config_project_root_isolated_to_tmp``,
         the guard test for the sibling autouse ``_isolate_orch_config`` fixture.
         """
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
+        )
 
         # Behavior-level contract only: the bound reader returns a
         # non-saturating, successful sample regardless of host load. This is
@@ -185,5 +191,7 @@ def test_real_psi_reader_marker_restores_real_reader() -> None:
     """
     import orchestrator.scheduler as scheduler_module
 
-    scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+    scheduler = Scheduler(
+        OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
+    )
     assert scheduler._read_psi_sample is scheduler_module.read_psi_sample

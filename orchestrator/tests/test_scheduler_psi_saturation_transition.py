@@ -109,6 +109,15 @@ def _psi(
     )
 
 
+def _psi_cfg(**overrides) -> PsiAdmissionConfig:
+    """A fresh gate config whose CPU arm, which these tests drive, is explicit.
+
+    Fresh per call, never a shared instance: apply_reload mutates submodels in
+    place.
+    """
+    return PsiAdmissionConfig(cpu_some_avg10=85.0, **overrides)
+
+
 # ---------------------------------------------------------------------------
 # Multi-tick transition harness
 #
@@ -294,7 +303,9 @@ class TestPsiSaturationTransition:
         """
         event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='da4-s1')
         clock = _FakeClock()
-        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=6)
+        config = OrchestratorConfig(
+            max_per_module=1, max_concurrent_tasks=6, psi_admission=_psi_cfg(),
+        )
 
         tasks = [
             _heavy_task('H1', priority='high', files=['src/h1.py']),
@@ -385,7 +396,7 @@ class TestPsiSaturationTransition:
         clock = _FakeClock()
         config = OrchestratorConfig(
             max_per_module=1,
-            psi_admission=PsiAdmissionConfig(min_inflight_floor=2),
+            psi_admission=_psi_cfg(min_inflight_floor=2),
         )
 
         tasks = [
@@ -460,7 +471,9 @@ class TestPsiSaturationTransition:
         """
         event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='da4-s3')
         clock = _FakeClock()
-        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=4)
+        config = OrchestratorConfig(
+            max_per_module=1, max_concurrent_tasks=4, psi_admission=_psi_cfg(),
+        )
 
         heavy_tasks = [
             _heavy_task(f'H{i}', priority='high', files=[f'src/h{i}.py'])
