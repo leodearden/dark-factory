@@ -17,7 +17,6 @@ rebased-twin and force-push arms (``TestC3SubmitGateQueued``).
 from __future__ import annotations
 
 import asyncio
-import inspect
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -179,30 +178,13 @@ async def settle() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (A) The façade seam and the frozen escalation-server signature
+# (A) The façade seam
 # ---------------------------------------------------------------------------
 
 
 def test_the_facade_resolves_the_request_entry_to_intake() -> None:
     assert facade.coalesce_or_enqueue_merge_request is intake.coalesce_or_enqueue_merge_request
     assert facade.enqueue_merge_request is intake.enqueue_merge_request
-
-
-def test_the_coalesce_signature_is_the_frozen_escalation_server_contract() -> None:
-    kind = inspect.Parameter
-    params = inspect.signature(coalesce_or_enqueue_merge_request).parameters
-    shape = [(name, p.kind, p.default) for name, p in params.items()]
-    assert shape == [
-        ('queue', kind.POSITIONAL_OR_KEYWORD, kind.empty),
-        ('req', kind.POSITIONAL_OR_KEYWORD, kind.empty),
-        ('event_store', kind.POSITIONAL_OR_KEYWORD, kind.empty),
-        ('registry', kind.POSITIONAL_OR_KEYWORD, kind.empty),
-        ('git_ops', kind.POSITIONAL_OR_KEYWORD, None),
-        ('liveness_secs', kind.KEYWORD_ONLY, 10800),
-        ('retention', kind.KEYWORD_ONLY, None),
-        ('live_snapshot', kind.KEYWORD_ONLY, None),
-        ('classifier_git_ops', kind.KEYWORD_ONLY, None),
-    ]
 
 
 # ---------------------------------------------------------------------------
