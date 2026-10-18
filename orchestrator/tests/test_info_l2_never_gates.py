@@ -23,7 +23,7 @@ from _workflow_helpers import _make_resolving_steward
 from escalation.models import Escalation
 from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
-from test_workflow_merge_gating_strand import (  # noqa: F401 -- fixtures used by name
+from test_workflow_merge_gating_strand import (
     _build_workflow,
     _make_advanced_worktree,
     _make_silent_steward,
@@ -31,11 +31,11 @@ from test_workflow_merge_gating_strand import (  # noqa: F401 -- fixtures used b
     _submit_gating_l0,
     _time_the_wait,
     _wire_resolve_callback,
-    config,
-    git_ops,
-    git_repo,
-    task_assignment,
 )
+from test_workflow_merge_gating_strand import config as config
+from test_workflow_merge_gating_strand import git_ops as git_ops
+from test_workflow_merge_gating_strand import git_repo as git_repo
+from test_workflow_merge_gating_strand import task_assignment as task_assignment
 
 from orchestrator.workflow import _is_gating_escalation
 
