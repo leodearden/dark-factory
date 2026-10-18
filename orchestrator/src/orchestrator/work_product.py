@@ -8,10 +8,12 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
+from typing import ClassVar
 
 # 8.4s measured cold over 1,323 branches at load ~90; 60s separates slow from hung.
 PROBE_TIMEOUT_SECS: float = 60.0
@@ -22,6 +24,27 @@ _STDERR_SHOWN: int = 500
 class BranchWork:
     commits_ahead: int
     tip_committed_at: float
+
+
+@dataclass(frozen=True)
+class WorkProductSnapshot:
+    branches: Mapping[str, BranchWork]
+    zero_progress: frozenset[str]
+
+    EMPTY: ClassVar[WorkProductSnapshot]
+
+    def has_work_product(self, task_id: str, *, now: float, max_age_secs: float) -> bool:
+        """PRD C3: the task's branch is ahead of main, its newest commit is no older than *max_age_secs*, and the zero-progress detector never fired for it."""
+        work = self.branches.get(task_id)
+        return (
+            work is not None
+            and work.commits_ahead >= 1
+            and now - work.tip_committed_at <= max_age_secs
+            and task_id not in self.zero_progress
+        )
+
+
+WorkProductSnapshot.EMPTY = WorkProductSnapshot(branches=MappingProxyType({}), zero_progress=frozenset())
 
 
 class BranchProbeError(Exception):

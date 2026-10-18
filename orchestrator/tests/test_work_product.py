@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -160,7 +161,9 @@ NOW = 1_760_100_000.0
 MAX_AGE = 604800.0
 
 
-def _snapshot(*, ahead: int = 2, tip: float = NOW - 3600, zero_progress=frozenset()) -> WorkProductSnapshot:
+def _snapshot(
+    *, ahead: int = 2, tip: float = NOW - 3600, zero_progress: Iterable[str] = (),
+) -> WorkProductSnapshot:
     return WorkProductSnapshot(
         branches={'10': BranchWork(commits_ahead=ahead, tip_committed_at=tip)},
         zero_progress=frozenset(zero_progress),
