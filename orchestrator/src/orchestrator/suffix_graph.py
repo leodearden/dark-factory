@@ -22,9 +22,9 @@ churn.  The tracker itself never holds a worker reference: GitOps access,
 lane-buffer access, frozen-prefix reads, and lifecycle retirement are
 injected as narrow *re-reading* callables (``git_ops``, ``lane_buffers``,
 ``frozen_prefix``, ``frozen_prefix_tip``, ``retire_item``) that look up the
-caller's live attribute on every call — not a value or bound method captured once at construction — so the
-tracker is unit-testable standalone AND stays correct if the caller later
-reassigns e.g. ``worker._git_ops`` (amend: reviewer
+caller's live attribute on every call — not a value or bound method captured
+once at construction — so the tracker is unit-testable standalone AND stays
+correct if the caller later reassigns e.g. ``worker._git_ops`` (amend: reviewer
 robustness_stale_reference / consistency, task δ=1988).
 
 A moved method that reads a worker-resident constant (``MERGE_LANES``,
