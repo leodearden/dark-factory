@@ -783,7 +783,7 @@ def _outcome_of(ref: TaskRef, ticket: str | None, status: str, metadata: Mapping
 
 def _ticket_only(row: Mapping[str, Any]) -> TaskOutcome:
     resolution = row.get("resolution")
-    note = "awaiting the curator" if resolution is None else f"ticket {resolution}; it names no task"
+    note = "awaiting the curator" if resolution is None else f"{resolution}; it names no task"
     return TaskOutcome(None, row.get("ticket"), None, None, note)
 
 
@@ -1056,6 +1056,11 @@ def disposition_of(entry: Mapping[str, Any], standings: Mapping[TaskRef, Standin
     return Disposition(DispositionKind.FILED, max(live)) if live else _OPEN
 
 
+def entry_dispositions(cb: Mapping[str, Any], standings: Mapping[TaskRef, Standing]) -> dict[str, Disposition]:
+    """Every entry's contract §7 disposition, by :func:`disposition_of`."""
+    return {entry["id"]: disposition_of(entry, standings) for entry in cb.get("entries") or []}
+
+
 def task_standings(outcomes: Outcomes, decisions: Iterable[Decision]) -> dict[TaskRef, Standing]:
     """Every task standing this run knows: the outcome read's, then each
     routed decision's, a curator ticket's created or combined task among them."""
@@ -1265,3 +1270,173 @@ def structural_lines(record: Mapping[str, Any]) -> list[str]:
         "",
         *_table(STRUCTURAL_COLUMNS, structural),
     ]
+
+
+class RowOutcome(enum.StrEnum):
+    """What one back-linked ticket or task did to its entry this run."""
+
+    LIVE = "live"
+    ACCEPTED = "accepted"
+    ABANDONED = "abandoned"
+    GONE = "gone"
+    PRESENT = "present"
+    PRESENT_STRUCTURAL = "present-structural"
+    INCONCLUSIVE = "inconclusive"
+    DEFERRED = "deferred"
+    SETTLED = "settled"
+    OUTRANKED = "outranked"
+    HELD = "held"
+    UNOBSERVED = "unobserved"
+    TICKET = "ticket"
+
+
+_STANDING_OUTCOME = {Standing.FILED: RowOutcome.LIVE, Standing.ACCEPTED: RowOutcome.ACCEPTED}
+_REVERIFY_OUTCOME = {
+    ReverifyResult.GONE: RowOutcome.GONE,
+    ReverifyResult.INCONCLUSIVE: RowOutcome.INCONCLUSIVE,
+    ReverifyResult.DEFERRED: RowOutcome.DEFERRED,
+}
+
+
+@dataclass(frozen=True)
+class OutcomeReport:
+    """One run's outcome feedback, for the run record: the *outcomes* read,
+    the re-verifies by entry, the projection's *changes*, the entries
+    *refiled*, and every entry's contract §7 disposition after the run."""
+
+    outcomes: Outcomes
+    reverified: Mapping[str, Reverification]
+    changes: tuple[StatusChange, ...]
+    refiled: tuple[Refiling, ...]
+    dispositions: Mapping[str, Disposition]
+
+    def _done_outcome(self, entry: EntryOutcome) -> tuple[RowOutcome, str | int | None]:
+        if entry.entry_status in _SETTLED_STATUSES:
+            return RowOutcome.SETTLED, entry.entry_status
+        again = self.reverified.get(entry.entry_id)
+        if again is None:
+            return RowOutcome.INCONCLUSIVE, "no re-verify ran"
+        if again.result is ReverifyResult.PRESENT:
+            mechanical = again.found is not None and files(again.found)
+            return (RowOutcome.PRESENT, again.task.task_id) if mechanical else (RowOutcome.PRESENT_STRUCTURAL, None)
+        if again.result is ReverifyResult.GONE:
+            fixed_at = {change.entry_id: change.fixed_at_sha for change in self.changes}
+            return RowOutcome.GONE, fixed_at.get(entry.entry_id)
+        return _REVERIFY_OUTCOME[again.result], again.reason
+
+    def _outcome(self, entry: EntryOutcome, task: TaskOutcome) -> tuple[RowOutcome, str | int | None]:
+        if task.ref is None:
+            return RowOutcome.TICKET, task.note
+        if task.standing is None:
+            return RowOutcome.UNOBSERVED, task.note
+        governing = entry.governing
+        if governing is None or governing.ref is None:
+            return RowOutcome.HELD, "another linked task was not observed"
+        if governing.ref != task.ref:
+            return RowOutcome.OUTRANKED, governing.ref.task_id
+        if task.standing is Standing.ABANDONED:
+            refiled = any(refiling.entry_id == entry.entry_id for refiling in self.refiled)
+            return RowOutcome.ABANDONED, "re-filed this run" if refiled else "not sighted this run"
+        if task.standing is Standing.DONE:
+            return self._done_outcome(entry)
+        return _STANDING_OUTCOME[task.standing], None
+
+    def _row(self, entry: EntryOutcome, task: TaskOutcome) -> dict[str, Any]:
+        outcome, detail = self._outcome(entry, task)
+        return {
+            "entry_id": entry.entry_id,
+            "finding_key": entry.finding_key,
+            "project_root": None if task.ref is None else task.ref.project_root,
+            "ticket": task.ticket,
+            "task_id": None if task.ref is None else task.ref.task_id,
+            "task_status": task.status,
+            "outcome": outcome.value,
+            "detail": detail,
+            "disposition": str(self.dispositions[entry.entry_id]),
+        }
+
+    def _reverify_counts(self) -> dict[str, int]:
+        results = [again.result for again in self.reverified.values()]
+        return {
+            "due": len(self.outcomes.due),
+            "offered": sum(1 for result in results if result is not ReverifyResult.DEFERRED),
+            **{result.value: results.count(result) for result in ReverifyResult},
+        }
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "any_back_links": self.outcomes.any_back_links,
+            "statuses_error": self.outcomes.statuses_error,
+            "rows": [self._row(entry, task) for entry in self.outcomes.entries for task in entry.tasks],
+            "reverify": self._reverify_counts(),
+            "changes": [asdict(change) for change in self.changes],
+            "refiled": [
+                {"entry_id": refiling.entry_id, "supersedes_task": refiling.supersedes_task,
+                 "verified_present": refiling.verified_present}
+                for refiling in self.refiled
+            ],
+        }
+
+
+DISPOSITION_COLUMNS = (
+    "entry_id", "finding_key", "ticket", "task_id", "task_status", "outcome", "disposition", "project_root",
+)
+_NOT_YET_LINKED = "_no back-linked tickets yet._"
+_NOTHING_CHANGED = "_no outcome changed this run._"
+_OUTCOME_CELLS = {
+    RowOutcome.LIVE: "live",
+    RowOutcome.ACCEPTED: "accepted",
+    RowOutcome.ABANDONED: "abandoned (eligible to re-file; {detail})",
+    RowOutcome.GONE: "done -> re-verified gone (fixed at {detail})",
+    RowOutcome.PRESENT: "done -> re-verified present (re-filed, supersedes {detail})",
+    RowOutcome.PRESENT_STRUCTURAL: "done -> re-verified present but structural (contract §6: not re-filed)",
+    RowOutcome.INCONCLUSIVE: "done -> re-verify inconclusive ({detail})",
+    RowOutcome.DEFERRED: "done -> re-verify deferred by the verify cap (re-queued next run)",
+    RowOutcome.SETTLED: "done -> entry already {detail}",
+    RowOutcome.OUTRANKED: "{task_status} (task {detail} decides the entry)",
+    RowOutcome.HELD: "{task_status} (not acted on: {detail})",
+    RowOutcome.UNOBSERVED: "unobserved ({detail})",
+    RowOutcome.TICKET: "ticket {detail}",
+}
+
+
+def _disposition_row(row: Mapping[str, Any], observed_root: str) -> dict[str, Any]:
+    template = _OUTCOME_CELLS[RowOutcome(row["outcome"])]
+    return {
+        **row,
+        "outcome": template.format(detail=row["detail"], task_status=row["task_status"]),
+        "project_root": None if row["project_root"] in (None, observed_root) else row["project_root"],
+    }
+
+
+def _change_line(change: Mapping[str, Any]) -> str:
+    line = f"- {change['entry_id']}: {change['from_status']} -> {change['to_status']}"
+    if change["fixed_at_sha"] is not None:
+        line += f", fixed at {change['fixed_at_sha']}"
+    if change["accepted_by"] is not None:
+        line += f", accepted by task {change['accepted_by']}"
+    return line
+
+
+def dispositions_lines(record: Mapping[str, Any], *, observed_root: str) -> list[str]:
+    """The report's ``## Dispositions`` section, always present, rendered
+    from :meth:`OutcomeReport.to_record`: each previous ticket -> its task ->
+    that task's outcome for its entry, then what changed."""
+    heading = ["", "## Dispositions", ""]
+    if not record["any_back_links"]:
+        return [*heading, _NOT_YET_LINKED]
+    notes = []
+    if record["statuses_error"] is not None:
+        notes.append(
+            f"- get_statuses could not be read ({record['statuses_error']}); "
+            "no status changed for the tasks it could not see."
+        )
+    counts = record["reverify"]
+    notes.append(
+        f"- Re-verify at as_of_sha (D8): {counts['due']} due, {counts['offered']} offered, "
+        f"{counts['gone']} gone, {counts['present']} present, {counts['inconclusive']} inconclusive, "
+        f"{counts['deferred']} deferred by the verify cap."
+    )
+    changes = [_change_line(change) for change in record["changes"]] or [_NOTHING_CHANGED]
+    rows = (_disposition_row(row, observed_root) for row in record["rows"])
+    return [*heading, *notes, "", *_table(DISPOSITION_COLUMNS, rows), "", *changes]
