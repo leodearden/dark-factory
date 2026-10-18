@@ -29,12 +29,13 @@ robustness_stale_reference / consistency, task δ=1988).
 A moved method that reads a worker-resident constant (``MERGE_BOUNCE_CAP``,
 ``NEEDS_REBASE_REASON_PREFIX``, which stay in ``merge_lane/worker.py``)
 resolves it through a function-local (deferred) import from
-:mod:`orchestrator.merge_lane.worker` rather than a top-level import;
-``MERGE_LANES`` comes from :mod:`orchestrator.merge_lane.intake`.  This mirrors the reach-back convention of
-:mod:`orchestrator.merge_lane.liveness` / :mod:`orchestrator.merge_lane.drift` and
-keeps this module free of any top-level import of the worker (which would
-deadlock module load, since the worker imports this module at module level
-and needs it fully defined first).
+:mod:`orchestrator.merge_lane.worker` rather than a top-level import.  This
+mirrors the reach-back convention of :mod:`orchestrator.merge_lane.liveness` /
+:mod:`orchestrator.merge_lane.drift` and keeps this module free of any
+top-level import of the worker (which would deadlock module load, since the
+worker imports this module at module level and needs it fully defined first).
+``MERGE_LANES`` is imported at the top from :mod:`orchestrator.merge_lane.intake`,
+which loads neither the worker nor this module.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ import secrets
 from collections.abc import Callable
 
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.types import (
     GroupMergeRequest,
     MergeBounceRegistry,
@@ -143,26 +145,23 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 
 
 @functools.lru_cache(maxsize=1)
-def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
-    """Resolve MERGE_LANES / MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
+def _worker_constants() -> tuple[int, str]:
+    """Resolve MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
 
-    ``MERGE_BOUNCE_CAP`` and ``NEEDS_REBASE_REASON_PREFIX`` stay in
-    ``merge_lane/worker.py`` (see module docstring); ``MERGE_LANES`` lives in
-    ``merge_lane/intake.py``.  The function-local (deferred) import is required to
-    avoid deadlocking the worker's own module load, but that constraint only binds
-    at *module import time*; by the time :meth:`SuffixConflictTracker.recompute`
-    or :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items` actually
-    run (the merge-acquire hot path), both modules are already fully loaded.
-    Memoizing the lookup here means those hot-path calls pay for the
-    sys.modules dict lookup + attribute rebind once, not on every call
-    (amend: reviewer performance).
+    Both stay in ``merge_lane/worker.py`` (see module docstring).  The
+    function-local (deferred) import is required to avoid deadlocking the
+    worker's own module load, but that constraint only binds at *module import
+    time*; by the time :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items`
+    or its escalation path actually run (the merge-acquire hot path), both
+    modules are already fully loaded.  Memoizing the lookup here means those
+    hot-path calls pay for the sys.modules dict lookup + attribute rebind once,
+    not on every call (amend: reviewer performance).
     """
-    from orchestrator.merge_lane.intake import MERGE_LANES
     from orchestrator.merge_lane.worker import (
         MERGE_BOUNCE_CAP,
         NEEDS_REBASE_REASON_PREFIX,
     )
-    return MERGE_LANES, MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX
+    return MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX
 
 
 class SuffixConflictTracker:
@@ -220,7 +219,7 @@ class SuffixConflictTracker:
         item that never lands.  Accepted: the steward resolves it, and if the
         frozen item fails, the branch requeues without prejudice.
         """
-        _, _, NEEDS_REBASE_REASON_PREFIX = _merge_queue_constants()
+        _, NEEDS_REBASE_REASON_PREFIX = _worker_constants()
         self._escalations_issued += 1
         ordinal = self._escalations_issued
         branch = req.branch.bare_id
@@ -270,10 +269,6 @@ class SuffixConflictTracker:
         This method is async (forks git subprocesses) while snapshot() stays
         synchronous and cheap (reads the stored graph; no await).
         """
-        # Deferred reach-back, memoized after the first call — see
-        # _merge_queue_constants() (amend: reviewer performance).
-        MERGE_LANES, _, _ = _merge_queue_constants()
-
         # ── 1. Build ordered suffix list ──────────────────────────────────────
         # ε=1890 defensive exclusion: frozen items (currently verifying) must
         # never appear as suffix-graph nodes — the frozen/suffix partition is
@@ -530,8 +525,8 @@ class SuffixConflictTracker:
         without touching any item.
         """
         # Deferred reach-back, memoized after the first call — see
-        # _merge_queue_constants() (amend: reviewer performance).
-        MERGE_LANES, MERGE_BOUNCE_CAP, _ = _merge_queue_constants()
+        # _worker_constants() (amend: reviewer performance).
+        MERGE_BOUNCE_CAP, _ = _worker_constants()
 
         if not self.graph.conflicts_with_main:
             return  # nothing to bounce — leave signature intact
