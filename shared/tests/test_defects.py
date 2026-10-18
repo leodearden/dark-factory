@@ -24,6 +24,7 @@ from shared.defects import (
     DefectOrigin,
     DefectProof,
     DefectStatus,
+    DuplicateDefectRef,
     Exemption,
     ExemptionReason,
     IllegalDefectTransition,
@@ -66,6 +67,7 @@ from shared.defects import (
     parse_declare_event,
     parse_outcome_event,
     parse_ref,
+    require_unique_refs,
 )
 from shared.finding_key import finding_key
 from shared.governed_exceptions import Debt, TaskRef, TicketRef, owner_record
@@ -1349,3 +1351,32 @@ class TestMetadataRegistration:
         pending['closure']['owner'] = {'type': 'task', 'id': 0}
         _model, warnings = parse_metadata({'defects': [pending]}, direction='read')
         assert [(w.field, w.code) for w in warnings] == [('defects', 'invalid_submodel')]
+
+
+# --- I1: one record per ref within a task ------------------------------------------
+
+
+class TestRequireUniqueRefs:
+    def test_distinct_refs_pass(self) -> None:
+        require_unique_refs([_declaration(), _proven_entry()])
+
+    def test_no_records_pass(self) -> None:
+        require_unique_refs([])
+
+    def test_a_repeated_ref_is_refused_however_the_records_differ(self) -> None:
+        with pytest.raises(DuplicateDefectRef) as excinfo:
+            require_unique_refs([_declaration(), _declaration(summary='Another summary')])
+        assert excinfo.value.refs == (_REF,)
+        assert _REF in str(excinfo.value)
+
+    def test_each_repeated_ref_is_named_once_in_first_seen_order(self) -> None:
+        once = _declaration(ref=mint_explore_ref('run-1', 9), origin=DefectOrigin.EXPLORATORY)
+        records = [_proven_entry(), _declaration(), once, _declaration(), _proven_entry()]
+        with pytest.raises(DuplicateDefectRef) as excinfo:
+            require_unique_refs(records)
+        assert excinfo.value.refs == (_OTHER_REF, _REF)
+
+    def test_retirements_are_unique_by_ref_too(self) -> None:
+        with pytest.raises(DuplicateDefectRef) as excinfo:
+            require_unique_refs([_retirement(), _accepted_retirement()])
+        assert excinfo.value.refs == (_REF,)

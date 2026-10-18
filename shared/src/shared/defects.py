@@ -1,8 +1,11 @@
 """The defect-tests vocabulary: enums, the ref grammar, records and the transition table.
 
 This module is the single home of that vocabulary (``plans/defect-tests-prd.md``
-decisions 7, 13, 15 and 16; Contract **Types**, invariants **I1** and **I2**).
-Consumers import from here and never re-spell an enum value or the ref grammar.
+decisions 7, 13, 15 and 16; Contract **Types** and invariant **I2**). Of **I1**
+it holds the ref grammar and :func:`require_unique_refs`; which writers may
+write, and when, is the fused-memory write path's (α2), and every list that
+path stores must first pass :func:`require_unique_refs`. Consumers import from
+here and never re-spell an enum value or the ref grammar.
 
 Intentionally NOT re-exported from ``shared/__init__.py``: consumers import
 ``from shared.defects import …``, the sub-module convention
@@ -13,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -54,6 +58,7 @@ __all__ = [
     'DefectRefStr',
     'DefectStatus',
     'DefectTrigger',
+    'DuplicateDefectRef',
     'Exemption',
     'ExemptionReason',
     'FIX_FINDING_OUTCOMES',
@@ -102,6 +107,7 @@ __all__ = [
     'parse_declare_event',
     'parse_outcome_event',
     'parse_ref',
+    'require_unique_refs',
 ]
 
 
@@ -1365,6 +1371,39 @@ def issue_kind_of(issue: Mapping[str, object]) -> IssueKindReading:
     if kind is None:
         return IssueKindReading(IssueKind.DEFECT, IssueKindFlag.UNRECOGNISED)
     return IssueKindReading(kind)
+
+
+# --- I1: one record per ref within a task ------------------------------------
+
+
+class DuplicateDefectRef(ValueError):
+    """A task's defect records name one ref more than once (I1's uniqueness half).
+
+    Attributes:
+        refs: Each repeated ref once, in order of first appearance.
+    """
+
+    def __init__(self, refs: tuple[str, ...]) -> None:
+        self.refs = refs
+        super().__init__(
+            'a task holds at most one record per defect ref (PRD I1); repeated: '
+            f'{", ".join(refs)}'
+        )
+
+
+def require_unique_refs(records: Iterable[DefectDeclaration | Retirement]) -> None:
+    """Refuse one task's ``defects`` or ``defect_test_retirements`` list if it repeats a ref.
+
+    The registration validates each entry alone and cannot see this, so every
+    writer calls it on the whole list it is about to store.
+
+    Raises:
+        DuplicateDefectRef: naming each repeated ref.
+    """
+    counts = Counter(record.ref for record in records)
+    repeated = tuple(ref for ref, count in counts.items() if count > 1)
+    if repeated:
+        raise DuplicateDefectRef(repeated)
 
 
 # --- Metadata registration ---------------------------------------------------

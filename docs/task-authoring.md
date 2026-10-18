@@ -1894,7 +1894,10 @@ touches the key is still refused.
 Both are registered submodels with list cardinality. Their record shapes,
 enums, ref grammar and transition table live in one place,
 `shared/src/shared/defects.py`. This subsection names who writes each key
-and deliberately restates none of that.
+and deliberately restates none of that. The registration validates each
+entry alone, so it passes a list that names one ref twice; every writer of
+either key must also pass the whole list through
+`shared/src/shared/defects.py::require_unique_refs`.
 
 - **`defects`**: a list of `DefectDeclaration` records, one per declared
   defect, each keyed by its ref.
