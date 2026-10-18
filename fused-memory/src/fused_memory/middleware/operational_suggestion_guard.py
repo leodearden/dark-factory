@@ -250,11 +250,11 @@ def operational_suggestion_finding(
     if task_kind != 'normal':
         return None
 
-    execution_class = raw_metadata_dict(metadata, source='operational_suggestion_guard').get('execution_class')
-    if execution_class in _EXEMPT_EXECUTION_CLASSES:
+    meta = raw_metadata_dict(metadata, source='operational_suggestion_guard')
+    if meta.get('execution_class') in _EXEMPT_EXECUTION_CLASSES:
         return None
 
-    if extract_files(metadata):
+    if extract_files(meta):
         return None
 
     fields: dict[str, str] = {

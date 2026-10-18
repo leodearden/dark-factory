@@ -774,9 +774,13 @@ _SCHEMA_WARNING = 'task_metadata.schema_warning'
 _SOURCE = 'source=operational_suggestion_guard'
 
 
-def _discard_lines(caplog) -> list[str]:
+def _census_lines(caplog) -> list[str]:
     messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+    return [m for m in messages if _SCHEMA_WARNING in m]
+
+
+def _discard_lines(caplog) -> list[str]:
+    return [m for m in _census_lines(caplog) if _SOURCE in m]
 
 
 def _finding_for(metadata):
@@ -798,6 +802,11 @@ class TestUnreadableMetadataIsDiscardedLoudly:
         assert finding is not None
         assert finding == _finding_for(None)
         assert len(_discard_lines(caplog)) == 1
+
+    def test_unreadable_value_is_resolved_and_logged_once_per_finding(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _finding_for('{not json')
+        assert len(_census_lines(caplog)) == 1
 
     @pytest.mark.parametrize('metadata', [None, ''])
     def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
