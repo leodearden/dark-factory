@@ -49,6 +49,7 @@ import collections
 import contextlib
 import logging
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -245,6 +246,7 @@ def _make_req(
     git_repo: Path,
     *,
     merge_first_enqueued_at: float | None = 1000.0,
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
     """Build a minimal MergeRequest with a fresh event-loop future.
 
@@ -259,7 +261,7 @@ def _make_req(
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
-        lane='normal',
+        lane=lane,
         merge_first_enqueued_at=merge_first_enqueued_at,
     )
 
@@ -269,18 +271,34 @@ def _make_tracker(
     *,
     lane_buffers: dict[str, collections.deque],
     frozen_tip: str,
+    retired: list[tuple[str, bool]] | None = None,
 ) -> SuffixConflictTracker:
     """A tracker over the TEST's lane buffers and a fixed frozen-prefix tip.
 
-    The four accessors the tracker is constructed with are the whole seam: no
+    The accessors the tracker is constructed with are the whole seam: no
     worker is involved, so every piece of state these tests assert on is one
-    the test owns or one the tracker publishes.
+    the test owns or one the tracker publishes. With *retired*, each
+    retirement is recorded there with whether the request was still buffered
+    when it was retired.
     """
+    if retired is None:
+        return SuffixConflictTracker(
+            git_ops=lambda: git_ops,
+            lane_buffers=lambda: lane_buffers,
+            frozen_prefix=lambda: (),
+            frozen_prefix_tip=lambda _main_sha: frozen_tip,
+        )
+
+    def _record(rid: str) -> None:
+        buffered = any(r.request_id == rid for lane in lane_buffers.values() for r in lane)
+        retired.append((rid, buffered))
+
     return SuffixConflictTracker(
         git_ops=lambda: git_ops,
         lane_buffers=lambda: lane_buffers,
         frozen_prefix=lambda: (),
         frozen_prefix_tip=lambda _main_sha: frozen_tip,
+        retire_item=_record,
     )
 
 
@@ -615,7 +633,8 @@ class TestBounceBookkeeping:
     on a clean rebase, escalated on a real conflict or a busted cap, skipped
     for a train). These pin what the bounce records while doing it -- the
     per-branch count, the untouched enqueue time, the log line an operator
-    greps for, and the fail-open when the tip cannot be established at all.
+    greps for, the retirement of every request it diverts, and the fail-open
+    when the tip cannot be established at all.
     """
 
     async def test_clean_rebase_records_one_bounce_and_keeps_the_enqueue_time(
@@ -723,6 +742,111 @@ class TestBounceBookkeeping:
         assert any('get_main_sha' in r.message for r in caplog.records), (
             'expected a warning naming get_main_sha but none was logged'
         )
+
+    async def test_real_conflict_escalation_retires_the_request(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A diverted request leaves the caller's registry as well as its lane.
+
+        Left registered, it stays LANE_BUFFERED in a buffer that no longer
+        holds it: never pickable, and listed as queued until a restart.
+        """
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3333', retired=retired,
+        )
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', AsyncMock(return_value=False))
+
+        outcome = await _escalate_at_tracker(tracker, buffers, req)
+
+        assert retired == [(req.request_id, False)], (
+            f'expected one retirement after the request left its lane, got {retired!r}'
+        )
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX)
+
+    async def test_cap_exceeded_escalation_retires_the_request(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe4444', retired=retired,
+        )
+        rebase_spy = AsyncMock(return_value=True)
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', rebase_spy)
+
+        outcome = await _cap_out_at_tracker(tracker, buffers, req)
+
+        assert retired == [(req.request_id, False)], (
+            f'expected one retirement after the request left its lane, got {retired!r}'
+        )
+        rebase_spy.assert_not_awaited()
+        assert outcome.reason is not None
+        assert 'bounce cap exceeded' in outcome.reason
+
+    async def test_clean_rebase_retires_nothing(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe5555', retired=retired,
+        )
+        tracker.graph = _conflicting(req)
+        tracker.signature = ((req.request_id,), 'abc123')
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', AsyncMock(return_value=True))
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert retired == [], f'a re-queued request was retired: {retired!r}'
+        assert req in buffers['normal'], 'a cleanly rebased item stays queued'
+
+    async def test_item_buffered_under_a_lane_its_field_does_not_name_is_still_diverted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The divert removes the request from the lane it was found in.
+
+        ``req.lane`` need not name that lane:
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._buffer_owned_request``
+        files a request under its normalized lane, not under the field.
+        """
+        req = _make_req('591', '591', config, git_repo, lane='high')
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe6666', retired=retired,
+        )
+        tracker.graph = _conflicting(req)
+        tracker.signature = ((req.request_id,), 'abc123')
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', AsyncMock(return_value=False))
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert req not in buffers['normal'], 'the conflicting request stayed queued'
+        assert req.result.result().status == 'blocked'
+        assert retired == [(req.request_id, False)], f'{retired!r}'
 
 
 # ── Bounce escalations and workflow.py's merge-thrash ladder ─────────────────
