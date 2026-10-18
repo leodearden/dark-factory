@@ -1,0 +1,137 @@
+"""A second reviewer generation whose Rule 2 blocks only on a stated ground.
+
+The context-complete (D2) generation is selected per dispatch by
+``ReviewBriefing``. Each role is resolved through the production resolve
+path (``PromptArtifactStore.resolve``, the call
+``workflow.py::TaskWorkflow._resolve_role_system_prompt`` makes), so a pinned
+artifact or a harness-version mix-up shows up exactly as it would live.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore
+
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import (
+    ALL_REVIEWERS,
+    CODE_QUALITY_GUIDANCE,
+    REVIEWER_COMPREHENSIVE,
+    AgentRole,
+    build_reviewer_role,
+    reviewers_for,
+)
+
+INCUMBENT_RULE_2_LEAD = '**Blocking means broken.**'
+ANCHORED_RULE_2_LEAD = '**Block only on a stated ground.**'
+SPECIALIZATION_FOOTER = '## Your Specialization: '
+
+
+def _context_complete() -> AgentRole:
+    (role,) = reviewers_for(ReviewBriefing.CONTEXT_COMPLETE)
+    return role
+
+
+def _resolve(store: PromptArtifactStore, role: AgentRole) -> str:
+    assert role.prompt_spec is not None
+    assert role.prompt_harness_version is not None
+    return store.resolve(
+        role.prompt_spec, executor_model='opus', harness_version=role.prompt_harness_version,
+    ).text
+
+
+def _without_rule_2(heuristics: str) -> str:
+    start = heuristics.index('\n2. ')
+    end = heuristics.index('\n3. ')
+    return heuristics[:start] + heuristics[end:]
+
+
+class TestRoster:
+    def test_diff_only_is_the_existing_roster(self):
+        assert reviewers_for(ReviewBriefing.DIFF_ONLY) == ALL_REVIEWERS
+
+    def test_context_complete_keeps_the_verdict_identity(self):
+        role = _context_complete()
+
+        assert role.name == REVIEWER_COMPREHENSIVE.name == 'reviewer_comprehensive'
+        assert role.prompt_harness_version == 'reviewer-d2-v1'
+        assert REVIEWER_COMPREHENSIVE.prompt_harness_version == 'reviewer-v1'
+
+
+class TestPromptSplit:
+    def test_the_contract_half_is_shared(self):
+        role = _context_complete()
+        assert role.prompt_spec is not None
+        assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
+
+        assert role.prompt_spec.contract == REVIEWER_COMPREHENSIVE.prompt_spec.contract
+
+    def test_the_generations_differ_only_in_rule_2(self):
+        role = _context_complete()
+        assert role.prompt_spec is not None
+        assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
+
+        assert _without_rule_2(role.prompt_spec.baseline_heuristics) == _without_rule_2(
+            REVIEWER_COMPREHENSIVE.prompt_spec.baseline_heuristics,
+        )
+        assert role.prompt_spec.baseline_heuristics != (
+            REVIEWER_COMPREHENSIVE.prompt_spec.baseline_heuristics
+        )
+
+
+class TestResolvedText:
+    def test_the_context_complete_text_carries_the_anchored_rule(self, tmp_path: Path):
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        incumbent = _resolve(store, REVIEWER_COMPREHENSIVE)
+
+        text = _resolve(store, _context_complete())
+
+        assert CODE_QUALITY_GUIDANCE in text
+        assert incumbent[incumbent.index(SPECIALIZATION_FOOTER):] in text
+        assert ANCHORED_RULE_2_LEAD in text
+        assert INCUMBENT_RULE_2_LEAD not in text
+
+    def test_the_incumbent_text_keeps_its_rule(self, tmp_path: Path):
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+
+        text = _resolve(store, REVIEWER_COMPREHENSIVE)
+
+        assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
+        assert text == REVIEWER_COMPREHENSIVE.prompt_spec.in_code_constant
+        assert INCUMBENT_RULE_2_LEAD in text
+        assert ANCHORED_RULE_2_LEAD not in text
+
+    def test_an_incumbent_pin_never_reaches_the_new_generation(self, tmp_path: Path):
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        role = _context_complete()
+        before = _resolve(store, role)
+        assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
+
+        store.pin(
+            REVIEWER_COMPREHENSIVE.prompt_spec.prompt_id, 'opus', 'reviewer-v1',
+            heuristics='PINNED: an optimised incumbent heuristics block.',
+            provenance=ArtifactProvenance(
+                optimizer_model='claude-opus-4',
+                corpus_hash='sha256:deadbeef',
+                split_seed=42,
+                held_out_TEST_score=0.9,
+                accept_delta=0.05,
+                git_sha='abc1234',
+                date='2026-10-18',
+                harness_version='reviewer-v1',
+            ),
+        )
+
+        assert 'PINNED: an optimised' in _resolve(store, REVIEWER_COMPREHENSIVE)
+        assert _resolve(store, role) == before
+
+
+def test_build_reviewer_role_shares_the_incumbent_tooling():
+    role = build_reviewer_role('x', 'spec', ReviewBriefing.CONTEXT_COMPLETE)
+
+    assert role.name == 'reviewer_x'
+    assert role.allowed_tools == REVIEWER_COMPREHENSIVE.allowed_tools
+    assert role.disallowed_tools == REVIEWER_COMPREHENSIVE.disallowed_tools
+    assert role.mcp_families == REVIEWER_COMPREHENSIVE.mcp_families
+    assert role.prompt_harness_version == 'reviewer-d2-v1'
