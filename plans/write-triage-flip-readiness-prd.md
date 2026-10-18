@@ -243,3 +243,33 @@ Deps: π2 (6530) ← —; λ2 (6531, operational) ← π2; ι2 (6532) ← λ2; �
 - **ι2 scores both regimes with one per-write classifier** (`fused-memory/scripts/score_write_triage_pairs.py::_outcome_cells`; rules text under `comparative_rules` in the committed artifacts; pinned by `fused-memory/tests/test_score_write_triage_pairs.py::test_an_arm_that_stores_everything_is_the_status_quo`). Under the task spec's literal arm rule, an arm that stores every write behaves exactly as the status quo yet scores `2 × contradiction_writes` (176) better than it. The adopted rule is the stricter of the two.
 - **Governing figures** (write-time slates, 484 production-judged writes; `fused-memory/calibration/write_triage_config_matrix.json`): status quo harm 329 (306 placeable writes, 88 contradiction writes). gpt-6.1-sol:low@5 delta −62.5 [−118.5, −6.5], wrong sibling 22/279 = 0.079. gpt-5.6-terra:none@5 −2.0 [−48.5, 44.0], 38/298 = 0.128. gpt-4o-mini@5 +278 [215.0, 339.5], 35/242 = 0.145. Under the literal rule the deltas are −106.5, −70 and +190 (esc-6532-3; re-run 2026-10-11). Sol is the only arm meeting every D19 bound under either reading, and Γ3 (5808) passed on the adopted rule on 2026-10-11.
 - **The 3169 flip (ruled and applied 2026-10-11) rests on `write_triage_best_config.json` `comparative` and `comparative_rules`, not on these 10-05 figures.** Read those when reviewing it. D20's weights are unchanged and remain provisional (G6).
+
+## 13. Amendment 2026-10-11 — the embedder cutover makes the retrieval-dependent evidence stale; this PRD re-measures it
+
+**Origin:** `plans/local-embedder-cutover-prd.md` (decisions D4, D5, D6; leaf κ1, task 6799). Leo ruled that the embedder cutover goes first and that this PRD owns re-measuring (cutover D6). Nothing recorded in §§1–12 changes: no figure, gate or decision is edited; this section only dates their validity.
+
+### 13.1 What goes stale, and when
+
+The cutover re-embeds every memory vector into granite-embedding-english-r2 (768 dims) at its task η (6807). All evidence in this PRD was measured in the text-embedding-3-small space (1536 dims). From η's completion, the retrieval-dependent evidence is stale, because a different embedder returns different neighbours and different cosine scores:
+
+- **π and π2's frozen slates** (retrievals and cosine scores behind each candidate slate, including the write-time slates of §12.4).
+- **The band decisions at `t_high` and `t_low`** (which writes reach the judge band, and the `population.n_judge_band` counts).
+- **μ's configuration matrix** (`write_triage_config_matrix.json`) and **`write_triage_best_config.json`**, which are scored on those slates.
+- **Γ3's comparative figures** (`comparative.wrong_sibling_rate_placeable`, `comparative.harm_delta_vs_status_quo`, and the outcome tables, harm totals and population counts under them).
+
+The judge arms' own behaviour given a slate, and the rater verdicts on pairs already rated, are text judgements rather than embedder scores. They remain valid evidence about those pairs. Pairs that a granite-space slate surfaces and the corpus has not rated need λ-style rating.
+
+### 13.2 Who re-measures what
+
+- **The cutover PRD's η** recalibrates the write-triage bands in the granite space with `fused-memory/scripts/calibrate_write_triage.py`, covering both the pooled bands and the `dark_factory` per-project calibration, and commits the reports. The invocation belongs to η's row in the cutover PRD's §10 and is not restated here. That step re-derives `t_high`/`t_low`. It does not re-measure the flip evidence below.
+- **The cutover PRD's ε** stamps each band group with `{embedder_model, embedder_dimensions}`. Its provenance guard refuses any band still stamped 1536 (`CalibrationProvenanceMismatch`), so a stale band cannot be applied silently between η's window and the recalibration.
+- **This PRD** owns re-measuring its flip evidence in the granite space. The leaves whose figures depend on retrieval are:
+  - from §11.6: **π** (fresh population and arm runs), **λ** (blind rating of the pairs that π surfaces), **μ** (task 5807) and **Γ3** (task 5808);
+  - from §12.4: **π2** (6530, write-time slates), **λ2** (6531, rating top-up), **ι2** (6532, comparative scorer and μ rerun) and **Γ3** (5808).
+  - ι (the scorer, `score_write_triage_pairs.py`), ω, ψ and χ do not depend on retrieval and are not re-run for this reason. Γ4 (5810) re-checks preconditions on the refreshed tree and follows Γ3.
+
+### 13.3 Task 3169 and notification
+
+- **3169.** The cutover PRD recorded 3169 as on HOLD (D6, §9). By this amendment's date that no longer holds: §12.5 records the flip as ruled and applied on 2026-10-11, resting on `write_triage_best_config.json` `comparative` and `comparative_rules`, and 3169's record carries the ruling (`x_flip_ruling_2026_10_11`). The consequence is that the live judge configuration was selected on 1536-space evidence, and η changes the embedder underneath it. Re-measuring in the granite space (§13.2) is how that selection is confirmed or re-opened. This amendment makes no ruling on the flip. The cutover PRD's D6 and §9 still read HOLD; on this point, this section supersedes them.
+- **Triage is live during η's window.** Because 3169 has flipped, live writes are triaged while η swaps the embedder, and the bands they would apply are still stamped 1536. ε lands before η (ε → δ → ζ → η, cutover PRD §14), so its guard is already in place when the embedder changes: it refuses those bands (§13.2) until η's recalibration writes granite-stamped ones.
+- **Notification.** The cutover PRD's η notifies this PRD's owner when it lands. That notice is the trigger for the re-measurement in §13.2.

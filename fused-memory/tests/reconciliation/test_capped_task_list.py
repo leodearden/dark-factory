@@ -12,6 +12,7 @@ import logging
 import pytest
 
 from fused_memory.reconciliation.capped_task_list import render_capped_task_list
+from fused_memory.utils.clip_disclosure import clip_note
 
 _EVENT = 'reconciliation.test_render_capped'
 
@@ -62,6 +63,16 @@ class TestRenderCappedTaskList:
         assert 'MAX_WIDGETS_RENDERED=3' in note
         assert 'NOT complete this cycle' in note
         assert 'the newest widgets were dropped first' in note
+
+    def test_over_cap_note_is_the_shared_clip_note(self):
+        note = next(line for line in _render(_tasks(5)).splitlines() if line.startswith('_NOTE:'))
+        assert note == clip_note(
+            omitted=2,
+            omitted_noun='widget task(s)',
+            cap_name='MAX_WIDGETS_RENDERED',
+            cap=3,
+            dropped_first='the newest widgets',
+        )
 
     def test_over_cap_logs_one_warning_with_caller_extras_and_clip_counts(self, caplog):
         with caplog.at_level(logging.WARNING):

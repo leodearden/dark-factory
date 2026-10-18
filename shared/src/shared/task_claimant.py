@@ -38,10 +38,12 @@ __all__ = [
     'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
     'compose_claimant_run_id',
     'has_live_claimant',
+    'is_hygiene_tier_claimant',
     'is_stale_hygiene_tier_claimant',
     'is_stranded',
     'is_stranded_any_status',
     'is_stranded_blocked',
+    'ledger_covers_claimant',
     'violates_terminal_claimant_invariant',
 ]
 
@@ -253,6 +255,16 @@ def violates_terminal_claimant_invariant(task: Mapping) -> bool:
     return str(task.get('status')) in TERMINAL and _carries_claimant(task)
 
 
+def is_hygiene_tier_claimant(task: Mapping) -> bool:
+    """Return True when *task* carries a claimant on a hygiene-allowlisted status, fresh or stale.
+
+    The population D3's hygiene tier is drawn from; not alarmable. A fresh
+    claimant here is the legal C3.1 teardown window, so only the stale subset
+    (:func:`is_stale_hygiene_tier_claimant`) is repairable.
+    """
+    return str(task.get('status')) in _HYGIENE_TIER_STATUSES and _carries_claimant(task)
+
+
 def is_stale_hygiene_tier_claimant(task: Mapping, now: datetime, ttl: timedelta) -> bool:
     """Return True when *task* is in D3's hygiene tier: a stale claimant on an allowlisted status.
 
@@ -261,8 +273,22 @@ def is_stale_hygiene_tier_claimant(task: Mapping, now: datetime, ttl: timedelta)
     (see ``_HYGIENE_TIER_STATUSES``). Staleness is read through
     :func:`is_stranded_any_status` (C4-E6).
     """
-    return (
-        str(task.get('status')) in _HYGIENE_TIER_STATUSES
-        and _carries_claimant(task)
-        and is_stranded_any_status(task, now, ttl)
-    )
+    return is_hygiene_tier_claimant(task) and is_stranded_any_status(task, now, ttl)
+
+
+def ledger_covers_claimant(task: Mapping) -> bool:
+    """Return True when ``metadata.claimant_exception`` names the claimant *task* still carries.
+
+    E-2's ``ledger_covers`` (``docs/prds/claimant-invariant-detection.md``
+    D-5/E-2): the C4-E2 sanctioned-mint ledger that fused-memory's interceptor
+    stamps (``fused_memory/middleware/task_interceptor.py::_claimant_exception_entry``).
+    Status-agnostic; the alarm tier is
+    ``violates_terminal_claimant_invariant(t) and not ledger_covers_claimant(t)``.
+    """
+    if not _carries_claimant(task):
+        return False
+    metadata = task.get('metadata')
+    if not isinstance(metadata, Mapping):
+        return False
+    entry = metadata.get('claimant_exception')
+    return isinstance(entry, Mapping) and entry.get('claimant_run_id') == task.get('claimant_run_id')

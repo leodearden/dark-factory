@@ -65,6 +65,7 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
+from fused_memory.utils.clip_disclosure import TruncationFact, clip_text
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
@@ -348,11 +349,11 @@ JUDGE_PROMPT_CHAR_BUDGET = 27_000
 
 
 def _elide(text: object, field_chars: int) -> str:
-    """*text* as a string, bounded by *field_chars* and marked if cut."""
-    body = text if isinstance(text, str) else str(text or '')
-    if len(body) <= field_chars:
-        return body
-    return body[:field_chars] + _ELIDED_MARKER
+    """*text* cut to *field_chars* by clip_text, marked with the judge's own ``_ELIDED_MARKER``."""
+    clip = clip_text(text, field_chars, field='judge_field')
+    if clip.fact is None:
+        return clip.text
+    return clip.text + _ELIDED_MARKER
 
 
 def select_judge_candidates(
@@ -768,6 +769,20 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
     return None
 
 
+def resolve_judge_api_url(memory_service: Any) -> str | None:
+    """The judge's own endpoint, or None meaning INHERIT the provider's api_url.
+
+    A blank or non-string value inherits, for the same reason
+    :func:`_provider_credentials` refuses to forward a blank credential: an
+    empty ``base_url`` fails every call and reads as a judge outage rather
+    than as the cleared leaf it is.
+    """
+    value = _judge_attr(memory_service, 'judge_api_url')
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 # --- the LLM call ------------------------------------------------------------
 
 #: Output cap for the two answer-only arms (anthropic, and a chat-only compat
@@ -805,6 +820,12 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     in config.yaml). Reading the config section is for a deployment that pins a
     key or points at an OpenAI-compatible local endpoint.
 
+    ``base_url`` is ``write_triage.judge_api_url`` when set, else
+    ``llm.providers.<provider>.api_url``. The override is judge-only, so the
+    main LLM arm is unaffected; the ``api_key`` still comes from the provider
+    section (a judge-scoped key is task ν's, not this leaf's), and so does
+    ``serves_responses_api`` below.
+
     ``serves_responses_api`` is the deployment's existing declaration of what
     the configured OpenAI endpoint speaks — ``llm.client_class``, the same
     declaration ``backends/graphiti_client.py`` builds its client from, where
@@ -822,7 +843,7 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     api_key = getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
         client_kwargs['api_key'] = api_key
-    api_url = getattr(section, 'api_url', None)
+    api_url = resolve_judge_api_url(memory_service) or getattr(section, 'api_url', None)
     if isinstance(api_url, str) and api_url:
         client_kwargs['base_url'] = api_url
     serves_responses_api = (
@@ -1132,9 +1153,10 @@ async def judge_write(
         )
         return TriageJudgeVerdict(OUTCOME_STORED)
 
+    candidate_count = resolve_judge_candidate_count(memory_service)
     selected = select_judge_candidates(
         candidates,
-        resolve_judge_candidate_count(memory_service),
+        candidate_count,
         canonical_id=getattr(decision, 'canonical_id', None),
     )
     if not selected:
@@ -1151,4 +1173,18 @@ async def judge_write(
         reasoning_effort=resolve_judge_reasoning_effort(memory_service),
     )
     verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
-    return verdict._replace(usage=reply.usage)
+    return verdict._replace(
+        usage=reply.usage,
+        truncation_facts=_slate_trim_facts(candidates, selected, candidate_count),
+    )
+
+
+def _slate_trim_facts(
+    candidates: Any, selected: Sequence[MemoryResult], candidate_count: int,
+) -> tuple[TruncationFact, ...]:
+    """How many COMPARABLE candidates the judge was not shown, counted with ``cosine_of``."""
+    comparable = sum(1 for result in candidates or () if cosine_of(result) is not None)
+    elided = comparable - len(selected)
+    if elided <= 0:
+        return ()
+    return (TruncationFact(field='judge_candidates', cap=candidate_count, elided=elided),)

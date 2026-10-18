@@ -210,7 +210,7 @@ class TestResolveMarkerExpression:
         assert resolved == 'not slow'
 
     def test_the_first_pytest_clause_wins_not_the_last(self):
-        """FIRST occurrence — the same clause ``_scope_prefix_to_keyword`` scopes.
+        """FIRST occurrence — the same clause ``scope_prefix_to_keyword`` scopes.
 
         ``head.find('pytest')`` truncates a chained ``test_command`` to its first
         pytest clause, so the marker probe must read that clause too; reading the
@@ -2158,7 +2158,7 @@ class TestProbeConsultsTheCommandsEffectiveRootdir:
     def test_a_chained_test_command_is_never_widened(self):
         """GUARD 2: a raw-retained chain hides both the rootdir and which clause runs.
 
-        ``_scope_prefix_to_keyword`` truncates a chained ``test_command`` to its
+        ``scope_prefix_to_keyword`` truncates a chained ``test_command`` to its
         FIRST pytest clause; rather than risk the probe describing a different
         invocation than the scoper, the probe refuses the whole shape.
         """

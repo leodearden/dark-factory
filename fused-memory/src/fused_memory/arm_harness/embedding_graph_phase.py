@@ -7,7 +7,7 @@ search is the production ``GraphitiBackend.search`` on the arm's scratch graph.
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -38,6 +38,7 @@ from fused_memory.arm_harness.retrieval import (
     tally_probe,
 )
 from fused_memory.arm_harness.scratch_indices import drop_all_indices
+from fused_memory.arm_harness.sleep_seam import Sleep
 from fused_memory.arm_harness.topology import (
     IntegrityVerdict,
     Topology,
@@ -52,8 +53,6 @@ logger = logging.getLogger(__name__)
 SEARCH_K = RETRIEVAL_UTILITY_K
 CONFIGURATION_ORDER = (IndexConfiguration.EMBEDDING_ONLY, IndexConfiguration.WITH_INDICES)
 """Embedding-only first: whatever indices COPY carried are dropped, then built afresh."""
-
-Sleep = Callable[[float], Awaitable[object]]
 
 
 class ArmScratchGraph(Protocol):
@@ -121,7 +120,7 @@ async def run_graph_phase(
 ) -> GraphPhase:
     name = arm.scratch_group_id
     reference, frozen = await _require_frozen_reference(arm, client, probe_set.reference)
-    await copy_reference_graph(client, probe_set.reference.graph, name)
+    await copy_reference_graph(client, probe_set.reference.graph, name, sleep=sleep)
     graph = client.select_graph(name)
     await adopt_group_id(graph, name)
     reembed = await reembed_graph(graph, name, embedder)

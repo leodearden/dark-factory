@@ -187,3 +187,5 @@ tasks:
       kind: manual
       reason: event name is Open Q4 (EventType naming decided in η); no stable grep
         token at authoring time
+signal_leaves:
+- ζ

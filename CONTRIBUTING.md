@@ -238,7 +238,7 @@ Reversing this decision means updating this section, `CLAUDE.md` and
      the repo declares at the same value. Pinned by
      tests/scripts/test_pytest_per_test_timeout_policy.py — change the configs
      and this paragraph goes red until it is updated to match. -->
-  Every pytest config caps a single test at `540` seconds of WALL CLOCK (not CPU
+  Every pytest config caps a single test at `420` seconds of WALL CLOCK (not CPU
   time), a value DERIVED FROM MEASUREMENT rather than picked — see
   `plans/pytest-per-test-timeout-measurement-2026-09-17.md` for the corpus and
   the arithmetic, and `shared/pyproject.toml` for why the cap exists at all.
@@ -254,9 +254,9 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   verify leg passes `--timeout=300` on its CLI, and a CLI `--timeout` overrides
   the ini. So verify currently runs TIGHTER than a bare local or agent `pytest`
   — an unmarked test taking 310 seconds passes locally and reds the gate, and
-  the two tests the measurement above derived its value from still run at the
-  4.9x headroom that measurement calls insufficient. Aligning that yaml knob is
-  outside the scope that set these configs and is filed as residue 2 of
+  the test the value is now derived from (45.48s) runs at only ~6.6x headroom
+  under verify's 300, short of the 8x the measurement demands. Aligning that
+  yaml knob is outside the scope that set these configs and is filed as residue 2 of
   `plans/pytest-per-test-timeout-measurement-2026-09-17.md`.
 <!-- pytest-timeout-mirror:end -->
 <!-- lint-command-mirror:begin

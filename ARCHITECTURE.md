@@ -642,8 +642,12 @@ and are not restated here.
   `CONVERT_TO_BLOCKED` in all four branch states, landed-but-pinned rows
   included; the normative rule is spec §7.2. The applier,
   `Harness._reconcile_one_stranded` (`harness.py`), writes `blocked`, files
-  nothing and writes no `done_provenance`. Conversion is a legibility action,
-  not a recovery: the row keeps its pin and does not self-heal. Its exit is
+  nothing and writes no `done_provenance`. It stamps `metadata.strand_converted`
+  (`shared/src/shared/strand_conversion.py::StrandConverted`: `at`, `shape`,
+  `pinning_escalation_ids`) and emits one `strand_converted` event naming the
+  same records (`orchestrator/src/orchestrator/strand_conversion.py`).
+  Conversion is a legibility action, not a recovery: the row keeps its pin
+  and does not self-heal. Its exit is
   its record's resolution — by a human, or, for a dead-filer L0, by the
   supervised consumer that takes it once the orphan-L0 reaper has promoted it
   to L1 ("Orphaned L0 records" below) — where a `resume` re-pends it (§6).
@@ -813,7 +817,15 @@ the `unblock` skill).
 The offline lane (`orchestrator/src/orchestrator/offline_lane.py`) is a
 singleton background worker that runs heavy test suites off the merge hot
 path, snapshotting `main` at run start and coalescing advances — it never
-gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`).
+gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
+test is a per-test episode that is filed as one fix task once reproduced on
+`git.offline_lane_persist_passes` spaced passes, with one bounded level-1
+escalation if the fix stays unlanded. A command that declares an outage probe
+(`outage_probe`) runs it after a red detection, and a probe that exits 75
+naming a dependency makes the pass an outage, which is escalated, not filed.
+The lane re-runs the probe alone until it passes, then closes its own
+escalation and runs the command again (`plans/offline-lane-red-path-prd.md`;
+runbook in `OPERATIONS.md`).
 Operators can inspect and pause the merge lane directly: `get_merge_queue()`
 gives a live snapshot (lane states, conflict graph, frozen prefix, metrics)
 that the event store alone can't reconstruct; `halt_merge_queue`/

@@ -9,7 +9,8 @@ widening past "command parsing": the four marker assertions were about to exist
 in a second hand-written copy for exactly the reason the five command-parsing
 copies below did, and the same rule applies to both. Everything in the WHY IT
 EXISTS and IMPORT ME sections is written about the command helpers, but is meant
-about this module.
+about this module. Since task 5769 it also holds :func:`marked_body`, the
+slug-keyed form of that extraction.
 
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
@@ -593,3 +594,28 @@ def marked_span(
         f"(task {task})"
     )
     return spans[0]
+
+
+_AFTER_THE_OPENING_COMMENT = re.compile(r"\A.*?-->(.*)\Z", re.DOTALL)
+
+
+def marked_body(text: str, *, slug: str, source: str, label: str, task: str) -> str:
+    """The body of the ``<!-- {slug}:begin ... -->`` / ``<!-- {slug}:end -->`` span.
+
+    The opener is matched as a PREFIX, not as a whole comment, so it may carry
+    its own prose; the body starts where that comment closes. Every malformed
+    shape raises through :func:`marked_span`: an unterminated opener and
+    inverted markers both leave no pattern match, and a blank body fails its
+    non-blank assertion. The body is returned verbatim: comment and whitespace
+    policy belong to the caller.
+    """
+    return marked_span(
+        text,
+        begin=f"<!-- {slug}:begin",
+        end=f"<!-- {slug}:end -->",
+        pattern=_AFTER_THE_OPENING_COMMENT,
+        what="body after the closed opening-marker comment",
+        source=source,
+        label=label,
+        task=task,
+    )

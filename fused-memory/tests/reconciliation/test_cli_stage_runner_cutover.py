@@ -9,10 +9,12 @@ import pytest
 
 from fused_memory.reconciliation.cli_stage_runner import (
     FINDING_ITEM_SCHEMA,
+    RAW_TEXT_FALLBACK_STAT,
     STAGE3_REPORT_SCHEMA,
     STAGE_REPORT_SCHEMA,
     _extract_report,
 )
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
 
 
 class TestFindingItemSchemaShape:
@@ -185,6 +187,52 @@ class TestOutputSchemaNonePassthrough:
         assert report == {}, (
             f'_extract_report must return {{}} when output is empty, got {report!r}'
         )
+
+
+def _agent_result(output: str, structured_output: object = None):
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(output=output, structured_output=structured_output, turns=0, cost_usd=0.0, success=True)
+
+
+class TestExtractReportRawTextFallback:
+    """A prose-only reply is reported as such, and a clipped summary says how much it lost.
+
+    Scoped to _extract_report: on the recon_report path BaseStage.run replaces this dict by design.
+    """
+
+    def test_long_prose_is_elided_and_its_clip_recorded_in_stats(self):
+        prose = 'The stage found nothing worth flagging. ' * 1000
+
+        report = _extract_report(_agent_result(prose))
+
+        [fact] = report['stats'][TRUNCATION_FACTS_KEY]
+        cap = fact['cap']
+        assert fact == {'field': 'summary', 'cap': cap, 'elided': len(prose) - cap}
+        assert report['summary'] == prose[:cap] + elision_marker(len(prose) - cap)
+        assert report['flagged_items'] == []
+        assert report['stats'][RAW_TEXT_FALLBACK_STAT] is True
+
+    def test_short_prose_is_unmarked_but_still_flagged_as_a_fallback(self):
+        report = _extract_report(_agent_result('All consistent; no findings.'))
+
+        assert report == {
+            'summary': 'All consistent; no findings.',
+            'flagged_items': [],
+            'stats': {RAW_TEXT_FALLBACK_STAT: True},
+        }
+
+    def test_parsed_json_output_carries_no_fallback_stat(self):
+        report = _extract_report(_agent_result('{"summary": "ok", "flagged_items": []}'))
+
+        assert report == {'summary': 'ok', 'flagged_items': []}
+
+    def test_structured_output_carries_no_fallback_stat(self):
+        structured = {'summary': 'ok', 'flagged_items': [], 'stats': {'n': 1}}
+
+        report = _extract_report(_agent_result('ignored prose', structured_output=structured))
+
+        assert report == structured
 
 
 def _make_capture_invoke(captured_kwargs: dict):

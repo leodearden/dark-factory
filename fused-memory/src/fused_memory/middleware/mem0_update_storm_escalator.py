@@ -5,7 +5,7 @@ record says while preserving its Qdrant point id, so an agent stuck in a rewrite
 loop leaves behind no new records, no id churn and no failed calls — nothing a
 downstream reader could notice. INV-4 (``storm-escape-required``) therefore
 requires an unconditional escape hatch: ``MemoryService`` counts content-amend
-calls per ``agent_id`` in a rolling window
+calls per ``(agent_id, project_id)`` in a rolling window
 (:class:`fused_memory.server.storm_counter.StormCounter`) and, on a burst, calls
 this module to make the condition reach a human.
 
@@ -34,31 +34,35 @@ content fingerprint answers that while still folding the repeat breaches, so thi
 keeps decision doc §4's ratified class shape and its state (the queue cache).
 
 RESOLVING ``project_id`` → ``project_root``. ``update_memory`` carries only a
-``project_id`` and ``MemoryService`` holds no filesystem root, so the
-``{project_id: project_root}`` snapshot that ``server/main.py`` already builds
-with ``build_known_projects_map`` (and already hands to ``ReconciliationHarness``
-and ``TicketJanitor``) is INJECTED here via :meth:`set_known_projects`. That is
-pure data with no lifetime coupling to any conditionally-constructed component,
-which is what lets this escalator be built unconditionally in
-``MemoryService.__init__`` — the alarm must not vanish when
+``project_id``, so this escalator resolves the root from a
+``{project_id: project_root}`` registry INJECTED via :meth:`set_known_projects`.
+``MemoryService`` constructs it and immediately hands it the service's own
+registry, seeded from ``DASHBOARD_KNOWN_PROJECT_ROOTS`` alone;
+``server/main.py`` later replaces that with the full startup snapshot it builds
+with ``build_known_projects_map`` (and also hands to ``ReconciliationHarness``
+and ``TicketJanitor``). That is pure data with no lifetime coupling to any
+conditionally-constructed component, which is what lets this escalator be built
+unconditionally in ``MemoryService.__init__`` — the alarm must not vanish when
 ``config.reconciliation.enabled`` is false, since that is exactly the degraded
 configuration where an unattended rewrite loop is least likely to be noticed any
 other way.
 
-When the root cannot be resolved (setter never called, or the id is absent from
-the map) this logs a structured WARN carrying the agent, the count and the
-window — so the signal stays recoverable from logs — and submits nothing.
-Falling back to ``config.taskmaster.project_root`` is explicitly FORBIDDEN: it
-defaults to ``'.'``, so the fallback would file into the server's cwd, where no
-operator is watching, and report success while doing it.
+When the root cannot be resolved (the project is neither in the env registry nor
+wired at startup) this logs a structured WARN carrying the agent, the count and
+the window — so the signal stays recoverable from logs — and submits nothing.
+Falling back to ``config.taskmaster.project_root`` is explicitly FORBIDDEN, both
+here and as a source for the seed: it defaults to ``'.'``, so the fallback would
+file into the server's cwd, where no operator is watching, and report success
+while doing it.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.project_layout import escalation_queue_dir
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -82,22 +86,8 @@ except ImportError:  # pragma: no cover — exercised only in minimal envs
 logger = logging.getLogger(__name__)
 
 
-_QUEUE_DIRNAME: str = 'data/escalations'
+# Not a ``middleware/_folded_escalation`` filer — see that module's docstring.
 
-# NOT A MEMBER of ``middleware/_folded_escalation``'s family, deliberately
-# (task 4854). That helper is the one home for the PENDING-ANCHOR-FOLD filer
-# skeleton — ``queue.get_by_task(anchor, status='pending')`` plus a never-raise
-# submit — which seven filers carried verbatim. This module does not carry it:
-# it dedupes on ``compute_content_fingerprint`` + ``DedupeConfig`` through
-# ``escalation.dedupe.submit_or_dedupe`` over a CACHED per-project queue.
-# Migrating it would replace content-fingerprint dedupe with pending-anchor
-# dedupe, which is a behaviour regression rather than a refactor. Do not
-# "finish the job" by folding this in.
-#
-# The anchor below is still swept by
-# ``tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor``: this module
-# writes to the SAME queue, so it can squat an anchor even though it is not a
-# member.
 # Anchor task_id used by ``EscalationQueue.make_id`` so the resulting escalation
 # ids (e.g. ``esc-mem0-update-storm-3``) are greppable and distinct from the
 # path-guard's ``task-path-guard`` and the migration's ``candidate-key-migration``
@@ -122,9 +112,10 @@ class Mem0UpdateStormEscalator:
     """File ``mem0_in_place_update_storm`` escalations for update_memory bursts.
 
     Constructed zero-arg (``Mem0UpdateStormEscalator()``) inside
-    ``MemoryService.__init__``; the ``{project_id: project_root}`` map arrives
-    afterwards via :meth:`set_known_projects` because the map is built later in
-    server startup than the service is.
+    ``MemoryService.__init__``, which immediately hands it the service's
+    env-seeded ``{project_id: project_root}`` registry via
+    :meth:`set_known_projects`; server startup replaces that registry with the
+    full snapshot.
 
     Holds one cached :class:`escalation.queue.EscalationQueue` per
     ``project_root``. State is process-local and per-instance, so nothing bleeds
@@ -157,7 +148,7 @@ class Mem0UpdateStormEscalator:
             return None
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(escalation_queue_dir(project_root))
             self._queues[project_root] = q
         return q
 
@@ -171,6 +162,9 @@ class Mem0UpdateStormEscalator:
         window_seconds: float,
     ) -> str | None:
         """File (or fold into) a storm escalation for *agent_id*.
+
+        *count* is *agent_id*'s amendments in *project_id* alone, so the number
+        filed is reproducible from that project's own journal rows.
 
         Returns the escalation id — freshly minted, or the existing pending
         parent's id when this breach folded into it — or ``None`` when nothing
@@ -195,8 +189,9 @@ class Mem0UpdateStormEscalator:
                 'project_id=%r (%d known project(s)); NOT escalating the '
                 'update_memory content-amend storm from agent_id=%r '
                 '(count=%d, threshold=%d, window_seconds=%s). '
-                'Wire MemoryService.set_known_projects(build_known_projects_map(...)) '
-                'at server startup to restore this alarm.',
+                'Register the project in DASHBOARD_KNOWN_PROJECT_ROOTS, or wire '
+                'MemoryService.set_known_projects(build_known_projects_map(...)) '
+                'at server startup, to restore this alarm.',
                 project_id, len(self._known_projects), agent_id,
                 count, threshold, window_seconds,
             )
@@ -222,8 +217,9 @@ class Mem0UpdateStormEscalator:
             f'window_seconds={window_seconds}',
             '',
             f'Agent {agent_id!r} issued {count} in-place update_memory '
-            f'content amendments within {window_seconds}s, at or above the '
-            f'storm threshold of {threshold}.',
+            f'content amendments in project {project_id!r} within '
+            f'{window_seconds}s, at or above the storm threshold of '
+            f'{threshold}.',
             '',
             'In-place amendment preserves the record id, so a runaway rewrite '
             'loop leaves no new records, no id churn and no failed calls — this '
@@ -253,8 +249,8 @@ class Mem0UpdateStormEscalator:
                 category=_CATEGORY,
                 summary=(
                     f'update_memory content-amend storm: agent {agent_id!r} '
-                    f'amended {count} records in {window_seconds}s '
-                    f'(threshold {threshold})'
+                    f'amended {count} records in project {project_id!r} '
+                    f'within {window_seconds}s (threshold {threshold})'
                 ),
                 detail=detail,
                 suggested_action='investigate_runaway_amendment_loop',

@@ -11,7 +11,7 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
@@ -88,11 +89,12 @@ _HARNESS_CANCEL_TIMEOUT = 25.0
 _CLEANUP_STEP_TIMEOUT = 5.0
 
 # Per-step budget for the memory_service.close step specifically (task 2701).
-# MemoryService.close() runs six sub-closes sequentially, each individually
-# time-boxed at memory_service._SUBCLOSE_TIMEOUT (3.0s), so this outer step
-# budget must dominate 6 * _SUBCLOSE_TIMEOUT (=18s) with margin. 20s does and
-# fits inside _FORCE_EXIT_BUDGET's existing headroom (the worst-case step sum
-# below rises to 70s <= 75s) while leaving graceful+force<systemd untouched —
+# MemoryService.close() runs its sub-closes sequentially, each individually
+# time-boxed, so this outer step budget must dominate their sum,
+# services/memory_service.py::MemoryService.close_budget_secs, with margin.
+# 20s does and fits inside _FORCE_EXIT_BUDGET's existing headroom (the
+# worst-case step sum below rises to 70s <= 75s) while leaving
+# graceful+force<systemd untouched —
 # so the schema.py _MIRROR_* mirror and the systemd-template parity test stay
 # valid. Guarded by TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
 _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
@@ -687,16 +689,14 @@ async def run_server():
     # be noticed any other way. Pure data, no lifetime coupling, same injection
     # pattern ReconciliationHarness and TicketJanitor already use.
     #
-    # KNOWINGLY UNCOVERED, and the asymmetry is the reason. Those two components
-    # need no wiring test because each DEFENDS ITSELF — omit the kwarg and it
-    # calls build_known_projects_map. This escalator has no such fallback (a
-    # safe fallback source is an open question: the module docstring forbids
-    # config.taskmaster.project_root, which defaults to '.'), so it depends on
-    # this one call. Deleting or reordering the line degrades the storm alarm to
-    # a WARN with no test failure. Do NOT "cover" it with a grep- or ast-based
-    # meta-test: that shape was deleted from this repo in fb3c47dccf on a
-    # CONFIRMED review finding. The real fix is tracked as a follow-up to task
-    # 3088 (escalation agent-followup-3088).
+    # MemoryService already seeds this registry from DASHBOARD_KNOWN_PROJECT_ROOTS,
+    # so this call adds the primary root rather than enabling the alarm. Tests pin
+    # the seed and set_known_projects' replace-on-set behaviour, but NO test
+    # exercises this call site: deleting or reordering it leaves every test
+    # green while a primary root the env var does not list loses its storm,
+    # dead-letter and entity-mint alarms. Do NOT "cover" it with a grep- or
+    # ast-based meta-test: that shape was deleted from this repo in fb3c47dccf
+    # on a CONFIRMED review finding.
     memory_service.set_known_projects(_known_projects_map)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
@@ -1186,6 +1186,12 @@ async def run_server():
         config.write_journal.prune_max_rows_per_run,
     )
 
+    remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
+        taskmaster,
+        task_interceptor.remint_broken_recurrence_chains,
+        _known_projects_map.values(),
+    )
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -1362,6 +1368,10 @@ async def run_server():
         write_ops_prune_task.cancel()
         with contextlib.suppress(BaseException):
             await write_ops_prune_task
+        if remint_sweep_task is not None:
+            remint_sweep_task.cancel()
+            with contextlib.suppress(BaseException):
+                await remint_sweep_task
         loop_lag_task.cancel()
         with contextlib.suppress(BaseException):
             await loop_lag_task
@@ -1632,6 +1642,36 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     return asyncio.create_task(
         _loop_lag_monitor(threshold_ms=threshold_ms),
         name='loop_lag_monitor',
+    )
+
+
+def _start_remint_sweep(
+    task_backend: TaskBackendProtocol | None,
+    remint: Callable[[str], Awaitable[object]],
+    project_roots: Iterable[str],
+) -> asyncio.Task[None] | None:
+    """Spawn the recurrence re-mint sweep (task 6572) and RETURN its handle for teardown.
+
+    The sweep repairs chains left done with no successor by a failed mint or a
+    crash between the done write and the mint. Without a task backend there
+    is no chain to repair, so nothing is spawned.
+    """
+    from fused_memory.middleware.recurrence_mint import (
+        REMINT_SWEEP_INTERVAL_SECS,
+        run_remint_sweep_loop,
+    )
+
+    if task_backend is None:
+        logger.info('  Recurrence re-mint sweep: disabled (no task backend)')
+        return None
+    roots = tuple(project_roots)
+    logger.info(
+        '  Recurrence re-mint sweep: enabled (at startup, then every %.0fs, %d project root(s))',
+        REMINT_SWEEP_INTERVAL_SECS,
+        len(roots),
+    )
+    return asyncio.create_task(
+        run_remint_sweep_loop(remint, roots), name='recurrence_remint_sweep',
     )
 
 

@@ -41,10 +41,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-# The orchestrator's own data/ is gitignored (the `/data/` rule in .gitignore),
-# so a task worktree has no store of its own and a worktree-relative default
-# would never resolve.  The live store exists only in the main checkout.
-DEFAULT_RUNS_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
+import _checkout as _checkout
+from shared.project_layout import default_project_root, runs_db
+
+
+def default_runs_db() -> Path:
+    """The main checkout's runs.db: data/ is gitignored, so no task worktree has a live store."""
+    return runs_db(default_project_root())
+
 
 # A trailing-window spec: N hours or N days, N a POSITIVE integer. Anchored so
 # '24' and '24x' are both rejected rather than silently truncated to 24, and
@@ -886,18 +890,26 @@ def render_json(result: AuditResult) -> str:
     }, indent=2)
 
 
+def _table_cell(value: Any) -> str:
+    """*value* as one markdown table cell: a single line, with every pipe escaped."""
+    return ' '.join(str(value).split()).replace('|', r'\|')
+
+
 def markdown_table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
     """A markdown table, or a single italic line when there are no rows.
+
+    Each row is one line whose cell count matches the header's, whatever the
+    cell text holds.
 
     The empty case is spelled out rather than emitted as a headed table with no
     body, because an empty table reads as a rendering glitch while "none" reads
     as a measurement.
     """
-    body = [f"| {' | '.join(str(cell) for cell in row)} |" for row in rows]
+    body = [f"| {' | '.join(_table_cell(cell) for cell in row)} |" for row in rows]
     if not body:
         return ['_none_']
     return [
-        f"| {' | '.join(header)} |",
+        f"| {' | '.join(_table_cell(h) for h in header)} |",
         f"|{'|'.join('---' for _ in header)}|",
         *body,
     ]
@@ -999,10 +1011,22 @@ def render_markdown(result: AuditResult) -> str:
 
 
 def _merge_cell(outcome: MergeOutcome | None) -> str:
+    """*outcome* as a one-line summary; the full reason is in `--format json`."""
     if outcome is None:
         return '-'
-    detail = outcome.merge_sha or outcome.reason or ''
+    detail = outcome.merge_sha or _first_line(outcome.reason or '')
     return f'{outcome.state} ({detail})' if detail else outcome.state
+
+
+def _first_line(text: str) -> str:
+    """The first line of *text*, marked with how many lines after it were dropped."""
+    lines = text.strip().splitlines()
+    if not lines:
+        return ''
+    dropped = len(lines) - 1
+    if not dropped:
+        return lines[0]
+    return f"{lines[0]} \N{HORIZONTAL ELLIPSIS} +{dropped} line{'' if dropped == 1 else 's'}"
 
 
 def _parse_window(spec: str) -> timedelta:
@@ -1095,12 +1119,13 @@ def main(argv: Sequence[str] | None = None) -> int:
              f'defaults {DEFAULT_ROLE_CEILINGS_SECS}. A role with no ceiling is '
              'reported as unknown rather than as under one.',
     )
-    parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
+    parser.add_argument('--runs-db', default=None, type=Path,
+                        help="(default: the main checkout's runs.db)")
     parser.add_argument('--format', default='markdown', choices=('markdown', 'json'))
     args = parser.parse_args(argv)
 
     window_end = args.until or datetime.now(UTC)
-    conn = connect_ro(args.runs_db)
+    conn = connect_ro(args.runs_db if args.runs_db is not None else default_runs_db())
     try:
         result = audit(
             conn,

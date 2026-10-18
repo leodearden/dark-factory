@@ -16,8 +16,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import census as mod
 import pytest
+from legibility import census as mod
 from legibility import (
     census_identity,
     census_window,
@@ -28,11 +28,13 @@ from legibility import (
     unlanded,
 )
 from legibility.session_ledger import CodedBy, LedgerRow, Outcome
+from legibility_task_store_fake import FakeTaskStore
 
 _NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 _DATE = "2026-10-06"
 _RUN_ID = "census-p-20261006"
 _EMPTY_JUDGMENT = json.dumps({"matches": [], "candidates": []})
+_LANDED = unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1)
 
 
 @pytest.fixture(autouse=True)
@@ -63,18 +65,15 @@ def _write_session(directory: Path, cwd: str, sid: str, *, day: date, signal: bo
 class _Recorder:
     """A seam fake that records its keyword calls and returns *result*."""
 
-    def __init__(self, result=None, *, raises: Exception | None = None, effect=None):
+    def __init__(self, result=None, *, effect=None):
         self.calls: list[dict[str, Any]] = []
         self._result = result
-        self._raises = raises
         self._effect = effect
 
     def __call__(self, *args, **kwargs):
         self.calls.append(kwargs)
         if self._effect is not None:
             self._effect()
-        if self._raises is not None:
-            raise self._raises
         return self._result
 
 
@@ -91,6 +90,23 @@ class _Invoke:
 
     def mined(self, sessions) -> list[str]:
         return sorted(sid for sid in sessions for prompt in self.prompts if sid in prompt)
+
+
+class _DeletingInvoke(_Invoke):
+    """The miner/probe seam: *session*'s digest asks to delete an entry, every
+    other prompt gets an empty judgment."""
+
+    def __init__(self, session: str):
+        super().__init__()
+        self._session = session
+
+    def __call__(self, prompt, model):
+        if self._session not in prompt:
+            return super().__call__(prompt, model)
+        self.prompts.append(prompt)
+        return json.dumps({
+            "matches": [{"entry_id": "entry-a", "action": "delete"}], "candidates": [],
+        })
 
 
 class _Census:
@@ -146,9 +162,10 @@ class _Census:
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
             synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
             submit_fn=_Recorder({"ticket": "tkt_1"}),
+            task_store=FakeTaskStore(),
             escalate_fn=_Recorder(),
             status_fetcher=lambda: {"statuses": {}},
-            commit=_Recorder(),
+            commit=_Recorder(_LANDED),
             roll_back=_Recorder(unlanded.Rollback(quarantine_dir=None, paths=())),
             codebook_dict={"version": 2, "entries": [], "candidates": []},
             config=self.cfg,
@@ -305,7 +322,10 @@ def test_an_unlanded_commit_rolls_back_the_record_and_ledgers_nothing(census):
     census.session("S-tango")
     roll_back = _Recorder(unlanded.Rollback(quarantine_dir=None, paths=()))
     kwargs = census.kwargs(
-        commit=_Recorder(raises=RuntimeError("pre-commit refused")), roll_back=roll_back,
+        commit=_Recorder(unlanded.CommitResult(
+            ok=False, sha=None, stderr="pre-commit refused", attempts=1,
+        )),
+        roll_back=roll_back,
     )
 
     outcome = mod.run_census(**kwargs)
@@ -315,6 +335,20 @@ def test_an_unlanded_commit_rolls_back_the_record_and_ledgers_nothing(census):
     [call] = roll_back.calls
     assert str(kwargs["report_path"].with_suffix(".json")) in call["paths"]
     assert census.ledger_rows() == []
+
+
+def test_row3_a_deletion_shaped_coding_is_skipped_and_never_ledgered(census):
+    """A skipped coding was never merged, so its session is not marked coded:
+    the next census mines it again. The rest of the run lands and ledgers."""
+    census.session("S-sierra")
+    census.session("S-tango")
+
+    outcome = mod.run_census(**census.kwargs(invoke=_DeletingInvoke("S-sierra")))
+
+    assert outcome.status == "done"
+    assert [skipped.session for skipped in outcome.skipped_deletions] == ["S-sierra"]
+    assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
+    assert outcome.ledger_rows_written == 1
 
 
 def test_a_preflight_defer_ledgers_nothing(census):
@@ -335,7 +369,9 @@ def test_a_ledger_write_failure_after_the_commit_is_reported_not_raised(census, 
         census.ledger_path.write_bytes(b"this is not a sqlite database")
 
     with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**census.kwargs(commit=_Recorder(effect=clobber_ledger)))
+        outcome = mod.run_census(
+            **census.kwargs(commit=_Recorder(_LANDED, effect=clobber_ledger)),
+        )
 
     assert outcome.status == "done"
     assert outcome.ledger_rows_written is None

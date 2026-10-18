@@ -1615,6 +1615,65 @@ async def test_get_mem0_tombstone_absent_returns_none(store):
 
 
 @pytest.mark.asyncio
+async def test_mem0_tombstones_with_prefix_lists_only_this_projects_matching_tombstones(store):
+    """A uuid prefix reaches the tombstone rows whose memory id starts with it (task 5323).
+
+    The store is keyed by the FULL memory id, so a prefix needs its own
+    listing. Project, record kind and the prefix itself each scope it, and
+    each row is the same record the exact-id read returns.
+    """
+    reify_b = 'bff81530-0000-4000-8000-00000000000b'
+    reify_a = 'bff81530-0000-4000-8000-00000000000a'
+    for project_id, memory_id in (
+        ('reify', reify_b),
+        ('reify', reify_a),
+        ('other', 'bff81530-0000-4000-8000-00000000000c'),
+        ('reify', 'cafe0000-0000-4000-8000-000000000001'),
+    ):
+        await record_mem0_deletion_tombstone(
+            _tombstone_ms(store),
+            project_id,
+            memory_id,
+            victim_metadata={},
+            victim_created_at=None,
+            deleter='stage1_cycle_summary_trim',
+            deleting_run_id='run-deleter',
+        )
+    await store.upsert(ReconLedgerRecord(
+        project_id='reify',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='bff81530-0000-4000-8000-00000000000d',
+        flag_type='f1',
+    ))
+
+    rows = await store.mem0_tombstones_with_prefix('reify', 'bff81530')
+
+    assert [row.task_id for row in rows] == [reify_a, reify_b]
+    assert rows == [await store.get_mem0_tombstone('reify', memory_id) for memory_id in (reify_a, reify_b)]
+
+
+@pytest.mark.asyncio
+async def test_mem0_tombstones_with_prefix_is_a_literal_case_sensitive_match(store):
+    """LIKE would fold case and read %/_ as wildcards; the prefix must not."""
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'reify',
+        'bff81530-0000-4000-8000-00000000000a',
+        victim_metadata={},
+        victim_created_at=None,
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-deleter',
+    )
+
+    assert await store.mem0_tombstones_with_prefix('reify', 'BFF81530') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff8153_') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff%') == []
+
+
+@pytest.mark.asyncio
 async def test_repeat_tombstone_for_same_victim_keeps_one_row(store):
     """A second tombstone for the same victim upserts in place (row count 1).
 

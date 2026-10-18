@@ -20,7 +20,9 @@ Its git plumbing is why these tests live in their own module rather than in
 a module under ``orchestrator/tests`` can import ``_orch_helpers``'s
 ``assert_isolated_git_repo`` / ``git_env_with_ceiling`` -- the two per-call
 layers of the esc-3072-3 defence that every git-in-tmp_path test here must use.
-The instrument's own pure helpers stay unit-tested next to the instrument.
+The pure faces this gate calls are unit-tested in
+``test_merge_lane_ratchet_commit_delta.py``, the rest of the instrument in
+``test_merge_lane_ratchet.py``.
 
 EVERY REFUSAL PINS THE EXIT CODE rather than merely non-zero. The ladder -- 0
 clean, 1 a policy refusal this commit must fix, 2 the gate could not do its job
@@ -41,22 +43,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-
-# The seed report is IMPORTED, never re-declared: a second synthetic baseline
-# would drift from the one the instrument's own unit tests pin, and the two
-# would then disagree about what a raise looks like. It sits in a fixtures
-# module of its own rather than in either suite -- see that module's docstring.
-from _merge_lane_ratchet_fixtures import synthetic_report
+from _merge_lane_ratchet_fixtures import metrics, synthetic_report
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
-
-# Same bootstrap as test_merge_lane_ratchet.py, and for the same reason:
-# orchestrator/pyproject.toml's [tool.pyright] extraPaths already carries
-# "../scripts", so importing the instrument needs no new config.
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-
-import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
 _GATE = _REPO_ROOT / metrics.COMMIT_GATE_RELPATH
@@ -1053,7 +1041,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         assert 'absent from both parents' in result.stdout
 
 
-#: The five real files a miniature repo needs before its hooks mean anything.
+#: The real files a miniature repo needs before its hooks mean anything.
 #: Copied VERBATIM rather than restated: if someone renames the auditor or drops
 #: the project-checks section, the copied hook stops refusing and these go red.
 _WIRED_FILES = (
@@ -1062,6 +1050,8 @@ _WIRED_FILES = (
     'scripts/merge_lane_metrics.py',
     'scripts/source_measures.py',
     'scripts/check_staged_ratchet_raise.py',
+    'scripts/_checkout.py',
+    'pyproject.toml',
 )
 
 

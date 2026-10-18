@@ -21,8 +21,9 @@ the names it uses, so one that needs the slicer alone, or the detector alone,
 pays nothing for the co-location, and every suite that uses the scaffold also
 slices. Splitting (2)+(3) into a sibling is the right move once this module
 outgrows one file. The import lines are not all that would move with them:
-scripts/tests/test_deploy_w5_recon_reliability.py pins
-`shell_sections.py::SIGPIPE_BULK_BYTES` by name.
+comments under scripts/tests/, which cannot import from this directory, pin
+`shell_sections.py::SIGPIPE_BULK_BYTES` by name — grep for that name before
+moving the constant.
 
 Sibling-helper module, following the `systemd_unit_invariants.py` precedent that
 tests/scripts/conftest.py explicitly supports: pyproject sets

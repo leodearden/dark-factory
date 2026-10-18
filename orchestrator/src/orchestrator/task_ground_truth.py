@@ -92,12 +92,12 @@ from shared.deploy_state import DeployPhase, DeployState
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     compose_claimant_run_id,
-    is_stranded,
+    is_stranded_any_status,
 )
 from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import LeaveReason, render_shape
 from orchestrator.recovery_pins import (
     records_pin_blocked_done_flip,
@@ -566,8 +566,8 @@ class TaskGroundTruth:
         1. ``scheduler.is_actively_held(tid)`` — the in-memory public
            accessor (task 2235).
         2. A fresh W2 db claimant: ``claimant_run_id`` present AND NOT
-           ``shared.task_claimant.is_stranded`` against the injected
-           ``now_fn``/``heartbeat_ttl``.
+           ``shared.task_claimant.is_stranded_any_status`` against the
+           injected ``now_fn``/``heartbeat_ttl``.
         3. A live ``plan.lock`` (owner_pid alive AND ``locked_at`` within
            ``heartbeat_ttl`` of ``now_fn()`` — see :func:`_lock_fresh`; the
            staleness cross-check guards against a PID-reuse false-live read,
@@ -582,24 +582,18 @@ class TaskGroundTruth:
            targets, with no legacy fallback (task 4028 — see the comment at
            the read site below).
 
-        A present-but-stale db claimant (``is_stranded`` True) collapses
-        straight to ``None`` — it deliberately does NOT fall through to the
-        plan.lock check, which exists solely for the claimant-absent case.
+        A present-but-stale db claimant (``is_stranded_any_status`` True)
+        collapses straight to ``None`` — it deliberately does NOT fall through
+        to the plan.lock check, which exists solely for the claimant-absent
+        case.
 
-        NOTE (``is_stranded`` is in-progress-only): ``is_stranded`` returns
-        False unconditionally whenever ``db_status`` is anything other than
-        ``'in-progress'`` (its own contract — task 2182). So a non-in-progress
-        task (e.g. ``blocked``) that still carries a non-blank
-        ``claimant_run_id`` — left behind by a crash rather than a clean
-        release, which clears it (harness.py:5810) — is treated as LIVE here
-        regardless of heartbeat age, and ``classify_recovery`` then defers to
-        LEAVE rather than reaching the blocked/no-claimant
-        RE_FILE_ESCALATION row (g). This is an accepted, intentionally scoped
-        edge case, pinned by
-        ``test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design``
-        — not an oversight. Broadening the staleness check to non-in-progress
-        statuses would mean re-deriving ``is_stranded``'s own contract here;
-        left to a follow-up if this edge case proves to matter in practice.
+        The staleness read is status-agnostic (C4-E6): a claimant stale past
+        ``heartbeat_ttl`` is dead on any status, so a stranded ``blocked`` row
+        reaches ``_RECOVERY`` row (g). The legacy ``metadata.infra_hold``
+        carve-out is retained, so such a row stays live and never takes row
+        (c)/(d) REVERT_TO_PENDING. Rationale:
+        docs/prds/claimant-invariant-enforcement.md D4; pinned by
+        test_task_ground_truth.py::TestDeriveTruthLiveClaimant::test_stale_db_claimant_on_blocked_task_is_not_live.
 
         *task* is the already-fetched row (:meth:`derive_truth` fetches it
         exactly once and shares it across every field that needs it) and
@@ -615,7 +609,7 @@ class TaskGroundTruth:
 
         claimant_run_id = task.get('claimant_run_id')
         if claimant_run_id and str(claimant_run_id).strip():
-            if is_stranded(task, self.now_fn(), self.heartbeat_ttl):
+            if is_stranded_any_status(task, self.now_fn(), self.heartbeat_ttl):
                 return None
             return Claimant(
                 run_id=claimant_run_id,
@@ -933,13 +927,6 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # shape is absent from this table and falls through to the LEAVE
     # default — re-filing over an already-open escalation would risk a
     # duplicate/competing one (review finding #1).
-    # NOTE (θ2 visibility): unreachable for a 'blocked' task that still
-    # carries a stale-but-present db claimant_run_id — is_stranded is
-    # in-progress-only, so that shape resolves live_claimant=True and hits
-    # the LEAVE default instead of this row. Accepted, intentionally scoped
-    # blind spot — see the NOTE in _resolve_live_claimant's docstring for
-    # the full rationale and the follow-up path if it bites in practice
-    # (review finding).
     (TaskStatus.BLOCKED, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.RE_FILE_ESCALATION,
     # (h) D1: a deterministic deploy crashed between 'ran' and 'verified',

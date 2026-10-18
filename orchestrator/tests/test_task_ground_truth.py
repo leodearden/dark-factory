@@ -38,7 +38,7 @@ from shared.deploy_state import DeployPhase
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, compose_claimant_run_id
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,
@@ -701,7 +701,7 @@ class TestDeriveTruthLiveClaimant:
 
     1. ``scheduler.is_actively_held(tid)`` (in-memory, TG-3 public accessor).
     2. A fresh W2 db claimant (``claimant_run_id`` present AND NOT
-       ``is_stranded``).
+       ``is_stranded_any_status``).
     3. A live ``plan.lock`` — consulted ONLY when the db claimant is
        genuinely absent (pre-2182 rows); a present-but-stale db claimant
        collapses straight to ``None`` and never falls through to plan.lock.
@@ -795,15 +795,9 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
-    async def test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design(self) -> None:
-        # is_stranded (task 2182) returns False unconditionally for any
-        # status other than 'in-progress' — so a 'blocked' task with a
-        # stale-but-present claimant_run_id resolves to a LIVE db Claimant
-        # here, not None. This is an intentionally scoped edge case (see the
-        # NOTE in _resolve_live_claimant's docstring), not an oversight:
-        # classify_recovery folds live_claimant=True into LEAVE, so the
-        # blocked/no-claimant RE_FILE_ESCALATION row (g) is unreachable for
-        # this specific stranded-blocked shape (review finding #2).
+    async def test_stale_db_claimant_on_blocked_task_is_not_live(self) -> None:
+        """A claimant stale past the TTL is dead on any status
+        (docs/prds/claimant-invariant-enforcement.md D4 / C4-E6)."""
         fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
         task = {
             'status': 'blocked',
@@ -817,11 +811,7 @@ class TestDeriveTruthLiveClaimant:
 
         report = await resolver.derive_truth('28')
 
-        assert report.live_claimant == Claimant(
-            run_id='run-1/session-1/pid=123',
-            heartbeat_at='2026-07-12T00:00:00+00:00',
-            source=ClaimantSource.DB,
-        )
+        assert report.live_claimant is None
 
     async def test_plan_lock_dead_owner_pid_returns_none(self, tmp_path: Path) -> None:
         # _pid_alive(2**31 - 1) is deterministically False — not a valid
@@ -1736,6 +1726,29 @@ class TestDeriveTruthRemainingFields:
 # ---------------------------------------------------------------------------
 
 
+_CLAIMED_RUN_ID = 'run-1/session-1/pid=123'
+
+
+async def _recover_claimed_row(
+    *, status: str, heartbeat_at: str, metadata: dict | None = None,
+) -> tuple[TruthReport, RecoveryAction]:
+    """``recovery_for`` over a claimed row at 2026-07-12T12:00Z, TTL 10 minutes,
+    branch GONE_NO_MARKER and no open escalation."""
+    task = {
+        'status': status,
+        'claimant_run_id': _CLAIMED_RUN_ID,
+        'heartbeat_at': heartbeat_at,
+        'metadata': metadata or {},
+    }
+    resolver = _make_ground_truth(
+        scheduler=_fake_scheduler(is_actively_held=False, task=task),
+        escalation_queue=_fake_escalation_queue(),
+        now_fn=lambda: datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC),
+        heartbeat_ttl=timedelta(minutes=10),
+    )
+    return await resolver.recovery_for('4623')
+
+
 @pytest.mark.asyncio
 class TestRecoveryFor:
     """``recovery_for(tid)`` composes ``derive_truth`` -> ``classify_recovery``
@@ -1804,6 +1817,41 @@ class TestRecoveryFor:
         assert report.branch_state == BranchState(BranchStateKind.GONE_NO_MARKER, None)
         assert report.deploy_phase == DeployPhase.RAN
         assert action == RecoveryAction.RE_FILE_ESCALATION
+
+    # B7-B9: docs/prds/claimant-invariant-enforcement.md boundary rows for
+    # the status-agnostic liveness read (task 4623). Each row is a
+    # GONE_NO_MARKER branch with no open escalation.
+
+    async def test_b7_stale_claimant_blocked_gone_no_marker_refiles(self) -> None:
+        report, action = await _recover_claimed_row(
+            status='blocked', heartbeat_at='2026-07-12T00:00:00+00:00',
+        )
+
+        assert report.live_claimant is None
+        assert action == RecoveryAction.RE_FILE_ESCALATION
+
+    async def test_b8_fresh_claimant_blocked_is_still_live_and_left(self) -> None:
+        report, action = await _recover_claimed_row(
+            status='blocked', heartbeat_at='2026-07-12T11:55:00+00:00',
+        )
+
+        assert report.live_claimant == Claimant(
+            run_id=_CLAIMED_RUN_ID,
+            heartbeat_at='2026-07-12T11:55:00+00:00',
+            source=ClaimantSource.DB,
+        )
+        assert action == RecoveryAction.LEAVE
+
+    async def test_b9_infra_hold_carve_out_keeps_stale_in_progress_row_live(self) -> None:
+        report, action = await _recover_claimed_row(
+            status='in-progress',
+            heartbeat_at='2026-07-12T00:00:00+00:00',
+            metadata={'infra_hold': True},
+        )
+
+        assert report.live_claimant is not None
+        assert report.live_claimant.source == ClaimantSource.DB
+        assert action == RecoveryAction.LEAVE
 
 
 # ---------------------------------------------------------------------------

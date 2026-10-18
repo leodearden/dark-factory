@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import importlib.resources
 import logging
+import math
 import os
 import re
 import stat
@@ -40,6 +41,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
+from orchestrator.verify_admission_gate import AdmissionOrder
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,15 @@ TIER_BASE: dict[str, int] = {
     'low': 2000,
     'polish': 1000,
 }
+
+# Defaults of ScoringConfig's sub-budgets (plans/scheduler-dispatch-scoring-and-
+# lock-layer-prd.md C2).  Each bonus term is bounded by its own budget, and the
+# budgets together stay inside one TIER_WIDTH (I-1), so no term masks another.
+CPM_BUDGET: float = 300.0
+CPM_D_CAP: int = 32
+AGE_BUDGET: float = 500.0
+AGE_HALF_SECS: float = 259200.0
+CONTINUITY_CREDIT: float = 120.0
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
@@ -579,6 +590,86 @@ class FairnessConfig(BaseModel):
                 )
             )
         return int(self.skip_threshold)
+
+
+class ScoringConfig(BaseModel):
+    """Dispatch-score sub-budgets (task 3819; plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C2).
+
+    A candidate scores ``TIER_BASE[tier]`` plus three bonus terms, each capped
+    by its own budget, so a saturated term can never mask the others:
+    critical-path weight (``cpm_budget``), pending age (``age_budget``) and
+    work-product continuity (``continuity_credit``).  The scheduler arms this
+    formula only on ticks where at least ``new_scoring_min_anchor_coverage``
+    of the candidates carry a usable ``pending_since`` anchor (PRD I-6).
+
+    Plain BaseModel (no ``validate_assignment``) so ``_set_leaf`` can write a
+    multi-leaf retune one leaf at a time — see :class:`MergeDeepConfig`.  The
+    cross-leaf invariants still bind a reload: ``apply_reload`` re-validates
+    the whole config afterwards and rolls back on failure.  Every leaf is
+    green-tier (PRD D8).
+    """
+
+    cpm_budget: float = Field(
+        default=CPM_BUDGET,
+        gt=0,
+        description='Ceiling of the critical-path term, reached at cpm_d_cap transitive dependents (PRD C2).',
+    )
+    cpm_d_cap: int = Field(
+        default=CPM_D_CAP,
+        ge=1,
+        description='Transitive-dependent count at which the critical-path term saturates (PRD C2).',
+    )
+    age_budget: float = Field(
+        default=AGE_BUDGET,
+        gt=0,
+        description='Ceiling the pending-age term approaches as a task waits (PRD C2).',
+    )
+    age_half_secs: float = Field(
+        default=AGE_HALF_SECS,
+        gt=0,
+        description='Seconds pending at which the age term reaches half of age_budget (PRD C2).',
+    )
+    continuity_credit: float = Field(
+        default=CONTINUITY_CREDIT,
+        ge=0,
+        description='Flat credit for a task that already carries work product (PRD C2).',
+    )
+    new_scoring_min_anchor_coverage: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Share of a tick\'s candidates that must carry a usable pending_since '
+            'anchor for that tick to score on the sub-budget formula; below it the '
+            'whole tick falls back to the legacy formula (PRD D12, I-6).'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _reject_budget_sum_crossing_tier(self) -> 'ScoringConfig':
+        total = self.cpm_budget + self.age_budget + self.continuity_credit
+        if total > TIER_WIDTH - 1:
+            raise ValueError(
+                'ScoringConfig.cpm_budget + age_budget + continuity_credit '
+                f'({self.cpm_budget} + {self.age_budget} + {self.continuity_credit} '
+                f'= {total}) must be <= TIER_WIDTH - 1 ({TIER_WIDTH - 1}); a larger '
+                'sum lets a bonus lift a task across a priority-tier boundary. '
+                'Lower one of the three budgets.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _reject_continuity_above_cpm_d4(self) -> 'ScoringConfig':
+        cpm_at_d4 = self.cpm_budget * math.log1p(4) / math.log1p(self.cpm_d_cap)
+        if self.continuity_credit >= cpm_at_d4:
+            raise ValueError(
+                f'ScoringConfig.continuity_credit ({self.continuity_credit}) must be '
+                f'< the critical-path term at four dependents ({cpm_at_d4:.4f}, from '
+                f'cpm_budget={self.cpm_budget} and cpm_d_cap={self.cpm_d_cap}); '
+                'otherwise resuming a half-done task outranks unblocking four others. '
+                'Lower continuity_credit, or raise cpm_budget.'
+            )
+        return self
 
 
 class StarvationWatchdogConfig(BaseModel):
@@ -1108,7 +1199,7 @@ class SpeculationProbeConfig(BaseModel):
     P(pass|depth) curve.
 
     ``probe_fraction=0.0`` (the default) disables the mechanism entirely:
-    :func:`orchestrator.merge_queue.select_probe_depth` always returns
+    :func:`orchestrator.merge_lane.worker.select_probe_depth` always returns
     ``None`` at fraction<=0, so dispatch falls through to the unchanged
     ``_verify_frontier_depth()`` path -- byte-identical to pre-task-2359
     behaviour.
@@ -1687,9 +1778,15 @@ class LaneCommand(BaseModel):
     (a shell string, via ``sh -c``) at idle nice/ionice in ``<worktree>/<cwd>``
     with ``DF_VERIFY_ROLE=offline``, off the merge hot path, always from the
     current ``main`` head. A red result routes through the existing
-    ``OfflineLaneWorker`` red path (confirm → fingerprint → dedup'd fix task →
-    staged L2), filing the fix task at ``fix_task_priority`` — no new mechanism
-    (INV-5). This generalizes the previously reify-hard-coded run seams to
+    ``OfflineLaneWorker`` red path: a red detection run is confirmed and
+    narrowed to the named tests; a command that declares ``outage_probe``
+    runs it first, and a probe that exits 75 naming a dependency makes the
+    pass an outage, escalated rather than filed; each failing test is a
+    per-test episode; an episode is filed as one fix task (at ``fix_task_priority``) once it is
+    reproduced on ``git.offline_lane_persist_passes`` spaced passes, with one
+    bounded level-1 escalation if the fix is unlanded after
+    ``git.offline_lane_red_unlanded_hours`` (plans/offline-lane-red-path-prd.md).
+    This generalizes the previously reify-hard-coded run seams to
     per-project config (PRD plans/integration-test-lane-prd.md, task alpha).
     """
 
@@ -1702,14 +1799,11 @@ class LaneCommand(BaseModel):
     command: str = Field(
         description=(
             'Shell command string launched via ``sh -c`` for this sub-run '
-            '(e.g. ``pytest -m integration``). Required. NOTE: the default '
-            'confirm/dedup path is pytest-oriented — it serializes via '
-            '``_serial_pytest_str`` and extracts still-failing pytest '
-            'node-ids. A non-pytest command that reproduces red (non-zero '
-            'exit, no parseable node-ids) is filed under a stable '
-            '``<name>::nonzero-exit`` sentinel rather than being swallowed as '
-            'a flake; inject a custom ``command_confirmation_runner`` for '
-            'richer per-failure dedup.'
+            '(e.g. ``pytest -m integration``). Required. A command that '
+            'exits non-zero while naming no test is held and filed under the '
+            "lane's unconfirmable pseudo-test "
+            '(``offline_lane_episode_state.py::UNCONFIRMABLE_SUFFIX``) rather '
+            'than being swallowed as a flake.'
         ),
     )
     cwd: str = Field(
@@ -1734,6 +1828,37 @@ class LaneCommand(BaseModel):
         description=(
             'When False this command is skipped by the offline-lane runner '
             '(a config-only off switch that leaves the entry in place).'
+        ),
+    )
+    outage_probe: str | None = Field(
+        default=None,
+        description=(
+            'Optional shell command run via ``sh -c`` once after a red '
+            'detection run, in ``<worktree>/<cwd>`` with the command\'s '
+            'environment but at normal priority (no idle nice/ionice). Exit 0 '
+            'means every external service the tests use is usable, and the red '
+            'goes to the confirm. Exit 75 '
+            '(``shared/src/shared/lane_probe.py::OUTAGE_EXIT_STATUS``) with a '
+            'first stdout line naming the failed dependency makes the pass an '
+            'outage, escalated rather than filed. Anything else, the timeout '
+            'included, is a broken probe, and the red goes to the confirm as if '
+            'none were declared (plans/offline-lane-red-path-prd.md D7). Read '
+            'by ``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
+        ),
+    )
+    outage_probe_timeout_secs: int = Field(
+        default=180,
+        ge=1,
+        description=(
+            'Seconds (default 180) the outage probe may run before its process '
+            'group is killed; a timeout is a broken probe. Read by '
+            '``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
         ),
     )
 
@@ -1968,15 +2093,41 @@ class GitConfig(BaseModel):
             'included) never widens what counts as a stale lock.'
         ),
     )
-    offline_lane_red_advances_before_blocker: int = Field(
-        default=3,
+    offline_lane_persist_passes: int = Field(
+        default=2,
         ge=1,
         description=(
-            'N = number of consecutive confirmed-red advances (same failing-'
-            'test-set fingerprint) the offline-deep lane worker (β3, PRD '
-            '§11.3 / C4) tolerates before promoting its filed fix task to a '
-            'born-at-L2 escalate_blocker. Not frozen — retunable via '
-            'orchestrator.yaml without a code change.'
+            'Number of counted passes (default 2) on which a per-test red '
+            'must reproduce before the offline-deep lane files its fix task '
+            '(PRD plans/offline-lane-red-path-prd.md D5); 1 restores filing '
+            'on the first reproduced pass. Read by '
+            '``offline_lane_episodes.lane_policy`` at every pass and tick, '
+            'never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_recheck_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'Minimum start-to-start spacing (seconds, default 1800.0) of '
+            'counted offline-lane passes, and the delay before a held red is '
+            're-observed (PRD D5, D12). '
+            'Read by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_red_unlanded_hours: float = Field(
+        default=24.0,
+        gt=0,
+        description=(
+            'Hours (default 24.0) a filed red may stay unlanded before the '
+            'lane raises its one bounded level-1 escalation (PRD D11); also '
+            'the expiry of a held episode (D5), one knob serving both. Read '
+            'by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
         ),
     )
     offline_lane_commands: list[LaneCommand] = Field(
@@ -1986,8 +2137,9 @@ class GitConfig(BaseModel):
             'entry drives one additional offline-lane sub-run — launched at '
             'idle nice/ionice via ``sh -c`` in ``<worktree>/<cwd>`` with '
             '``DF_VERIFY_ROLE=offline``, off the merge hot path, always from '
-            'head — that reuses the existing red path (confirm → dedup fix '
-            'task → staged L2). Generic commands run IN ADDITION to whichever '
+            'head — that reuses the existing red path (confirm → per-test '
+            'episodes → fix task filed on persistence); a declared '
+            '``outage_probe`` can turn a red into an escalated outage. Generic commands run IN ADDITION to whichever '
             'legacy seams (numeric / infra) are enabled. Defaults to [] '
             '(opt-in, byte-identical no-op). Uses default_factory to avoid a '
             'shared mutable default across model instances.'
@@ -3543,6 +3695,10 @@ class OrchestratorConfig(BaseSettings):
     # verify_env): read fresh each verify with no in-flight-split risk.
     # Deliberately NOT in _OVERRIDABLE_FIELDS — it is a whole-worktree concern,
     # not a per-module override.
+    # Remote verifies receive this value in their spec (MergeVerifySpec /
+    # TaskVerifySpec, applied by verify_spec_shared.py::apply_spec_to_host_config),
+    # so the deployed value still lives only in dark-factory-orchestrator.yaml,
+    # and a remote host's copy is a fallback.
     verify_cold_preprovision_command: str = Field(default='')
 
     # Per-model USD/1M-token prices for backends without native cost
@@ -3770,6 +3926,15 @@ class OrchestratorConfig(BaseSettings):
     # load/reload instead of silently reaching pytest-xdist and failing the
     # whole test leg at verify time.
     verify_admission_pytest_n: str = Field(default='auto')
+    # The in-process admission gate in front of that flock slot (task 5628;
+    # plans/verify-admission-fifo-prd.md). The code default 'unordered' keeps
+    # today's random winner; a project flips to 'arrival' in its yaml. Promote
+    # is the gate age at which a background waiter ranks with task verifies,
+    # keeping its own arrival stamp. The alarm age sits above today's p90 wait
+    # (about 11h), so it is not a standing alarm.
+    verify_admission_order: AdmissionOrder = Field(default='unordered')
+    verify_admission_background_promote_secs: float = Field(default=7200.0, gt=0)
+    verify_admission_wait_alarm_secs: float = Field(default=43200.0, gt=0)
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
@@ -3816,6 +3981,16 @@ class OrchestratorConfig(BaseSettings):
         description='Deprecated — set max_turns.simple_task instead.',
     )
 
+    strict_mcp_config: bool = Field(
+        default=False,
+        description=(
+            'Scope every TaskWorkflow agent invocation to ONLY the orchestrator-built '
+            'mcp_config (--strict-mcp-config), ignoring the ambient project .mcp.json. '
+            'False in production (argv unchanged); EVAL_PROFILE sets it True so an eval '
+            'agent cannot reach live escalation / task DB / fused-memory (task 4757).'
+        ),
+    )
+
     # Auto-eval — when the optimistic path (B-skip or C-simple) blocks at
     # plan/execute/verify/review, automatically rerun the same task from the
     # same branchpoint via the full architect path. The original branch and
@@ -3835,7 +4010,10 @@ class OrchestratorConfig(BaseSettings):
         default_factory=lambda: {'plan', 'execute', 'verify', 'review'},
         description=(
             'Block phases that trigger auto-eval. Merge/infra failures are '
-            'excluded — they are unlikely to differ on the full path.'
+            'excluded — they are unlikely to differ on the full path; '
+            'infra-class block categories are excluded by '
+            'orchestrator/src/orchestrator/harness.py::'
+            '_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES whatever their phase.'
         ),
     )
 
@@ -4788,6 +4966,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Scheduler fairness / anti-starvation
     fairness: FairnessConfig = Field(default_factory=FairnessConfig)
+
+    # Dispatch-score sub-budgets (task 3819).  An absent stanza yields the
+    # default instance; age_alpha / cpm_beta below remain the legacy formula's
+    # knobs, which the anchor-coverage gate still falls back to.
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
 
     # Scheduler starvation watchdog (task 1880).
     starvation_watchdog: StarvationWatchdogConfig = Field(
@@ -5896,6 +6079,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
+    # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
+    # which is why the old age_alpha / cpm_beta constants were never tuned.
+    # I-1 / I-3 still bind a reload through apply_reload's whole-config
+    # re-validation.
+    _submodel_leaf_paths('scoring', ScoringConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a
@@ -6035,10 +6224,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # picked up by the very next invocation.
         'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
-        # leaf-mutation only per I3)
+        # leaf-mutation only per I3); the persistence trio is read by
+        # `offline_lane_episodes.lane_policy` at every pass, never cached
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
-        'git.offline_lane_red_advances_before_blocker',
+        'git.offline_lane_persist_passes',
+        'git.offline_lane_recheck_secs',
+        'git.offline_lane_red_unlanded_hours',
         # advance_main's foreign-index-lock stand-off budget (task 3060) —
         # a leaf-mutation-only tuning knob re-read per advance (never
         # captured at startup), so a reload takes effect on the very next
@@ -6055,7 +6247,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Verify admission control (task 2390 T2; task 2394 T6 adds the
         # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
         # can retune slot counts / nice tiers / the -n cap / toggle the gate
-        # without a process restart.
+        # without a process restart. The admission gate's knobs (task 5628)
+        # are read at each grant (slots/order/promote) or each watch tick
+        # (alarm), so a reload applies to the next grant or tick.
         'verify_admission_enabled',
         'verify_admission_task_slots',
         'verify_admission_slots_dir',
@@ -6063,6 +6257,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'verify_admission_nice_task',
         'verify_admission_nice_background',
         'verify_admission_pytest_n',
+        'verify_admission_order',
+        'verify_admission_background_promote_secs',
+        'verify_admission_wait_alarm_secs',
         # Per-role verify scope CPUWeight (task 5205): read at each verify scope
         # spawn (verify.py::_resolve_scope_cpu_weight), so a reload applies from
         # the next spawn; a scope already running keeps the weight it started with.

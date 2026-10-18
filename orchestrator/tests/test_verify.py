@@ -1855,6 +1855,301 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestParsePytestFailures:
+    """``parse_pytest_failures`` types each failing test by kind and first failure line."""
+
+    FAILED = verify.FailureKind.FAILED
+    ERROR = verify.FailureKind.ERROR
+
+    def _parse(self, output: str) -> list[tuple[str, str, str]]:
+        return [
+            (f.node_id, f.kind.value, f.first_line) for f in verify.parse_pytest_failures(output)
+        ]
+
+    def test_failed_line_is_kind_failed(self):
+        assert self._parse('FAILED tests/a.py::test_x - assert 1 == 2') == [
+            ('tests/a.py::test_x', 'failed', 'assert 1 == 2'),
+        ]
+
+    def test_error_node_line_is_kind_error(self):
+        assert self._parse('ERROR tests/a.py::test_x - RuntimeError: setup') == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: setup'),
+        ]
+
+    def test_bare_error_file_line_is_kind_error(self):
+        assert self._parse('ERROR tests/a.py - ImportError: nope') == [
+            ('tests/a.py', 'error', 'ImportError: nope'),
+        ]
+
+    def test_xdist_crash_notice_is_kind_failed(self):
+        output = "worker 'gw1' crashed while running 'tests/a.py::test_x'"
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_node_down_preceding_line_is_kind_failed(self):
+        output = 'tests/a.py::test_x\n[gw0] node down: Not properly terminated\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_summary_reason_is_stripped_of_line_ending_and_trailing_spaces(self):
+        output = 'FAILED tests/a.py::test_x - AssertionError: boom  \r\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'AssertionError: boom')]
+
+    def test_first_line_keeps_everything_after_first_separator(self):
+        output = 'FAILED tests/a.py::test_x - ValueError: a - b\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'ValueError: a - b')]
+
+    def test_error_without_reason_takes_e_line_of_its_own_section(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at setup of test_other ___\n'
+            'E   KeyError: other\n'
+            '___ ERROR at setup of test_x ___\n'
+            'x = 1\n'
+            'E   RuntimeError: fixture exploded\n'
+            'E   second line\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: fixture exploded'),
+        ]
+
+    def test_section_of_parametrised_id_is_matched_by_full_id(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at setup of test_x[1] ___\n'
+            'E   KeyError: one\n'
+            '___ ERROR at setup of test_x[2] ___\n'
+            'E   KeyError: two\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py::test_x[2]\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x[2]', 'error', 'KeyError: two')]
+
+    def test_section_of_class_qualified_id_uses_dotted_header(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ TestBox.test_x ___\n'
+            'E   AssertionError: boxed\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::TestBox::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::TestBox::test_x', 'failed', 'AssertionError: boxed'),
+        ]
+
+    def test_collection_error_takes_e_line_of_collecting_section(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR collecting tests/a.py ___\n'
+            'E   ModuleNotFoundError: no module named zz\n'
+            '=== short test summary info ===\n'
+            'ERROR tests/a.py\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py', 'error', 'ModuleNotFoundError: no module named zz'),
+        ]
+
+    def test_failed_and_error_sections_of_one_node_are_kept_apart(self):
+        output = (
+            '=== ERRORS ===\n'
+            '___ ERROR at teardown of test_x ___\n'
+            'E   OSError: teardown\n'
+            '=== FAILURES ===\n'
+            '___ test_x ___\n'
+            'E   AssertionError: body\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x\n'
+            'ERROR tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', 'AssertionError: body'),
+            ('tests/a.py::test_x', 'error', 'OSError: teardown'),
+        ]
+
+    def test_first_line_is_empty_without_reason_or_section(self):
+        assert self._parse('ERROR tests/a.py::test_x\n') == [('tests/a.py::test_x', 'error', '')]
+
+    def test_section_without_e_line_leaves_first_line_empty(self):
+        output = (
+            '___ test_x ___\n'
+            'plain output\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_e_line_after_the_section_ends_is_not_taken(self):
+        output = (
+            '___ test_x ___\n'
+            'plain output\n'
+            '___ test_y ___\n'
+            'E   KeyError: belongs to y\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_same_named_tests_in_two_files_each_take_their_own_section(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ test_x ___\n'
+            'tests/a.py:3: in test_x\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'tests/b.py:9: in test_x\n'
+            'E   ValueError: from b\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/b.py::test_x\n'
+            'FAILED tests/a.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/b.py::test_x', 'failed', 'ValueError: from b'),
+            ('tests/a.py::test_x', 'failed', 'KeyError: from a'),
+        ]
+
+    def test_same_named_tests_whose_sections_name_no_path_leave_first_line_empty(self):
+        output = (
+            '___ test_x ___\n'
+            'E   KeyError: from a\n'
+            '___ test_x ___\n'
+            'E   ValueError: from b\n'
+            'FAILED tests/a.py::test_x\n'
+            'FAILED tests/b.py::test_x\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', ''),
+            ('tests/b.py::test_x', 'failed', ''),
+        ]
+
+    def test_extract_failing_test_ids_returns_every_reasonless_failure(self):
+        count = 500
+        output = (
+            ''.join(f'___ test_{i} ___\nE   Boom: {i}\n' for i in range(count))
+            + ''.join(f'FAILED tests/a.py::test_{i}\n' for i in range(count))
+        )
+        assert verify._extract_failing_test_ids(output) == [
+            f'tests/a.py::test_{i}' for i in range(count)
+        ]
+
+    def test_xdist_crash_has_no_section_first_line(self):
+        output = (
+            '___ test_x ___\n'
+            'E   KeyError: unrelated\n'
+            "worker 'gw1' crashed while running 'tests/a.py::test_x'\n"
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_crash_takes_reason_of_failed_line_for_same_node(self):
+        output = (
+            "worker 'gw1' crashed while running 'tests/a.py::test_x'\n"
+            'FAILED tests/a.py::test_x - worker crashed\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', 'worker crashed')]
+
+    def test_order_follows_position_across_interleaved_surfaces(self):
+        output = (
+            'FAILED tests/z.py::test_1 - a\n'
+            'ERROR tests/y.py::test_2 - b\n'
+            'FAILED tests/x.py::test_3 - c\n'
+            'ERROR tests/w.py - d\n'
+        )
+        assert [node for node, _, _ in self._parse(output)] == [
+            'tests/z.py::test_1',
+            'tests/y.py::test_2',
+            'tests/x.py::test_3',
+            'tests/w.py',
+        ]
+
+    def test_repeated_node_and_kind_is_one_entry_keeping_first_position(self):
+        output = (
+            'FAILED tests/a.py::test_x - first\n'
+            'FAILED tests/a.py::test_y - y\n'
+            'FAILED tests/a.py::test_x - second\n'
+        )
+        assert self._parse(output) == [
+            ('tests/a.py::test_x', 'failed', 'first'),
+            ('tests/a.py::test_y', 'failed', 'y'),
+        ]
+
+    def test_node_both_failed_and_error_is_two_entries_but_one_node_id(self):
+        output = 'FAILED tests/a.py::test_x - f\nERROR tests/a.py::test_x - e\n'
+        failures = verify.parse_pytest_failures(output)
+        assert [(f.kind, f.first_line) for f in failures] == [
+            (self.FAILED, 'f'),
+            (self.ERROR, 'e'),
+        ]
+        assert verify.node_ids_of(failures) == ['tests/a.py::test_x']
+
+    def test_empty_input_parses_to_empty_tuple(self):
+        assert verify.parse_pytest_failures('') == ()
+
+    def test_extract_failing_test_ids_is_the_node_ids_of_the_parse(self):
+        output = (
+            'FAILED tests/b.py::test_1 - x\n'
+            'ERROR tests/a.py::test_2\n'
+            'ERROR tests/c.py\n'
+            'FAILED tests/a.py::test_2 - y\n'
+            "worker 'gw1' crashed while running 'tests/d.py::test_4'\n"
+            'FAILED tests/b.py::test_1 - again\n'
+        )
+        assert verify._extract_failing_test_ids(output) == verify.node_ids_of(
+            verify.parse_pytest_failures(output),
+        )
+        assert verify._extract_failing_test_ids(output) == [
+            'tests/b.py::test_1',
+            'tests/a.py::test_2',
+            'tests/c.py',
+            'tests/d.py::test_4',
+        ]
+
+
+class TestReproducedFailures:
+    """``reproduced_failures(original, rerun)`` — the one home of the kind rule."""
+
+    FAILED = verify.FailureKind.FAILED
+    ERROR = verify.FailureKind.ERROR
+
+    def _failure(self, node_id: str, kind: verify.FailureKind) -> verify.PytestFailure:
+        return verify.PytestFailure(node_id, kind, '')
+
+    def test_failed_then_failed_is_reproduced(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_failed_then_error_is_not_reproduced(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == ()
+
+    def test_error_then_error_is_reproduced(self):
+        original = [self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_error_then_failed_is_reproduced(self):
+        original = [self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_a_rerun_node_absent_from_the_original_is_dropped(self):
+        original = [self._failure('t.py::a', self.FAILED)]
+        rerun = [self._failure('t.py::b', self.FAILED), self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == (rerun[1],)
+
+    def test_result_follows_rerun_order(self):
+        original = [self._failure('t.py::a', self.FAILED), self._failure('t.py::b', self.FAILED)]
+        rerun = [self._failure('t.py::b', self.FAILED), self._failure('t.py::a', self.FAILED)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_an_original_with_failed_and_error_for_one_node_accepts_error(self):
+        original = [self._failure('t.py::a', self.FAILED), self._failure('t.py::a', self.ERROR)]
+        rerun = [self._failure('t.py::a', self.ERROR)]
+        assert verify.reproduced_failures(original, rerun) == tuple(rerun)
+
+    def test_no_original_reproduces_nothing(self):
+        assert verify.reproduced_failures([], [self._failure('t.py::a', self.FAILED)]) == ()
+
+
 class TestExtractFailingTestIdsFromJunit:
     """``_extract_failing_test_ids_from_junit(path)`` parses a pytest junitxml
     report into a sorted, de-duplicated list of stable ``classname::name`` ids
@@ -1946,6 +2241,256 @@ class TestExtractFailingTestIdsFromJunit:
         ]
 
 
+class TestExtractTestIdsFromJunit:
+    """``_extract_test_ids_from_junit(path)`` — ONE parse, failing and skipped vectors.
+
+    Task 3226.  The failing vector alone leaves ``main_baseline_failing_ids``
+    unable to tell "main RAN this test and it passed" from "main never ran it";
+    only the first supports the task-fault conclusion the id-diff fast path in
+    ``verify_failure_is_preexisting_on_main`` draws.  The skipped vector is the
+    never-executed population, so it must hold exactly the tests the run did
+    not execute — an xfail ran.
+    """
+
+    # DELIBERATELY the failing parser's fixture, verbatim: the partition
+    # assertion below is that ONE report yields two disjoint vectors.
+    _JUNIT_XML = TestExtractFailingTestIdsFromJunit._JUNIT_XML
+
+    @staticmethod
+    def _parse(tmp_path: Path, xml: str) -> verify._JunitTestIds | None:
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(xml)
+        return verify._extract_test_ids_from_junit(junit_path)
+
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
+        )
+
+    def test_one_report_partitions_into_failing_and_skipped(self, tmp_path: Path):
+        """Failing and skipped are DISJOINT, a pass is in neither, and the
+        failing projection agrees with the pair."""
+        ids = self._parse(tmp_path, self._JUNIT_XML)
+
+        assert ids == (
+            ['tests.test_sample::test_error', 'tests.test_sample::test_fail'],
+            ['tests.test_sample::test_skip'],
+        ), ids
+        assert ids is not None
+        assert verify._extract_failing_test_ids_from_junit(tmp_path / 'junit.xml') == ids.failing
+
+    def test_nothing_skipped_is_an_empty_vector_not_none(self, tmp_path: Path):
+        """``[]`` ("junit collected, zero skipped") licenses "main ran
+        everything"; ``None`` (no report) licenses nothing."""
+        ids = self._parse(
+            tmp_path,
+            self._suite('<testcase classname="tests.test_sample" name="test_pass" />'),
+        )
+
+        assert ids == ([], [])
+
+    def test_xfail_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """pytest writes an xfail as ``<skipped type="pytest.xfail">``
+        (``_pytest/junitxml.py::_NodeReporter.append_skipped``), but the test
+        RAN.  Counting it as skipped would let the merge-queue reason say
+        "main never ran" about a test main did run."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_skip">'
+                '<skipped type="pytest.skip" message="no reify checkout">x</skipped>'
+                '</testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_skip']), ids
+
+    def test_strict_xpass_ran_so_it_is_not_skipped(self, tmp_path: Path):
+        """A strict XPASS is written as an UNTYPED ``<skipped>`` with a fixed
+        message (``_pytest/junitxml.py::_NodeReporter.append_failure``); it ran
+        too.  An untyped collection skip did not, and stays skipped."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xpass_strict">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+                '<testcase classname="t" name="test_module">'
+                '<skipped message="collection skipped">reason</skipped></testcase>',
+            ),
+        )
+
+        assert ids == ([], ['t::test_module']), ids
+
+    def test_a_testcase_with_a_failure_is_failing_whatever_else_it_records(
+        self, tmp_path: Path,
+    ):
+        """A skip in the call phase plus a teardown error lands in ``failing``
+        only, so the two vectors stay disjoint by construction."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_both">'
+                '<skipped type="pytest.skip" message="s" />'
+                '<error message="failed on teardown">boom</error></testcase>',
+            ),
+        )
+
+        assert ids == (['t::test_both'], []), ids
+
+    def test_bare_testsuite_root_is_handled(self, tmp_path: Path):
+        """A writer that omits the ``<testsuites>`` wrapper must not yield an
+        empty vector, which would read as "nothing skipped"."""
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="no reify checkout" type="pytest.skip" />'
+            '</testcase></testsuite>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'])
+
+    def test_both_vectors_share_the_classname_file_name_id_fallback(self, tmp_path: Path):
+        """The vectors are set-differenced against each other downstream, so
+        they must spell an id identically: classname, then file, then name."""
+        ids = self._parse(
+            tmp_path,
+            self._suite(
+                '<testcase file="tests/test_x.py" name="test_by_file">'
+                '<skipped message="s" /></testcase>',
+                '<testcase name="test_bare"><failure message="f" /></testcase>',
+            ),
+        )
+
+        assert ids == (['test_bare'], ['tests/test_x.py::test_by_file']), ids
+
+    def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
+        ids = self._parse(
+            tmp_path,
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites>'
+            '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '</testsuites>\n',
+        )
+
+        assert ids == ([], ['tests.test_sample::test_skip'])
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path):
+        """No junit collected — the B3 degrade signal, and NOT ``([], [])``,
+        which would license "main ran everything" from a report never written."""
+        assert verify._extract_test_ids_from_junit(tmp_path / 'missing.xml') is None
+
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_unparseable_report_returns_none(self, tmp_path: Path, content: str):
+        assert self._parse(tmp_path, content) is None
+
+
+class TestExtractTestOutcomesFromJunit:
+    """``extract_test_outcomes_from_junit(path)`` — passed and skipped per testcase, failing excluded."""
+
+    @staticmethod
+    def _read(tmp_path: Path, xml: str) -> dict[str, str] | None:
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(xml)
+        return verify.extract_test_outcomes_from_junit(junit_path)
+
+    @staticmethod
+    def _suite(*testcases: str) -> str:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            + ''.join(testcases)
+            + '</testsuite></testsuites>\n'
+        )
+
+    def test_passed_and_skipped_are_reported_by_classname_and_name(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="tests.test_a.TestX" name="test_pass" />',
+                '<testcase classname="tests.test_a" name="test_skip">'
+                '<skipped type="pytest.skip" message="no checkout">x</skipped></testcase>',
+            ),
+        )
+        assert outcomes == {
+            'tests.test_a.TestX::test_pass': 'passed',
+            'tests.test_a::test_skip': 'skipped',
+        }
+
+    def test_an_xfail_and_a_strict_xpass_ran_so_they_are_passed(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_xfail">'
+                '<skipped type="pytest.xfail" message="known bug" /></testcase>',
+                '<testcase classname="t" name="test_xpass">'
+                '<skipped message="xfail-marked test passes unexpectedly" /></testcase>',
+            ),
+        )
+        assert outcomes == {'t::test_xfail': 'passed', 't::test_xpass': 'passed'}
+
+    def test_failing_and_erroring_testcases_are_excluded(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            self._suite(
+                '<testcase classname="t" name="test_ok" />',
+                '<testcase classname="t" name="test_fail"><failure message="boom" /></testcase>',
+                '<testcase classname="t" name="test_err"><error message="boom" /></testcase>',
+            ),
+        )
+        assert outcomes == {'t::test_ok': 'passed'}
+
+    def test_a_bare_testsuite_root_is_read(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            '<testsuite name="pytest"><testcase classname="t" name="test_ok" /></testsuite>',
+        )
+        assert outcomes == {'t::test_ok': 'passed'}
+
+    def test_several_testsuites_under_a_wrapper_are_merged(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path,
+            '<testsuites>'
+            '<testsuite name="one"><testcase classname="a" name="test_x" /></testsuite>'
+            '<testsuite name="two"><testcase classname="b" name="test_y" /></testsuite>'
+            '</testsuites>',
+        )
+        assert outcomes == {'a::test_x': 'passed', 'b::test_y': 'passed'}
+
+    def test_a_report_without_testcases_is_an_empty_mapping_not_none(self, tmp_path: Path):
+        assert self._read(tmp_path, self._suite()) == {}
+
+    def test_a_missing_report_is_none(self, tmp_path: Path):
+        assert verify.extract_test_outcomes_from_junit(tmp_path / 'missing.xml') is None
+
+    @pytest.mark.parametrize('content', ['not valid xml <<<', ''], ids=['malformed', 'empty'])
+    def test_an_unreadable_report_is_none(self, tmp_path: Path, content: str):
+        assert self._read(tmp_path, content) is None
+
+    def test_ids_use_the_spelling_of_the_failing_reader(self, tmp_path: Path):
+        xml = self._suite(
+            '<testcase classname="tests.test_a" name="test_pass" />',
+            '<testcase file="tests/test_b.py" name="test_nofile" />',
+            '<testcase name="test_bare" />',
+        )
+        outcomes = self._read(tmp_path, xml)
+        assert outcomes == {
+            'tests.test_a::test_pass': 'passed',
+            'tests/test_b.py::test_nofile': 'passed',
+            'test_bare': 'passed',
+        }
+
+
 # ---------------------------------------------------------------------------
 # Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
 # — a plain JSON-native `list[str] | None` (mirrors the `contention` (task
@@ -1995,6 +2540,208 @@ class TestVerifyResultFailingTestIds:
 
         assert restored.failing_test_ids == []
         assert restored.failing_test_ids is not None
+
+
+class TestVerifyResultSkippedTestIds:
+    """VerifyResult carries `skipped_test_ids` beside `failing_test_ids` (task 3226).
+
+    Same three seams as the failing field — dataclass default, generic
+    asdict/**d codec, and `_aggregate_results` — because the two vectors are
+    consumed TOGETHER: a caller asks "did main run this test?" by checking one
+    against the other, and a field that survived only two of the three seams
+    would answer that question with stale or absent data at the third.
+
+    JSON-native `list[str] | None` like `contention`/`plan`/`failing_test_ids`,
+    so no serialization allowlist needs editing.
+    """
+
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_skipped_test_ids_is_none(self):
+        """None is the fail-OPAQUE default: no junit collected, nothing may be concluded."""
+        assert self._make_result().skipped_test_ids is None
+
+    def test_skipped_test_ids_round_trips_via_asdict_codec(self):
+        vr = self._make_result(skipped_test_ids=['a::b'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == ['a::b']
+        assert restored == vr
+
+    def test_empty_skipped_test_ids_is_preserved_not_coerced_to_none(self):
+        """`[]` ("junit collected, zero skipped") must survive the codec distinctly.
+
+        Coercing it to None across the wire would erase the only positive
+        evidence that main ran its whole suite — turning a genuine "main ran
+        everything" into "we do not know", which fails the wrong way for the
+        caller this field exists to serve.
+        """
+        vr = self._make_result(skipped_test_ids=[])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == []
+        assert restored.skipped_test_ids is not None
+
+    @pytest.mark.asyncio
+    async def test_run_verification_parses_both_vectors_from_one_report(
+        self, tmp_path: Path,
+    ):
+        """Both vectors reach the result from ONE parse of the report.
+
+        Drives the real ``run_verification`` seam (nothing executes —
+        ``_run_cmd`` is a spy).  ``role='merge'`` plus
+        ``merge_verify_breadth='full'`` is exactly what makes ``junit_path``
+        non-None, so the seam is reached.  A single parse is what guarantees
+        the two vectors describe the same run.
+        """
+        worktree = tmp_path / 'merge-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        failing_sentinel = ['sentinel::failing']
+        skipped_sentinel = ['sentinel::skipped']
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(failing=failing_sentinel, skipped=skipped_sentinel),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='merge',
+                attempt_id=None,
+            )
+
+        # (a) both vectors reach the result on the correct fields — neither
+        #     dropped, aliased, nor swapped.
+        assert result.failing_test_ids == failing_sentinel, (
+            f'the failing vector must reach the result; got {result.failing_test_ids!r}'
+        )
+        assert result.skipped_test_ids == skipped_sentinel, (
+            f'the skipped vector must reach the result; got {result.skipped_test_ids!r}'
+        )
+
+        # (b) the report was parsed exactly once.
+        assert parser.call_count == 1, parser.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_neither_vector_is_parsed_when_the_seam_is_not_reached(
+        self, tmp_path: Path,
+    ):
+        """(c) role='task' leaves junit_path None: the report is not parsed and
+        BOTH fields come back None."""
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        parser = MagicMock(
+            return_value=verify._JunitTestIds(
+                failing=['sentinel::failing'], skipped=['sentinel::skipped'],
+            ),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_test_ids_from_junit', new=parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='task',
+                attempt_id=None,
+            )
+
+        parser.assert_not_called()
+        assert result.failing_test_ids is None, result.failing_test_ids
+        assert result.skipped_test_ids is None, result.skipped_test_ids
+
+    def test_both_id_vectors_coexist_on_one_result(self):
+        """The two fields are independent — neither aliases nor overwrites the other."""
+        vr = self._make_result(failing_test_ids=['f::1'], skipped_test_ids=['s::1'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == ['f::1']
+        assert restored.skipped_test_ids == ['s::1']
+
+
+class TestAggregateResultsSkippedTestIds:
+    """`_aggregate_results` unions skipped_test_ids by the SAME rule as the failing side."""
+
+    def _r(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok'
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_all_none_stays_none(self):
+        agg = _aggregate_results([self._r(), self._r()])
+        assert agg.skipped_test_ids is None
+
+    def test_one_none_child_does_not_erase_another_childs_skip_evidence(self):
+        """The mixed case, and the reason the rule is None-iff-EVERY-child-is-None.
+
+        A module that collected no junit at all (None — OPAQUE command, or
+        breadth != full) knows nothing about skips; letting it POISON the
+        aggregate to None would discard a sibling module's real, collected skip
+        evidence and silently return the whole run to the can't-tell state this
+        task closes. None contributes nothing; it does not suppress.
+        """
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=['a::b'])])
+
+        assert agg.skipped_test_ids == ['a::b'], (
+            f'an OPAQUE module must not erase a sibling\'s collected skips; got '
+            f'{agg.skipped_test_ids!r}'
+        )
+
+    def test_unions_sorts_and_dedupes_across_children(self):
+        agg = _aggregate_results(
+            [
+                self._r(skipped_test_ids=['y::2', 'shared::s']),
+                self._r(skipped_test_ids=['x::1', 'shared::s']),
+            ]
+        )
+
+        assert agg.skipped_test_ids == ['shared::s', 'x::1', 'y::2']
+
+    def test_empty_child_makes_the_aggregate_non_none(self):
+        """A child that collected junit and found zero skips is EVIDENCE, not silence."""
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=[])])
+
+        assert agg.skipped_test_ids == []
+        assert agg.skipped_test_ids is not None
+
+    def test_failing_and_skipped_aggregate_independently(self):
+        """Wiring the new field must not perturb the failing side's aggregation."""
+        agg = _aggregate_results(
+            [
+                self._r(failing_test_ids=['f::1']),
+                self._r(skipped_test_ids=['s::1']),
+            ]
+        )
+
+        assert agg.failing_test_ids == ['f::1']
+        assert agg.skipped_test_ids == ['s::1']
+
 
 
 # ---------------------------------------------------------------------------

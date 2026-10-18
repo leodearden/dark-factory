@@ -8,7 +8,6 @@ without conflicting with sibling subprojects' conftests under
 import asyncio
 import itertools
 import json
-import logging
 import os
 import shutil
 import sys
@@ -55,7 +54,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
-# Must be set BEFORE any `orchestrator.merge_queue` import so the module-level
+# Must be set BEFORE any `orchestrator.merge_lane.worker` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
@@ -63,6 +62,7 @@ from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
+    ample_disk_usage,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -90,11 +90,10 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
-from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
 from orchestrator.merge_lane import worker  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
-# orchestrator.merge_queue was imported (by another conftest/plugin) before
+# orchestrator.merge_lane.worker was imported (by another conftest/plugin) before
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
 worker._DEBUG_ASSERTS = True
@@ -103,7 +102,7 @@ track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _drain_leaked_tasks():
+async def _drain_leaked_tasks(_no_unexpected_exit_contract_violation):
     """Cancel every task a test left pending, then wait, before its loop closes.
 
     A task cancelled between spawning a subprocess and connecting its pipes
@@ -112,6 +111,9 @@ async def _drain_leaked_tasks():
     delivers exactly one, and hung on it. This cancel is the first of the two
     such a task needs, and the bounded wait lets it land before ``Runner.close``
     throws the second. Pinned end to end by test_leaked_task_drain.py.
+    Requesting ``_no_unexpected_exit_contract_violation`` keeps that guard
+    tearing down AFTER this drain, so a leaked run() that exits while being
+    cancelled is judged against the test that leaked it.
     """
     yield
     own = asyncio.current_task()
@@ -497,13 +499,8 @@ def _no_unexpected_exit_contract_violation(request):
     of ``real_verify_admission`` above: only for a test that DELIBERATELY
     drives a violation.
     """
-    collector = ExitContractViolationCollector()
-    contract_logger = logging.getLogger('orchestrator.exit_contract')
-    contract_logger.addHandler(collector)
-    try:
+    with ExitContractViolationCollector.listening() as collector:
         yield
-    finally:
-        contract_logger.removeHandler(collector)
     if not collector.violations:
         return
     if request.node.get_closest_marker('exit_contract_violation_expected') is not None:
@@ -641,6 +638,18 @@ def _hermetic_psi_reader(monkeypatch, request):
     monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_disk_usage(monkeypatch):
+    """Every ``shutil.disk_usage`` reads ``_orch_helpers.py::ample_disk_usage`` (task 7032).
+
+    The free-space guards read the host's disk, so a verify host under the 10 GiB
+    floor of ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
+    failed lane and workflow tests on every branch (esc-5509-2). A test of a guard
+    patches ``shutil.disk_usage`` over this one with its own numbers.
+    """
+    monkeypatch.setattr(shutil, 'disk_usage', ample_disk_usage)
+
+
 @pytest.fixture
 def forbid_live_mcp(monkeypatch):
     """Opt-in guard: fail the test if a live fused-memory MCP round-trip is attempted.
@@ -751,7 +760,7 @@ def _restore_sandbox_backend():
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
-    """Clear verify._PROBE_CACHE (and its sibling _BASELINE_FAILING_IDS_CACHE)
+    """Reset verify's main-probe caches (``verify.clear_main_probe_caches``)
     before and after every test.
 
     ``verify_failure_is_preexisting_on_main`` stores results in the
@@ -762,12 +771,12 @@ def _clear_probe_cache():
     short-circuits the probe path in the later test — causing it to skip
     worktree creation / cleanup and return the wrong result.
 
-    ``_BASELINE_FAILING_IDS_CACHE`` (task μ, verify-scope-inversion-prd.md) is
-    the sibling per-main-SHA failing-test-id baseline cache keyed on
-    ``main_sha`` alone — the same cross-test-pollution hazard applies (an
-    earlier test's seeded/probed baseline for a reused MAIN_SHA would
-    silently serve a later test's ``main_baseline_failing_ids`` call from
-    cache instead of exercising its own probe/seed path).
+    The per-main-SHA failing- and skipped-test-id baselines (task μ,
+    verify-scope-inversion-prd.md; task 3226) are keyed on ``main_sha`` alone
+    — the same cross-test-pollution hazard applies (an earlier test's
+    seeded/probed baseline for a reused MAIN_SHA would silently serve a later
+    test's ``main_baseline_failing_ids`` call from cache instead of
+    exercising its own probe/seed path).
 
     Clearing the caches before *and* after each test ensures:
     - every test starts with empty caches regardless of prior teardown;
@@ -778,17 +787,14 @@ def _clear_probe_cache():
 
     **Maintainer note — adding new verify.py process-globals:**
     If ``orchestrator/src/orchestrator/verify.py`` gains additional
-    module-level caches (e.g. a sibling result cache), add a matching
-    ``.clear()`` call here so they are also reset between tests.  The
-    relevant globals are defined near ``_PROBE_CACHE``/``_PROBE_CACHE_TTL``
-    and ``_BASELINE_FAILING_IDS_CACHE``.
+    module-level caches (e.g. a sibling result cache), clear them in
+    ``verify.clear_main_probe_caches`` — the single reset this fixture calls
+    — so they are also reset between tests.
     """
     from orchestrator import verify
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
     yield
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
 
 
 @pytest.fixture(autouse=True)
@@ -801,6 +807,7 @@ def _isolated_merge_provenance(tmp_path_factory):
     lookup in the same worker (task 5034). The file is never created unless
     something records through the facade.
     """
+    from orchestrator.merge_lane.landed_outbox import LandedOutbox, MergeProvenance
     basetemp = tmp_path_factory.getbasetemp()
     MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
 
@@ -810,7 +817,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
     A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
-    orchestrator.merge_queue.run_scoped_verification on every call; tests that run
+    orchestrator.merge_lane.worker.run_scoped_verification on every call; tests that run
     one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
@@ -829,7 +836,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
     which use the marker as the SOLE restore mechanism (no in-body patch):
       - test_train_integration.py::TestTrainIntegrationB2::test_lower_member_break_blocks_train
       - test_atomic_train_merge.py::TestScenario5GroupMergeVerify::test_group_merge_workspace_verify_red
-    Do NOT add a redundant in-body ``patch('orchestrator.merge_queue.run_scoped_verification',
+    Do NOT add a redundant in-body ``patch('orchestrator.merge_lane.worker.run_scoped_verification',
     ...)`` to these tests — the marker is sufficient and is the authoritative mechanism
     (pinned by test_merge_verify_mock_autouse.py).
     Every other test that drives the real merge path either overrides
@@ -844,7 +851,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
 
     from orchestrator.verify import VerifyResult
     monkeypatch.setattr(
-        'orchestrator.merge_queue.run_scoped_verification',
+        'orchestrator.merge_lane.worker.run_scoped_verification',
         AsyncMock(return_value=VerifyResult(
             passed=True, test_output='', lint_output='',
             type_output='', summary='mocked merge verify',
@@ -1257,4 +1264,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
+    # read a truthy Mock and run every mock-config workflow test strictly scoped.
+    config.strict_mcp_config = False
     return config

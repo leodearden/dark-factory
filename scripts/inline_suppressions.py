@@ -53,9 +53,10 @@ A docstring is a STRING, which is precisely what the token walk tells apart.
 enforces the rule tree-wide for disposition markers, and the ratchet enforces
 it for suppression markers once the baseline is seeded.
 
-**Consumers.**  Task 5602's exception register reads ``--json`` for the
-closed-world check of inline ``ratified:`` ids and for the per-``(kind, code)``
-table it renders; task 5607 runs ``--seed`` once at the cutover; task 5609 runs
+**Consumers.**  Task 5602's exception register reads ``--json``:
+``by_kind_code`` and ``by_file`` for the tables it renders, ``ratified`` and
+``class_table`` for its closed-world check, and the ``debt`` owners for the
+owner sweep it feeds; task 5607 runs ``--seed`` once at the cutover; task 5609 runs
 ``--tighten`` after the rulings land; task 5611's integration gate reads the
 report.  ``--json`` is the report's only data source, so nothing downstream
 re-implements the scan.
@@ -74,6 +75,7 @@ from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
 
+import _checkout as _checkout
 from inline_suppression_classify import (
     Classification,
     Classified,
@@ -120,7 +122,7 @@ nothing reads it as a global.
 #: format, which changes for entirely different reasons.  Two orthogonal schemas
 #: get two numbers, so a report-shape change never reads as a baseline-format
 #: change to the consumer that sees it.
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 
 class Status(Enum):
     """Which green a zero exit is — three states that are not interchangeable.
@@ -563,22 +565,6 @@ def _site_record(site: Site) -> dict[str, object]:
     }
 
 
-def _owner(debt: Debt) -> str:
-    """A debt's owner as D6 spells it — ``task 5601`` or ``ticket tkt_…``.
-
-    The same tail the inline marker carries, so a report entry and the line it
-    came from read alike and a consumer following the owner up needs no second
-    vocabulary.  The two nouns come from the two ref TYPES rather than from a
-    string test, which is why a ticket can never be reported as a task.
-    """
-    noun = (
-        'task'
-        if isinstance(debt.owner, import_shared('governed_exceptions').TaskRef)
-        else 'ticket'
-    )
-    return f'{noun} {debt.owner.id}'
-
-
 def _tally(values: Iterable[str], vocabulary: Iterable[str]) -> dict[str, int]:
     """Count *values*, with every word of *vocabulary* present even at zero.
 
@@ -615,6 +601,22 @@ def _by_kind_code(scan: Scan) -> list[dict[str, object]]:
     ]
 
 
+def _by_file(scan: Scan) -> list[dict[str, object]]:
+    """Sites per file, for every file holding at least one, sorted by path."""
+    tally = Counter(site.path for site in scan.sites)
+    return [{'path': path, 'sites': sites} for path, sites in sorted(tally.items())]
+
+
+def _class_table(classes: Mapping[SuppressionClass, Policy]) -> list[dict[str, object]]:
+    """Every row of the class table this run was handed, matched or not.
+
+    ``classes`` lists only rows with sites, so a row citing a ratification that
+    does not exist would escape the register's closed-world check without this.
+    """
+    rows = sorted((cls.render(), policy.ratified) for cls, policy in classes.items())
+    return [{'class': rendered, 'ratified': ratified} for rendered, ratified in rows]
+
+
 def _owned_blocks(classification: Classification) -> dict[str, object]:
     """The three site-level ownership blocks, built in one pass.
 
@@ -644,7 +646,7 @@ def _owned_blocks(classification: Classification) -> dict[str, object]:
     for entry in classification.classified:
         record = _site_record(entry.site)
         if isinstance(entry.disposition, debt_type):
-            debt.append(record | {'owner': _owner(entry.disposition)})
+            debt.append(record | {'owner': governed.owner_record(entry.disposition.owner)})
         elif isinstance(entry.disposition, policy_type):
             ratified.setdefault(entry.disposition.ratified, []).append(record)
         if entry.suppression_class is not None:
@@ -687,6 +689,8 @@ def _report_dict(request: Request, measured: Measurement, verdict: Verdict) -> d
             (ownership.value for ownership in Ownership),
         ),
         'by_kind_code': _by_kind_code(measured.scan),
+        'by_file': _by_file(measured.scan),
+        'class_table': _class_table(request.classes),
         **_owned_blocks(classification),
         'baseline': {
             'path': str(request.baseline),

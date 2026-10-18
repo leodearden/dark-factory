@@ -9,7 +9,7 @@ words: "Whether a conflict rejects the write is leaf delta's gate to decide."
 A pure, server-state-free function rather than a ``create_mcp_server`` closure
 like ``_backlog_gate`` / ``_known_project_gate``.  Those two are closures ONLY
 because they close over server state; this gate closes over nothing — its whole
-input is ``(entities, content, group_id, agent_id)`` — so it follows the closer
+input is its arguments — so it follows the closer
 precedent of ``server/near_duplicate_guard.py``, ``server/markup_guard.py`` and
 ``services/completion_claim_gate.py``: module-level hint constants, a
 ``build_*_block`` factory, and a pure predicate that needs no FastMCP server to
@@ -38,24 +38,23 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from fused_memory.server.guard_excerpt import excerpt_fields
 from fused_memory.utils.canonical_labels import scan_content
 from fused_memory.utils.referent_resolution import ReferentSet, resolve_referents
 from fused_memory.utils.validation import InputValidationError
 
 logger = logging.getLogger(__name__)
 
-#: Remediation for a declaration the content contradicts.  Names BOTH
-#: legitimate remedies, and says explicitly that omitting the parameter is
-#: always safe — an agent that reads "your referents were rejected" and cannot
-#: tell whether silence is also rejected will start guessing, and a guessed
-#: declaration is the misattribution this PRD exists to prevent.
+#: Remediation for a declaration the content contradicts.  Both remedies KEEP
+#: the declaration: a hint that offered removing it trained agents out of the
+#: feature, and they recorded that advice as durable memories (task 6059).
 _ENTITIES_CONFLICT_HINT = (
-    'The referents you declared in `entities` are contradicted by your own '
-    'content (see conflicts/content_referents). Either correct `entities` to '
-    'name what the content is actually about, or drop `entities` entirely and '
-    'let the content scan derive the set for you. This gate rejects only a '
-    'CONFLICT, never an absence: omitting `entities` — or passing [] to record '
-    'that you considered referents and none applied — always succeeds.'
+    'Your content contradicts a referent you declared in `entities` (see '
+    'conflicts/content_referents): it names a task one typo away from a '
+    'declared id, or names the declared number under a different project. '
+    'If the declared id is wrong, correct it in `entities`. If it is right, '
+    'spell that task as `task NNN` in the content so the scan can corroborate '
+    'it. Keep declaring: `entities` is how a write states what it is about.'
 )
 
 
@@ -65,6 +64,7 @@ def entities_gate(
     content: str,
     group_id: str,
     agent_id: str | None = None,
+    declaration_recorded: bool = True,
 ) -> dict[str, Any] | None:
     """Verdict on a caller's declared referents: a block dict, or ``None``.
 
@@ -96,6 +96,11 @@ def entities_gate(
             and ``Scope.graphiti_group_id`` IS ``project_id``, so the gate and
             ``MemoryService`` classify local-vs-foreign referents identically.
         agent_id: Echoed into the block, matching every sibling guard.
+        declaration_recorded: Whether the write will record the declaration.
+            When False the declaration is shape-checked only and never
+            conflict-rejected: a discarded declaration can only cost a false
+            rejection and can buy no attribution. Defaults to True, the strict
+            direction, because ``add_episode`` always records its declaration.
 
     ``metadata`` is deliberately NOT a parameter and ``metadata=None`` is
     passed to the resolver.  ``ReferentResolution.conflicts`` is populated on
@@ -144,6 +149,9 @@ def entities_gate(
         # this type — written so THIS handler catches all of them.
         return build_entities_malformed_block(agent_id, content, exc)
 
+    if not declaration_recorded:
+        return None
+
     if resolution.conflicts:
         # A SECOND CALL of the one scanner, on the REJECTION PATH ONLY.
         #
@@ -164,9 +172,9 @@ def entities_gate(
             declared=resolution.referents,
             conflicts=resolution.conflicts,
             # `refs + ambiguous`, never `refs` alone. `_conflicting_referents`
-            # tests membership against `refs | ambiguous`, so a scan that found
-            # ONLY an ambiguous referent still satisfies its "the scan saw this
-            # kind" precondition and CAN produce a conflict. Reporting `refs`
+            # draws its evidence from `refs | ambiguous`, so a scan that found
+            # ONLY an ambiguous referent can still supply the positive evidence
+            # for a conflict. Reporting `refs`
             # there would emit "the content cites nothing" beside a rejection
             # for contradicting the content — a guard malfunction to read, not
             # a decision.
@@ -214,7 +222,7 @@ def build_entities_malformed_block(
         'error': str(exc),
         'error_type': 'ValidationError',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content),
     }
 
 
@@ -252,7 +260,7 @@ def build_entities_conflict_block(
         'error': 'declared_referent_conflict',
         'error_type': 'DeclaredReferentConflictRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content),
         'declared': _node_names(declared),
         'conflicts': _node_names(conflicts),
         'content_referents': _node_names(content_referents),

@@ -5,7 +5,7 @@ See plans/confusion-reduction-prd.md §7.1 (codebook v2 contract) and §7.3
 (coding record contract). Per PRD decision 1, this module is the SOLE
 WRITER of `docs/legibility/confusion-codebook.yaml`: the LLM trickle coder
 and census miner never edit the YAML directly — they emit coding records
-(§7.3) that this module's `apply_coding_record()` merges in idempotently,
+(§7.3) that this module's `apply_coding_records()` merges in idempotently,
 append-only, never-delete.
 """
 from __future__ import annotations
@@ -19,9 +19,10 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Collection
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -31,7 +32,14 @@ import yaml
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import invariants  # noqa: E402
+# Bind `shared` to this checkout, as coder.py::_SHARED_SRC does, so a worktree
+# run validates keys against its own shared.finding_key. No module-level
+# assignment precedes the imports below, so they need no E402 suppression.
+if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
+    sys.path.insert(0, _SHARED_SRC)
+
+from legibility import finding_area, invariants
+from shared.finding_key import KEY_PATTERN, is_finding_key
 
 logger = logging.getLogger("legibility.codebook")
 
@@ -53,7 +61,7 @@ PHASES = [
     "unknown",
 ]
 
-STATUSES = ["open", "partially", "fixed", "retired", "mined-unverified"]
+STATUSES = ["open", "partially", "fixed", "retired", "mined-unverified", "accepted"]
 
 DISPOSITIONS = ["pending", "promoted", "rejected"]
 
@@ -64,23 +72,22 @@ HEADER = """\
 # version 2. MERGER-OWNED FILE: written solely by scripts/legibility/codebook.py
 # (plans/confusion-reduction-prd.md §7.1/§7.3). Append-only, never hand-edited:
 # entries are never deleted (retire via status: retired); sightings/candidates
-# are appended by the deterministic merger's apply_coding_record(). Hand edits
+# are appended by the deterministic merger's apply_coding_records(). Hand edits
 # will be normalized/overwritten on the next merge.
 """
 
 # Removal-directive markers a §7.3 coding record must never carry (PRD §8.3
 # never-delete). Presence of any top-level key, or any match op with one of
-# these actions, is rejected outright by apply_coding_record() before it
+# these actions, is rejected outright by apply_coding_records() before it
 # mutates anything.
 _REMOVAL_KEYS = {"delete", "remove", "retract", "drop"}
 _REMOVAL_ACTIONS = {"delete", "remove"}
 
 
 class NeverDeleteError(Exception):
-    """Raised when a coding record carries a deletion-shaped directive, or
-    when a merge result would drop a codebook entry or shrink an entry's
-    sighting history. The confusion codebook is append-only (PRD §6/§8.3):
-    entries are retired via status='retired', never removed."""
+    """Raised when a codebook write would drop an entry or a candidate, or
+    shrink one's sighting history. The confusion codebook is append-only (PRD
+    §6/§8.3): entries are retired via status='retired', never removed."""
 
 # ---------------------------------------------------------------------------
 # v2 schema (structural). Strict on v2-relevant fields; permissive on v1
@@ -99,12 +106,38 @@ _SIGHTING_SCHEMA = {
         "manifested_phase": {"enum": PHASES},
         # A free string here, so validate() keeps the legacy free-text values
         # valid. New writes are screened against the project's invariant
-        # slugs by screen_invariant_slugs inside apply_coding_record.
+        # slugs by screen_invariant_slugs inside _apply_coding_record.
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
         "evidence_quote": {"type": "string"},
     },
     "required": ["date", "project", "session", "origin_phase", "manifested_phase"],
+}
+
+# Contract run history and ticket fields (plans/census-incremental-prd.md C1;
+# docs/quality-findings-contract.md §1, §2, §8). The finding identity fields
+# are checked by finding_identity_errors, not by these schemas.
+_FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
+
+_RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
+
+FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "existing")
+
+FILED_TICKET_STEPS = ("key", "semantic", "curator")
+
+_FILED_TICKET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ticket": {"type": ["string", "null"]},
+        "project_root": {"type": "string"},
+        "run_id": _RUN_ID_SCHEMA,
+        # null: filed before finding keys existed (plans/census-incremental-prd.md L4 backfill)
+        "finding_key": {"type": ["string", "null"], "pattern": KEY_PATTERN},
+        "task_id": {"type": ["integer", "null"]},
+        "resolution": {"enum": [*FILED_TICKET_RESOLUTIONS, None]},
+        "step": {"enum": list(FILED_TICKET_STEPS)},
+    },
+    "required": ["ticket", "project_root", "run_id", "finding_key", "task_id", "resolution", "step"],
 }
 
 _ENTRY_SCHEMA = {
@@ -117,6 +150,13 @@ _ENTRY_SCHEMA = {
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
+        "severity_reason": {"type": "string"},
+        "first_seen_run": _RUN_ID_SCHEMA,
+        "last_seen_runs": {"type": "array", "items": _RUN_ID_SCHEMA},
+        "supersedes": {"type": "array", "items": _FINDING_KEY_SCHEMA},
+        "filed_tickets": {"type": "array", "items": _FILED_TICKET_SCHEMA},
+        "fixed_at_sha": {"type": "string", "pattern": r"^[0-9a-f]{7,40}$"},
+        "accepted_by": {"type": "integer"},
     },
     "required": [
         "id",
@@ -137,8 +177,32 @@ _CANDIDATE_SCHEMA = {
         "first_seen": {"type": "string"},
         "disposition": {"enum": DISPOSITIONS},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
+        "attached_by": {
+            "type": "object",
+            "properties": {
+                "method": {"enum": ["session", "title", "key", "similarity"]},
+                "score": {"type": "number"},
+                "run_id": _RUN_ID_SCHEMA,
+            },
+            "required": ["method", "run_id"],
+        },
+        "adjudicated_with": {"type": "string", "pattern": _CANDIDATE_ID_RE.pattern},
     },
     "required": ["id", "title", "first_seen", "disposition", "sightings"],
+}
+
+HISTORICAL_BACKFILL = "historical_backfill"
+"""The top-level key recording the one run whose backfill linked the census
+tasks filed before back-links existed (plans/census-incremental-prd.md L4),
+and the task ids it matched to no entry."""
+
+_HISTORICAL_BACKFILL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "run_id": _RUN_ID_SCHEMA,
+        "unmatched_task_ids": {"type": "array", "items": {"type": "integer"}},
+    },
+    "required": ["run_id", "unmatched_task_ids"],
 }
 
 V2_SCHEMA = {
@@ -148,6 +212,7 @@ V2_SCHEMA = {
         "version": {"const": 2},
         "entries": {"type": "array", "items": _ENTRY_SCHEMA},
         "candidates": {"type": "array", "items": _CANDIDATE_SCHEMA},
+        HISTORICAL_BACKFILL: _HISTORICAL_BACKFILL_SCHEMA,
     },
     "required": ["version", "entries"],
 }
@@ -231,6 +296,8 @@ def _type_matches(value, type_spec) -> bool:
         "object": lambda v: isinstance(v, dict),
         "array": lambda v: isinstance(v, list),
         "string": lambda v: isinstance(v, str),
+        "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
         "null": lambda v: v is None,
     }
     return any(checks[t](value) for t in types if t in checks)
@@ -239,7 +306,7 @@ def _type_matches(value, type_spec) -> bool:
 def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
     """Minimal recursive validator for the small JSON-Schema subset this
     module's schemas use (type/properties/required/items/enum/const/
-    minLength).
+    minLength/minItems/pattern).
 
     Not a general-purpose JSON-Schema implementation: the `jsonschema` PyPI
     package is NOT available in this module's actual verify environment
@@ -276,6 +343,16 @@ def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
         )
         return errors
 
+    pattern = schema.get("pattern")
+    if pattern is not None and isinstance(instance, str) and not re.search(pattern, instance):
+        errors.append(f"{loc}: {instance!r} does not match the pattern {pattern!r}")
+        return errors
+
+    min_items = schema.get("minItems")
+    if min_items is not None and isinstance(instance, list) and len(instance) < min_items:
+        errors.append(f"{loc}: {instance!r} has fewer than the required minItems {min_items}")
+        return errors
+
     if "properties" in schema and isinstance(instance, dict):
         for required in schema.get("required", []):
             if required not in instance:
@@ -295,16 +372,100 @@ def _schema_errors(instance: dict, schema: dict) -> list[str]:
     return _validate_node(instance, schema, [])
 
 
+def filed_ticket_errors(row: Mapping[str, object]) -> list[str]:
+    """The one statement of the C1 ``filed_tickets`` row invariant: validate()
+    applies it to every entry's rows, and disposition.BackLink to itself."""
+    return _validate_node(row, _FILED_TICKET_SCHEMA, ["filed_ticket"])
+
+
+FINDING_IDENTITY_FIELDS = ("finding_key", "finding_area", "finding_anchor", "finding_tags")
+
+
+@dataclass(frozen=True)
+class FindingIdentityError:
+    field: str
+    problem: str
+
+    def at(self, location: str) -> str:
+        return f"{location}/{self.field}: {self.problem}"
+
+
+def finding_identity_errors(record: Mapping[str, object]) -> list[FindingIdentityError]:
+    """The finding identity a codebook record carries (contract §1, §2):
+    either none of FINDING_IDENTITY_FIELDS, or all four, holding a §2 key, a
+    plain area key, a §1 anchor and a non-empty list of §1 tags.
+
+    The one statement of that invariant: validate() applies it to every
+    entry and candidate, and census_findings.FindingIdentity to itself.
+    """
+    # verdict owns the §1 anchor and tag vocabulary and imports this module.
+    from legibility import verdict
+
+    present = [field for field in FINDING_IDENTITY_FIELDS if field in record]
+    missing = [field for field in FINDING_IDENTITY_FIELDS if field not in record]
+    if not present:
+        return []
+    if missing:
+        return [
+            FindingIdentityError(
+                field,
+                f"is missing beside {', '.join(present)}: a finding identity is all four fields or none",
+            )
+            for field in missing
+        ]
+    checks: tuple[tuple[str, Callable[[object], bool], str], ...] = (
+        ("finding_key", is_finding_key, "a finding key fk-<12 hex>"),
+        (
+            "finding_area",
+            lambda value: isinstance(value, str) and re.fullmatch(finding_area.AREA_KEY_PATTERN, value) is not None,
+            "a plain area key",
+        ),
+        (
+            "finding_anchor",
+            lambda value: isinstance(value, str) and verdict.is_anchor(value),
+            "a contract §1 anchor: slug:<kebab> or a repo-relative path[::symbol] with no line pin",
+        ),
+        (
+            "finding_tags",
+            lambda value: isinstance(value, (list, tuple))
+            and bool(value)
+            and all(isinstance(tag, str) and verdict.is_finding_tag(tag) for tag in value),
+            "a non-empty list of contract §1 tags",
+        ),
+    )
+    return [
+        FindingIdentityError(field, f"{record[field]!r} is not {expected}")
+        for field, holds, expected in checks
+        if not holds(record[field])
+    ]
+
+
+def _finding_identity_errors_at(records: object, path: str) -> list[str]:
+    if not isinstance(records, list):
+        return []
+    return [
+        error.at(f"{path}/{index}")
+        for index, record in enumerate(records)
+        if isinstance(record, dict)
+        for error in finding_identity_errors(record)
+    ]
+
+
 def validate(codebook: dict) -> list[str]:
     """Structural + semantic validation of a v2 codebook.
 
     Returns a list of human-readable error strings; an empty list means the
     codebook is valid. Strict on v2-relevant fields (version, entry
     id/title/severity/status, origin_phase/manifested_phase enums, sighting
-    shape, candidate id regex + disposition); permissive on v1 free-form
-    fields (validate() never rejects on their presence, absence, or type).
+    shape, candidate id regex + disposition, the optional C1 finding fields,
+    finding_identity_errors, accepted ⇒ accepted_by); permissive on v1
+    free-form fields (validate() never rejects on their presence, absence,
+    or type).
     """
     errors = _schema_errors(codebook, V2_SCHEMA)
+    if isinstance(codebook, dict):
+        errors.extend(_finding_identity_errors_at(codebook.get("entries"), "entries"))
+        errors.extend(_finding_identity_errors_at(codebook.get("candidates"), "candidates"))
 
     entries = codebook.get("entries", []) if isinstance(codebook, dict) else []
     if isinstance(entries, list):
@@ -319,6 +480,8 @@ def validate(codebook: dict) -> list[str]:
                 errors.append(f"duplicate entry id: {entry_id!r}")
             else:
                 seen_ids.add(entry_id)
+            if entry.get("status") == "accepted" and "accepted_by" not in entry:
+                errors.append(f"entry {entry_id!r}: status 'accepted' requires accepted_by (contract §7)")
 
     candidates = codebook.get("candidates", []) if isinstance(codebook, dict) else []
     if isinstance(candidates, list):
@@ -364,28 +527,25 @@ def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> 
     return sighting
 
 
-def _reject_deletion_directive(record: dict) -> None:
-    """Raise NeverDeleteError if `record` is deletion-shaped: a top-level
+def _deletion_directive(record: object) -> str | None:
+    """Why `record` is deletion-shaped, or None when it is not: a top-level
     delete/remove/retract/drop key, or a match/correction carrying a
-    delete/remove action. Called before apply_coding_record touches anything."""
+    delete/remove action."""
     if not isinstance(record, dict):
-        return
+        return None
     for key in _REMOVAL_KEYS:
         if key in record:
-            raise NeverDeleteError(
-                f"coding record carries a removal directive: top-level {key!r} key"
-            )
+            return f"coding record carries a removal directive: top-level {key!r} key"
     for match in record.get("matches", []) or []:
         if isinstance(match, dict) and match.get("action") in _REMOVAL_ACTIONS:
-            raise NeverDeleteError(
-                f"coding record match carries a removal action: {match.get('action')!r}"
-            )
+            return f"coding record match carries a removal action: {match.get('action')!r}"
     for correction in record.get("corrections", []) or []:
         if isinstance(correction, dict) and correction.get("action") in _REMOVAL_ACTIONS:
-            raise NeverDeleteError(
+            return (
                 "coding record correction carries a removal action: "
                 f"{correction.get('action')!r}"
             )
+    return None
 
 
 def assert_no_deletion(before: dict, after: dict) -> None:
@@ -479,6 +639,85 @@ class SlugTally:
         )
 
 
+@dataclass(frozen=True)
+class MergeCounts:
+    """What merged coding records did, op by op. The field names are the keys
+    of the `codebook.py apply` summary line."""
+
+    matched: int = 0
+    candidates_applied: int = 0
+    candidate_disposition_conflicts: int = 0
+    corrections_applied: int = 0
+    correction_skipped: int = 0
+    skipped_unknown_entry: int = 0
+
+    def plus(self, other: MergeCounts) -> MergeCounts:
+        return MergeCounts(
+            **{f.name: getattr(self, f.name) + getattr(other, f.name) for f in fields(self)}
+        )
+
+    @property
+    def mutations(self) -> int:
+        """The ops that wrote the codebook: every appended sighting (a recurrence
+        on an adjudicated title included) and every correction."""
+        return (
+            self.matched
+            + self.candidates_applied
+            + self.candidate_disposition_conflicts
+            + self.corrections_applied
+        )
+
+
+@dataclass(frozen=True)
+class SkippedRecord:
+    """A record a merge left out whole: its position in the batch, its
+    session when it has one, and why."""
+
+    index: int
+    session: str | None
+    reason: str
+
+    @classmethod
+    def of(cls, index: int, record: object, reason: str) -> SkippedRecord:
+        session = record.get("session") if isinstance(record, dict) else None
+        return cls(index=index, session=session if isinstance(session, str) else None, reason=reason)
+
+    def describe(self) -> str:
+        return f"session={self.session}: {self.reason}"
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """One batch merged by `apply_coding_records`.
+
+    `merged_records` are the records that went through the merge, in batch
+    order, an already-absorbed re-apply included; `skipped_deletions` and
+    `invalid_records` are the ones left out; `counts` and `invariant_slugs` sum
+    over the merged ones.
+    """
+
+    codebook: dict
+    counts: MergeCounts = MergeCounts()
+    merged_records: tuple[dict, ...] = ()
+    skipped_deletions: tuple[SkippedRecord, ...] = ()
+    invalid_records: tuple[SkippedRecord, ...] = ()
+    invariant_slugs: SlugTally = SlugTally()
+
+    @property
+    def mutated(self) -> bool:
+        return self.counts.mutations > 0
+
+    def summary(self) -> str:
+        values = {f.name: getattr(self.counts, f.name) for f in fields(self.counts)}
+        values.update(
+            record_invalid=len(self.invalid_records),
+            deletion_directive=len(self.skipped_deletions),
+            invariant_slugs_valid=self.invariant_slugs.valid,
+            invariant_slugs_rejected=len(self.invariant_slugs.rejected),
+        )
+        return " ".join(f"{key}={value}" for key, value in values.items())
+
+
 def screen_invariant_slugs(
     record: dict, invariant_slugs: Collection[str]
 ) -> tuple[dict, SlugTally]:
@@ -542,10 +781,63 @@ def warn_unknown_invariant_slugs(
     )
 
 
-def apply_coding_record(
+def apply_coding_records(
+    codebook: dict, records: Iterable[dict], *, invariant_slugs: Collection[str]
+) -> MergeResult:
+    """Merge a batch of §7.3 coding records into a copy of *codebook*.
+
+    Never mutates or aliases *codebook*. A deletion-shaped record lands in
+    `skipped_deletions` and one failing `validate_coding_record` in
+    `invalid_records`, each skipped whole, before it can touch the copy, while
+    the rest of the batch merges.
+
+    Raises ValueError for a non-dict *codebook*. Raises NeverDeleteError only
+    when `assert_no_deletion()`, the construction-independent safety net run
+    over the whole merge, finds a dropped entry or sighting: that is a merger
+    bug, never a property of a record.
+    """
+    if not isinstance(codebook, dict):
+        raise ValueError(
+            "apply_coding_records: expected a dict-shaped codebook, got "
+            f"{type(codebook).__name__} (empty or malformed YAML file?)"
+        )
+    merged = copy.deepcopy(codebook)
+    counts, slugs = MergeCounts(), SlugTally()
+    merged_records: list[dict] = []
+    skipped_deletions: list[SkippedRecord] = []
+    invalid_records: list[SkippedRecord] = []
+    for index, record in enumerate(records):
+        directive = _deletion_directive(record)
+        if directive is not None:
+            skipped_deletions.append(SkippedRecord.of(index, record, directive))
+            continue
+        errors = validate_coding_record(record)
+        if errors:
+            invalid_records.append(SkippedRecord.of(index, record, "; ".join(errors)))
+            continue
+        record_counts, record_slugs = _apply_coding_record(
+            merged, record, invariant_slugs=invariant_slugs
+        )
+        counts, slugs = counts.plus(record_counts), slugs.plus(record_slugs)
+        merged_records.append(record)
+    assert_no_deletion(codebook, merged)
+    return MergeResult(
+        codebook=merged,
+        counts=counts,
+        merged_records=tuple(merged_records),
+        skipped_deletions=tuple(skipped_deletions),
+        invalid_records=tuple(invalid_records),
+        invariant_slugs=slugs,
+    )
+
+
+def _apply_coding_record(
     codebook: dict, record: dict, *, invariant_slugs: Collection[str]
-) -> tuple[dict, dict]:
-    """Apply one §7.3 coding record to a v2 codebook. Sole-writer merge.
+) -> tuple[MergeCounts, SlugTally]:
+    """Apply one §7.3 coding record to a v2 codebook, in place. Sole-writer
+    merge. Preconditions: *codebook* is the batch's own copy, and *record* is
+    valid and not deletion-shaped; the batch, `apply_coding_records`, ensures
+    all three.
 
     Three ops: `matches` (append a sighting to an existing entry),
     `candidates` (file a novel cause for the census to adjudicate), and
@@ -553,22 +845,13 @@ def apply_coding_record(
     the order corrections → matches → candidates (see the correction-handling
     paragraph for why corrections go first).
 
-    Operates on a deep copy — never mutates `codebook` in place. Returns
-    `(new_codebook, stats)` where stats has keys `matched`,
-    `skipped_unknown_entry`, `candidates_applied`,
-    `candidate_disposition_conflicts`, `corrections_applied`,
-    `correction_skipped`, `record_invalid`, `invariant_slugs`.
+    Returns what each op did and the record's `SlugTally`.
 
-    A record that fails `validate_coding_record()` is skipped WHOLE (never
-    partially applied): the input codebook comes back unchanged (deep
-    copy) and `stats['record_invalid']` is True.
-
-    A valid record is then screened by `screen_invariant_slugs()` against
+    The record is first screened by `screen_invariant_slugs()` against
     *invariant_slugs*, the observed project's declared vocabulary: an
     `invariant_violated` value that is not one of them is stored as absent
-    rather than failing the record, and `stats['invariant_slugs']` is the
-    record's `SlugTally`. Emitting the run's one WARNING is the caller's job
-    (`warn_unknown_invariant_slugs()`).
+    rather than failing the record. Emitting the run's one WARNING is the
+    caller's job (`warn_unknown_invariant_slugs()`).
 
     Match handling: an entry_id that doesn't resolve to an existing entry
     is counted as skipped and never fabricated into a new entry — only the
@@ -639,51 +922,16 @@ def apply_coding_record(
     rather than by manufacturing a byte-identical-title pending record —
     which is precisely how rejected `cand-20260722-28` reappeared as
     pending `cand-20260724-2` in the live registry.
-
-    Never-delete: a deletion-shaped `record` (top-level delete/remove/
-    retract/drop key, or a match with a delete/remove action) raises
-    NeverDeleteError immediately, before `codebook` is even copied.
-    `assert_no_deletion()` is also run as a construction-independent
-    safety net just before returning.
-
-    Raises ValueError if `codebook` is not a dict (e.g. an empty or
-    malformed YAML file loads via yaml.safe_load as None, or as some
-    non-mapping) — mirrors validate()'s isinstance guard so malformed
-    input fails loudly with a clear message before any mutation, rather
-    than an AttributeError deep in the merge logic below.
     """
-    if not isinstance(codebook, dict):
-        raise ValueError(
-            "apply_coding_record: expected a dict-shaped codebook, got "
-            f"{type(codebook).__name__} (empty or malformed YAML file?)"
-        )
-    _reject_deletion_directive(record)
-
-    stats = {
-        "matched": 0,
-        "skipped_unknown_entry": 0,
-        "candidates_applied": 0,
-        "candidate_disposition_conflicts": 0,
-        "corrections_applied": 0,
-        "correction_skipped": 0,
-        "record_invalid": False,
-        "invariant_slugs": SlugTally(),
-    }
-
-    result = copy.deepcopy(codebook)
-
-    record_errors = validate_coding_record(record)
-    if record_errors:
-        stats["record_invalid"] = True
-        assert_no_deletion(codebook, result)
-        return result, stats
-    record, stats["invariant_slugs"] = screen_invariant_slugs(record, invariant_slugs)
+    matched = candidates_applied = candidate_disposition_conflicts = 0
+    corrections_applied = correction_skipped = skipped_unknown_entry = 0
+    record, slugs = screen_invariant_slugs(record, invariant_slugs)
 
     session = record["session"]
     date = record["date"]
     project = record["project"]
 
-    entries_by_id = {e["id"]: e for e in result.get("entries", [])}
+    entries_by_id = {e["id"]: e for e in codebook.get("entries", [])}
 
     # Entries that ALREADY carried this session before this record was applied.
     # Everything below deduplicates on (session, entry), so this set is what
@@ -705,7 +953,7 @@ def apply_coding_record(
         entry_id = correction.get("entry_id")
         entry = entries_by_id.get(entry_id)
         if entry is None:
-            stats["skipped_unknown_entry"] += 1
+            skipped_unknown_entry += 1
             continue
         sightings = entry.setdefault("sightings", [])
         if session in {s.get("session") for s in sightings}:
@@ -714,7 +962,7 @@ def apply_coding_record(
                 # this record's one sighting slot, so this one's field writes
                 # cannot land. Silently dropping a framing withdrawal is the
                 # one outcome this op must never have.
-                stats["correction_skipped"] += 1
+                correction_skipped += 1
                 logger.warning(
                     "codebook: correction for entry %r dropped — session %r was "
                     "already recorded on that entry by an earlier op in the SAME "
@@ -732,21 +980,21 @@ def apply_coding_record(
         sightings.append(
             _build_sighting(correction, session=session, date=date, project=project)
         )
-        stats["corrections_applied"] += 1
+        corrections_applied += 1
 
     for match in record.get("matches", []) or []:
         entry = entries_by_id.get(match.get("entry_id"))
         if entry is None:
-            stats["skipped_unknown_entry"] += 1
+            skipped_unknown_entry += 1
             continue
         sightings = entry.setdefault("sightings", [])
         existing_sessions = {s.get("session") for s in sightings}
         if session in existing_sessions:
             continue
         sightings.append(_build_sighting(match, session=session, date=date, project=project))
-        stats["matched"] += 1
+        matched += 1
 
-    candidates = result.setdefault("candidates", [])
+    candidates = codebook.setdefault("candidates", [])
     date_prefix = f"cand-{date.replace('-', '')}-"
 
     for candidate_payload in record.get("candidates", []) or []:
@@ -766,7 +1014,7 @@ def apply_coding_record(
         )
         if pending_match is not None:
             pending_match.setdefault("sightings", []).append(sighting)
-            stats["candidates_applied"] += 1
+            candidates_applied += 1
         elif same_title:
             # Every same-title candidate is already adjudicated (rejected/
             # promoted). Fabricating a fresh pending twin here would silently
@@ -795,18 +1043,18 @@ def apply_coding_record(
                 entry_sightings = promoted_entry.setdefault("sightings", [])
                 if session not in {s.get("session") for s in entry_sightings}:
                     entry_sightings.append(sighting)
-                    stats["matched"] += 1
+                    matched += 1
             else:
                 # Rejected, or promoted with a `promoted_to` that names no
                 # existing entry (hand-edited/pre-promote_candidate record).
                 # The merger never fabricates an entry -- only the census
                 # does -- so the sighting lands on the candidate so the
                 # signal is not lost, and the conflict is surfaced via
-                # stats. `same_title[-1]` (last in list order = most recently
+                # counts. `same_title[-1]` (last in list order = most recently
                 # added) is the deterministic tie-break when more than one
                 # adjudicated record shares a title.
                 same_title[-1].setdefault("sightings", []).append(sighting)
-                stats["candidate_disposition_conflicts"] += 1
+                candidate_disposition_conflicts += 1
         else:
             n = 1 + sum(
                 1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
@@ -822,10 +1070,16 @@ def apply_coding_record(
                     "sightings": [sighting],
                 }
             )
-            stats["candidates_applied"] += 1
+            candidates_applied += 1
 
-    assert_no_deletion(codebook, result)
-    return result, stats
+    return MergeCounts(
+        matched=matched,
+        candidates_applied=candidates_applied,
+        candidate_disposition_conflicts=candidate_disposition_conflicts,
+        corrections_applied=corrections_applied,
+        correction_skipped=correction_skipped,
+        skipped_unknown_entry=skipped_unknown_entry,
+    ), slugs
 
 
 def validate_coding_record(record: dict) -> list[str]:
@@ -834,7 +1088,7 @@ def validate_coding_record(record: dict) -> list[str]:
     Returns a list of human-readable error strings; an empty list means the
     record is valid. Required: session/date/project/agent_class (strings).
     matches/candidates are optional lists; invariant_violated accepts null
-    or any string here. An unknown slug is not an error: apply_coding_record
+    or any string here. An unknown slug is not an error: apply_coding_records
     stores it as absent through screen_invariant_slugs.
     """
     return _schema_errors(record, CODING_RECORD_SCHEMA)
@@ -907,7 +1161,7 @@ def migrate_v1_to_v2(codebook: dict) -> dict:
     is retained verbatim; entry order is preserved. Top-level candidates
     defaults to [] (only if absent). The top-level `updated` field (if
     present) is DROPPED rather than retained or re-stamped: under the
-    sole-writer design dump()/apply_coding_record() never touch it, so a
+    sole-writer design dump()/apply_coding_records() never touch it, so a
     retained value would freeze at the migration date and mislead readers
     as sightings accumulate, while a mutable timestamp would break dump()'s
     byte-stable no-change-night guarantee (PRD §6.7). Output passes
@@ -978,39 +1232,32 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_jsonl(path: str) -> tuple[list[tuple[int, Any]], int]:
+    """The (line number, value) of each non-blank line of *path*, and how many
+    lines were not JSON. Each of those is named on stderr and skipped."""
+    parsed: list[tuple[int, Any]] = []
+    malformed = 0
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                parsed.append((lineno, json.loads(line)))
+            except json.JSONDecodeError as exc:
+                print(f"{path}:{lineno}: malformed JSON, skipping: {exc}", file=sys.stderr)
+                malformed += 1
+    return parsed, malformed
+
+
 def _cmd_apply(args: argparse.Namespace) -> int:
-    """Merge a JSONL batch of §7.3 coding records into a v2 codebook.
+    """Merge a JSONL batch of §7.3 coding records into a v2 codebook file.
 
-    Per-record failures are skipped-and-counted, never fatal to the batch:
-    a malformed JSON line (`malformed_json`), a record that fails
-    `validate_coding_record()` (`record_invalid`, skipped whole inside
-    `apply_coding_record`), and a deletion-shaped record
-    (`deletion_directive`, rejected by `_reject_deletion_directive` before
-    the codebook is even copied). Each prints a `path:lineno:` line to
-    stderr and increments its counter in the stdout summary; the return
-    value stays 0 so a batch that did land its other work is not
-    misreported after a successful `dump()`. Only a codebook that fails
-    `validate()` after the merge returns 1, leaving the file untouched.
-
-    `candidate_disposition_conflicts` counts a DIFFERENT thing and is not a
-    fourth failure mode: not a skipped record, but a successfully-merged
-    recurrence sighting appended to an already-adjudicated candidate, whose
-    disposition is left to the census. It covers the rejected case and the
-    promoted-with-no-resolvable-`promoted_to` case only — a promoted title's
-    recurrence is routed onto the entry it was promoted to and counted in
-    `matched` instead (see `apply_coding_record`).
-
-    `correction_skipped` is a fifth thing again: a well-formed correction
-    whose field writes could not land because a sibling correction in the
-    same record already claimed that entry's one sighting slot for this
-    session. It is reported here and as a WARNING (never silently dropped),
-    but the batch keeps going and the return value stays 0 — the record is
-    valid, it just says the same thing twice.
-
-    `invariant_slugs_valid`/`invariant_slugs_rejected` count the
-    `invariant_violated` values screened against the slugs declared under
-    `--project-root`; a rejected value is stored as absent and the batch
-    logs one WARNING naming them.
+    A malformed JSON line, a deletion-shaped record and a schema-invalid record
+    are each skipped, named on stderr by `path:lineno:`, and counted on the
+    stdout `applied:` line; the rest of the batch still lands. Returns 1,
+    leaving the file untouched, only for a non-dict codebook or a merged
+    codebook that fails `validate()`.
     """
     invariant_slugs = invariants.read_slugs(args.project_root)
     codebook = load(args.codebook)
@@ -1021,89 +1268,30 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    totals = {
-        "matched": 0,
-        "skipped_unknown_entry": 0,
-        "candidates_applied": 0,
-        "candidate_disposition_conflicts": 0,
-        "corrections_applied": 0,
-        "correction_skipped": 0,
-        "record_invalid": 0,
-        "malformed_json": 0,
-        "deletion_directive": 0,
-    }
-    slug_tally = SlugTally()
+    parsed, malformed = _read_jsonl(args.records)
+    merge = apply_coding_records(
+        codebook, [record for _, record in parsed], invariant_slugs=invariant_slugs
+    )
+    for label, skips in (
+        ("deletion directive rejected", merge.skipped_deletions),
+        ("invalid coding record", merge.invalid_records),
+    ):
+        for skipped in skips:
+            lineno = parsed[skipped.index][0]
+            print(
+                f"{args.records}:{lineno}: {label}, skipping: {skipped.describe()}",
+                file=sys.stderr,
+            )
+    warn_unknown_invariant_slugs(merge.invariant_slugs, invariant_slugs, run=f"apply {args.records}")
 
-    with open(args.records, encoding="utf-8") as f:
-        for lineno, raw_line in enumerate(f, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                # Mirror apply_coding_record()'s skip-whole semantics for an
-                # invalid record: one malformed JSONL line is dropped and
-                # counted, never aborts the rest of the nightly/trickle
-                # batch (a JSON parse error happens before a record can
-                # ever reach apply_coding_record()'s own validation skip).
-                print(
-                    f"{args.records}:{lineno}: malformed JSON, skipping: {exc}",
-                    file=sys.stderr,
-                )
-                totals["malformed_json"] += 1
-                continue
-            try:
-                codebook, stats = apply_coding_record(
-                    codebook, record, invariant_slugs=invariant_slugs
-                )
-            except NeverDeleteError as exc:
-                # Mirror the malformed-JSON sibling above: one deletion-shaped
-                # record is dropped and counted, never aborts the rest of the
-                # nightly/trickle batch (dump() is after this loop, so an
-                # escaping exception discarded every already-applied in-memory
-                # record). apply_coding_record raises before it even
-                # deep-copies, so `codebook` is provably untouched by the bad
-                # record.
-                print(
-                    f"{args.records}:{lineno}: deletion directive rejected, skipping: {exc}",
-                    file=sys.stderr,
-                )
-                totals["deletion_directive"] += 1
-                continue
-            totals["matched"] += stats["matched"]
-            totals["skipped_unknown_entry"] += stats["skipped_unknown_entry"]
-            totals["candidates_applied"] += stats["candidates_applied"]
-            totals["candidate_disposition_conflicts"] += stats[
-                "candidate_disposition_conflicts"
-            ]
-            totals["corrections_applied"] += stats["corrections_applied"]
-            totals["correction_skipped"] += stats["correction_skipped"]
-            totals["record_invalid"] += int(stats["record_invalid"])
-            slug_tally = slug_tally.plus(stats["invariant_slugs"])
-
-    warn_unknown_invariant_slugs(slug_tally, invariant_slugs, run=f"apply {args.records}")
-    totals["invariant_slugs_valid"] = slug_tally.valid
-    totals["invariant_slugs_rejected"] = len(slug_tally.rejected)
-
-    errors = validate(codebook)
+    errors = validate(merge.codebook)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
         return 1
 
-    dump(codebook, args.codebook)
-    print(
-        "applied: matched={matched} candidates_applied={candidates_applied} "
-        "candidate_disposition_conflicts={candidate_disposition_conflicts} "
-        "corrections_applied={corrections_applied} "
-        "correction_skipped={correction_skipped} "
-        "skipped_unknown_entry={skipped_unknown_entry} "
-        "record_invalid={record_invalid} malformed_json={malformed_json} "
-        "deletion_directive={deletion_directive} "
-        "invariant_slugs_valid={invariant_slugs_valid} "
-        "invariant_slugs_rejected={invariant_slugs_rejected}".format(**totals)
-    )
+    dump(merge.codebook, args.codebook)
+    print(f"applied: {merge.summary()} malformed_json={malformed}")
     return 0
 
 

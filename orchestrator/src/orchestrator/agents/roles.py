@@ -885,8 +885,8 @@ this session is one-shot, and abandoned work is recorded as a successful run."""
 #
 # No sighting COUNT is stated in the text below -- the codebook accrues a new
 # sighting every census cycle, and a number baked into a role prompt goes
-# stale silently while "catalogued sightings all show the same shape" stays
-# true.
+# stale silently.  The evidence sentence instead names the defect's REGION
+# with an open list of sub-shapes, which stays true as new sub-shapes accrue.
 _TOOL_CALL_REJECTION_KNOWN_SHAPES = """
 ## Reading a tool-call rejection before you retry
 
@@ -897,8 +897,11 @@ reports several distinct shapes, and they do not share a fix:
 - "could not be parsed as JSON" means the call's SYNTAX is broken and no
   parameter VALUE is implicated. Re-emit the entire call from scratch; never
   copy the rejected call and edit one field. Catalogued sightings of this
-  shape all show a `Read` call whose echoed input carries an empty slot
-  between `offset` and `limit` — editing `limit` and resubmitting the same
+  shape are `Read` calls malformed in the `offset`/`limit` pagination
+  region — an empty slot, a stray extra value, a bare value with no key, or
+  the closing brace placed before `limit` — and the defect you see may be
+  none of these. Whatever the echo shows, the fix is the same re-emit from
+  scratch: editing a value such as `limit` and resubmitting the same
   malformed structure reproduces the identical rejection, because editing a
   value cannot fix a syntax error.
 - A rejection naming a parameter the schema does not have is the opposite
@@ -2311,7 +2314,7 @@ spelling of the same set.
 
 Do NOT substitute either near-miss constant for this one -- they are different
 vocabularies that merely share the ``stash_failed`` token.
-:data:`orchestrator.merge_queue._HALT_ADVANCE_RESULTS` holds ``advance_main``
+:data:`orchestrator.merge_lane.worker._HALT_ADVANCE_RESULTS` holds ``advance_main``
 RESULT codes (its ``wip_overlap`` / ``pop_conflict`` /
 ``pop_conflict_no_advance`` members are not escalation categories at all), and
 :data:`orchestrator.stranded_verified_green.DURABLE_MERGE_FAILURE_STATUSES`

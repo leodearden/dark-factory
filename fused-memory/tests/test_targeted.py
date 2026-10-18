@@ -12,6 +12,7 @@ import pytest_asyncio
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
@@ -2841,6 +2842,22 @@ class TestSweepCancelledDescendants:
         mock_interceptor.update_task.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_escalate_files_into_the_layout_escalation_queue_when_relocated(
+        self, wired_reconciler, mock_taskmaster, monkeypatch, tmp_path,
+        escalation_queue_relocation,
+    ):
+        self._orchestrator_live(monkeypatch)
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        escalated = self._descendant_actions(result, 'descendant_escalated')
+        filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
+        assert [p.stem for p in filed] == [a.get('escalation_id') for a in escalated]
+        assert len(filed) == 1
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('stage,raised', [
         pytest.param('init', 'read-only fs', id='init'),
         pytest.param('submit', 'disk full', id='submit'),
@@ -3353,116 +3370,6 @@ def test_targeted_uses_the_shared_supersedes_parser(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _truncate_clean unit tests (task 2080)
-#
-# _format_outcome_echo's `note[:max_note_chars]` slice (and _on_task_done's
-# identical `details[:500]` append) cut on a raw character count with no
-# regard for word/token boundaries, so a long note is silently garbled mid
-# word/number (e.g. task 2054: "8679,8680" chopped to "8679,868") and, in the
-# note+commit branch, the " (commit <sha>)" suffix is glued directly onto
-# that broken fragment. _truncate_clean is the shared pure helper that
-# replaces both raw slices with a clean, word-boundary-aware truncation.
-
-
-def test_truncate_clean_returns_short_text_unchanged():
-    """Text at or under the limit is returned verbatim -- no ellipsis
-    appended -- so every existing short-note/short-details case is
-    unaffected."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    short = 'x' * 20
-    assert _truncate_clean(short, 500) == short
-    assert '…' not in _truncate_clean(short, 500)
-    # Boundary case: exactly at the limit is still "unchanged", not truncated.
-    exact = 'y' * 500
-    assert _truncate_clean(exact, 500) == exact
-
-
-def test_truncate_clean_cuts_on_word_boundary():
-    """A long text with whitespace near the cutoff backs up to that boundary
-    instead of slicing through the trailing word -- the dropped word must
-    not appear as a broken fragment glued to the ellipsis."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    # Index 495 is the last whitespace char within text[:499] (the budget
-    # for limit=500); the word 'ZZZZZZZZZZ' starts right after it and would
-    # be chopped to 'ZZZ' by a naive text[:500] slice.
-    text = ('A' * 495) + ' ' + ('Z' * 10)
-    result = _truncate_clean(text, 500)
-
-    assert result.endswith('…')
-    assert len(result) <= 500
-    # The boundary word must be dropped whole, not split mid-token.
-    assert 'Z' not in result
-    assert 'ZZZ…' not in result
-    assert result == ('A' * 495) + '…'
-
-
-def test_truncate_clean_hard_cuts_when_no_whitespace_in_window():
-    """No whitespace anywhere in the truncation window -- falls back to a
-    hard cut at (limit - 1) chars plus the ellipsis, still honoring the
-    cap."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    long_text = 'N' * 600
-    result = _truncate_clean(long_text, 500)
-
-    assert result == ('N' * 499) + '…'
-    assert len(result) == 500
-
-
-def test_truncate_clean_ignores_early_whitespace_min_retention_guard():
-    """Whitespace that sits very early in the window is NOT used as the cut
-    point when backing up to it would discard more than half the budget --
-    that would collapse a 500-char budget down to a couple of characters."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    text = 'ab ' + ('N' * 600)
-    result = _truncate_clean(text, 500)
-
-    # Must NOT back up to the space at index 2 (would keep only 'ab').
-    assert not result.startswith('ab…')
-    assert result == text[:499] + '…'
-    assert len(result) == 500
-
-
-def test_truncate_clean_word_boundary_well_past_half_budget_retains_chunk():
-    """A last-whitespace index that is comfortably past budget // 2 -- but
-    nowhere near the edge of the window, unlike the near-boundary word-cut
-    test above -- still takes the word-boundary branch (backs up to that
-    whitespace) rather than falling through to a hard cut at the budget."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    # budget = limit - 1 = 499, so budget // 2 == 249; the space at index 300
-    # is well past that threshold without hugging the window's edge.
-    text = ('A' * 300) + ' ' + ('B' * 300)
-    result = _truncate_clean(text, 500)
-
-    assert result == ('A' * 300) + '…'
-    assert 'B' not in result
-    assert len(result) < 500
-
-
-def test_truncate_clean_rstrips_trailing_whitespace_before_ellipsis():
-    """Multiple consecutive whitespace chars ending at the word-boundary cut
-    point leave the head (`text[:last_ws]`) still ending in whitespace --
-    rstrip() must trim that before the ellipsis is appended, so the result
-    never reads as "...word    …" and its length can land strictly under
-    the limit rather than exactly at it."""
-    from fused_memory.reconciliation.targeted import _truncate_clean
-
-    # Three consecutive spaces at indices 300-302; index 302 is the last
-    # whitespace in the text[:499] window for limit=500, so head = text[:302]
-    # still carries two of those spaces for rstrip() to remove.
-    text = ('A' * 300) + '   ' + ('B' * 300)
-    result = _truncate_clean(text, 500)
-
-    assert result == ('A' * 300) + '…'
-    assert not result.endswith(' …')
-    assert len(result) < 500
-
-
-# ---------------------------------------------------------------------------
 # _format_outcome_echo truth table (task 2049)
 #
 # _on_task_done's fast-path completion echo currently appends the task's raw
@@ -3524,7 +3431,7 @@ def test_format_outcome_echo_truth_table(provenance, expected_contains):
 
 
 def test_format_outcome_echo_truncates_long_note():
-    """``_truncate_clean(note, max_note_chars)`` caps the echoed note at 500
+    """``utils/clip_disclosure.py::fit_at_word`` caps the echoed note at 500
     chars, and in the note+commit branch the cap is applied to the note
     BEFORE the ``" (commit <sha>)"`` suffix is appended -- so the suffix must
     still appear, intact, after a note longer than the cap.
@@ -3973,7 +3880,7 @@ async def test_on_task_done_first_transition_echoes_provenance_not_description(
 # `details` was previously hard-cut with a raw `details[:500]` slice -- the
 # same naive-character-count bug fixed in _format_outcome_echo's note
 # branches. This pins the legacy fallback to the same clean, word-boundary
-# truncation contract (_truncate_clean).
+# truncation contract (utils/clip_disclosure.py::fit_at_word).
 
 
 @pytest.mark.asyncio
@@ -4032,7 +3939,8 @@ async def test_on_task_done_legacy_details_fallback_skips_non_str_details(
     reconciler, mock_memory_service, mock_taskmaster,
 ):
     """A non-str `details` (e.g. a list slipping through task metadata) must
-    not crash _truncate_clean's len()/slicing/.isspace() chain. Mirroring
+    not crash fit_at_word's len()/slicing/.isspace() chain (see
+    utils/clip_disclosure.py::fit_at_word). Mirroring
     _format_outcome_echo's isinstance guard on `note`, the fallback simply
     omits the Details section instead of propagating a TypeError."""
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
@@ -5773,6 +5681,39 @@ async def test_unblock_dependent_failure_does_not_strand_siblings(
 # ── task-4903: escalation-pin veto ──────────────────────────────────────────
 
 
+def _seed_open_escalation_pinning_task_2(project_root: str) -> str:
+    """Submit a real pending escalation pinning task '2' into the layout queue."""
+    from escalation.models import Escalation
+    from escalation.queue import EscalationQueue
+
+    queue = EscalationQueue(escalation_queue_dir(project_root))
+    return queue.submit(Escalation(
+        id=queue.make_id('2'),
+        task_id='2',
+        agent_role='harness',
+        severity='blocking',
+        category='dependency_discovered',
+        summary='Task 2 blocked pending external dependency',
+        detail='blocked pending review',
+        suggested_action='wait',
+        level=1,
+    ))
+
+
+async def _unblock_sweep_over_blocked_task_2(
+    wired_reconciler, mock_taskmaster, project_root: str,
+) -> dict:
+    """Complete task '1' with task '2' blocked on it, driving the dependent-unblock sweep."""
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+    return await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=project_root,
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+
 @pytest.mark.asyncio
 async def test_unblock_dependent_vetoed_by_open_escalation(
     wired_reconciler, mock_taskmaster, tmp_path,
@@ -5792,32 +5733,11 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
     targeted.py:1441-1454), so the on-disk shape is production-real rather
     than a hand-rolled JSON blob.
     """
-    from escalation.models import Escalation
-    from escalation.queue import EscalationQueue
-
     project_root = str(tmp_path)
-    queue = EscalationQueue(Path(project_root) / 'data/escalations')
-    esc = Escalation(
-        id=queue.make_id('2'),
-        task_id='2',
-        agent_role='harness',
-        severity='blocking',
-        category='dependency_discovered',
-        summary='Task 2 blocked pending external dependency',
-        detail='blocked pending review',
-        suggested_action='wait',
-        level=1,
-    )
-    esc_id = queue.submit(esc)
+    esc_id = _seed_open_escalation_pinning_task_2(project_root)
 
-    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
-        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
-    ))
-
-    result = await wired_reconciler.reconcile_task(
-        task_id='1', transition='done', project_id='test-project',
-        project_root=project_root,
-        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, project_root,
     )
 
     actions = _dep_actions_for(result, '2')
@@ -5832,6 +5752,22 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
         f'Expected escalation_ids to name the pinning escalation, got: {actions[0]!r}'
     )
     wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_queue(
+    wired_reconciler, mock_taskmaster, tmp_path, escalation_queue_relocation,
+):
+    esc_id = _seed_open_escalation_pinning_task_2(str(tmp_path))
+
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, str(tmp_path),
+    )
+
+    [action] = _dep_actions_for(result, '2')
+    assert action.get('reason') == 'escalation_pinned', action
+    assert action.get('escalation_ids') == [esc_id], action
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 @pytest.mark.asyncio
@@ -7061,6 +6997,19 @@ def _contradicted_result(**overrides) -> VerificationResult:
 
 class TestContradictedEscalation:
     """A contradicted verdict files an L1 escalation; no other verdict does."""
+
+    @pytest.mark.asyncio
+    async def test_contradicted_files_into_the_layout_escalation_queue_when_relocated(
+        self, reconciler, tmp_path, escalation_queue_relocation,
+    ):
+        from escalation.queue import EscalationQueue
+
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+
+        await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
+        assert len(EscalationQueue(escalation_queue_dir(tmp_path)).get_pending()) == 1
 
     @pytest.mark.asyncio
     async def test_contradicted_files_an_l1_escalation_with_pointers(

@@ -7,7 +7,8 @@ Two things every such guard needs from git:
   pre-commit hook does) would silently point the call at a different index.
   A missing git or a non-zero exit raises ``AssertionError`` and never skips:
   a guard whose population git supplies would otherwise pass green without
-  having looked at anything.
+  having looked at anything. ``run_git`` is the same call for commands whose
+  exit code IS the answer (e.g. ``check-ignore``), so it does not assert on it.
 * ``listed_files`` is ``--cached --others --exclude-standard``: tracked files
   plus untracked ones that are not ignored. So a newly created, uncommitted
   file is swept, while gitignored foreign checkouts (``.worktrees/`` and the
@@ -27,18 +28,23 @@ import subprocess
 from pathlib import Path
 
 
-def git(cwd: Path, *args: str) -> str:
-    """The stdout of ``git *args`` run in *cwd*."""
+def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """``git *args`` run in *cwd*, whatever its exit code."""
     env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
     command = ['git', *args]
     try:
-        proc = subprocess.run(
+        return subprocess.run(
             command, cwd=cwd, capture_output=True, text=True, env=env, check=False,
         )
     except OSError as exc:
         raise AssertionError(f'could not run {command} in {cwd}: {exc!r}') from exc
+
+
+def git(cwd: Path, *args: str) -> str:
+    """The stdout of ``git *args`` run in *cwd*."""
+    proc = run_git(cwd, *args)
     assert proc.returncode == 0, (
-        f'{command} failed in {cwd} with rc={proc.returncode}; stderr: {proc.stderr!r}'
+        f'{proc.args} failed in {cwd} with rc={proc.returncode}; stderr: {proc.stderr!r}'
     )
     return proc.stdout
 

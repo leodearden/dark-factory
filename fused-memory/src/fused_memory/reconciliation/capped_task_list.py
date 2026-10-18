@@ -1,9 +1,10 @@
 """The no-silent-caps render of a Stage-2 payload section's task list.
 
 Audit sections promise COMPLETE enumeration yet carry a defensive render cap.
-This module owns what a clip must say: a ``_NOTE:`` line in the section (the
-token the Stage-2 prompt tells the model to read as clipped coverage) and a
-WARNING log naming what was dropped.
+A clip here says so twice: the shared ``_NOTE:`` line in the section
+(``utils/clip_disclosure.py::clip_note``, the token the Stage-2 prompt tells
+the model to read as clipped coverage) and a WARNING log naming what was
+dropped.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import logging
 from collections.abc import Mapping
 
 from fused_memory.reconciliation.task_filter import format_task_list
+from fused_memory.utils.clip_disclosure import clip_note
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +38,11 @@ def render_capped_task_list(
     if omitted <= 0:
         return f'{format_task_list(tasks)}\n'
     logger.warning(log_event, extra={**log_extra, 'rendered': cap, 'omitted': omitted})
-    return (
-        f'{format_task_list(tasks[:cap])}\n'
-        f'\n_NOTE: {omitted} additional {omitted_noun} were omitted from this render by the '
-        f'{cap_name}={cap} cap. Coverage was clipped — NOT complete this cycle; '
-        f'{dropped_first} were dropped first._'
+    note = clip_note(
+        omitted=omitted,
+        omitted_noun=omitted_noun,
+        cap_name=cap_name,
+        cap=cap,
+        dropped_first=dropped_first,
     )
+    return f'{format_task_list(tasks[:cap])}\n\n{note}'

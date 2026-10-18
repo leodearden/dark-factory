@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
 import pytest
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
@@ -94,6 +95,15 @@ class TestTheFiledEscalation:
         operator watches."""
         _emit(tmp_path)
         assert (tmp_path / 'data' / 'escalations').is_dir()
+
+    def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        esc_id = _emit(tmp_path)
+
+        filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
+        assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_the_id_is_minted_off_the_anchor(self, tmp_path):
         esc_id = _emit(tmp_path)

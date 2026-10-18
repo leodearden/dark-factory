@@ -93,6 +93,10 @@ _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 #   REIFY_ROOT — or when REIFY_ROOT names a path that has no guard script, in
 #   which case the skip NAMES that path.  Run this in any environment that has
 #   both repos checked out side-by-side.
+#
+# Out of suite: `scripts/check_lock_charter_drift.py` (task 3226) runs the same
+#   cross-repo comparison explicitly, without the full suite — three exit codes,
+#   no skip state, so an absent or unrunnable sibling reports as loudly as drift.
 # ---------------------------------------------------------------------------
 
 # The canonical α/γ vector — update this list AND FILE_EXTENSIONS together.
@@ -111,7 +115,7 @@ _CANONICAL_EXTENSIONS = [
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
@@ -406,6 +410,8 @@ _ACCEPT_PATHS = [
     # reify file with a `tombstones` extension; filename is PRD-normative
     # (reify docs/prds/v0_6/spec-conformance-suite.md D3).
     'docs/reify-language-spec.tombstones',  # reify
+    # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
+    'tests/infra/affected-crates-direct-sets.tsv',  # reify
 ]
 
 

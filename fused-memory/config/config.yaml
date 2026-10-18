@@ -378,6 +378,7 @@ reconciliation:
   # benign hovering without masking a real runaway (which would blow well past 1500).
   backlog_hard_limit_overrides:
     reify: 1500
+    # solar_challenge deliberately has no override: task 7076, plans/recon-throughput-capacity.md
   # Aggregate storm alarm — dead_owner_shielded suppression burst (task 1755 / PRD β).
   # When >=threshold suppressions occur in a rolling window, one loud
   # recon_watchdog_kill_storm escalation fires. Per-event suppression (task 1731) is kept.
@@ -685,7 +686,7 @@ mem0_update:
 write_triage:
   # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the
   # CALIBRATION OUTPUT fence are the ones a human is meant to edit — these two
-  # and the eight judge knobs below them; everything below the fence is
+  # and the judge knobs below them; everything below the fence is
   # derived. All of them are green-tier hot-reloadable, and
   # scripts/calibrate_write_triage.py --write-config preserves them when it
   # rewrites the calibrated keys below.
@@ -705,8 +706,8 @@ write_triage:
   candidate_k: 20
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
-  # them. All eight are green-tier hot-reloadable and read live per middle-band
-  # write.
+  # them. Every judge knob is green-tier hot-reloadable and read live per
+  # middle-band write.
   #
   # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
   # unlike `enabled` above, because the judge is inert while triage is off —
@@ -724,6 +725,8 @@ write_triage:
   # llm.model, which scored worse than the status quo on the comparative.
   judge_provider: openai
   judge_model: gpt-6.1-sol
+  # judge_api_url: the judge's OWN endpoint (null inherits llm.providers.<provider>.api_url); see plans/write-triage-flip-readiness-prd.md task σ.
+  judge_api_url: null
   # judge_timeout_seconds: NOT optional. No LLM call elsewhere in fused-memory
   # sets a timeout and the openai SDK default is 600s; on the synchronous
   # add_memory write path that is a wedge, not a degradation. A timeout

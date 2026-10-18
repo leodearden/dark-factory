@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import _checkout as _checkout
 from orchestrator.harness import _extract_tagger_entries
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (

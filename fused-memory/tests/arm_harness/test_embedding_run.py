@@ -30,6 +30,7 @@ from arm_harness._embedding_doubles import (
     reference_graph,
 )
 from arm_harness._fakes import embedding_spec, llm_spec, make_prereg_repo
+from fused_memory.arm_harness import graph_copy
 from fused_memory.arm_harness.arm_embedder import ArmEmbedder, EmbedSettings, QueryEmbedder
 from fused_memory.arm_harness.embedding_graph_phase import EmbeddingRunCheckFailed
 from fused_memory.arm_harness.embedding_run import EmbeddingRunRefused, run_embedding_arm
@@ -102,6 +103,7 @@ class World:
         self.ranker = RecordingRanker()
         self.run_dir = tmp_path / 'runs' / 'granite'
         self.backend_kwargs = dict(backend_kwargs or {})
+        self.sleeps: list[float] = []
 
     async def probe_set(self) -> ProbeSet:
         return ProbeSet(
@@ -168,8 +170,11 @@ class World:
             base_config=self.base_config,
             run_dir=self.run_dir,
             repo_root=self.repo.root,
-            sleep=_no_sleep,
+            sleep=self.sleep,
         )
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
 
     def phases(self) -> list[str]:
         """The run's store calls by phase, consecutive repeats collapsed."""
@@ -178,10 +183,6 @@ class World:
             if not collapsed or collapsed[-1] != phase:
                 collapsed.append(phase)
         return collapsed
-
-
-async def _no_sleep(seconds: float) -> None:
-    return None
 
 
 def _by_metric(records: Sequence[MetricsRecord]) -> dict[tuple[str, str | None], MetricsRecord]:
@@ -402,6 +403,17 @@ async def test_the_manifest_records_settings_embedder_reembeds_and_checks(make_w
     ]
     assert all(check.passed for check in manifest.check_results)
     assert manifest.started_at <= manifest.finished_at
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reference_copy_is_retried_through_the_runs_sleep(make_world):
+    world = make_world(reference_kwargs={'refused_copies': 2})
+
+    await world.run()
+
+    assert (world.run_dir / 'run.json').exists()
+    assert world.log.count('copy') == 3
+    assert world.sleeps.count(graph_copy.COPY_RETRY_INTERVAL_S) == 2
 
 
 # --- failures that are measurements, not errors -----------------------------------------

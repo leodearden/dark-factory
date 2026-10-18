@@ -7,18 +7,25 @@ import types
 from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from _fm_helpers import _make_rate_limit_error
 from _mem0_record_shapes import mem0_record
+from _qdrant_responses import missing_collection_404
+from qdrant_client.http.exceptions import UnexpectedResponse
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, escalation_queue_dir
 
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import Scope, resolve_project_id_for_root
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
     ReferentRepairStats,
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
+    metadata_row_text,
 )
 from fused_memory.utils.referent_verification import ReferentStats
 
@@ -47,9 +54,18 @@ DEFAULT_POINT_PAYLOAD = {
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
+    return _mocked_service(mock_config)
+
+
+def _mocked_service(config) -> MemoryService:
+    """Build a MemoryService over *config* with mocked backends.
+
+    The ``service`` fixture's body, callable from a test body so a test can
+    set the environment BEFORE the service is constructed.
+    """
     from _fm_helpers import install_identity_mocks
 
-    svc = MemoryService(mock_config)
+    svc = MemoryService(config)
     # Mock backends
     svc.graphiti = MagicMock()
     svc.graphiti.search = AsyncMock(return_value=[])
@@ -2832,12 +2848,130 @@ class TestUpdateMemoryStormCounter:
 
         assert isinstance(service._mem0_update_storm_escalator, Mem0UpdateStormEscalator)
 
-    def test_set_known_projects_reaches_the_escalator(self, service):
-        """The registry snapshot must arrive where project_root resolution happens."""
-        service.set_known_projects({'dark_factory': '/home/leo/src/dark-factory'})
-        assert service._mem0_update_storm_escalator._known_projects == {
-            'dark_factory': '/home/leo/src/dark-factory',
-        }
+
+@pytest.mark.skipif(
+    not storm_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestUpdateMemoryStormFilesIntoTheProjectQueue:
+    """An update_memory burst lands as a record in the right project's queue.
+
+    Drives the REAL escalator into real queue files under tmp_path through the
+    public surface, so it fails whichever link breaks: the registry seed, its
+    forwarding to the escalator, or the project_id -> root resolution.
+    """
+
+    AGENT = 'recon-stage-memory_consolidator'
+
+    @staticmethod
+    def _filed(root):
+        queue_files = sorted(escalation_queue_dir(root).glob('esc-*.json'))
+        return [json.loads(path.read_text()) for path in queue_files]
+
+    async def _amend(self, service, project_id, times):
+        for _ in range(times):
+            await service.update_memory(
+                memory_id='point-1', project_id=project_id,
+                content='amended text', reason='consolidation',
+                agent_id=self.AGENT,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_never_wired_service_files_into_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The alarm defends itself: startup wiring is not its only registry source."""
+        root = tmp_path / 'storm_proj'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+
+        await self._amend(service, resolve_project_id_for_root(root), times=3)
+
+        filed = self._filed(root)
+        assert len(filed) == 1, filed
+        assert filed[0]['category'] == 'mem0_in_place_update_storm'
+        assert self.AGENT in filed[0]['summary']
+
+    @pytest.mark.asyncio
+    async def test_startup_wiring_replaces_the_env_seed(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The startup snapshot wins over the seed, and the setter reaches the escalator."""
+        root_env = tmp_path / 'seeded' / 'storm_proj'
+        root_env.mkdir(parents=True)
+        root_wired = tmp_path / 'wired'
+        root_wired.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root_env))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(root_env)
+
+        service.set_known_projects({project_id: str(root_wired)})
+        await self._amend(service, project_id, times=3)
+
+        assert len(self._filed(root_wired)) == 1
+        assert self._filed(root_env) == []
+
+    @pytest.mark.asyncio
+    async def test_the_seed_never_consults_taskmaster_project_root(
+        self, mock_config, tmp_path, caplog,
+    ):
+        """taskmaster.project_root defaults to '.', so seeding from it would misfile.
+
+        With no env registry the burst must be logged and filed nowhere, even
+        into a real directory the config names.
+        """
+        primary = tmp_path / 'primary_proj'
+        primary.mkdir()
+        mock_config.taskmaster = TaskmasterConfig(project_root=str(primary))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(primary)
+
+        with caplog.at_level(logging.WARNING, logger=storm_mod.__name__):
+            await self._amend(service, project_id, times=3)
+
+        assert self._filed(primary) == []
+        assert any(
+            record.name == storm_mod.__name__
+            and record.levelno == logging.WARNING
+            and project_id in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_one_agent_amending_in_two_projects_files_a_per_project_count(
+        self, mock_config, tmp_path,
+    ):
+        """A recon stage id carries no project, so one agent amends in many.
+
+        The count filed into a project's queue must be reproducible from that
+        project's own journal rows, never pooled across projects.
+        """
+        root_a = tmp_path / 'a'
+        root_b = tmp_path / 'b'
+        root_a.mkdir()
+        root_b.mkdir()
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        service.set_known_projects({'proj_a': str(root_a), 'proj_b': str(root_b)})
+
+        await self._amend(service, 'proj_a', times=2)
+        await self._amend(service, 'proj_b', times=2)
+
+        assert self._filed(root_a) == []
+        assert self._filed(root_b) == []
+
+        await self._amend(service, 'proj_b', times=1)
+
+        filed = self._filed(root_b)
+        assert len(filed) == 1, filed
+        assert 'count=3' in filed[0]['detail'].splitlines()
+        assert 'proj_b' in filed[0]['summary']
+        assert self._filed(root_a) == []
+        assert service.mem0_update_storm_tracked_agents == frozenset({self.AGENT})
 
 
 class TestUpdateEdgeVerification:
@@ -3047,6 +3181,48 @@ class TestClose:
         mock_journal.close.assert_called_once()
         mock_buffer.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_close_closes_router_and_classifier(self, service):
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+        service.router.close = AsyncMock()
+        service.classifier.close = AsyncMock()
+
+        await service.close()
+
+        service.router.close.assert_awaited_once()
+        service.classifier.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_flush_closes_run_before_sdk_pool_releases(self, service):
+        service._write_journal = MagicMock()
+        service._event_buffer = MagicMock()
+        service.planned_episode_registry = MagicMock()
+        order: list[str] = []
+        for label, resource in (
+            ('durable_queue', service.durable_queue),
+            ('graphiti', service.graphiti),
+            ('mem0', service.mem0),
+            ('write_journal', service._write_journal),
+            ('event_buffer', service._event_buffer),
+            ('planned_episode_registry', service.planned_episode_registry),
+            ('classifier', service.classifier),
+            ('router', service.router),
+        ):
+            resource.close = AsyncMock(side_effect=lambda label=label: order.append(label))
+
+        await service.close()
+
+        assert sorted(order) == sorted(
+            [
+                'durable_queue', 'graphiti', 'mem0', 'write_journal',
+                'event_buffer', 'planned_episode_registry', 'classifier', 'router',
+            ]
+        )
+        for durable in ('write_journal', 'event_buffer', 'planned_episode_registry'):
+            for pool in ('classifier', 'router'):
+                assert order.index(durable) < order.index(pool), order
+
 
 # The logger MemoryService.close() reports sub-close failures on. Single-sourced
 # so the caplog LEVEL scope (`at_level(logger=...)`) and the record FILTER below
@@ -3182,9 +3358,10 @@ class TestCloseBoundsSlowSubclose:
     shutdown budget or starve the durable-flush closes that follow it."""
 
     def _wire_resources(self, service):
-        """Wire all six sub-resources with AsyncMock close() methods and
-        return a name->mock mapping (mirrors
-        TestCloseLogsExceptions._make_resource_mocks)."""
+        """Wire the six storage sub-resources with AsyncMock close() methods
+        and return a name->mock mapping (mirrors
+        TestCloseLogsExceptions._make_resource_mocks). The classifier and
+        router SDK-pool releases are left real."""
         service.graphiti.close = AsyncMock()
         service.mem0.close = AsyncMock()
 
@@ -3329,6 +3506,35 @@ class TestCloseBoundsSlowSubclose:
         resources['durable_queue'].close.assert_awaited_once()
         for name in ('_write_journal', '_event_buffer', 'planned_episode_registry'):
             resources[name].close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hung_sdk_pool_release_is_bounded_below_the_backend_budget(
+        self, service, caplog
+    ):
+        """An SDK connection-pool release only drops local idle sockets, so its
+        real budget is far tighter than a storage backend's: a hung classifier
+        release lets close() return inside 2.0s with no timeout monkeypatched,
+        and the router release after it still runs."""
+        resources = self._wire_resources(service)
+        service.router.close = AsyncMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        service.classifier.close = AsyncMock(side_effect=_hang)
+
+        with caplog.at_level(logging.WARNING, logger=_CLOSE_LOGGER):
+            await asyncio.wait_for(service.close(), timeout=2.0)
+
+        service.router.close.assert_awaited_once()
+        for resource in resources.values():
+            resource.close.assert_awaited_once()
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == _CLOSE_LOGGER
+        ]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert 'classifier' in warnings[0].getMessage()
 
 
 class TestGraphitiBackendRemoveEdge:
@@ -4061,6 +4267,49 @@ class TestGetEntity:
         assert 'e-invalid' not in {e['uuid'] for e in result['edges']}, (
             'FUZZY branch must drop invalidated edges to match the EXACT/topological '
             'branch (task 2726)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_branch_keeps_restored_edges(self, service):
+        """FUZZY branch keeps a restored edge — ``invalid_at`` None, ``expired_at``
+        set — while still dropping a superseded one (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature; graphiti_core never sets ``expired_at`` without
+        ``invalid_at``.  So ``expired_at`` alone marks a RESTORED fact, not a
+        retired one, and dropping it would hide exactly what the hooks restored.
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        # Empty exact-name result forces the FUZZY fallback.  search_nodes and
+        # search are awaited concurrently through gather_or_raise, so both must
+        # be stubbed or the gather raises.
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Svc', uuid='n1')]
+        )
+        retired = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Svc valid fact', uuid='e-valid', invalid_at=None, expired_at=None),
+            MockEdge(
+                fact='Svc superseded fact',
+                uuid='e-superseded',
+                invalid_at=retired,
+                expired_at=retired,
+            ),
+            MockEdge(
+                fact='Svc restored fact',
+                uuid='e-restored',
+                invalid_at=None,
+                expired_at=retired,
+            ),
+        ])
+
+        result = await service.get_entity('Svc', project_id='test')
+
+        assert [e['uuid'] for e in result['edges']] == ['e-valid', 'e-restored'], (
+            'FUZZY branch must drop the superseded edge (invalid_at set) and keep '
+            'the restored one (invalid_at None, expired_at set) — esc-4714-9'
         )
 
     # ------------------------------------------------------------------
@@ -7626,6 +7875,63 @@ class TestSearchGraphitiInvalidatedFiltering:
             'RRF scores must be strictly decreasing in rank order'
         )
 
+    @pytest.mark.asyncio
+    async def test_restored_edge_with_expired_at_alone_is_returned(self, service):
+        """A restored edge — ``invalid_at`` None, ``expired_at`` set — surfaces
+        (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature, and graphiti_core never sets ``expired_at``
+        without ``invalid_at``, so ``expired_at`` alone marks a restored fact.
+        Three edges go in: one fully active, one superseded via ``invalid_at``
+        (task 312), and one restored.  The active and restored facts come back,
+        ranked contiguously over the survivors.
+        """
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_retired = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Current fact',
+                uuid='edge-active',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Superseded fact',
+                uuid='edge-invalid-at',
+                valid_at=dt_valid,
+                invalid_at=dt_retired,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Restored fact',
+                uuid='edge-restored',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=dt_retired,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert [r.id for r in results] == ['edge-active', 'edge-restored'], (
+            'the superseded edge must be dropped (task 312) and the restored '
+            'edge kept: expired_at alone does not retire an edge (esc-4714-9)'
+        )
+        assert [r.content for r in results] == ['Current fact', 'Restored fact']
+
+        assert [r.metadata['store_rank'] for r in results] == [1, 2], (
+            'store_rank must be contiguous over survivors — the dropped '
+            'superseded edge must not consume a rank'
+        )
+
 
 class TestSearchRrfMerge:
     """Task 3658: MemoryService.search merges the two stores by RRF, not by precedence.
@@ -10988,6 +11294,55 @@ class TestCountMemoriesByMetadata:
         assert isinstance(filters['task_id'], int)
 
 
+class TestMetadataReadsOnAbsentCollection:
+    """Both service-level metadata reads inherit the backend's absent-collection
+    degradation through their passthrough, so every caller of either one reads
+    a never-provisioned project as empty while a real failure still raises
+    (task 4858).
+
+    ``svc.mem0`` stays the REAL ``Mem0Backend``; only its Qdrant client is faked.
+    """
+
+    _PROJECT = 'solar_challenge'
+    _FILTERS = {'kind': 'project_status_correction'}
+    _READS = ['get_memories_by_metadata', 'count_memories_by_metadata']
+    _EMPTY_READ_RESULTS = [
+        pytest.param('get_memories_by_metadata', [], id='get'),
+        pytest.param('count_memories_by_metadata', 0, id='count'),
+    ]
+
+    @classmethod
+    async def _read_with_qdrant_raising(cls, mock_config, read: str, exc: BaseException):
+        svc = MemoryService(mock_config)
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=exc)
+        client.count = AsyncMock(side_effect=exc)
+        with patch.object(svc.mem0, '_get_async_qdrant', AsyncMock(return_value=client)):
+            return await getattr(svc, read)(project_id=cls._PROJECT, filters=cls._FILTERS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('read', 'empty'), _EMPTY_READ_RESULTS)
+    async def test_absent_collection_reads_as_empty(self, mock_config, read, empty):
+        collection = Scope(project_id=self._PROJECT).mem0_collection_name(
+            mock_config.mem0.collection_prefix,
+        )
+
+        result = await self._read_with_qdrant_raising(
+            mock_config, read, missing_collection_404(collection),
+        )
+
+        assert result == empty
+        assert type(result) is type(empty)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('read', _READS)
+    async def test_backend_failure_still_raises(self, mock_config, read):
+        failure = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
+
+        with pytest.raises(UnexpectedResponse):
+            await self._read_with_qdrant_raising(mock_config, read, failure)
+
+
 # ---------------------------------------------------------------------------
 # Task 1752: get_status uptime fields
 # ---------------------------------------------------------------------------
@@ -11662,6 +12017,37 @@ class TestGetMemoryById:
 
         with pytest.raises(TimeoutError):
             await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+
+class TestMetadataRowText:
+    """metadata_row_text: the text of one get_memories_by_metadata row.
+
+    Rows take the real scroll shape ``{'id', 'created_at', 'metadata'}`` of
+    backends/mem0_client.py::Mem0Backend._normalise_point, where ``metadata``
+    is the full payload.
+    """
+
+    def test_reads_the_text_from_the_payload_under_metadata(self):
+        row = {
+            'id': 'u',
+            'created_at': '2026-01-01T00:00:00+00:00',
+            'metadata': {'data': 'the text', 'topic': 't', 'created_at': '2026-01-01T00:00:00+00:00'},
+        }
+
+        assert metadata_row_text(row) == 'the text'
+
+    def test_a_top_level_content_key_is_not_the_rows_text(self):
+        row = {'id': 'u', 'content': 'stray', 'created_at': None, 'metadata': {'topic': 't'}}
+
+        assert metadata_row_text(row) == ''
+
+    @pytest.mark.parametrize(
+        'row',
+        [{'id': 'u'}, {'id': 'u', 'metadata': None}, {'id': 'u', 'metadata': 'not-a-dict'}],
+        ids=['no-metadata-key', 'metadata-none', 'metadata-not-a-dict'],
+    )
+    def test_a_row_without_a_payload_dict_reads_as_empty(self, row):
+        assert metadata_row_text(row) == ''
 
 
 class _FakePointStore:
@@ -14654,6 +15040,22 @@ class TestReferentScanNarrowsWithTheProjectRegistry:
         assert self._enqueued_refs(service) == [self.EVIL_REF]
 
     @pytest.mark.asyncio
+    async def test_a_never_wired_service_narrows_with_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The constructor's env seed reaches this consumer, not only the storm alarm."""
+        root = tmp_path / 'reify'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+
+        assert self._enqueued_refs(service) == []
+
+    @pytest.mark.asyncio
     async def test_add_memory_preserves_a_genuine_in_registry_foreign_ref(self, service):
         service.set_known_projects(self.REGISTRY)
         await service.add_memory(
@@ -14711,13 +15113,14 @@ class TestSetKnownProjectsLogsTheWireUp:
     """One INFO line per wire-up, naming whether referent narrowing is ACTIVE.
 
     `set_known_projects` is the single injection point every caller goes
-    through (`server/main.py` plus tests), so a future second caller cannot
-    bypass the report by wiring the registry somewhere else.
+    through (the constructor's env seed, `server/main.py` and tests), so a
+    future second caller cannot bypass the report by wiring the registry
+    somewhere else.
 
     The PERMISSIVE arm is logged too, and is the one an operator most needs:
-    `MemoryService` is constructed before `build_known_projects_map` runs, so
-    an empty registry is a real and easily-missed window — and while it lasts,
-    every producer scan silently stays permissive.
+    with DASHBOARD_KNOWN_PROJECT_ROOTS unset the constructor's seed is empty
+    until startup wiring, so an empty registry is a real and easily-missed
+    window — and while it lasts, every producer scan silently stays permissive.
     """
 
     @staticmethod

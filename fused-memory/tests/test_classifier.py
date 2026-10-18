@@ -1,7 +1,7 @@
 """Tests for the write classifier heuristics."""
 
 import pytest
-from _openai_stubs import completion_client, raising_client
+from _sdk_client_stubs import completion_client, raising_client
 
 from fused_memory.models.enums import (
     LLM_CLASSIFIER_FAILURES,

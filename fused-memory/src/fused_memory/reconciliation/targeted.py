@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from shared.project_layout import escalation_queue_dir
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -43,6 +44,7 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.utils.clip_disclosure import fit_at_word
 from fused_memory.utils.task_dependency_ids import task_dependency_ids
 from fused_memory.utils.validation import InputValidationError, require_project_root
 
@@ -81,10 +83,6 @@ _PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
 _SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
     {'done', 'cancelled', 'deferred'}
 )
-
-# Default location of the per-project escalation queue.  Matches the
-# convention used by scope_violation_escalator.py and ticket_janitor.py.
-_ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 
 # What the dependent-unblock claimant clear did, carried on the action as
 # ``claimant_clear`` (see TargetedReconciler._clear_claimant_before_unblock).
@@ -631,7 +629,7 @@ class TargetedReconciler:
                         )
                     details = task.get('details', '')
                     if isinstance(details, str) and details:
-                        content += f"\nDetails: {_truncate_clean(details, 500)}"
+                        content += f"\nDetails: {fit_at_word(details, 500)}"
 
             write_metadata: dict[str, Any] = {
                 'source': _ECHO_SOURCE,
@@ -1785,7 +1783,7 @@ class TargetedReconciler:
         detail = '\n'.join(detail_lines)
 
         try:
-            queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            queue = EscalationQueue(escalation_queue_dir(project_root))
             esc = Escalation(
                 id=queue.make_id(task_id),
                 task_id=task_id,
@@ -1908,7 +1906,7 @@ class TargetedReconciler:
         flat_title = ' '.join(str(title).split())
         summary = (
             f'Codebase evidence contradicts the completion claim of task '
-            f'{task_id}: {_truncate_clean(flat_title, 120)}'
+            f'{task_id}: {fit_at_word(flat_title, 120)}'
         )
         # POINTERS ONLY (INV-9): no verifier summary, no evidence snippets.
         # The finding already has two homes; this says where they are so the
@@ -1941,7 +1939,7 @@ class TargetedReconciler:
             # contradicted branch would create data/escalations/ in every
             # target project as a side effect of an unrelated done
             # transition — the trap _escalation_pin_index_for documents.
-            queue = queue_cls(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            queue = queue_cls(escalation_queue_dir(project_root))
             esc = esc_cls(
                 id=queue.make_id(task_id),
                 task_id=task_id,
@@ -2132,7 +2130,7 @@ class TargetedReconciler:
             return None
         index: dict[str, list[str]] | None
         try:
-            queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            queue = EscalationQueue(escalation_queue_dir(project_root))
             index = {}
             for esc in await asyncio.to_thread(queue.get_pending):
                 # str() both sides of what get_by_task compared with ==, so an
@@ -2738,42 +2736,6 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != _ECHO_SOURCE
 
 
-def _truncate_clean(text: str, limit: int) -> str:
-    """Truncate ``text`` to at most ``limit`` chars without splitting a word.
-
-    Task 2080: a naive ``text[:limit]`` slice (the previous behavior of both
-    ``_format_outcome_echo``'s note cap and ``_on_task_done``'s legacy
-    ``details[:500]`` append) cuts at a raw character count with no regard
-    for word/token boundaries — e.g. a dense CSV-like note's "8679,8680" was
-    silently garbled to "8679,868", and in the note+commit echo the
-    " (commit <sha>)" suffix then glued directly onto that broken fragment.
-
-    Contract:
-    - ``text`` at or under ``limit`` is returned unchanged (no ellipsis).
-    - Otherwise, one char of the budget is reserved for a trailing ellipsis
-      ('…', U+2026) and the cut backs up to the last whitespace boundary
-      within that budget — but ONLY when doing so retains more than half the
-      budget. This avoids collapsing the result to a handful of characters
-      when whitespace is sparse or sits only very early in the window; in
-      that case (or when there is no whitespace at all) it falls back to a
-      hard cut at the budget.
-
-    The result length is always <= ``limit``.
-    """
-    if len(text) <= limit:
-        return text
-    budget = limit - 1
-    window = text[:budget]
-    # Only the LAST whitespace in the window matters, so scan backwards and
-    # stop at the first match instead of a full forward pass over `window`.
-    last_ws = next(
-        (i for i in range(len(window) - 1, -1, -1) if window[i].isspace()),
-        -1,
-    )
-    head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
-    return head.rstrip() + '…'
-
-
 # Bounds on the evidence pointers carried by the contradicted-verdict L1
 # escalation (task 4723).  Small on purpose: the escalation is a one-screen
 # alert a human triages, not a copy of the finding.
@@ -2821,9 +2783,9 @@ def _evidence_paths(
         stripped = raw.strip()
         if not stripped:
             continue
-        # _truncate_clean (task 2080) rather than a raw slice: a naive cut
-        # garbles a dense path mid-segment the same way it garbled a CSV note.
-        path = _truncate_clean(stripped, maxlen)
+        # utils/clip_disclosure.py::fit_at_word (task 2080) rather than a raw slice: a naive
+        # cut garbles a dense path mid-segment the same way it garbled a CSV note.
+        path = fit_at_word(stripped, maxlen)
         if path in seen:
             continue
         seen.add(path)
@@ -2851,8 +2813,9 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
       signalling the caller to fall back to the existing description+details
       append (preserves legacy/no-provenance behavior).
 
-    ``note`` is cleanly truncated (word-boundary cut, ``_truncate_clean``) to
-    ``max_note_chars`` to bound the memory write — mirroring the
+    ``note`` is cleanly truncated (word-boundary cut,
+    ``utils/clip_disclosure.py::fit_at_word``) to ``max_note_chars`` to
+    bound the memory write — mirroring the
     ``details[:500]`` cap in the fast-path append (also cleanly truncated,
     task 2080). A prior revision used a raw ``note[:max_note_chars]`` slice,
     which cut mid-word/mid-number (task 2054: "8679,8680" garbled to
@@ -2866,9 +2829,9 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
     note = raw_note.strip() if isinstance(raw_note, str) else ''
     commit = raw_commit.strip() if isinstance(raw_commit, str) else ''
     if note and commit:
-        return f'{_truncate_clean(note, max_note_chars)} (commit {commit})'
+        return f'{fit_at_word(note, max_note_chars)} (commit {commit})'
     if note:
-        return _truncate_clean(note, max_note_chars)
+        return fit_at_word(note, max_note_chars)
     if commit:
         return f'Landed in commit {commit}.'
     return None

@@ -3820,6 +3820,21 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         )
 
     @pytest.mark.asyncio
+    async def test_payload_recently_completed_discloses_the_done_cap(self, mock_deps, watermark):
+        """Done tasks beyond MAX_DONE_TASKS_RETAINED are counted in a window note, not silently dropped."""
+        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [self._make_task(i, 'done') for i in range(1, MAX_DONE_TASKS_RETAINED + 6)]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, '### Recently Completed Tasks')
+        [note] = [line for line in section.splitlines() if line.startswith('_NOTE:')]
+        assert f'of {MAX_DONE_TASKS_RETAINED + 5} done task(s)' in note
+        assert f'MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}' in note
+
+    @pytest.mark.asyncio
     async def test_stage_does_not_apply_second_slice_on_done_tasks(
         self, mock_deps, watermark
     ):
@@ -5396,7 +5411,7 @@ class TestBriefingKnownGapsRefresh:
             patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
             patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=MagicMock(
+                new=AsyncMock(return_value=StageResult(
                     success=True, report={'summary': 'ok'},
                 )),
             ),
@@ -5446,7 +5461,7 @@ class TestBriefingKnownGapsRefresh:
             patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
             patch(
                 'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=MagicMock(
+                new=AsyncMock(return_value=StageResult(
                     success=True, report={'summary': 'ok'},
                 )),
             ),
@@ -5502,7 +5517,7 @@ class TestBriefingKnownGapsRefresh:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['taskmaster'].add_task.return_value = {'id': '9001', 'message': 'created'}
 
-        fake_cli_result = MagicMock(success=True, report={'summary': 'ok'})
+        fake_cli_result = StageResult(success=True, report={'summary': 'ok'})
 
         with (
             patch(
@@ -5545,7 +5560,7 @@ class TestBriefingKnownGapsRefresh:
         stage.scope = _scope('reify', stage.scope.project_root)
         stage.scope = _scope(stage.scope.project_id, str(tmp_path))
 
-        fake_cli_result = MagicMock(success=True, report={'summary': 'ok'})
+        fake_cli_result = StageResult(success=True, report={'summary': 'ok'})
 
         with (
             patch(
@@ -7055,7 +7070,7 @@ class TestQueryStage2Flags:
             self._make_result('id-1', 'flag content', {'flag_for_stage2': True, 'task_id': '742', 'run_id': 'r-current'}),
             self._make_result('id-2', 'no flag', {}),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued, _carried = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         assert current_flags[0]['id'] == 'id-1'
         assert stale_missing_ids == []
@@ -7069,7 +7084,7 @@ class TestQueryStage2Flags:
             self._make_result('id-4', 'irrelevant', {'some_other_key': True}),
             self._make_result('id-5', 'also irrelevant', {}),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued, _carried = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
         assert stale_missing_ids == []
         assert stale_mismatched_ids == []
@@ -7082,7 +7097,7 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('id-6', 'content here', meta),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued, _carried = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert len(current_flags) == 1
         flag = current_flags[0]
         assert flag['id'] == 'id-6'
@@ -7098,7 +7113,7 @@ class TestQueryStage2Flags:
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
         with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
-            current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+            current_flags, stale_missing_ids, stale_mismatched_ids, _rescued, _carried = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
         assert stale_missing_ids == []
         assert stale_mismatched_ids == []
@@ -7140,7 +7155,7 @@ class TestQueryStage2Flags:
                 {'flag_for_stage2': True, 'task_id': '999'},
             ),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued, _carried = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         stale_marker_ids = stale_missing_ids + stale_mismatched_ids
 
         # Only the current-cycle marker should be in current_flags
@@ -7175,7 +7190,7 @@ class TestQueryStage2Flags:
         memory_service.search.return_value = [
             self._make_result('test-id', 'content', meta),
         ]
-        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(
+        current_flags, stale_missing_ids, stale_mismatched_ids, _rescued, _carried = await _query_stage2_flags(
             memory_service, 'reify', filter_run_id
         )
         stale_marker_ids = stale_missing_ids + stale_mismatched_ids
@@ -7207,9 +7222,9 @@ class TestQueryStage2Flags:
         ]
         partition = await _query_stage2_flags(memory_service, 'reify', 'r-current')
 
-        # Partition must be the right type with 4 fields
+        # Partition must be the right type with 5 fields
         assert isinstance(partition, Stage2FlagPartition)
-        assert len(partition) == 4
+        assert len(partition) == 5
 
         # (a) only matching marker in current
         assert len(partition.current) == 1
@@ -7646,9 +7661,10 @@ class TestQueryStage2Flags:
         )
 
     @pytest.mark.asyncio
-    async def test_partition_return_is_4_field_stage2flagpartition(self):
-        """Return is a 4-field Stage2FlagPartition (current, stale_missing_run_id_ids,
-        stale_mismatched_run_id_ids, rescued_ids) with run_window_start active."""
+    async def test_partition_return_is_5_field_stage2flagpartition(self):
+        """Return is a 5-field Stage2FlagPartition (current, stale_missing_run_id_ids,
+        stale_mismatched_run_id_ids, rescued_ids, carried_forward_ids) with
+        run_window_start active."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             Stage2FlagPartition,
             _query_stage2_flags,
@@ -7661,8 +7677,9 @@ class TestQueryStage2Flags:
             memory_service, 'reify', 'r-current', run_window_start=run_window_start
         )
         assert isinstance(partition, Stage2FlagPartition)
-        assert len(partition) == 4
+        assert len(partition) == 5
         assert partition.rescued_ids == []
+        assert partition.carried_forward_ids == []
 
     @pytest.mark.asyncio
     async def test_rescued_ids_field_collects_window_guard_rescued_marker_ids(self):
@@ -11501,14 +11518,13 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
-        fake_cli_result = MagicMock(
+        fake_cli_result = StageResult(
             success=True,
             report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
             llm_calls=1,
             tokens_used=0,
             cost_usd=0.0,
             model='test-model',
-            error=None,
         )
         watermark = Watermark(project_id='reify')
 
@@ -11542,14 +11558,13 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': []}
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
-        fake_cli_result = MagicMock(
+        fake_cli_result = StageResult(
             success=True,
             report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
             llm_calls=1,
             tokens_used=0,
             cost_usd=0.0,
             model='test-model',
-            error=None,
         )
         watermark = Watermark(project_id='reify')
 
@@ -11589,11 +11604,11 @@ class TestAssemblePayloadRunWindowStart:
         }
 
     def _fake_cli_result(self):
-        return MagicMock(
+        return StageResult(
             success=True,
             report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
             llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
+            model='test-model',
         )
 
     @pytest.mark.asyncio
@@ -11619,7 +11634,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11661,7 +11676,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11703,7 +11718,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11765,7 +11780,7 @@ class TestAssemblePayloadRunWindowStart:
 
         async def capture_query(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return Stage2FlagPartition([], [], [], [])
+            return Stage2FlagPartition([], [], [], [], [])
 
         with (
             patch(
@@ -11836,11 +11851,11 @@ class TestRescuedInWindowMarkersStat:
         }
 
     def _fake_cli_result(self):
-        return MagicMock(
+        return StageResult(
             success=True,
             report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
             llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
+            model='test-model',
         )
 
     @pytest.mark.asyncio
@@ -11963,6 +11978,7 @@ class TestRescuedInWindowMarkersStat:
             stale_missing_run_id_ids=[],
             stale_mismatched_run_id_ids=[],
             rescued_ids=['rescued-1'],  # only 1, even though both flags have non-matching run_id
+            carried_forward_ids=[],
         )
 
         with (
@@ -12229,9 +12245,9 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
     def mock_deps(self):
         return _mock_stage_deps()
 
-    def _make_cli_result(self, flagged_items: list[dict]) -> MagicMock:
-        """Return a fake StageResult-like object for patching run_stage_via_cli."""
-        return MagicMock(
+    def _make_cli_result(self, flagged_items: list[dict]) -> StageResult:
+        """Return a StageResult for patching run_stage_via_cli."""
+        return StageResult(
             success=True,
             report={'flagged_items': flagged_items, 'summary': 'ok'},
             llm_calls=1,
@@ -12529,12 +12545,12 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 # ── Task-1137: Stage 2 post-flight guards ────────────────────────────────────
 
 
-def _make_stage2_guard_cli_result(flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
-    """Return a fake StageResult-like object for patching run_stage_via_cli."""
+def _make_stage2_guard_cli_result(flagged_items: list[dict], stats: dict | None = None) -> StageResult:
+    """Return a StageResult for patching run_stage_via_cli."""
     report = {'flagged_items': flagged_items, 'summary': 'ok'}
     if stats:
         report['stats'] = stats
-    return MagicMock(
+    return StageResult(
         success=True,
         report=report,
         llm_calls=1,
@@ -15075,6 +15091,75 @@ class TestIntegrityCheckContaminationCeilingWiring:
             "when no flags are dropped; "
             f"got stats={report.stats!r}"
         )
+
+
+class TestIntegrityCheckSnapshotStatEdgeWiring:
+    """IntegrityCheck.run() applies filter_snapshot_stat_edge_findings for every
+    project and surfaces report.stats['snapshot_stat_edge_findings_dropped']
+    (task 3487). Mirrors TestIntegrityCheckContaminationCeilingWiring."""
+
+    @pytest.fixture
+    def config(self):
+        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+
+    @pytest.fixture
+    def mock_deps(self, config):
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('dark_factory', '/tmp/test'),
+        }
+
+    async def _run(self, mock_deps, flags):
+        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
+        stage.filtered_task_tree = None
+        base_report = StageReport(
+            stage=StageId.integrity_check,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=flags,
+            stats={},
+        )
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='run-3487',
+            )
+
+    @pytest.mark.asyncio
+    async def test_stat_edge_finding_dropped_for_a_non_blocked_project(self, mock_deps):
+        stat_edge_flag = {
+            'task_id': None,
+            'flag_type': 'stats_mismatch',
+            'category': 'memory_stale',
+            'description': 'Stage 2 reported task_count_snapshot_mem0_written=1 but no '
+                           'Graphiti temporal_facts edge exists',
+            'suggested_action': 'Investigate the rejected write',
+            'actionable': False,
+        }
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        report = await self._run(mock_deps, [stat_edge_flag, benign_flag])
+
+        assert report.items_flagged == [benign_flag]
+        assert report.stats['snapshot_stat_edge_findings_dropped'] == 1
+
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_with_no_flags(self, mock_deps):
+        report = await self._run(mock_deps, [])
+
+        assert report.stats['snapshot_stat_edge_findings_dropped'] == 0
 
 
 class TestIntegrityCheckPhantomTaskCreationWiring:
@@ -18290,6 +18375,29 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         assert report.stats['preservation_specimen_unresolved'] == 0
         # Not just the count: the citation travels into the stats blob Stage 2
         # is handed verbatim, so the suppression is never anonymous there.
+        assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
+
+    @pytest.mark.asyncio
+    async def test_a_novel_flag_type_is_suppressed_through_the_action_channel(self, mock_deps):
+        """A naming with no 'strand' stem is still caught by its prose.
+
+        The fixture is this class's realistic finding verbatim apart from
+        flag_type: the status sits in description, the reset in suggested_action.
+        """
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+
+        specimen = self._stranded_flag(flag_type='liveness_anomaly_unattended_workflow')
+        base_report = self._make_base_report([specimen])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5463-action-channel',
+            )
+
+        assert specimen not in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 1
         assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
 
     @pytest.mark.asyncio

@@ -41,8 +41,9 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.models.scope import build_known_projects_map
 from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
@@ -65,8 +66,6 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-
-_QUEUE_DIRNAME = 'data/escalations'
 
 # Sentinel project_id used when the candidate_json is unparseable, so we can
 # still group those rows and emit a single escalation for the batch.
@@ -189,7 +188,7 @@ class TicketJanitor:
     def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(escalation_queue_dir(project_root))
             self._queues[project_root] = q
         return q
 

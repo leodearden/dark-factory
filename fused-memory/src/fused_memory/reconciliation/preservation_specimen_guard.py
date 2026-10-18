@@ -41,23 +41,32 @@ the first cycle somebody remembers to write a suppression record for it.
 COMPOSITE TASK IDS, AND THE DEFECT THIS AVOIDS.  A flag's OWN ``task_id`` is
 routinely comma-joined — task 3105 has been flagged as ``'3105,5080'`` and
 ``'3105,4223'``, among others — so every candidate id is DECOMPOSED before
-corroboration and the counters key on the corroborated COMPONENT, not on the
-raw string.  That is a correctness requirement rather than a refinement, and the reason is visible in
-the sibling: ``flag_dedup.filter_suppressed._keep`` looks its flag's task_id up
+corroboration and the counters key on a corroborated COMPONENT, not on the
+raw string.  Decomposition is what lets the guard SEE a specimen inside a
+composite at all, and the sibling shows the gap it avoids:
+``flag_dedup.filter_suppressed._keep`` looks its flag's task_id up
 VERBATIM while only the suppression ROW side is decomposed (see
 ``_decompose_suppression_task_id``'s docstring, which scopes itself to that
 side), so a suppression row for ``'3105'`` still does not match a finding
-carrying ``'3105,4223'``.  Inheriting that gap would make this guard
-zero-recall on exactly the task it exists to protect.  This guard and
+carrying ``'3105,4223'``.  Inheriting that gap would leave this guard blind
+to the specimen inside every composite that names it.  This guard and
 ``flag_dedup._flag_candidate_task_ids`` both decompose a flag's own task_id
 through the one shared splitter, ``flag_task_ids.task_id_components``.
+
+Seeing a specimen is not licence to drop the finding.  A composite is dropped
+only when EVERY component corroborates: ``'3105,4223'`` claims something about
+4223 too, and the under-suppression bias below forbids hiding that claim on
+3105's citation.  A mixed composite is instead kept on a copy annotated with
+:data:`PRESERVED_SPECIMEN_COMPONENTS_KEY`, so Stage 2 sees the specimen
+evidence beside the reset request.
 
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
 ``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
 task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
 matcher), ``services.memory_service`` (for the canonical raw-payload content
-extractor) and, optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
+extractor), ``shared.task_statuses`` (the closed status vocabulary) and,
+optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
 nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
 calls in.  It performs detection only — it drops flags, never writes tasks or
 memories.
@@ -79,9 +88,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+from shared.task_statuses import TaskStatus
 
 from fused_memory.reconciliation.flag_shape import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
@@ -89,12 +101,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
 )
 
-# The canonical ``data`` -> ``memory`` -> ``content`` raw-payload key fallback.
-# IMPORTED rather than re-spelled, exactly as ``server/grouped_read.py`` does:
-# a scroll payload and a search item do not put the text under the same key,
-# which is why guessing one is wrong, and a second copy of the order would be
-# one more place for the two to drift (INV-5).
-from fused_memory.services.memory_service import _mem0_content
+# The scroll-row text reader, IMPORTED rather than re-spelled: it owns the
+# canonical raw-payload key fallback through ``_mem0_content``, and a second
+# copy would be one more place for the two to drift (INV-5).
+from fused_memory.services.memory_service import metadata_row_text
 
 # Optional escalation dependency: the reconciliation package must import
 # cleanly where the escalation package is not installed, and
@@ -112,6 +122,7 @@ __all__ = [
     'PRESERVATION_CORROBORATION_BUDGET_SECONDS',
     'PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE',
     'PRESERVATION_TOKEN_FAMILY',
+    'PRESERVED_SPECIMEN_COMPONENTS_KEY',
     'STRANDED_ACTION_TARGET_FAMILY',
     'STRANDED_ACTION_VERB_FAMILY',
     'STRANDED_FLAG_TOKEN_FAMILY',
@@ -187,10 +198,37 @@ STRANDED_ACTION_TARGET_FAMILY: tuple[str, ...] = ('in-progress', 'in progress')
 
 #: Flag fields consulted for the ACTION channel.  ``suggested_action`` is the
 #: canonical field (``FINDING_ITEM_SCHEMA``); ``description`` is read too
-#: because the LLM routinely states the requested reset there and leaves
-#: ``suggested_action`` terse.
+#: because the LLM routinely states the task's status there and leaves
+#: ``suggested_action`` terse, so the verb and the target may sit in
+#: different fields.
 _STRANDED_ACTION_FIELDS: tuple[str, ...] = ('suggested_action', 'description')
 
+#: The destinations a reset out of in-progress can name, derived from
+#: ``TaskStatus`` so the list has one home.  Longest first, so no member can
+#: shadow a longer one in an alternation.
+_STATUSES_OUT_OF_IN_PROGRESS: tuple[str, ...] = tuple(
+    sorted((s.value for s in TaskStatus if s is not TaskStatus.IN_PROGRESS), key=len, reverse=True)
+)
+
+
+def _alternation(members: tuple[str, ...]) -> str:
+    return '|'.join(map(re.escape, members))
+
+
+#: A :data:`STRANDED_ACTION_VERB_FAMILY` verb whose object is the task itself:
+#: "task" or "the task" with an optional id, then the clause ends (a comma does
+#: not end it) or names a destination status.  Anything else after it is
+#: something the task OWNS: "task 3105's priority override", "to its default".
+_RESET_AIMED_AT_THE_TASK: re.Pattern[str] = re.compile(
+    rf'\b(?:{_alternation(STRANDED_ACTION_VERB_FAMILY)})\s+(?:the\s+)?tasks?(?:\s+#?\d+)?'
+    rf'(?=\s*(?:[.;:!?)]|$)|\s+(?:back\s+)?to\s+(?:{_alternation(_STATUSES_OUT_OF_IN_PROGRESS)})\b)',
+    re.IGNORECASE,
+)
+
+#: The key a KEPT mixed-composite flag's copy carries: ``{component: citation}``
+#: for each component of its task_id that corroborated as a preserved specimen.
+#: Stage 2 is handed each flag as JSON, so the evidence travels beside the claim.
+PRESERVED_SPECIMEN_COMPONENTS_KEY: str = 'preserved_specimen_components'
 
 #: Per-cycle, per-task suppression ceiling for the INV-4 storm escape.  One
 #: preserved specimen legitimately draws one stranded finding a cycle, very
@@ -286,17 +324,25 @@ def flag_asserts_stranded(flag: Any) -> bool:
     1. **Vocabulary** — ``flag['flag_type']`` contains a
        :data:`STRANDED_FLAG_TOKEN_FAMILY` stem.  Catches the namings already
        observed, and any future one built on the same word.
-    2. **Requested action** — the flag's ``suggested_action``/``description``
-       contains BOTH a :data:`STRANDED_ACTION_VERB_FAMILY` verb and a
-       :data:`STRANDED_ACTION_TARGET_FAMILY` status.  Catches a naming built on
-       a different word entirely, which the vocabulary channel must eventually
-       miss because ``flag_type`` is free-form LLM output.
+    2. **Requested action** — the flag asks to move the task out of
+       ``in-progress``: ONE of ``suggested_action``/``description`` holds both
+       a :data:`STRANDED_ACTION_VERB_FAMILY` verb and a
+       :data:`STRANDED_ACTION_TARGET_FAMILY` status, or the status sits in
+       either field and a verb aimed at the task itself
+       (:data:`_RESET_AIMED_AT_THE_TASK`) in either.  The second form is how
+       real findings read: the status in ``description``, "reset task 3105" in
+       ``suggested_action``.  Catches a naming built on a different word
+       entirely, which the vocabulary channel must eventually miss because
+       ``flag_type`` is free-form LLM output.
 
     The conjunction in channel 2 is load-bearing.  ``'reset'`` alone matches
     ``stale_priority_override``'s perfectly reasonable "reset the priority
     override back to its default"; ``'in-progress'`` alone matches any finding
-    that merely mentions a task's status.  Requiring both keeps the channel
-    inside the class it is named for.
+    that merely mentions a task's status, and a preserved specimen is
+    permanently in-progress, so its unrelated findings mention that status
+    often.  That is why a verb pairs with a status in the OTHER field only when
+    the task is its object.  Requiring both keeps the channel inside the class
+    it is named for.
 
     This is the discriminator that BOUNDS the guard: a preserved task's genuine,
     unrelated findings still reach Stage 2 because they answer False here.
@@ -311,12 +357,26 @@ def flag_asserts_stranded(flag: Any) -> bool:
         return False
     if contains_any_casefolded(flag.get('flag_type'), STRANDED_FLAG_TOKEN_FAMILY):
         return True
-    return any(
-        contains_any_casefolded(flag.get(field), STRANDED_ACTION_VERB_FAMILY)
-        and contains_any_casefolded(flag.get(field), STRANDED_ACTION_TARGET_FAMILY)
-        for field in _STRANDED_ACTION_FIELDS
-    )
+    return _requests_reset_out_of_in_progress(flag)
 
+
+def _requests_reset_out_of_in_progress(flag: dict[str, Any]) -> bool:
+    """Channel 2 of :func:`flag_asserts_stranded`, whose docstring states the rule.
+
+    Each field is read on its own rather than joined, so no match can straddle
+    the boundary between two of them.  Total over non-``str`` values.  Pure,
+    sync, no I/O.
+    """
+    texts = [text for field in _STRANDED_ACTION_FIELDS if isinstance(text := flag.get(field), str)]
+    in_one_field = any(
+        contains_any_casefolded(text, STRANDED_ACTION_VERB_FAMILY)
+        and contains_any_casefolded(text, STRANDED_ACTION_TARGET_FAMILY)
+        for text in texts
+    )
+    across_fields = any(
+        contains_any_casefolded(text, STRANDED_ACTION_TARGET_FAMILY) for text in texts
+    ) and any(_RESET_AIMED_AT_THE_TASK.search(text) for text in texts)
+    return in_one_field or across_fields
 
 
 def _is_usable_task_id(component: str) -> bool:
@@ -368,12 +428,17 @@ class PreservationSuppressionResult:
     """Outcome of :func:`filter_preservation_specimen_flags`.
 
     - ``kept_flags`` — the flags that survived, input order preserved, to be
-      assigned back to ``report.items_flagged``.
-    - ``suppressed_by_task`` — ``{task_id: count}`` of flags dropped, attributed
-      per corroborated task.  Its ``values()`` sum is the per-cycle
-      ``preservation_specimen_suppressed`` stat, and it drives the storm escape.
+      assigned back to ``report.items_flagged``.  A mixed composite survives
+      as an annotated COPY (the module docstring's COMPOSITE TASK IDS); every
+      other kept flag is the input object itself.
+    - ``suppressed_by_task`` — ``{task_id: count}`` of flags dropped, each
+      counted ONCE, so its ``values()`` sum is the per-cycle
+      ``preservation_specimen_suppressed`` stat.  A composite counts against
+      its least component in string order, never the first-written one, so
+      every ordering of the same ids lands on one counter.  It drives the
+      storm escape.
     - ``citations_by_task`` — ``{task_id: citation_ref}``, the Mem0 memory id or
-      Graphiti uuid each suppression actually relied on.  A suppression is never
+      Graphiti uuid of every component citation a drop relied on.  A drop is never
       anonymous: without this, "one flag suppressed" gives an operator no way to
       check whether the citation is real, current, or over-broad.
     - ``unresolved_task_ids`` — tasks this cycle reached no verdict on: a
@@ -438,18 +503,6 @@ def preservation_mem0_filters(task_id: str) -> dict[str, Any]:
     Pure, sync, no I/O.
     """
     return {'kind': MEM0_KIND_INVESTIGATION_OUTCOME, 'task_id': task_id, 'actionable': False}
-
-
-def _mem0_row_text(row: dict[str, Any]) -> str:
-    """The human-readable prose of one ``get_memories_by_metadata`` row.
-
-    That reader returns ``{'id', 'created_at', 'metadata'}`` where ``metadata``
-    is the FULL raw Qdrant payload, so the text is wherever
-    :func:`~fused_memory.services.memory_service._mem0_content` says it is —
-    ``data``, then ``memory``, then ``content``.  Pure, sync, no I/O.
-    """
-    payload = row.get('metadata')
-    return _mem0_content(payload) if isinstance(payload, dict) else ''
 
 
 def _first_citation(
@@ -679,7 +732,7 @@ async def _corroborate_preservation(
         )
         degraded = True
     else:
-        citation = _first_citation(rows, _mem0_row_text, 'id')
+        citation = _first_citation(rows, metadata_row_text, 'id')
         if citation is not None:
             return _Corroboration(citation=citation, degraded=False)
 
@@ -722,6 +775,21 @@ async def _corroborate_preservation(
     return _Corroboration(citation=_graphiti_citation(entity), degraded=degraded)
 
 
+def _component_citations(
+    task_ids: tuple[str, ...], verdicts: dict[str, _Corroboration],
+) -> dict[str, str]:
+    """``{component: citation}`` for each of *task_ids* that corroborated, in order.
+
+    A component with no verdict (the cycle's budget ran out before it was
+    looked up) or no citation is simply absent.  Pure, sync, no I/O.
+    """
+    return {
+        task_id: verdict.citation
+        for task_id in task_ids
+        if (verdict := verdicts.get(task_id)) is not None and verdict.citation is not None
+    }
+
+
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 
@@ -744,8 +812,9 @@ async def filter_preservation_specimen_flags(
     2. Each candidate is corroborated ONCE by
        :func:`_corroborate_preservation`, positive and negative verdicts alike,
        so a task appearing on N flags costs one corroboration pass.
-    3. A corroborated task's stranded flags are dropped and the citation
-       recorded.
+    3. A stranded flag is dropped, and its citations recorded, only when EVERY
+       component of its task_id corroborated; one where only some did is kept
+       on an annotated copy (the module docstring's COMPOSITE TASK IDS).
 
     An empty candidate set short-circuits before any I/O, so a cycle with
     nothing in this class — the overwhelming majority — costs zero backend
@@ -843,43 +912,33 @@ async def filter_preservation_specimen_flags(
     kept: list[dict[str, Any]] = []
     suppressed_by_task: dict[str, int] = {}
     citations_by_task: dict[str, str] = {}
-    kept_task_ids: set[str] = set()
     for flag, task_ids in candidacy:
-        cited = next(
-            (
-                (tid, verdict.citation)
-                for tid in task_ids
-                if (verdict := verdicts.get(tid)) is not None and verdict.citation is not None
-            ),
-            None,
-        )
-        if cited is None:
+        citations = _component_citations(task_ids, verdicts)
+        if not citations:
             kept.append(flag)
-            kept_task_ids.update(task_ids)
-            continue
-        # Counters key on the CORROBORATED COMPONENT, never the raw composite:
-        # one task is flagged under several comma-joined spellings, and keying on
-        # the string would scatter its suppressions across a counter per
-        # permutation — the storm threshold would never trip and the citation
-        # audit trail would fragment.
-        cited_task, citation = cited
-        suppressed_by_task[cited_task] = suppressed_by_task.get(cited_task, 0) + 1
-        citations_by_task[cited_task] = citation
-        log.info(
-            'preservation_specimen_guard: suppressed flag_type=%r (task_id=%r) for '
-            'task %s in project %s — corroborated as a preserved specimen by %s',
-            flag.get('flag_type'), flag.get('task_id'), cited_task, project_id, citation,
-        )
+        elif len(citations) < len(task_ids):
+            kept.append({**flag, PRESERVED_SPECIMEN_COMPONENTS_KEY: citations})
+            log.info(
+                'preservation_specimen_guard: kept flag_type=%r (task_id=%r) in project '
+                '%s annotated with specimen citations %s — not every component '
+                'corroborated as a preserved specimen',
+                flag.get('flag_type'), flag.get('task_id'), project_id, citations,
+            )
+        else:
+            counted_against = min(task_ids)
+            suppressed_by_task[counted_against] = suppressed_by_task.get(counted_against, 0) + 1
+            citations_by_task.update(citations)
+            log.info(
+                'preservation_specimen_guard: suppressed flag_type=%r (task_id=%r) in '
+                'project %s — every component corroborated as a preserved specimen: %s',
+                flag.get('flag_type'), flag.get('task_id'), project_id, citations,
+            )
 
-    # Disclose a degraded verdict only for a task that is actually LEFT
-    # UNPROTECTED by it — one whose flags were kept.  A component whose read
-    # failed alongside a sibling that DID corroborate changed no outcome, and
-    # reporting it would raise a false alarm about an unprotected specimen.
     return PreservationSuppressionResult(
         kept_flags=kept,
         suppressed_by_task=suppressed_by_task,
         citations_by_task=citations_by_task,
-        unresolved_task_ids=tuple(t for t in unresolved if t in kept_task_ids),
+        unresolved_task_ids=tuple(unresolved),
     )
 
 

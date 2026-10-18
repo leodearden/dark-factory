@@ -19,20 +19,23 @@ from pathlib import Path
 
 import pytest
 from escalation.models import Escalation
+from shared.task_tags import DEFAULT_TAG
 
 import dashboard.data.escalation_corpus as escalation_corpus
 from dashboard.config import DashboardConfig
-from dashboard.data.datum import Datum, DatumState, validate_datum
+from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datum
 from dashboard.data.escalation_corpus import (
     CORPUS_FRESHNESS_BOUND_SECONDS,
     CORPUS_TTL_SECONDS,
     EscalationCorpus,
     EscalationView,
     Location,
+    PendingEscalations,
     QueueKind,
     QueueRef,
     acquire_corpus,
     corpus_queues,
+    pending_escalation_ids,
     views_over,
     walk_corpus,
 )
@@ -293,6 +296,95 @@ class TestViewsOver:
 
         assert views[EscalationView.QUEUE_PENDING].value == 3
         assert views[EscalationView.OPEN_IN_HISTORY].value == 7
+
+
+class TestPendingEscalationIds:
+    """Each task's pending live-queue escalations in one queue; None when that is unknown."""
+
+    def test_pending_root_records_are_grouped_by_task_with_sorted_ids(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-2', task_id='7'))
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        _write(queue_dir, _record('esc-9-1', task_id='9'))
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1', 'esc-7-2'), '9': ('esc-9-1',)})
+
+    def test_the_queue_names_only_tasks_of_the_default_tag(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids is not None
+        assert ids.pinning(DEFAULT_TAG, 7) == ('esc-7-1',)
+        assert ids.pinning(DEFAULT_TAG, 8) == ()
+        assert ids.pinning('feature', 7) is None
+
+    def test_resolved_and_archived_records_are_not_in_the_live_queue_view(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        _write(queue_dir, _record('esc-7-2', status='resolved', task_id='7'))
+        _write(queue_dir, _record('esc-8-1', task_id='8'), archived=True)
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
+
+    def test_an_unreached_queue_is_unknown(self, tmp_path):
+        queue = _queue(tmp_path / 'never-escalated')
+
+        assert pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id) is None
+
+    def test_an_unreadable_file_makes_the_queue_unknown_not_none(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        (queue_dir / 'esc-7-2.json').write_text('{not json')
+        queue = _queue(queue_dir)
+
+        assert pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id) is None
+
+    def test_an_unreadable_archived_file_leaves_the_live_queue_known(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        corrupt = _write(queue_dir, _record('esc-8-1', task_id='8'), archived=True)
+        corrupt.write_text('{not json')
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
+
+    def test_an_unread_corpus_is_unknown(self, tmp_path):
+        unread = unknown_datum('the escalation corpus was not read', CORPUS_FRESHNESS_BOUND_SECONDS)
+
+        assert pending_escalation_ids(unread, str(tmp_path)) is None
+
+    def test_only_the_named_queue_is_read(self, tmp_path):
+        first_dir = tmp_path / 'a' / 'escalations'
+        second_dir = tmp_path / 'b' / 'escalations'
+        _write(first_dir, _record('esc-7-1', task_id='7'))
+        _write(second_dir, _record('esc-7-9', task_id='7'))
+        _write(second_dir, _record('esc-3-1', task_id='3'))
+        first = _queue(first_dir, 'a')
+        second = _queue(second_dir, 'b')
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((first, second))), first.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
+
+    def test_a_queue_the_corpus_does_not_carry_is_unknown(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), str(tmp_path / 'other'))
+
+        assert ids is None
 
 
 

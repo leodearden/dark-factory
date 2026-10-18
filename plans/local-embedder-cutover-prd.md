@@ -240,8 +240,9 @@ leaf builds on landed substrate (§8).
   - α's `lms-arm@` units stay eval-only.
 
 - **D4 — Thresholds: recalibrate where labels exist, quantile-map the rest** (Leo).
-  - **Recalibrated in η:** the write-triage bands, by a full `calibrate_write_triage.py`
-    run with `--write-config`, plus `--write-project-config` for `dark_factory`.
+  - **Recalibrated in η:** the pooled write-triage bands and the `dark_factory` per-project
+    calibration, by two full `calibrate_write_triage.py` runs. η's row in §10 gives the
+    commands.
   - **Quantile-mapped:** near-dup 0.92, `search_tasks` 0.3, the skills' 0.6, and zot 0.65.
     Each is mapped on the score population its consumer actually gates, scored in both
     spaces over the same sampled items, with the side kept as `≥`:
@@ -271,8 +272,10 @@ leaf builds on landed substrate (§8).
   gap between η's window and the post-cutover recalibration.
 
 - **D6 — Sequencing: the cutover goes first** (Leo). The write-triage PRD's 1536-space flip
-  evidence becomes stale at η; that PRD owns re-measuring it, and 3169 stays on HOLD. κ1
-  files the correction.
+  evidence becomes stale at η; that PRD owns re-measuring it. κ1
+  files the correction. *Update 2026-10-11: the original "3169 stays on HOLD" no longer
+  holds. Task 3169 is done and flipped on 2026-10-11 (`x_flip_ruling_2026_10_11`); see
+  `plans/write-triage-flip-readiness-prd.md` §13.3, which supersedes this PRD on the point.*
 
 - **D7 — Rollback: keep backups 14 days** (Leo).
   - The backup is record-keyed and complete: full Qdrant points (id, payload, vector) plus
@@ -553,7 +556,7 @@ P5 reads only non-escalated entries; any escalated entry blocks P5.
 | Other PRD / task | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | `plans/local-memory-models-eval-prd.md` | consumes | λ decision records, ι evidence, Phase 1 residency artifact | eval PRD (complete); κ1 adds a pointer | wired |
-| `plans/write-triage-flip-readiness-prd.md` (3169 HOLD) | produces | write-triage bands and their stamps; the slates and retrievals its flip evidence measured | this PRD: η's recalibration, ε's guard, κ1's correction. Write-triage PRD: re-measuring its flip evidence in the granite space | queued (κ1) |
+| `plans/write-triage-flip-readiness-prd.md` (3169 flipped 2026-10-11; see its §13.3) | produces | write-triage bands and their stamps; the slates and retrievals its flip evidence measured | this PRD: η's recalibration, ε's guard, κ1's correction. Write-triage PRD: re-measuring its flip evidence in the granite space | queued (κ1) |
 | `docs/prds/falkordb-index-provisioning.md` | none today | No vector index exists; any future one takes its width from `embedder.dimensions` | falkordb-index-provisioning | note |
 | `skills/review*` (quality-findings dedup) | consumes | `search_tasks(score_threshold=0.6)` | this PRD: ε maps, κ2 updates | queued |
 | tasks 3867, 4877 | superseded | Mem0 and curator width guards | this PRD (β2) | cancel at decompose |
@@ -574,7 +577,7 @@ Every leaf is authored against `docs/code-quality.md`. Labels map to task ids at
 | **ε** | `search_tasks` config key, provenance stamps + guard (C4), quantile mapper (D4) | `config/schema.py`, `server/{write_triage.py,near_duplicate_guard.py,tools.py}`, `middleware/{task_curator.py,curator_zot_duplicate_sweep.py}`, `scripts/{calibrate_write_triage.py,audit_duplicate_memories.py}`, new mapper script | B16 and B20 pass. The mapper produces a C4b artifact on a fixture. Live `audit_duplicate_memories` (no `--apply`) under matching stamps reports exactly as before. Unlocks δ, ζ | γ1, β2 |
 | **δ** | `reembed cutover`: profiles, phases P0–P6, hold, journal, transient unit with dead-owner restore, auto-restore, P5 semantics, smoke | `maintenance/reembed/cutover.py` (+ smoke module), systemd transient-unit wiring | B8b, B9, B10b, B11, B12a/b, B13 (transient-unit fixture), B14 and B17 pass on fixture stores. Unlocks ζ, which runs the live `--dry-run` and the real-systemd B13 | α1, β2, γ2, ε |
 | **ζ** | Dress rehearsal on scratch copies (integration gate) | scratch compose project on alternate ports, loaded from point-in-time copies (FalkorDB RDB, Qdrant snapshots); scratch fused-memory instance as a transient user unit; no product code | Committed `plans/local-embedder-cutover-rehearsal-<date>.md`: the live `reembed census` and live `cutover --profile live --dry-run` P0 verdicts (no side effect); measured window; reference/P4 census; paired smoke per family pre/post; `search_tasks` self-retrieval pre/post, the B10b round trip on real-shaped data, an injected-fault auto-restore. Also commits `fused-memory/calibration/embedder-threshold-map-<date>.json` computed on the copy. **Predicate:** window ≤ 10 min AND widths uniform AND counts equal AND smoke ≥ 0.9× per family AND round trip within B10a tolerance AND no escalated threshold; otherwise escalate to Leo with the numbers | α2, δ |
-| **η** | Live cutover (born-at-L2 attended operator gate) | live stores, host overlay (P5), calibration reports | Live `get_status`: granite, 768, reachable, guard ok, with `config_overlay` listing the overlay. Live census: all in-scope containers 768. A full `calibrate_write_triage.py` run (`--write-config`, `--write-project-config dark_factory`) writes granite-stamped bands into the overlay, and its reports are committed. Paired live smoke passes. Write-triage owner notified per κ1 | ζ |
+| **η** | Live cutover (born-at-L2 attended operator gate) | live stores, host overlay (P5), calibration reports | Live `get_status`: granite, 768, reachable, guard ok, with `config_overlay` listing the overlay. Live census: all in-scope containers 768. Two full `calibrate_write_triage.py` runs write granite-stamped bands into the overlay: a pooled `--write-config` run, then a separate `--project-id dark_factory --write-project-config --fixture <...> --report-path <...>` run (without `--project-id`, the second run silently calibrates `reify`). Their reports are committed. Write triage is live during η's window (3169 flipped 2026-10-11), so live writes meet 1536-stamped bands until the recalibration; ε's `CalibrationProvenanceMismatch` guard refuses those bands. Paired live smoke passes. Write-triage owner notified per κ1 | ζ |
 | **λ** | Fold the embedder overlay into tracked config after the soak | `fused-memory/config/config.yaml` | Merged through the merge queue: `config.yaml` carries the overlay's values exactly (embedder block, `embedder_thresholds`, bands, project calibrations, stamps). Live `get_status` effective values are unchanged. Dated milestone = η done + 14 d | η |
 | **θ** | Remove the overlay and the 1536 backups after the fold | host overlay, drop-in, backup path | Deterministic. It first asserts that every overlay value equals the tracked `config.yaml` value at HEAD, then removes the overlay and drop-in (`daemon-reload`) and deletes the backups. After the next restart, `get_status` shows no `config_overlay` and the same effective values | λ |
 | **κ1** | Cross-PRD corrections: write-triage evidence stale at η; eval PRD pointer | `plans/write-triage-flip-readiness-prd.md`, `plans/local-memory-models-eval-prd.md` | Both carry a dated amendment naming this PRD and, for write-triage, who re-measures what | — |

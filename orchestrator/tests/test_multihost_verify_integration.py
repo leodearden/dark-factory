@@ -87,8 +87,8 @@ from orchestrator.merge_lane.liveness import (
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
-from orchestrator.merge_queue import PRODUCTION_CLOCK, MergeRequest
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import PRODUCTION_CLOCK, MergeRequest
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     DriftDetector,
@@ -1928,7 +1928,7 @@ def _xcheck_config(*, project_root: Path, cross_check: bool = True) -> Orchestra
 
 def _xcheck_req(config: OrchestratorConfig, *, task_files=('src/foo.py',), worktree=None):
     """A minimal MergeRequest for _run_post_merge_verify cross-check tests."""
-    from orchestrator.merge_queue import MergeRequest
+    from orchestrator.merge_lane.worker import MergeRequest
 
     loop = asyncio.get_running_loop()
     return MergeRequest(
@@ -1989,7 +1989,7 @@ class TestPerLandCrossCheck:
         halt + BORN-AT-L2 escalation + event (task 2886 fix 3)."""
         from unittest.mock import Mock
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2055,7 +2055,7 @@ class TestPerLandCrossCheck:
         one flaky local verify cannot block every merge lane fleet-wide)."""
         from unittest.mock import Mock
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2111,7 +2111,7 @@ class TestPerLandCrossCheck:
         """fix 3 ordering: the synchronous halt MUST precede the escalation submit and the
         blocked return, so no FURTHER adoption can occur before a human looks."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2156,7 +2156,7 @@ class TestPerLandCrossCheck:
         """fix 3 None-safety: non-production callers omit halt_hook (default None) — the
         divergence still withholds the land + files a born-at-L2 escalation, no crash."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2190,7 +2190,7 @@ class TestPerLandCrossCheck:
     async def test_agree_local_pass_proceeds_and_emits_verdict_parity_ok(self, tmp_path):
         """knob ON, remote PASS + local PASS -> proceeds (None) + verdict_parity_ok."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2223,7 +2223,7 @@ class TestPerLandCrossCheck:
     async def test_knob_off_never_constructs_local_runner_byte_identical(self, tmp_path):
         """knob OFF -> the local cross-check runner is NEVER constructed (byte-identical)."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=False)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2257,7 +2257,7 @@ class TestPerLandCrossCheck:
     async def test_local_runner_unavailable_is_inconclusive_and_trusts_remote(self, tmp_path):
         """knob ON, local cross-check raises RunnerUnavailable -> inconclusive + trust remote green."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2289,7 +2289,7 @@ class TestPerLandCrossCheck:
     async def test_trivial_remote_pass_skips_cross_check(self, tmp_path):
         """knob ON, remote returns a TRIVIAL pass -> cross-check SKIPPED (no suite ran to compare)."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2327,7 +2327,7 @@ class TestPerLandCrossCheck:
     async def test_local_dispatch_path_skips_cross_check_entirely(self, tmp_path):
         """runner is None (local dispatch): the cross-check branch never runs."""
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)
@@ -2615,7 +2615,7 @@ class TestIndeterminateLocalLegDoesNotVeto:
         "not recorded" case drivable.
         """
 
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _xcheck_config(project_root=tmp_path / 'proj', cross_check=True)
         req = _xcheck_req(config, worktree=tmp_path)

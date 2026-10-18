@@ -15,7 +15,6 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, cast
 
 import aiosqlite
@@ -26,6 +25,8 @@ from shared.async_sqlite_base import (
     apply_wal_pragmas,
     connect_daemon,
 )
+from shared.project_id import normalize_project_id
+from shared.project_layout import tasks_db
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
@@ -34,6 +35,10 @@ from shared.task_metadata import (
 )
 from shared.task_statuses import TERMINAL, TaskStatus
 
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    validate_metadata_lookup,
+)
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
@@ -46,6 +51,8 @@ from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DependencyResult,
     GetTasksResult,
+    MetadataLookupResult,
+    MetadataLookupRow,
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
@@ -258,9 +265,9 @@ def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
     """Parse a cross-project dependency string of the form ``"project_id:task_id"``.
 
     Assumes the caller has already detected that ``':'`` is present.
-    Strips whitespace, normalises ``'-'`` to ``'_'`` in the project_id portion,
-    and rejects any malformed input with a ``TaskmasterError`` whose code is
-    ``TASKMASTER_TOOL_ERROR``.
+    Strips whitespace, normalises the project_id portion with
+    ``shared.project_id.normalize_project_id``, and rejects any malformed
+    input with a ``TaskmasterError`` whose code is ``TASKMASTER_TOOL_ERROR``.
 
     Returns:
         ``(normalized_project_id, dep_int)`` where ``dep_int > 0``.
@@ -292,7 +299,7 @@ def _parse_qualified_dep(depends_on: str) -> tuple[str, int]:
         raise TaskmasterError(*_MALFORMED) from err
     if dep_int <= 0:
         raise TaskmasterError(*_MALFORMED)
-    norm_pid = raw_pid.lower().replace('-', '_')
+    norm_pid = normalize_project_id(raw_pid)
     return norm_pid, dep_int
 
 
@@ -1361,6 +1368,10 @@ def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
     )
 
 
+def _wire_priority(raw: str | None) -> str:
+    return raw or 'medium'
+
+
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
@@ -1410,7 +1421,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'testStrategy': row['test_strategy'] or '',
         'status': row['status'],
         'dependencies': dependencies,
-        'priority': row['priority'] or 'medium',
+        'priority': _wire_priority(row['priority']),
         'subtasks': [],
         'updatedAt': row['updated_at'],
         'metadata': metadata if metadata is not None else {},
@@ -1441,6 +1452,88 @@ def _updated_task_response(
             if refreshed is not None else None
         ),
     }
+
+
+# The quoted JSON path of the looked-up key, built in SQL from the bound
+# ``:key`` so the caller's key never becomes SQL text.
+_METADATA_KEY_PATH = """('$."' || :key || '"')"""
+
+
+def _metadata_lookup_sql(status_count: int | None) -> str:
+    """The one statement behind ``find_tasks_by_metadata``: counts and page, one snapshot.
+
+    ``status_count`` is the number of ``:s0, :s1, ...`` status parameters, or
+    ``None`` for every status. ``doc`` is the metadata only when it is a JSON
+    object, so no JSON function ever reads a malformed row.
+    """
+    status_clause = (
+        '' if status_count is None
+        else 'AND status IN (' + ', '.join(f':s{i}' for i in range(status_count)) + ')'
+    )
+    path = _METADATA_KEY_PATH
+    return f"""
+WITH scoped AS (
+    SELECT id, title, status, priority, updated_at,
+           COALESCE(metadata, '') <> '' AS has_metadata,
+           CASE WHEN json_valid(metadata) THEN
+               CASE WHEN json_type(metadata) = 'object' THEN metadata END
+           END AS doc
+    FROM tasks
+    WHERE tag = :tag {status_clause}
+),
+keyed AS MATERIALIZED (
+    SELECT id, title, status, priority, updated_at,
+           has_metadata AND doc IS NULL AS malformed,
+           json_type(doc, {path}) IS NOT NULL AS has_key,
+           CASE
+               WHEN json_type(doc, {path}) IS NULL THEN 0
+               WHEN :vtype IS NULL THEN 1
+               WHEN json_type(doc, {path}) = :vtype THEN doc ->> {path} = :value
+               WHEN json_type(doc, {path}) = 'array' THEN EXISTS (
+                   SELECT 1 FROM json_each(doc, {path}) WHERE type = :vtype AND value = :value
+               )
+               ELSE 0
+           END AS is_match
+    FROM scoped
+),
+stats AS (
+    SELECT COALESCE(SUM(is_match), 0) AS total,
+           COALESCE(SUM(has_key), 0) AS tasks_with_key,
+           (SELECT json_group_array(id) FROM keyed WHERE malformed) AS malformed_ids
+    FROM keyed
+),
+page AS (
+    SELECT id, title, status, priority, updated_at
+    FROM keyed WHERE is_match ORDER BY id LIMIT :limit OFFSET :offset
+)
+SELECT stats.total, stats.tasks_with_key, stats.malformed_ids,
+       page.id, page.title, page.status, page.priority, page.updated_at,
+       CASE WHEN :include_value THEN t.metadata -> {path} END AS value_json
+FROM stats
+LEFT JOIN page ON 1
+LEFT JOIN tasks AS t ON t.tag = :tag AND t.id = page.id
+ORDER BY page.id
+"""
+
+
+def _json_value_type(value: str | int | None) -> str | None:
+    """The ``json_type`` a stored value must have to equal *value*; ``None`` is presence."""
+    if value is None:
+        return None
+    return 'text' if isinstance(value, str) else 'integer'
+
+
+def _metadata_lookup_row(row: aiosqlite.Row, *, include_value: bool) -> MetadataLookupRow:
+    out: MetadataLookupRow = {
+        'task_id': int(row['id']),
+        'title': row['title'],
+        'status': row['status'],
+        'priority': _wire_priority(row['priority']),
+        'updated_at': row['updated_at'],
+    }
+    if include_value:
+        out['matched_value'] = json.loads(row['value_json'])
+    return out
 
 
 class SqliteTaskBackend:
@@ -1627,10 +1720,6 @@ class SqliteTaskBackend:
 
     # ── Connection management ──────────────────────────────────────────
 
-    @staticmethod
-    def _db_path(project_root: str) -> Path:
-        return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-
     async def _get_write_access(self, project_root: str) -> AtomicConnection:
         """Return the open, schema-applied WRITE connection for ``project_root``.
 
@@ -1654,7 +1743,7 @@ class SqliteTaskBackend:
             if access is not None:
                 return access
 
-            db_path = self._db_path(project_root)
+            db_path = tasks_db(project_root)
             db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = await connect_daemon(str(db_path))
             conn.row_factory = aiosqlite.Row
@@ -1802,7 +1891,7 @@ class SqliteTaskBackend:
             if self._closed:
                 raise RuntimeError('SqliteTaskBackend is closed')
 
-            conn = await connect_daemon(str(self._db_path(project_root)), isolation_level=None)
+            conn = await connect_daemon(str(tasks_db(project_root)), isolation_level=None)
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
             conn.row_factory = aiosqlite.Row
             # Re-check once more: close() could have run to completion
@@ -2023,6 +2112,56 @@ class SqliteTaskBackend:
         with contextlib.suppress(TypeError, ValueError):
             out['id'] = int(out['id'])
         return out
+
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        """One page of the tasks whose top-level ``metadata[key]`` matches *value*.
+
+        ``value=None`` matches presence; a str or int matches a scalar by
+        equality or a list by membership. The page and its counts come from
+        one statement read through :meth:`_fresh_read_conn`, and a store
+        error raises rather than reading as no match. Semantics:
+        ``plans/task-metadata-lookup-prd.md`` decisions 5-7.
+        """
+        validate_metadata_lookup(
+            key=key, value=value, statuses=statuses, include_value=include_value,
+            limit=limit, offset=offset,
+        )
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        if statuses is not None and not statuses:
+            return {'results': [], 'total': 0, 'tasks_with_key': 0, 'malformed_metadata_ids': []}
+        params: dict[str, Any] = {
+            'tag': tag, 'key': key, 'value': value, 'vtype': _json_value_type(value),
+            'limit': limit, 'offset': offset, 'include_value': include_value,
+        }
+        params.update({f's{i}': status for i, status in enumerate(statuses or [])})
+        sql = _metadata_lookup_sql(None if statuses is None else len(statuses))
+        async with (
+            self._fresh_read_conn(project_root) as conn,
+            conn.execute(sql, params) as cursor,
+        ):
+            rows = list(await cursor.fetchall())
+        counts = rows[0]
+        return {
+            'results': [
+                _metadata_lookup_row(row, include_value=include_value)
+                for row in rows if row['id'] is not None
+            ],
+            'total': counts['total'],
+            'tasks_with_key': counts['tasks_with_key'],
+            'malformed_metadata_ids': sorted(json.loads(counts['malformed_ids'])),
+        }
 
     async def get_dependency_edges(
         self, project_root: str, tag: str | None = None,
@@ -2259,7 +2398,7 @@ class SqliteTaskBackend:
             ``{str(id): status}`` mapping; ``{}`` if the DB file does not
             exist yet or the read fails for any reason.
         """
-        db_path = self._db_path(project_root)
+        db_path = tasks_db(project_root)
         if not db_path.exists():
             return {}
         # conn is opened *inside* the try (not before it) so that a failure

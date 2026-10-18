@@ -1222,13 +1222,27 @@ same-files successor would be refused as a duplicate of its own predecessor
 (`fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title`).
 `cancelled` ends the chain, and an existing non-terminal link with the same
 `key` suppresses the mint. A mint failure never fails the status write: it
-logs `recurrence_mint_failed:` and leaves the link `done` with no successor,
-the *broken* state the chain-state gauge (a separate PRD task, not yet live)
-will surface. A request cancelled after its `done` write committed does not
-abandon the mint, which runs on to completion; a mint that is itself cancelled
-logs that same line. A link completed inside the same wall-clock second as its
-predecessor would give its successor its own run label, so that mint fails
-the same way.
+logs `recurrence_mint_failed:`. A request cancelled after its `done` write
+committed does not abandon the mint, which runs on to completion; a mint that
+is itself cancelled logs that same line. A link completed inside the same
+wall-clock second as its predecessor would give its successor its own run
+label, so that mint fails the same way.
+
+A failed mint, or a crash between the `done` write and the mint, leaves the
+chain *broken*: its current link is `done` and no live link exists
+(`shared/src/shared/recurrence_chains.py::current_links` is the one
+definition of a chain's current link). It stays broken until fused-memory's
+re-mint sweep
+(`fused-memory/src/fused_memory/middleware/recurrence_mint.py::run_remint_sweep_loop`)
+repairs it. The sweep runs at startup and then hourly. Under the write lock it
+re-reads each chain it found and leaves alone one that is no longer broken,
+then mints through the same C-2-checked path, so a re-run never double-mints
+and a chain ended since the sweep looked stays ended. It anchors the
+successor's `at` on the predecessor's stored terminal time. Each repair logs a
+`recurrence_remint:` WARNING and journals a `task_created` event with
+`trigger='remint_sweep'`. A chain that still cannot be minted, such as the
+same-second run-label collision or a carrier that no longer verifies, logs
+`recurrence_mint_failed:` on every sweep.
 
 ---
 
@@ -1641,7 +1655,8 @@ One-off, timestamped, or id-suffixed annotation keys (e.g.
 metadata key — that just adds another `code=unknown_key` census line. Use
 the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
-value into a single `annotations` field.
+value into a single `annotations` field. An `x_` key is findable like any
+other top-level key through `find_tasks_by_metadata` (§9).
 
 `x_inv12_finding` and `x_inv12_owns` are the Tier-C keys of the INV-12
 sweep (exceptions are owned or ratified; PRD
@@ -1880,6 +1895,25 @@ corpus, which is only populated by tasks the curator has actually indexed
 a batch you just planned will not show up in `search_tasks` results even
 though it exists. Confirm a specific id landed with `get_task(id=...)`
 directly.
+
+**Look a task up by a metadata key with `find_tasks_by_metadata`, not a
+forensic sqlite read.** `find_tasks_by_metadata(project_root=...,
+key="x_finding_key", value="fk-…")` returns every task whose top-level
+`metadata[key]` matches, in every status including `deferred` and
+`cancelled` (unlike `search_tasks`, above). Omit `value` to match every task
+that carries the key at all. A str or int matches a scalar by equality and a
+list by membership, type-strictly, so `40` does not match `"40"`. Results
+are paged: follow `pagination.has_more` with `offset += returned`.
+`include_value=True` adds `matched_value`, the whole stored value, under a
+48,000 B page budget
+(`fused-memory/src/fused_memory/server/tools.py::RESULT_BYTE_BUDGET`);
+a single row over that budget comes back alone with `truncated_value: true`
+and its value elided, so read that task with `get_task`. `tasks_with_key`
+counts the tasks in the searched statuses that carry the key, so without a
+`statuses` filter `tasks_with_key == 0` means no task carries it at all (a
+misspelt key, or no producer has written it yet). An unknown status is
+rejected rather than searched. An error payload means the lookup failed,
+never "no match". Semantics: `plans/task-metadata-lookup-prd.md`.
 
 **Change a filed task's kind in place with `update_task`, not
 remove+refile.** If a task's `task_kind`, `before_done`, or other metadata

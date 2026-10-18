@@ -2,10 +2,10 @@
 
 A "splice contract" is the family of invariants that hold when a named prompt
 constant is spliced into a machine-derived set of role prompts: the constant is
-non-empty, it reaches every role in the set, it reaches no role outside it, it
-appears exactly once per role, it lands in a structurally defined spot, and the
-hand-maintained role set still equals the set derived from the capability that
-justifies the splice. This module holds that shape once, and is the
+non-empty, it opens its own ``##`` section, it reaches every role in the set, it
+reaches no role outside it, it appears exactly once per role, it lands in a
+structurally defined spot, and the hand-maintained role set still equals the set
+derived from the capability that justifies the splice. This module holds that shape once, and is the
 AUTHORITATIVE home for the rationale behind it — the consumers point here rather
 than restating it, so there is one place to correct.
 
@@ -124,6 +124,21 @@ def assert_brace_free(name: str, value: str, *, remedy: str) -> None:
         f'{name} contains a literal brace, so it is not safe at an interpolating '
         f'splice site (it raises at format time or mangles the rendered prompt). '
         f'{remedy}'
+    )
+
+
+def assert_opens_own_section(name: str, value: str, *, remedy: str) -> None:
+    """Assert ``value`` opens with its own ``MARKDOWN_HEADING``.
+
+    A splice unit reaches a prompt by plain concatenation, so one that does not
+    open with its own heading reads as a continuation of the block before it.
+    It is also the precondition for ``SpliceContract.assert_placement``'s
+    up-front arm, whose landmark is the prompt's first ``MARKDOWN_HEADING``.
+    """
+    assert value.startswith(MARKDOWN_HEADING), (
+        f'{name} does not start with MARKDOWN_HEADING ({MARKDOWN_HEADING!r}), so '
+        'where it is spliced it reads as an unheaded continuation of whichever '
+        f'block precedes it rather than as its own section. {remedy}'
     )
 
 
@@ -522,11 +537,14 @@ class PreambleTailContractTests:
 
     def test_guidance_opens_its_own_section(self) -> None:
         """The block opens with its own ``\\n## `` heading."""
-        assert self.block.constant.startswith(MARKDOWN_HEADING), (
-            f'{self.block.constant_name} does not start with MARKDOWN_HEADING, so '
-            'at the tail of _BASH_CAPABLE_ROLE_PREAMBLE it would read as an unheaded '
-            'continuation of whichever block precedes it. Give it a leading blank '
-            'line and a `## ` heading.'
+        assert_opens_own_section(
+            self.block.constant_name,
+            self.block.constant,
+            remedy=(
+                'At the tail of _BASH_CAPABLE_ROLE_PREAMBLE it would run on from '
+                'whichever census block precedes it. Give it a leading blank line '
+                'and a `## ` heading.'
+            ),
         )
 
     def test_role_set_matches_bash_capability(self) -> None:

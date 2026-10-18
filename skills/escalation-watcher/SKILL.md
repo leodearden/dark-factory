@@ -52,7 +52,8 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 ```
 
 **Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is **optional** and
-defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
+defaults to `<--name>-$CLAUDE_PID` (or `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a
+`claude agents` host); `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
 Pass either **only** as a deliberate operator override. Both are derived rather than documented for
 one reason (tasks 3994, 4248): the token is load-bearing on *every* heartbeat and on the final
 release, and it must not depend on this document getting one shell token right — which is exactly
@@ -69,6 +70,23 @@ process is `$CLAUDE_PID`. Verify with:
 ```bash
 ps -o comm= -p "$CLAUDE_PID"   # prints: claude
 ```
+
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still forces
+stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
+`lease-heartbeat` is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
+the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
+`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
+reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
+`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
 
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
 message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
@@ -331,7 +349,11 @@ always-ask list ("Bypasses" in "Always ask — keyed on record content").
    step 2 of the next pass is the authoritative source of what to handle
 6. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
-7. Go to 1 (restart watcher → confirm up → drain → handle)
+7. GET `/api/v2/dashboard/invariants` and digest this project's record (see "Reading the
+   invariants gauge" below) — once per cycle. Each `FINDING` line it prints (a chain gone
+   `overdue` or `broken` among them), and each `paused` line reading `pinned_by=[]`, is a
+   finding: handle it in step 3 of the next pass, beside the drained escalations
+8. Go to 1 (restart watcher → confirm up → drain → handle)
 ```
 
 The fired escalation (step 5) is just the wake; you do not handle it inline. Looping back
@@ -475,7 +497,7 @@ watcher.
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess (Main Loop steps 1
-and 7), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
+and 8), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
 Watcher Lease" above):
 
 ```bash
@@ -504,6 +526,21 @@ the whole blob in context. Loop back, re-arm the watcher, and let the next compa
 authoritative list of what to handle. Fetch the full record via
 `mcp__escalation__get_escalation(escalation_id="esc-XX-N")` only for the specific item you're about
 to act on — ideally inside the handling sub-agent rather than at top level.
+
+### Reading the invariants gauge
+
+The command, what counts as a finding (the chain rule included), change-only triage, the census
+follow-up, the broken-chain journal probe, the D-4 pointer, the filing store and keys live in
+[`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
+Read them there. This skill's deltas:
+
+- **Scope.** Pass this watcher's `<project_root>` to the digest, so only this project's record is
+  read. The recon-escalation-watcher covers the whole roster.
+- **Handling.** Never inline at step 7: the watcher is down from its fire (step 5) until step 1
+  re-arms it, and handling is the step most likely to run long. A finding joins step 3 of the next
+  pass and goes through "Before an item reaches Leo" like any drained item.
+- **Stopping.** A finding still undisposed at stop goes into the handover's "Untriaged — start
+  here" section.
 
 ## Priority Hierarchy
 
@@ -1648,7 +1685,8 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
 #### When it runs
 
 - **Nightly at 05:30**, from `return-brief.timer`: headless on Fable, recommend-only and read-only.
-  This is the *nightly form*: investigate, then `record` preparations. The render that follows
+  This is the *nightly form*: investigate, then `record` preparations, which it does through
+  batch files in its per-run inbox (`data/sitting/inbox/<run>/`). The render that follows
   writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)"). Its
   autonomous closes are windowed on `closed_at`, and a close with no `closed_at` is listed as
   undated, not dropped.

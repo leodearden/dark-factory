@@ -20,6 +20,8 @@ from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.project_layout import escalation_queue_dir
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
@@ -27,7 +29,6 @@ from fused_memory.backends.falkor_indices import (
     expected_index_set,
     normalize_index_records,
 )
-from fused_memory.backends.mem0_client import is_missing_collection_error
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
@@ -253,13 +254,6 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 
-# Task 4821: the per-project ORCHESTRATOR escalation queue, relative to a
-# project_root.  DISTINCT from the recon queue (`config.escalation_queue_dir`,
-# drained by the port-8103 watcher) that `_escalate` writes to.  Same spelling
-# and same convention as `targeted.py::_ESCALATION_QUEUE_DIRNAME`,
-# `scope_violation_escalator.py` and `ticket_janitor.py`.
-_ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME = 'data/escalations'
-
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
 # the two can never desynchronise.
@@ -481,8 +475,17 @@ def _finding_has_citation_failures(finding: dict) -> bool:
     return bool(finding.get('citation_failures'))
 
 
+def _finding_is_superseded(finding: dict) -> bool:
+    """True iff a later finding of the same run retired this claim (task 4653,
+    ``server/recon_report.py::ReconReportState.add_finding`` ``supersedes``), so
+    the row is a record of the claim, not a standing one.  Truthiness, so the
+    always-projected ``superseded_by: None`` reads as standing."""
+    return bool(finding.get('superseded_by'))
+
+
 def _finding_is_live_actionable(finding: dict) -> bool:
-    """Return True iff *finding* is actionable and not superseded.
+    """Return True iff *finding* is actionable and not superseded
+    (composes ``_finding_is_superseded``).
 
     Task 4653: ``add_finding(..., supersedes=...)`` lets a later finding of a
     run mark an earlier one historical, stamping the target's
@@ -508,7 +511,7 @@ def _finding_is_live_actionable(finding: dict) -> bool:
     never-cited placeholder, so counting it as either would corrupt the
     drop-cause attribution that split exists to get right.
     """
-    return bool(finding.get('actionable', False)) and not finding.get('superseded_by')
+    return bool(finding.get('actionable', False)) and not _finding_is_superseded(finding)
 
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -1747,9 +1750,6 @@ class ReconciliationHarness:
             None when statuses is empty (fail-open: no supersede attempted, and
             no memory-service calls are made).  Otherwise a record dict:
               - found=False when no cached project_status_correction memory exists.
-              - found=False plus collection_missing=True when the project's Mem0
-                collection was never provisioned — an empty result, NOT an
-                error (task 2949); logged at INFO so found=False stays legible.
               - diverged=False, superseded=False when the cached memory matches
                 the live census (no-op).
               - diverged=True, superseded=True, memory_id, old, new when the
@@ -1765,46 +1765,10 @@ class ReconciliationHarness:
             return None
 
         try:
-            try:
-                memories = await self.memory.get_memories_by_metadata(
-                    project_id=project_id,
-                    filters={'kind': PROJECT_STATUS_CORRECTION_KIND},
-                )
-            except Exception as exc:
-                # A project whose Qdrant collection was never provisioned has no
-                # cached corrections — an EMPTY RESULT, not a failed read.  Left
-                # to the outer handler it would return an `error` record that
-                # Stage 3 re-flags as an unresolved integrity issue every cycle
-                # (task 2949).  Narrow by construction: anything else — a 500, a
-                # TimeoutError, any other exception — re-raises into the outer
-                # handler unchanged, so real failures still surface loudly.
-                #
-                # DELIBERATELY SCOPED to this call site.  The same un-provisioned
-                # collection still raises from every other Mem0 read in the cycle
-                # (targeted.py, standing_decision_writer.py, summary_pool.py,
-                # scope_freshness.py, stages/task_knowledge_sync.py all reach the
-                # same scroll_by_metadata), so a brand-new project can still see
-                # errors from those paths.  Task 2949 scopes the fix to the
-                # status_correction path and keeps scroll_by_metadata's
-                # no-silent-fail contract untouched for its other callers —
-                # including hot pool-GC loops that would pay for a proactive
-                # collection_exists round-trip.  Generalising the degradation to
-                # the whole read surface is filed as a follow-up.
-                if not is_missing_collection_error(exc):
-                    raise
-                logger.info(
-                    'reconciliation.status_correction_collection_missing',
-                    extra={'project_id': project_id},
-                )
-                return {
-                    'available': True,
-                    'found': False,
-                    'diverged': False,
-                    'superseded': False,
-                    # Distinguishes "collection absent" from "collection
-                    # genuinely empty" for an operator reading found=False.
-                    'collection_missing': True,
-                }
+            memories = await self.memory.get_memories_by_metadata(
+                project_id=project_id,
+                filters={'kind': PROJECT_STATUS_CORRECTION_KIND},
+            )
             if not memories:
                 return {
                     'available': True,
@@ -3062,8 +3026,9 @@ class ReconciliationHarness:
             # exist_ok=True)`, so building it earlier would create a spurious
             # `data/escalations` directory under a project that never files
             # (targeted.py defers construction for exactly this reason).
+            # The per-project ORCHESTRATOR queue, not the recon queue `_escalate` writes to.
             queue = EscalationQueue(  # type: ignore[possibly-undefined]
-                Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
+                escalation_queue_dir(project_root)
             )
             fingerprint = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
             # Cross-cycle dedupe: the fold policy is
@@ -4890,8 +4855,8 @@ class ReconciliationHarness:
         The filter runs BEFORE the ``if items:`` fall-through, so a run whose
         every finding was retired behaves exactly like a run that flagged
         nothing: an older completed run still gets its turn, and no empty
-        "Prior Stage 3 Findings" section is rendered.  ``.get`` is fail-open —
-        a finding dict that never carried the key is unaffected.
+        "Prior Stage 3 Findings" section is rendered.  A finding dict that never
+        carried the key is unaffected.
         """
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=3)
@@ -4905,7 +4870,7 @@ class ReconciliationHarness:
                     items = s3_report.get('items_flagged', [])
                 else:
                     items = s3_report.items_flagged
-                items = [f for f in items if not f.get('superseded_by')]
+                items = [f for f in items if not _finding_is_superseded(f)]
                 if items:
                     return items
         except Exception as e:
@@ -4924,6 +4889,11 @@ class ReconciliationHarness:
         for dedup), so findings that differ only in non-identity fields do not inflate the
         count.  Counted per-run — duplicates within one run's items_flagged do not count
         twice.
+
+        A row its own run superseded (``_finding_is_superseded``) is a record of the
+        claim, not an occurrence, so it is skipped before it is fingerprinted.  The skip
+        is per row: a standing copy beside a retired one still counts the run.  Pinned by
+        ``tests/test_harness.py::test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation``.
 
         The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
         that raising the threshold never silently caps the count below the gate value.
@@ -4967,6 +4937,8 @@ class ReconciliationHarness:
                 # Count this run once if any item matches the target fingerprint
                 for item in items:
                     try:
+                        if _finding_is_superseded(item):
+                            continue
                         fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, item)
                     except Exception:
                         any_item_fp_failed = True
@@ -6015,11 +5987,14 @@ class ReconciliationHarness:
                 # None inputs and never raises on them), which leaves the verdict
                 # biased toward "not corroborated" — the direction that lets a
                 # stranded escalation through only when nothing at all vouches for
-                # the task. read_scheduler_state already returns an empty skeleton
-                # for an absent/invalid file; orchestrator_started_at returns None
-                # for an absent or unparseable lock.
+                # the task. read_scheduler_state already returns
+                # SchedulerStateSnapshot.empty() for an absent/invalid file;
+                # orchestrator_started_at returns None for an absent or
+                # unparseable lock.
                 try:
-                    _sched_state: dict | None = read_scheduler_state(Path(project_root))
+                    _sched_state: SchedulerStateSnapshot | None = read_scheduler_state(
+                        Path(project_root)
+                    )
                 except Exception:
                     _sched_state = None
                 try:

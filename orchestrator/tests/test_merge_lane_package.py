@@ -1,8 +1,8 @@
-"""The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1, β and ζ2).
+"""The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1, β, ζ2 and η).
 
-The façade is pinned by what it exports, by importing cleanly in either
-order with the pre-package module names, and by each of those names being
-the very module object its package submodule is. The ports are
+The façade is pinned by what it exports, and by the fourteen pre-package
+module names being gone: task η migrated their importers and deleted the
+aliases, so each old name must now fail to import. The ports are
 pinned by driving a real ``MergeLane`` over a real git repository with the
 fakes from ``_merge_lane_fakes`` injected: the injected verifier decides
 whether a branch lands, and the injected clock is the one the worker ages
@@ -43,7 +43,7 @@ from orchestrator.merge_lane.ports import escalation_port
 from orchestrator.merge_lane.worker import (
     PRODUCTION_CLOCK,
     SpeculativeMergeWorker,
-    _resolve_dispatch_time_merge_base,
+    resolve_dispatch_time_merge_base,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,8 +54,14 @@ REASON_CONSTANTS = 17
 
 
 def test_merge_lane_is_the_worker() -> None:
-    assert MergeLane is SpeculativeMergeWorker
-    assert merge_lane.resolve_dispatch_time_merge_base is _resolve_dispatch_time_merge_base
+    assert merge_lane.MergeLane is MergeLane is SpeculativeMergeWorker
+    assert merge_lane.resolve_dispatch_time_merge_base is resolve_dispatch_time_merge_base
+
+
+@pytest.mark.parametrize('name', ['_resolve_dispatch_time_merge_base', 'SpeculativeMergeWorker'])
+def test_the_pre_eta_facade_aliases_are_gone(name: str) -> None:
+    assert not hasattr(merge_lane, name)
+    assert name not in merge_lane.__all__
 
 
 def test_every_export_resolves_and_the_reason_constants_are_strings() -> None:
@@ -75,67 +81,35 @@ def test_a_name_outside_the_facade_is_an_attribute_error() -> None:
         _ = merge_lane.not_an_export
 
 
-#: Pre-package module name -> the package submodule it now names (task 5037
-#: migrates their importers and deletes the alias files).
-PRE_PACKAGE_ALIASES = {
-    'orchestrator.merge_queue': 'orchestrator.merge_lane.worker',
-    'orchestrator.merge_gates': 'orchestrator.merge_lane.gates',
-    'orchestrator.merge_types': 'orchestrator.merge_lane.types',
-    'orchestrator.merge_shadow': 'orchestrator.merge_lane.shadow',
-    'orchestrator.merge_liveness': 'orchestrator.merge_lane.liveness',
-    'orchestrator.merge_disposition': 'orchestrator.merge_lane.disposition',
-    'orchestrator.merge_queue_store': 'orchestrator.merge_lane.queue_store',
-    'orchestrator.merge_completion': 'orchestrator.merge_lane.completion',
-    'orchestrator.merge_drift': 'orchestrator.merge_lane.drift',
-    'orchestrator.merge_speculation_controller': (
-        'orchestrator.merge_lane.speculation_controller'
-    ),
-    'orchestrator.merge_request_ledger': 'orchestrator.merge_lane.request_ledger',
-    'orchestrator.merge_skew_tripwire': 'orchestrator.merge_lane.skew_tripwire',
-    'orchestrator.landing_evidence': 'orchestrator.merge_lane.landing_evidence',
-    'orchestrator.landed_outbox': 'orchestrator.merge_lane.landed_outbox',
-}
-
-
-@pytest.mark.parametrize(
-    'first, second',
-    [
-        ('orchestrator.merge_queue', 'orchestrator.merge_lane'),
-        ('orchestrator.merge_lane', 'orchestrator.merge_queue'),
-    ],
+#: The pre-package module names task 5037 deleted. Nothing aliases them, so a
+#: stale import fails loudly instead of reaching the package by another name.
+PRE_PACKAGE_MODULE_NAMES = (
+    'orchestrator.merge_queue',
+    'orchestrator.merge_gates',
+    'orchestrator.merge_types',
+    'orchestrator.merge_shadow',
+    'orchestrator.merge_liveness',
+    'orchestrator.merge_disposition',
+    'orchestrator.merge_queue_store',
+    'orchestrator.merge_completion',
+    'orchestrator.merge_drift',
+    'orchestrator.merge_speculation_controller',
+    'orchestrator.merge_request_ledger',
+    'orchestrator.merge_skew_tripwire',
+    'orchestrator.landing_evidence',
+    'orchestrator.landed_outbox',
 )
-def test_facade_imports_cleanly_in_either_order_with_the_pre_package_name(
-    first: str, second: str,
-) -> None:
-    program = (
-        f'import {first}; import {second}; '
-        'from orchestrator.merge_lane import MergeLane; '
-        'from orchestrator.merge_queue import SpeculativeMergeWorker; '
-        'assert MergeLane is SpeculativeMergeWorker'
-    )
-    completed = subprocess.run(
-        [sys.executable, '-c', program], capture_output=True, text=True, timeout=120,
-    )
-    assert completed.returncode == 0, completed.stderr
 
 
-@pytest.mark.parametrize('alias, submodule', sorted(PRE_PACKAGE_ALIASES.items()))
-@pytest.mark.parametrize('alias_first', [True, False])
-def test_each_pre_package_name_is_its_submodule(
-    alias: str, submodule: str, alias_first: bool,
-) -> None:
-    """One module object under two names, so an import, a string-path patch
-    and the module's own global lookups all meet at a single binding."""
-    order = (alias, submodule) if alias_first else (submodule, alias)
-    program = (
-        'import importlib, sys; '
-        f'[importlib.import_module(name) for name in {order!r}]; '
-        f'assert sys.modules[{alias!r}] is sys.modules[{submodule!r}]'
-    )
+@pytest.mark.parametrize('name', PRE_PACKAGE_MODULE_NAMES)
+def test_no_pre_package_module_name_is_importable(name: str) -> None:
+    """A fresh interpreter, so no module this suite already imported can answer."""
     completed = subprocess.run(
-        [sys.executable, '-c', program], capture_output=True, text=True, timeout=120,
+        [sys.executable, '-c', f'import {name}'], capture_output=True, text=True, timeout=120,
     )
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode != 0, f'{name} still imports'
+    assert 'ModuleNotFoundError' in completed.stderr, completed.stderr
+    assert name in completed.stderr, completed.stderr
 
 
 # ---------------------------------------------------------------------------

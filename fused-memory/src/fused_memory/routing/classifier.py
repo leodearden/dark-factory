@@ -57,7 +57,10 @@ Respond as JSON:
 
 
 class WriteClassifier:
-    """Classifies content into a MemoryCategory for write routing."""
+    """Classifies content into a MemoryCategory for write routing.
+
+    An injected ``openai_client`` is owned by the classifier: ``close()`` releases it.
+    """
 
     def __init__(
         self, config: FusedMemoryConfig, *, openai_client: AsyncOpenAI | None = None,
@@ -73,6 +76,12 @@ class WriteClassifier:
                 api_key = cfg.providers.openai.api_key
             self._openai_client = AsyncOpenAI(api_key=api_key)
         return self._openai_client
+
+    async def close(self) -> None:
+        """Release the AsyncOpenAI connection pool this classifier holds, built or injected."""
+        client, self._openai_client = self._openai_client, None
+        if client is not None:
+            await client.close()
 
     async def classify(self, content: str) -> ClassificationResult:
         """Classify content — heuristic first, LLM fallback."""

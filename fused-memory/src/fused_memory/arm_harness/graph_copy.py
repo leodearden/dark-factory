@@ -6,15 +6,19 @@ written, so "no stale incumbent vector survives" is checkable by census for
 every arm, the 1536-dimension incumbent included.
 """
 
+import asyncio
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from redis.exceptions import ResponseError
+
 from fused_memory.arm_harness.arm_embedder import DocumentEmbedder, DocumentEmbeddings
 from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.normalization import NormStats, norm_stats
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
+from fused_memory.arm_harness.sleep_seam import Sleep
 
 ADOPT_NODE_GROUP_CYPHER = 'MATCH (n) SET n.group_id = $group_id RETURN count(n)'
 ADOPT_EDGE_GROUP_CYPHER = 'MATCH ()-[r]->() SET r.group_id = $group_id RETURN count(r)'
@@ -41,6 +45,13 @@ COUNT_FACT_EMBEDDINGS_CYPHER = (
 
 DEFAULT_WRITE_BATCH_SIZE = 64
 
+COPY_FORK_REFUSAL = 'GRAPH.COPY failed, could not fork'
+"""How FalkorDB's reply begins while another child process (e.g. a BGSAVE) holds the fork; graph module 4.18.0."""
+
+COPY_ATTEMPTS = 60
+COPY_RETRY_INTERVAL_S = 2.0
+"""Sixty attempts, fifty-nine sleeps: at most 118s waiting, against BGSAVEs measured at 13-42s."""
+
 
 class ScratchGraph(Protocol):
     """The slice of falkordb's AsyncGraph a re-embed uses."""
@@ -60,6 +71,23 @@ class GraphCopyClient(Protocol):
     async def list_graphs(self) -> list[str]: ...
 
     def select_graph(self, graph_id: str, /) -> CopyableGraph: ...
+
+
+class GraphCopyRefused(RuntimeError):
+    """FalkorDB refused every GRAPH.COPY attempt because it could not fork; no copy exists."""
+
+    def __init__(
+        self, reference: str, target: str, attempts: int, waited_s: float, reply: str
+    ) -> None:
+        self.reference = reference
+        self.target = target
+        self.attempts = attempts
+        self.waited_s = waited_s
+        self.reply = reply
+        super().__init__(
+            f'GRAPH.COPY {reference!r} -> {target!r} was refused {attempts} times over '
+            f'{waited_s:.0f}s: {reply}; the server could not fork, so no copy was made'
+        )
 
 
 class ReembedCensusError(RuntimeError):
@@ -110,7 +138,13 @@ _FACT_EMBEDDING = _VectorProperty(
 _VECTOR_PROPERTIES = (_NAME_EMBEDDING, _FACT_EMBEDDING)
 
 
-async def copy_reference_graph(client: GraphCopyClient, reference: str, target: str) -> None:
+async def copy_reference_graph(
+    client: GraphCopyClient,
+    reference: str,
+    target: str,
+    *,
+    sleep: Sleep = asyncio.sleep,
+) -> None:
     require_scratch_name(reference, checkpoint=GuardCheckpoint.GRAPH_COPY)
     require_scratch_name(target, checkpoint=GuardCheckpoint.GRAPH_COPY)
     if target == reference:
@@ -120,7 +154,38 @@ async def copy_reference_graph(client: GraphCopyClient, reference: str, target: 
             f'copy target {target!r} already exists; tear it down first, because a stale '
             'copy is never reused'
         )
-    await client.select_graph(reference).copy(target)
+    await _copy_through_fork_refusals(client.select_graph(reference), reference, target, sleep)
+
+
+async def _copy_through_fork_refusals(
+    graph: CopyableGraph,
+    reference: str,
+    target: str,
+    sleep: Sleep,
+) -> None:
+    """A refused copy leaves no target behind (measured), so the same copy is simply reissued."""
+    refusal: ResponseError | None = None
+    for attempt in range(COPY_ATTEMPTS):
+        if attempt:
+            await sleep(COPY_RETRY_INTERVAL_S)
+        try:
+            await graph.copy(target)
+            return
+        except ResponseError as error:
+            if not _is_fork_refusal(error):
+                raise
+            refusal = error
+    raise GraphCopyRefused(
+        reference,
+        target,
+        COPY_ATTEMPTS,
+        (COPY_ATTEMPTS - 1) * COPY_RETRY_INTERVAL_S,
+        str(refusal),
+    ) from refusal
+
+
+def _is_fork_refusal(error: ResponseError) -> bool:
+    return str(error).startswith(COPY_FORK_REFUSAL)
 
 
 async def adopt_group_id(graph: ScratchGraph, name: str) -> GroupAdoption:

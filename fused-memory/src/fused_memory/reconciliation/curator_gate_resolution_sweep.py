@@ -85,6 +85,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
+
+from fused_memory.reconciliation.task_metadata_selection import select_task_ids_by_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +125,7 @@ def curator_gate_source(task_id) -> str:
     return CURATOR_GATE_SOURCE_TEMPLATE.format(task_id=str(task_id))
 
 
-def extract_open_gate_task_ids(tasks: list[dict]) -> list[str]:
+def extract_open_gate_task_ids(tasks: Iterable[object]) -> list[str]:
     """Return sorted, deduped str ids of open human-curator gate tasks.
 
     A task qualifies when ALL hold:
@@ -161,22 +164,15 @@ def extract_open_gate_task_ids(tasks: list[dict]) -> list[str]:
     2. It uses bare ``task.get(...)`` with no ``isinstance(task, dict)`` guard;
        the guard added here is a strictly-safer divergence.
 
+    The traversal — skips, ``str`` coercion, sorted dedup — is
+    ``task_metadata_selection.py::select_task_ids_by_metadata``; this function
+    supplies only the predicate.
+
     Pure: no I/O, no side effects.  Empty input returns ``[]``.
     """
-    seen: set[str] = set()
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-        metadata = task.get('metadata')
-        if not isinstance(metadata, dict):
-            continue
-        if metadata.get('operational_mode') != 'gate':
-            continue
-        raw_tid = task.get('id')
-        if raw_tid is None:
-            continue
-        seen.add(str(raw_tid))
-    return sorted(seen)
+    return select_task_ids_by_metadata(
+        tasks, lambda metadata: metadata.get('operational_mode') == 'gate',
+    )
 
 
 def build_gate_resolution_flag(task_id, memories, *, task: dict | None = None) -> dict:

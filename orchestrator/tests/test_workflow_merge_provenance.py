@@ -27,8 +27,8 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import DeliveredChecksConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_queue import reconcile_landed_outbox
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.worker import reconcile_landed_outbox
 from orchestrator.scheduler import SetTaskStatusRejected
 from orchestrator.workflow import WorkflowOutcome, WorkflowState
 
@@ -130,21 +130,13 @@ class TestFinaliseRecoveryDone:
     async def test_mark_done_rejection_routes_to_mark_blocked_not_phantom_done(
         self, tmp_path: Path,
     ):
-        """A rejected mark_done must route to _mark_blocked, not report DONE."""
+        """A rejected mark_done blocks the row behind one L1, not a phantom DONE."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         rejection = SetTaskStatusRejected(
             task_id=f.wf.task_id, error_code='conflict', raw='row already terminal',
         )
         f.wf.scheduler.mark_done = AsyncMock(side_effect=rejection)
-        # STUBBED DELIBERATELY (esc-5026-4): this chokepoint enters the DONE
-        # phase BEFORE mark_done, so the real `_mark_blocked` sees a terminal
-        # machine, logs 'already done, ignoring late blocked transition' and
-        # returns DONE — the sibling `_finalise_merged_done` marks done first
-        # and does return BLOCKED (see that test below, which runs the real
-        # path).  Un-stubbing here would change what this test asserts, so the
-        # stub stays until the production ordering question is adjudicated.
-        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        queue = _arm_escalation_queue(f, tmp_path)
 
         outcome = await f.wf._finalise_recovery_done(
             basis='fallback', sha='mainsha123', kind='found_on_main',
@@ -152,10 +144,10 @@ class TestFinaliseRecoveryDone:
         )
 
         assert outcome == WorkflowOutcome.BLOCKED
-        mark_blocked.assert_awaited_once()
-        assert mark_blocked.await_args is not None
-        _args, kwargs = mark_blocked.await_args
-        assert kwargs.get('escalate_to_human') is True
+        assert f.wf.state == WorkflowState.BLOCKED
+        assert f.set_task_status.await_args is not None
+        assert f.set_task_status.await_args.args[1] == 'blocked'
+        assert len(queue.get_by_task(f.wf.task_id, status='pending', level=1)) == 1
 
 
 # ---------------------------------------------------------------------------

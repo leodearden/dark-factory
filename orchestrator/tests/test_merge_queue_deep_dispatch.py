@@ -44,17 +44,18 @@ import pytest
 from _merge_lane_census import queued_in_lane, queued_request_ids
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
-from orchestrator import merge_liveness, merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import (
+from orchestrator.merge_lane import liveness as merge_liveness
+from orchestrator.merge_lane import worker as merge_queue
+from orchestrator.merge_lane.types import (
     ChainResult,
     MergeResult,
     QueuedBranch,
     RealMergeItem,
 )
+from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
 
 # ── repo fixtures (adapted from test_merge_queue_build_chain.py:47-102) ───────
 
@@ -358,7 +359,7 @@ class TestSelectChainDepth:
 
     def test_cap_zero_is_the_kill_switch_for_every_input(self) -> None:
         """cap=0 (α's shipped default) → None for EVERY queue_len/halving_state."""
-        from orchestrator.merge_queue import select_chain_depth
+        from orchestrator.merge_lane.worker import select_chain_depth
 
         for queue_len in (0, 1, 2, 5, 50, 1000):
             for halving_state in (None, 1, 2, 3, 6, 999):
@@ -369,7 +370,7 @@ class TestSelectChainDepth:
 
     def test_queue_shorter_than_two_never_chains(self) -> None:
         """The PRD's ``queue >= 2`` gate: a lone item is not a chain."""
-        from orchestrator.merge_queue import select_chain_depth
+        from orchestrator.merge_lane.worker import select_chain_depth
 
         for cap in (1, 2, 6, 100):
             for halving_state in (None, 1, 6):
@@ -382,14 +383,14 @@ class TestSelectChainDepth:
         Evaluated at DISPATCH time, not frozen at pass time, so a queue that
         grew since the last pass is honoured (plan design decision 4).
         """
-        from orchestrator.merge_queue import select_chain_depth
+        from orchestrator.merge_lane.worker import select_chain_depth
 
         assert select_chain_depth(6, 4, None) == 4     # queue binds
         assert select_chain_depth(6, 10, None) == 6    # cap binds
         assert select_chain_depth(6, 6, None) == 6     # tie
 
     def test_halving_state_binds_when_smallest(self) -> None:
-        from orchestrator.merge_queue import select_chain_depth
+        from orchestrator.merge_lane.worker import select_chain_depth
 
         assert select_chain_depth(6, 10, 3) == 3       # halving binds
         assert select_chain_depth(6, 10, 6) == 6       # equal to cap
@@ -402,7 +403,7 @@ class TestSelectChainDepth:
         This is what makes "the floor is byte-identical to today's adjacent
         verify" true BY CONSTRUCTION rather than by careful mimicry.
         """
-        from orchestrator.merge_queue import select_chain_depth
+        from orchestrator.merge_lane.worker import select_chain_depth
 
         assert select_chain_depth(1, 10, None) is None   # cap=1
         assert select_chain_depth(6, 10, 1) is None      # halving_state=1
@@ -418,7 +419,7 @@ class TestNextHalvingState:
     """
 
     def test_fail_halves_with_a_floor_of_one(self) -> None:
-        from orchestrator.merge_queue import next_halving_state
+        from orchestrator.merge_lane.worker import next_halving_state
 
         assert next_halving_state(False, 6) == 3
         assert next_halving_state(False, 3) == 1
@@ -427,7 +428,7 @@ class TestNextHalvingState:
         assert next_halving_state(False, 1) == 1
 
     def test_pass_resets_to_the_none_sentinel(self) -> None:
-        from orchestrator.merge_queue import next_halving_state
+        from orchestrator.merge_lane.worker import next_halving_state
 
         for depth in (1, 2, 3, 6, 50):
             assert next_halving_state(True, depth) is None
@@ -442,7 +443,7 @@ class TestHalvingWalkComposition:
     """
 
     def test_successive_fails_walk_six_three_then_floor(self) -> None:
-        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+        from orchestrator.merge_lane.worker import next_halving_state, select_chain_depth
 
         cap, queue_len = 6, 10
         state: int | None = None
@@ -459,7 +460,7 @@ class TestHalvingWalkComposition:
         assert state == 1, 'the halving state rests at the floor, never 0'
 
     def test_a_pass_resets_the_walk_to_min_queue_cap(self) -> None:
-        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+        from orchestrator.merge_lane.worker import next_halving_state, select_chain_depth
 
         cap, queue_len = 6, 10
         state = next_halving_state(False, 6)       # one fail: 6 → 3
@@ -471,7 +472,7 @@ class TestHalvingWalkComposition:
 
     def test_reset_re_evaluates_a_grown_queue(self) -> None:
         """A pass stores None, so a queue that grew is seen on the next round."""
-        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+        from orchestrator.merge_lane.worker import next_halving_state, select_chain_depth
 
         cap = 6
         state = next_halving_state(True, 2)
@@ -623,7 +624,7 @@ def _spy_build_chain(
     *,
     passthrough: bool = False,
 ) -> list[dict]:
-    """Replace ``orchestrator.merge_queue.build_chain`` with a recorder.
+    """Replace ``orchestrator.merge_lane.worker.build_chain`` with a recorder.
 
     Returns the list of recorded call kwargs (``{'git_ops', 'queue_snapshot',
     'head_merge_commit', 'cap', 'target_depth'}``) — step-11 asserts it stays
@@ -655,7 +656,7 @@ def _spy_build_chain(
             )
         return result if result is not None else ChainResult(links=[], tip=head_merge_commit)
 
-    monkeypatch.setattr('orchestrator.merge_queue.build_chain', _recording)
+    monkeypatch.setattr('orchestrator.merge_lane.worker.build_chain', _recording)
     return calls
 
 
@@ -1000,7 +1001,7 @@ class TestDeepChainPlacementBuild:
         # so it also covers acquire_chain_build_lane's reset+clean+CoW seed.
         # Too tight and the cancel lands INSIDE the acquisition under parallel
         # load, testing a different path than the one this test names.
-        monkeypatch.setattr('orchestrator.merge_queue.CHAIN_BUILD_TIMEOUT_SECS', 2.0)
+        monkeypatch.setattr('orchestrator.merge_lane.worker.CHAIN_BUILD_TIMEOUT_SECS', 2.0)
         reached: list[str] = []
 
         async def _stalled_merge(_lane, branch):
@@ -1068,9 +1069,9 @@ class TestDeepChainPlacementBuild:
         async def _exploding(*_a, **_kw):
             raise RuntimeError('builder bug')
 
-        monkeypatch.setattr('orchestrator.merge_queue.build_chain', _exploding)
+        monkeypatch.setattr('orchestrator.merge_lane.worker.build_chain', _exploding)
 
-        with caplog.at_level(logging.ERROR, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.ERROR, logger='orchestrator.merge_lane'):
             assert await worker._deep_chain_placement(item) is None
 
         assert _lane_states(git_ops) == [LaneState.FREE], 'no lane stranded'
@@ -1168,7 +1169,7 @@ class TestDeepChainPlacementBuild:
             await never.wait()
 
         monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
-        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
 
         task = asyncio.ensure_future(worker._deep_chain_placement(item))
         # Wait on the stub's own signal, never a sleep: the cancel has to land
@@ -1217,7 +1218,7 @@ class TestDeepChainPlacementBuild:
             await never.wait()
             raise AssertionError('unreachable: the build must not return on its own')
 
-        monkeypatch.setattr('orchestrator.merge_queue.build_chain', _blocking_build)
+        monkeypatch.setattr('orchestrator.merge_lane.worker.build_chain', _blocking_build)
         item = _make_item(
             _make_req('101', '101', scene.config, repo), scene.head,
             _ephemeral_merge_wt(scene.git_ops, 'cancel-dispatch'),
@@ -1248,7 +1249,7 @@ class TestDeepChainPlacementBuild:
         """
         released: list = []
         monkeypatch.setattr(
-            'orchestrator.merge_queue.release_chain_build_lane',
+            'orchestrator.merge_lane.worker.release_chain_build_lane',
             lambda git_ops, lane, *, warm: released.append((lane, warm)),
         )
         git_ops, worker, item, _head, _cfg = await self._fixture(
@@ -1352,10 +1353,10 @@ def _local_lease():
 
 # NOTE ON HOW THE WARM-SWAP BYPASS IS OBSERVED (no reach-back patch).
 #
-# The obvious spy — ``monkeypatch.setattr('orchestrator.merge_queue.
+# The obvious spy — ``monkeypatch.setattr('orchestrator.merge_lane.worker.
 # _acquire_warm_verify_worktree', ...)`` — is a merge_queue reach-back patch,
 # frozen by test_merge_queue_reachback_patch_guard.py.  Repointing it at the
-# DEFINING module (``orchestrator.merge_liveness``) would not work either:
+# DEFINING module (``orchestrator.merge_lane.liveness``) would not work either:
 # ``_run_inflight_verify`` resolves the name through merge_queue's own module
 # global, so a merge_liveness patch sits off the resolution path and any
 # "was not called" assertion would pass VACUOUSLY — exactly the failure mode
@@ -1389,7 +1390,7 @@ def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[di
         return outcome
 
     monkeypatch.setattr(
-        'orchestrator.merge_queue._run_post_merge_verify', _recording,
+        'orchestrator.merge_lane.worker._run_post_merge_verify', _recording,
     )
     return calls
 
@@ -1408,7 +1409,7 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
         return await real(git_ops, lane, warm=warm)
 
     monkeypatch.setattr(
-        'orchestrator.merge_queue.release_chain_build_lane', _recording,
+        'orchestrator.merge_lane.worker.release_chain_build_lane', _recording,
     )
     return calls
 
@@ -1640,7 +1641,7 @@ class TestRunInflightVerifyChainRedirect:
         ``Verification error:`` terminally blocked a request whose own subset
         tree was never even run.
         """
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         from orchestrator.warm_lane_pool import LaneState
 
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
@@ -1747,7 +1748,7 @@ class TestRunInflightVerifyChainRedirect:
         no seeding, no monkeypatched constants — and assert the whole walk:
         round 1 defers and suppresses, round 2 is un-chained and TERMINATES.
         """
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
 
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
         task_id = item.request.task_id
@@ -1859,7 +1860,7 @@ class TestRunInflightVerifyChainRedirect:
         already-FREE lane.  Exactly one must reach the pool; a second real
         release would hand a free lane back twice.
         """
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
         from orchestrator.warm_lane_pool import LaneState
 
         git_ops, worker, item, chain, _head = await self._fixture(git_repo)
@@ -1870,7 +1871,7 @@ class TestRunInflightVerifyChainRedirect:
             await asyncio.sleep(30)
 
         monkeypatch.setattr(
-            'orchestrator.merge_queue._run_post_merge_verify', _slow_verify,
+            'orchestrator.merge_lane.worker._run_post_merge_verify', _slow_verify,
         )
         # The sole waiter gives up: this is what _request_abandoned reads.
         item.request.result.cancel()
@@ -1908,7 +1909,7 @@ class TestRunInflightVerifyChainRedirect:
         request terminally as ``blocked``, exactly as before γ.  Pairs with
         ``test_chain_none_is_byte_identical_to_todays_path`` on the pass path.
         """
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
 
         git_ops, worker, item, chain, _head = await self._fixture(git_repo)
         await merge_liveness.release_chain_build_lane(
@@ -2125,7 +2126,7 @@ class TestDeepTipVerifyNeverAdopts:
         test_merge_queue_deep_landing.py::TestTipPassAdoptionSignal for the
         adopting exit's own contract.
         """
-        from orchestrator.merge_types import InflightStatus
+        from orchestrator.merge_lane.types import InflightStatus
 
         _git_ops, worker, item, _chain, res, _store, _q = await self._fixture(
             git_repo, monkeypatch, passed=passed, raises=raises,
@@ -2223,7 +2224,7 @@ class TestDeepTipVerifyNeverAdopts:
         phantom head there wedges the whole queue behind an entry that will
         never complete.
         """
-        from orchestrator.merge_types import InflightEntry
+        from orchestrator.merge_lane.types import InflightEntry
 
         _git_ops, worker, item, chain, res, _store, _q = await self._fixture(
             git_repo, monkeypatch, passed=passed, raises=raises,
@@ -2469,7 +2470,7 @@ async def _make_deep_scene(
             return None if passed else _fail_verify_result()
 
         monkeypatch.setattr(
-            'orchestrator.merge_queue._run_post_merge_verify', _oracle,
+            'orchestrator.merge_lane.worker._run_post_merge_verify', _oracle,
         )
     return scene
 
