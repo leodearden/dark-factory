@@ -59,6 +59,7 @@ class TestPsiAdmissionConfigDefaults:
     def test_memory_threshold_ranked_tighter_than_io(self):
         """DA-D1: memory ranks above io, so its default threshold trips first."""
         cfg = PsiAdmissionConfig()
+        assert cfg.mem_some_avg10 is not None and cfg.io_some_avg10 is not None
         assert cfg.mem_some_avg10 < cfg.io_some_avg10
 
 
@@ -81,11 +82,13 @@ class TestPsiAdmissionArmVocabulary:
 
     @pytest.mark.parametrize('field', _THRESHOLD_FIELDS)
     def test_threshold_accepts_none(self, field):
-        assert getattr(PsiAdmissionConfig(**{field: None}), field) is None
+        assert getattr(PsiAdmissionConfig.model_validate({field: None}), field) is None
 
     @pytest.mark.parametrize('field', _THRESHOLD_FIELDS)
     def test_each_threshold_alone_trips_its_own_arm(self, field):
-        cfg = PsiAdmissionConfig(**{f: (1.0 if f == field else None) for f in _THRESHOLD_FIELDS})
+        cfg = PsiAdmissionConfig.model_validate(
+            {f: (1.0 if f == field else None) for f in _THRESHOLD_FIELDS}
+        )
         sample = PsiSample(
             cpu_some10=50.0,
             mem_some10=50.0,
