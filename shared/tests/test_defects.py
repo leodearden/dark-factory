@@ -6,6 +6,7 @@ are written here from the PRD, never derived from the module's own tables.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
@@ -26,6 +27,8 @@ from shared.defects import (
     Exemption,
     ExemptionReason,
     IllegalDefectTransition,
+    IssueKind,
+    IssueKindFlag,
     KeepCheck,
     KeepOutcome,
     MalformedDefectRef,
@@ -52,6 +55,7 @@ from shared.defects import (
     WithdrawalReason,
     apply_event,
     apply_retirement_event,
+    issue_kind_of,
     mint_explore_ref,
     mint_finding_ref,
     mint_followup_ref,
@@ -1207,3 +1211,41 @@ class TestApplyRetirementEventEffects:
             apply_retirement_event(_retirement(), event)
         assert _REF in str(excinfo.value)
         assert _OTHER_REF in str(excinfo.value)
+
+
+# --- issue_kind_of (decision 16) ---------------------------------------------------
+
+
+class TestIssueKindOf:
+    @pytest.mark.parametrize('kind', list(IssueKind), ids=str)
+    def test_a_known_kind_reads_unflagged(self, kind: IssueKind) -> None:
+        reading = issue_kind_of({'kind': kind.value, 'severity': 'blocking'})
+        assert reading.kind is kind
+        assert reading.flag is None
+        assert reading.flagged is False
+
+    @pytest.mark.parametrize(
+        'issue',
+        [{'severity': 'blocking'}, {'kind': None, 'severity': 'blocking'}],
+        ids=['absent', 'none'],
+    )
+    def test_a_missing_kind_fails_closed_to_defect(self, issue: dict[str, object]) -> None:
+        reading = issue_kind_of(issue)
+        assert reading.kind is IssueKind.DEFECT
+        assert reading.flag is IssueKindFlag.MISSING
+        assert reading.flagged is True
+
+    @pytest.mark.parametrize(
+        'value', ['bug', 'Defect', 1, ['defect']], ids=['bug', 'wrong-case', 'int', 'list']
+    )
+    def test_an_unrecognised_kind_fails_closed_to_defect(self, value: object) -> None:
+        reading = issue_kind_of({'kind': value, 'severity': 'blocking'})
+        assert reading.kind is IssueKind.DEFECT
+        assert reading.flag is IssueKindFlag.UNRECOGNISED
+        assert reading.flagged is True
+
+    def test_the_issue_is_not_mutated(self) -> None:
+        issue: dict[str, object] = {'kind': ['defect'], 'severity': 'blocking'}
+        before = copy.deepcopy(issue)
+        issue_kind_of(issue)
+        assert issue == before
