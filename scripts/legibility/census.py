@@ -2678,7 +2678,12 @@ def run_census(
     (``fixed`` only from a re-verify that found it gone, INV-3); a finding
     re-verified present files again superseding its done task, and one whose
     task was cancelled without an acceptance reason files again once it
-    recurs (is sighted this run) ->
+    recurs (is sighted this run). An entry whose earlier ticket still awaits
+    the curator is held, since that ticket may become its live task: no
+    re-verify, no re-filing, and no second ticket from ``dispose`` below
+    (``Outcomes.awaiting``). The read precedes ``resolve_tickets``, so a
+    ticket the curator decided since the last run holds its entry for that
+    one run ->
     ``_filing_queue``, which pairs
     each fileable cluster with the entry it was promoted to and adds every
     earlier-withheld entry that has since recurred, then the re-filings ->
@@ -3214,6 +3219,7 @@ def run_census(
         [pending.filing(payload) for pending, payload in zip(filing_queue, task_payloads, strict=True)],
         store=task_store,
         submit=None if dry_run_payloads_path is not None else submit_fn,
+        awaiting=outcomes.awaiting,
     )
     withheld_entry_ids = {
         pending.withheld_entry_id for pending in filing_queue if pending.withheld_entry_id is not None
