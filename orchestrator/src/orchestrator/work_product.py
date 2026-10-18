@@ -5,6 +5,8 @@ plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C3.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import shlex
 import subprocess
@@ -15,9 +17,16 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import ClassVar
 
+from orchestrator.sentinel_l1 import SentinelL1
+
+logger = logging.getLogger(__name__)
+
 # 8.4s measured cold over 1,323 branches at load ~90; 60s separates slow from hung.
 PROBE_TIMEOUT_SECS: float = 60.0
 _STDERR_SHOWN: int = 500
+# Three consecutive TTL-spaced failures are 10+ min of a fleet-wide zero continuity term; one transient git failure never pages.
+FAILURE_STREAK_ESCALATION_THRESHOLD: int = 3
+PROBE_SENTINEL: str = '__continuity_probe__'
 
 
 @dataclass(frozen=True)
@@ -151,3 +160,83 @@ def _as_text(output: str | bytes | None) -> str:
     if isinstance(output, bytes):
         return output.decode(errors='replace')
     return output or ''
+
+
+class WorkProductProbe:
+    """Owns the TTL window, the one in-flight refresh, the published snapshot and the failure streak.
+
+    The caller supplies the load (run on a worker thread) and delivers the escalation.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_secs: Callable[[], float],
+        clock: Callable[[], float],
+        escalate: Callable[[SentinelL1], None],
+    ) -> None:
+        self._ttl_secs = ttl_secs
+        self._clock = clock
+        self._escalate = escalate
+        self._snapshot = WorkProductSnapshot.EMPTY
+        self._attempted_at: float | None = None
+        self._in_flight: asyncio.Task[None] | None = None
+        self._failure_streak = 0
+
+    @property
+    def snapshot(self) -> WorkProductSnapshot:
+        return self._snapshot
+
+    def poll(self, load: Callable[[], WorkProductSnapshot]) -> None:
+        """Start a refresh when one is due and none is in flight; never waits on it."""
+        if self._in_flight is not None:
+            return
+        now = self._clock()
+        if self._attempted_at is not None and now - self._attempted_at < self._ttl_secs():
+            return
+        self._attempted_at = now
+        self._in_flight = asyncio.get_running_loop().create_task(self._refresh(load))
+
+    async def join(self) -> None:
+        """Wait for the in-flight refresh, if any, to publish its outcome."""
+        in_flight = self._in_flight
+        if in_flight is not None:
+            await in_flight
+
+    async def _refresh(self, load: Callable[[], WorkProductSnapshot]) -> None:
+        try:
+            snapshot = await asyncio.to_thread(load)
+        except Exception as exc:
+            self._snapshot = WorkProductSnapshot.EMPTY
+            self._failure_streak += 1
+            logger.warning(
+                'continuity probe refresh failed (%d consecutive): %s',
+                self._failure_streak, exc, exc_info=not isinstance(exc, BranchProbeError),
+            )
+            if self._failure_streak >= FAILURE_STREAK_ESCALATION_THRESHOLD:
+                self._escalate(self._failure_escalation(exc))
+        else:
+            self._snapshot = snapshot
+            self._failure_streak = 0
+        finally:
+            self._in_flight = None
+
+    def _failure_escalation(self, exc: Exception) -> SentinelL1:
+        streak = self._failure_streak
+        return SentinelL1(
+            sentinel=PROBE_SENTINEL,
+            category='infra_issue',
+            summary=(
+                f'{streak} consecutive continuity-probe refreshes failed: '
+                'no candidate earns continuity credit'
+            ),
+            detail=(
+                f'{streak} consecutive refreshes of the continuity probe failed, one per '
+                f'{self._ttl_secs():g}s TTL window. Latest failure: {exc}. Until a refresh '
+                'succeeds the continuity term is zero fleet-wide, so no task earns credit for '
+                'its work product (PRD C3, INV-4). Usual causes: git older than 2.41 lacks '
+                '%(ahead-behind); the configured main branch is missing; project_root is not a '
+                'repository root. The streak clears on the next successful refresh.'
+            ),
+            suggested_action='restore_the_continuity_branch_probe',
+        )

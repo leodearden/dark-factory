@@ -367,7 +367,7 @@ class TestWorkProductProbe:
     async def test_each_further_failure_re_files_for_the_queue_to_dedup(self):
         rig = _Rig()
         await rig.refresh(_failing())
-        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD + 1):
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD):
             await rig.refresh_next_window(_failing())
 
         assert len(rig.filed) == 2
