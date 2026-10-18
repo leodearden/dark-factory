@@ -968,6 +968,40 @@ class TestDeliveredNotificationIsAReap:
         ]
         assert detect_ended_awaiting_background(records) is False
 
+    @pytest.mark.parametrize(
+        'later_launch',
+        [
+            [_assistant([_monitor_call()]), _monitor_armed()],
+            [
+                _assistant([_bash_launch(command='job-b', tool_id='toolu_b')]),
+                _bg_launch_result(tool_id='toolu_b', task_id='bbb22222'),
+            ],
+        ],
+        ids=['later-monitor-arm', 'later-bash-launch'],
+    )
+    def test_earlier_completion_after_later_launch_is_false_documented_gap(
+        self, later_launch: list
+    ) -> None:
+        """DOCUMENTED, ACCEPTED false negative.  Reaps are positional, not per
+        launch: Bash A launches, a later launch L follows, A's completion is
+        delivered, and the turn ends with L still pending → the delivery is
+        the final event → False.
+
+        A notification arrives asynchronously, so it can land after a launch
+        the agent made later, unlike a tool_use reap the agent issues itself.
+        Clearing only the launch a reap names would need per-launch tracking,
+        and the module errs toward not downgrading.  Sibling of
+        test_streamed_monitor_event_then_end_is_false_documented_gap.
+        """
+        records = [
+            _assistant([_bash_launch(command='cargo test --all')]),
+            _bg_launch_result(),
+            *later_launch,
+            _delivered_mid_turn(_bash_completion_text()),
+            _assistant([_text('Tests passed. Standing by for the second result.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
     def test_notification_for_an_unknown_task_is_not_a_reap(self) -> None:
         """A delivery that names no harvested token engages with nothing pending."""
         records = [

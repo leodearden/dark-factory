@@ -1222,6 +1222,10 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     that delivered a mid-stream event, after which the session ended awaiting
     a later one, is reaped by that delivery → False.  Telling a terminal event
     from a mid-stream one would need parsing of the notification text.
+
+    Reaps are positional, not per launch (accepted on the same grounds): an
+    earlier launch's delivered completion that lands after a later launch
+    clears the verdict while that later launch is still pending → False.
     """
     if not records:
         return False
