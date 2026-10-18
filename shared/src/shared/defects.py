@@ -1233,3 +1233,43 @@ def apply_retirement_event(
             record, retirement_event, trigger, 'decision 13 has no such retirement transition'
         )
     return _retirement_effect(record, retirement_event)
+
+
+# --- Reviewer-issue kind (decision 16) ---------------------------------------
+
+
+class IssueKindFlag(StrEnum):
+    MISSING = 'missing'
+    UNRECOGNISED = 'unrecognised'
+
+
+@dataclass(frozen=True)
+class IssueKindReading:
+    """A reviewer issue's kind, flagged when it was read fail-closed rather than as written."""
+
+    kind: IssueKind
+    flag: IssueKindFlag | None = None
+
+    @property
+    def flagged(self) -> bool:
+        return self.flag is not None
+
+
+_ISSUE_KIND_BY_VALUE: MappingProxyType[str, IssueKind] = MappingProxyType(
+    {kind.value: kind for kind in IssueKind}
+)
+
+
+def issue_kind_of(issue: Mapping[str, object]) -> IssueKindReading:
+    """The kind of a reviewer issue; every reviewer-issue reader calls this, never ``issue['kind']``.
+
+    A missing or unrecognised kind reads as ``defect``, the fail-closed value,
+    with a flag the caller records in its own structured output. Pure: no logging.
+    """
+    raw = issue.get('kind')
+    if raw is None:
+        return IssueKindReading(IssueKind.DEFECT, IssueKindFlag.MISSING)
+    kind = _ISSUE_KIND_BY_VALUE.get(raw) if isinstance(raw, str) else None
+    if kind is None:
+        return IssueKindReading(IssueKind.DEFECT, IssueKindFlag.UNRECOGNISED)
+    return IssueKindReading(kind)
