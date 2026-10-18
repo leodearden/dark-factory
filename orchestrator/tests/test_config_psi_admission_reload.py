@@ -11,6 +11,7 @@ test_config_reload_integration_gate.py's stated rationale).
 from __future__ import annotations
 
 import pytest
+import yaml
 from pydantic import ValidationError
 from shared import psi
 from shared.psi import PsiSample
@@ -21,6 +22,7 @@ from orchestrator.config import (
     PsiAdmissionConfig,
     apply_reload,
     diff_config,
+    load_config,
 )
 
 _THRESHOLD_FIELDS = (
@@ -31,6 +33,7 @@ _THRESHOLD_FIELDS = (
     'runqueue_ratio',
     'own_cpu_some_avg10',
 )
+_PERCENT_THRESHOLDS = tuple(f for f in _THRESHOLD_FIELDS if f != 'runqueue_ratio')
 
 
 class TestPsiAdmissionConfigDefaults:
@@ -125,6 +128,65 @@ class TestMinInflightFloorValidation:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(psi_admission={'min_inflight_floor': 0})  # type: ignore[arg-type]
+
+
+class TestThresholdRangeValidation:
+    """An out-of-range threshold is refused at construction, at load and at
+    hot reload (task 4063, absorbed by 3590; PRD
+    plans/load-throttle-harmonisation-prd.md boundary row 8). A negative
+    percentage would silently disable an arm and one over 100 would pin it.
+    """
+
+    @pytest.mark.parametrize('field', _PERCENT_THRESHOLDS)
+    @pytest.mark.parametrize('bad_value', [-0.1, 100.1])
+    def test_percentage_outside_0_to_100_rejected(self, field, bad_value):
+        with pytest.raises(ValidationError, match=field):
+            PsiAdmissionConfig(**{field: bad_value})
+
+    @pytest.mark.parametrize('field', _PERCENT_THRESHOLDS)
+    @pytest.mark.parametrize('good_value', [0.0, 100.0])
+    def test_percentage_bounds_accepted(self, field, good_value):
+        assert getattr(PsiAdmissionConfig(**{field: good_value}), field) == good_value
+
+    @pytest.mark.parametrize('bad_value', [0.0, -1.0])
+    def test_non_positive_runqueue_ratio_rejected(self, bad_value):
+        with pytest.raises(ValidationError, match='runqueue_ratio'):
+            PsiAdmissionConfig(runqueue_ratio=bad_value)
+
+    @pytest.mark.parametrize('good_value', [0.1, 50.0])
+    def test_positive_runqueue_ratio_accepted_with_no_upper_bound(self, good_value):
+        assert PsiAdmissionConfig(runqueue_ratio=good_value).runqueue_ratio == good_value
+
+    @pytest.mark.parametrize(
+        ('field', 'bad_value'), [('mem_full_avg10', 101), ('runqueue_ratio', 0)]
+    )
+    def test_rejected_by_load_config(self, monkeypatch, tmp_path, field, bad_value):
+        """load_config is the call Harness.reload_config makes, so a bad yaml
+        edit is refused before it reaches the live config."""
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(yaml.safe_dump({'psi_admission': {field: bad_value}}))
+        # load_config writes os.environ; monkeypatch owns the restore.
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(cfg_path))
+
+        with pytest.raises(ValidationError, match=field):
+            load_config(cfg_path)
+
+    @pytest.mark.parametrize(
+        ('field', 'bad_value'), [('mem_full_avg10', 101.0), ('runqueue_ratio', 0.0)]
+    )
+    def test_hot_reload_rejected_and_live_kept(self, monkeypatch, tmp_path, field, bad_value):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        live_value = getattr(live.psi_admission, field)
+        fresh = OrchestratorConfig()
+        object.__setattr__(fresh.psi_admission, field, bad_value)
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is False
+        assert field in report['error']
+        assert getattr(live.psi_admission, field) == live_value
 
 
 class TestPsiAdmissionReloadDisposition:
