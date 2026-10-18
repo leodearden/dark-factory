@@ -1889,6 +1889,35 @@ most of the corpus. It is now admitted when the payload carries the stored
 which is exactly what the migration script sends. Any other shape that
 touches the key is still refused.
 
+### Defect keys: `defects` and `defect_test_retirements`
+
+Both are registered submodels with list cardinality. Their record shapes,
+enums, ref grammar and transition table live in one place,
+`shared/src/shared/defects.py`. This subsection names who writes each key
+and deliberately restates none of that.
+
+- **`defects`**: a list of `DefectDeclaration` records, one per declared
+  defect, each keyed by its ref.
+  - *Who writes it:* at creation, `submit_task` accepts only fresh `open`
+    entries. After creation only `declare_defect` and
+    `record_defect_outcome` write it, never `update_task`; the PRD's α2 leaf
+    builds those two tools and the `update_task` refusal. A defect leaves
+    `open` only through a recorded I2 transition
+    (`shared/src/shared/defects.py::apply_event`).
+  - *PRD:* `plans/defect-tests-prd.md` decisions 7, 13 and 15; Contract I1
+    and I2.
+- **`defect_test_retirements`**: a list of `Retirement` records, carried on
+  the task whose diff removes a proven defect's test, not on the defect's
+  own task.
+  - *Who writes it:* declared through `declare_defect` (a
+    `DeclareRetirement` event) and ruled through `record_defect_outcome` (a
+    `Rule` event).
+  - *PRD:* `plans/defect-tests-prd.md` decisions 13 and 14.
+
+**Census corollary:** like `delivered_checks` above, both registrations are
+an import side effect of `shared.defects`, so a census script must import
+that module first or it will count both keys as `unknown_key`.
+
 ---
 
 ## 9. Practical recipes
