@@ -1862,25 +1862,17 @@ def _store_failure_diagnostics(
     elapsed and was cancelled (there, *exc* is None — there is no exception object,
     only the fact of the timeout).
 
-    INNER vs OUTER TIMEOUT, and why ``reason`` is the only discriminator.  Since
-    task 5265 a mem0 BACKEND read timeout (``Mem0Backend.search`` exceeding
-    ``backend_read_timeout_seconds``) also arrives at the ``'exception'`` branch,
-    where it used to be swallowed into an empty response and never reach here at
-    all.  Both variants carry ``error_type='TimeoutError'``, so they are told
-    apart ONLY by ``reason``: inner backend read timeout → ``'exception'``;
-    outer fan-out deadline → ``'timeout'``.  The inner one additionally carries
-    a non-empty ``error`` naming the backend read timeout, because
-    ``Mem0Backend`` re-raises with that text rather than letting
-    ``asyncio.wait_for``'s empty-stringifying ``TimeoutError`` through.
-
-    GraphitiBackend still swallows its own inner ``TimeoutError`` (at
-    ``search`` and several sibling reads), so a Graphiti backend read timeout
-    does NOT reach this function and leaves the search reported as clean.  That
-    asymmetry is deliberate and temporary: it is entangled with a second,
-    independent degrade mechanism in this module
-    (``_graphiti_classify_or_degrade`` / ``_graphiti_degraded_entity_result`` /
-    ``get_entity``'s fallback arms), so reversing it is design work on the
-    degrade contract and was explicitly held out of task 5265's scope.
+    INNER vs OUTER TIMEOUT, and why ``reason`` is the only discriminator.  A
+    BACKEND read timeout from either store (``Mem0Backend.search`` or
+    ``GraphitiBackend.search`` exceeding ``backend_read_timeout_seconds``, tasks
+    5265 / 5699) arrives at the ``'exception'`` branch, where it used to be
+    swallowed into an empty response and never reach here at all.  Both
+    variants carry ``error_type='TimeoutError'``, so they are told apart ONLY by
+    ``reason``: inner backend read timeout → ``'exception'``; outer fan-out
+    deadline → ``'timeout'``.  The inner one additionally carries a non-empty
+    ``error`` naming the store, operation and budget, because both backends
+    raise through ``backends/timeout_budget.py::await_within`` rather than
+    letting ``asyncio.wait_for``'s empty-stringifying ``TimeoutError`` through.
 
     This is the diagnosability fix for task 2653: search()'s prior degraded-path
     WARNING carried only ``{'store': ..., 'error': str(e)}`` — no exception type, no

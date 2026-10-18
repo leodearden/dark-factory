@@ -240,12 +240,6 @@ class Mem0Backend:
     copy of the rule to keep accurate rather than one per method.  Several
     methods predating task 5265 do still restate their own propagation inline;
     that is tolerated drift, not licence to add more.
-
-    ``GraphitiBackend`` still swallows its own inner ``TimeoutError`` on
-    ``search`` and several sibling reads.  That asymmetry is deliberate, not an
-    oversight: it is entangled with a second, independent degrade mechanism in
-    ``services/memory_service.py``, so it was held out of scope here and is
-    tracked separately.
     """
 
     def __init__(self, config: FusedMemoryConfig):

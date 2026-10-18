@@ -11,11 +11,11 @@ import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -59,6 +59,7 @@ from fused_memory.backends.llm_token_usage import (
     measure_llm_tokens,
 )
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
+from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
@@ -67,6 +68,8 @@ from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar('_T')
 
 
 _MIN_OPENAI_VERSION: tuple[int, ...] = (1, 91, 0)
@@ -1564,6 +1567,20 @@ class GraphitiBackend:
     FalkorDB is multi-tenant: each project's data lives in its own graph
     (named after the project_id / group_id).  The driver is cloned per-request
     so every operation targets the correct graph.
+
+    TIMEOUT POSTURE (task 5699, the twin of ``Mem0Backend``'s from task 5265).
+    Every read and write budgeted by ``_read_timeout`` / ``_write_timeout``
+    goes through :meth:`_timed_read` / :meth:`_timed_write` to
+    ``backends/timeout_budget.py::await_within``: a timeout PROPAGATES as a
+    ``TimeoutError`` naming the store, the operation and the budget, and is
+    never degraded into a falsy return.  This paragraph is the canonical
+    statement of the rule; a method's ``Raises:`` line adds only the
+    consequence specific to it.
+
+    The one deliberate exception is index provisioning (``_ensure_indices``,
+    ``provision_registered_graphs``).  It runs on its own
+    ``_index_provision_timeout`` budget and never raises, per
+    docs/prds/falkordb-index-provisioning.md D4-D6.
     """
 
     def __init__(
@@ -1614,6 +1631,18 @@ class GraphitiBackend:
         or ``reset()``.
         """
         return measure_llm_tokens(self._llm_client)
+
+    async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's READ budget."""
+        return await await_within(
+            awaitable, store='Graphiti', op=op, budget_s=self._read_timeout,
+        )
+
+    async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's WRITE budget."""
+        return await await_within(
+            awaitable, store='Graphiti', op=op, budget_s=self._write_timeout,
+        )
 
     # --- Per-request driver routing ---
 
@@ -2024,20 +2053,16 @@ class GraphitiBackend:
         client = self._require_client()
         gids = group_ids or []
         driver = self._driver_for(gids[0]) if gids else None
-        try:
-            return await asyncio.wait_for(
-                client.search(
-                    query=query,
-                    group_ids=gids,
-                    num_results=num_results,
-                    center_node_uuid=center_node_uuid,
-                    driver=driver,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Graphiti search timed out after {self._read_timeout}s')
-            return []
+        return await self._timed_read(
+            client.search(
+                query=query,
+                group_ids=gids,
+                num_results=num_results,
+                center_node_uuid=center_node_uuid,
+                driver=driver,
+            ),
+            'search',
+        )
 
     @_canonicalize_group_args
     async def search_nodes(
