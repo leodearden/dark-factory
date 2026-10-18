@@ -14,7 +14,7 @@ from fused_memory.models.scope import Scope
 
 logger = logging.getLogger(__name__)
 
-#: Return type of whatever a timed call is awaiting — see Mem0Backend._timed.
+#: Return type of whatever a timed call is awaiting — see Mem0Backend._timed_read.
 _T = TypeVar('_T')
 
 # The canonical Qdrant payload key for a memory's text, with the historical
@@ -361,18 +361,17 @@ class Mem0Backend:
             logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
         return self._instances[project_id]
 
-    @staticmethod
-    async def _timed(awaitable: Awaitable[_T], op: str, timeout: float) -> _T:
-        """``backends/timeout_budget.py::await_within`` for the Mem0 store."""
-        return await await_within(awaitable, store='Mem0', op=op, budget_s=timeout)
-
     async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
-        """:meth:`_timed` under this backend's READ budget."""
-        return await self._timed(awaitable, op, self._read_timeout)
+        """``await_within`` under this backend's READ budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._read_timeout,
+        )
 
     async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
-        """:meth:`_timed` under this backend's WRITE budget."""
-        return await self._timed(awaitable, op, self._write_timeout)
+        """``await_within`` under this backend's WRITE budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._write_timeout,
+        )
 
     async def _timed_collection_read(
         self, awaitable: Awaitable[_T], op: str, collection_name: str, *, if_absent: _T,

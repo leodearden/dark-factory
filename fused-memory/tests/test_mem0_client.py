@@ -197,8 +197,8 @@ class TestMem0BackendScrollByMetadata:
         Mirrors count_by_metadata's propagate-by-default contract: a timed-out
         scroll must never be indistinguishable from a genuinely-empty result
         (no-silent-fail invariant).  Since task 5265 the read is bounded by
-        Mem0Backend._timed, whose only handling of a TimeoutError is to re-raise
-        it naming the operation and the budget.
+        backends/timeout_budget.py::await_within, whose only handling of a
+        TimeoutError is to re-raise it naming the operation and the budget.
         """
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -1380,9 +1380,10 @@ class TestMem0BackendSemanticReadTimeouts:
     """One contract, one test: every mem0-instance read propagates and NAMES itself.
 
     ``search`` / ``get_all`` / ``get`` share a single implementation of this —
-    ``Mem0Backend._timed``, the sole ``asyncio.wait_for`` call site on the
-    class — so they are asserted together.  Three near-identical copies of
-    this test could drift apart without noticing; one parametrized copy cannot,
+    ``Mem0Backend._timed_read`` over ``backends/timeout_budget.py::await_within``,
+    the sole ``asyncio.wait_for`` call site — so they are asserted together.
+    Three near-identical copies of this test could drift apart without
+    noticing; one parametrized copy cannot,
     which matters because the MESSAGE is a contract and not decoration: it is
     what reaches ``MemoryService._store_failure_diagnostics['error']``, and
     ``asyncio.wait_for``'s own ``TimeoutError`` stringifies EMPTY, so a bare
