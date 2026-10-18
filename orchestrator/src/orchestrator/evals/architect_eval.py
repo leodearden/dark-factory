@@ -6,20 +6,31 @@ classify, assemble (task 6737)".
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.roles import ARCHITECT
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.workflow import _meta_root_for_worktree
+from orchestrator.config import OrchestratorConfig
+from orchestrator.workflow import _inject_plan_tools_mcp, _meta_root_for_worktree
 
 from .configs import EvalConfig
-from .eval_gate import EVAL_CAP_WAIT_SANITY_SECS, GateFactory, build_eval_usage_gate
+from .eval_gate import (
+    EVAL_CAP_WAIT_SANITY_SECS,
+    GateFactory,
+    InjectedGate,
+    build_eval_usage_gate,
+    owned_usage_gate,
+)
 from .judge import PlanQualityVerdict, judge_plan_quality, score_plan_structure
 from .measurement import (
     MeasurementStage,
@@ -27,11 +38,21 @@ from .measurement import (
     Unmeasured,
     UnmeasuredCause,
     UnmeasuredRecord,
+    classify_unmeasured,
+    clip_reason,
+    coerce_cost_usd,
     exception_reason,
 )
-from .metrics import EvalMetrics, compose_cost_source, resolve_terminal_kind
+from .metrics import (
+    EvalMetrics,
+    compose_cost_source,
+    is_proxied_endpoint,
+    read_decline_artifacts,
+    resolve_cost_usd,
+    resolve_terminal_kind,
+)
 from .plan_predicates import is_scorable_plan
-from .replay_frame import REPLAY_FRAME_ID
+from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
 from .results import CellName, ResultStore
 from .snapshots import (
     cleanup_eval_worktree,
@@ -50,6 +71,16 @@ ReadDiff = Callable[[Path, str, str], Awaitable[str]]
 
 CANDIDATE_ATTRIBUTABLE_CAUSES = frozenset({UnmeasuredCause.TIMEOUT})
 """Architect causes that still asked the candidate, so they never taint a cell."""
+
+
+def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
+    """The ONLY MCP an eval architect may reach: plan-tools, strictly scoped.
+
+    The PAIR is the invariant (task 4757). A plan-tools config without the
+    strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
+    the live escalation (:8102) and fused-memory (:8002) servers.
+    """
+    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
 
 
 def open_eval_artifacts(worktree: Path) -> TaskArtifacts:
@@ -95,6 +126,289 @@ class ArchitectAttempt:
     cost_source: str = 'cli'
     is_local_model: bool = False
     unmeasured: Unmeasured | None = None
+
+
+@dataclass(frozen=True)
+class _Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_create_tokens: int = 0
+    turns: int = 0
+    duration_ms: int = 0
+
+    @classmethod
+    def of(cls, result: AgentResult) -> _Usage:
+        """The last attempt's usage; a provider that did not report one counts 0."""
+        return cls(
+            input_tokens=result.input_tokens or 0,
+            output_tokens=result.output_tokens or 0,
+            cache_read_tokens=result.cache_read_tokens or 0,
+            cache_create_tokens=result.cache_create_tokens or 0,
+            turns=result.turns or 0,
+            duration_ms=result.duration_ms,
+        )
+
+
+@dataclass(frozen=True)
+class _Exit:
+    """How the architect invoke ended, before declines and cost are attached."""
+
+    outcome: str
+    plan: dict
+    usage: _Usage = dataclasses.field(default_factory=_Usage)
+    unmeasured: Unmeasured | None = None
+
+
+async def invoke_architect(
+    task: dict,
+    config: EvalConfig,
+    deps: ArchitectEvalDeps,
+    *,
+    build_orch_config: Callable[[], OrchestratorConfig],
+    usage_gate: InjectedGate,
+    timeout_minutes: float,
+) -> ArchitectAttempt:
+    """Invoke the architect once in a fresh worktree and record what it left behind."""
+    project_root = Path(task['project_root'])
+    worktree, run_id = await deps.create_worktree(
+        project_root, task['id'], task['pre_task_commit'],
+        setup_commands=task.get('setup_commands'),
+    )
+    address = CellName(task['id'], config.name, run_id)
+    call = _ArchitectCall(
+        task, config, deps, worktree, build_orch_config, usage_gate, timeout_minutes,
+    )
+    try:
+        ended = await call.run()
+    finally:
+        declines = _read_declines(call.artifacts, call.label)
+        await deps.cleanup_worktree(project_root, worktree)
+    is_local_model = is_proxied_endpoint(config.env_overrides)
+    cost_usd, cost_source = _architect_cost(
+        ended.usage, model=config.model, prices=call.prices,
+        spent_usd=call.spent_usd, is_local_model=is_local_model,
+    )
+    usage = ended.usage
+    return ArchitectAttempt(
+        address=address,
+        worktree=worktree,
+        outcome=ended.outcome,
+        plan=ended.plan,
+        declines=declines,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+        cache_create_tokens=usage.cache_create_tokens,
+        turns=usage.turns,
+        duration_ms=usage.duration_ms,
+        cost_usd=cost_usd,
+        cost_source=cost_source,
+        is_local_model=is_local_model,
+        unmeasured=ended.unmeasured,
+    )
+
+
+@dataclass
+class _ArchitectCall:
+    """One architect invocation in an existing worktree, and how far it got."""
+
+    task: dict
+    config: EvalConfig
+    deps: ArchitectEvalDeps
+    worktree: Path
+    build_orch_config: Callable[[], OrchestratorConfig]
+    usage_gate: InjectedGate
+    timeout_minutes: float
+    artifacts: TaskArtifacts | None = None
+    prices: dict[str, Any] | None = None
+    spent_usd: float = 0.0
+
+    @property
+    def label(self) -> str:
+        return cell_label(self.task, self.config)
+
+    async def run(self) -> _Exit:
+        try:
+            result, artifacts = await self._ask()
+        except TimeoutError:
+            return _timed_out(self.label, self.timeout_minutes, self.spent_usd)
+        except AllAccountsCappedException as e:
+            return _cap_exhausted(self.label, e, self.artifacts, self.spent_usd)
+        except Exception as e:
+            return _harness_error(self.label, e, self.spent_usd)
+        return _read_the_answer(self.label, result, artifacts, self.config, self.spent_usd)
+
+    async def _ask(self) -> tuple[AgentResult, TaskArtifacts]:
+        orch_config = self.build_orch_config()
+        self.prices = orch_config.prices
+        artifacts = self.artifacts = self.deps.open_artifacts(self.worktree)
+        pre = self.task['pre_task_commit']
+        task_def = self.task.get('task_definition', {})
+        artifacts.init(
+            self.task['id'], task_def.get('title', ''), task_def.get('description', ''),
+            base_commit=pre,
+        )
+        briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
+        prompt = await briefing.build_architect_prompt(task_def, worktree=self.worktree)
+        async with owned_usage_gate(
+            self.usage_gate, orch_config, factory=self.deps.gate_factory, label=self.label,
+        ) as gate:
+            result = await invoke_with_cap_retry(
+                gate,
+                f'Architect eval {self.label}',
+                cap_wait_sanity_secs=self.deps.cap_wait_secs,
+                invoke_fn=self._timed_attempt,
+                backend=self.config.backend,
+                **_architect_invocation(self.task, self.config, prompt, self.worktree),
+            )
+        return result, artifacts
+
+    async def _timed_attempt(self, **kwargs: Any) -> AgentResult:
+        """One attempt bounded by the operator's timeout, its spend banked as it returns."""
+        result = await asyncio.wait_for(
+            self.deps.invoke(**kwargs), timeout=self.timeout_minutes * 60,
+        )
+        self.spent_usd += coerce_cost_usd(result.cost_usd)
+        return result
+
+
+def _architect_invocation(
+    task: dict, config: EvalConfig, prompt: str, worktree: Path,
+) -> dict[str, Any]:
+    """This candidate's architect invocation, scoped to plan-tools alone."""
+    return {
+        'prompt': prompt,
+        'system_prompt': ARCHITECT.system_prompt,
+        'cwd': worktree,
+        'model': config.model,
+        'max_turns': task.get('max_architect_turns', 50),
+        'max_budget_usd': config.max_budget_usd,
+        'allowed_tools': ARCHITECT.allowed_tools or None,
+        'disallowed_tools': ARCHITECT.disallowed_tools or None,
+        'effort': config.effort or 'high',
+        'env_overrides': config.env_overrides or None,
+        **architect_eval_mcp_scope(worktree),
+    }
+
+
+def _read_the_answer(
+    label: str,
+    result: AgentResult,
+    artifacts: TaskArtifacts,
+    config: EvalConfig,
+    spent_usd: float,
+) -> _Exit:
+    usage = _Usage.of(result)
+    refusal = _refusal(label, result, config, spent_usd)
+    try:
+        plan = artifacts.read_plan() or {}
+    except Exception as e:
+        logger.error(f'Architect eval {label} failed: {e}')
+        return _Exit('blocked', {}, usage, refusal or _harness_marker(e, spent_usd))
+    return _Exit('done' if result.success else 'blocked', plan, usage, refusal)
+
+
+def _refusal(
+    label: str, result: AgentResult, config: EvalConfig, spent_usd: float,
+) -> Unmeasured | None:
+    """The transport refusal behind *result*, carrying every attempt's spend."""
+    try:
+        refused = classify_unmeasured(
+            result, stage=MeasurementStage.ARCHITECT, backend=config.backend,
+        )
+    except Exception:
+        logger.warning(
+            f'invocation-error classification raised for {label}; leaving the cell unmarked',
+            exc_info=True,
+        )
+        return None
+    return dataclasses.replace(refused, cost_usd=spent_usd) if refused is not None else None
+
+
+def _timed_out(label: str, timeout_minutes: float, spent_usd: float) -> _Exit:
+    logger.error(f'Architect eval {label} timed out after {timeout_minutes}m')
+    marker = Unmeasured(
+        MeasurementStage.ARCHITECT, UnmeasuredCause.TIMEOUT,
+        f'no answer within {timeout_minutes}m', cost_usd=spent_usd,
+    )
+    return _Exit('timeout', {}, unmeasured=marker)
+
+
+def _cap_exhausted(
+    label: str,
+    exc: AllAccountsCappedException,
+    artifacts: TaskArtifacts | None,
+    spent_usd: float,
+) -> _Exit:
+    logger.error(
+        f'Architect eval {label}: all accounts capped after {exc.retries} retries '
+        f'({exc.elapsed_secs:.1f}s) — giving up on this cell rather than stalling '
+        f'the campaign'
+    )
+    marker = Unmeasured(
+        MeasurementStage.ARCHITECT, UnmeasuredCause.CAP_EXHAUSTED,
+        clip_reason(str(exc)), cost_usd=spent_usd,
+    )
+    return _Exit('blocked', _reread_plan(label, artifacts), unmeasured=marker)
+
+
+def _reread_plan(label: str, artifacts: TaskArtifacts | None) -> dict:
+    """A plan written before the pool ran dry, or ``{}``; never a raise."""
+    if artifacts is None:
+        return {}
+    try:
+        return artifacts.read_plan() or {}
+    except Exception:
+        logger.warning(
+            f'plan re-read after cap exhaustion failed for {label}; cell stays unmeasurable',
+            exc_info=True,
+        )
+        return {}
+
+
+def _harness_error(label: str, exc: Exception, spent_usd: float) -> _Exit:
+    logger.error(f'Architect eval {label} failed: {exc}')
+    return _Exit('blocked', {}, unmeasured=_harness_marker(exc, spent_usd))
+
+
+def _harness_marker(exc: Exception, spent_usd: float) -> Unmeasured:
+    return Unmeasured(
+        MeasurementStage.ARCHITECT, UnmeasuredCause.HARNESS_ERROR,
+        exception_reason(exc), cost_usd=spent_usd,
+    )
+
+
+def _read_declines(
+    artifacts: TaskArtifacts | None, label: str,
+) -> Mapping[str, dict | None]:
+    """The decline artifacts, read while the meta root still exists; never a raise."""
+    try:
+        return read_decline_artifacts(artifacts)
+    except Exception:
+        logger.warning(
+            f'decline-artifact read failed for {label}; the cell keeps its '
+            f'plan-derived terminal kind',
+            exc_info=True,
+        )
+        return {}
+
+
+def _architect_cost(
+    usage: _Usage,
+    *,
+    model: str,
+    prices: dict[str, Any] | None,
+    spent_usd: float,
+    is_local_model: bool,
+) -> tuple[float, str]:
+    """The architect component's ``(cost_usd, cost_source)`` per Invariant P5."""
+    if not (usage.input_tokens or usage.output_tokens or spent_usd):
+        return 0.0, 'cli'
+    return resolve_cost_usd(
+        usage.input_tokens, usage.output_tokens, model=model, prices=prices,
+        cli_cost_usd=spent_usd, is_local_model=is_local_model,
+    )
 
 
 class PlanScoring(StrEnum):

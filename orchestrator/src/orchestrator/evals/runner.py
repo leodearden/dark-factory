@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import logging
 import threading
@@ -13,11 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from shared.cli_invoke import (
-    AgentResult,
-    AllAccountsCappedException,
-    invoke_with_cap_retry,
-)
 from shared.eval_lane import is_eval_fixture_task_id
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -34,18 +28,17 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import (
     WorkflowOutcome,
-    _inject_plan_tools_mcp,
     _meta_root_for_worktree,
     build_workflow,
 )
 
 from .architect_eval import (
-    ArchitectAttempt,
     ArchitectEvalDeps,
     PlanScoring,
     assemble_metrics,
     cell_label,
     classify_attempt,
+    invoke_architect,
     judge_plan,
     log_architect_cell,
     read_reference_diff,
@@ -58,26 +51,14 @@ from .configs import (
     matrix_pairs,
 )
 from .eval_gate import (
-    EVAL_CAP_WAIT_SANITY_SECS,
     GATE_UNSET,
     InjectedGate,
     campaign_usage_gate,
     owned_usage_gate,
 )
-from .measurement import (
-    MeasurementStage,
-    Unmeasured,
-    UnmeasuredCause,
-    classify_unmeasured,
-    clip_reason,
-    coerce_cost_usd,
-    exception_reason,
-)
 from .metrics import (
     collect_metrics,
     is_proxied_endpoint,
-    read_decline_artifacts,
-    resolve_cost_usd,
 )
 from .profile import apply_eval_profile
 from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
@@ -85,16 +66,6 @@ from .results import CellName, EvalResult, ResultStore
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
-
-
-def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
-    """The ONLY MCP an eval architect may reach: plan-tools, strictly scoped.
-
-    The PAIR is the invariant (task 4757). A plan-tools config without the
-    strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
-    the live escalation (:8102) and fused-memory (:8002) servers.
-    """
-    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -527,480 +498,59 @@ async def run_architect_eval(
     *,
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
+    deps: ArchitectEvalDeps | None = None,
 ) -> EvalResult:
-    """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
+    """Run ONE architect eval: invoke the architect live, score its plan, persist the cell.
 
-    Unlike :func:`run_eval` (which FREEZES the plan and scores the implementer),
-    this drives ONLY the architect — the ``_run_plan_only`` invocation sequence
-    (create_eval_worktree at ``pre_task_commit`` → ``TaskArtifacts.init`` →
-    ``briefing.build_architect_prompt`` → ``invoke_agent(ARCHITECT)`` →
-    ``artifacts.read_plan``) — so every downstream role
-    (implementer/debugger/reviewer/verify) is FROZEN (decision 8: noise
-    isolation + token savings). The architect runs with THIS candidate's
-    model/backend/effort/env_overrides, not the hardcoded opus-high the
-    implementer path pins. Its prompt ends with the replay frame, and the cell
-    is stamped ``replay_frame`` (docs/eval-replay-frame.md). The architect
-    reaches plan-tools and no other MCP server (:func:`architect_eval_mcp_scope`);
-    ``evals/profile.py::EVAL_PROFILE`` documents the workflow-path counterpart.
-
-    The cell is classified and scored by
-    :mod:`orchestrator.evals.architect_eval` (``classify_attempt`` →
-    ``judge_plan`` when judged → ``assemble_metrics``); the taint table and the
-    scoring rationale are in docs/plan-scoring-and-judge.md, "The architect
-    cell: invoke, classify, assemble (task 6737)". The result carries
-    ``role_under_test='architect'`` and is persisted into *store* (``None``
-    persists into :meth:`ResultStore.packaged`).
-
-    Cost PROVENANCE (task 3656): the ARCHITECT component of the cell's cost is
-    RESOLVED per Invariant P5, through the same
-    :func:`~orchestrator.evals.metrics.resolve_cost_usd` seam
-    ``collect_metrics`` uses on the implementer path — so a PROXIED architect
-    candidate no longer keeps the raw CLI figure P5 calls untrustworthy for a
-    proxy, and ``cost_source`` is DERIVED rather than left at an unverified
-    dataclass default. The PLAN-JUDGE component deliberately keeps its CLI
-    figure: the judge is always a native-cloud opus call
-    (:func:`~orchestrator.evals.judge.judge_plan_quality` takes neither the
-    candidate's model nor its ``env_overrides``), so re-resolving it against
-    the candidate's price table would price opus tokens at a vLLM rate. The
-    cell's single ``cost_source`` therefore reads ``'mixed'``
-    (:func:`~orchestrator.evals.metrics.compose_cost_source`) whenever those
-    two components disagree AND the judge actually spent — the
-    operator-visible answer to the mixed-provenance question, rather than one
-    label quietly standing in for two sources. A NATIVE candidate resolves
-    ``'cli'`` beside a ``'cli'`` judge, so today's cells keep both figure and
-    label byte-identical. A cell that spent NOTHING (timeout, harness error,
-    pre-invoke cap) skips the resolution altogether: $0.00 has no provenance to
-    resolve, and resolving it would attach a loud degradation WARNING to spend
-    that never happened.
-
-    TERMINAL OUTCOME (task 4760). The cell also carries
-    ``metrics.terminal_kind``: WHAT the architect's last statement about the
-    task actually was — a scorable plan, one of the five explicit plan-tools
-    decline exits, or neither. A DECLINE IS NOT A CONTENT FAILURE: it is the
-    correct refusal the prompt tells the architect to make INSTEAD of planning,
-    so ``plan_steps``, ``cap_tainted`` and ``plan_quality`` are all left exactly
-    as they were and planRate keeps its historical ``plan_steps > 0``
-    derivation. The field exists so a ``plan_steps = 0`` cell can be split by
-    CAUSE without transcript forensics. When a cell carries BOTH a plan and a
-    decline, LAST TERMINAL CALL WINS — see
-    :func:`~orchestrator.evals.metrics.resolve_terminal_kind` for the policy and
-    its ambiguity direction. The artifacts are read in the ``finally`` block
-    below, which is the last moment they exist.
+    Unlike :func:`run_eval`, which freezes the plan and scores the implementer,
+    only the architect runs, with this candidate's model, backend, effort and
+    env_overrides; every downstream role is frozen. The cell is
+    ``invoke_architect`` → ``read_reference_diff`` → ``classify_attempt`` →
+    ``judge_plan`` (only when judged) → ``assemble_metrics``, over *deps*
+    (production defaults, persisting into *store*, or
+    :meth:`ResultStore.packaged` when neither is given). Rationale:
+    docs/plan-scoring-and-judge.md, "The architect cell: invoke, classify,
+    assemble (task 6737)".
     """
-    from orchestrator.agents.invoke import invoke_agent
-    from orchestrator.agents.roles import ARCHITECT
-    from orchestrator.artifacts import TaskArtifacts
-    from orchestrator.evals import judge as judge_mod
-    from orchestrator.evals import snapshots
-
+    if store is not None and deps is not None:
+        raise ValueError(
+            'run_architect_eval takes store= or deps=, not both: deps.store is '
+            'where an injected deps persists the cell'
+        )
     task = load_task(task_path)
-    task_id = task['id']
-    project_root = Path(task['project_root'])
-    pre = task['pre_task_commit']
-
-    logger.info(
-        f'Starting architect eval: {task_id} × {config.name} (trial {trial})'
-    )
+    deps = deps or ArchitectEvalDeps(store=store or ResultStore.packaged())
+    label = cell_label(task, config)
+    logger.info(f'Starting architect eval: {label} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
-
-    # 1. Worktree at the fixture's pre_task_commit.
-    worktree, run_id = await snapshots.create_eval_worktree(
-        project_root, task_id, pre, setup_commands=task.get('setup_commands'),
-    )
-    address = CellName(task_id, config.name, run_id)
-
-    plan: dict = {}
-    # Pre-initialised for the same reason ``artifacts``/``usage_gate`` below
-    # are: the finally block READS the decline artifacts, and it must not
-    # NameError on a failure that happened before that read.
-    declines: dict[str, dict | None] = {}
-    # Pre-initialised so the cap-exhaustion handler below can best-effort
-    # re-read the plan artifact: that handler runs on an exception raised AT
-    # the invoke, which is before the normal ``artifacts.read_plan()``, and on
-    # the earlier failure paths (worktree/config) the name is genuinely unbound
-    # — which pyright correctly flags without this.
-    artifacts: TaskArtifacts | None = None
-    # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
-    # architect invocation's spend. The cell's persisted ``cost_usd`` below
-    # additionally folds in the plan judge's spend (``judge_cost_usd``), so
-    # the two must never be confused under one name.
-    arch_cost_usd = 0.0
-    # The architect invocation's TOKEN USAGE — the price-table inputs Invariant
-    # P5 needs (see resolve_cost_usd). Pre-try for the same reason arch_cost_usd
-    # is: the timeout and harness-error paths never bind ``result``, so the
-    # honest zeros must already exist.
-    arch_input_tokens = 0
-    arch_output_tokens = 0
-    # The REST of the token profile ``collect_metrics`` stamps on the implementer
-    # path. Not P5 inputs — they price nothing — but on a native Claude run the
-    # cache reads typically DOMINATE the profile, so a cell reporting input/output
-    # beside a zeroed cache block would read as a far smaller run than it was
-    # (reviewer: completeness). Pre-try for the same reason as above.
-    arch_cache_read_tokens = 0
-    arch_cache_create_tokens = 0
-    arch_turns = 0
-    # Whether this candidate runs against a PROXIED endpoint, the third P5
-    # input. Read from the EvalConfig — not the built orch config — because it
-    # is literally what ``invoke_agent(env_overrides=config.env_overrides)``
-    # below is handed, and because reading it here means a harness crash inside
-    # the try cannot leave the proxy signal unknowable. Through the SAME
-    # ``is_proxied_endpoint`` predicate ``build_eval_orch_config`` keys its
-    # price-table seeding on (and ``collect_metrics`` reads on the implementer
-    # path), so the seeded table and the trust-the-CLI flag cannot drift apart.
-    is_local = is_proxied_endpoint(config.env_overrides)
-    arch_duration_ms = 0
-    outcome = 'done'
-    # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
-    # Set on the transport-refusal path (classified from the AgentResult) AND on
-    # the timeout / harness-exception paths below, so no zero-content failure is
-    # left byte-indistinguishable from a genuinely terrible plan.
-    arch_unmeasured: Unmeasured | None = None
-    # Honor the operator's --timeout around the LIVE architect invoke, exactly
-    # as run_eval bounds workflow.run(). timeout_override is in MINUTES
-    # (run_eval convention — the CLI threads the same --timeout to both); without
-    # this a hung architect run would block indefinitely, bounded only by
-    # max_budget_usd.
-    #
-    # Since eval-revival φ this bounds each ATTEMPT, not the whole cap-retry
-    # loop — see _timed_invoke below for why the distinction is load-bearing
-    # rather than incidental.
-    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
-    # Hoisted out of the try so its PRICE TABLE survives to the cost resolution
-    # after the finally. A harness crash before it is built leaves an explicit
-    # ``None`` (which resolve_cost_usd tolerates) rather than an
-    # UnboundLocalError that would lose the whole cell — and that path never
-    # invoked the architect (0 tokens, $0.00), so no price table could have
-    # changed the number anyway.
-    orch_config: OrchestratorConfig | None = None
-    try:
-        # 2. Eval orch config (project_root / verify / profile parity).
-        orch_config = build_eval_orch_config(
+    attempt = await invoke_architect(
+        task, config, deps,
+        build_orch_config=lambda: build_eval_orch_config(
             config, task, base_config, memory_endpoint=memory_endpoint,
-        )
-
-        # 3. Init artifacts so the architect has a place to write plan.json.
-        #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
-        #    injected plan-tools server writes to (BUG 1: writer==reader), so
-        #    read_plan() below picks up what the architect's plan-tools calls
-        #    persisted, exactly like real dispatch.
-        artifacts = TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
-        task_def = task.get('task_definition', {})
-        artifacts.init(
-            task_id,
-            task_def.get('title', ''),
-            task_def.get('description', ''),
-            base_commit=pre,
-        )
-
-        # 4. Build the architect prompt and invoke the architect LIVE with THIS
-        #    candidate's model/backend/effort/env_overrides.
-        briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
-        prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-
-        async def _timed_invoke(**kwargs) -> AgentResult:
-            """Bound ONE attempt by the operator's --timeout, and bank its spend.
-
-            The timeout deliberately lives HERE, per attempt, rather than
-            wrapped around ``invoke_with_cap_retry`` as a whole. Wrapping the
-            retry loop would make a cap WAIT surface as ``TimeoutError`` →
-            ``outcome='timeout'`` → NOT tainted (the deliberate timeout
-            asymmetry in the docstring above) → a cap-starved cell scored a
-            fabricated 0.0 and INCLUDED in the mean. That is exactly the
-            differential-exclusion bias φ exists to remove, and it would fire
-            whenever the operator's --timeout is shorter than the cap patience
-            bound.
-
-            Per-attempt keeps the two clocks orthogonal and each one's meaning
-            intact: candidate-attributable slowness → ``TimeoutError`` →
-            ``outcome='timeout'``, kept and scored on content; infra cap
-            starvation → ``AllAccountsCappedException`` → the cap backstop.
-            Worst-case wall clock stays bounded in practice because a
-            cap-classified attempt is by construction near-instant and
-            zero-cost, so an attempt that burns the full timeout is never the
-            one being retried.
-
-            SPEND IS ACCUMULATED HERE, per attempt, rather than read off the
-            returned result (reviewer: correctness). ``invoke_with_cap_retry``
-            returns only the LAST AgentResult and never aggregates cost, so a
-            cap landing MID-run — after the architect already spent real money
-            through plan-tools — would contribute its spend to nothing. That
-            matters specifically BECAUSE of φ: the cell is now INCLUDED in the
-            aggregate, so an under-reported cost biases the cost comparison in
-            the same direction the quality comparison was biased, and for the
-            same reason (the more cap-exposed candidate fails over more often).
-            The resume path has the identical shape — the retried attempt
-            reports only the resumed segment.
-
-            Only ``cost_usd`` accumulates. ``arch_duration_ms`` deliberately
-            stays the WINNING attempt's latency: cap waits and abandoned
-            attempts are infra time, not candidate latency, and folding them in
-            would corrupt the per-candidate duration the campaign compares.
-            ``measurement.coerce_cost_usd`` guards the read so a Mock/None/NaN
-            degrades to an honest 0.0 instead of poisoning the sum.
-            """
-            nonlocal arch_cost_usd
-            attempt = await asyncio.wait_for(
-                invoke_agent(**kwargs), timeout=timeout_minutes * 60,
-            )
-            arch_cost_usd += coerce_cost_usd(getattr(attempt, 'cost_usd', 0.0))
-            return attempt
-
-        # Account failover (eval-revival φ): all retry/resume/backoff behaviour
-        # comes from the shared wrapper — this call site adds none of its own.
-        # With usage_gate=None it degrades to a single invocation, i.e. exactly
-        # the pre-φ behaviour, so a deployment with usage_cap disabled is
-        # unchanged. `backend` moves to the wrapper's own keyword-only
-        # parameter, which forwards it into the dispatched call because a
-        # custom invoke_fn is supplied.
-        #
-        # The architect is scoped to plan-tools ONLY (architect_eval_mcp_scope):
-        # plan-tools is wired through the SAME production seam real dispatch
-        # uses (relocated meta_root + direct-interpreter launch), and the strict
-        # flag drops the ambient .mcp.json's live production servers.
-        #
-        # The gate (eval_gate.owned_usage_gate) is scoped to this one call.
-        async with owned_usage_gate(
-            usage_gate, orch_config, label=f'{task_id} × {config.name}',
-        ) as gate:
-            result = await invoke_with_cap_retry(
-                gate,
-                f'Architect eval {task_id} × {config.name}',
-                cap_wait_sanity_secs=EVAL_CAP_WAIT_SANITY_SECS,
-                invoke_fn=_timed_invoke,
-                backend=config.backend,
-                prompt=prompt,
-                system_prompt=ARCHITECT.system_prompt,
-                cwd=worktree,
-                model=config.model,
-                max_turns=task.get('max_architect_turns', 50),
-                max_budget_usd=config.max_budget_usd,
-                allowed_tools=ARCHITECT.allowed_tools or None,
-                disallowed_tools=ARCHITECT.disallowed_tools or None,
-                effort=config.effort or 'high',
-                env_overrides=config.env_overrides or None,
-                **architect_eval_mcp_scope(worktree),
-            )
-        # arch_cost_usd is banked inside _timed_invoke (every attempt), not
-        # read off `result` (the last attempt only) — see its docstring. The
-        # token/turn counters below DO come off `result`, i.e. the final
-        # attempt: they feed the P5 price-table provenance, which describes the
-        # invocation that actually produced the scored plan.
-        #
-        # ``or 0``, not a bare read: AgentResult declares both ``int | None``,
-        # and a provider that did not report usage must persist an honest 0
-        # rather than a None that would poison the price-table arithmetic.
-        arch_input_tokens = result.input_tokens or 0
-        arch_output_tokens = result.output_tokens or 0
-        # Same ``or 0`` contract: both cache counts are ``int | None`` too, and
-        # ``turns`` is 0 when the provider does not track it.
-        arch_cache_read_tokens = result.cache_read_tokens or 0
-        arch_cache_create_tokens = result.cache_create_tokens or 0
-        arch_turns = result.turns or 0
-        arch_duration_ms = result.duration_ms
-        if not result.success:
-            outcome = 'blocked'
-        # Was this a TRANSPORT-layer refusal (a 429 cap hit / auth failure — we
-        # never got to ask the model) rather than an ordinary content failure?
-        # The outcome vocabulary stays 'blocked' either way; the distinction
-        # lives in metrics, which is what the report and the persisted JSON
-        # read. Guarded so a classifier bug degrades to an unmarked cell rather
-        # than nuking the whole run.
-        try:
-            refused = classify_unmeasured(
-                result, stage=MeasurementStage.ARCHITECT, backend=config.backend,
-            )
-            if refused is not None:
-                arch_unmeasured = dataclasses.replace(refused, cost_usd=arch_cost_usd)
-        except Exception:
-            logger.warning(
-                f'invocation-error classification raised for {task_id} × '
-                f'{config.name}; leaving the cell unmarked',
-                exc_info=True,
-            )
-        # 5. Read the produced plan artifact (the scoring input).
-        plan = artifacts.read_plan() or {}
-    except TimeoutError:
-        logger.error(
-            f'Architect eval {task_id} × {config.name} timed out after '
-            f'{timeout_minutes}m'
-        )
-        outcome = 'timeout'
-        # MARKED, yet candidate-attributable: architect_eval.classify_attempt
-        # keeps a timeout scoring on content while a cap hit is excluded.
-        arch_unmeasured = arch_unmeasured or Unmeasured(
-            MeasurementStage.ARCHITECT, UnmeasuredCause.TIMEOUT,
-            f'no answer within {timeout_minutes}m', cost_usd=arch_cost_usd,
-        )
-    except AllAccountsCappedException as e:
-        # Every account in the pool was capped for longer than this eval's
-        # patience bound. Caught HERE, ahead of the generic handler, for two
-        # reasons that both matter to the persisted cell:
-        #
-        # 1. LABELLING. The generic handler stamps
-        #    `harness_error: AllAccountsCappedException: ...`, which charges a
-        #    TRANSPORT refusal to our own crash and collapses two rows of the
-        #    taint table (architect_eval.classify_attempt) that exist to stay
-        #    distinguishable. Legibility of the failure marker is the whole
-        #    point of the 3118 marker machinery.
-        #
-        # 2. THE ARTIFACT RE-READ. The exception is raised at the invoke, so
-        #    the normal `artifacts.read_plan()` above never ran. A plan the
-        #    architect wrote through plan-tools BEFORE the pool ran dry would
-        #    otherwise be silently discarded — converting a scorable cell into
-        #    an exclusion and re-opening the differential-exclusion hazard from
-        #    the other side. Re-reading makes cap exhaustion obey the SAME
-        #    taint-table row an inline mid-run 429 already obeys, with zero
-        #    change to the taint predicate itself.
-        #
-        # `arch_cost_usd` already holds whatever the ABANDONED attempts spent:
-        # _timed_invoke banks each attempt's cost as it returns, so a cap that
-        # landed after the architect burned real money still reports that money
-        # here, even though no AgentResult survives to be read. It stays 0.0
-        # only when the pool was dry before anything ran, which is the honest
-        # answer for that case.
-        logger.error(
-            f'Architect eval {task_id} × {config.name}: all accounts capped '
-            f'after {e.retries} retries ({e.elapsed_secs:.1f}s) — giving up on '
-            f'this cell rather than stalling the campaign'
-        )
-        outcome = 'blocked'
-        arch_unmeasured = arch_unmeasured or Unmeasured(
-            MeasurementStage.ARCHITECT, UnmeasuredCause.CAP_EXHAUSTED,
-            clip_reason(str(e)), cost_usd=arch_cost_usd,
-        )
-        if artifacts is not None:
-            # Best-effort: an unreadable artifact here must degrade to the
-            # tainted path, never turn a cap into a harness crash.
-            try:
-                plan = artifacts.read_plan() or {}
-            except Exception:
-                logger.warning(
-                    f'plan re-read after cap exhaustion failed for {task_id} × '
-                    f'{config.name}; cell stays unmeasurable',
-                    exc_info=True,
-                )
-    except Exception as e:
-        logger.error(f'Architect eval {task_id} × {config.name} failed: {e}')
-        outcome = 'blocked'
-        # A HARNESS failure (worktree/config/briefing/artifact-read raised), not
-        # a candidate failure — the candidate was never even asked, so scoring it
-        # 0.0 would charge our own crash to it. Marked AND unmeasurable. An
-        # already-classified transport refusal is more specific, so it wins.
-        arch_unmeasured = arch_unmeasured or Unmeasured(
-            MeasurementStage.ARCHITECT, UnmeasuredCause.HARNESS_ERROR,
-            exception_reason(e), cost_usd=arch_cost_usd,
-        )
-    finally:
-        # The architect's DECLINE artifacts (task 4760) — read HERE, and only
-        # here, for two reasons. (a) This single site is reached by ALL FOUR
-        # exits: success, TimeoutError, AllAccountsCappedException and the
-        # generic harness-error handler. Reading beside ``artifacts.read_plan()``
-        # on the happy path instead would leave the timeout and harness-error
-        # cells with no terminal kind at all, and would need a SECOND copy on
-        # the cap-exhaustion re-read path — the duplication that path's own
-        # comment exists to justify avoiding. (b) It is the LAST moment the
-        # artifacts exist: the very next statement rmtree's the relocated
-        # .task-meta/<name>/ root (snapshots.cleanup_eval_worktree), so any read
-        # placed after it — which is everywhere post-``finally`` — finds nothing.
-        #
-        # Best-effort: a failure while cleaning up must never turn an
-        # already-scored cell into a lost run. read_decline_artifacts already degrades PER KIND; this is the
-        # outer backstop.
-        try:
-            declines = read_decline_artifacts(artifacts)
-        except Exception:
-            logger.warning(
-                f'decline-artifact read failed for {task_id} × {config.name}; '
-                f'the cell keeps its plan-derived terminal kind',
-                exc_info=True,
-            )
-        # Plan already read above; the worktree is no longer needed (scoring
-        # reads the in-memory plan + the committed reference diff).
-        await snapshots.cleanup_eval_worktree(project_root, worktree)
-
-    # Cost provenance (Invariant P5) for the ARCHITECT component, through the
-    # SAME seam collect_metrics uses on the implementer path — a proxied
-    # endpoint's own CLI figure is untrustworthy, so it must be resolved rather
-    # than copied. Two non-obvious arguments:
-    #   - ``model=config.model``: this path calls
-    #     ``invoke_agent(model=config.model)`` DIRECTLY, so the EvalConfig's
-    #     model is literally what produced the tokens being priced.
-    #     ``orch_config.models.architect`` would be the WRONG key —
-    #     build_eval_orch_config pins it to the frozen 'opus' default whenever
-    #     architect_config is None, which is every run_architect_eval caller,
-    #     so pricing would silently look up opus for a fable or vLLM candidate.
-    #   - ``prices`` from ``orch_config``, NOT ``base_config``:
-    #     build_eval_orch_config auto-merges claude_endpoint_price_table() into
-    #     .prices for a PROXIED candidate (task 2820), and that merge is exactly
-    #     what makes 'price_table' reachable here instead of the degraded
-    #     'unpriced_proxy'.
-    #
-    # SKIPPED entirely when NOTHING was spent — the timeout, harness-error and
-    # pre-invoke cap paths never bind ``result``, so they arrive here with 0
-    # tokens and $0.00. There is no provenance to resolve for a figure that is
-    # not there, and resolving it anyway would fire the LOUD unpriced-proxy
-    # WARNING for spend that never happened on EVERY timed-out or crashed
-    # proxied cell — training operators to ignore the warning that matters, and
-    # labelling a $0.00 cell 'unpriced_proxy' as if the degradation were real
-    # (reviewer: log-noise). The label then stays the documented 'cli' default,
-    # which is exactly what a $0.00 architect cell has always read.
-    if arch_input_tokens or arch_output_tokens or arch_cost_usd:
-        resolved_arch_cost, arch_cost_source = resolve_cost_usd(
-            arch_input_tokens,
-            arch_output_tokens,
-            model=config.model,
-            prices=orch_config.prices if orch_config is not None else None,
-            cli_cost_usd=arch_cost_usd,
-            is_local_model=is_local,
-        )
-    else:
-        resolved_arch_cost, arch_cost_source = 0.0, 'cli'
-
-    attempt = ArchitectAttempt(
-        address=address,
-        worktree=worktree,
-        outcome=outcome,
-        plan=plan,
-        declines=declines,
-        input_tokens=arch_input_tokens,
-        output_tokens=arch_output_tokens,
-        cache_read_tokens=arch_cache_read_tokens,
-        cache_create_tokens=arch_cache_create_tokens,
-        turns=arch_turns,
-        duration_ms=arch_duration_ms,
-        cost_usd=resolved_arch_cost,
-        cost_source=arch_cost_source,
-        is_local_model=is_local,
-        unmeasured=arch_unmeasured,
-    )
-    # Interim (task 6737 step-4): judge and reference-diff reader are looked up
-    # at call time so the hermetic harness's module patches still reach them.
-    deps = ArchitectEvalDeps(
-        store=store or ResultStore.packaged(),
-        judge=judge_mod.judge_plan_quality,
-        read_reference_diff=snapshots.get_diff_between_commits,
+        ),
+        usage_gate=usage_gate,
+        timeout_minutes=timeout_override or task.get('timeout_minutes', 60),
     )
     reference_diff = await read_reference_diff(task, deps)
     scoring = classify_attempt(attempt)
     judgement = (
-        await judge_plan(plan, reference_diff, task, deps)
+        await judge_plan(attempt.plan, reference_diff, task, deps)
         if scoring is PlanScoring.JUDGE else None
     )
     metrics = assemble_metrics(attempt, scoring, judgement)
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
-    result_obj = EvalResult(
-        task_id=address.task_id,
-        config_name=address.config_name,
-        outcome=outcome,
+    result = EvalResult(
+        task_id=attempt.address.task_id,
+        config_name=attempt.address.config_name,
+        outcome=attempt.outcome,
         metrics=metrics.to_dict(),
-        worktree_path=str(worktree),
+        worktree_path=str(attempt.worktree),
         wall_clock_ms=wall_clock_ms,
-        run_id=address.run_id,
+        run_id=attempt.address.run_id,
         trial=trial,
     )
-    deps.store.save(result_obj)
-    log_architect_cell(cell_label(task, config), scoring, metrics, wall_clock_ms)
-    return result_obj
+    deps.store.save(result)
+    log_architect_cell(label, scoring, metrics, wall_clock_ms)
+    return result
 
 
 async def run_end_to_end(

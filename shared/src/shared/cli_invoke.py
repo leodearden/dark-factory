@@ -152,7 +152,7 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         entry instead of raising.
 #
 # orchestrator/evals/eval_gate.py         EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
-#   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
+#   (architect_eval.invoke_architect)     RAISED from 1800 s on 2026-08-25
 #                                         (esc-3634-1).  It is the one caller in
 #                                         this table that does NOT take the
 #                                         short house value, deliberately.  The

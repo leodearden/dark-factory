@@ -421,9 +421,9 @@ def read_decline_artifacts(
     not an OBJECT (``[]``, ``"x"``, ``3``), which no ``except`` would catch.
     Only a kind the architect never reported goes quiet, because that ``None``
     is a measurement, not a degradation. This matters because the SOLE caller
-    is inside ``run_architect_eval``'s ``finally`` block — the only place the
-    artifacts still exist, since the next statement ``rmtree``s the meta root
-    — where a raise would turn an already-scored cell into a lost run.
+    is inside ``architect_eval.invoke_architect``'s ``finally`` block — the only
+    place the artifacts still exist, since the next statement ``rmtree``s the
+    meta root — where a raise would turn an already-scored cell into a lost run.
 
     ``artifacts is None`` (the harness-error path, where it was never
     constructed) and an object missing a reader (a legacy or monkeypatched
@@ -623,8 +623,9 @@ def is_proxied_endpoint(env_overrides: dict[str, str] | None) -> bool:
     apart from a native-cloud one, and THREE sites key on it: ``runner
     .build_eval_orch_config`` (which seeds :func:`claude_endpoint_price_table`
     into ``config.prices`` for a proxied candidate, task 2820),
-    :func:`collect_metrics` and ``runner.run_architect_eval`` (both of which
-    pass it to :func:`resolve_cost_usd` as the do-not-trust-the-CLI-cost flag).
+    :func:`collect_metrics` and ``architect_eval.invoke_architect`` (both of
+    which pass it to :func:`resolve_cost_usd` as the do-not-trust-the-CLI-cost
+    flag).
     Those three MUST agree — a seeded price table beside a "native, trust the
     CLI figure" flag would resolve one candidate's cost two different ways — so
     the predicate gets ONE home rather than three copies a future change to the

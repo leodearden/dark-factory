@@ -1263,6 +1263,76 @@ cap-wait patience, store) is a field of `ArchitectEvalDeps`, whose defaults are
 the production collaborators, so a test injects fakes rather than patching
 module paths.
 
+**The invoke step (`invoke_architect`).** It is the only step with effects on
+the architect, and it drives only the architect: the worktree at the fixture's
+`pre_task_commit`, `TaskArtifacts.init` at the relocated `.task-meta/<name>/`
+root, the replay-framed architect prompt (docs/eval-replay-frame.md), one gated
+`invoke_with_cap_retry` with this candidate's model, backend, effort and
+`env_overrides`, then `read_plan`. Every downstream role is frozen. The
+architect reaches plan-tools and no other MCP server
+(`architect_eval_mcp_scope`): plan-tools is wired through the same seam real
+dispatch uses, so the server writes `plan.json` where the artifacts read it,
+and the strict flag drops the worktree's ambient `.mcp.json` with its live
+escalation and fused-memory servers. The cell's address (`CellName`) is built
+right after the worktree exists, before anything spends, so an unaddressable
+cell fails without a run.
+
+Each way the invoke can end is one row:
+
+| Exit | `outcome` | Architect `Unmeasured` | Plan | Usage |
+|---|---|---|---|---|
+| Answered | `done`, or `blocked` when not `success` | the transport refusal, if `classify_unmeasured` finds one | `read_plan()` | the last attempt's |
+| Answered, then `read_plan` raised | `blocked` | the refusal if any, else `harness_error` | `{}` | the last attempt's |
+| `TimeoutError` | `timeout` | `timeout` | not read | zeros |
+| `AllAccountsCappedException` | `blocked` | `cap_exhausted` | re-read, `{}` if that raises | zeros |
+| Any other exception (config, artifacts, briefing, invoke) | `blocked` | `harness_error` | `{}` | zeros |
+
+Every marker carries the spend banked so far. A classifier that raises leaves
+the cell unmarked rather than losing it.
+
+- The operator's `--timeout` bounds each attempt, never the cap-retry loop.
+  Around the loop, a cap wait longer than the timeout would surface as
+  `outcome='timeout'`, which is candidate-attributable and so not tainted: a
+  cap-starved cell would be scored on a fabricated 0.0 and included in the
+  mean, the differential-exclusion bias φ exists to remove. Per attempt, the
+  two clocks keep their meanings: slowness is a timeout and scores on content,
+  cap starvation is cap exhaustion and taints. A capped attempt is near-instant
+  and free, so the attempt that burns the whole timeout is never the one being
+  retried.
+- Spend is banked per attempt, as each attempt returns.
+  `invoke_with_cap_retry` returns only the last `AgentResult`, so a cap landing
+  mid-run, after the architect spent real money, would otherwise vanish. That
+  matters because the cell is now included: under-reported cost biases the
+  cost comparison the same way exclusion biased quality. Duration is the
+  winning attempt's alone, because cap waits and abandoned attempts are infra
+  time, not candidate latency.
+- Cap exhaustion re-reads the plan. The exception is raised at the invoke, so
+  the ordinary `read_plan` never ran, and a plan written through plan-tools
+  before the pool ran dry would be discarded, turning a scorable cell into an
+  exclusion. The re-read makes exhaustion follow the same taint row an inline
+  mid-run 429 follows. It is caught ahead of the generic handler so it is not
+  labelled our own crash.
+- A transport refusal outranks a later harness error: when `read_plan` raises
+  after a classified refusal, the refusal is the more specific statement of
+  why the cell is not measured.
+- The decline artifacts are read in the step's `finally`, after every exit and
+  before `cleanup_worktree`, which removes the meta root they live under: it
+  is the last moment they exist. A read that raises costs the declines, never
+  the cell.
+
+The architect component's cost is resolved per Invariant P5 through
+`metrics.resolve_cost_usd`, the seam `collect_metrics` uses. Its model is
+`config.model`, the model the invoke was handed; `orch_config.models.architect`
+is pinned to the frozen `opus` default for every architect eval and would
+price a fable or vLLM candidate as opus. Its prices come from the built orch
+config, which seeds `claude_endpoint_price_table()` for a proxied candidate
+(task 2820), and its proxy flag is `is_proxied_endpoint(config.env_overrides)`,
+the predicate that seeding keys on. A cell that spent nothing (no tokens, $0.00
+banked) skips resolution and reads `(0.0, 'cli')`: there is no provenance to
+resolve, and resolving would fire the unpriced-proxy warning for spend that
+never happened. The judge's spend keeps its CLI figure (the judge is always a
+native opus call) and the two are composed by `compose_cost_source`.
+
 **The taint table (`classify_attempt`).** "Never asked" means the attempt
 carries an architect `Unmeasured` whose cause is not candidate-attributable;
 `CANDIDATE_ATTRIBUTABLE_CAUSES` holds `timeout` alone. "Scorable" is
