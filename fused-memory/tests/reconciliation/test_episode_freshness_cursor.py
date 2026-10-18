@@ -13,19 +13,26 @@ time, so a same-day-earlier episode re-surfaced on every cycle forever.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    ReconciliationRun,
+    RunType,
     StageId,
     StageReport,
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.episode_window import (
+    UNFINISHED_WRITE_START_STAT,
+    next_episode_window_anchor,
+    recorded_unfinished_write_start,
+)
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import (
     MemoryConsolidator,
@@ -46,6 +53,7 @@ def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
     memory_mock.mem0 = AsyncMock()
     memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
     memory_mock.get_status = AsyncMock(return_value={})
+    memory_mock.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
 
     stage = MemoryConsolidator(
         StageId.memory_consolidator,
@@ -743,3 +751,114 @@ class TestAssembledPathOmitsFreshnessCutoffs:
             f'Expected the assembled path to reset the undatable counter to 0, '
             f'got {stage._undatable_freshness_records}'
         )
+
+
+RUN_START = datetime(2026, 8, 22, 9, 0, 0, tzinfo=UTC)
+
+
+def _run_with_stage1(report: StageReport) -> ReconciliationRun:
+    return ReconciliationRun(
+        id='run-window',
+        project_id='test_project',
+        run_type=RunType.full,
+        trigger_reason='t',
+        started_at=RUN_START,
+        stage_reports={StageId.memory_consolidator.value: report},
+    )
+
+
+class TestUnfinishedGraphitiWriteSample:
+    """Stage 1 records when the earliest Graphiti write still executing began,
+    sampled just BEFORE its episode fetch, so the next cycle's episode window
+    starts no later than that (fused_memory/reconciliation/episode_window.py).
+    Driven through the REAL assemble_payload; only BaseStage.run's CLI tail is
+    replaced."""
+
+    @staticmethod
+    async def _run(stage: MemoryConsolidator) -> StageReport:
+        async def _fake_base_run(events, watermark, prior_reports, run_id, model=None, resume_session_id=None):
+            await stage.assemble_payload(events, watermark, prior_reports)
+            return StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={},
+            )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=_fake_base_run)):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project', last_episode_timestamp=WATERMARK_TS),
+                prior_reports=[],
+                run_id='run-window',
+            )
+
+    @pytest.mark.asyncio
+    async def test_unfinished_write_start_becomes_the_next_episode_anchor(self):
+        stage = _make_consolidator()
+        unfinished = RUN_START - timedelta(minutes=5)
+        sample = MagicMock(return_value=unfinished)
+        stage.memory.earliest_unfinished_graphiti_write_start = sample
+
+        report = await self._run(stage)
+
+        sample.assert_called_once_with('test_project')
+        assert next_episode_window_anchor(_run_with_stage1(report)) == unfinished
+
+    @pytest.mark.asyncio
+    async def test_sample_is_taken_before_the_episode_fetch(self):
+        stage = _make_consolidator()
+        order: list[str] = []
+
+        def _sample(project_id):
+            order.append('sample')
+            return None
+
+        async def _fetch(*args, **kwargs):
+            order.append('fetch')
+            return []
+
+        stage.memory.earliest_unfinished_graphiti_write_start = MagicMock(side_effect=_sample)
+        stage.memory.get_episodes = AsyncMock(side_effect=_fetch)
+
+        await self._run(stage)
+
+        assert order[:2] == ['sample', 'fetch']
+
+    @pytest.mark.asyncio
+    async def test_nothing_executing_records_the_stat_and_anchors_at_run_start(self):
+        stage = _make_consolidator()
+
+        report = await self._run(stage)
+
+        assert UNFINISHED_WRITE_START_STAT in report.stats
+        assert next_episode_window_anchor(_run_with_stage1(report)) == RUN_START
+
+    @pytest.mark.asyncio
+    async def test_reused_stage_records_none_on_a_later_assembled_run(self):
+        stage = _make_consolidator()
+        unfinished = RUN_START - timedelta(minutes=5)
+        stage.memory.earliest_unfinished_graphiti_write_start = MagicMock(return_value=unfinished)
+        first = await self._run(stage)
+        assert recorded_unfinished_write_start(_run_with_stage1(first)) == unfinished
+
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        second = await self._run(stage)
+
+        assert UNFINISHED_WRITE_START_STAT in second.stats
+        assert recorded_unfinished_write_start(_run_with_stage1(second)) is None
+
+    @pytest.mark.asyncio
+    async def test_reused_stage_records_none_on_a_later_remediation_run(self):
+        stage = _make_consolidator()
+        unfinished = RUN_START - timedelta(minutes=5)
+        stage.memory.earliest_unfinished_graphiti_write_start = MagicMock(return_value=unfinished)
+        first = await self._run(stage)
+        assert recorded_unfinished_write_start(_run_with_stage1(first)) == unfinished
+
+        stage.remediation_findings = [{'description': 'fix me'}]
+        second = await self._run(stage)
+
+        assert UNFINISHED_WRITE_START_STAT in second.stats
+        assert recorded_unfinished_write_start(_run_with_stage1(second)) is None
