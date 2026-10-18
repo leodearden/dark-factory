@@ -1066,32 +1066,36 @@ def _delivered_notification_texts(record: dict) -> list[str] | None:
     return None
 
 
+def _monitor_call_id(block: dict) -> str | None:
+    """Return the id of a ``Monitor`` tool_use *block*, else None."""
+    call_id = block.get('id')
+    if block.get('name') == _MONITOR_TOOL and isinstance(call_id, str):
+        return call_id
+    return None
+
+
 def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None:
-    """Classify one non-Monitor tool_use *block* as a launch, a reap, or neither."""
-    # Normalize the name to ``str`` ONCE, up front, so every membership test
-    # below is on a hashable.  A block carrying a non-scalar name
-    # (``'name': ['weird']``) previously reached ``name in
-    # _BACKGROUND_REAP_TOOLS`` and raised ``TypeError: unhashable type`` —
-    # breaking the detector's "malformed blocks are skipped, never raise"
-    # contract at an unguarded call site inside ``_run_subprocess``, i.e.
-    # failing the whole agent invocation (reviewer_comprehensive amendment,
-    # task 3639).  ``''`` matches no tool name, so such a block falls through
-    # to the token check — exactly its pre-normalization classification for
-    # the non-raising shapes.
+    """Classify one tool_use *block* as a launch, a reap, or neither.
+
+    Branch order is load-bearing: launch → ``Monitor`` call → named reap tool →
+    token reference.  A ``run_in_background`` Bash that mentions an earlier
+    token is a LAUNCH, and a ``Monitor`` call is neither: only its confirmed
+    arm (``_monitor_arm_task_id``) is a launch, so a Monitor naming a pending
+    launch's token does not reap it.
+    """
     name = block.get('name')
     if not isinstance(name, str):
-        name = ''
+        name = ''  # a malformed name matches no tool and must not raise on lookup
     if name == 'Bash':
         inp = block.get('input')
         if isinstance(inp, dict) and inp.get('run_in_background'):
             return _BackgroundEvent.LAUNCH
+    elif name == _MONITOR_TOOL:
+        return None
     elif name in _BACKGROUND_REAP_TOOLS or (
         _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
     ):
         return _BackgroundEvent.REAP
-    # Branch order is load-bearing: launch → named reap tool → token
-    # reference.  A ``run_in_background`` Bash that happens to mention an
-    # earlier token is still classified as a LAUNCH.
     if tokens and _mentions_token(_iter_input_strings(block.get('input')), tokens):
         return _BackgroundEvent.REAP
     return None
@@ -1101,8 +1105,7 @@ def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
     """Yield the background LAUNCH and REAP events of *records*, in record order.
 
     Owns the identity tokens of the launches seen so far and the ids of the
-    Monitor calls awaiting confirmation.  A ``Monitor`` tool_use yields
-    nothing: only its confirming ``user`` record is an event.
+    Monitor calls awaiting confirmation.
     """
     tokens: set[str] = set()
     monitor_call_ids: set[str] = set()
@@ -1126,11 +1129,9 @@ def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
         for block in _content_blocks(record):
             if not isinstance(block, dict) or block.get('type') != 'tool_use':
                 continue
-            if block.get('name') == _MONITOR_TOOL:
-                call_id = block.get('id')
-                if isinstance(call_id, str):
-                    monitor_call_ids.add(call_id)
-                continue
+            call_id = _monitor_call_id(block)
+            if call_id is not None:
+                monitor_call_ids.add(call_id)
             event = _classify_tool_use(block, tokens)
             if event is not None:
                 yield event
