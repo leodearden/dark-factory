@@ -905,16 +905,21 @@ def parse_outcome_event(raw: object) -> OutcomeEvent:
 
 
 class DefectTrigger(StrEnum):
-    """What an event does to a record, finer than its kind: I2 routes on proof class and closure."""
+    """What an event does to a record, finer than its kind: I2 routes on proof class and closure.
+
+    One vocabulary for both :data:`DEFECT_TRANSITIONS` and :data:`RETIREMENT_TRANSITIONS`.
+    """
 
     DECLARE = 'declare'
     DECLARE_CLOSURE = 'declare_closure'
+    DECLARE_RETIREMENT = 'declare_retirement'
     SIGHTING = 'sighting'
     PROOF_PROVEN = 'proof_proven'
     PROOF_FIX_FINDING = 'proof_fix_finding'
     PROOF_NO_VERDICT = 'proof_no_verdict'
     RULE_ACCEPTED_EXEMPTION = 'rule_accepted_exemption'
     RULE_ACCEPTED_WITHDRAWAL = 'rule_accepted_withdrawal'
+    RULE_ACCEPTED_RETIREMENT = 'rule_accepted_retirement'
     RULE_REJECTED = 'rule_rejected'
 
 
@@ -1140,3 +1145,91 @@ def apply_event(
     entry_event = _entry_event(entry, event)
     trigger = _trigger(entry, entry_event)
     return _effect(entry, entry_event, _destination(entry, entry_event, trigger))
+
+
+# --- Retirement lifecycle ----------------------------------------------------
+
+RETIREMENT_TRANSITIONS: Mapping[tuple[RetirementState | None, DefectTrigger], RetirementState] = (
+    MappingProxyType(
+        {
+            (None, DefectTrigger.DECLARE_RETIREMENT): RetirementState.PENDING,
+            (RetirementState.PENDING, DefectTrigger.RULE_ACCEPTED_RETIREMENT): (
+                RetirementState.ACCEPTED
+            ),
+            (RetirementState.PENDING, DefectTrigger.RULE_REJECTED): RetirementState.REJECTED,
+            (RetirementState.REJECTED, DefectTrigger.DECLARE_RETIREMENT): RetirementState.PENDING,
+        }
+    )
+)
+"""A retirement's lifecycle (decision 13): only its own declaration and ruling change it.
+
+A rejected retirement may be declared again with a better reason.
+"""
+
+_RetirementEvent = DeclareRetirement | Rule
+
+
+def _retirement_refusal(
+    record: Retirement | None, event: _AnyEvent, trigger: DefectTrigger | None, why: str
+) -> IllegalDefectTransition:
+    return _refusal(
+        RETIREMENT_TRANSITIONS,
+        ref=event.ref if record is None else record.ref,
+        from_status=None if record is None else record.state,
+        event=event.event,
+        trigger=trigger,
+        why=why,
+    )
+
+
+def _retirement_event(record: Retirement | None, event: _AnyEvent) -> _RetirementEvent:
+    if isinstance(event, DeclareRetirement) or (
+        isinstance(event, Rule) and event.ruling.subject is RulingSubject.RETIREMENT
+    ):
+        return event
+    raise _retirement_refusal(
+        record,
+        event,
+        None,
+        'only a declare_retirement event or a retirement-subject rule applies to a retirement',
+    )
+
+
+def _retirement_trigger(event: _RetirementEvent) -> DefectTrigger:
+    if isinstance(event, DeclareRetirement):
+        return DefectTrigger.DECLARE_RETIREMENT
+    if event.ruling.accepted:
+        return DefectTrigger.RULE_ACCEPTED_RETIREMENT
+    return DefectTrigger.RULE_REJECTED
+
+
+def _retirement_effect(record: Retirement | None, event: _RetirementEvent) -> Retirement:
+    """The record after a transition the table allowed, always CONSTRUCTED so validation re-runs."""
+    if isinstance(event, DeclareRetirement):
+        return event.retirement
+    if record is None:
+        raise _retirement_refusal(record, event, None, 'only declare_retirement creates a record')
+    return Retirement(ref=record.ref, reason=record.reason, ruling=event.ruling)
+
+
+def apply_retirement_event(
+    record: Retirement | None, event: DeclareEvent | OutcomeEvent
+) -> Retirement:
+    """The retirement record after *event*, per :data:`RETIREMENT_TRANSITIONS`; pure.
+
+    *record* is None when the removing task holds no retirement for the ref yet.
+
+    Raises:
+        IllegalDefectTransition: the event concerns another ref, is not a
+            retirement event, or the table has no transition for it from the
+            record's state.
+    """
+    if record is not None:
+        _require_event_ref(record.ref, record.state, event, RETIREMENT_TRANSITIONS)
+    retirement_event = _retirement_event(record, event)
+    trigger = _retirement_trigger(retirement_event)
+    if (None if record is None else record.state, trigger) not in RETIREMENT_TRANSITIONS:
+        raise _retirement_refusal(
+            record, retirement_event, trigger, 'decision 13 has no such retirement transition'
+        )
+    return _retirement_effect(record, retirement_event)
