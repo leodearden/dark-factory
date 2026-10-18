@@ -42,7 +42,7 @@ def _shortest_unique_suffix(root: Path, roots: tuple[Path, ...]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ProjectLabels:
-    """Every configured root's label: its shortest trailing path suffix no other root shares."""
+    """A label for each root it holds, no two roots sharing one."""
 
     _label_by_root: Mapping[Path, str]
     _root_by_label: Mapping[str, Path] = field(init=False, repr=False)
@@ -57,19 +57,36 @@ class ProjectLabels:
 
     @classmethod
     def of_roots(cls, roots: Iterable[str | os.PathLike[str]]) -> ProjectLabels:
+        """Label each of *roots* by its shortest trailing path suffix no other of them shares."""
         unique = tuple(dict.fromkeys(_as_path(root) for root in roots))
         return cls(MappingProxyType({root: _shortest_unique_suffix(root, unique) for root in unique}))
 
+    def including(self, roots: Iterable[str | os.PathLike[str]]) -> ProjectLabels:
+        """This table plus *roots*, each added root labelled by its shortest suffix no other root here shares.
+
+        Every label already held is kept, so payloads keyed by it still join. The one
+        root this cannot label is a relative path spelling a held label (``'app'``
+        beside ``/srv/app``): it stays out, and :meth:`of` gives it its basename.
+        """
+        held = tuple(self._label_by_root)
+        everything = tuple(dict.fromkeys((*held, *(_as_path(root) for root in roots))))
+        label_by_root = dict(self._label_by_root)
+        for root in everything[len(held):]:
+            label = _shortest_unique_suffix(root, everything)
+            if label not in self._root_by_label:
+                label_by_root[root] = label
+        return ProjectLabels(MappingProxyType(label_by_root))
+
     @property
     def roots(self) -> tuple[Path, ...]:
-        """The configured roots, in first-seen order."""
+        """The labelled roots, in first-seen order."""
         return tuple(self._label_by_root)
 
     def of(self, project_root: str | os.PathLike[str]) -> str:
-        """The root's label; an unconfigured root is labelled by its basename."""
+        """The root's label; a root this table does not hold is labelled by its basename."""
         label = self._label_by_root.get(_as_path(project_root))
         return basename_label(project_root) if label is None else label
 
     def root_for(self, label: str) -> Path | None:
-        """The configured root carrying *label*, if any."""
+        """The root carrying *label*, if any."""
         return self._root_by_label.get(label)

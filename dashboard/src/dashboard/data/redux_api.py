@@ -60,7 +60,9 @@ def shape_orchestrators(
     :func:`dashboard.data.orchestrator.discover_orchestrators`.  Every project
     is named by its project label (``dashboard/project_labels.py::ProjectLabels``),
     and ``labels.roots`` are the configured roots: a project without a running
-    orchestrator is still surfaced (with ``active: False``).  ``running_spark`` is an
+    orchestrator is still surfaced (with ``active: False``).  A running
+    orchestrator's root outside them is labelled alongside them
+    (``ProjectLabels.including``), so no two projects share an id.  ``running_spark`` is an
     optional ``{labels, values}`` time-series of the total running-orchestrator
     count over the last day, surfaced as ``ORCHESTRATORS_SPARK``.
 
@@ -87,18 +89,18 @@ def shape_orchestrators(
     its project's census Datum, whose state and reason travel with the count.
     """
     orchestrators = list(orchestrators)
+    active_roots = {str(o.get('project_root') or '') for o in orchestrators}
+    named = labels.including(active_roots)
     out_orchs: list[dict] = []
-    active_roots: set[str] = set()
     for o in orchestrators:
         pids = o.get('pids') or []
         primary_pid = pids[0] if pids else None
         project_root = o.get('project_root') or ''
-        active_roots.add(str(project_root))
         orch_entry: dict = {
             'pid': primary_pid,
             'pids': list(pids),
-            'label': o.get('label') or labels.of(project_root),
-            'project': labels.of(project_root),
+            'label': o.get('label') or named.of(project_root),
+            'project': named.of(project_root),
             'project_root': str(project_root),
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
@@ -118,7 +120,7 @@ def shape_orchestrators(
         if root in seen:
             continue
         seen.add(root)
-        name = labels.of(root)
+        name = named.of(root)
         out_projects.append({
             'id': name,
             'name': name,
@@ -989,7 +991,9 @@ def shape_burndown(
     """Build ``{BURNDOWN, BURNDOWN_BY_PROJECT}`` from per-project series.
 
     ``BURNDOWN_BY_PROJECT`` is keyed by project label
-    (``dashboard/project_labels.py::ProjectLabels``).  Both blocks carry
+    (``dashboard/project_labels.py::ProjectLabels``); a series for a root
+    outside *labels* is labelled alongside them (``ProjectLabels.including``),
+    so no series overwrites another.  Both blocks carry
     one series per :data:`_BURNDOWN_KEYS` key (the nine census members and
     the rows' in-progress split), two served Datums — ``latest`` and
     ``forecast`` — and a parity block.  Per-project blocks also carry
@@ -1060,7 +1064,8 @@ def shape_burndown(
     aggregate banner is not left hunting for which one.
     """
     served_at = resolve_now(served_at)
-    raw = {labels.of(pid): series for pid, series in series_by_project.items()}
+    named = labels.including(series_by_project)
+    raw = {named.of(pid): series for pid, series in series_by_project.items()}
     filled = {pid: _with_split(series) for pid, series in raw.items()}
     completions = {pid: compute_window_completion(series) for pid, series in raw.items()}
     provenance, aggregate_provenance = _burndown_provenance(

@@ -404,6 +404,17 @@ class TestReduxShapers:
             ('team-a/app', 'team-a/app', True), ('team-b/app', 'team-b/app', True),
         ]
 
+    def test_a_discovered_orchestrator_is_told_apart_from_the_configured_root_it_shares_a_basename_with(self):
+        raw = [
+            {'pids': [pid], 'project_root': root, 'running': True, 'started': ''}
+            for pid, root in ((1, '/srv/app'), (2, '/tmp/wt/app'))
+        ]
+
+        body = redux_api.shape_orchestrators(raw, labels=ProjectLabels.of_roots(['/srv/app']))
+
+        assert [orch['project'] for orch in body['ORCHESTRATORS']] == ['app', 'wt/app']
+        assert sorted(p['id'] for p in body['PROJECTS']) == ['app', 'wt/app']
+
     def test_merge_queue_keeps_each_roots_depth_and_halt(self):
         halt_status = {
             'team-a/app': {'wired': True, 'halted': True, 'owner_esc_id': 'esc-a', 'offline': False},
@@ -430,6 +441,18 @@ class TestReduxShapers:
         body = redux_api.shape_burndown(series, labels=_TEAM_LABELS, served_at=_NOW)
 
         assert set(body['BURNDOWN_BY_PROJECT']) == {'team-a/app', 'team-b/app'}
+        assert body['BURNDOWN']['latest']['value']['counts']['done'] == 42
+
+    def test_burndown_keeps_a_discovered_roots_series_beside_the_configured_one(self):
+        sampled_at = (_NOW - timedelta(minutes=1)).isoformat()
+        series = {
+            '/srv/app': {'labels': [sampled_at], 'done': [10], 'pending': [1]},
+            '/tmp/wt/app': {'labels': [sampled_at], 'done': [32], 'pending': [2]},
+        }
+
+        body = redux_api.shape_burndown(series, labels=ProjectLabels.of_roots(['/srv/app']), served_at=_NOW)
+
+        assert set(body['BURNDOWN_BY_PROJECT']) == {'app', 'wt/app'}
         assert body['BURNDOWN']['latest']['value']['counts']['done'] == 42
 
 

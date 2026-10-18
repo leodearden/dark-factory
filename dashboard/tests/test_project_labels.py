@@ -88,6 +88,50 @@ class TestOfRoots:
             assert labels.of(left) != labels.of(right), (left, right)
 
 
+class TestIncluding:
+    def test_a_discovered_root_sharing_a_configured_basename_gets_its_own_label(self):
+        labels = ProjectLabels.of_roots(['/srv/app', '/srv/other']).including(['/tmp/wt/app'])
+
+        assert labels.of('/tmp/wt/app') == 'wt/app'
+
+    def test_the_configured_labels_are_kept(self):
+        configured = ProjectLabels.of_roots(['/srv/app', '/srv/team-a/web', '/srv/team-b/web'])
+        everything = configured.including(['/tmp/wt/app', '/tmp/team-a/web'])
+
+        assert {root: everything.of(root) for root in configured.roots} == {
+            root: configured.of(root) for root in configured.roots
+        }
+
+    def test_a_discovered_root_with_a_unique_basename_keeps_it(self):
+        labels = ProjectLabels.of_roots(['/srv/app']).including(['/tmp/wt/tool'])
+
+        assert labels.of('/tmp/wt/tool') == 'tool'
+
+    def test_discovered_roots_are_told_apart_from_each_other(self):
+        labels = ProjectLabels.of_roots(['/srv/other']).including(['/tmp/x/app', '/tmp/y/app'])
+
+        assert (labels.of('/tmp/x/app'), labels.of('/tmp/y/app')) == ('x/app', 'y/app')
+
+    def test_an_already_labelled_root_is_not_added_again(self):
+        configured = ProjectLabels.of_roots(['/srv/app'])
+
+        assert configured.including(['/srv/app/', Path('/srv/app')]).roots == configured.roots
+
+    @pytest.mark.parametrize('roots', [_SAME_BASENAME, _DEEP_COLLISION, _SUFFIX_OF_ANOTHER, _MIXED])
+    def test_every_label_is_distinct(self, roots):
+        discovered = [f'/tmp/wt{depth}{root}' for depth, root in enumerate(roots) if root != '/']
+        labels = ProjectLabels.of_roots(roots).including([*discovered, '/tmp/proj', '/elsewhere/app'])
+
+        for left, right in itertools.combinations(labels.roots, 2):
+            assert labels.of(left) != labels.of(right), (left, right)
+
+    def test_a_relative_root_whose_only_label_is_taken_keeps_the_basename_fallback(self):
+        labels = ProjectLabels.of_roots(['/srv/app']).including(['app'])
+
+        assert (labels.of('/srv/app'), labels.of('app')) == ('app', 'app')
+        assert labels.roots == (Path('/srv/app'),)
+
+
 class TestRootFor:
     @pytest.mark.parametrize('roots', [_SAME_BASENAME, _DEEP_COLLISION, _SUFFIX_OF_ANOTHER, _MIXED])
     def test_every_configured_root_round_trips(self, roots):
