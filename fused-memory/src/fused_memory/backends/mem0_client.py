@@ -1,6 +1,5 @@
 """Per-project Mem0 AsyncMemory instance manager."""
 
-import asyncio
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Sequence
 from contextlib import aclosing
@@ -8,6 +7,7 @@ from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
 
+from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
@@ -230,9 +230,10 @@ class Mem0Backend:
     stringifies EMPTY, so a bare one reaches an operator's log, and
     ``MemoryService._store_failure_diagnostics['error']``, as no text at all.
     Propagating a fault while discarding the one detail that attributes it is
-    only half a fix, so both halves are enforced in one place: :meth:`_timed`
-    is the sole ``asyncio.wait_for`` call site on this class, reached through
-    :meth:`_timed_read` / :meth:`_timed_write`.
+    only half a fix, so both halves are enforced in one place: every timed
+    call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
+    to ``backends/timeout_budget.py::await_within``, the single home of the
+    message format.
 
     This paragraph is the CANONICAL statement of the rule, and a method's own
     ``Raises:`` line adds only the consequence specific to IT — so there is one
@@ -368,19 +369,8 @@ class Mem0Backend:
 
     @staticmethod
     async def _timed(awaitable: Awaitable[_T], op: str, timeout: float) -> _T:
-        """Await *awaitable* under *timeout*, raising a timeout that names itself.
-
-        THE single ``asyncio.wait_for`` call site on this class, so both halves
-        of the class-wide timeout posture — propagate, and say what timed out
-        — have exactly one home (INV-5).  *op* is the method name as a reader
-        grepping a log would look for it; *timeout* is echoed rather than read
-        back off ``self`` so the message can never name a budget other than the
-        one actually applied.
-        """
-        try:
-            return await asyncio.wait_for(awaitable, timeout=timeout)
-        except TimeoutError as exc:
-            raise TimeoutError(f'Mem0 {op} timed out after {timeout}s') from exc
+        """``backends/timeout_budget.py::await_within`` for the Mem0 store."""
+        return await await_within(awaitable, store='Mem0', op=op, budget_s=timeout)
 
     async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
         """:meth:`_timed` under this backend's READ budget."""
