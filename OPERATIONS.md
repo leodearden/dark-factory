@@ -1164,7 +1164,9 @@ takes no arguments: it always re-reads that process's own
   rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `scoring.*` (whole submodel: the dispatch-score sub-budgets `cpm_budget`,
   `cpm_d_cap`, `age_budget`, `age_half_secs` and `continuity_credit`, plus
-  the anchor-coverage arming threshold `new_scoring_min_anchor_coverage`), so
+  the anchor-coverage arming threshold `new_scoring_min_anchor_coverage`, and
+  the work-product probe's `continuity_probe_ttl_secs` and
+  `continuity_credit_max_age_secs`), so
   scoring is retuned without a fleet restart (PRD D8). A retune that breaks
   the no-tier-crossing or continuity-subordination invariant is rejected and
   rolled back whole. Normative homes:
