@@ -864,9 +864,13 @@ class TestRevalidationTextDriftNotice:
         assert '## The Task Text May Have Changed' in prompt
         assert '## The Task Text Has Changed' not in prompt
 
-    async def test_current_text_adds_no_notice(self, briefing: BriefingAssembler):
-        prompt = await self._prompt(briefing, None)
+    @pytest.mark.parametrize('text_drift', [None, TaskTextDrift.CURRENT])
+    async def test_current_text_adds_no_notice(
+        self, briefing: BriefingAssembler, text_drift: TaskTextDrift | None,
+    ):
+        prompt = await self._prompt(briefing, text_drift)
         assert 'The Task Text' not in prompt
+        assert prompt == await self._prompt(briefing, None)
 
 
 @pytest.mark.asyncio

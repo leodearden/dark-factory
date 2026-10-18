@@ -31,7 +31,7 @@ def test_none_and_empty_are_the_same_text():
 
 
 def test_fields_are_separated():
-    assert task_text_fingerprint('a b', '') != task_text_fingerprint('a', 'b')
+    assert task_text_fingerprint('ab', '') != task_text_fingerprint('a', 'b')
 
 
 def test_shape_is_prefixed_and_fixed_length():

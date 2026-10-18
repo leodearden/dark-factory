@@ -68,6 +68,7 @@ the list is partial and can read the rest from the task record itself.
 """
 
 _TEXT_DRIFT_NOTICES = {
+    TaskTextDrift.CURRENT: '',
     TaskTextDrift.AMENDED: (
         '## The Task Text Has Changed\n\n'
         'The description or details under # Task have been amended since this '
@@ -470,9 +471,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
             files_section = f'{overlap_section}\n\n{other_section}'.strip()
 
         plan_json = json.dumps(existing_plan, indent=2)
-        text_drift_section = (
-            f'{_TEXT_DRIFT_NOTICES[text_drift]}\n\n' if text_drift else ''
-        )
+        notice = _TEXT_DRIFT_NOTICES[text_drift] if text_drift is not None else ''
+        text_drift_section = f'{notice}\n\n' if notice else ''
 
         return f"""\
 {preamble}
