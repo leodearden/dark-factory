@@ -34,6 +34,7 @@ from _briefing_helpers import (
     recorded_search_text,
 )
 from shared.briefing_queries import TASK_SEMANTIC, BriefingScope, queries_for
+from shared.mcp_session import McpCallError, McpFailureKind
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.memory_recall import (
@@ -1039,19 +1040,21 @@ class TestMemoryContextProvenanceCaveat:
 class TestFailureClassification:
     """A slow memory service reads differently from an unreachable one.
 
-    ``mcp_call`` re-raises a plain ``RuntimeError`` once its retries exhaust,
-    keeping the cause only as ``__cause__``; these tests raise exactly that.
+    ``mcp_call`` raises a ``McpCallError`` of kind ``TRANSPORT`` once its
+    retries exhaust, keeping the cause only as ``__cause__``; these tests
+    raise exactly that.
     """
 
     @staticmethod
-    def _exhausted(cause: Exception) -> RuntimeError:
+    def _exhausted(cause: Exception) -> McpCallError:
         """The wrap ``shared.mcp_session.McpSession.call`` raises on retry exhaustion.
 
         The shape itself is pinned against the real retry loop in
         ``shared/tests/test_mcp_session.py::TestIsTimeoutFailure``.
         """
-        err = RuntimeError(
-            f'MCP tools/call failed after 3 attempts: {type(cause).__name__}: {cause}'
+        err = McpCallError(
+            McpFailureKind.TRANSPORT,
+            f'MCP tools/call failed after 3 attempts: {type(cause).__name__}: {cause}',
         )
         err.__cause__ = cause
         return err

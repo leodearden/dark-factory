@@ -25,7 +25,7 @@ from shared.testing_mcp_stub import StubMcpServer
 
 import orchestrator.mcp_lifecycle
 from orchestrator.config import OrchestratorConfig
-from orchestrator.fm_retry import FM_NULL_SENTINEL_URL, fm_retry_backoffs
+from orchestrator.fm_retry import FM_NULL_SENTINEL_URL, FM_RESTART_RETRY_WINDOW_SECS
 from orchestrator.mcp_lifecycle import (
     ORCHESTRATOR_MCP_IDENTITY,
     McpLifecycle,
@@ -87,21 +87,17 @@ class TestFmSessionRetrySchedule:
 
     @pytest.mark.asyncio
     async def test_a_real_endpoint_spans_the_fm_restart_window(self):
-        """random.uniform is pinned to the max draw while fm_session draws its
-        schedule, so this test's own fm_retry_backoffs() call agrees with it."""
-        expected = fm_retry_backoffs(rng=lambda lo, hi: hi)
-        with patch('random.uniform', side_effect=lambda lo, hi: hi):
-            session = fm_session('http://localhost:8002')
-
+        """Whatever the jitter draws, the sleeps sum to the window and each precedes a retry."""
         with (
             _scripted(httpx.ConnectError('refused')) as (client, sleep),
             pytest.raises(McpCallError),
         ):
-            await session.call_tool('get_tasks', {})
+            await fm_session('http://localhost:8002').call_tool('get_tasks', {})
 
-        assert len(expected) + 1 > 3
-        assert client.post.call_count == len(expected) + 1
-        assert [c.args[0] for c in sleep.call_args_list] == expected
+        sleeps = [c.args[0] for c in sleep.call_args_list]
+        assert len(sleeps) + 1 > 3
+        assert client.post.call_count == len(sleeps) + 1
+        assert sum(sleeps) == pytest.approx(FM_RESTART_RETRY_WINDOW_SECS)
 
     @pytest.mark.asyncio
     async def test_a_real_endpoint_recovers_after_transient_errors(self):
