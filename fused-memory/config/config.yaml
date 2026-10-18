@@ -292,6 +292,16 @@ write_journal:
 # max_rows_inserted_per_day = 75,000 is ~1.9x the highest post-change day and
 # ~3.9x the 7-day mean. A regression to per-read journalling crosses it within
 # ~2 h of trailing window. It clears by itself when the rate falls.
+#
+# SECOND EXPECTED TRANSIENT: the insert-rate ceiling ALSO fires once, for up to
+# ~24 h after fused-memory first runs the 5405 build. The sample is a ROWID
+# difference over the trailing 24 h (WriteJournal._rows_inserted_since), so the
+# ~0.8-1.1M per-read rows the OLD build inserted inside that window count even
+# after the migration deletes them; migration does not shorten it. Do NOT
+# re-anchor the 75,000 ceiling on this transient: it ends on its own once the
+# trailing window holds only 5405-build inserts, and the alarm's suggested
+# GROUP BY over write_ops shows nothing anomalous by then. A crossing that
+# persists past ~24 h after the 5405 restart is a real regression.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal_growth_alarm:
   max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:6442450944}
