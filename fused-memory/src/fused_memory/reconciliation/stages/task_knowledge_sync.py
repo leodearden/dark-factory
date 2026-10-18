@@ -3353,6 +3353,8 @@ class TaskKnowledgeSync(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
@@ -3928,6 +3930,32 @@ class TaskKnowledgeSync(BaseStage):
             },
         )
 
+    async def _resolve_task_tree(self) -> tuple[FilteredTaskTree, datetime]:
+        """The task tree this payload renders, paired with the instant it was read.
+
+        Uses the harness-injected tree when there is one (task 455); otherwise
+        self-fetches from taskmaster and stamps the instant after the fetch.
+        """
+        if self.filtered_task_tree is not None:
+            read_at = self.filtered_task_tree_fetched_at
+            if read_at is None:
+                logger.warning(
+                    'reconciliation.task_tree_read_instant_missing: harness-injected '
+                    'task tree carries no read instant; ageing its claims at wall clock',
+                    extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+                )
+                read_at = datetime.now(UTC)
+            return self.filtered_task_tree, read_at
+
+        # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
+        tasks_data: object = {}
+        if self.taskmaster:
+            try:
+                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+            except Exception:
+                tasks_data = {}
+        return filter_task_tree(tasks_data), datetime.now(UTC)
+
     async def assemble_payload(
         self,
         events: list[ReconciliationEvent],
@@ -3954,20 +3982,7 @@ class TaskKnowledgeSync(BaseStage):
 
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Dual-path: use harness-injected tree or self-fetch (task 455)
-        if self.filtered_task_tree is not None:
-            # Harness path: tree already fetched and filtered before run()
-            filtered = self.filtered_task_tree
-        else:
-            # Fallback path: self-fetch via taskmaster
-            # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
-            tasks_data: object = {}
-            if self.taskmaster:
-                try:
-                    tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-                except Exception:
-                    tasks_data = {}
-            filtered = filter_task_tree(tasks_data)
+        filtered, tree_read_at = await self._resolve_task_tree()
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4068,7 +4083,8 @@ class TaskKnowledgeSync(BaseStage):
         visible_active, active_tree_text = render_active_section(filtered)
 
         # Compute the hint-attention section: active tasks whose memory_hints
-        # need conversion from legacy list format (or are missing entirely).
+        # need conversion from legacy list format (or are missing entirely), less
+        # any task live-claimed when the tree was read (task 5093).
         # Gated on `if not self.remediation_mode:` — mirrors proactive_sample_section
         # (above) because hint conversion is a general-sync activity, not a Stage 1
         # remediation task. Rendered conditionally within that gate — omitted on the
@@ -4077,9 +4093,9 @@ class TaskKnowledgeSync(BaseStage):
         # always used for the prompt template slot regardless of remediation_mode.
         hint_conversion_section = ''
         if not self.remediation_mode:
-            tasks_needing_hint_attention = [
-                t for t in visible_active if _needs_hint_attention(t)
-            ]
+            tasks_needing_hint_attention = select_tasks_needing_hint_attention(
+                visible_active, claims_read_at=tree_read_at
+            )
             if tasks_needing_hint_attention:
                 hint_conversion_section = (
                     '\n### Tasks Needing Memory Hint Attention\n'
