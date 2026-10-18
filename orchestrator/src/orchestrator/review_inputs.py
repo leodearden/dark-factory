@@ -9,6 +9,7 @@ conventions path; nothing here reads config.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from orchestrator.agents.review_briefing import (
     ReviewConvention,
     ReviewSubject,
 )
+
+logger = logging.getLogger(__name__)
 
 _GIT_TIMEOUT_SECS = 120.0
 
@@ -81,14 +84,27 @@ async def gather_review_subject(
     plan_absent_reason: str,
     conventions_relpath: str,
 ) -> ReviewSubject:
-    """Everything the context-complete reviewer is briefed with, read from *checkout*."""
+    """Everything the context-complete reviewer is briefed with, read from *checkout*.
+
+    A git failure raises. A malformed conventions file only costs the review
+    its conventions section: one project's yaml typo must not fail every
+    review in that project.
+    """
     return ReviewSubject(
         task=task,
         plan=plan,
         plan_absent_reason=plan_absent_reason,
         change=await collect_review_change(checkout, base),
-        conventions=load_review_conventions(checkout / conventions_relpath),
+        conventions=_conventions_or_none(checkout / conventions_relpath),
     )
+
+
+def _conventions_or_none(path: Path) -> tuple[ReviewConvention, ...]:
+    try:
+        return load_review_conventions(path)
+    except ValueError as exc:
+        logger.warning('Reviewing without project conventions: %s', exc)
+        return ()
 
 
 async def _git_output(checkout: Path, base: str, cmd: list[str]) -> str:

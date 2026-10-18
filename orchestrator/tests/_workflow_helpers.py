@@ -31,6 +31,7 @@ from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.locking import normalize_lock
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -492,6 +493,13 @@ class FakeBriefing:
         # fake would have caught it.
         return f'Review ({reviewer_type}): {diff[:100]}'
 
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+    ) -> str:
+        first_path = subject.change.files[0].path if subject.change.files else ''
+        return f'Review-d2 ({reviewer_type}): {first_path}'
+
     async def build_completion_judge_prompt(
         self,
         plan: dict,
@@ -671,6 +679,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
     config.git.branch_prefix = 'task/'
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     set_task_status = AsyncMock()
     scheduler = MagicMock()
