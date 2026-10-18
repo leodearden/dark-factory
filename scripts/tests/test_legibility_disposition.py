@@ -861,3 +861,239 @@ def _verdict(route: verdict.Route) -> verdict.Verdict:
 def test_only_a_mechanical_finding_files() -> None:
     assert disposition.files(_verdict(verdict.Route.MECHANICAL)) is True
     assert disposition.files(_verdict(verdict.Route.STRUCTURAL)) is False
+
+
+# ---------------------------------------------------------------------------
+# Outcome feedback: each back-linked task's standing, read from one
+# get_statuses snapshot (plans/census-incremental-prd.md L5; contract §7, §8 1a-1c)
+# ---------------------------------------------------------------------------
+
+
+def _task_row(task_id: int, **overrides: Any) -> dict:
+    return _row(None, task_id=task_id, resolution=Resolution.CREATED, **overrides)
+
+
+def _read(cb: dict, statuses: dict | None, store: FakeTaskStore | None = None, *, error: str | None = None):
+    return disposition.read_outcomes(
+        cb, statuses=statuses, statuses_error=error, observed_root=_ROOT, store=store or FakeTaskStore(),
+    )
+
+
+def _entry_outcome(outcomes: disposition.Outcomes, entry_id: str) -> disposition.EntryOutcome:
+    (found,) = [entry for entry in outcomes.entries if entry.entry_id == entry_id]
+    return found
+
+
+def _only_task(outcomes: disposition.Outcomes, entry_id: str = "entry-a") -> disposition.TaskOutcome:
+    (task,) = _entry_outcome(outcomes, entry_id).tasks
+    return task
+
+
+@pytest.mark.parametrize(
+    ("status", "standing"),
+    [
+        ("pending", Standing.FILED),
+        ("in-progress", Standing.FILED),
+        ("blocked", Standing.FILED),
+        ("deferred", Standing.FILED),
+        ("merge-deferred", Standing.FILED),
+        ("done", Standing.DONE),
+    ],
+)
+def test_an_observed_task_takes_its_standing_from_the_snapshot_alone(status, standing) -> None:
+    store = FakeTaskStore()
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120)]))
+
+    task = _only_task(_read(cb, {"5120": status}, store))
+
+    assert (task.ref, task.status, task.standing) == (disposition.TaskRef(_ROOT, 5120), status, standing)
+    assert store.calls == []
+
+
+@pytest.mark.parametrize(
+    ("record", "standing"),
+    [(_accepting(5120), "accepted"), (_task(5120, "cancelled"), "abandoned")],
+    ids=["accepting", "abandoned"],
+)
+def test_a_cancelled_task_is_read_back_for_its_acceptance_reason(record, standing) -> None:
+    store = FakeTaskStore(tasks={5120: record})
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120)]))
+
+    task = _only_task(_read(cb, {"5120": "cancelled"}, store))
+
+    assert (task.status, task.standing) == ("cancelled", Standing(standing))
+    assert store.arguments_of("get_task") == [{"project_root": _ROOT, "task_id": 5120}]
+
+
+def test_another_projects_task_is_read_with_get_task_and_never_from_the_snapshot() -> None:
+    store = FakeTaskStore(tasks={7: _task(7, "done")})
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(7, project_root=_HARNESS_ROOT)]))
+
+    task = _only_task(_read(cb, {"7": "pending"}, store))
+
+    assert (task.ref, task.status, task.standing) == (disposition.TaskRef(_HARNESS_ROOT, 7), "done", Standing.DONE)
+    assert store.arguments_of("get_task") == [{"project_root": _HARNESS_ROOT, "task_id": 7}]
+
+
+def test_another_projects_cancelled_task_reads_its_acceptance_from_the_same_record() -> None:
+    store = FakeTaskStore(tasks={7: _accepting(7)})
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(7, project_root=_HARNESS_ROOT)]))
+
+    task = _only_task(_read(cb, {}, store))
+
+    assert task.standing is Standing.ACCEPTED
+    assert len(store.arguments_of("get_task")) == 1
+
+
+@pytest.mark.parametrize(
+    ("statuses", "store", "error", "named"),
+    [
+        ({}, FakeTaskStore(), None, "5120"),
+        (None, FakeTaskStore(), "get_statuses returned a tool-error envelope (ValidationError): 'boom'", "boom"),
+        ({"5120": "cancelled"}, FakeTaskStore(unreachable=["get_task"]), None, "get_task"),
+        ({"5120": "review"}, FakeTaskStore(), None, "review"),
+    ],
+    ids=["absent-from-snapshot", "no-snapshot", "unreachable-read-back", "unrecognised-status"],
+)
+def test_an_unobserved_task_has_no_standing_and_a_note_naming_why(statuses, store, error, named, caplog) -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120)]))
+
+    with caplog.at_level("WARNING", logger="legibility.disposition"):
+        outcomes = _read(cb, statuses, store, error=error)
+
+    task = _only_task(outcomes)
+    assert task.standing is None
+    assert task.note is not None
+    assert named in task.note
+    assert _entry_outcome(outcomes, "entry-a").governing is None
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert any("5120" in message for message in warnings)
+    assert not any("done-count" in message for message in warnings)
+
+
+def test_an_unobserved_read_never_raises_out_of_read_outcomes() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120), _task_row(7, project_root=_HARNESS_ROOT)]))
+
+    outcomes = _read(cb, {"5120": "cancelled"}, FakeTaskStore(unreachable=["get_task"]))
+
+    assert [task.standing for task in _entry_outcome(outcomes, "entry-a").tasks] == [None, None]
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        ({"10": "done", "12": "cancelled", "5": "pending", "7": "blocked", "3": "cancelled"}, 7),
+        ({"10": "done", "12": "cancelled", "3": "cancelled"}, 12),
+        ({"10": "done", "9": "done", "3": "cancelled"}, 10),
+        ({"3": "cancelled", "4": "cancelled"}, 4),
+    ],
+    ids=["live-wins", "accepted-over-done", "newest-done", "newest-abandoned"],
+)
+def test_the_governing_task_follows_the_step_one_precedence(statuses, expected) -> None:
+    store = FakeTaskStore(tasks={12: _accepting(12), 3: _task(3, "cancelled"), 4: _task(4, "cancelled")})
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(int(task_id)) for task_id in statuses]))
+
+    governing = _entry_outcome(_read(cb, statuses, store), "entry-a").governing
+
+    assert governing is not None
+    assert governing.ref == disposition.TaskRef(_ROOT, expected)
+
+
+def test_any_unobserved_task_leaves_the_entry_without_a_governing_task() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120), _task_row(5518)]))
+
+    outcome = _entry_outcome(_read(cb, {"5120": "done"}), "entry-a")
+
+    assert [task.standing for task in outcome.tasks] == [Standing.DONE, None]
+    assert outcome.governing is None
+
+
+def test_a_task_two_rows_of_one_entry_hold_is_read_once() -> None:
+    store = FakeTaskStore(tasks={5120: _task(5120, "cancelled")})
+    cb = _codebook(_entry("entry-a", filed_tickets=[
+        _task_row(5120), _row("tkt_1", task_id=5120, resolution=Resolution.CREATED),
+    ]))
+
+    outcome = _entry_outcome(_read(cb, {"5120": "cancelled"}, store), "entry-a")
+
+    assert [task.ref for task in outcome.tasks] == [disposition.TaskRef(_ROOT, 5120)]
+    assert len(store.arguments_of("get_task")) == 1
+
+
+def test_a_ticket_without_a_task_is_listed_and_triggers_no_read() -> None:
+    store = FakeTaskStore()
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_9")]))
+
+    outcomes = _read(cb, {}, store)
+
+    task = _only_task(outcomes)
+    assert (task.ref, task.ticket, task.standing) == (None, "tkt_9", None)
+    assert _entry_outcome(outcomes, "entry-a").governing is None
+    assert outcomes.due == ()
+    assert store.calls == []
+
+
+def test_a_ticket_only_row_beside_an_observed_task_does_not_block_its_governance() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_9"), _task_row(5120)]))
+
+    governing = _entry_outcome(_read(cb, {"5120": "done"}), "entry-a").governing
+
+    assert governing is not None
+    assert governing.ref == disposition.TaskRef(_ROOT, 5120)
+
+
+def test_the_reverify_queue_holds_each_unfixed_entry_governed_by_a_done_task_in_codebook_order() -> None:
+    cb = _codebook(
+        _entry("entry-z", filed_tickets=[_task_row(30)]),
+        _entry("entry-fixed", status="fixed", fixed_at_sha="abcdef1", filed_tickets=[_task_row(31)]),
+        _entry("entry-retired", status="retired", filed_tickets=[_task_row(32)]),
+        _entry("entry-live", filed_tickets=[_task_row(33), _task_row(34)]),
+        _entry("entry-partial", status="partially", filed_tickets=[_task_row(35)]),
+        _entry("entry-plain"),
+    )
+    statuses = {"30": "done", "31": "done", "32": "done", "33": "done", "34": "pending", "35": "done"}
+
+    outcomes = _read(cb, statuses)
+
+    assert outcomes.due == (
+        disposition.Reverify("entry-z", disposition.TaskRef(_ROOT, 30)),
+        disposition.Reverify("entry-partial", disposition.TaskRef(_ROOT, 35)),
+    )
+    assert [entry.entry_id for entry in outcomes.entries] == [
+        "entry-z", "entry-fixed", "entry-retired", "entry-live", "entry-partial",
+    ]
+    assert _entry_outcome(outcomes, "entry-live").entry_status == "open"
+
+
+def test_a_codebook_without_back_links_has_no_outcomes_at_all() -> None:
+    outcomes = _read(_codebook(_entry("entry-a")), {"5120": "done"})
+
+    assert outcomes.entries == ()
+    assert outcomes.any_back_links is False
+    assert outcomes.due == ()
+
+
+def test_back_links_whose_read_changes_nothing_still_have_outcomes() -> None:
+    outcomes = _read(_codebook(_entry("entry-a", filed_tickets=[_task_row(5120)])), {"5120": "pending"})
+
+    assert outcomes.any_back_links is True
+    assert outcomes.due == ()
+
+
+def test_the_entry_outcome_carries_the_entry_key_and_the_snapshot_error() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120)], **_IDENTITY))
+
+    outcomes = _read(cb, None, error="no snapshot")
+
+    assert _entry_outcome(outcomes, "entry-a").finding_key == _KEY_A
+    assert outcomes.statuses_error == "no snapshot"
+
+
+def test_an_abandoned_task_carrying_the_key_still_counts_as_absent_for_step_one() -> None:
+    store = FakeTaskStore(
+        metadata_hits=_key_hits(_hit(12, "cancelled"), _hit(9, "done")), tasks={12: _task(12, "cancelled")},
+    )
+
+    decision = _only(disposition.dispose([_filing()], store=store, submit=_Submit()))
+
+    assert (decision.standing, decision.task_id) == (Standing.DONE, 9)
