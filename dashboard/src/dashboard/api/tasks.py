@@ -147,7 +147,7 @@ def _terminal_key(project: str) -> str:
     the client reads the body under the key it built itself and stores the
     value under that same name. A body that lacks the key is still reported
     ``applied``, so a mismatch is silent. The two halves are guarded together by
-    ``test_app.py::TestTerminalWindow::test_the_real_client_applies_the_window_this_endpoint_serves``,
+    ``test_tasks_terminal_answer.py::TestTerminalWindow::test_the_real_client_applies_the_window_this_endpoint_serves``,
     which runs the real client over this endpoint's real body.
     """
     return f'TASKS_TERMINAL:{project}'
