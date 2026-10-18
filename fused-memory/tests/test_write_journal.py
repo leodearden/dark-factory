@@ -327,21 +327,21 @@ async def test_error_recording(journal):
         success=False,
         error='Connection refused',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert len(ops) == 1
     assert ops[0]['success'] == 0
     assert ops[0]['error'] == 'Connection refused'
 
 
 @pytest.mark.asyncio
-async def test_get_ops_since(journal):
+async def test_get_stored_ops_since(journal):
     for _i in range(5):
         await journal.log_write_op(
             write_op_id=str(uuid.uuid4()),
             operation='add_memory',
             project_id='test',
         )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00', limit=3)
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00', limit=3)
     assert len(ops) == 3
 
 
@@ -413,7 +413,7 @@ async def test_kind_column_persists(journal):
         kind='read',
         project_id='test',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert len(ops) == 1
     assert ops[0]['kind'] == 'read'
 
@@ -427,7 +427,7 @@ async def test_kind_defaults_to_write(journal):
         operation='add_memory',
         project_id='test',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert ops[0]['kind'] == 'write'
 
 
@@ -441,14 +441,14 @@ async def test_session_id_persists(journal):
         session_id='sess-abc',
         agent_id='claude-task-7',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert ops[0]['session_id'] == 'sess-abc'
     assert ops[0]['agent_id'] == 'claude-task-7'
 
 
 @pytest.mark.asyncio
-async def test_get_ops_since_kind_filter(journal):
-    """get_ops_since with kind filter returns only matching rows."""
+async def test_get_stored_ops_since_kind_filter(journal):
+    """get_stored_ops_since with kind filter returns only matching rows."""
     for _i in range(3):
         await journal.log_write_op(
             write_op_id=str(uuid.uuid4()),
@@ -463,8 +463,8 @@ async def test_get_ops_since_kind_filter(journal):
             kind='read',
             project_id='test',
         )
-    reads = await journal.get_ops_since('2000-01-01T00:00:00', kind='read')
-    writes = await journal.get_ops_since('2000-01-01T00:00:00', kind='write')
+    reads = await journal.get_stored_ops_since('2000-01-01T00:00:00', kind='read')
+    writes = await journal.get_stored_ops_since('2000-01-01T00:00:00', kind='write')
     assert len(reads) == 2
     assert len(writes) == 3
 
@@ -605,46 +605,6 @@ async def test_migration_adds_backend_ops_duration_ms_without_backfill(tmp_path)
         assert fresh_row['duration_ms'] == 12.5
     finally:
         await j.close()
-
-
-# ------------------------------------------------------------------
-# Stats methods
-# ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_session_ops(journal):
-    for i in range(5):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='search' if i % 2 == 0 else 'add_memory',
-            kind='read' if i % 2 == 0 else 'write',
-            agent_id='target-agent',
-        )
-    await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
-        operation='add_memory',
-        agent_id='other-agent',
-    )
-
-    ops = await journal.get_session_ops('target-agent')
-    assert len(ops) == 5
-    assert all(op['agent_id'] == 'target-agent' for op in ops)
-    # Most recent first
-    assert ops[0]['created_at'] >= ops[-1]['created_at']
-
-
-@pytest.mark.asyncio
-async def test_get_session_ops_with_limit(journal):
-    for _ in range(10):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='search',
-            kind='read',
-            agent_id='busy-agent',
-        )
-    ops = await journal.get_session_ops('busy-agent', limit=3)
-    assert len(ops) == 3
 
 
 # ------------------------------------------------------------------
@@ -1164,7 +1124,7 @@ async def test_write_ops_has_terminal_columns(journal):
         operation='add_episode',
         project_id='test-project',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     row = next(o for o in ops if o['id'] == op_id)
     # Terminal state is UNKNOWN at log time — NULL, not False.
     assert row['terminal_status'] is None
@@ -1399,7 +1359,7 @@ async def test_late_producer_log_write_op_preserves_terminal_outcome(journal):
     assert row['terminal_at'] is not None
 
     # And exactly one row exists — the upsert converged, it did not duplicate.
-    ops = [o for o in await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = [o for o in await journal.get_stored_ops_since('2000-01-01T00:00:00')
            if o['id'] == op_id]
     assert len(ops) == 1
 

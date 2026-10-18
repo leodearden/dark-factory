@@ -832,10 +832,15 @@ class WriteJournal:
         results.sort(key=lambda r: r.get('created_at', ''))
         return results
 
-    async def get_ops_since(
+    async def get_stored_ops_since(
         self, since: str, limit: int = 100, kind: str | None = None
     ) -> list[dict]:
-        """Return write_ops since a timestamp, optionally filtered by kind."""
+        """Return the ``write_ops`` rows STORED since a timestamp, optionally by kind.
+
+        Successful reads without a per-row consumer are counted into
+        ``read_op_counts`` and never stored (``read_rollup.py``), so this is not
+        an activity count: ``kind='read'`` yields searches and failed reads only.
+        """
         if kind:
             sql = 'SELECT * FROM write_ops WHERE created_at >= ? AND kind = ? ORDER BY created_at LIMIT ?'
             params = (since, kind, limit)
@@ -1354,21 +1359,3 @@ class WriteJournal:
         except Exception as e:
             logger.error(f'Failed to prune write_ops: {e}')
             return 0
-
-    async def get_session_ops(
-        self, agent_id: str, since: str | None = None, limit: int = 100
-    ) -> list[dict]:
-        """Return ops for a specific agent, most recent first."""
-        if since:
-            sql = (
-                'SELECT * FROM write_ops WHERE agent_id = ? AND created_at >= ? '
-                'ORDER BY created_at DESC LIMIT ?'
-            )
-            params = (agent_id, since, limit)
-        else:
-            sql = (
-                'SELECT * FROM write_ops WHERE agent_id = ? '
-                'ORDER BY created_at DESC LIMIT ?'
-            )
-            params = (agent_id, limit)
-        return [dict(row) for row in await self._require_access().read_all(sql, params)]

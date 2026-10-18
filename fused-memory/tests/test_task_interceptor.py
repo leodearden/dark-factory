@@ -13006,7 +13006,7 @@ async def _wired_journal(interceptor, path):
 async def _only_row(journal, operation: str) -> dict:
     """The single write_ops row for *operation*, via the public reader."""
     rows = [
-        row for row in await journal.get_ops_since('1970-01-01')
+        row for row in await journal.get_stored_ops_since('1970-01-01')
         if row['operation'] == operation
     ]
     assert len(rows) == 1, rows
