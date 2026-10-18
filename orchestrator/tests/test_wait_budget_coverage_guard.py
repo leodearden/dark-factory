@@ -52,6 +52,9 @@ _SYNTHETIC_CLOCK_MODULES: frozenset[str] = frozenset(
         # Its waits run against an injected _StarvationClock or tiny injected
         # caps, never the wall clock its bill describes.
         'test_orch_helpers_wait_responsive.py',
+        # Every item it bills is a @virtual_clock_test: its waits run on
+        # shared.testing_virtual_clock's loop clock, which jumps when idle.
+        'test_offline_lane.py',
     }
 )
 
