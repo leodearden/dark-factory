@@ -26,6 +26,7 @@ from _briefing_helpers import (
     memory_transport,
 )
 from shared.capability_manifest import DeliveredCheckMeta
+from shared.task_text_fingerprint import TaskTextDrift
 from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import (
@@ -830,6 +831,42 @@ class TestRevalidationPriorProposal:
         assert 'medium' in prompt
         assert 'orchestrator/x.py' in prompt
         assert '2026-07-13T10:00:00+00:00' in prompt
+
+
+@pytest.mark.asyncio
+class TestRevalidationTextDriftNotice:
+    """Task 4031: a revalidating architect is told when the task text moved."""
+
+    async def _prompt(self, briefing: BriefingAssembler, text_drift: TaskTextDrift | None) -> str:
+        return await briefing.build_revalidation_prompt(
+            {'id': '4031', 'title': 'T', 'description': 'Amended: item 4 added'},
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+            text_drift=text_drift,
+        )
+
+    async def test_amended_text_is_announced_beside_the_amended_description(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._prompt(briefing, TaskTextDrift.AMENDED)
+        assert 'Amended: item 4 added' in prompt
+        assert '## The Task Text Has Changed' in prompt
+        assert prompt.index('## The Task Text Has Changed') < prompt.index(
+            '## Your Previous Plan',
+        )
+
+    async def test_unstamped_plan_is_announced_as_possibly_changed(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._prompt(briefing, TaskTextDrift.UNSTAMPED)
+        assert '## The Task Text May Have Changed' in prompt
+        assert '## The Task Text Has Changed' not in prompt
+
+    async def test_current_text_adds_no_notice(self, briefing: BriefingAssembler):
+        prompt = await self._prompt(briefing, None)
+        assert 'The Task Text' not in prompt
 
 
 @pytest.mark.asyncio
