@@ -2708,11 +2708,14 @@ class Scheduler:
         self._landed_outbox_gate: Callable[[str], Any] | None = None
         # Injected PSI reader for the dispatch-admission gate (task 2328,
         # DA3 of PRD docs/prds/dispatch-admission-load-cap.md).  Defaults to
-        # the real /proc/pressure reader; tests reassign
-        # ``scheduler._read_psi_sample = lambda: PsiSample(...)`` — mirrors
-        # the ``_landed_outbox_gate`` seam above (instance attr, no new
-        # constructor kwarg).  Signature: () -> PsiSample.
-        self._read_psi_sample: Callable[[], PsiSample] = read_psi_sample
+        # the real reader with this project's id bound here, so the
+        # own-cgroup reading resolves df-<project_id>.slice (task 3590); tests
+        # reassign ``scheduler._read_psi_sample = lambda: PsiSample(...)`` —
+        # mirrors the ``_landed_outbox_gate`` seam above (instance attr, no
+        # new constructor kwarg).  Signature: () -> PsiSample.
+        self._read_psi_sample: Callable[[], PsiSample] = partial(
+            read_psi_sample, project_id=config.fused_memory.project_id
+        )
         # Rate-limit timestamps (monotonic, via self._time_source) for the
         # dispatch-admission gate's two WARNING streams — deliberately
         # separate so "PSI unreadable" (fail-open, DA-D6) and "deferring

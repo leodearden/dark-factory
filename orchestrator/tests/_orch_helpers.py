@@ -1079,7 +1079,7 @@ _BASEMODEL_PROPS: frozenset[str] = frozenset(
 _BASEMODEL_ATTRS: frozenset[str] = frozenset(dir(BaseModel))
 
 
-def idle_psi_sample() -> PsiSample:
+def idle_psi_sample(*, project_id: str | None = None) -> PsiSample:
     """Return the hermetic default PSI reading: idle and read_ok.
 
     Task 2418 — fix for the scheduler-test xdist flake where the dispatch-
@@ -1106,6 +1106,10 @@ def idle_psi_sample() -> PsiSample:
     scheduler.py) exactly — tests that need a specific (e.g. saturated)
     reading still reassign ``scheduler._read_psi_sample`` post-construction,
     which overrides this default same as before.
+
+    ``project_id`` is accepted and ignored: ``Scheduler.__init__`` binds the
+    module-level reader with its project_id (task 3590), and conftest
+    substitutes this function for that reader BEFORE construction.
     """
     return PsiSample(
         cpu_some10=0.0,
