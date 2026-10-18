@@ -65,11 +65,15 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.merge_lane.gates import DropGuardResult, _check_plan_files_touched_in_branch
+from orchestrator.merge_lane.intake import (
+    MERGE_LANES,
+    coalesce_or_enqueue_merge_request,
+    register_and_enqueue_merge_request,
+)
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
-from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch
+from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch, TerminalOutcomeRecord
 from orchestrator.merge_lane.worker import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
-    MERGE_LANES,
     NEEDS_REBASE_REASON_PREFIX,
     PRODUCTION_VERIFIER,
     TRAIN_INCOMPLETE_REASON_PREFIX,
@@ -87,7 +91,6 @@ from orchestrator.merge_lane.worker import (
     SpeculativeItem,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
-    TerminalOutcomeRecord,
     TerminalOutcomeRetention,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
@@ -95,9 +98,7 @@ from orchestrator.merge_lane.worker import (
     _ensure_verify_disk_space,
     _is_speculation_race,
     _verify_hit_enospc,
-    coalesce_or_enqueue_merge_request,
     item_merge_wt,
-    register_and_enqueue_merge_request,
 )
 from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
 from orchestrator.verify import VerifyResult
@@ -6567,7 +6568,7 @@ class TestEnqueueMergeRequest:
         self, tmp_path: Path, config: OrchestratorConfig,
     ):
         """enqueue_merge_request emits merge_queued and places req on queue."""
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs.db'
@@ -6610,7 +6611,7 @@ class TestEnqueueMergeRequest:
         """
         import json
 
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs.db'
@@ -6642,7 +6643,7 @@ class TestEnqueueMergeRequest:
         """Existing callers (no source=) emit NO 'source' key — byte-identical."""
         import json
 
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs.db'
@@ -6669,7 +6670,7 @@ class TestEnqueueMergeRequest:
         self, tmp_path: Path, config: OrchestratorConfig,
     ):
         """Passing event_store=None must still enqueue and not raise."""
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         wt = tmp_path / 'wt'
@@ -6691,7 +6692,7 @@ class TestEnqueueMergeRequest:
         Resolving req.result triggers the callback; one merge_finalized row
         must appear with the correct request_id, state, branch, and merge_sha.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs.db'
@@ -6734,7 +6735,7 @@ class TestEnqueueMergeRequest:
 
         Covers PRD D7 — cancelled futures must be finalized, not silently dropped.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs_cancel.db'
@@ -6771,7 +6772,7 @@ class TestEnqueueMergeRequest:
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """When retention is passed, resolving the future populates the ring."""
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs_ret.db'
@@ -6812,7 +6813,7 @@ class TestEnqueueMergeRequest:
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """When retention is passed, cancelling the future records state=='abandoned'."""
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs_ret2.db'
@@ -6845,7 +6846,7 @@ class TestEnqueueMergeRequest:
         - fut.exception() is called inside the callback so asyncio never emits
           an 'exception was never retrieved' warning
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs_exc.db'
@@ -6896,7 +6897,7 @@ class TestEnqueueMergeRequest:
         causes _on_finalized to record superseded_by + generation in the retention ring
         AND in the merge_finalized event data dict.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs_sup.db'
@@ -6958,7 +6959,7 @@ class TestEnqueueMergeRequest:
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """Blocked outcomes don't set superseded_by (None in both ring and event)."""
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs_blk.db'
@@ -7002,7 +7003,7 @@ class TestEnqueueMergeRequest:
         durable-tier reason parity gap for FAILURES only, not newly surfacing
         an empty string on every terminal outcome.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs_reason.db'
@@ -7488,7 +7489,7 @@ class TestSpeculativeMergeWorkerDequeueEvent:
         so the test is fast and doesn't need real git merge work.
         """
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         db_path = tmp_path / 'events.db'
         event_store = EventStore(db_path=db_path, run_id='test-run')
@@ -7564,7 +7565,7 @@ class TestCasRetryStaysInLane:
         the conflict one by
         TestSpeculativeMergeWorker.test_speculative_remerge_preserves_duration_ms.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         db_path = tmp_path / 'events.db'
         event_store = EventStore(db_path=db_path, run_id='test-run')
@@ -7711,7 +7712,7 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         call_recorder.attach_mock(mock_helper, 'enqueue')
 
         # Patch the source module so both local and module-level imports get the mock.
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', mock_helper):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', mock_helper):
             await workflow._submit_to_merge_queue('42')
 
         # KEY: enqueue_merge_request must have been called exactly once
@@ -7776,7 +7777,7 @@ class TestEscalationServerUsesEnqueueHelper:
         mock_helper = AsyncMock(side_effect=_mock_enqueue)
 
         # Patch the source module so local imports inside the tool get the mock
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', mock_helper):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', mock_helper):
             # Before step-14: create_server raises TypeError (unexpected kwarg)
             mcp = create_server(
                 MagicMock(),
@@ -7840,7 +7841,7 @@ class TestEscalationServerMergeRequestModuleConfigsNone:
 
         mock_helper = AsyncMock(side_effect=_mock_enqueue)
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', mock_helper):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', mock_helper):
             mcp = create_server(
                 MagicMock(),
                 merge_queue=merge_queue,
@@ -11521,7 +11522,7 @@ class TestInflightWorktreeIsStale:
 
     def test_a_no_snapshot_provider_is_not_stale(self, tmp_path: Path):
         """(a) live_snapshot is None → False (back-compat default)."""
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-a'
         wt.mkdir()
@@ -11532,7 +11533,7 @@ class TestInflightWorktreeIsStale:
 
         Mirrors test_snapshot_provider_raises_trusts_registry's `_raising_snap`.
         """
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-b'
         wt.mkdir()
@@ -11549,7 +11550,7 @@ class TestInflightWorktreeIsStale:
         be trusted must never be read as "empty queue" (which would reap a live
         merge and double-dispatch onto the branch).
         """
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-c'
         wt.mkdir()
@@ -11570,7 +11571,7 @@ class TestInflightWorktreeIsStale:
         (a test double, or a rolling deploy where the escalation server sees an
         older worker).  Wiring order can never turn the gate destructive.
         """
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-d'
         wt.mkdir()
@@ -11588,7 +11589,7 @@ class TestInflightWorktreeIsStale:
         double-dispatch onto main.  Not-owned ⇒ mtime is real evidence ⇒ keep
         today's behaviour.
         """
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-e'
         wt.mkdir()
@@ -11602,7 +11603,7 @@ class TestInflightWorktreeIsStale:
 
     def test_f_owned_with_live_branch_entry_is_not_stale(self, tmp_path: Path):
         """(f) owned AND some entry carries this branch → False (genuinely in flight)."""
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-f'
         wt.mkdir()
@@ -11627,7 +11628,7 @@ class TestInflightWorktreeIsStale:
         §2's `age <= liveness_secs` test is permanently true.  Only the live
         snapshot can tell that the corpse's owner is gone.
         """
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-g'
         wt.mkdir()
@@ -11658,7 +11659,7 @@ class TestInflightWorktreeIsStale:
         `path = Path(entry.path).resolve()`), so the two ownership tests can
         never disagree about the same worktree.
         """
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         real = tmp_path / '_merge-h'
         real.mkdir()
@@ -11696,7 +11697,7 @@ class TestInflightWorktreeIsStale:
         These are the realistically-triggerable malformed inputs; the enumerated
         OSError case is near-unreachable because `Path.resolve()` is non-strict.
         """
-        from orchestrator.merge_lane.worker import _inflight_worktree_is_stale
+        from orchestrator.merge_lane.intake import _inflight_worktree_is_stale
 
         wt = tmp_path / '_merge-i'
         wt.mkdir()
@@ -14521,10 +14522,10 @@ class TestFinalizeAdvancedMerge:
         OFF, _finalize_advanced_merge returns 'blocked' (not 'superseded') even when
         chain_ctx is wired and tip is a SUPERSET advance, and the queue stays empty."""
         from orchestrator.merge_lane import gates
+        from orchestrator.merge_lane.tip_relation import TipRelation
         from orchestrator.merge_lane.worker import (
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             MergeRequest,
-            TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
             _maybe_auto_chain_generation,
@@ -14584,9 +14585,9 @@ class TestFinalizeAdvancedMerge:
     ) -> None:
         """(b) chain_ctx + merged_branch_tip + SUPERSET advance → returns superseded,
         enqueues gen-(n+1) request (tested with AUTO_CHAIN_GENERATIONS_ENABLED=True)."""
+        from orchestrator.merge_lane.tip_relation import TipRelation
         from orchestrator.merge_lane.worker import (
             MergeRequest,
-            TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
             _maybe_auto_chain_generation,
@@ -14647,9 +14648,9 @@ class TestFinalizeAdvancedMerge:
         'post_merge_generation_chained' merge_attempt event to the event_store.
         This is the observable contract for reconciliation provenance."""
         from orchestrator.event_store import EventType
+        from orchestrator.merge_lane.tip_relation import TipRelation
         from orchestrator.merge_lane.worker import (
             MergeRequest,
-            TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
             _maybe_auto_chain_generation,
@@ -14782,9 +14783,9 @@ class TestFinalizeAdvancedMerge:
         registers the _on_finalized callback with the same ring — enabling coexistence
         tests that verify both callbacks fire on the same future.
         """
+        from orchestrator.merge_lane.tip_relation import TipRelation
         from orchestrator.merge_lane.worker import (
             MergeRequest,
-            TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
             _maybe_auto_chain_generation,
@@ -16770,7 +16771,7 @@ class TestRegisterAndEnqueue:
         self, config: OrchestratorConfig, tmp_path: Path,
     ):
         """Happy path: acquired=True, branch is_inflight, entry.task_id=='B', queue has 1 item."""
-        from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -16790,7 +16791,7 @@ class TestRegisterAndEnqueue:
         self, config: OrchestratorConfig, tmp_path: Path,
     ):
         """(a) release-on-resolve: after future resolves, a second call re-acquires."""
-        from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -16816,7 +16817,7 @@ class TestRegisterAndEnqueue:
         self, config: OrchestratorConfig, tmp_path: Path,
     ):
         """(b) release-on-cancel: soft-cancel releases the slot for the retry loop."""
-        from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -16836,7 +16837,7 @@ class TestRegisterAndEnqueue:
     ):
         """(c) already-held: returns False but still enqueues (no deadlock),
         and the slot remains owned by the first holder."""
-        from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 
         queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -16865,7 +16866,7 @@ class TestRegisterAndEnqueue:
         self, config: OrchestratorConfig, tmp_path: Path,
     ):
         """(d) registry=None: falls back to plain enqueue, returns False."""
-        from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 
         queue: asyncio.Queue = asyncio.Queue()
         event_store = self._make_event_store(tmp_path)
@@ -16889,7 +16890,7 @@ class TestRegisterAndEnqueue:
         # resolve req.result (simulating a closed queue / cancellation).
         boom = RuntimeError('queue closed')
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request',
+            'orchestrator.merge_lane.intake.enqueue_merge_request',
             new=AsyncMock(side_effect=boom),
         ), pytest.raises(RuntimeError, match='queue closed'):
             await register_and_enqueue_merge_request(queue, req, None, registry)
@@ -17639,14 +17640,14 @@ class TestTipRelation:
 
     async def test_same_tip(self, git_ops: GitOps):
         """Same SHA → TipRelation.SAME."""
-        from orchestrator.merge_lane.worker import TipRelation, classify_tip_relation
+        from orchestrator.merge_lane.tip_relation import TipRelation, classify_tip_relation
         main_sha = await git_ops.get_main_sha()
         relation = await classify_tip_relation(main_sha, main_sha, git_ops)
         assert relation is TipRelation.SAME
 
     async def test_superset(self, git_ops: GitOps):
         """Branch advanced past old tip → TipRelation.SUPERSET (new is ancestor-descendant)."""
-        from orchestrator.merge_lane.worker import TipRelation, classify_tip_relation
+        from orchestrator.merge_lane.tip_relation import TipRelation, classify_tip_relation
         # Create branch with one commit; record that tip as "old"
         worktree = await _make_branch_with_file(git_ops, 'tr-super', 'f.py', 'x=1\n')
         old_sha = await self._head_sha(worktree)
@@ -17660,7 +17661,7 @@ class TestTipRelation:
 
     async def test_subset(self, git_ops: GitOps):
         """Old tip is ahead of new tip → TipRelation.SUBSET."""
-        from orchestrator.merge_lane.worker import TipRelation, classify_tip_relation
+        from orchestrator.merge_lane.tip_relation import TipRelation, classify_tip_relation
         worktree = await _make_branch_with_file(git_ops, 'tr-sub', 'h.py', 'z=3\n')
         old_sha = await self._head_sha(worktree)
         (worktree / 'k.py').write_text('k=4\n')
@@ -17673,7 +17674,7 @@ class TestTipRelation:
 
     async def test_divergent(self, git_ops: GitOps):
         """Two branches off same base with distinct commits → TipRelation.DIVERGENT."""
-        from orchestrator.merge_lane.worker import TipRelation, classify_tip_relation
+        from orchestrator.merge_lane.tip_relation import TipRelation, classify_tip_relation
         wt_a = await _make_branch_with_file(git_ops, 'tr-div-a', 'a.py', 'a=1\n')
         wt_b = await _make_branch_with_file(git_ops, 'tr-div-b', 'b.py', 'b=2\n')
         sha_a = await self._head_sha(wt_a)
@@ -17745,7 +17746,7 @@ class TestPatchContentContained:
 
     async def test_resolve_divergent_content_equal_returns_subset(self, git_ops: GitOps):
         """resolve_divergent for cherry-picked content → TipRelation.SUBSET."""
-        from orchestrator.merge_lane.worker import TipRelation, resolve_divergent
+        from orchestrator.merge_lane.tip_relation import TipRelation, resolve_divergent
         wt = await _make_branch_with_file(git_ops, 'rd-eq', 'eq.py', 'z = 7\n')
         branch_tip = await self._head_sha(wt)
         rc, _, err = await _run(
@@ -17760,7 +17761,7 @@ class TestPatchContentContained:
 
     async def test_resolve_divergent_genuinely_new_returns_superset(self, git_ops: GitOps):
         """resolve_divergent for a genuinely new branch commit → TipRelation.SUPERSET."""
-        from orchestrator.merge_lane.worker import TipRelation, resolve_divergent
+        from orchestrator.merge_lane.tip_relation import TipRelation, resolve_divergent
         wt = await _make_branch_with_file(git_ops, 'rd-new', 'rd_new.py', 'w = 5\n')
         branch_tip = await self._head_sha(wt)
         main_tip = await git_ops.get_main_sha()
@@ -17806,19 +17807,19 @@ class TestSelectRecoveryWinner:
 
     async def test_single_tip_is_winner(self) -> None:
         """One tip → index 0, no divergence (the pairwise loop never runs)."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops(set())
         assert await select_recovery_winner(['A'], git_ops) == (0, False)
 
     async def test_identical_tips_keep_earliest(self) -> None:
         """Two identical tips → SAME → COALESCE → earliest (index 0) wins."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops(set())
         assert await select_recovery_winner(['A', 'A'], git_ops) == (0, False)
 
     async def test_ancestor_then_descendant_descendant_wins(self) -> None:
         """[ancestor, descendant] → SUPERSET → REPLACE → descendant (index 1) wins."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops({('anc', 'desc')})
         assert await select_recovery_winner(['anc', 'desc'], git_ops) == (1, False)
 
@@ -17828,20 +17829,20 @@ class TestSelectRecoveryWinner:
         Order-independence: the descendant-most tip wins regardless of the
         journal order the records were persisted in.
         """
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops({('anc', 'desc')})
         assert await select_recovery_winner(['desc', 'anc'], git_ops) == (0, False)
 
     async def test_divergent_superset_replaces_and_flags(self, monkeypatch) -> None:
         """Divergent pair, patch NOT contained → resolve_divergent SUPERSET →
         REPLACE → candidate (index 1) wins AND divergence_seen True (D2)."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
 
         async def _pcc(head: str, upstream: str, git_ops: Any) -> bool:
             return False
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.patch_content_contained', _pcc,
+            'orchestrator.merge_lane.tip_relation.patch_content_contained', _pcc,
         )
         git_ops = _make_ancestry_git_ops(set())  # is_ancestor False both ways
         assert await select_recovery_winner(['X', 'Y'], git_ops) == (1, True)
@@ -17849,20 +17850,20 @@ class TestSelectRecoveryWinner:
     async def test_divergent_subset_keeps_and_flags(self, monkeypatch) -> None:
         """Divergent pair, patch contained → resolve_divergent SUBSET →
         COALESCE → earliest (index 0) kept AND divergence_seen True (D2)."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
 
         async def _pcc(head: str, upstream: str, git_ops: Any) -> bool:
             return True
 
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.patch_content_contained', _pcc,
+            'orchestrator.merge_lane.tip_relation.patch_content_contained', _pcc,
         )
         git_ops = _make_ancestry_git_ops(set())
         assert await select_recovery_winner(['X', 'Y'], git_ops) == (0, True)
 
     async def test_none_candidate_tip_skipped(self) -> None:
         """A None candidate tip is skipped (no crash), current winner kept."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops(set())
         assert await select_recovery_winner(['A', None], git_ops) == (0, False)
 
@@ -17873,7 +17874,7 @@ class TestSelectRecoveryWinner:
         the winner would make tip-based dedup silently degrade to journal order
         (every comparison against a None current is skipped).  So a later
         candidate with a resolvable tip is PROMOTED to winner (index 1)."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops(set())
         assert await select_recovery_winner([None, 'A'], git_ops) == (1, False)
 
@@ -17883,14 +17884,14 @@ class TestSelectRecoveryWinner:
 
         Confirms the promotion does not short-circuit the descendant-most
         contract for the remaining real tips."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops({('anc', 'desc')})
         assert await select_recovery_winner([None, 'anc', 'desc'], git_ops) == (2, False)
 
     async def test_all_none_until_last_promotes_last(self) -> None:
         """[None, None, 'A'] → the only resolvable tip wins (index 2); the
         leading tip-less records never shadow it."""
-        from orchestrator.merge_lane.worker import select_recovery_winner
+        from orchestrator.merge_lane.tip_relation import select_recovery_winner
         git_ops = _make_ancestry_git_ops(set())
         assert await select_recovery_winner([None, None, 'A'], git_ops) == (2, False)
 
@@ -17910,39 +17911,63 @@ class TestDecideAttachAction:
 
     async def test_same_not_verifying(self):
         """SAME + not verifying → COALESCE."""
-        from orchestrator.merge_lane.worker import AttachAction, TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import (
+            AttachAction,
+            TipRelation,
+            decide_attach_action,
+        )
         assert decide_attach_action(TipRelation.SAME, verifying=False) is AttachAction.COALESCE
 
     async def test_same_verifying(self):
         """SAME + verifying → COALESCE."""
-        from orchestrator.merge_lane.worker import AttachAction, TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import (
+            AttachAction,
+            TipRelation,
+            decide_attach_action,
+        )
         assert decide_attach_action(TipRelation.SAME, verifying=True) is AttachAction.COALESCE
 
     async def test_superset_not_verifying(self):
         """SUPERSET + not verifying → RESNAPSHOT."""
-        from orchestrator.merge_lane.worker import AttachAction, TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import (
+            AttachAction,
+            TipRelation,
+            decide_attach_action,
+        )
         assert decide_attach_action(TipRelation.SUPERSET, verifying=False) is AttachAction.RESNAPSHOT
 
     async def test_superset_verifying(self):
         """SUPERSET + verifying → ATTACH_AND_CHAIN (gen-2 chaining, γ2)."""
-        from orchestrator.merge_lane.worker import AttachAction, TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import (
+            AttachAction,
+            TipRelation,
+            decide_attach_action,
+        )
         assert decide_attach_action(TipRelation.SUPERSET, verifying=True) is AttachAction.ATTACH_AND_CHAIN
 
     async def test_subset_not_verifying(self):
         """SUBSET + not verifying → ATTACH_CONTAINMENT (boundary test 13 substrate)."""
-        from orchestrator.merge_lane.worker import AttachAction, TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import (
+            AttachAction,
+            TipRelation,
+            decide_attach_action,
+        )
         assert decide_attach_action(TipRelation.SUBSET, verifying=False) is AttachAction.ATTACH_CONTAINMENT
 
     async def test_subset_verifying(self):
         """SUBSET + verifying → ATTACH_CONTAINMENT (containment applies regardless)."""
-        from orchestrator.merge_lane.worker import AttachAction, TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import (
+            AttachAction,
+            TipRelation,
+            decide_attach_action,
+        )
         assert decide_attach_action(TipRelation.SUBSET, verifying=True) is AttachAction.ATTACH_CONTAINMENT
 
     async def test_divergent_raises_value_error(self):
         """DIVERGENT → ValueError (must resolve via resolve_divergent first)."""
         import pytest
 
-        from orchestrator.merge_lane.worker import TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import TipRelation, decide_attach_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_attach_action(TipRelation.DIVERGENT, verifying=False)
 
@@ -17950,7 +17975,7 @@ class TestDecideAttachAction:
         """DIVERGENT + verifying → ValueError (same constraint)."""
         import pytest
 
-        from orchestrator.merge_lane.worker import TipRelation, decide_attach_action
+        from orchestrator.merge_lane.tip_relation import TipRelation, decide_attach_action
         with pytest.raises(ValueError, match='DIVERGENT'):
             decide_attach_action(TipRelation.DIVERGENT, verifying=True)
 
@@ -18038,10 +18063,8 @@ class TestMaybeAutoChainGeneration:
     ) -> None:
         """(3) SUPERSET advance within bound → returns MergeOutcome('superseded'),
         enqueues gen-(n+1) request, increments counts[branch]."""
-        from orchestrator.merge_lane.worker import (
-            TipRelation,
-            _maybe_auto_chain_generation,
-        )
+        from orchestrator.merge_lane.tip_relation import TipRelation
+        from orchestrator.merge_lane.worker import _maybe_auto_chain_generation
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         req = self._make_req(tmp_path, config, branch='task/t1', generation=1)
@@ -18086,10 +18109,8 @@ class TestMaybeAutoChainGeneration:
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """(4) DIVERGENT → resolve_divergent → SUPERSET → chains."""
-        from orchestrator.merge_lane.worker import (
-            TipRelation,
-            _maybe_auto_chain_generation,
-        )
+        from orchestrator.merge_lane.tip_relation import TipRelation
+        from orchestrator.merge_lane.worker import _maybe_auto_chain_generation
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         req = self._make_req(tmp_path, config, branch='task/t1', generation=1)
@@ -18120,10 +18141,8 @@ class TestMaybeAutoChainGeneration:
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """(4b) DIVERGENT → resolve_divergent → SUBSET (patch-contained) → returns None."""
-        from orchestrator.merge_lane.worker import (
-            TipRelation,
-            _maybe_auto_chain_generation,
-        )
+        from orchestrator.merge_lane.tip_relation import TipRelation
+        from orchestrator.merge_lane.worker import _maybe_auto_chain_generation
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         req = self._make_req(tmp_path, config)
@@ -18152,9 +18171,9 @@ class TestMaybeAutoChainGeneration:
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """counts already at MAX_AUTO_CHAINED_GENERATIONS → escalate, reset counter."""
+        from orchestrator.merge_lane.tip_relation import TipRelation
         from orchestrator.merge_lane.worker import (
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            TipRelation,
             _maybe_auto_chain_generation,
         )
 
@@ -18190,10 +18209,8 @@ class TestMaybeAutoChainGeneration:
         self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         """Sequence: advance-1 → counts=1, advance-2 → counts=2, advance-3 → escalate + reset."""
-        from orchestrator.merge_lane.worker import (
-            TipRelation,
-            _maybe_auto_chain_generation,
-        )
+        from orchestrator.merge_lane.tip_relation import TipRelation
+        from orchestrator.merge_lane.worker import _maybe_auto_chain_generation
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         req = self._make_req(tmp_path, config, branch='task/t-seq')
@@ -18240,11 +18257,11 @@ class TestMaybeAutoChainGeneration:
         """(γ2 step-21 RED) provenance retention seam: when _maybe_auto_chain_generation
         receives a retention ring it passes it to enqueue_merge_request so the gen-(n+1)
         terminal outcome is recorded (superseded_by pointer resolves)."""
+        from orchestrator.merge_lane.tip_relation import TipRelation
+        from orchestrator.merge_lane.types import TerminalOutcomeRecord
         from orchestrator.merge_lane.worker import (
             MergeOutcome,
-            TerminalOutcomeRecord,
             TerminalOutcomeRetention,
-            TipRelation,
             _GenerationChainContext,
             _maybe_auto_chain_generation,
         )
@@ -18687,11 +18704,11 @@ class TestBoundaryTableWorkerEntry:
         carries superseded_by == gen-2 request_id.
         Reuses TestMaybeAutoChainGeneration._make_req and the flag-flip pattern.
         """
+        from orchestrator.merge_lane.tip_relation import TipRelation
         from orchestrator.merge_lane.worker import (
             MAX_AUTO_CHAINED_GENERATIONS,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             MergeRequest,
-            TipRelation,
             _maybe_auto_chain_generation,
         )
 
@@ -18856,13 +18873,13 @@ class TestBoundaryTableWorkerEntry:
         status in {done, already_merged} (fan-out realization).
         """
         from orchestrator.merge_lane import WaiterRecord
-        from orchestrator.merge_lane.worker import (
+        from orchestrator.merge_lane.tip_relation import (
             AttachAction,
-            MergeOutcome,
             TipRelation,
             classify_tip_relation,
             decide_attach_action,
         )
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         # Create two commits on a branch: T_old = commit 1, T_new = same as initial (ancestor)
         bt13_branch = 'bt13-subset'
@@ -19212,7 +19229,7 @@ class TestSpeculativeWorkerDequeueDepth:
         Fails today because _merger_loop emit payload is only {branch}.
         """
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         db_path = tmp_path / 'events.db'
         event_store = EventStore(db_path=db_path, run_id='spec-depth-test')
@@ -19275,7 +19292,7 @@ class TestEnqueueMergeQueuedDepth:
 
         Fails today because _emit_merge_queued payload is only {branch}.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         db_path = tmp_path / 'runs.db'
@@ -19450,7 +19467,7 @@ class TestHeartbeatTaskLifecycle:
         Fails today because _heartbeat_loop and _heartbeat_task do not exist.
         """
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -23078,7 +23095,7 @@ class TestResolveAttachAction:
 
     async def test_same_tip_returns_coalesce(self) -> None:
         """SAME tip (new_tip == old_tip) → COALESCE regardless of verifying."""
-        from orchestrator.merge_lane.worker import AttachAction, resolve_attach_action
+        from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
 
         git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=False)
         action = await resolve_attach_action('TIP', 'TIP', verifying=False, git_ops=git_ops)
@@ -23086,7 +23103,7 @@ class TestResolveAttachAction:
 
     async def test_superset_not_verifying_returns_resnapshot(self) -> None:
         """old is ancestor of new (SUPERSET) + verifying=False → RESNAPSHOT."""
-        from orchestrator.merge_lane.worker import AttachAction, resolve_attach_action
+        from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
 
         git_ops = self._stub_git_ops(old_is_ancestor_new=True, new_is_ancestor_old=False)
         action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
@@ -23094,7 +23111,7 @@ class TestResolveAttachAction:
 
     async def test_superset_verifying_returns_attach_and_chain(self) -> None:
         """old is ancestor of new (SUPERSET) + verifying=True → ATTACH_AND_CHAIN."""
-        from orchestrator.merge_lane.worker import AttachAction, resolve_attach_action
+        from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
 
         git_ops = self._stub_git_ops(old_is_ancestor_new=True, new_is_ancestor_old=False)
         action = await resolve_attach_action('NEW', 'OLD', verifying=True, git_ops=git_ops)
@@ -23102,7 +23119,7 @@ class TestResolveAttachAction:
 
     async def test_subset_returns_attach_containment(self) -> None:
         """new is ancestor of old (SUBSET) → ATTACH_CONTAINMENT."""
-        from orchestrator.merge_lane.worker import AttachAction, resolve_attach_action
+        from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
 
         git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=True)
         action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)
@@ -23114,13 +23131,13 @@ class TestResolveAttachAction:
         Patches patch_content_contained to return True, simulating a
         rebased-but-identical set of commits.
         """
-        from orchestrator.merge_lane.worker import AttachAction, resolve_attach_action
+        from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
 
         # Neither is ancestor of the other → DIVERGENT
         git_ops = self._stub_git_ops(old_is_ancestor_new=False, new_is_ancestor_old=False)
 
         with patch(
-            'orchestrator.merge_lane.worker.patch_content_contained',
+            'orchestrator.merge_lane.tip_relation.patch_content_contained',
             AsyncMock(return_value=True),
         ):
             action = await resolve_attach_action('NEW', 'OLD', verifying=False, git_ops=git_ops)

@@ -429,8 +429,8 @@ class TestLandedViaChainCarrier:
     ) -> None:
         """(b) A landed_via_chain outcome reaches the durable payload."""
         from orchestrator.event_store import EventStore
+        from orchestrator.merge_lane.intake import enqueue_merge_request
         from orchestrator.merge_lane.types import MergeOutcome
-        from orchestrator.merge_lane.worker import enqueue_merge_request
 
         config = self._config(tmp_path)
         db_path = tmp_path / 'runs.db'
@@ -464,8 +464,8 @@ class TestLandedViaChainCarrier:
         read a chain that never happened.
         """
         from orchestrator.event_store import EventStore
+        from orchestrator.merge_lane.intake import enqueue_merge_request
         from orchestrator.merge_lane.types import MergeOutcome
-        from orchestrator.merge_lane.worker import enqueue_merge_request
 
         config = self._config(tmp_path)
         db_path = tmp_path / 'runs.db'
@@ -498,8 +498,8 @@ class TestLandedViaChainCarrier:
         these names.
         """
         from orchestrator.event_store import EventStore
+        from orchestrator.merge_lane.intake import enqueue_merge_request
         from orchestrator.merge_lane.types import MergeOutcome
-        from orchestrator.merge_lane.worker import enqueue_merge_request
 
         config = self._config(tmp_path)
         db_path = tmp_path / 'runs.db'
@@ -544,8 +544,8 @@ class TestLandedViaChainCarrier:
         field rides both or neither.
         """
         from orchestrator.event_store import EventStore
+        from orchestrator.merge_lane.intake import enqueue_merge_request
         from orchestrator.merge_lane.types import MergeOutcome, TerminalOutcomeRetention
-        from orchestrator.merge_lane.worker import enqueue_merge_request
 
         config = self._config(tmp_path)
         db_path = tmp_path / 'runs.db'
@@ -871,8 +871,8 @@ async def _prefix_scene_upto_finalize(
     history.
     """
     from orchestrator.event_store import EventStore
+    from orchestrator.merge_lane.intake import enqueue_merge_request
     from orchestrator.merge_lane.types import InflightEntry
-    from orchestrator.merge_lane.worker import enqueue_merge_request
 
     git_ops = _make_git_ops(git_repo, size=2)
     config = _make_config(git_repo, chain_cap=6)
@@ -1716,8 +1716,8 @@ async def _head_and_prefix_scene(
     and must not race the chain build for a git worktree.
     """
     from orchestrator.event_store import EventStore
+    from orchestrator.merge_lane.intake import enqueue_merge_request
     from orchestrator.merge_lane.types import InflightEntry, ItemLifecycleState
-    from orchestrator.merge_lane.worker import enqueue_merge_request
 
     git_ops = (
         GitOps(git_config, git_repo, merge_spec_warm_lane_pool_size=2)
@@ -3242,7 +3242,7 @@ class _DeltaScene:
         for a scene that lands nothing) would make every landing assertion here
         blind to the payload δ exists to produce.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         for tid in task_ids:
             self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)

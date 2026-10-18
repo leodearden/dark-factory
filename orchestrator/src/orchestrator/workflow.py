@@ -106,6 +106,7 @@ from orchestrator.git_ops import (
     is_wip_safety_commit,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_lane.intake import select_train_members
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
@@ -675,65 +676,6 @@ def compute_preexisting_main_break_fingerprint(
         )
     except Exception:
         return ''
-
-
-def _line_ranges_stackable(
-    ranges_a: dict[str, list[tuple[int, int]]],
-    ranges_b: dict[str, list[tuple[int, int]]],
-) -> bool:
-    """Return True iff tasks A and B are line-level stackable.
-
-    Two tasks are stackable iff no file they both touch has overlapping changed
-    line ranges relative to BASE (main).  Crate/file-disjointness is NOT
-    required for stackability — same file, different lines is fine (PRD §A.2).
-
-    Uses closed-interval intersection: range (s1,e1) intersects (s2,e2)
-    iff s1 <= e2 and s2 <= e1.
-    """
-    shared_files = set(ranges_a) & set(ranges_b)
-    for fname in shared_files:
-        for s1, e1 in ranges_a[fname]:
-            for s2, e2 in ranges_b[fname]:
-                if s1 <= e2 and s2 <= e1:
-                    return False
-    return True
-
-
-def _select_train_members(
-    anchor_id: str,
-    candidate_ids: list[str],
-    ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]],
-    max_members: int,
-) -> list[str]:
-    """Select a mutually-stackable subset of candidates capped at max_members.
-
-    Greedy selection: start with the anchor, then iterate candidates in
-    deterministic (id-sorted) order, adding each that is _line_ranges_stackable
-    against ALL already-selected members.  Stops when len(selected) == max_members.
-
-    Returns [] when the result has fewer than 2 members — the sentinel for
-    "no viable train" (a single-member train is meaningless).
-
-    The anchor is always first (order-0) in the returned list.
-    """
-    selected: list[str] = [anchor_id]
-
-    for candidate_id in sorted(candidate_ids):
-        if len(selected) >= max_members:
-            break
-        candidate_ranges = ranges_by_id.get(candidate_id, {})
-        # Must be stackable with every already-selected member (mutual stackability).
-        stackable_with_all = all(
-            _line_ranges_stackable(candidate_ranges, ranges_by_id.get(sel_id, {}))
-            for sel_id in selected
-        )
-        if stackable_with_all:
-            selected.append(candidate_id)
-
-    # A single-member "train" is a no-op — return the empty sentinel.
-    if len(selected) < 2:
-        return []
-    return selected
 
 
 def classify_rebase_cohort(
@@ -1678,13 +1620,13 @@ class TaskWorkflow:
         Returns the mapped ``WorkflowOutcome``, or ``None`` to signal the caller
         to park the workflow as ``MERGE_DEFERRED``.
         """
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
         from orchestrator.merge_lane.worker import (
             TRAIN_INCOMPLETE_REASON_PREFIX,
             TRAIN_VERIFY_FAILED_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
             QueuedBranch,
-            register_and_enqueue_merge_request,
         )
 
         train = self._train
@@ -1941,7 +1883,7 @@ class TaskWorkflow:
 
         Formation (when guards pass and candidates exist):
           1. Fetch line ranges for self + each candidate.
-          2. Select a mutually-stackable subset via _select_train_members (greedy, capped).
+          2. Select a mutually-stackable subset via select_train_members (greedy, capped).
           3. Assign metadata.train={id, order, members} to every selected member via
              scheduler.update_task(append=True) — backend recursive-merge touches only
              the train key, preserving all other metadata keys without a race.
@@ -1987,7 +1929,7 @@ class TaskWorkflow:
             cid: r for cid, r in zip(_all_range_ids, _range_results, strict=True)
         }
 
-        selected = _select_train_members(
+        selected = select_train_members(
             self.task_id, candidate_ids, ranges_by_id,
             self.config.merge_train_max_members,
         )
@@ -11010,14 +10952,15 @@ class TaskWorkflow:
         )
         from orchestrator.merge_lane.disposition import MergeFailureDisposition
         from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
+        from orchestrator.merge_lane.intake import (
+            _emit_merge_coalesced,
+            register_and_enqueue_merge_request,
+        )
+        from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
         from orchestrator.merge_lane.worker import (
-            AttachAction,
             MergeRequest,
             OutcomeKind,
             _emit_merge_attempt,
-            _emit_merge_coalesced,
-            register_and_enqueue_merge_request,
-            resolve_attach_action,
         )
 
         assert self.worktree is not None

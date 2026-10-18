@@ -319,7 +319,9 @@ from orchestrator.merge_lane import (
     coalesce_or_enqueue_merge_request,
     retire_cancelled_merge_request,
 )
+from orchestrator.merge_lane.intake import enqueue_merge_request
 from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_lane.tip_relation import select_recovery_winner
 from orchestrator.merge_lane.types import (
     InFlightMergeRegistry,
     MergeRequest,
@@ -327,11 +329,7 @@ from orchestrator.merge_lane.types import (
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
 )
-from orchestrator.merge_lane.worker import (
-    PRODUCTION_CLOCK,
-    enqueue_merge_request,
-    select_recovery_winner,
-)
+from orchestrator.merge_lane.worker import PRODUCTION_CLOCK
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,

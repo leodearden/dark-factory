@@ -151,11 +151,8 @@ class TestScenario1:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_lane.worker import (
-            MergeOutcome,
-            SpeculativeMergeWorker,
-            enqueue_merge_request,
-        )
+        from orchestrator.merge_lane.intake import enqueue_merge_request
+        from orchestrator.merge_lane.worker import MergeOutcome, SpeculativeMergeWorker
 
         # 3 disjoint-file branches (each touches a unique file → line-stackable).
         # Branch names are BARE (no 'task/' prefix): create_worktree('ig1') creates
@@ -357,7 +354,7 @@ class TestScenario2:
     Three branches: s21 and s22 are disjoint (unique files → stackable);
     s23 adds the SAME file as s21 (file_overlap.py) → get_changed_line_ranges
     returns old-side point range (0,0) on file_overlap.py for BOTH s21 and s23
-    → _line_ranges_stackable returns False → _select_train_members rejects s23.
+    → line_ranges_stackable returns False → select_train_members rejects s23.
 
     Assertions:
       (a) the formed train has exactly 2 members (s21 + s22), NOT s23
@@ -373,7 +370,7 @@ class TestScenario2:
 
     GREEN (step-4): s23 now adds file_overlap.py (same filename as s21) so
     parse_diff_line_ranges maps it to (0,0) on file_overlap.py — same as s21's
-    range — and _line_ranges_stackable returns False.  The coalescing pass forms
+    range — and line_ranges_stackable returns False.  The coalescing pass forms
     a 2-member train from s21+s22 and leaves s23 solo in the buffer.
     """
 
@@ -396,7 +393,7 @@ class TestScenario2:
         #        (0,0) on file_overlap.py → intersects s21's range → NOT stackable.
         #        git diff main...task/ig_s23 shows file_overlap.py as a pure insertion
         #        (@@ -0,0 +1,1 @@) → parse_diff_line_ranges maps it to (0,0).
-        #        _line_ranges_stackable({'file_overlap.py': [(0,0)]}, {'file_overlap.py': [(0,0)]})
+        #        line_ranges_stackable({'file_overlap.py': [(0,0)]}, {'file_overlap.py': [(0,0)]})
         #        → shared_files={'file_overlap.py'}, 0<=0 and 0<=0 → NOT stackable.
         wt1 = await _make_branch_with_file(git_ops, 'ig_s21', 'file_overlap.py', 'x = 1\n')
         wt2 = await _make_branch_with_file(git_ops, 'ig_s22', 'file_s22.py',      'y = 2\n')

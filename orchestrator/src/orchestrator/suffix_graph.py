@@ -27,11 +27,11 @@ tracker is unit-testable standalone AND stays correct if the caller later
 reassigns e.g. ``worker._git_ops`` (amend: reviewer
 robustness_stale_reference / consistency, task δ=1988).
 
-A moved method that reads a worker-resident constant (``MERGE_LANES``,
-``MERGE_BOUNCE_CAP``, ``NEEDS_REBASE_REASON_PREFIX``) — these stay in
-``merge_lane/worker.py`` and are NOT moved — resolves it through a
-function-local (deferred) import from :mod:`orchestrator.merge_lane.worker`
-rather than a top-level import.  This mirrors the reach-back convention of
+A moved method that reads a worker-resident constant (``MERGE_BOUNCE_CAP``,
+``NEEDS_REBASE_REASON_PREFIX``, which stay in ``merge_lane/worker.py``)
+resolves it through a function-local (deferred) import from
+:mod:`orchestrator.merge_lane.worker` rather than a top-level import;
+``MERGE_LANES`` comes from :mod:`orchestrator.merge_lane.intake`.  This mirrors the reach-back convention of
 :mod:`orchestrator.merge_lane.liveness` / :mod:`orchestrator.merge_lane.drift` and
 keeps this module free of any top-level import of the worker (which would
 deadlock module load, since the worker imports this module at module level
@@ -147,8 +147,9 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
     """Resolve MERGE_LANES / MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
 
-    These three constants stay in ``merge_lane/worker.py`` (not moved — see
-    module docstring).  The function-local (deferred) import is required to
+    ``MERGE_BOUNCE_CAP`` and ``NEEDS_REBASE_REASON_PREFIX`` stay in
+    ``merge_lane/worker.py`` (see module docstring); ``MERGE_LANES`` lives in
+    ``merge_lane/intake.py``.  The function-local (deferred) import is required to
     avoid deadlocking the worker's own module load, but that constraint only binds
     at *module import time*; by the time :meth:`SuffixConflictTracker.recompute`
     or :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items` actually
@@ -157,9 +158,9 @@ def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
     sys.modules dict lookup + attribute rebind once, not on every call
     (amend: reviewer performance).
     """
+    from orchestrator.merge_lane.intake import MERGE_LANES
     from orchestrator.merge_lane.worker import (
         MERGE_BOUNCE_CAP,
-        MERGE_LANES,
         NEEDS_REBASE_REASON_PREFIX,
     )
     return MERGE_LANES, MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX

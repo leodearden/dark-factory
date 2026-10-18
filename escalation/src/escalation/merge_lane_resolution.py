@@ -25,8 +25,8 @@ applies to its carrier census.  Eight copies of an argument drift; one does
 not.
 
 Both halves key on the SAME vocabulary.  ``MERGE_LANES`` and
-``lane_for_task_metadata`` are imported from ``orchestrator.merge_lane.worker``,
-never copied: ``lane_for_task_metadata`` is the same function the
+``lane_for_task_metadata`` are imported from ``orchestrator.merge_lane.intake``
+and ``orchestrator.merge_lane.worker``, never copied: ``lane_for_task_metadata`` is the same function the
 orchestrator's own submit path uses (``orchestrator/src/orchestrator/
 workflow.py::TaskWorkflow::_submit_to_merge_queue``), so the two submit paths
 cannot drift apart, and the loud-reject path tests membership against the
@@ -115,7 +115,7 @@ def validate_requested_lane(requested: Any) -> MergeLane | None:
     """
     if requested is None:
         return None
-    from orchestrator.merge_lane.worker import MERGE_LANES
+    from orchestrator.merge_lane.intake import MERGE_LANES
 
     if not isinstance(requested, str) or requested not in MERGE_LANES:
         raise InvalidMergeLane(requested, tuple(MERGE_LANES))

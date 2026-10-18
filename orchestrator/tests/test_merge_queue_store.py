@@ -32,6 +32,7 @@ from test_verify_merge_flake_suppression import _module_config
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.merge_lane import MergeOutcome
+from orchestrator.merge_lane.intake import enqueue_merge_request
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
 from orchestrator.merge_lane.queue_store import (
@@ -40,14 +41,9 @@ from orchestrator.merge_lane.queue_store import (
     reconstruct_merge_request,
     recover_pending_merges,
 )
+from orchestrator.merge_lane.tip_relation import select_recovery_winner
 from orchestrator.merge_lane.types import InFlightMergeRegistry, QueuedBranch
-from orchestrator.merge_lane.worker import (
-    GroupMergeRequest,
-    MergeRequest,
-    enqueue_merge_request,
-    patch_content_contained,
-    select_recovery_winner,
-)
+from orchestrator.merge_lane.worker import GroupMergeRequest, MergeRequest, patch_content_contained
 
 # ---------------------------------------------------------------------------
 # Shared helpers

@@ -18,22 +18,25 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
-from orchestrator.merge_lane.intake import (
-    coalesce_or_enqueue_merge_request,
-    line_ranges_stackable,
-    register_and_enqueue_merge_request,
-    select_train_members,
-)
+import pytest_asyncio
+from _git_fixtures import seed_repo
 
 import orchestrator.merge_lane as facade
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import intake
+from orchestrator.merge_lane.intake import (
+    coalesce_or_enqueue_merge_request,
+    line_ranges_stackable,
+    register_and_enqueue_merge_request,
+    select_train_members,
+)
 from orchestrator.merge_lane.types import (
     InFlightMergeRegistry,
     MergeDispatchResult,
@@ -96,17 +99,14 @@ class MergeWorktrees:
 
 
 class RivalWinsTheScan(MergeWorktrees):
-    """A disk scan during which a rival request claims the branch's slot."""
+    """A disk scan during which a rival submission claims the branch's slot."""
 
-    def __init__(self, registry: InFlightMergeRegistry, rival: MergeRequest) -> None:
+    def __init__(self, rival_submits: Callable[[], Awaitable[bool]]) -> None:
         super().__init__(None)
-        self.registry = registry
-        self.rival = rival
+        self.rival_submits = rival_submits
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
-        self.registry.acquire(
-            branch, self.rival.task_id, self.rival.result, request_id=self.rival.request_id,
-        )
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+        await self.rival_submits()
         return None
 
 
@@ -352,14 +352,20 @@ async def test_a_rival_that_claims_the_slot_during_the_disk_scan_absorbs_the_req
     rival = merge_request(config, request_id='mr-rival')
     late = merge_request(config, request_id='mr-late')
     queue: asyncio.Queue = asyncio.Queue()
+    disk = RivalWinsTheScan(
+        lambda: register_and_enqueue_merge_request(
+            queue, rival, events, registry, retention=retention,
+        ),
+    )
 
     result = await coalesce_or_enqueue_merge_request(
-        queue, late, events, registry, RivalWinsTheScan(registry, rival), retention=retention,
+        queue, late, events, registry, disk, retention=retention,
     )
 
     assert result.in_flight is True
     assert result.source == 'registry'
     assert result.inflight_request_id == 'mr-rival'
+    assert queue.get_nowait() is rival
     assert queue.empty()
     assert events.data_of(EventType.merge_coalesced) == [
         coalesced_data('900', 'registry', result.eta_seconds),
@@ -405,14 +411,10 @@ async def _commit(repo: Path, name: str) -> str:
     return out.strip()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def history(tmp_path: Path) -> tuple[GitOps, str, str]:
     """A real repository with two commits, the second descending from the first."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    repo = seed_repo(tmp_path / 'repo')
     older = await _commit(repo, 'older')
     newer = await _commit(repo, 'newer')
     git_config = GitConfig(

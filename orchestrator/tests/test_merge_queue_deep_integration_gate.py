@@ -1658,7 +1658,7 @@ class _GateScene:
         ``_lane_buffers`` directly would make every landing assertion blind to
         the payload this gate exists to read.
         """
-        from orchestrator.merge_lane.worker import enqueue_merge_request
+        from orchestrator.merge_lane.intake import enqueue_merge_request
 
         for tid in task_ids:
             self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)

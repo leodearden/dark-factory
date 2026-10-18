@@ -770,7 +770,7 @@ class TestPartialStackability:
 
         worker._lane_buffers['normal'].extend([req1, req2, req3])
 
-        # All disjoint → _select_train_members selects all 3.
+        # All disjoint → select_train_members selects all 3.
         async def _mock_gcr(task_id: str):
             return {
                 'ej1': {'fa.py': [(1, 2)]},
