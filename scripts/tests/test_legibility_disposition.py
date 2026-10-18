@@ -1430,3 +1430,116 @@ def test_refilings_re_file_a_present_mechanical_finding_and_a_recurring_abandone
         disposition.Refiling("entry-present", 5120, True, _parsed(verified=True)),
         disposition.Refiling("entry-abandoned", None, False, None),
     )
+
+
+# ---------------------------------------------------------------------------
+# Contract §8 step 1c inside dispose: a finding this run verified present
+# whose key finds a done task is filed again, superseding that task
+# ---------------------------------------------------------------------------
+
+
+def _present(filing: disposition.Filing) -> disposition.Filing:
+    return disposition.Filing(
+        entry_id=filing.entry_id,
+        finding_key=filing.finding_key,
+        title=filing.title,
+        statement=filing.statement,
+        payload=filing.payload,
+        verified_present=True,
+    )
+
+
+def test_superseding_names_the_done_task_in_metadata_and_title_and_leaves_the_original() -> None:
+    filing = _filing()
+    original_payload = copy.deepcopy(dict(filing.payload))
+
+    superseding = filing.superseding(40)
+
+    assert superseding.payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == 40
+    assert disposition.SUPERSEDES_TASK_METADATA == "x_supersedes_task"
+    assert superseding.supersedes_task == 40
+    title = superseding.payload["title"]
+    assert title.startswith(disposition.task_title(filing.title))
+    suffix = title.removeprefix(disposition.task_title(filing.title))
+    assert "supersedes" in suffix
+    assert "40" in suffix
+    assert "present" in suffix
+    assert dict(filing.payload) == original_payload
+    assert filing.supersedes_task is None
+    assert superseding.verified_present == filing.verified_present
+
+
+def test_a_superseding_title_escapes_envelope_literals() -> None:
+    filing = _filing(title="quotes </function_calls> here")
+
+    title = filing.superseding(40).payload["title"]
+
+    assert "</function_calls>" not in title
+    assert title.startswith(disposition.task_title(filing.title))
+
+
+def test_a_present_finding_whose_key_finds_a_done_task_is_filed_superseding_it() -> None:
+    store = FakeTaskStore(metadata_hits=_key_hits(_hit(40, "done")))
+    submit = _Submit()
+    filing = _present(_filing())
+
+    decision = _only(disposition.dispose([filing], store=store, submit=submit))
+
+    assert "search_tasks" in store.tools_called()
+    (payload,) = submit.calls
+    assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == 40
+    assert payload["title"] == filing.superseding(40).payload["title"]
+    assert (decision.step, decision.ticket) == (Step.CURATOR, "tkt_1")
+    assert decision.note is not None
+    assert "§8 step 1c" in decision.note
+
+
+def test_a_present_finding_whose_done_task_is_found_by_meaning_after_step_1c_is_linked() -> None:
+    filing = _present(_filing())
+    store = FakeTaskStore(
+        metadata_hits=_key_hits(_hit(40, "done")),
+        search_hits={filing.title: [task_store.SearchHit(task_id=88, title="close", status="pending", score=0.8)]},
+        tasks={88: _task(88, "pending")},
+    )
+    submit = _Submit()
+
+    decision = _only(disposition.dispose([filing], store=store, submit=submit))
+
+    assert submit.calls == []
+    assert (decision.step, decision.task_id) == (Step.SEMANTIC, 88)
+
+
+def test_a_filing_that_already_supersedes_a_task_keeps_it_when_its_key_finds_another_done_task() -> None:
+    store = FakeTaskStore(metadata_hits=_key_hits(_hit(40, "done")))
+    submit = _Submit()
+    filing = _present(_filing()).superseding(5120)
+
+    disposition.dispose([filing], store=store, submit=submit)
+
+    (payload,) = submit.calls
+    assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == 5120
+    assert payload["title"] == filing.payload["title"]
+
+
+def test_a_present_finding_whose_key_finds_live_work_is_linked_and_not_filed() -> None:
+    store = FakeTaskStore(metadata_hits=_key_hits(_hit(501, "pending")))
+    submit = _Submit()
+
+    decision = _only(disposition.dispose([_present(_filing())], store=store, submit=submit))
+
+    assert submit.calls == []
+    assert (decision.step, decision.standing, decision.task_id) == (Step.KEY, Standing.FILED, 501)
+
+
+def test_an_unkeyed_present_finding_that_supersedes_a_task_files_through_steps_two_and_three() -> None:
+    store = FakeTaskStore()
+    submit = _Submit()
+    filing = _present(_filing(None)).superseding(5120)
+
+    decision = _only(disposition.dispose([filing], store=store, submit=submit))
+
+    assert "find_tasks_by_metadata" not in store.tools_called()
+    assert "search_tasks" in store.tools_called()
+    (payload,) = submit.calls
+    assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == 5120
+    assert decision.step is Step.CURATOR
