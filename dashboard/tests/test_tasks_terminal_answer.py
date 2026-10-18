@@ -120,9 +120,10 @@ def _terminal_render(
     # key, and refreshOne applies body[key] verbatim, so the window must answer
     # under exactly one flat per-project key. A nested TASKS_TERMINAL map would
     # pass every read below and never reach the browser.
-    assert _terminal_keys(body) == [f'TASKS_TERMINAL:{terminal}'], (
-        'the window must answer under the ONE flat key the client reads, and '
-        f'under no other terminal key; got {_terminal_keys(body)}'
+    assert set(body) == {f'TASKS_TERMINAL:{terminal}', 'served_at'}, (
+        'the client applies exactly the one key it built plus the served_at '
+        'receipt (data.js::startOnDemand/refreshOne), so any other key is '
+        f'bytes nobody reads; got {sorted(body)}'
     )
     return body, canned.calls
 
@@ -201,6 +202,43 @@ class TestTerminalWindow:
     WARNS rather than capping silently, and an unpositionable window is not
     fetched at all — has to hold HERE or it holds nowhere.
     """
+
+    def test_the_answer_carries_only_the_window_and_its_receipt(
+        self, client, monkeypatch, tmp_path
+    ):
+        """The answer is the window and ``served_at``, and nothing else.
+
+        The only client applies exactly one key and reads ``served_at`` as its
+        receipt (``data.js::startOnDemand`` and ``refreshOne``). Every
+        project's snapshot and every banner list used to ride along with it:
+        task 5598 measured 3.38 MB for this request, 0.32 MB of it the window.
+        """
+        from datetime import datetime
+
+        body, _calls = _terminal_render(
+            client, monkeypatch, tmp_path, terminal='dark-factory',
+            labels=('dark-factory', 'other'),
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+        )
+
+        default_render_keys = {
+            'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+            'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+            'TASKS_PROJECT_COUNT',
+        }
+        assert not default_render_keys & set(body), (
+            'no project snapshot and no banner list belongs on the terminal '
+            f'answer: {sorted(default_render_keys & set(body))}'
+        )
+        served_at = datetime.fromisoformat(body['served_at'])
+        assert served_at.utcoffset() is not None, (
+            'served_at must name one moment, not a local-clock reading'
+        )
+        window = body['TASKS_TERMINAL:dark-factory']
+        assert window['state'] == 'lower_bound', window
+        assert datetime.fromisoformat(window['as_of']) <= served_at, (
+            'the window claims to be measured after it was served'
+        )
 
     def test_the_window_is_a_lower_bound_datum_naming_the_bound(
         self, client, monkeypatch, tmp_path
@@ -401,9 +439,8 @@ class TestTerminalWindow:
             'a window that cannot be positioned must not be fetched at all, '
             f'got {_terminal_get_tasks(calls)}'
         )
-        # The rest of the payload is unaffected — this is a partial
-        # degradation of one key, not a failed render.
-        assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['dark-factory']
+        # The unknown window IS the whole answer, still carrying served_at.
+        assert body['served_at'], body
 
     def test_an_unconfigured_project_is_unknown_not_a_500(
         self, client, monkeypatch, tmp_path
@@ -491,6 +528,10 @@ class TestTerminalWindow:
         so, because ``applied`` is reported for a body that merely LACKS the
         key. Feeding this endpoint's own JSON through the REAL
         ``requestOnDemand`` fails on a rename on either side.
+
+        The body the real client is fed is the narrowed one — the window and
+        ``served_at``, nothing else — and it still stores the window with its
+        receipt.
         """
         body, _calls = _terminal_render(
             client, monkeypatch, tmp_path, terminal='dark-factory',
@@ -518,7 +559,7 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
     """The window degrades to unknown by the same rule as a root's snapshot.
 
     A ``lower_bound`` datum with no reason breaks the envelope. The key still
-    answers, as an explained unknown, and the rest of the payload survives.
+    answers, as an explained unknown, with its receipt.
     """
     import logging
     from datetime import UTC, datetime
@@ -542,9 +583,10 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    window = body[f'TASKS_TERMINAL:{label}']
+    key = f'TASKS_TERMINAL:{label}'
+    window = body[key]
     assert window['state'] == 'unknown', window
     assert window['value'] is None and window['as_of'] is None
     assert DatumInvariant.REASON_REQUIRED.value in window['reason']
-    assert body['TASKS_SNAPSHOT'][label]['census']['state'] == 'fresh'
+    assert set(body) == {key, 'served_at'}, sorted(body)
     assert len(bug_warnings(caplog)) == 1, bug_warnings(caplog)
