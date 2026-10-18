@@ -228,9 +228,8 @@ _SHAPES: Mapping[str, _Shape] = MappingProxyType({
 })
 
 
-def _replay(store: EventStore, reads: tuple[_Read, ...], shape: str, hit: bool) -> None:
-    results = [read.issue(store) for read in reads]
-    assert any(results) is hit, (shape, results)
+def _replay(store: EventStore, reads: tuple[_Read, ...]) -> list[object]:
+    return [read.issue(store) for read in reads]
 
 
 @pytest.mark.asyncio
@@ -253,8 +252,11 @@ async def test_b10_cross_run_lookup_p99_is_under_50_ms(
         shape, response,
     )
 
+    replayed = _replay(seeded.store, reads)
+    assert any(replayed) is hit, (shape, replayed)
+
     remeasured = remeasure_until_p99_within(
-        lambda: time_window(lambda: _replay(seeded.store, reads, shape, hit), _SAMPLES),
+        lambda: time_window(lambda: _replay(seeded.store, reads), _SAMPLES),
         bound_ms=_BOUND_MS, budget_s=_REMEASURE_BUDGET_S, pause_s=_REMEASURE_PAUSE_S,
     )
     assert remeasured.met, (
