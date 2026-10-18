@@ -14,6 +14,7 @@ from _eval_refusal import answered, refused_agent_result
 from click.testing import CliRunner
 from shared.cli_invoke import AgentResult
 
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.config import default_price_table
 from orchestrator.evals.measurement import MeasurementStage, Unmeasured, UnmeasuredCause
 from orchestrator.evals.reviewer_trial.__main__ import _select_original_corpus, cli
@@ -466,6 +467,65 @@ class TestCampaignUnmeasured:
         assert rerun.exit_code == 0, f'{rerun.output}\n{rerun.exception!r}'
         assert sum('REFUSED_MARKER' in p for p in prompts) == 2
         assert sum('OK_MARKER' in p for p in prompts) == 1
+
+
+class TestCampaignBriefing:
+    """`campaign --briefing` crosses the chosen arms with each reviewer briefing generation."""
+
+    def _invoke(self, tmp_path: Path, *options: str):
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(diff_id='d1', language='python', source='synthetic',
+                       diff_text='d', description='d1', ground_truth=[_gt('g1')]),
+        ])
+        run_trial = AsyncMock(return_value=[
+            PanelRunResult(variant_name='variant_a', diff_id='d1', total_cost_usd=1.0),
+        ])
+        score = AsyncMock(return_value=ScoringResult(
+            variant_name='variant_a', diff_id='d1', cost_usd=1.0,
+            recall=1.0, precision=1.0, f1=1.0, blocking_recall=1.0,
+        ))
+        with (
+            patch('orchestrator.evals.reviewer_trial.__main__._load_corpus', return_value=manifest),
+            patch('orchestrator.evals.reviewer_trial.runner.run_trial', run_trial),
+            patch('orchestrator.evals.reviewer_trial.scorer.score_panel_run', score),
+        ):
+            result = CliRunner().invoke(cli, [
+                'campaign', '--results-dir', str(tmp_path / 'camp'), '--trials', '1',
+                '--split', 'all', '--no-pool', *options,
+            ])
+        return result, run_trial
+
+    def test_d2_adds_a_context_complete_arm_after_each_diff_only_arm(self, tmp_path: Path) -> None:
+        result, run_trial = self._invoke(
+            tmp_path, '--arms', 'variant_a', '--briefing', 'diff-only,d2',
+        )
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        arms = run_trial.call_args.args[0]
+        assert [arm.name for arm in arms] == ['variant_a', 'variant_a_d2']
+        assert [arm.briefing for arm in arms] == [
+            ReviewBriefing.DIFF_ONLY, ReviewBriefing.CONTEXT_COMPLETE,
+        ]
+
+    def test_without_briefing_only_diff_only_arms_run(self, tmp_path: Path) -> None:
+        result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a,variant_a_xhigh')
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        arms = run_trial.call_args.args[0]
+        assert [arm.name for arm in arms] == ['variant_a', 'variant_a_xhigh']
+        assert {arm.briefing for arm in arms} == {ReviewBriefing.DIFF_ONLY}
+
+    def test_an_unknown_briefing_is_a_usage_error_naming_the_valid_values(
+        self, tmp_path: Path,
+    ) -> None:
+        result, run_trial = self._invoke(
+            tmp_path, '--arms', 'variant_a', '--briefing', 'diff-only,bogus',
+        )
+
+        assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
+        assert 'bogus' in result.output
+        assert 'diff-only' in result.output and 'd2' in result.output
+        run_trial.assert_not_called()
 
 
 def _unmeasured_score(variant: str, diff_id: str, cost_usd: float = 2.0,

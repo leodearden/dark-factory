@@ -154,3 +154,121 @@ def test_markdown_names_each_arms_unmeasured_count() -> None:
     assert '`arm` unmeasured: 1' in md
     assert '`inc` unmeasured: 0' in md
     assert '| unmeasured |' in md.splitlines()[0]
+
+
+def _scored(variant: str, diff: str, trial: int, *, br: float, f1: float) -> dict:
+    """A measured score record whose blocking recall and F1 differ."""
+    return _rec(variant, diff, trial, [], [], f1) | {'blocking_recall': br}
+
+
+def _refused(variant: str, diff: str, trial: int) -> dict:
+    return _unmeasured_rec(variant, diff, trial)
+
+
+def _three_trials(variant: str, scores: dict[str, tuple[float, float]]) -> list[dict]:
+    """Every trial 1..3 with the same per-fixture ``(blocking_recall, f1)``."""
+    return [
+        _scored(variant, diff, t, br=br, f1=f1)
+        for t in (1, 2, 3) for diff, (br, f1) in scores.items()
+    ]
+
+
+class TestNonInferior:
+    """The D2 gate: blocking recall not below and F1 not worse, per trial, paired, measured."""
+
+    def test_passes_when_every_trial_holds_both_metrics_ties_included(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5), 'd2': (0.5, 0.4)})
+        arm = _three_trials('arm', {'d1': (0.5, 0.5), 'd2': (0.6, 0.4)})
+
+        assert campaign.non_inferior(arm, inc) is True
+
+    @pytest.mark.parametrize(
+        ('metric', 'trial3'),
+        [
+            pytest.param('blocking_recall', {'br': 0.4, 'f1': 0.9}, id='lower-blocking-recall'),
+            pytest.param('f1', {'br': 0.9, 'f1': 0.4}, id='lower-f1'),
+        ],
+    )
+    def test_fails_when_one_trial_is_lower_on_either_metric(
+        self, metric: str, trial3: dict[str, float],
+    ) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5)})
+        arm = [
+            _scored('arm', 'd1', 1, br=0.9, f1=0.9),
+            _scored('arm', 'd1', 2, br=0.9, f1=0.9),
+            _scored('arm', 'd1', 3, **trial3),
+        ]
+
+        assert campaign.non_inferior(arm, inc) is False, metric
+
+    def test_fails_with_fewer_than_three_shared_trials(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5)})
+        arm = [_scored('arm', 'd1', t, br=0.9, f1=0.9) for t in (1, 2)]
+
+        assert campaign.non_inferior(arm, inc) is False
+        assert campaign.non_inferior(arm, inc, min_trials=2) is True
+
+    def test_an_arm_is_judged_on_the_fixtures_it_shares_with_the_incumbent(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5), 'd2': (0.9, 0.9)})
+        skipped_d2 = _three_trials('arm', {'d1': (0.6, 0.6)})
+
+        assert campaign.non_inferior(skipped_d2, inc) is True
+
+    def test_a_poor_incumbent_score_on_a_fixture_the_arm_lacks_does_not_count(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5), 'd2': (0.0, 0.0)})
+        skipped_d2 = _three_trials('arm', {'d1': (0.4, 0.4)})
+
+        assert campaign.non_inferior(skipped_d2, inc) is False
+
+    def test_a_refused_incumbent_cell_drops_its_pair_rather_than_reading_as_zero(self) -> None:
+        inc = [
+            r for r in _three_trials('inc', {'d1': (0.5, 0.5), 'd2': (0.5, 0.5)})
+            if (r['trial'], r['diff_id']) != (1, 'd1')
+        ] + [_refused('inc', 'd1', 1)]
+        arm = [
+            r for r in _three_trials('arm', {'d1': (0.5, 0.5), 'd2': (0.5, 0.5)})
+            if r['trial'] != 1
+        ] + [_scored('arm', 'd1', 1, br=0.9, f1=0.9), _scored('arm', 'd2', 1, br=0.4, f1=0.4)]
+
+        assert campaign.non_inferior(arm, inc) is False
+
+    def test_a_refused_arm_cell_drops_its_pair_rather_than_reading_as_zero(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5), 'd2': (0.5, 0.5)})
+        arm = [
+            r for r in _three_trials('arm', {'d1': (0.5, 0.5), 'd2': (0.6, 0.6)})
+            if (r['trial'], r['diff_id']) != (1, 'd1')
+        ] + [_refused('arm', 'd1', 1)]
+
+        assert campaign.non_inferior(arm, inc) is True
+
+    def test_an_arm_with_nothing_measured_fails(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5)})
+        arm = [_refused('arm', 'd1', t) for t in (1, 2, 3)]
+
+        assert campaign.non_inferior(arm, inc) is False
+        assert campaign.non_inferior([], inc) is False
+
+    def test_records_without_the_unmeasured_key_are_measured(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5)})
+        arm = _three_trials('arm', {'d1': (0.5, 0.5)})
+        assert not any('unmeasured' in r for r in inc + arm)
+
+        assert campaign.non_inferior(arm, inc) is True
+
+    def test_the_campaign_decides_and_reports_it_per_arm(self) -> None:
+        inc = _three_trials('inc', {'d1': (0.5, 0.5)})
+        holds = _three_trials('holds', {'d1': (0.5, 0.6)})
+        slips = _three_trials('slips', {'d1': (0.4, 0.9)})
+
+        arms, decisions = campaign.summarize_campaign(inc + holds + slips, 'inc', BLOCKING_GT)
+
+        assert decisions.non_inferiority == {'holds': True, 'slips': False}
+        lines = campaign.format_markdown(arms, decisions).splitlines()
+        holds_line = next(line for line in lines if line.startswith('- `holds` non-inferior'))
+        slips_line = next(line for line in lines if line.startswith('- `slips` non-inferior'))
+        assert '**PASS**' in holds_line
+        assert '**FAIL**' in slips_line
+        assert not any(line.startswith('- `inc` non-inferior') for line in lines)
+        assert campaign.to_json(arms, decisions)['decisions']['non_inferiority'] == {
+            'holds': True, 'slips': False,
+        }
