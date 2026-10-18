@@ -29,6 +29,7 @@ CENSUS_SOURCE = "legibility_census"
 SOURCE_METADATA = "source"
 FINDING_KEY_METADATA = "x_finding_key"
 ACCEPTANCE_REASON_METADATA = "x_acceptance_reason"
+SUPERSEDES_TASK_METADATA = "x_supersedes_task"
 SEMANTIC_SCORE_THRESHOLD = 0.6
 RESOLVE_BUDGET_SECS = 300.0
 RESOLVE_CALL_CAP_SECS = 115.0
@@ -114,13 +115,16 @@ def ticket_id_from_submit_result(result: object) -> str | None:
 @dataclass(frozen=True)
 class Filing:
     """One verified finding the census would file, with the curator payload
-    that files it and the codebook entry its back-link lands on."""
+    that files it and the codebook entry its back-link lands on.
+    *verified_present*: this run's verifier found the finding present at
+    as_of_sha, which is the re-verify contract §8 step 1c asks of a done task."""
 
     entry_id: str | None
     finding_key: str | None
     title: str
     statement: str
     payload: Mapping[str, Any]
+    verified_present: bool = False
 
     @property
     def project_root(self) -> str:
@@ -129,6 +133,17 @@ class Filing:
     @property
     def query(self) -> str:
         return "\n".join(dict.fromkeys(text for text in (self.title, self.statement) if text))
+
+    @property
+    def supersedes_task(self) -> int | None:
+        return (self.payload.get("metadata") or {}).get(SUPERSEDES_TASK_METADATA)
+
+    def superseding(self, task_id: int) -> Filing:
+        """This filing superseding done task *task_id*: the one writer of
+        x_supersedes_task and of the title that says so (contract §8 step 1c)."""
+        suffix = escape_envelope_literals(f" (supersedes done task {task_id}: the finding is still present)")
+        metadata = {**(self.payload.get("metadata") or {}), SUPERSEDES_TASK_METADATA: task_id}
+        return replace(self, payload={**self.payload, "title": task_title(self.title) + suffix, "metadata": metadata})
 
 
 @dataclass(frozen=True)
@@ -340,6 +355,24 @@ def _file_with_curator(filing: Filing, submit: Callable[..., Any], note: str | N
     return Decision(filing, Step.CURATOR, ticket=ticket, note=note)
 
 
+def _past_step_one(
+    filing: Filing,
+    *,
+    store: task_store.TaskStore,
+    submit: Callable[..., Any] | None,
+    note: str | None = None,
+) -> Decision | None:
+    """Contract §8 steps 2 and 3."""
+    match = _semantic_lookup(filing, store)
+    if match.task_id is not None:
+        return Decision(
+            filing, Step.SEMANTIC, Standing.FILED, task_id=match.task_id, resolution=Resolution.EXISTING, note=note,
+        )
+    if submit is None:
+        return None
+    return _file_with_curator(filing, submit, _notes(note, match.note))
+
+
 def _decide(
     filing: Filing,
     found: _Found | None,
@@ -347,14 +380,13 @@ def _decide(
     store: task_store.TaskStore,
     submit: Callable[..., Any] | None,
 ) -> Decision | None:
-    if found is not None:
-        return Decision(filing, Step.KEY, found.standing, task_id=found.task_id, resolution=Resolution.EXISTING)
-    match = _semantic_lookup(filing, store)
-    if match.task_id is not None:
-        return Decision(filing, Step.SEMANTIC, Standing.FILED, task_id=match.task_id, resolution=Resolution.EXISTING)
-    if submit is None:
-        return None
-    return _file_with_curator(filing, submit, match.note)
+    if found is None:
+        return _past_step_one(filing, store=store, submit=submit)
+    if found.standing is Standing.DONE and filing.verified_present:
+        superseding = filing if filing.supersedes_task is not None else filing.superseding(found.task_id)
+        note = f"§8 step 1c: done task {found.task_id} carries the key and the finding is still present"
+        return _past_step_one(superseding, store=store, submit=submit, note=note)
+    return Decision(filing, Step.KEY, found.standing, task_id=found.task_id, resolution=Resolution.EXISTING)
 
 
 def _same_key_as(filing: Filing, earlier: Decision) -> Decision:
