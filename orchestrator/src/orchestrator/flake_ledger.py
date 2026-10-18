@@ -162,6 +162,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_flake_debt_due_dedup
 #: the report flags it.  Age since ``enqueued_at``, never since ``next_attempt_at``, which
 #: every failed attempt pushes forward.
 DUE_ITEM_STALE_AFTER: Final = timedelta(minutes=30)
+DUE_ITEM_STALE_MINUTES: Final = int(DUE_ITEM_STALE_AFTER.total_seconds() // 60)
 
 # The one spelling of the stale predicate (heuristic 11, SPOT).
 _IS_STALE_SQL = 'enqueued_at <= :stale_before'
@@ -211,7 +212,7 @@ class FlakeSuppression:
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
 
 
-def _coerce_test_ids(value: object, *, context: str) -> tuple[str, ...]:
+def _coerce_test_ids(value: object, *, context: str, warn: bool = True) -> tuple[str, ...]:
     """Normalize a ``test_ids`` payload to a tuple, stating the wrap-not-drop rule ONCE.
 
     A bare ``str`` where a tuple belongs is an easy mistake to make (one node-id passed
@@ -233,14 +234,18 @@ def _coerce_test_ids(value: object, *, context: str) -> tuple[str, ...]:
     Raises ``TypeError`` on a non-iterable, deliberately: both callers wrap this in a
     catch-all (B12 at write time, the never-raise guard on the wire), and each already
     knows how to degrade loudly.
+
+    *warn* ``False`` coerces without the warning, for a second coercion of a payload
+    whose first coercion already warned.
     """
     if isinstance(value, str):
-        logger.warning(
-            'flake_ledger: test_ids arrived as a bare str (%r) from %s; treating it as '
-            'ONE node-id — the producer should pass a list/tuple',
-            value,
-            context,
-        )
+        if warn:
+            logger.warning(
+                'flake_ledger: test_ids arrived as a bare str (%r) from %s; treating it as '
+                'ONE node-id — the producer should pass a list/tuple',
+                value,
+                context,
+            )
         return (value,)
     return tuple(value)  # type: ignore[call-overload]
 
@@ -850,9 +855,15 @@ def due_items_for(
 
     Verdict-agnostic: whether the observation makes its tests debt-eligible is the
     caller's decision.  Never raises; a malformed *s* is logged and owes nothing.
+
+    A bare-``str`` ``test_ids`` is coerced here WITHOUT the warning: the items are
+    written by ``enqueue_debt(items, occurrence=s)``, whose row derivation warns once
+    for the same payload.
     """
     try:
-        test_ids = _coerce_test_ids(s.test_ids, context=f'call_site={s.call_site}')
+        test_ids = _coerce_test_ids(
+            s.test_ids, context=f'call_site={s.call_site}', warn=False,
+        )
         return tuple(
             DueItem(
                 test_id=test_id,
@@ -1201,13 +1212,19 @@ def build_deflake_task_arguments(row: DebtRow) -> dict:
       breaks for every non-standard path.  The adapter already HOLDS the project root and
       injects it (``chronic_flake.py::SchedulerChronicFlakeTaskClient.submit_task``).
 
+    The title carries the cycle ordinal from the second cycle on (the first cycle's
+    title is unchanged): the task store folds a submission whose title matches an
+    existing non-cancelled task, DONE ones included, so a re-entry filed under the
+    finished owner's title would be folded onto that done task and refused as no owner.
+
     ``metadata.files`` is likewise omitted deliberately: a ``test_id`` may be a reify
     script-suite NAME rather than a path, and a wrong or over-wide concurrency lock
     derived from a guess is worse than no lock — the de-flake agent discovers the files.
     """
+    cycle = f' (cycle {row.open_count})' if row.open_count > 1 else ''
     return {
         'title': (
-            f'Flake debt: {row.test_id} — {FlakeVerdict.passes_in_isolation.value} '
+            f'Flake debt: {row.test_id}{cycle} — {FlakeVerdict.passes_in_isolation.value} '
             f'after a merge-gate red was suppressed'
         ),
         'description': (
@@ -1914,7 +1931,7 @@ _RESOLVE_BUDGET_SECS = 10.0
 
 
 @dataclass(frozen=True)
-class _LazyClose:
+class _CloseVerdict:
     """What :func:`_resolve` did: whether this call stamped the resolution, the live
     owner read it made when one succeeded, and — when *halt* is set — the row
     :func:`open_debt` returns at once, with no upsert and no owner filing."""
@@ -2333,19 +2350,19 @@ async def _resolve(
     now: datetime | None,
     read_budget_secs: float,
     head_contains_fix: Callable[[Mapping[str, Any]], Awaitable[bool | None]] | None = None,
-) -> _LazyClose:
+) -> _CloseVerdict:
     """:func:`resolve_debt`'s body: whether this call closed the cycle, and the live
     owner read it made when one SUCCEEDED, so :func:`open_debt` acts on that read rather
     than repeating it.  The read's bound is the caller's: :func:`open_debt` passes its
     own ``resolve_budget_secs``.
 
     *head_contains_fix* is :func:`open_debt`'s stale-head check, asked only about an
-    owner read as done; its ``False`` and ``None`` set :attr:`_LazyClose.halt`."""
+    owner read as done; its ``False`` and ``None`` set :attr:`_CloseVerdict.halt`."""
     try:
         stamp = _canonicalize_utc(now or datetime.now(UTC), origin='resolve_debt')
         row = read_debt(db_path, test_id)
         if row is None or row.resolved_at is not None:
-            return _LazyClose(False, None)
+            return _CloseVerdict(False, None)
         owner_task_id = row.owner_task_id
         if not owner_task_id:
             logger.info(
@@ -2353,13 +2370,13 @@ async def _resolve(
                 'close it',
                 test_id,
             )
-            return _LazyClose(False, None)
+            return _CloseVerdict(False, None)
         owner = await _read_owner(
             task_client, test_id, owner_task_id, budget_secs=read_budget_secs,
         )
         task = None if owner is None else _finished_task(owner, test_id)
         if task is None:
-            return _LazyClose(False, owner)
+            return _CloseVerdict(False, owner)
         contained = (
             True if head_contains_fix is None
             else await _ask_containment(head_contains_fix, task, test_id)
@@ -2371,7 +2388,7 @@ async def _resolve(
                 test_id,
                 owner_task_id,
             )
-            return _LazyClose(False, owner, halt=row)
+            return _CloseVerdict(False, owner, halt=row)
         commit = resolving_commit(task)
         closed = _stamp_resolution(
             db_path, test_id, owner_task_id=owner_task_id, resolving_commit=commit, stamp=stamp,
@@ -2393,7 +2410,7 @@ async def _resolve(
                 commit or '(none recorded)',
             )
         if contained:
-            return _LazyClose(closed, owner)
+            return _CloseVerdict(closed, owner)
         logger.info(
             'flake_ledger: evidence for test_id=%s predates the fix of owner %s: cycle '
             'closed, not re-opened',
@@ -2401,7 +2418,7 @@ async def _resolve(
             owner_task_id,
         )
         halt = replace(row, resolved_at=stamp, prior_resolving_commit=commit) if closed else row
-        return _LazyClose(closed, owner, halt=halt)
+        return _CloseVerdict(closed, owner, halt=halt)
     except Exception:
         logger.warning(
             'flake_ledger: failed to resolve debt for test_id=%s (project_id=%s)',
@@ -2409,7 +2426,7 @@ async def _resolve(
             project_id,
             exc_info=True,
         )
-        return _LazyClose(False, None)
+        return _CloseVerdict(False, None)
 
 
 def list_open_debt(db_path: Path) -> list[DebtRow]:

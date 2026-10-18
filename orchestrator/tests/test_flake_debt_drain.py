@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,7 @@ import pytest
 from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask
 
+from orchestrator import flake_debt_drain
 from orchestrator.flake_debt_drain import (
     REGRESSED_AFTER_RESOLUTION,
     STALE_DUE_ESCALATION_ROLE,
@@ -39,6 +41,7 @@ from orchestrator.flake_ledger import (
     DueRow,
     FlakeLedgerTaskClient,
     enqueue_debt,
+    open_debt,
     read_debt,
     read_due_items,
     resolve_debt,
@@ -79,7 +82,10 @@ class _FakeLedgerTaskClient:
     answers ``SubmitFailed``, the reads answer an error half, ``commit_planning`` does
     nothing.  *submit_hangs* / *commit_hangs* (toggleable) never answer, setting
     :attr:`submit_entered` / :attr:`commit_entered` first.  *on_call* runs at the start
-    of every method (a test's clock advance).
+    of every method (a test's clock advance).  *folds_titles* (toggleable) is the task
+    store's candidate key: a submission whose title matches an existing task that is not
+    cancelled is answered as COMBINED into that task, a ``done`` one included.
+    *get_task_hangs* (toggleable) makes ``get_task`` never answer.
     """
 
     def __init__(
@@ -97,7 +103,12 @@ class _FakeLedgerTaskClient:
         submit_hangs: bool = False,
         commit_hangs: bool = False,
         on_call: Callable[[], None] | None = None,
+        folds_titles: bool = False,
+        get_task_hangs: bool = False,
     ) -> None:
+        self.folds_titles = folds_titles
+        self.get_task_hangs = get_task_hangs
+        self._titles: dict[str, str] = {}
         self.submit_calls: list[dict] = []
         self.statuses_calls: list[list[str]] = []
         self.task_calls: list[str] = []
@@ -133,7 +144,12 @@ class _FakeLedgerTaskClient:
             raise self.submit_raises
         if self.unreachable:
             return SubmitFailed('unreachable')
+        if self.folds_titles:
+            for task_id, title in self._titles.items():
+                if title == arguments['title'] and self._statuses.get(task_id) != 'cancelled':
+                    return SubmittedTask(task_id, self._statuses.get(task_id), combined=True)
         new_id = f'deflake-{len(self.filed) + 1}'
+        self._titles[new_id] = arguments['title']
         self.filed.append(new_id)
         self._statuses.setdefault(new_id, self._status_after_submit)
         return SubmittedTask(new_id, self._status_after_submit)
@@ -155,6 +171,8 @@ class _FakeLedgerTaskClient:
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
         self._enter('get_task')
         self.task_calls.append(task_id)
+        if self.get_task_hangs:
+            await asyncio.Event().wait()
         if self.unreachable:
             return None, ConnectionError('unreachable')
         if task_id not in self._statuses:
@@ -613,6 +631,22 @@ class TestStaleHead:
         assert len(queue.regressions()) == 1
         assert client.filed == [owner, 'deflake-2']
 
+    async def test_a_re_entry_files_under_a_title_the_store_does_not_fold_onto_the_done_owner(
+        self, tmp_path: Path,
+    ) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient(folds_titles=True)
+        git = _FakeAncestry({(FIX, GOOD_HEAD): True})
+        owner = await _owned(db, client, clock, A, 0)
+        client.finish(owner, commit=FIX)
+        _enqueue(db, A, 1, at=clock.now, head=GOOD_HEAD)
+
+        report = await _pass(db, client, clock, git=git, queue=_RecordingQueue(tmp_path / 'queue'))
+
+        row = read_debt(db, A)
+        assert row is not None and row.open_count == 2
+        assert row.owner_task_id == 'deflake-2', 'the new cycle has its own owner'
+        assert (report.failed, report.stop) == (0, None) and _items(db) == []
+
     async def test_drain_timing_form_an_owner_done_after_the_enqueue_closes_the_cycle(
         self, tmp_path: Path,
     ) -> None:
@@ -854,3 +888,54 @@ class TestStaleItemEscalation:
             drain.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await drain
+
+
+@pytest.mark.asyncio
+class TestTaskClientBounds:
+    """The drain's own backstops on the task client: a call that outlives
+    ``_TASK_CLIENT_CALL_TIMEOUT_SECS`` fails the attempt, and a cancellation inside a
+    call is recorded as a failure and still propagates."""
+
+    async def test_a_hung_client_call_fails_the_attempt_and_stops_the_pass(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(flake_debt_drain, '_TASK_CLIENT_CALL_TIMEOUT_SECS', 0.05)
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient(submit_hangs=True)
+        _enqueue(db, A, 0, at=clock.now)
+        _enqueue(db, B, 1, at=clock.now)
+
+        report = await asyncio.wait_for(_pass(db, client, clock), timeout=10)
+
+        assert report.stop is DrainStop.TASK_CLIENT_FAILED
+        assert (report.attempted, report.failed) == (1, 1), 'the pass stops at the first'
+        assert _item(db, A).last_error == DueFailure.TASK_CLIENT_FAILED.value
+        assert len(client.submit_calls) == 1
+
+    async def test_a_cancellation_inside_a_client_call_propagates(self, tmp_path: Path) -> None:
+        db, clock = _db(tmp_path), _Clock()
+        client = _FakeLedgerTaskClient(submit_raises=asyncio.CancelledError())
+        _enqueue(db, A, 0, at=clock.now)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _pass(db, client, clock)
+
+        assert [i.attempts for i in _items(db)] == [0], 'the cancelled attempt is not recorded'
+
+    async def test_a_read_the_ledger_cancels_at_its_budget_counts_as_a_client_failure(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The ledger bounds its owner read and cancels the call when the budget expires;
+        the drain must still read that as the task client failing, not as a clean read."""
+        monkeypatch.setattr(
+            flake_debt_drain, 'open_debt', functools.partial(open_debt, resolve_budget_secs=0.05),
+        )
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        owner = await _owned(db, client, clock, A, 0)
+        client.finish(owner, commit=FIX)
+        client.get_task_hangs = True
+        _enqueue(db, A, 1, at=clock.now)
+
+        report = await asyncio.wait_for(_pass(db, client, clock), timeout=10)
+
+        assert report.stop is DrainStop.TASK_CLIENT_FAILED
+        assert _item(db, A).last_error == DueFailure.TASK_CLIENT_FAILED.value

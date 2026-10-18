@@ -1520,6 +1520,23 @@ class TestBuildDeflakeTaskArguments:
             'flake_debt_opened_at': '2026-08-01T09:30:00+00:00',
         }
 
+    def test_the_first_cycle_title_is_the_original_and_later_cycles_are_distinct(self) -> None:
+        """The task store folds a submission onto an existing non-cancelled task with the
+        same title, a done one included, so a re-entry's title must differ from the
+        finished owner's while the first cycle's stays as it always was."""
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        first = build_deflake_task_arguments(_debt_row(open_count=1))['title']
+        second = build_deflake_task_arguments(_debt_row(open_count=2))['title']
+        third = build_deflake_task_arguments(_debt_row(open_count=3))['title']
+
+        test_id = _debt_row().test_id
+        assert first == (
+            f'Flake debt: {test_id} — passes_in_isolation after a merge-gate red was suppressed'
+        )
+        assert len({first, second, third}) == 3
+        assert '(cycle 2)' in second and '(cycle 3)' in third
+
     def test_block_omits_project_root(self) -> None:
         """``open_debt`` holds a ``db_path``, not a ``project_root`` (§8.3).  The
         adapter injects the key (``SchedulerChronicFlakeTaskClient.submit_task``,

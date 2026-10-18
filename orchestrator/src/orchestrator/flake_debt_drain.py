@@ -48,6 +48,7 @@ from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
+    DUE_ITEM_STALE_MINUTES,
     NEVER_WIDEN_A_TIMEOUT,
     DebtRow,
     DueRow,
@@ -282,8 +283,8 @@ def _regression_detail(row: DebtRow, *, item: DueRow) -> str:
         f'  observed_at:             {item.observed_at}\n'
         f'\n'
         f"The ledger files this cycle's de-flake task itself, straight after this "
-        f'escalation; `orchestrator flake-ledger` shows its owner, or the unowned breach '
-        f'if that filing failed.\n'
+        f'escalation; `orchestrator flake-ledger` shows its owner, `filing pending` while '
+        f'the drain still owes the filing, or the unowned breach if no filing is due.\n'
         f'\n'
         f'{NEVER_WIDEN_A_TIMEOUT}'
     )
@@ -374,8 +375,6 @@ def _escalate_regressed_after_resolution(
 # The stale-item escalation (INV-4 storm escape, INV-7 age surfacing)
 # ---------------------------------------------------------------------------
 
-_STALE_MINUTES = int(DUE_ITEM_STALE_AFTER.total_seconds() // 60)
-
 
 def _last_error(item: DueRow) -> str:
     return item.last_error or 'not yet attempted'
@@ -386,7 +385,7 @@ def _stale_summary(summary: DueSummary) -> str:
     appends only when the framing changes, so it changes at the rate items do."""
     oldest = summary.stale_sample[0]
     return (
-        f'{summary.stale} flake-debt item(s) waiting over {_STALE_MINUTES} min for a '
+        f'{summary.stale} flake-debt item(s) waiting over {DUE_ITEM_STALE_MINUTES} min for a '
         f'de-flake filing; oldest {oldest.test_id} since {oldest.enqueued_at}: '
         f'{_last_error(oldest)}'
     )
@@ -395,7 +394,7 @@ def _stale_summary(summary: DueSummary) -> str:
 def _stale_detail(summary: DueSummary) -> str:
     lines = [
         f'{summary.stale} item(s) on the flake ledger\'s due list (flake_debt_due) have '
-        f'waited over {_STALE_MINUTES} minutes for their de-flake owner to be filed. '
+        f'waited over {DUE_ITEM_STALE_MINUTES} minutes for their de-flake owner to be filed. '
         f'The oldest {len(summary.stale_sample)}, oldest first:',
         '',
     ]
@@ -445,7 +444,7 @@ async def _surface_stale_items(
             for esc in pending:
                 escalation_queue.resolve(
                     esc.id,
-                    f'auto-resolved: no flake-debt item has waited over {_STALE_MINUTES} minutes',
+                    f'auto-resolved: no flake-debt item has waited over {DUE_ITEM_STALE_MINUTES} minutes',
                     resolved_by=STALE_DUE_ESCALATION_ROLE,
                 )
             return
@@ -468,8 +467,9 @@ async def _surface_stale_items(
                 detail=detail,
                 suggested_action=(
                     'Restore fused-memory if last_error reads task_client_failed (the usual '
-                    'cause); the drain then catches up and resolves this record itself. See '
-                    "OPERATIONS.md 'Reading the flake ledger'."
+                    'cause); the drain then catches up and resolves this record itself. A '
+                    'persistent no_owner means the task store refused the filing: escalate to '
+                    "the operator. See OPERATIONS.md 'Reading the flake ledger'."
                 ),
                 level=1,
                 filing_claimant_run_id=filing_claimant_run_id,

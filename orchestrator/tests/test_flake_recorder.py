@@ -23,6 +23,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -324,6 +325,22 @@ class TestRecordMergeFlakeSuppression:
         # ... and every suppression along the way still emitted + landed rows.
         assert len(es.emits) == threshold
         assert len(_occurrences(tmp_path)) == 2 * threshold
+
+    async def test_a_bare_str_test_ids_warns_once_per_suppression(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The rows and the due items both derive from ``test_ids``; the one upstream
+        bug is reported once, not once per derivation."""
+        s = _suppression(test_ids=cast(Any, _IDS[0]))
+
+        with caplog.at_level(logging.WARNING):
+            await _record(
+                _result(s), tmp_path, event_store=_FakeEventStore(),
+                escalation_queue=_FakeEscalationQueue(),
+            )
+
+        assert caplog.text.count('arrived as a bare str') == 1, caplog.text
+        assert [d.test_id for d in _due(tmp_path)] == [_IDS[0]]
 
     # -- (f) B12: a broken ledger must never cost the other two signals -------
 

@@ -50,6 +50,7 @@ from pathlib import Path
 
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
+    DUE_ITEM_STALE_MINUTES,
     UNKNOWN_TEST_ID,
     DebtRow,
     DueSummary,
@@ -823,8 +824,6 @@ def build_report(
 
 # --- rendering ---------------------------------------------------------------
 
-_STALE_MINUTES = int(DUE_ITEM_STALE_AFTER.total_seconds() // 60)
-
 
 def _due_line(report: FlakeLedgerReport) -> str:
     """The due list's size and its oldest item's age, flagged once that item is past the
@@ -838,7 +837,7 @@ def _due_line(report: FlakeLedgerReport) -> str:
         return 'due list: empty'
     enqueued = _parse_stamp(due.oldest.enqueued_at)
     age = None if enqueued is None else report.generated_at - enqueued
-    past = f' — PAST THE {_STALE_MINUTES}-MINUTE BOUND' if due.stale else ''
+    past = f' — PAST THE {DUE_ITEM_STALE_MINUTES}-MINUTE BOUND' if due.stale else ''
     return (
         f'due list: {due.size} item(s), oldest enqueued {due.oldest.enqueued_at} '
         f'(age {format_age(age)}){past}'
