@@ -520,13 +520,18 @@ class _OpenTicket:
     carried: bool
 
 
+def _awaits_curator(row: Mapping[str, Any]) -> bool:
+    """The one rule for a C1 row whose ticket the curator has not decided."""
+    return row.get("ticket") is not None and row.get("resolution") is None
+
+
 def _open_tickets(cb: dict, run_id: str) -> list[_OpenTicket]:
-    """Every row of *cb* holding a ticket with no resolution, carried-over rows first."""
+    """Every row of *cb* awaiting the curator, carried-over rows first."""
     open_tickets = [
         _OpenTicket(entry["id"], row, carried=row.get("run_id") != run_id)
         for entry in cb.get("entries") or []
         for row in entry.get("filed_tickets") or []
-        if row.get("ticket") is not None and row.get("resolution") is None
+        if _awaits_curator(row)
     ]
     return sorted(open_tickets, key=lambda open_ticket: not open_ticket.carried)
 
@@ -638,7 +643,7 @@ def backfill(
         return cb, Backfill(error=str(exc))
     by_title = _entry_ids_by_filed_title(cb)
     linked_task_ids = {row.get("task_id") for _, row in _rows_of(cb)}
-    ticketed = {entry_id for entry_id, row in _rows_of(cb) if row.get("ticket") is not None and row.get("resolution") is None}
+    ticketed = {entry_id for entry_id, row in _rows_of(cb) if _awaits_curator(row)}
     keys = {entry["id"]: entry.get("finding_key") for entry in cb.get("entries") or []}
     links: list[BackLink] = []
     unmatched: list[task_store.TaskHit] = []
@@ -684,27 +689,40 @@ class TaskOutcome:
 
 @dataclass(frozen=True)
 class EntryOutcome:
-    """What one codebook entry's back-linked tasks say, read this run."""
+    """What one codebook entry's back-linked tasks say, read this run.
+    *awaiting* holds the tickets of its rows the curator has not decided, in
+    row order."""
 
     entry_id: str
     finding_key: str | None
     entry_status: str
     tasks: tuple[TaskOutcome, ...]
+    awaiting: tuple[str, ...] = ()
+
+    @property
+    def hold(self) -> str | None:
+        """Why the entry is not acted on this run, or None. Corroborate
+        before acting (INV-3): a ticket awaiting the curator may still become
+        the live task, and so may a linked task this run did not observe."""
+        if self.awaiting:
+            return f"ticket {self.awaiting[-1]} awaits the curator and may become the live task"
+        if any(task.ref is not None and task.standing is None for task in self.tasks):
+            return "another linked task was not observed"
+        return None
 
     @property
     def governing(self) -> TaskOutcome | None:
         """The task whose standing decides the entry, by the §8 step 1
-        precedence; None when there is no task, or when any task went
-        unobserved, since that one could be the live one (INV-3)."""
-        tasks = [task for task in self.tasks if task.ref is not None]
+        precedence; None when there is no task, or while the entry is on
+        :attr:`hold`."""
+        if self.hold is not None:
+            return None
         ranked = [
             (_rank(task.standing, task.ref.task_id), task)
-            for task in tasks
+            for task in self.tasks
             if task.standing is not None and task.ref is not None
         ]
-        if not ranked or len(ranked) != len(tasks):
-            return None
-        return min(ranked, key=lambda each: each[0])[1]
+        return min(ranked, key=lambda each: each[0])[1] if ranked else None
 
 
 @dataclass(frozen=True)
@@ -733,6 +751,12 @@ class Outcomes:
     @property
     def any_back_links(self) -> bool:
         return bool(self.entries)
+
+    @property
+    def awaiting(self) -> dict[str, str]:
+        """Each entry's newest ticket awaiting the curator, by entry id: the
+        work an earlier run filed for it that the curator still holds."""
+        return {entry.entry_id: entry.awaiting[-1] for entry in self.entries if entry.awaiting}
 
     @property
     def due(self) -> tuple[Reverify, ...]:
@@ -782,15 +806,15 @@ def _outcome_of(ref: TaskRef, ticket: str | None, status: str, metadata: Mapping
 
 
 def _ticket_only(row: Mapping[str, Any]) -> TaskOutcome:
-    resolution = row.get("resolution")
-    note = "awaiting the curator" if resolution is None else f"{resolution}; it names no task"
+    note = "awaiting the curator" if _awaits_curator(row) else f"{row.get('resolution')}; it names no task"
     return TaskOutcome(None, row.get("ticket"), None, None, note)
 
 
 def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None], TaskOutcome]) -> EntryOutcome:
+    rows = entry.get("filed_tickets") or []
     tasks: list[TaskOutcome] = []
     seen: set[TaskRef] = set()
-    for row in entry.get("filed_tickets") or []:
+    for row in rows:
         if row.get("task_id") is None:
             tasks.append(_ticket_only(row))
             continue
@@ -798,7 +822,8 @@ def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None
         if ref not in seen:
             seen.add(ref)
             tasks.append(read(ref, row.get("ticket")))
-    return EntryOutcome(entry["id"], entry.get("finding_key"), entry["status"], tuple(tasks))
+    awaiting = tuple(row["ticket"] for row in rows if _awaits_curator(row))
+    return EntryOutcome(entry["id"], entry.get("finding_key"), entry["status"], tuple(tasks), awaiting)
 
 
 def read_outcomes(
@@ -1331,7 +1356,7 @@ class OutcomeReport:
             return RowOutcome.UNOBSERVED, task.note
         governing = entry.governing
         if governing is None or governing.ref is None:
-            return RowOutcome.HELD, "another linked task was not observed"
+            return RowOutcome.HELD, entry.hold
         if governing.ref != task.ref:
             return RowOutcome.OUTRANKED, governing.ref.task_id
         if task.standing is Standing.ABANDONED:
