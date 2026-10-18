@@ -926,36 +926,33 @@ def _iter_result_texts(record: dict):
                     yield sub['text']
 
 
-def _iter_input_strings(value: object):
+def _iter_input_strings(value: object) -> Iterator[str]:
     """Yield every ``str`` reachable inside a tool_use ``input`` *value*.
 
-    Walks dict values (and str keys) and list/tuple items depth-first; scalars
-    that are not ``str`` (``int``/``float``/``bool``/``None``) yield nothing,
-    and any other object yields its ``str()`` — preserving what
-    ``json.dumps(..., default=str)`` used to expose for an exotic leaf such as
-    a ``Path``.
+    Walks dict values (and str keys) and list/tuple items; scalars that are
+    not ``str`` (``int``/``float``/``bool``/``None``) yield nothing, and any
+    other object yields its ``str()`` — what ``json.dumps(..., default=str)``
+    would expose for an exotic leaf such as a ``Path``.
 
-    Replaces serializing the whole input (reviewer_comprehensive amendment,
-    task 3639): once ``bg_tokens`` is non-empty, EVERY subsequent tool_use was
-    fully ``json.dumps``-ed, allocating a complete string copy of every
-    ``Write`` body / ``Edit`` old+new pair / ``TodoWrite`` list in the
-    transcript on each invocation-end.  Yielding the already-materialized
-    strings lets ``any()`` short-circuit on the first hit and allocates
-    nothing for the common case.
+    The walk keeps its own stack, so an input nested past the interpreter's
+    recursion limit (``json.loads`` decodes one) is walked whole and never
+    raises.  Yielding the already-materialized strings lets ``any()``
+    short-circuit on the first hit without copying a ``Write`` body or an
+    ``Edit`` pair the way serializing the whole input would.
     """
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str):
-                yield key
-            yield from _iter_input_strings(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _iter_input_strings(item)
-    elif value is not None and not isinstance(value, (int, float)):
-        # bool is an int subclass, so it is covered by the isinstance above.
-        yield str(value)
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            pending.extend(key for key in item if isinstance(key, str))
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        elif item is not None and not isinstance(item, (int, float)):
+            # bool is an int subclass, so it is covered by the isinstance above.
+            yield str(item)
 
 
 def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
@@ -1001,10 +998,7 @@ class _BackgroundEvent(enum.Enum):
 def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
     """Return True when any of *texts* contains any of *tokens* — the single
     definition of "references a background task"."""
-    try:
-        return any(token in text for text in texts for token in tokens)
-    except Exception:  # pragma: no cover - the walk is total
-        return False
+    return any(token in text for text in texts for token in tokens)
 
 
 def _monitor_arm_task_id(record: dict, monitor_call_ids: set[str]) -> str | None:

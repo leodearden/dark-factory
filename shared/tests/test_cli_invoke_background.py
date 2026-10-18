@@ -28,6 +28,7 @@ complete and exited success, silently abandoning the work mid-task.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -1361,7 +1362,8 @@ class TestDetectorTotalityAndTokenHygiene:
     records/blocks ... are skipped, never raise" previously covered only
     records), a degenerate identity token cannot mute the whole verdict, and
     the token scan sees the same strings the old whole-input ``json.dumps``
-    exposed.
+    exposed.  Task 5986 adds a fourth: that scan reaches the bottom of an
+    input of any depth.
     """
 
     def test_non_str_tool_use_name_never_raises(self) -> None:
@@ -1442,6 +1444,26 @@ class TestDetectorTotalityAndTokenHygiene:
             }]),
         ]
         assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        ('innermost', 'expected'),
+        [(_bg_log_path(), False), ('/etc/hosts', True)],
+        ids=['token-at-the-bottom-reaps', 'no-token-still-fires'],
+    )
+    def test_input_nested_past_the_recursion_limit_is_scanned_whole(
+        self, innermost: str, expected: bool
+    ) -> None:
+        """``json.loads`` decodes a transcript line nested far deeper than the
+        interpreter's recursion limit, so the token scan must walk such an
+        input to the bottom rather than raise or give up partway."""
+        depth = sys.getrecursionlimit() + 500
+        deep_input = json.loads('[' * depth + json.dumps(innermost) + ']' * depth)
+        records = [
+            _assistant([_bash_launch()]),
+            _bg_launch_result(),
+            _assistant([{'type': 'tool_use', 'name': 'SomeTool', 'input': {'deep': deep_input}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is expected
 
     def test_input_with_no_strings_is_not_a_reap(self) -> None:
         """An input carrying no ``str`` anywhere cannot match a token."""
