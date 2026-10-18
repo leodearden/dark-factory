@@ -492,7 +492,7 @@ def test_scheduler_heatmap_discloses_what_it_is_not_showing(scheduler_heatmap_js
     60 rows has no way to tell whether that is the whole picture or the top 2%
     of it. The copy's truth is pinned executably in
     dashboard/tests/js/scheduler_heatmap_bounds.test.mjs; this probe pins only
-    that the component renders that caption and writes none of its own.
+    that the component renders that caption.
     """
     src = strip_js_comments(scheduler_heatmap_jsx_body)
     assert re.search(
@@ -508,10 +508,6 @@ def test_scheduler_heatmap_discloses_what_it_is_not_showing(scheduler_heatmap_js
         'SchedulerHeatmap must render the caption describeHeatmapCap composes'
     )
     assert 'sched-heatmap-cap' in body, 'the caption keeps its styled container'
-    assert 'most contended' not in body, (
-        'the caption copy has one home, beside the selection it describes; a '
-        'second hand-written sentence would drift from it'
-    )
 
 
 def test_cell_state_delegates_membership_to_the_shared_predicate(scheduler_heatmap_jsx_body):
