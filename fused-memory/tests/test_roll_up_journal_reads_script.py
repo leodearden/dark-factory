@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import subprocess
+import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -210,6 +212,24 @@ def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:
     assert code == 0, err
     return code
 
+    def test_the_work_queue_scan_is_reported_apart_from_the_chunk_rate(
+        self, journal, capsys, monkeypatch,
+    ):
+        slow_scan = _script.count_only_span
+
+        def scan_taking_time(conn):
+            time.sleep(0.4)
+            return slow_scan(conn)
+
+        monkeypatch.setattr(_script, 'count_only_span', scan_taking_time)
+
+        code, report, err = _migrate(journal, capsys)
+
+        assert code == 0, err
+        assert report is not None
+        assert report['setup_seconds'] >= 0.4
+        assert report['seconds'] < 0.4
+
 
 class TestPanelInvariance:
     def _snapshots(self, journal, capsys, tmp_path) -> list[Path]:
@@ -265,6 +285,25 @@ class TestPanelInvariance:
         assert mismatch['hour'] == _ROLLUP_HOUR.strftime('%Y-%m-%dT%H:00')
         assert (mismatch['kind'], mismatch['operation']) == ('read', 'get_task')
         assert mismatch['observed'] == mismatch['expected'] + 1000
+
+    def test_a_surplus_rollup_key_absent_from_the_snapshot_fails_verify(
+        self, journal, capsys, tmp_path,
+    ):
+        snapshots = self._snapshots(journal, capsys, tmp_path)
+        _migrate(journal, capsys)
+        _seed_rollup(
+            journal, (_ROLLUP_HOUR.isoformat(), 'dark_factory', '', 'get_double_counted', 7)
+        )
+
+        code, report, _ = _run(
+            capsys, 'verify', '--journal', str(journal), '--snapshot', str(snapshots[1])
+        )
+
+        assert code != 0
+        assert report is not None
+        [mismatch] = report['mismatches']
+        assert mismatch['operation'] == 'get_double_counted'
+        assert (mismatch['expected'], mismatch['observed']) == (0, 7)
 
 
 class TestReadRetentionHorizon:
@@ -417,6 +456,52 @@ class TestCrashSafety:
         assert _rollup_counts(journal) == expected
 
 
+class TestChunkVerification:
+    """The per-chunk oracle: a statement that silently under-applies is not committed."""
+
+    def test_a_rollup_write_that_is_ignored_rolls_the_chunk_back(self, journal, capsys):
+        before_rows = _write_ops_by_id(journal)
+        before_rollup = _rollup_counts(journal)
+        conn = sqlite3.connect(journal)
+        conn.execute(
+            'CREATE TRIGGER ignore_rollup BEFORE INSERT ON read_op_counts'
+            ' BEGIN SELECT RAISE(IGNORE); END'
+        )
+        conn.commit()
+        conn.close()
+
+        code, _, err = _migrate(journal, capsys)
+
+        assert code != 0
+        assert 'count is' in err
+        assert _write_ops_by_id(journal) == before_rows
+        assert _rollup_counts(journal) == before_rollup
+
+    def test_a_raw_delete_that_skips_a_row_rolls_its_chunk_back(self, journal, capsys):
+        history = _history_rows()
+        skipped = _poison_row(history)
+        conn = sqlite3.connect(journal)
+        conn.execute(
+            'CREATE TRIGGER skip_delete BEFORE DELETE ON write_ops'
+            f" WHEN OLD.id = '{skipped['id']}' BEGIN SELECT RAISE(IGNORE); END"
+        )
+        conn.commit()
+        conn.close()
+
+        code, _, err = _migrate(journal, capsys)
+
+        assert code != 0
+        assert 'deleted' in err
+        surviving = _write_ops_by_id(journal)
+        assert skipped['id'] in surviving
+        expected = Counter({_PRE_EXISTING_ROLLUP[:4]: _PRE_EXISTING_ROLLUP[4]})
+        expected.update(
+            _rollup_key(row) for row in history
+            if _is_count_only(row) and row['id'] not in surviving
+        )
+        assert _rollup_counts(journal) == expected
+
+
 class TestGuards:
     def test_a_count_only_read_inside_the_deploy_grace_refuses(self, journal, capsys):
         recent = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
@@ -445,6 +530,32 @@ class TestGuards:
         assert code != 0
         assert 'read_op_counts' in err
         assert _dump(db_path) == before
+
+
+class TestJournalLocation:
+    def test_without_journal_the_one_fused_memory_is_configured_to_write_is_used(
+        self, journal, capsys, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv('RECONCILIATION_DATA_DIR', str(journal.parent))
+        monkeypatch.chdir(tmp_path)
+        assert journal.name == 'write_journal.db'
+
+        code, report, err = _run(capsys, 'status')
+
+        assert code == 0, err
+        assert report is not None and report['count_only_span'] is not None
+
+    def test_a_temp_dir_with_a_quote_is_rejected_before_anything_runs(
+        self, journal, capsys, tmp_path,
+    ):
+        before = _dump(journal)
+
+        with pytest.raises(SystemExit) as exited:
+            _script.main(['reclaim', '--journal', str(journal), '--temp-dir', str(tmp_path / "a'b")])
+
+        assert exited.value.code == 2
+        assert 'quote' in capsys.readouterr().err
+        assert _dump(journal) == before
 
 
 class TestStatus:
@@ -574,3 +685,87 @@ class TestReclaim:
         assert db_path.stat().st_size < size_before
         assert db_path.stat().st_ino == inode_before
         assert _table_row_counts(db_path) == rows_before
+
+    def test_apply_leaves_no_wal_behind_while_another_connection_stays_open(
+        self, tmp_path, capsys,
+    ):
+        db_path = _bulky_migrated_journal(tmp_path, capsys)
+        bystander = sqlite3.connect(db_path)
+        try:
+            bystander.execute('SELECT COUNT(*) FROM write_ops').fetchone()
+
+            code, report, err = _run_reclaim(capsys, db_path, '--apply')
+        finally:
+            bystander.close()
+
+        assert code == 0, err
+        assert report is not None
+        wal = db_path.with_name(db_path.name + '-wal')
+        assert not wal.exists() or wal.stat().st_size == 0
+        assert report['after_bytes'] < report['before_bytes'] // 2
+
+
+@pytest.fixture
+def systemctl_on_path(tmp_path, monkeypatch):
+    """A PATH holding only a fake ``systemctl`` that prints what the test sets."""
+
+    def install(stdout: str) -> None:
+        bin_dir = tmp_path / 'fake-bin'
+        bin_dir.mkdir(exist_ok=True)
+        fake = bin_dir / 'systemctl'
+        fake.write_text(f"#!/bin/sh\nprintf '%s' '{stdout}'\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv('PATH', str(bin_dir))
+
+    return install
+
+
+class TestUnitProbeFailsClosed:
+    """Whatever the probe cannot confirm inactive counts as active, so VACUUM is refused."""
+
+    def _reclaim_with_the_real_probe(self, tmp_path, capsys):
+        db_path = _bulky_migrated_journal(tmp_path, capsys)
+        before = _db_bytes(db_path)
+        code = _script.main(['reclaim', '--journal', str(db_path), '--apply'])
+        return code, capsys.readouterr().err, db_path, before
+
+    def test_confirmed_inactive_units_let_the_reclaim_run(
+        self, tmp_path, capsys, systemctl_on_path,
+    ):
+        systemctl_on_path('inactive\ninactive\n')
+
+        code, err, db_path, before = self._reclaim_with_the_real_probe(tmp_path, capsys)
+
+        assert code == 0, err
+        assert _db_bytes(db_path) != before
+
+    def test_a_missing_systemctl_refuses(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv('PATH', str(tmp_path / 'no-such-bin'))
+
+        code, err, db_path, before = self._reclaim_with_the_real_probe(tmp_path, capsys)
+
+        assert code != 0
+        assert 'fused-memory' in err
+        assert _db_bytes(db_path) == before
+
+    def test_a_probe_that_times_out_refuses(self, tmp_path, capsys, monkeypatch):
+        def hang(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd='systemctl', timeout=10)
+
+        monkeypatch.setattr(_script.subprocess, 'run', hang)
+
+        code, err, db_path, before = self._reclaim_with_the_real_probe(tmp_path, capsys)
+
+        assert code != 0
+        assert 'fused-memory' in err
+        assert _db_bytes(db_path) == before
+
+    def test_output_naming_fewer_units_than_asked_refuses(
+        self, tmp_path, capsys, systemctl_on_path,
+    ):
+        systemctl_on_path('inactive\n')
+
+        code, err, db_path, before = self._reclaim_with_the_real_probe(tmp_path, capsys)
+
+        assert code != 0
+        assert _db_bytes(db_path) == before

@@ -4,6 +4,7 @@ Everything runs on real sqlite3 connections built from the module's own
 public SQL constants; nothing is mocked.
 """
 
+import asyncio
 import itertools
 import sqlite3
 import uuid
@@ -15,11 +16,13 @@ from fused_memory.services.read_rollup import (
     COUNT_ONLY_READ_PREDICATE,
     COUNT_READ_SQL,
     DELETE_COUNT_ONLY_READS_SQL,
+    FIRST_COUNT_ONLY_ROWID_SQL,
     RAW_READS_BY_ROLLUP_KEY_SQL,
     READ_OP_COUNTS_SCHEMA_SQL,
     keeps_read_row,
 )
 from fused_memory.services.write_journal import SCHEMA_SQL as WRITE_OPS_SCHEMA_SQL
+from fused_memory.services.write_journal import WriteJournal
 
 
 def _rollup_db() -> sqlite3.Connection:
@@ -319,3 +322,43 @@ class TestMigrationChunkSql:
         assert any(_is_count_only(row) for row in outside)
         after = _full_rows(conn)
         assert all(after[row['rowid']] == before[row['rowid']] for row in outside)
+
+
+# The statements run on the live journal, whose kind index (idx_wo_kind_time) exists
+# only once WriteJournal.initialize() has run, and whose size makes the plan the whole
+# cost: a plan that walks the kind index instead of the rowid b-tree holds the
+# migration's write lock for minutes per chunk (task 5405 review).
+class TestMigrationQueryPlans:
+    @pytest.fixture
+    def live_shaped_db(self, tmp_path):
+        async def _init() -> str:
+            journal = WriteJournal(tmp_path / 'journal')
+            await journal.initialize()
+            await journal.close()
+            return str(journal.db_path)
+
+        conn = sqlite3.connect(asyncio.run(_init()))
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(write_ops)')}
+        assert 'idx_wo_kind_time' in indexes
+        yield conn
+        conn.close()
+
+    @staticmethod
+    def _plan(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> str:
+        # EXPLAIN QUERY PLAN rows are (id, parent, notused, detail).
+        return ' | '.join(row[3] for row in conn.execute(f'EXPLAIN QUERY PLAN {sql}', params))
+
+    @pytest.mark.parametrize(
+        'sql', [RAW_READS_BY_ROLLUP_KEY_SQL, DELETE_COUNT_ONLY_READS_SQL],
+        ids=['preview', 'delete'],
+    )
+    def test_a_chunk_statement_seeks_the_rowid_range(self, live_shaped_db, sql):
+        plan = self._plan(live_shaped_db, sql, (1, 5001))
+
+        assert 'USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)' in plan, plan
+        assert 'idx_wo' not in plan, plan
+
+    def test_the_first_rowid_lookup_scans_in_rowid_order_without_a_sort(self, live_shaped_db):
+        plan = self._plan(live_shaped_db, FIRST_COUNT_ONLY_ROWID_SQL)
+
+        assert plan == 'SCAN write_ops', plan

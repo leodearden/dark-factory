@@ -53,16 +53,26 @@ COUNT_ONLY_READ_PREDICATE = (
 )
 
 # History migration (fused-memory/scripts/roll_up_journal_reads.py). Parameters
-# for both: a rowid window (lo, hi), half-open. Rowids are a sequential table
-# b-tree range in insertion (= time) order, so no index is built on write_ops.
+# for both: a rowid window (lo, hi), half-open. NOT INDEXED pins the plan to the
+# INTEGER PRIMARY KEY rowid range: left to itself the planner walks every
+# kind = 'read' entry of idx_wo_kind_time, which at journal scale holds the write
+# lock for minutes per chunk.
 _COLUMN_KEY = _rollup_key('created_at', 'project_id', 'agent_id', 'operation')
 
 RAW_READS_BY_ROLLUP_KEY_SQL = (
-    f'SELECT {_COLUMN_KEY}, COUNT(*) FROM write_ops '
+    f'SELECT {_COLUMN_KEY}, COUNT(*) FROM write_ops NOT INDEXED '
     f'WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE} '
     'GROUP BY 1, 2, 3, 4'
 )
 
 DELETE_COUNT_ONLY_READS_SQL = (
-    f'DELETE FROM write_ops WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE}'
+    'DELETE FROM write_ops NOT INDEXED '
+    f'WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE}'
+)
+
+# The migration's work queue starts at the first count-only rowid; NOT INDEXED
+# keeps ORDER BY rowid a rowid-order scan that stops at its first match.
+FIRST_COUNT_ONLY_ROWID_SQL = (
+    f'SELECT rowid FROM write_ops NOT INDEXED WHERE {COUNT_ONLY_READ_PREDICATE} '
+    'ORDER BY rowid LIMIT 1'
 )

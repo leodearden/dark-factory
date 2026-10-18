@@ -38,8 +38,10 @@ rows, search reads and failed reads are never touched.
 RJ="uv run --frozen --project fused-memory python fused-memory/scripts/roll_up_journal_reads.py"
 ```
 
-`--journal` defaults to the live file,
-`/home/leo/src/dark-factory/data/reconciliation/write_journal.db`.
+`--journal` defaults to the file fused-memory's config names
+(`reconciliation.data_dir`, read as `snapshot` reads the retention horizon;
+a relative `data_dir` is anchored at this checkout, the service's working
+directory), the live `data/reconciliation/write_journal.db`.
 Every command prints one JSON report on stdout, and refusals on stderr with
 exit 1.
 
@@ -96,7 +98,8 @@ and exits naming the window, the key and both values. Compare the pilot's
 check `max_chunk_seconds`. Each chunk holds SQLite's write lock for about its
 transaction time, and fused-memory's `busy_timeout` is 5000 ms: a write that
 waits longer is DROPPED (`log_write_op` swallows the error). Keep the maximum
-well under ~2 s. If it is higher, lower `--chunk-rowids` or raise
+well under ~2 s (the full-scale pilot measured mean ~0.45 s, max ~0.6 s at the
+default 2,000 rowids). If it is higher, lower `--chunk-rowids` or raise
 `--pause-seconds`.
 
 `verify` exits 1 and prints every `(window, hour, kind, operation)` whose
@@ -194,7 +197,16 @@ were re-anchored on the post-5405 volume:
 
 - **Insert rate** (`max_rows_inserted_per_day`): clears by itself once
   fused-memory runs the 5405 build, because counted reads insert no
-  `write_ops` row.
+  `write_ops` row. **Expect ONE fresh insert-rate escalation first, for up to
+  ~24 h after fused-memory first runs the 5405 build.** The sample is a rowid
+  difference over the trailing 24 h, so the ~0.8-1.1M per-read rows the old
+  build inserted inside that window count even after `migrate` deletes them,
+  and migrating does not shorten it. **Do NOT re-anchor the 75,000 ceiling on
+  that transient.** It ends on its own when the window holds only 5405-build
+  inserts. The alarm's suggested `GROUP BY operation, agent_id` over
+  `write_ops` shows nothing anomalous once rows are migrated, which is the
+  tell. A crossing that persists beyond ~24 h after the 5405 restart is a
+  real regression.
 - **File size** (`max_file_bytes`): stays BREACHED from deploy until the
   reclaim above runs, because the file only shrinks under VACUUM. That one
   folded escalation is expected; this reclaim clears it.
@@ -274,31 +286,53 @@ regression would bring back, ran 0.71-1.20M/day, with a trailing 7-day mean of
 1,012,738/day. That is ~477 MB/day at the 2026-09-10 measurement of
 471 B/row.
 
-**(c) Migration rate.**
+**(c) Migration rate, at full scale (2026-10-18).** The 2026-10-16 figures
+here came from a 1M-row scratch journal and did not transfer: on the live
+journal's 35M `kind='read'` index entries the chunk statements planned a walk
+of `idx_wo_kind_time` and held the write lock for minutes per chunk. Both chunk
+statements and the first-rowid lookup are now `NOT INDEXED`, and tests pin their
+plans (`fused-memory/tests/test_read_rollup.py::TestMigrationQueryPlans`).
+Re-measured on 2026-10-18 against a full-size COPY of the live journal
+(19,943,129,088 B, MAX(rowid) 62,188,633, taken with the sqlite3 backup API from
+a `mode=ro` source in one step, 138 s; on the same NVMe volume as the live
+file; deleted afterwards), with the script run exactly as the runbook says,
+apart from creating the empty `read_op_counts` table the live pre-5405
+build did not have yet:
 
-- **Setup:** one day of live `write_ops` (2026-10-08, rowids 51,290,176 to
-  52,307,029, 1,016,853 rows) was copied into a scratch journal. Copies of it
-  ran `migrate_chunk` in a loop for up to 120-150 s per setting.
-- **Lock hold vs. checkpoint:** the second pass turned auto-checkpoint off and
-  ran `PRAGMA wal_checkpoint(PASSIVE)` after each COMMIT. That separates the
-  transaction (the write-lock hold) from the checkpoint, which auto-checkpoint
-  runs after the lock is released.
+- **Plans on the live file (read-only):** both chunk statements
+  `SEARCH write_ops USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)`; the
+  first-rowid lookup `SCAN write_ops` (rowid order, no sort). One 5,000-rowid
+  `RAW_READS_BY_ROLLUP_KEY_SQL` chunk took 0.018 s (35 keys, 4,946 rows); the
+  old SQL took 73.7 s and 92.7 s for the same chunk. The first-rowid lookup
+  took 6.0 s (old: 237-302 s).
+- **`status`:** 12.9 s (old: ~5 min). `snapshot`: 83 s. `verify`: 68-102 s,
+  empty `mismatches` after the pilot and again after 2.06M rows (5.9% of the
+  backlog).
+- **Setup is reported apart from the rate.** `setup_seconds` is the first-rowid
+  lookup (0.3-9 s); `seconds` and `rows_per_second` cover the chunk loop only.
 
-| `--chunk-rowids` / `--pause-seconds` | rows/s | chunk transaction mean / p95 / max (s) | checkpoint mean (s) |
+| `--chunk-rowids` / `--pause-seconds` | chunks | rows/s | chunk transaction mean / max (s) |
 |---|---|---|---|
-| 1000 / 0.25 | 1,651 | 0.32 / 0.55 / 1.04 | 0.03 |
-| 2000 / 0.5 | 2,092 | 0.43 / 0.93 / 1.93 | 0.02 |
-| 2000 / 0.5 (repeat) | 2,067 | 0.40 / 0.60 / 1.08 | 0.05 |
-| **5000 / 0.5** (default) | **5,293** | **0.37 / 0.63 / 1.06** | 0.07 |
-| 10000 / 0.5 (first pass, finished the day in 99.6 s) | 10,144 | 0.48 / 0.91 / 1.44 | included |
+| 5000 / 0.5 (pilot, `--max-chunks 25`) | 25 | 2,554 | 1.44 / 2.09 |
+| **2000 / 0.5** (default) | 25 | 2,096 | 0.44 / 0.61 |
+| 1000 / 0.5 | 25 | 1,237 | 0.30 / 0.52 |
+| **2000 / 0.5, sustained 600 s** | 593 | **1,960** | **0.51 / 5.69** |
 
-- **Fixed cost per transaction:** a transaction costs ~0.3 s almost
-  regardless of size, which is the `synchronous=FULL` commit on this shared,
-  loaded disk. Small chunks therefore buy no shorter lock and cost throughput.
-- **Variance:** a first-pass 2000 / 0.5 run on a cold copy measured
-  0.80 / 2.41 / 3.64 s. Treat the maxima as noisy, which is why the pilot
-  reports `max_chunk_seconds`.
-- **Projection:** the backlog is 35,100,727 count-only rows, plus ~1M a day
-  until fused-memory restarts onto 5405. At ~5,000 rows/s that is **~2 h** on
-  scratch. The live table holds ~35x the scratch's rows and its b-trees are
-  colder, so expect slower; the pilot's `rows_per_second` is the real figure.
+- **The cost is per row, not per transaction.** A chunk deletes ~5,000 rows
+  and updates every index of cold pages, so a 5,000-rowid chunk costs ~1.4 s
+  and a 2,000-rowid chunk ~0.45 s. That is why the default is now 2,000 and
+  not 5,000: the maximum then stays under fused-memory's 5000 ms
+  `busy_timeout` with room to spare.
+- **Lock hold vs. the reported time.** `*_chunk_seconds` include the
+  auto-checkpoint that runs after COMMIT, outside the write lock. A separate run
+  with checkpoints taken apart (129 chunks of 2,000 rowids) measured the
+  transaction alone at mean 0.37 s, p95 0.58 s, max 1.94 s; 87 chunks of 5,000
+  measured 0.78 / 1.36 / 2.71 s.
+- **Variance:** the 600 s run had one 5.69 s chunk in 593, on a workstation that
+  is ~97% CPU-busy. A maximum above 5 s is a dropped write in the live service,
+  so watch `max_chunk_seconds` in the pilot; if the 25-chunk pilot shows more
+  than ~2 s, lower `--chunk-rowids` or raise `--pause-seconds`.
+- **Projection:** the backlog is ~35.1M count-only rows, plus ~1M a day until
+  fused-memory restarts onto 5405. At the sustained 1,960 rows/s that is about
+  **5 h** of online migration (extrapolated from a 10-minute run; the pilot's
+  `rows_per_second` on the live file is the real figure).

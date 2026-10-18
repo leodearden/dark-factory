@@ -29,14 +29,16 @@ from fused_memory.services.read_rollup import (
     COUNT_ONLY_READ_PREDICATE,
     COUNT_READ_SQL,
     DELETE_COUNT_ONLY_READS_SQL,
+    FIRST_COUNT_ONLY_ROWID_SQL,
     RAW_READS_BY_ROLLUP_KEY_SQL,
 )
+from fused_memory.services.write_journal import WriteJournal
 
-DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
+CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 #: The config fused-memory reads when CONFIG_PATH is unset, as
 #: fused_memory/server/main.py::run_server defaults it.
-SERVICE_CONFIG = Path(__file__).resolve().parents[1] / 'config' / 'config.yaml'
-DEFAULT_CHUNK_ROWIDS = 5000
+SERVICE_CONFIG = CHECKOUT_ROOT / 'fused-memory' / 'config' / 'config.yaml'
+DEFAULT_CHUNK_ROWIDS = 2000
 DEFAULT_PAUSE_SECONDS = 0.5
 DEFAULT_DEPLOY_GRACE_MINUTES = 15.0
 DEFAULT_WINDOW_HOURS = (1, 24, 168)
@@ -48,9 +50,6 @@ _ACTIVE_STATES = frozenset({'active', 'activating', 'reloading', 'deactivating'}
 
 _ROLLUP_KEY_COLUMNS = ('hour_start', 'project_id', 'agent_id', 'operation')
 
-_FIRST_COUNT_ONLY_ROWID_SQL = (
-    f'SELECT rowid FROM write_ops WHERE {COUNT_ONLY_READ_PREDICATE} ORDER BY rowid LIMIT 1'
-)
 _NEWEST_COUNT_ONLY_READ_SQL = (
     'SELECT created_at FROM write_ops INDEXED BY idx_wo_kind_time '
     f'WHERE {COUNT_ONLY_READ_PREDICATE} ORDER BY created_at DESC LIMIT 1'
@@ -122,10 +121,13 @@ class MigrationReport:
     applied: bool
     chunks: int
     rows_moved: int
+    #: Chunk-loop time only; ``rows_per_second`` and ``--max-seconds`` use it.
     seconds: float
     rows_per_second: float
     remaining: RowidSpan | None
     preview: tuple[tuple[Any, ...], ...]
+    #: Resolving the work queue's first rowid, before the first chunk.
+    setup_seconds: float = 0.0
     #: Each chunk's transaction time, which bounds its write-lock hold; keep it
     #: well under fused-memory's 5000 ms busy_timeout.
     mean_chunk_seconds: float = 0.0
@@ -189,6 +191,13 @@ def window_hours(text: str) -> tuple[int, ...]:
     return hours
 
 
+def unquoted_dir(text: str) -> Path:
+    """A directory spelled into a quoted PRAGMA string, so it cannot carry a quote."""
+    if "'" in text:
+        raise argparse.ArgumentTypeError(f'a directory with a quote character: {text!r}')
+    return Path(text)
+
+
 def connect_read_only(journal: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f'{journal.resolve().as_uri()}?mode=ro', uri=True, timeout=5.0)
     conn.execute('PRAGMA query_only=ON')
@@ -209,7 +218,7 @@ def _scalar(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> A
 
 def count_only_span(conn: sqlite3.Connection) -> RowidSpan | None:
     """The rowid span still holding count-only raw reads: the migration's work queue."""
-    first = _scalar(conn, _FIRST_COUNT_ONLY_ROWID_SQL)
+    first = _scalar(conn, FIRST_COUNT_ONLY_ROWID_SQL)
     if first is None:
         return None
     return RowidSpan(first_rowid=first, max_rowid=_scalar(conn, 'SELECT MAX(rowid) FROM write_ops'))
@@ -248,17 +257,28 @@ def require_no_recent_count_only_read(
         )
 
 
-def configured_read_retention_days() -> float:
-    """fused-memory's raw read horizon, loaded as the service loads it: from
-    $CONFIG_PATH, else SERVICE_CONFIG, with ${VAR:default} expanded from this
-    process's environment."""
+def service_config() -> FusedMemoryConfig:
+    """fused-memory's config, loaded as the service loads it: from $CONFIG_PATH,
+    else SERVICE_CONFIG, with ${VAR:default} expanded from this process's environment."""
     previous = os.environ.get('CONFIG_PATH')
     os.environ['CONFIG_PATH'] = previous or str(SERVICE_CONFIG)
     try:
-        return FusedMemoryConfig().write_journal.read_retention_days
+        return FusedMemoryConfig()
     finally:
         if previous is None:
             del os.environ['CONFIG_PATH']
+
+
+def configured_read_retention_days() -> float:
+    return service_config().write_journal.read_retention_days
+
+
+def configured_journal() -> Path:
+    """The journal the service writes: ``reconciliation.data_dir``, which the service
+    anchors at its working directory (the checkout root), so a relative one is
+    anchored at this script's checkout."""
+    data_dir = Path(service_config().reconciliation.data_dir)
+    return WriteJournal(CHECKOUT_ROOT / data_dir).db_path
 
 
 def panel_windows(
@@ -380,8 +400,9 @@ def _limit_reached(limits: MigrationLimits, chunks: int, elapsed: float) -> bool
 
 
 def migrate(conn: sqlite3.Connection, limits: MigrationLimits) -> MigrationReport:
-    started = time.monotonic()
+    setup_started = time.monotonic()
     span = count_only_span(conn)
+    started = time.monotonic()
     rows_moved = 0
     chunk_seconds: list[float] = []
     if span is not None:
@@ -399,6 +420,7 @@ def migrate(conn: sqlite3.Connection, limits: MigrationLimits) -> MigrationRepor
         applied=True,
         chunks=len(chunk_seconds),
         rows_moved=rows_moved,
+        setup_seconds=round(started - setup_started, 3),
         seconds=round(seconds, 3),
         rows_per_second=round(rows_moved / seconds, 1) if seconds > 0 else 0.0,
         remaining=count_only_span(conn),
@@ -510,7 +532,11 @@ def reclaim(
 
 def _common_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument('--journal', type=Path, default=DEFAULT_JOURNAL)
+    common.add_argument(
+        '--journal', type=Path, default=None,
+        help="the journal (default: the one fused-memory's config names; see "
+        '--read-retention-days for how the config is found)',
+    )
     return common
 
 
@@ -553,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vacuum.add_argument('--apply', action='store_true')
     vacuum.add_argument(
-        '--temp-dir', type=Path, default=None,
+        '--temp-dir', type=unquoted_dir, default=None,
         help="VACUUM's temporary copy (default: SQLite's own: $SQLITE_TMPDIR, $TMPDIR, "
         '/var/tmp, /usr/tmp, /tmp)',
     )
@@ -638,6 +664,8 @@ def main(
 ) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.journal is None:
+            args.journal = configured_journal()
         if args.command == 'reclaim':
             return _run_reclaim(args, unit_active)
         return _COMMANDS[args.command](args)
