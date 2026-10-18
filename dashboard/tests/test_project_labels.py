@@ -6,6 +6,7 @@ import itertools
 from pathlib import Path
 
 import pytest
+
 from dashboard.project_labels import ProjectLabels, basename_label
 
 _SAME_BASENAME = ('/srv/team-a/app', '/srv/team-b/app', '/srv/other')
