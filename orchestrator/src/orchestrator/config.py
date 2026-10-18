@@ -825,7 +825,10 @@ class PsiAdmissionConfig(BaseModel):
     dispatch. Each threshold is one saturation arm of
     ``shared.psi.PsiSample`` and ``None`` switches that arm off. The field
     set, code defaults and ranges are owned by PRD
-    plans/load-throttle-harmonisation-prd.md §6.2.
+    plans/load-throttle-harmonisation-prd.md §6.2. Out-of-range values are
+    rejected because ``enabled: false`` and ``None`` are the sanctioned ways
+    to switch the gate or an arm off: a negative threshold would silently
+    disable an arm and one over 100 would pin it.
 
     All fields are green-tier hot-tunable via RELOADABLE_FIELDS — an
     operator may adjust thresholds post-observation via
@@ -840,6 +843,8 @@ class PsiAdmissionConfig(BaseModel):
     )
     cpu_some_avg10: float | None = Field(
         default=None,
+        ge=0,
+        le=100,
         description=(
             'PSI cpu "some" avg10 (%) threshold — the legacy CPU arm, off by '
             'default because runqueue_ratio is the host CPU arm (PRD '
@@ -848,6 +853,8 @@ class PsiAdmissionConfig(BaseModel):
     )
     mem_some_avg10: float | None = Field(
         default=15.0,
+        ge=0,
+        le=100,
         description=(
             'PSI memory "some" avg10 (%) threshold. Deliberately tighter than '
             'io_some_avg10 — memory ranks above io per DA-D1. None = arm off.'
@@ -855,10 +862,14 @@ class PsiAdmissionConfig(BaseModel):
     )
     mem_full_avg10: float | None = Field(
         default=3.0,
+        ge=0,
+        le=100,
         description='PSI memory "full" avg10 (%) threshold — memory hard-trip. None = arm off.',
     )
     io_some_avg10: float | None = Field(
         default=40.0,
+        ge=0,
+        le=100,
         description=(
             'PSI io "some" avg10 (%) threshold — looser than mem_some_avg10. '
             'None = arm off.'
@@ -866,6 +877,7 @@ class PsiAdmissionConfig(BaseModel):
     )
     runqueue_ratio: float | None = Field(
         default=None,
+        gt=0,
         description=(
             'Host CPU arm (PRD load-throttle-harmonisation D1): procs_running '
             'from /proc/stat divided by len(os.sched_getaffinity(0)). Any value '
@@ -874,6 +886,8 @@ class PsiAdmissionConfig(BaseModel):
     )
     own_cpu_some_avg10: float | None = Field(
         default=None,
+        ge=0,
+        le=100,
         description=(
             'cpu "some" avg10 (%) of the orchestrator\'s own cgroup — its '
             'df-<project_id>.slice when present, else its own unit (PRD '
