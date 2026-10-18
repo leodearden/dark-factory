@@ -236,7 +236,8 @@ class WorkProductProbe:
                 'succeeds the continuity term is zero fleet-wide, so no task earns credit for '
                 'its work product (PRD C3, INV-4). Usual causes: git older than 2.41 lacks '
                 '%(ahead-behind); the configured main branch is missing; project_root is not a '
-                'repository root. The streak clears on the next successful refresh.'
+                'repository root; the events DB holding the zero-progress record is unreadable. '
+                'The streak clears on the next successful refresh.'
             ),
             suggested_action='restore_the_continuity_branch_probe',
         )

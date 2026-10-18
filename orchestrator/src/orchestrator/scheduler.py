@@ -93,6 +93,7 @@ from orchestrator.recovery_emission import (
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
+from orchestrator.strict_event_reads import task_ids_with_event
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.work_product import (
     BranchWork,
@@ -7924,12 +7925,13 @@ class Scheduler:
         return verdict.armed
 
     def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
-        """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3)."""
-        stalled = store.fetch_events_by_type_all_runs(EventType.zero_progress_requeue)
-        return WorkProductSnapshot(
-            branches=self._branch_work_reader(),
-            zero_progress=frozenset(str(row['task_id']) for row in stalled if row['task_id'] is not None),
-        )
+        """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3).
+
+        The gate is read strictly: an unreadable store fails the refresh, which
+        withdraws all credit, rather than reading as "no task ever stalled".
+        """
+        stalled = task_ids_with_event(store.db_path, EventType.zero_progress_requeue)
+        return WorkProductSnapshot(branches=self._branch_work_reader(), zero_progress=stalled)
 
     def _poll_work_product(self) -> None:
         """Start a continuity-probe refresh when one is due; with no event store there is no gate to read."""

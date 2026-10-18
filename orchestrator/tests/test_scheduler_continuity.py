@@ -261,6 +261,12 @@ class TestContinuityCredit:
 
         assert await _settled_winner(scheduler, _twins()) == '10'
 
+    async def test_an_unreadable_zero_progress_record_withholds_all_credit(self, store, clock):
+        scheduler = _scheduler(_reader({'11': _fresh()}), event_store=store, clock=clock)
+        store.db_path.write_bytes(b'not a database ' * 64)
+
+        assert await _settled_winner(scheduler, _twins()) == '10'
+
     async def test_another_tasks_zero_progress_row_does_not_withhold_the_credit(self, store, clock):
         store.emit(EventType.zero_progress_requeue, task_id='99', data={'consecutive': 3})
         scheduler = _scheduler(_reader({'11': _fresh()}), event_store=store, clock=clock)
