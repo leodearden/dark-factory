@@ -4,14 +4,11 @@ The sibling of ``escalation/tests/test_merge_status_boundary.py`` (rows B1-B9).
 On a store of at least 300k events and 2,500 merge_finalized rows, B10 replays
 the cross-run reads the real merge_status issues for each poll, recorded off
 the store.  It asserts two bounds.  Each read's query plan SEARCHes one of task
-6927's partial indexes, which fails on a dropped index whatever the host load.
-The median of 200 wall-clock replays is under 50 ms; it is WALL time because
-INV-8 (``docs/legibility/design-invariants.md``) bounds event-loop wall time,
-and merge_status's cross-run reads run synchronously inside its async resolver.
-These replace esc-4834-2's p99 < 50 ms, superseded by Leo's 2026-10-18 ruling
-(b) on cockpit decision dark_factory-b10-flake-7090, because host scheduling
-stalls on the merge host lift the tail of a ~2 ms read (task 7090).  Git is
-deliberately not touched: B10 is scoped to the cross-run read.
+6927's partial ``idx_mf_*`` indexes.  The median of 200 wall-clock replays is
+under 50 ms: INV-8 (``docs/legibility/design-invariants.md``) bounds event-loop
+wall time, and merge_status's cross-run reads run synchronously inside its
+async resolver.  The PRD's B10 row records why these bounds replaced a p99
+bound.  Git is deliberately not touched: B10 is scoped to the cross-run read.
 """
 from __future__ import annotations
 
@@ -262,39 +259,65 @@ async def _recorded_reads(store: EventStore, shape: str, escalations: Path) -> t
     return reads
 
 
+@dataclass(frozen=True)
+class _IssuedSelect:
+    """The one SELECT a recorded read ran on the store, and the parameters it bound."""
+
+    read: _Read
+    sql: str
+    params: tuple[Any, ...]
+
+    def plan(self, conn: sqlite3.Connection) -> str:
+        return ' | '.join(
+            row[3] for row in conn.execute(f'EXPLAIN QUERY PLAN {self.sql}', self.params)
+        )
+
+
 def _selects_issued(
     store: EventStore, reads: tuple[_Read, ...], monkeypatch: pytest.MonkeyPatch,
-) -> tuple[str, ...]:
-    """Replays *reads* once and returns each SELECT they ran on *store*'s database, parameters bound."""
-    statements: list[str] = []
+) -> tuple[_IssuedSelect, ...]:
+    """Replays each of *reads* alone, pairing it with the one SELECT it ran on *store*'s database."""
+    statements: list[tuple[str, tuple[Any, ...]]] = []
     connect = sqlite3.connect
 
-    def traced(database: str | os.PathLike[str], *args: Any, **kwargs: Any) -> sqlite3.Connection:
-        conn = connect(database, *args, **kwargs)
-        if Path(database) == store.db_path:
-            conn.set_trace_callback(statements.append)
-        return conn
+    class Recording(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            statements.append((sql, tuple(parameters)))
+            return super().execute(sql, parameters)
 
+    def recording(database: str | os.PathLike[str], *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if Path(database) != store.db_path:
+            return connect(database, *args, **kwargs)
+        return connect(database, *args, factory=Recording, **kwargs)
+
+    issued: list[_IssuedSelect] = []
     with monkeypatch.context() as patch:
-        patch.setattr(sqlite3, 'connect', traced)
-        _replay(store, reads)
-    return tuple(s for s in statements if s.lstrip().upper().startswith('SELECT'))
+        patch.setattr(sqlite3, 'connect', recording)
+        for read in reads:
+            statements.clear()
+            read.issue(store)
+            selects = [
+                (sql, params) for sql, params in statements
+                if sql.lstrip().upper().startswith('SELECT')
+            ]
+            assert len(selects) == 1, (read, statements)
+            issued.append(_IssuedSelect(read, *selects[0]))
+    return tuple(issued)
 
 
-def _plans_off_a_partial_index(db_path: Path, selects: Iterable[str]) -> list[str]:
-    """The query plan of each statement that does not SEARCH events through one of the table's partial indexes."""
+def _plans_off_a_partial_index(
+    db_path: Path, selects: Iterable[_IssuedSelect],
+) -> list[tuple[_Read, str]]:
+    """Each read whose SELECT does not SEARCH events through a partial ``idx_mf_*`` index, with its plan."""
     with closing(sqlite3.connect(db_path)) as conn:
         partial = {
             name for (name,) in conn.execute(
-                "SELECT name FROM pragma_index_list('events') WHERE partial",
+                "SELECT name FROM pragma_index_list('events') WHERE partial AND name GLOB 'idx_mf_*'",
             )
         }
-        plans = [
-            ' | '.join(row[3] for row in conn.execute(f'EXPLAIN QUERY PLAN {select}'))
-            for select in selects
-        ]
+        planned = [(select.read, select.plan(conn)) for select in selects]
     return [
-        plan for plan in plans
+        (read, plan) for read, plan in planned
         if not any(plan.startswith(f'SEARCH events USING INDEX {name} (') for name in partial)
     ]
 
@@ -324,26 +347,27 @@ async def test_b10_every_cross_run_read_searches_a_partial_index(
     seeded = production_sized_store
     reads = await _recorded_reads(seeded.store, shape, tmp_path / 'escalations')
     selects = _selects_issued(seeded.store, reads, monkeypatch)
-    assert len(selects) == len(reads), (shape, reads, selects)
     assert _plans_off_a_partial_index(seeded.store.db_path, selects) == [], shape
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('shape', 'dropped'), [
-    ('request_id_miss', 'idx_mf_request_id'),
-    ('request_id_miss', 'idx_mf_absorbs'),
-    ('request_id_miss', 'idx_mf_superseded_by'),
-    ('branch_miss', 'idx_mf_branch'),
-    ('task_id_miss', 'idx_mf_task_id'),
+@pytest.mark.parametrize(('shape', 'dropped', 'served_read'), [
+    ('request_id_miss', 'idx_mf_request_id', 'latest_merge_finalized'),
+    ('request_id_miss', 'idx_mf_absorbs', 'merge_finalized_absorbing'),
+    ('request_id_miss', 'idx_mf_superseded_by', 'merge_finalized_superseded_by'),
+    ('branch_miss', 'idx_mf_branch', 'latest_merge_finalized'),
+    ('task_id_miss', 'idx_mf_task_id', 'latest_merge_finalized'),
 ])
 async def test_b10_index_check_flags_the_read_whose_partial_index_is_dropped(
-    shape: str, dropped: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    shape: str, dropped: str, served_read: str, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = EventStore(tmp_path / 'runs.db', 'run-current')
     reads = await _recorded_reads(store, shape, tmp_path / 'escalations')
     selects = _selects_issued(store, reads, monkeypatch)
+    assert _plans_off_a_partial_index(store.db_path, selects) == []
     with closing(sqlite3.connect(store.db_path)) as conn:
         conn.execute(f'DROP INDEX {dropped}')
         conn.commit()
     off = _plans_off_a_partial_index(store.db_path, selects)
-    assert len(off) == 1, off
+    assert [read.method for read, _ in off] == [served_read], off
