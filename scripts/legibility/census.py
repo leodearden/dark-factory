@@ -3194,6 +3194,7 @@ def run_census(
                 sighted=sighted,
                 run_id=run_id,
                 cause_of=functools.partial(_entry_text, updated_codebook, field="cause"),
+                disposition_of=lambda entry: str(disposition.disposition_of(entry, {})),
             )
         ],
         area_map=area_map.to_record(),

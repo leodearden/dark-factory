@@ -70,6 +70,43 @@ class Standing(enum.StrEnum):
     ABANDONED = "abandoned"
 
 
+class DispositionKind(enum.StrEnum):
+    OPEN = "open"
+    FILED = "filed"
+    ACCEPTED = "accepted"
+    REFUTED = "refuted"
+    FIXED = "fixed"
+
+
+_REFERENCE_OF = {
+    DispositionKind.OPEN: (type(None), "no reference"),
+    DispositionKind.FILED: (int, "a task id"),
+    DispositionKind.ACCEPTED: (int, "a task id"),
+    DispositionKind.REFUTED: (type(None), "no reference"),
+    DispositionKind.FIXED: (str, "a commit sha"),
+}
+
+
+@dataclass(frozen=True)
+class Disposition:
+    """A finding's contract §7 disposition: ``open``, ``filed:<task id>``,
+    ``accepted:<task id>``, ``refuted`` or ``fixed:<sha>``."""
+
+    kind: DispositionKind
+    ref: int | str | None = None
+
+    def __post_init__(self) -> None:
+        expected, described = _REFERENCE_OF[self.kind]
+        if type(self.ref) is not expected:
+            raise ValueError(f"a {self.kind.value} disposition takes {described}, got {self.ref!r}")
+
+    def __str__(self) -> str:
+        return self.kind.value if self.ref is None else f"{self.kind.value}:{self.ref}"
+
+
+_OPEN = Disposition(DispositionKind.OPEN)
+
+
 def _require_the_codebook_vocabulary(name: str, stated: Iterable[str], required: Iterable[str]) -> None:
     if sorted(stated) != sorted(required):
         raise RuntimeError(
@@ -194,18 +231,18 @@ class Decision:
         return self.ticket is not None or self.task_id is not None
 
     def disposition(self) -> str:
-        """The contract §7 disposition this decision gives the finding."""
-        if self.standing is Standing.ACCEPTED:
-            return f"accepted:{self.task_id}"
+        """The contract §7 disposition this decision gives the finding, with a
+        note when it is open for a reason the decision knows."""
         if self.standing is Standing.DONE:
-            return f"open (task {self.task_id} done; §8 step 1c re-verify not yet run)"
+            return f"{_OPEN} (task {self.task_id} done; §8 step 1c re-verify not yet run)"
         if self.task_id is not None:
-            return f"filed:{self.task_id}"
+            kind = DispositionKind.ACCEPTED if self.standing is Standing.ACCEPTED else DispositionKind.FILED
+            return str(Disposition(kind, self.task_id))
         if self.resolution is not None:
-            return f"open (ticket {self.ticket} {self.resolution.value})"
+            return f"{_OPEN} (ticket {self.ticket} {self.resolution.value})"
         if self.ticket is not None:
-            return f"open (ticket {self.ticket} pending)"
-        return "open"
+            return f"{_OPEN} (ticket {self.ticket} pending)"
+        return str(_OPEN)
 
     def with_outcome(self, outcome: task_store.TicketOutcome) -> Decision:
         """This decision once its curator ticket reached *outcome*."""
@@ -999,6 +1036,39 @@ def refilings(
         elif governing is not None and governing.standing is Standing.ABANDONED and outcome.entry_id in sighted:
             refiled.append(Refiling(outcome.entry_id, None, False))
     return tuple(refiled)
+
+
+def disposition_of(entry: Mapping[str, Any], standings: Mapping[TaskRef, Standing]) -> Disposition:
+    """*entry*'s contract §7 disposition, from its (projected) status and its
+    ``filed_tickets`` read against *standings*: fixed at its sha, accepted by
+    its task, filed under its newest live task, else open."""
+    status = entry.get("status")
+    if status == _FIXED_STATUS and entry.get("fixed_at_sha"):
+        return Disposition(DispositionKind.FIXED, entry["fixed_at_sha"])
+    if status == _ACCEPTED_STATUS and entry.get("accepted_by") is not None:
+        return Disposition(DispositionKind.ACCEPTED, entry["accepted_by"])
+    live = [
+        row["task_id"]
+        for row in entry.get("filed_tickets") or []
+        if row.get("task_id") is not None
+        and standings.get(TaskRef(row["project_root"], row["task_id"])) is Standing.FILED
+    ]
+    return Disposition(DispositionKind.FILED, max(live)) if live else _OPEN
+
+
+def task_standings(outcomes: Outcomes, decisions: Iterable[Decision]) -> dict[TaskRef, Standing]:
+    """Every task standing this run knows: the outcome read's, then each
+    routed decision's, a curator ticket's created or combined task among them."""
+    standings = {
+        task.ref: task.standing
+        for entry in outcomes.entries
+        for task in entry.tasks
+        if task.ref is not None and task.standing is not None
+    }
+    for decision in decisions:
+        if decision.task_id is not None and decision.standing is not None:
+            standings[TaskRef(decision.filing.project_root, decision.task_id)] = decision.standing
+    return standings
 
 
 @dataclass(frozen=True)

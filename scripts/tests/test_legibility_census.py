@@ -2120,8 +2120,8 @@ def _sample_finding_entry() -> dict:
 def _sample_finding_record(*, cause: str = "the cause", observed: bool = False) -> dict:
     entry = _sample_finding_entry()
     if observed:
-        return census_findings.observed_row(entry, cause).to_record()
-    return census_findings.confirmed_row(entry, _FINDING_VERDICT, cause=cause).to_record()
+        return census_findings.observed_row(entry, cause, disposition="open").to_record()
+    return census_findings.confirmed_row(entry, _FINDING_VERDICT, cause=cause, disposition="open").to_record()
 
 
 _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
