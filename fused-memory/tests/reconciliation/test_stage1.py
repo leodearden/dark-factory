@@ -798,10 +798,10 @@ class TestReconEscalationDedup:
         cfg = DedupeConfig(
             infra_dedupe_enabled=True,
             infra_dedupe_window_secs=float('inf'),
-            infra_dedupe_categories=('test_sev_category',),
+            infra_dedupe_categories=('recon_integrity_issue',),
             key_fn=content_fingerprint_key,
         )
-        fp = compute_content_fingerprint('test_sev_category', 'stale_k', ['t1'], '')
+        fp = compute_content_fingerprint('recon_integrity_issue', 'stale_k', ['t1'], '')
 
         # First submission: 'info' severity → becomes the parent.
         esc1 = Escalation(
@@ -809,7 +809,7 @@ class TestReconEscalationDedup:
             task_id='sev-parent',
             agent_role='test',
             severity='info',
-            category='test_sev_category',
+            category='recon_integrity_issue',
             summary='stale_k for t1',
             dedupe_fingerprint=fp,
         )
@@ -821,7 +821,7 @@ class TestReconEscalationDedup:
             task_id='sev-child',
             agent_role='test',
             severity='blocking',
-            category='test_sev_category',
+            category='recon_integrity_issue',
             summary='stale_k for t1',
             dedupe_fingerprint=fp,
         )

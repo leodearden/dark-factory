@@ -1093,24 +1093,22 @@ class TestSeverityValidation:
 
 
 # ---------------------------------------------------------------------------
-# TestStrandedBlockedCategory: 'stranded_blocked' is registered in CATEGORIES
+# TestStrandedBlockedCategory: 'stranded_blocked' is a registered category
 # ---------------------------------------------------------------------------
 
 
 class TestStrandedBlockedCategory:
-    """CATEGORIES constant must include 'stranded_blocked' (PRD-3 D5 data-contract)."""
+    """'stranded_blocked' must be a registered category (PRD-3 D5 data-contract)."""
 
     def test_stranded_blocked_in_categories(self):
-        """'stranded_blocked' must be a member of CATEGORIES at runtime.
+        """'stranded_blocked' must be a member of EscalationCategory at runtime.
 
-        This is a data-contract assertion on a runtime constant — not a prose
-        test.  CATEGORIES is the canonical list downstream consumers (task ε,
-        task ι, task ζ) rely on to recognise the category.
+        ``escalation.categories.EscalationCategory`` is the canonical registry
+        downstream consumers (task ε, task ι, task ζ) rely on to recognise the
+        category, and the queue rejects a filing outside it.
         """
-        from escalation.server import CATEGORIES
-        assert 'stranded_blocked' in CATEGORIES, (
-            f"'stranded_blocked' missing from CATEGORIES; current list: {CATEGORIES}"
-        )
+        from escalation.categories import EscalationCategory
+        assert 'stranded_blocked' in EscalationCategory
 
 
 # ---------------------------------------------------------------------------
@@ -1329,12 +1327,11 @@ class TestResolveIssueTableBGate:
 
     @pytest.mark.asyncio
     async def test_novel_category_does_not_narrow_legality(self, tmp_path: Path):
-        """A category absent from server.CATEGORIES (e.g. 'milestone_gate') still resolves.
+        """A category outside the original agent set (e.g. 'milestone_gate') still resolves.
 
         Proves the Table B gate does not narrow legality by category — the G6
-        archive verification found live resolutions across a wide, open
-        category vocabulary that server.CATEGORIES (inert/unvalidated) does
-        not even fully list.
+        archive verification found live resolutions across a wide category
+        vocabulary, far beyond the original agent set.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)

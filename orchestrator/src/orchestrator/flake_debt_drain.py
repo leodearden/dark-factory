@@ -43,6 +43,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Protocol
 
+from escalation.categories import EscalationCategory
 from shared.task_statuses import OwnerLiveness, owner_liveness
 from shared.task_submit import SubmitFailed, SubmitOutcome
 
@@ -232,7 +233,7 @@ class _HeadCheck:
 
 #: The escalation category that IS the ``regressed_after_resolution`` flag (task η): a
 #: test re-entered flake debt after its de-flake task finished, so the fix did not hold.
-REGRESSED_AFTER_RESOLUTION = 'regressed_after_resolution'
+REGRESSED_AFTER_RESOLUTION = EscalationCategory.REGRESSED_AFTER_RESOLUTION
 
 #: ``make_id`` namespace for those escalations.  It names a counter FILE
 #: (``esc-{key}.seq``), so it is fixed and filename-safe, never the raw pytest node-id;
