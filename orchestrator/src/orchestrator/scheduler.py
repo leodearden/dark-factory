@@ -9569,6 +9569,10 @@ class Scheduler:
         if self.event_store:
             self._hold_history.seed_from_event_store(self.event_store)
 
+    async def aclose(self) -> None:
+        """Stop the scheduler's background work; call once at shutdown."""
+        await self.work_product.aclose()
+
     # --- Retry cap (per-task REQUEUED counter) ---
 
     def record_requeue(

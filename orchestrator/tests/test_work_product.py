@@ -394,3 +394,40 @@ class TestWorkProductProbe:
         await rig.refresh(load)
 
         assert load.calls == 2
+
+
+@pytest.mark.asyncio
+class TestWorkProductProbeClose:
+    async def test_close_cancels_an_in_flight_refresh_without_waiting_for_git(self):
+        rig, release = _Rig(), threading.Event()
+
+        def blocked_load() -> WorkProductSnapshot:
+            release.wait(timeout=30)
+            return FRESH
+
+        try:
+            rig.probe.poll(blocked_load)
+            await asyncio.wait_for(rig.probe.aclose(), timeout=5)
+            assert not release.is_set()
+        finally:
+            release.set()
+
+        assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
+        assert rig.filed == []
+
+    async def test_a_closed_probe_starts_no_further_refresh(self):
+        rig, load = _Rig(), _counting_load()
+        await rig.probe.aclose()
+
+        rig.clock[0] = 10 * TTL
+        await rig.refresh(load)
+
+        assert load.calls == 0
+
+    async def test_close_keeps_the_last_published_snapshot(self):
+        rig = _Rig()
+        await rig.refresh(_counting_load())
+
+        await rig.probe.aclose()
+
+        assert rig.probe.snapshot is FRESH

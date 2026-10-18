@@ -145,6 +145,27 @@ class TestBoundedProbeOccupancy:
         await scheduler.work_product.join()
         assert len(blocked) == 1
 
+    async def test_closing_the_scheduler_abandons_a_slow_refresh_and_stops_probing(self, store, clock):
+        release = threading.Event()
+        reads: list[int] = []
+
+        def blocked_reader() -> dict[str, BranchWork]:
+            reads.append(threading.get_ident())
+            release.wait(timeout=30)
+            return {}
+
+        scheduler = _scheduler(blocked_reader, event_store=store, clock=clock)
+        try:
+            await _tick(scheduler, _tasks(3))
+            await asyncio.wait_for(scheduler.aclose(), timeout=5)
+            assert not release.is_set()
+        finally:
+            release.set()
+
+        clock[0] += 10 * TTL
+        await _tick_and_settle(scheduler, _tasks(3))
+        assert len(reads) == 1
+
     async def test_nothing_is_probed_without_an_event_store(self, clock):
         reader = _reader()
         scheduler = _scheduler(reader, event_store=None, clock=clock)

@@ -182,26 +182,41 @@ class WorkProductProbe:
         self._attempted_at: float | None = None
         self._in_flight: asyncio.Task[None] | None = None
         self._failure_streak = 0
+        self._closed = False
 
     @property
     def snapshot(self) -> WorkProductSnapshot:
         return self._snapshot
 
     def poll(self, load: Callable[[], WorkProductSnapshot]) -> None:
-        """Start a refresh when one is due and none is in flight; never waits on it."""
-        if self._in_flight is not None:
+        """Start a refresh when one is due, none is in flight and the probe is open; never waits on it."""
+        if self._closed or self._in_flight is not None:
             return
         now = self._clock()
         if self._attempted_at is not None and now - self._attempted_at < self._ttl_secs():
             return
         self._attempted_at = now
-        self._in_flight = asyncio.get_running_loop().create_task(self._refresh(load))
+        self._in_flight = asyncio.get_running_loop().create_task(
+            self._refresh(load), name='continuity-probe-refresh',
+        )
 
     async def join(self) -> None:
         """Wait for the in-flight refresh, if any, to publish its outcome."""
         in_flight = self._in_flight
         if in_flight is not None:
             await in_flight
+
+    async def aclose(self) -> None:
+        """Start no further refresh and abandon the in-flight one, keeping the last published snapshot.
+
+        Returns once that refresh has unwound; a git child it already forked
+        finishes on its worker thread, bounded by PROBE_TIMEOUT_SECS.
+        """
+        self._closed = True
+        in_flight = self._in_flight
+        if in_flight is not None:
+            in_flight.cancel()
+            await asyncio.wait({in_flight})
 
     async def _refresh(self, load: Callable[[], WorkProductSnapshot]) -> None:
         try:
