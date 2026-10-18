@@ -41,10 +41,10 @@ def _with_usage_cap(tmp_path: Path, *, enabled: bool):
     )
 
 
-def _zero_account_gate():
+def _zero_account_gate(shutdown: AsyncMock):
     """A real gate that constructed fine but resolved no accounts."""
     gate = build_usage_gate([], [])
-    gate.shutdown = AsyncMock()
+    gate.shutdown = shutdown
     return gate
 
 
@@ -87,20 +87,21 @@ class TestBuildEvalUsageGate:
         caplog: pytest.LogCaptureFixture,
     ):
         caplog.set_level(logging.WARNING, logger=_GATE_LOGGER)
-        empty = _zero_account_gate()
-        monkeypatch.setattr(eval_gate, 'UsageGate', MagicMock(return_value=empty))
+        shutdown = AsyncMock()
+        monkeypatch.setattr(
+            eval_gate, 'UsageGate', MagicMock(return_value=_zero_account_gate(shutdown)),
+        )
 
         gate = await build_eval_usage_gate(_with_usage_cap(tmp_path, enabled=True))
 
         assert gate is None
-        empty.shutdown.assert_awaited_once()
+        shutdown.assert_awaited_once()
         assert 'ZERO accounts' in caplog.text
 
     async def test_a_failing_zero_account_teardown_still_degrades(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        empty = _zero_account_gate()
-        empty.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
+        empty = _zero_account_gate(AsyncMock(side_effect=RuntimeError('teardown boom')))
         monkeypatch.setattr(eval_gate, 'UsageGate', MagicMock(return_value=empty))
 
         gate = await build_eval_usage_gate(_with_usage_cap(tmp_path, enabled=True))

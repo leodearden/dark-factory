@@ -151,7 +151,7 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         retryable 'infra_failure' proposal
 #                                         entry instead of raising.
 #
-# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
+# orchestrator/evals/eval_gate.py         EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
 #   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
 #                                         (esc-3634-1).  It is the one caller in
 #                                         this table that does NOT take the

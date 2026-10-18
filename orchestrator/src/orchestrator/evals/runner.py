@@ -8,8 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,6 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
 )
 from shared.eval_lane import is_eval_fixture_task_id
-from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import (
@@ -47,6 +45,13 @@ from .configs import (
     EvalConfig,
     claude_endpoint_price_table,
     matrix_pairs,
+)
+from .eval_gate import (
+    EVAL_CAP_WAIT_SANITY_SECS,
+    GATE_UNSET,
+    InjectedGate,
+    campaign_usage_gate,
+    owned_usage_gate,
 )
 from .measurement import (
     MeasurementStage,
@@ -75,73 +80,6 @@ from .snapshots import create_eval_worktree, read_python_pin
 logger = logging.getLogger(__name__)
 
 
-# Cap-wait patience for the architect eval invoke (eval-revival φ).
-#
-# RAISED 1800 s → 48 h on 2026-08-25 (Leo, during the γ2 ruling session,
-# esc-3634-1). The original 1800 s took the house value shared by
-# `_DRY_RUN_CAP_WAIT_SANITY_SECS` and
-# `_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS`, on the rationale that "an eval
-# campaign is a bounded, queue-blocking job, so a fully-capped pool must fail
-# LOUD rather than park a campaign for two weeks". That rationale does not
-# survive contact with the gate:
-#
-#   A SHORT BOUND NEVER PREVENTED THE PARK. When every account is capped,
-#   `before_invoke` reaches `self._open.clear(); await self._open.wait()`
-#   (usage_gate.py) — unbounded, released only by a real cap reset or a
-#   successful resume probe. Freeing a campaign slot therefore buys no
-#   progress: the next cell parks in that same wait. The old bound only decided
-#   how many IN-FLIGHT cells were destroyed on the way to parking; the campaign
-#   parked either way. Worst of both.
-#
-#   AND TAINTING IS STRICTLY MORE EXPENSIVE THAN WAITING. A cap lands MID-cell,
-#   after the architect has already spent real money (γ1 mean: $8.88 banked per
-#   cap-excluded cell). `invoke_with_cap_retry` resumes the capped session via
-#   `--resume` on a freed account, preserving that work, so waiting costs ~$0
-#   extra. Tainting discards the banked spend AND pays full freight again on the
-#   prescribed re-run — strictly more total dollars and strictly more total wall
-#   clock, for the same measurement.
-#
-#   NOR IS RESTART A CHEAP ESCAPE. `run_ofat_stage` — the path campaign drivers
-#   use — has NO skip-existing guard (that is `run_eval_matrix`'s
-#   `ResultStore.exists` check, a different function). Cells persist individually
-#   via `ResultStore.save`, so a kill loses no data, but a relaunch RE-RUNS and
-#   RE-SPENDS them unless the operator hand-restricts `--tasks-dir`.
-#
-# 48 h is sized to the observed account regime, not to a round number: 1-3
-# accounts typically sit uncapped against the WEEKLY cap and are hit repeatedly
-# against their 5-HOUR caps, giving short all-capped windows regularly plus one
-# long window each week. 1800 s cannot skate a 5-hour window; 48 h skates it
-# with large margin. A weekly exhaustion outlasts even this bound — but per the
-# park analysis above, no value of this constant makes that case loud, so the
-# choice costs nothing there.
-#
-# Deliberately NO `max_cap_retries` companion (unchanged): a fixed count scales
-# the wrong way, since cooldown doubles per full cycle through the pool, so a
-# bigger, healthier pool would give up SOONER. Wall clock is the bound that
-# literally expresses the requirement. Both raise the same
-# AllAccountsCappedException from one chokepoint, so the handler below is
-# correct either way.
-#
-# WHAT THIS BOUND STILL DOES NOT COVER. `cap_wait_sanity_secs` is consulted at
-# exactly one place, `_check_cap_wait`, which runs in the cap-hit branch AFTER
-# an invocation returned and was classified as a cap. It bounds cap-RETRY
-# patience and nothing else — the unbounded `_open.wait()` above is out of its
-# reach, and raising it does not change that. That remains true, and it is why
-# the park needed a separate remedy rather than a bigger number here.
-#
-# THE PARK IS NO LONGER SILENT (task 4945). It is still unbounded — by design,
-# since no wall-clock value makes a weekly exhaustion loud without also
-# aborting the 5-hour windows this constant exists to skate — but it now
-# ANNOUNCES itself: `shared/usage_gate.py::UsageGate.before_invoke` emits a
-# throttled `all_capped_park` WARNING carrying elapsed seconds, the account
-# count and the soonest expected reopen, for as long as the pool stays frozen.
-# So a parked campaign is distinguishable from a hung one by reading the log,
-# which is the "fail loud" the original comment wanted — delivered as
-# visibility rather than as an abort, because aborting a park throws away
-# banked spend that `--resume` would otherwise recover.
-_EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
-
-
 def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     """The ONLY MCP an eval architect may reach: plan-tools, strictly scoped.
 
@@ -150,209 +88,6 @@ def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     the live escalation (:8102) and fused-memory (:8002) servers.
     """
     return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
-
-
-async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate | None:
-    """Build the account-failover gate for an eval entry point, or None.
-
-    ONE home for the construction all three entry points need (``run_eval``,
-    ``run_end_to_end``, ``run_architect_eval``), extracted from three
-    byte-identical copies (reviewer: duplication). Identical-by-copy is
-    precisely the shape that drifts: the empty-pool degrade below is a fix that
-    would otherwise have had to be remembered in three places, or leave the
-    entry points silently divergent about what "gated" means.
-
-    Three ways to come back ungated, all deliberate, all warn-and-degrade
-    rather than raise — losing failover costs CELLS, but raising costs the
-    whole CAMPAIGN, for a reason having nothing to do with the candidate under
-    test:
-
-    1. ``usage_cap.enabled=False`` — a real production configuration. A
-       deployment that opted out of the account pool must not pay for probe
-       dirs and account state it never asked for.
-    2. The constructor raised.
-    3. The gate CONSTRUCTED but resolved ZERO accounts (reviewer: robustness).
-       ``_init_accounts`` logs "No accounts configured and no default
-       credential found" and returns ``[]``, so construction SUCCEEDS and the
-       failure is deferred to the first ``before_invoke``, which raises
-       ``RuntimeError('No OAuth accounts available ...')``. That lands in the
-       caller's generic handler, is stamped ``harness_error:`` → unmeasurable →
-       the cell is EXCLUDED. With ``usage_cap.enabled=True`` but no
-       ``CLAUDE_OAUTH_*`` exported and no ``~/.claude/.credentials.json`` (an
-       ordinary CI shell), that loses EVERY architect cell — where the same
-       campaign ran fine ungated on ambient credentials pre-φ. That would be a
-       strictly WORSE version of the ~40% cell loss this gate exists to fix.
-       An empty pool has nothing to fail over TO, so degrading to the ungated
-       path forfeits nothing and saves the run.
-    """
-    if not orch_config.usage_cap.enabled:
-        return None
-    try:
-        gate = UsageGate(orch_config.usage_cap)
-    except Exception as exc:
-        logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
-        return None
-    if gate.account_count == 0:
-        logger.warning(
-            'UsageGate resolved ZERO accounts (no CLAUDE_OAUTH_* env and no '
-            'default credential?) — running without failover rather than '
-            'refusing every invocation'
-        )
-        # Tear the discarded gate down rather than dropping it on the floor:
-        # even with no accounts the constructor allocated a FALLBACK probe
-        # TaskConfigDir (the `or TaskConfigDir(...)` alias branch) and
-        # installed a SIGHUP handler, and this runs once PER CELL. Best-effort
-        # — a teardown failure must not turn the degrade into a raise.
-        try:
-            await gate.shutdown()
-        except Exception:
-            logger.warning('shutdown of the discarded empty UsageGate failed', exc_info=True)
-        return None
-    return gate
-
-
-class _UnsetGate:
-    """Sentinel TYPE for "the caller passed no ``usage_gate`` at all".
-
-    WHY NOT a plain ``usage_gate: UsageGate | None = None`` default (task 4427):
-    :func:`_build_eval_usage_gate` legitimately returns ``None`` three ways
-    (``usage_cap.enabled=False``, the constructor raised, zero accounts
-    resolved). A campaign whose gate degraded that way would hand ``None`` to
-    every cell; with a ``None`` default each cell would read that as "the caller
-    supplied nothing" and build its own gate — silently restoring the exact
-    per-cell construction the hoist exists to remove, and re-paying a probe-dir
-    allocation plus a SIGHUP-handler steal per cell on the zero-account path.
-
-    The sentinel keeps "not provided" (build and own one) and "provided as
-    ``None``" (deliberately ungated for the whole campaign) distinguishable. A
-    private CLASS rather than a bare ``object()`` so the parameter annotation
-    ``UsageGate | None | _UnsetGate`` and ``isinstance(usage_gate, _UnsetGate)``
-    are pyright-clean.
-    """
-
-
-_GATE_UNSET = _UnsetGate()
-
-
-# The `usage_gate=` parameter type shared by all three eval executors
-# (:func:`run_eval`, :func:`run_architect_eval`, :func:`run_end_to_end`). Named
-# so a reader of a public signature meets ONE concept with three readings
-# rather than a three-way union to decode at each site — and so the private
-# :class:`_UnsetGate` appears in exactly one place instead of three:
-#
-#   a ``UsageGate``  — a campaign owner handed its live gate down.
-#   ``None``         — a campaign owner that is deliberately UNGATED; run
-#                      without failover and do NOT build one.
-#   ``_GATE_UNSET``  — nobody supplied anything; build and own a gate.
-#
-# THE SHARED-OWNERSHIP CONTRACT (task 4427), stated once here because all three
-# executors obey it identically and three copies of the argument is the shape
-# that drifts: THE GATE IS TORN DOWN ONLY BY WHOEVER BUILT IT, i.e. by the
-# ``_GATE_UNSET`` reading alone. Each executor's ``finally`` spells that as
-# ``if owns_gate and usage_gate is not None``, where ``owns_gate`` is decided
-# from the CALLER's argument before any build can overwrite the parameter.
-#
-# Why an OWNED gate must come down: a campaign loops fixtures × candidates ×
-# trials in ONE process, so a gate left running leaks a live account-resume
-# probe loop firing real CLI probes for the rest of the campaign, and each new
-# gate steals the SIGHUP handler from predecessors kept alive by exactly those
-# background tasks. (469a2b5bd0 closed that leak for :func:`run_architect_eval`
-# only; :func:`run_eval` and :func:`run_end_to_end` leaked one gate per cell
-# until this task.)
-#
-# Why a BORROWED gate must NOT: it carries the one cap-state view every sibling
-# cell shares, so cell N+1 no longer re-leases the account cell N proved capped
-# — exactly the wasted invocation plus cooldown per cell the per-cell gate
-# cost. Shutting it down here would take failover from every sibling still to
-# run, including ones already in flight.
-#
-# Teardown is best-effort everywhere: the cell is already scored by then, so a
-# failing ``shutdown()`` must never turn it into a harness error.
-InjectedGate = UsageGate | None | _UnsetGate
-
-
-@asynccontextmanager
-async def campaign_usage_gate(
-    base_config: OrchestratorConfig | None,
-) -> AsyncIterator[UsageGate | None]:
-    """Own ONE account-failover gate for a whole eval campaign (task 4427).
-
-    A campaign is any loop that runs several cells in ONE process, and each
-    one needs build-once + tear-down-exactly-once. A hand-rolled copy of that
-    lifecycle per campaign is precisely the shape :func:`_build_eval_usage_gate`
-    itself was extracted to avoid, so the lifecycle lives here in one place.
-
-    WHY ``base_config`` IS THE RIGHT THING TO BUILD FROM.
-    :func:`_build_eval_usage_gate` reads exactly one leaf,
-    ``orch_config.usage_cap``. Every cell's orch config is
-    ``build_eval_orch_config(...)`` =
-    ``apply_eval_profile(base_config).model_copy(update=...)``, and neither
-    ``EVAL_PROFILE`` nor that update dict mentions ``usage_cap`` — so the leaf
-    is inherited verbatim and this gate is byte-identical to the one each cell
-    would have built for itself. That equivalence is emergent across two files
-    rather than enforced, so it is pinned as a tripwire by
-    ``test_eval_architect.py::TestCampaignGatePremise``.
-
-    WHY SHARING ONE GATE ACROSS CONCURRENT CELLS IS SAFE. It is the production
-    shape, not a new one: :class:`orchestrator.harness.Harness` builds exactly
-    ONE ``UsageGate`` per orchestrator process and shares it across every
-    concurrently-running workflow, tearing it down once in its own shutdown.
-    The gate's account leasing exists precisely to arbitrate concurrent
-    consumers — and sharing is what makes cap state MEAN anything: a cell that
-    proves an account capped must inform its in-flight siblings, not merely its
-    successors.
-
-    A ``None`` yield means "this campaign is deliberately UNGATED" — either
-    ``base_config`` was ``None`` (nothing to build from; the stage functions all
-    default it) or :func:`_build_eval_usage_gate` degraded. It MUST be threaded
-    to cells as an explicit ``usage_gate=None``, never dropped: a cell reads a
-    missing argument as "build your own" (see the ``_GATE_UNSET`` sentinel), so
-    dropping a degraded ``None`` would silently restore the per-cell
-    construction this exists to remove. The cell's half of that bargain — who
-    may tear a gate down, and what breaks either way — is stated once at
-    :data:`InjectedGate`.
-
-    WHAT ELSE ONE GATE SHARES: THE SPEND TALLY. The equivalence argument above
-    is about CONSTRUCTION; sharing also makes the gate's RUNTIME state
-    campaign-scoped, and ``UsageGate._cumulative_cost`` is part of that state.
-    ``before_invoke`` raises ``SessionBudgetExhausted`` once the tally reaches
-    ``usage_cap.session_budget_usd``, and nothing resets it between cells — so
-    ONE gate means ONE cumulative tally and ONE session ceiling for the WHOLE
-    campaign, where a per-cell gate gave each cell a fresh budget. With the
-    ceiling set, a long campaign trips partway through
-    ``fixtures × candidates × trials`` and every remaining cell blocks or is
-    stamped ``harness_error`` — losses the report would attribute to the
-    CANDIDATE under test rather than to the campaign budget.
-
-    Latent, not live: ``session_budget_usd`` defaults to ``None`` and no config
-    in this repo sets it, and one process-wide ceiling is exactly the
-    :class:`~orchestrator.harness.Harness` shape this adopts. A campaign that
-    does want per-cell budgeting should build from a ``usage_cap`` copy with
-    ``session_budget_usd=None`` (``base_config.model_copy`` over that leaf) and
-    let each invocation's ``max_budget_usd`` bound it instead.
-    """
-    if base_config is None:
-        yield None
-        return
-    gate = await _build_eval_usage_gate(base_config)
-    try:
-        yield gate
-    finally:
-        if gate is not None:
-            # Best-effort, exactly as in run_architect_eval's finally: the
-            # campaign's results are already collected by the time we get here,
-            # so a teardown failure must never turn a finished campaign into a
-            # raise. Left un-torn-down, the gate leaks a live account-resume
-            # probe loop firing real CLI probes, and the next gate built in this
-            # process steals the SIGHUP handler from it.
-            try:
-                await gate.shutdown()
-            except Exception:
-                logger.warning(
-                    'campaign UsageGate shutdown failed — continuing '
-                    '(the campaign is already complete)',
-                    exc_info=True,
-                )
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -607,7 +342,7 @@ async def run_eval(
     memory_endpoint: str | None = None,
     judge_config: EvalConfig | None = None,
     *,
-    usage_gate: InjectedGate = _GATE_UNSET,
+    usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
@@ -702,13 +437,9 @@ async def run_eval(
         logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
 
     # 5b. Usage gate for account failover (judge hits Claude API, may cap).
-    #     Built only when this cell OWNS it — see :data:`InjectedGate` for the
-    #     three readings of the argument and who may tear the gate down.
-    owns_gate = isinstance(usage_gate, _UnsetGate)
-    usage_gate = (
-        await _build_eval_usage_gate(orch_config) if owns_gate else usage_gate
-    )
-    try:
+    async with owned_usage_gate(
+        usage_gate, orch_config, label=f'{task_id} × {config.name}',
+    ) as gate:
         # 6. Run the real workflow
         workflow = build_workflow(
             assignment=assignment,
@@ -718,7 +449,7 @@ async def run_eval(
             briefing=briefing,
             mcp=mcp,  # type: ignore[arg-type]
             initial_plan=initial_plan,
-            usage_gate=usage_gate,
+            usage_gate=gate,
         )
 
         # Override worktree since we created it ourselves
@@ -777,19 +508,6 @@ async def run_eval(
             f'workflow={metrics_dict.get("workflow_duration_ms", 0) / 1000:.1f}s)'
         )
         return result
-    finally:
-        # Torn down only by whoever BUILT it — the shared-ownership contract
-        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
-        # turn an already-scored cell into a harness error.
-        if owns_gate and usage_gate is not None:
-            try:
-                await usage_gate.shutdown()
-            except Exception:
-                logger.warning(
-                    f'UsageGate shutdown failed for {task_id} × {config.name} '
-                    f'— continuing (the cell is already scored)',
-                    exc_info=True,
-                )
 
 
 async def run_architect_eval(
@@ -800,7 +518,7 @@ async def run_architect_eval(
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
     *,
-    usage_gate: InjectedGate = _GATE_UNSET,
+    usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
     """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
@@ -962,16 +680,6 @@ async def run_architect_eval(
     # the earlier failure paths (worktree/config) the name is genuinely unbound
     # — which pyright correctly flags without this.
     artifacts: TaskArtifacts | None = None
-    # Ownership is decided by what the CALLER did, never by what a build
-    # returned — so it is computed here, before anything can overwrite the
-    # parameter. See :data:`InjectedGate` for the three readings.
-    owns_gate = isinstance(usage_gate, _UnsetGate)
-    # Narrowed off the sentinel union so the invoke call site and the finally
-    # below both see a plain ``UsageGate | None``. Pre-initialised for the SAME
-    # reason as ``artifacts`` above, plus one more: the finally block shuts the
-    # gate down, and it must not NameError when the failure happened before the
-    # gate was built (worktree/orch-config).
-    usage_gate = None if owns_gate else usage_gate
     # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
     # architect invocation's spend. The cell's persisted ``cost_usd`` below
     # additionally folds in the plan judge's spend (``judge_cost_usd``), so
@@ -1034,30 +742,6 @@ async def run_architect_eval(
         orch_config = build_eval_orch_config(
             config, task, base_config, memory_endpoint=memory_endpoint,
         )
-
-        # 2b. Usage gate for account failover (eval-revival φ).
-        #     This was the LAST eval entry point invoking an agent ungated —
-        #     run_eval (:401-407) and run_end_to_end (:1039-1045) have always
-        #     built one. Ungated, a capped account refuses the architect
-        #     outright and the cell is recorded cap_tainted, i.e. EXCLUDED from
-        #     the reported mean (the taint table above). The 2026-07-28
-        #     architect wave lost ~40% of its cells that way — 37 blocked.
-        #
-        #     Exclusion is NOT neutral, which is why this is a correctness fix
-        #     and not a convenience: the costlier candidate runs longer, is more
-        #     cap-exposed, and so loses MORE cells than its cheaper rival. The
-        #     surviving cells are then a biased sample and the comparison the
-        #     campaign exists to make is silently wrong. Failing over to a
-        #     healthy account measures the candidate instead of the schedule.
-        #
-        #     Construction (enabled guard, warn-and-degrade, empty-pool
-        #     degrade) lives in _build_eval_usage_gate so all three entry
-        #     points build the gate from ONE definition rather than three
-        #     copies that can drift.
-        #
-        #     Built only when this cell OWNS it — see :data:`InjectedGate`.
-        if owns_gate:
-            usage_gate = await _build_eval_usage_gate(orch_config)
 
         # 3. Init artifacts so the architect has a place to write plan.json.
         #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
@@ -1138,24 +822,29 @@ async def run_architect_eval(
         # plan-tools is wired through the SAME production seam real dispatch
         # uses (relocated meta_root + direct-interpreter launch), and the strict
         # flag drops the ambient .mcp.json's live production servers.
-        result = await invoke_with_cap_retry(
-            usage_gate,
-            f'Architect eval {task_id} × {config.name}',
-            cap_wait_sanity_secs=_EVAL_CAP_WAIT_SANITY_SECS,
-            invoke_fn=_timed_invoke,
-            backend=config.backend,
-            prompt=prompt,
-            system_prompt=ARCHITECT.system_prompt,
-            cwd=worktree,
-            model=config.model,
-            max_turns=task.get('max_architect_turns', 50),
-            max_budget_usd=config.max_budget_usd,
-            allowed_tools=ARCHITECT.allowed_tools or None,
-            disallowed_tools=ARCHITECT.disallowed_tools or None,
-            effort=config.effort or 'high',
-            env_overrides=config.env_overrides or None,
-            **architect_eval_mcp_scope(worktree),
-        )
+        #
+        # The gate (eval_gate.owned_usage_gate) is scoped to this one call.
+        async with owned_usage_gate(
+            usage_gate, orch_config, label=f'{task_id} × {config.name}',
+        ) as gate:
+            result = await invoke_with_cap_retry(
+                gate,
+                f'Architect eval {task_id} × {config.name}',
+                cap_wait_sanity_secs=EVAL_CAP_WAIT_SANITY_SECS,
+                invoke_fn=_timed_invoke,
+                backend=config.backend,
+                prompt=prompt,
+                system_prompt=ARCHITECT.system_prompt,
+                cwd=worktree,
+                model=config.model,
+                max_turns=task.get('max_architect_turns', 50),
+                max_budget_usd=config.max_budget_usd,
+                allowed_tools=ARCHITECT.allowed_tools or None,
+                disallowed_tools=ARCHITECT.disallowed_tools or None,
+                effort=config.effort or 'high',
+                env_overrides=config.env_overrides or None,
+                **architect_eval_mcp_scope(worktree),
+            )
         # arch_cost_usd is banked inside _timed_invoke (every attempt), not
         # read off `result` (the last attempt only) — see its docstring. The
         # token/turn counters below DO come off `result`, i.e. the final
@@ -1282,9 +971,8 @@ async def run_architect_eval(
         # .task-meta/<name>/ root (snapshots.cleanup_eval_worktree), so any read
         # placed after it — which is everywhere post-``finally`` — finds nothing.
         #
-        # Best-effort for the same reason the gate teardown below is: a failure
-        # while cleaning up must never turn an already-scored cell into a lost
-        # run. read_decline_artifacts already degrades PER KIND; this is the
+        # Best-effort: a failure while cleaning up must never turn an
+        # already-scored cell into a lost run. read_decline_artifacts already degrades PER KIND; this is the
         # outer backstop.
         try:
             declines = read_decline_artifacts(artifacts)
@@ -1297,18 +985,6 @@ async def run_architect_eval(
         # Plan already read above; the worktree is no longer needed (scoring
         # reads the in-memory plan + the committed reference diff).
         await snapshots.cleanup_eval_worktree(project_root, worktree)
-        # Torn down only by whoever BUILT it — the shared-ownership contract
-        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
-        # turn an already-scored cell into a harness error.
-        if owns_gate and usage_gate is not None:
-            try:
-                await usage_gate.shutdown()
-            except Exception:
-                logger.warning(
-                    f'UsageGate shutdown failed for {task_id} × {config.name} '
-                    f'— continuing (the cell is already scored)',
-                    exc_info=True,
-                )
 
     # 6. Materialize the landed reference diff — the always-available ground
     #    truth (ζ fixtures frequently carry plan: null).
@@ -1670,7 +1346,7 @@ async def run_end_to_end(
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
     *,
-    usage_gate: InjectedGate = _GATE_UNSET,
+    usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
     """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
@@ -1736,12 +1412,9 @@ async def run_end_to_end(
     )
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
-    # Owned only when the caller supplied nothing — see :data:`InjectedGate`.
-    owns_gate = isinstance(usage_gate, _UnsetGate)
-    usage_gate = (
-        await _build_eval_usage_gate(orch_config) if owns_gate else usage_gate
-    )
-    try:
+    async with owned_usage_gate(
+        usage_gate, orch_config, label=f'{task_id} × {config_name}',
+    ) as gate:
         # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
         #    feeds the live implementer (the both-live path; run_eval hands a frozen
         #    plan here instead).
@@ -1753,7 +1426,7 @@ async def run_end_to_end(
             briefing=briefing,
             mcp=mcp,  # type: ignore[arg-type]
             initial_plan=None,
-            usage_gate=usage_gate,
+            usage_gate=gate,
         )
         workflow.worktree = worktree
 
@@ -1802,19 +1475,6 @@ async def run_end_to_end(
             f'({wall_clock_ms / 1000:.1f}s)'
         )
         return result
-    finally:
-        # Torn down only by whoever BUILT it — the shared-ownership contract
-        # at :data:`InjectedGate`, best-effort so a failing teardown cannot
-        # turn an already-scored cell into a harness error.
-        if owns_gate and usage_gate is not None:
-            try:
-                await usage_gate.shutdown()
-            except Exception:
-                logger.warning(
-                    f'UsageGate shutdown failed for {task_id} × {config_name} '
-                    f'— continuing (the cell is already scored)',
-                    exc_info=True,
-                )
 
 
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:

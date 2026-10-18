@@ -1352,16 +1352,13 @@ def _run_single_eval(
     still route to ``run_eval``, unchanged.
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
+    from orchestrator.evals.eval_gate import campaign_usage_gate
     from orchestrator.evals.report import (
         build_plan_quality_report,
         format_invocation_errors,
         format_plan_quality_table,
     )
-    from orchestrator.evals.runner import (
-        campaign_usage_gate,
-        run_architect_eval,
-        run_eval,
-    )
+    from orchestrator.evals.runner import run_architect_eval, run_eval
 
     all_configs = EVAL_CONFIGS
 

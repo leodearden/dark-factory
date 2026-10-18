@@ -18,6 +18,7 @@ follows precisely.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 from pathlib import Path
@@ -30,8 +31,8 @@ import pytest
 # files that pin this contract. _NO_INJECTED_GATE distinguishes "this case
 # passed no usage_gate at all" (the OWNED path, where run_architect_eval builds
 # and tears down its own) from "this case passed usage_gate=None" (deliberately
-# ungated by a campaign owner) — the same trap the production _GATE_UNSET
-# sentinel exists to avoid.
+# ungated by a campaign owner) — the same trap the production
+# eval_gate.GATE_UNSET sentinel exists to avoid.
 from _campaign_gate_helpers import NO_INJECTED_GATE as _NO_INJECTED_GATE
 from _campaign_gate_helpers import eval_base_config
 from shared.cli_invoke import AllAccountsCappedException
@@ -1425,10 +1426,10 @@ async def _run_architect_eval_hermetic(
     of MagicMock truthiness:
 
     - ``usage_gate=<gate>``: flips ``usage_cap.enabled`` on and patches
-      ``runner.UsageGate`` to a factory returning THIS gate. Exposed as
+      ``eval_gate.UsageGate`` to a factory returning THIS gate. Exposed as
       ``mocks['UsageGate']`` (the factory) and ``mocks['gate']`` (the gate).
     - ``usage_gate_error=<exc>``: flips ``usage_cap.enabled`` on and patches
-      ``runner.UsageGate`` to RAISE it — the construction-failure /
+      ``eval_gate.UsageGate`` to RAISE it — the construction-failure /
       warn-and-degrade path.
 
     ``injected_gate=`` is a DIFFERENT knob from ``usage_gate=`` and the two must
@@ -1544,7 +1545,7 @@ async def _run_architect_eval_hermetic(
     with contextlib.ExitStack() as es:
         p = es.enter_context
         if gate_factory is not None:
-            p(patch('orchestrator.evals.runner.UsageGate', gate_factory))
+            p(patch('orchestrator.evals.eval_gate.UsageGate', gate_factory))
         p(patch('shared.cli_invoke.asyncio.sleep', mock_sleep))
         p(patch('orchestrator.evals.snapshots.create_eval_worktree',
                 AsyncMock(return_value=(Path('/fake/wt'), 'run-abc'))))
@@ -3657,15 +3658,16 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
     exercised purely on ``cfg.role``. ``arch_metrics`` overrides the fake
     architect result's metrics dict. Returns ``(out, run_eval, run_architect)``.
 
-    ``_build_eval_usage_gate`` is patched to degrade to ``None`` (task 4427).
+    The campaign gate's builder is bound to degrade to ``None`` (task 4427).
     ``base_config`` here is a bare ``MagicMock``, so ``.usage_cap.enabled`` is a
     TRUTHY Mock attribute — once ``_run_single_eval`` owns a campaign gate, the
-    unpatched builder would construct a REAL ``UsageGate`` out of a mock config
+    production builder would construct a REAL ``UsageGate`` out of a mock config
     on every one of these routing cases (touching the filesystem for probe dirs
     and installing a SIGHUP handler). ``None`` is the ungated campaign, which is
     what every routing/echo case here already meant.
     """
     from orchestrator import cli
+    from orchestrator.evals import eval_gate
 
     arch_result = _fake_eval_result(
         config_name=cfg.name,
@@ -3684,8 +3686,9 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
         p(patch('orchestrator.evals.runner.run_architect_eval', mock_run_arch))
         p(patch('orchestrator.evals.configs.get_config_by_name',
                 MagicMock(return_value=cfg)))
-        p(patch('orchestrator.evals.runner._build_eval_usage_gate',
-                AsyncMock(return_value=None)))
+        p(patch('orchestrator.evals.eval_gate.campaign_usage_gate',
+                functools.partial(eval_gate.campaign_usage_gate,
+                                  factory=AsyncMock(return_value=None))))
         cli._run_single_eval(
             Path('/fake/task.json'), cfg.name, base_config=MagicMock(),
         )
@@ -3710,6 +3713,7 @@ def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None
     that config's executor raise, which propagates out of ``asyncio.run``.
     """
     from orchestrator import cli
+    from orchestrator.evals import eval_gate
 
     def _make(metrics):
         async def fake(_task_path, cfg, *_a, usage_gate=_NO_INJECTED_GATE, **_k):
@@ -3736,7 +3740,9 @@ def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None
         p(patch('orchestrator.evals.runner.run_eval', mock_run_eval))
         p(patch('orchestrator.evals.runner.run_architect_eval', mock_run_arch))
         p(patch('orchestrator.evals.configs.EVAL_CONFIGS', list(cfgs)))
-        p(patch('orchestrator.evals.runner._build_eval_usage_gate', mock_build_gate))
+        p(patch('orchestrator.evals.eval_gate.campaign_usage_gate',
+                functools.partial(eval_gate.campaign_usage_gate,
+                                  factory=mock_build_gate)))
         error: BaseException | None = None
         try:
             cli._run_single_eval(
@@ -3978,7 +3984,7 @@ class TestArchitectEvalUsageGate:
         dirs and account state it never asked for.
         """
         gate_factory = MagicMock()
-        with patch('orchestrator.evals.runner.UsageGate', gate_factory):
+        with patch('orchestrator.evals.eval_gate.UsageGate', gate_factory):
             result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(), produced_plan=_well_formed_plan(),
             )
@@ -3998,7 +4004,7 @@ class TestArchitectEvalUsageGate:
         campaign — and would do it for a REASON that has nothing to do with the
         candidate under test.
         """
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.eval_gate')
         result, mocks = await _run_architect_eval_hermetic(
             self._cfg(),
             produced_plan=_well_formed_plan(),
@@ -4154,7 +4160,7 @@ class TestArchitectEvalCapPatience:
         )
 
     async def test_eval_cap_patience_reaches_the_wrapper(self):
-        from orchestrator.evals import runner
+        from orchestrator.evals import eval_gate
 
         # The eval bound itself is pinned in test_eval_gate.py. A constant that
         # is defined but never passed would leave the campaign on the 14-day
@@ -4170,7 +4176,7 @@ class TestArchitectEvalCapPatience:
         assert wrapper.await_count == 1
         assert (
             wrapper.call_args.kwargs['cap_wait_sanity_secs']
-            == runner._EVAL_CAP_WAIT_SANITY_SECS
+            == eval_gate.EVAL_CAP_WAIT_SANITY_SECS
         )
 
     async def test_fully_capped_pool_fails_loud_into_cap_tainted(self):
@@ -4179,7 +4185,7 @@ class TestArchitectEvalCapPatience:
         # `arch_result` (not a side_effect LIST) means EVERY attempt caps, and
         # the patched bound trips on the first hit — so the pool is genuinely
         # exhausted and the test still runs in milliseconds.
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+        with patch.object(runner, 'EVAL_CAP_WAIT_SANITY_SECS', 0.0):
             result, _mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
                 produced_plan={},
@@ -4207,7 +4213,7 @@ class TestArchitectEvalCapPatience:
         from orchestrator.evals import runner
         from orchestrator.evals.judge import score_plan_structure
 
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+        with patch.object(runner, 'EVAL_CAP_WAIT_SANITY_SECS', 0.0):
             result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
                 produced_plan=_well_formed_plan(),
@@ -4452,7 +4458,7 @@ class TestArchitectEvalZeroAccountGate:
             await gate.before_invoke()
 
     async def test_zero_account_gate_degrades_to_the_ungated_path(self, caplog):
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.eval_gate')
         gate = _zero_account_gate()
 
         result, mocks = await _run_architect_eval_hermetic(
@@ -4561,7 +4567,7 @@ class TestArchitectEvalGateLifecycle:
         """Teardown is best-effort: the cell is already scored by then."""
         from shared.testing import make_gate_mock
 
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.eval_gate')
         gate = make_gate_mock()
         gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
 
@@ -4616,11 +4622,13 @@ class TestArchitectEvalInjectedGate:
         """The hoist is pointless if the cell builds one anyway."""
         from shared.testing import make_gate_mock
 
-        from orchestrator.evals import runner
+        from orchestrator.evals import eval_gate, runner
 
         gate = make_gate_mock()
         build = AsyncMock(return_value=make_gate_mock())
-        with patch.object(runner, '_build_eval_usage_gate', build):
+        with patch.object(runner, 'owned_usage_gate', functools.partial(
+            eval_gate.owned_usage_gate, factory=build,
+        )):
             _result, _mocks = await _run_architect_eval_hermetic(
                 self._cfg(), produced_plan=_well_formed_plan(),
                 injected_gate=gate, patch_cap_retry=True,
@@ -4666,16 +4674,18 @@ class TestArchitectEvalInjectedGate:
     async def test_explicit_none_means_ungated_not_unset(self):
         """``usage_gate=None`` is a DECISION, not a missing argument.
 
-        ``_build_eval_usage_gate`` returns None three legitimate ways, so a
+        ``build_eval_usage_gate`` returns None three legitimate ways, so a
         campaign can be deliberately ungated. If the cell read that None as
         "nothing was supplied" it would build its own gate — silently restoring
         the per-cell construction the hoist removes, and re-paying a probe-dir
         alloc plus a SIGHUP-handler steal on the zero-account path.
         """
-        from orchestrator.evals import runner
+        from orchestrator.evals import eval_gate, runner
 
         build = AsyncMock()
-        with patch.object(runner, '_build_eval_usage_gate', build):
+        with patch.object(runner, 'owned_usage_gate', functools.partial(
+            eval_gate.owned_usage_gate, factory=build,
+        )):
             _result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(), produced_plan=_well_formed_plan(),
                 injected_gate=None, patch_cap_retry=True,
@@ -4693,11 +4703,13 @@ class TestArchitectEvalInjectedGate:
         """
         from shared.testing import make_gate_mock
 
-        from orchestrator.evals import runner
+        from orchestrator.evals import eval_gate, runner
 
         own_gate = make_gate_mock()
         build = AsyncMock(return_value=own_gate)
-        with patch.object(runner, '_build_eval_usage_gate', build):
+        with patch.object(runner, 'owned_usage_gate', functools.partial(
+            eval_gate.owned_usage_gate, factory=build,
+        )):
             result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(), produced_plan=_well_formed_plan(),
                 patch_cap_retry=True,
@@ -4837,7 +4849,7 @@ class TestArchitectEvalSpendSurvivesFailover:
         """
         from orchestrator.evals import runner
 
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+        with patch.object(runner, 'EVAL_CAP_WAIT_SANITY_SECS', 0.0):
             result, _mocks = await _run_architect_eval_hermetic(
                 self._cfg(),
                 produced_plan={},

@@ -1177,7 +1177,7 @@ def campaign(
 
     async def _run() -> int:
         from orchestrator.config import default_price_table, load_config
-        from orchestrator.evals.runner import campaign_usage_gate
+        from orchestrator.evals.eval_gate import campaign_usage_gate
 
         from . import campaign as reduce
         from .runner import DIFF_CAP_CHARS, run_trial

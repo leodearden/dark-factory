@@ -1244,6 +1244,160 @@ decline artifacts themselves were already gone: `snapshots.py::cleanup_eval_work
 four exits (success, timeout, cap exhaustion, harness error) and the last moment
 the artifacts exist.
 
+### Eval usage-gate lifecycle (task 6737)
+
+Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
+(`build_eval_usage_gate`, `owned_usage_gate`, `campaign_usage_gate`,
+`GATE_UNSET`, `InjectedGate`, `EVAL_CAP_WAIT_SANITY_SECS`). Consumers:
+`runner.py`'s three executors and stage fan-outs, `cli.py::_run_single_eval`
+and `reviewer_trial/__main__.py::campaign`.
+
+**Why an eval invoke is gated at all (eval-revival φ).** Ungated, a capped
+account refuses the architect outright and the cell is recorded `cap_tainted`,
+so it is excluded from the reported mean. The 2026-07-28 architect wave lost
+about 40% of its cells that way (37 blocked). Exclusion is not neutral: the
+costlier candidate runs longer, is more cap-exposed, and so loses more cells
+than its cheaper rival. The surviving cells are then a biased sample, and the
+comparison the campaign exists to make is silently wrong. Failing over to a
+healthy account measures the candidate instead of the schedule.
+
+**One builder.** `build_eval_usage_gate` is the single construction every eval
+entry point uses. It replaced three byte-identical copies, the shape that
+drifts: the zero-account degrade below would otherwise have had to be
+remembered in three places. It comes back ungated (`None`) three ways, all
+warn-and-degrade rather than raise. Losing failover costs cells, but raising
+costs the whole campaign, for a reason that has nothing to do with the
+candidate under test.
+
+1. `usage_cap.enabled=False`. This is a real production configuration: a
+   deployment that opted out of the account pool must not pay for probe dirs
+   and account state it never asked for.
+2. The constructor raised.
+3. The gate constructed but resolved zero accounts. `_init_accounts` logs "No
+   accounts configured and no default credential found" and returns `[]`, so
+   construction succeeds and the failure is deferred to the first
+   `before_invoke`, which raises `RuntimeError('No OAuth accounts available
+   ...')`. That lands in the caller's harness-error handler, so the cell is
+   tainted and excluded. With `usage_cap.enabled=True` but no `CLAUDE_OAUTH_*`
+   exported and no `~/.claude/.credentials.json` (an ordinary CI shell), every
+   architect cell would be lost, where the same campaign ran fine ungated on
+   ambient credentials before φ. An empty pool has nothing to fail over to, so
+   degrading forfeits nothing. The discarded gate is still shut down
+   (best-effort): even with no accounts the constructor allocated a fallback
+   probe `TaskConfigDir` and installed a SIGHUP handler, and this runs once
+   per cell.
+
+**The three readings of a `usage_gate=` argument (`InjectedGate`, task 4427).**
+A `UsageGate` is a live gate a campaign owner handed down. `None` is a campaign
+owner that is deliberately ungated: run without failover and do not build one.
+`GATE_UNSET`, the default, means nobody supplied anything: build a gate and own
+it. A plain `None` default cannot express this, because `build_eval_usage_gate`
+legitimately returns `None` three ways. A campaign whose gate degraded would
+hand `None` to every cell, and each cell would read that as "nothing was
+supplied" and build its own, silently restoring the per-cell construction the
+campaign gate exists to remove (and re-paying a probe-dir allocation plus a
+SIGHUP-handler steal per cell on the zero-account path). `GATE_UNSET` is an
+instance of a private class so the annotation and the `isinstance` check are
+pyright-clean.
+
+**Whoever built the gate tears it down, and nobody else.** `owned_usage_gate`
+is that contract, stated once for all three executors. Given `GATE_UNSET` it
+builds through its factory, yields, and shuts the gate down on exit, whether
+the body returned or raised. Given a gate or `None` it yields the argument and
+touches nothing.
+
+- An owned gate must come down. A campaign loops fixtures × candidates ×
+  trials in one process, so a gate left running leaks a live account-resume
+  probe loop firing real CLI probes for the rest of the campaign, and each new
+  gate steals the SIGHUP handler from predecessors kept alive by exactly those
+  background tasks.
+- A borrowed gate must not. It carries the one cap-state view every sibling
+  cell shares, so cell N+1 no longer re-leases the account cell N proved
+  capped. Shutting it down would take failover from every sibling still to
+  run, including ones already in flight.
+- Teardown is best-effort everywhere: the cell (or the campaign) is already
+  complete by then, so a failing `shutdown()` logs and never turns a finished
+  result into a raise.
+
+In the architect cell the owned gate wraps only the `invoke_with_cap_retry`
+call, the one call that uses it. A harness error before the invoke therefore
+builds no gate at all.
+
+**One gate per campaign (`campaign_usage_gate`).** A campaign is any loop that
+runs several cells in one process. It builds through `owned_usage_gate`, so
+build, yield and teardown have one implementation. It builds from
+`base_config`, which is right because the builder reads exactly one leaf,
+`usage_cap`, and every cell's orch config is
+`apply_eval_profile(base_config).model_copy(update=...)` with neither
+`EVAL_PROFILE` nor the update dict mentioning `usage_cap`. The leaf is
+inherited verbatim and the campaign gate is identical to the one each cell
+would have built. That equivalence is emergent across two files, so
+`test_eval_architect.py::TestCampaignGatePremise` pins it as a tripwire. A
+`None` base config yields `None` without building: there is nothing to build
+from, and every stage function defaults it. A `None` yield, from that or from
+a degraded build, must be threaded to cells as an explicit `usage_gate=None`,
+never dropped, for the reason in the readings above.
+
+Sharing one gate across concurrent cells is the production shape, not a new
+one: `orchestrator.harness.Harness` builds one `UsageGate` per orchestrator
+process, shares it across every concurrently running workflow, and tears it
+down once. Account leasing exists to arbitrate concurrent consumers, and
+sharing is what makes cap state mean anything: a cell that proves an account
+capped must inform its in-flight siblings, not merely its successors.
+
+Sharing also makes the gate's runtime state campaign-scoped, including
+`UsageGate._cumulative_cost`. `before_invoke` raises `SessionBudgetExhausted`
+once that tally reaches `usage_cap.session_budget_usd`, and nothing resets it
+between cells, so one gate means one session ceiling for the whole campaign
+where a per-cell gate gave each cell a fresh budget. With the ceiling set, a
+long campaign would trip partway through and every remaining cell would block
+or be stamped `harness_error`, losses the report would attribute to the
+candidate. This is latent, not live: `session_budget_usd` defaults to `None`
+and no config in this repo sets it. A campaign that wants per-cell budgeting
+should build from a `usage_cap` copy with `session_budget_usd=None` and let
+each invocation's `max_budget_usd` bound it instead.
+
+**Cap-wait patience: 48 h (`EVAL_CAP_WAIT_SANITY_SECS`).** It was raised from
+1800 s on 2026-08-25 (esc-3634-1). The 1800 s house value was justified as
+"fail loud rather than park a campaign for two weeks", and that rationale does
+not survive contact with the gate:
+
+- A short bound never prevented the park. When every account is capped,
+  `before_invoke` waits on the gate's own unbounded `_open.wait()`, released
+  only by a real cap reset or a successful resume probe. Freeing a campaign
+  slot buys no progress, because the next cell parks in the same wait. The
+  short bound only decided how many in-flight cells were destroyed on the way
+  to parking.
+- Tainting costs more than waiting. A cap lands mid-cell, after the architect
+  has spent real money (γ1 mean: $8.88 banked per cap-excluded cell).
+  `invoke_with_cap_retry` resumes the capped session with `--resume` on a
+  freed account, so waiting costs about nothing extra, while tainting discards
+  the banked spend and pays full freight again on the re-run.
+- Restart is not a cheap escape. `run_ofat_stage`, the path campaign drivers
+  use, has no skip-existing guard (that is `run_eval_matrix`'s
+  `ResultStore.exists` check). Cells persist individually, so a kill loses no
+  data, but a relaunch re-runs and re-spends them unless the operator
+  restricts `--tasks-dir` by hand.
+
+48 h is sized to the observed account regime: one to three accounts typically
+sit uncapped against the weekly cap and are hit repeatedly against their
+5-hour caps, giving short all-capped windows regularly plus one long window
+each week. 1800 s cannot skate a 5-hour window; 48 h skates it with margin. A
+weekly exhaustion outlasts even this bound, but no value of this constant
+makes that case loud, so the choice costs nothing there. There is deliberately
+no `max_cap_retries` companion: cooldown doubles per full cycle through the
+pool, so a fixed count would make a bigger, healthier pool give up sooner.
+
+What the bound does not cover: `cap_wait_sanity_secs` is consulted only in
+`_check_cap_wait`, in the cap-hit branch after an invocation returned and was
+classified as a cap. It bounds cap-retry patience and nothing else; the
+unbounded `_open.wait()` is out of its reach. That park is no longer silent
+(task 4945): `shared/usage_gate.py::UsageGate.before_invoke` emits a throttled
+`all_capped_park` WARNING carrying elapsed seconds, the account count and the
+soonest expected reopen, so a parked campaign is distinguishable from a hung
+one by reading the log, without aborting a park whose banked spend `--resume`
+would otherwise recover.
+
 ---
 
 ## Sharp edges — read these before starting
