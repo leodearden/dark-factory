@@ -59,11 +59,14 @@ class Resolution(enum.StrEnum):
 
 
 class Standing(enum.StrEnum):
-    """What a task found for a finding says about it (contract §7, §8 step 1)."""
+    """What a task found for a finding says about it (contract §7, §8 step 1).
+    ABANDONED is a task cancelled without an acceptance reason: no work and no
+    acceptance, so the §8 key lookup treats it as absent."""
 
     FILED = "filed"
     ACCEPTED = "accepted"
     DONE = "done"
+    ABANDONED = "abandoned"
 
 
 def _require_the_codebook_vocabulary(name: str, stated: Iterable[str], required: Iterable[str]) -> None:
@@ -256,33 +259,47 @@ class _Found:
     task_id: int
 
 
-_PRECEDENCE = (Standing.FILED, Standing.ACCEPTED, Standing.DONE)
+_PRECEDENCE = (Standing.FILED, Standing.ACCEPTED, Standing.DONE, Standing.ABANDONED)
 
 
-def _standing_of(hit: task_store.TaskHit, *, store: task_store.TaskStore, project_root: str) -> Standing | None:
-    if hit.status in LIVE_STATUSES:
+def _rank(standing: Standing, task_id: int) -> tuple[int, int]:
+    """Which of several tasks found for one finding governs it: the first
+    standing in _PRECEDENCE, the newest task first."""
+    return _PRECEDENCE.index(standing), -task_id
+
+
+def _standing(status: str, metadata: Mapping[str, Any]) -> Standing | None:
+    """The one rule from a task's status, and a cancelled task's metadata, to
+    its Standing; None for a status this module does not recognise."""
+    if status in LIVE_STATUSES:
         return Standing.FILED
-    if hit.status == _DONE_STATUS:
+    if status == _DONE_STATUS:
         return Standing.DONE
-    if hit.status == _CANCELLED_STATUS:
-        accepting = store.get_task(project_root, hit.task_id).metadata.get(ACCEPTANCE_REASON_METADATA)
-        return Standing.ACCEPTED if accepting else None
+    if status == _CANCELLED_STATUS:
+        return Standing.ACCEPTED if metadata.get(ACCEPTANCE_REASON_METADATA) else Standing.ABANDONED
     return None
 
 
+def _hit_standing(hit: task_store.TaskHit, *, store: task_store.TaskStore, project_root: str) -> Standing | None:
+    metadata = store.get_task(project_root, hit.task_id).metadata if hit.status == _CANCELLED_STATUS else {}
+    return _standing(hit.status, metadata)
+
+
 def _key_lookup(filing: Filing, store: task_store.TaskStore) -> _Found | None:
-    """Contract §8 step 1. Raises StoreUnreachable when it cannot be performed."""
+    """Contract §8 step 1; an abandoned task counts as absent. Raises
+    StoreUnreachable when it cannot be performed."""
     if filing.finding_key is None:
         return None
     hits = store.find_tasks_by_metadata(filing.project_root, key=FINDING_KEY_METADATA, value=filing.finding_key)
     found = [
         _Found(standing, hit.task_id)
         for hit in hits
-        if (standing := _standing_of(hit, store=store, project_root=filing.project_root)) is not None
+        if (standing := _hit_standing(hit, store=store, project_root=filing.project_root))
+        not in (None, Standing.ABANDONED)
     ]
     if not found:
         return None
-    return min(found, key=lambda each: (_PRECEDENCE.index(each.standing), -each.task_id))
+    return min(found, key=lambda each: _rank(each.standing, each.task_id))
 
 
 @dataclass(frozen=True)
@@ -573,6 +590,176 @@ def backfill(
         "run_id": run_id, "unmatched_task_ids": [hit.task_id for hit in unmatched],
     }
     return result, Backfill(linked, tuple(unmatched))
+
+
+@dataclass(frozen=True)
+class TaskRef:
+    """A task, named in the project whose ids it is numbered in."""
+
+    project_root: str
+    task_id: int
+
+
+@dataclass(frozen=True)
+class TaskOutcome:
+    """One back-linked task as this run read it. *ref* None is a ticket that
+    names no task; a *ref* with *standing* None was not observed, and *note*
+    says why."""
+
+    ref: TaskRef | None
+    ticket: str | None
+    status: str | None
+    standing: Standing | None
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class EntryOutcome:
+    """What one codebook entry's back-linked tasks say, read this run."""
+
+    entry_id: str
+    finding_key: str | None
+    entry_status: str
+    tasks: tuple[TaskOutcome, ...]
+
+    @property
+    def governing(self) -> TaskOutcome | None:
+        """The task whose standing decides the entry, by the §8 step 1
+        precedence; None when there is no task, or when any task went
+        unobserved, since that one could be the live one (INV-3)."""
+        tasks = [task for task in self.tasks if task.ref is not None]
+        ranked = [
+            (_rank(task.standing, task.ref.task_id), task)
+            for task in tasks
+            if task.standing is not None and task.ref is not None
+        ]
+        if not ranked or len(ranked) != len(tasks):
+            return None
+        return min(ranked, key=lambda each: each[0])[1]
+
+
+@dataclass(frozen=True)
+class Reverify:
+    """An entry whose governing task is done, owed one re-verify (D8)."""
+
+    entry_id: str
+    task: TaskRef
+
+
+_SETTLED_STATUSES = frozenset({"fixed", "retired"})
+
+
+@dataclass(frozen=True)
+class Outcomes:
+    """Every back-linked entry's outcome, from one run's read; *statuses_error*
+    says why the get_statuses snapshot was unavailable, when it was."""
+
+    entries: tuple[EntryOutcome, ...] = ()
+    statuses_error: str | None = None
+
+    @property
+    def any_back_links(self) -> bool:
+        return bool(self.entries)
+
+    @property
+    def due(self) -> tuple[Reverify, ...]:
+        """The re-verify queue, in codebook order: each entry governed by a
+        done task that is not already fixed or retired."""
+        due: list[Reverify] = []
+        for entry in self.entries:
+            governing = entry.governing
+            if governing is None or governing.ref is None or governing.standing is not Standing.DONE:
+                continue
+            if entry.entry_status not in _SETTLED_STATUSES:
+                due.append(Reverify(entry.entry_id, governing.ref))
+        return tuple(due)
+
+
+def _read_outcome(
+    ref: TaskRef,
+    ticket: str | None,
+    *,
+    statuses: Mapping[str, Any] | None,
+    statuses_error: str | None,
+    observed_root: str,
+    store: task_store.TaskStore,
+) -> TaskOutcome:
+    """*ref*'s standing: from the snapshot for the observed project, with a
+    cancelled task read back for its acceptance reason, and from get_task
+    alone for another project's task, whose id the snapshot does not number."""
+    status = None
+    if ref.project_root == observed_root:
+        if statuses is None:
+            return TaskOutcome(ref, ticket, None, None, f"get_statuses could not be read: {statuses_error}")
+        status = statuses.get(str(ref.task_id))
+        if status is None:
+            return TaskOutcome(ref, ticket, None, None, f"task {ref.task_id} is not in the get_statuses snapshot")
+        if status != _CANCELLED_STATUS:
+            return _outcome_of(ref, ticket, status, {})
+    try:
+        record = store.get_task(ref.project_root, ref.task_id)
+    except task_store.StoreUnreachable as exc:
+        return TaskOutcome(ref, ticket, status, None, f"could not be read back: {exc}")
+    return _outcome_of(ref, ticket, record.status, record.metadata)
+
+
+def _outcome_of(ref: TaskRef, ticket: str | None, status: str, metadata: Mapping[str, Any]) -> TaskOutcome:
+    standing = _standing(status, metadata)
+    return TaskOutcome(ref, ticket, status, standing, None if standing else f"unrecognised task status {status!r}")
+
+
+def _ticket_only(row: Mapping[str, Any]) -> TaskOutcome:
+    resolution = row.get("resolution")
+    note = "awaiting the curator" if resolution is None else f"ticket {resolution}; it names no task"
+    return TaskOutcome(None, row.get("ticket"), None, None, note)
+
+
+def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None], TaskOutcome]) -> EntryOutcome:
+    tasks: list[TaskOutcome] = []
+    seen: set[TaskRef] = set()
+    for row in entry.get("filed_tickets") or []:
+        if row.get("task_id") is None:
+            tasks.append(_ticket_only(row))
+            continue
+        ref = TaskRef(row["project_root"], row["task_id"])
+        if ref not in seen:
+            seen.add(ref)
+            tasks.append(read(ref, row.get("ticket")))
+    return EntryOutcome(entry["id"], entry.get("finding_key"), entry["status"], tuple(tasks))
+
+
+def read_outcomes(
+    cb: Mapping[str, Any],
+    *,
+    statuses: Mapping[str, Any] | None,
+    statuses_error: str | None,
+    observed_root: str,
+    store: task_store.TaskStore,
+) -> Outcomes:
+    """Each back-linked entry's tasks, read from one get_statuses snapshot
+    (*statuses*, None when it could not be read, *statuses_error* saying why)
+    and get_task where the snapshot cannot answer. Never raises on a store
+    failure: an unread task is unobserved, and its note says why."""
+
+    def read(ref: TaskRef, ticket: str | None) -> TaskOutcome:
+        return _read_outcome(
+            ref, ticket, statuses=statuses, statuses_error=statuses_error, observed_root=observed_root, store=store,
+        )
+
+    entries = tuple(_entry_outcome(entry, read) for entry in cb.get("entries") or [] if entry.get("filed_tickets"))
+    unobserved = [
+        f"task {task.ref.task_id} in {task.ref.project_root}: {task.note}"
+        for entry in entries
+        for task in entry.tasks
+        if task.ref is not None and task.standing is None
+    ]
+    if unobserved:
+        logger.warning(
+            "disposition: %d back-linked task(s) were not observed, so their entries keep their status: %s",
+            len(unobserved),
+            "; ".join(unobserved),
+        )
+    return Outcomes(entries, statuses_error)
 
 
 @dataclass(frozen=True)
