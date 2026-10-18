@@ -46,11 +46,12 @@ from _merge_lane_fakes import (
     lane_state,
     make_lane,
     raises,
+    running_lane,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_lane.types import MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -2533,6 +2534,118 @@ class TestAbandonPredispatchRetiresRegistry:
             'retiring must pop the live object too, and no snapshot path can '
             'see that half: every one of them already skips a TERMINAL rid'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3860: a pre-dispatch request whose outcome is already decided is never
+# reported, however long it waits for the merger to drop it.
+# ---------------------------------------------------------------------------
+
+
+def _decide(request: MergeRequest, how: str) -> None:
+    """Decide *request* the way its waiter or another path would."""
+    if how == 'cancel':
+        request.result.cancel()
+    else:
+        request.result.set_result(MergeOutcome('blocked', reason='decided elsewhere'))
+
+
+async def _until_buffered(
+    lane: Any, queue: asyncio.Queue, request: MergeRequest, timeout: float = 10.0,
+) -> None:
+    """Wait until the merger has taken *request* off *queue* into a lane buffer."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if queue.empty() and lane_state(lane, request.request_id) == 'queued':
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(
+        f'{request.request_id} was not buffered within {timeout}s: '
+        f'queue empty={queue.empty()}, entry={lane_entry(lane, request.request_id)!r}'
+    )
+
+
+@pytest.mark.asyncio
+class TestDecidedPredispatchRequestsLeaveTheCensus:
+    """A request still waiting for the merger, whose future is already
+    resolved or cancelled, is gone from ``snapshot()`` at once.
+
+    The merger drops such a request only when it dequeues it, which can sit
+    behind head-of-line work or a halted lane for as long as that lasts.
+    Until then every surface reading the snapshot -- ``get_merge_queue``,
+    ``merge_status``, the heartbeat's head of line, the harness's idle check
+    -- would report a decided request as queued.
+    """
+
+    @pytest.mark.parametrize('how', ['cancel', 'resolve'])
+    async def test_decided_request_not_yet_drained_is_not_listed(
+        self, git_ops: GitOps, config: OrchestratorConfig, how: str,
+    ) -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        clock = FakeClock()
+        lane = make_lane(git_ops, queue, clock=clock)
+        live = _make_request('census-live', 'census-live', git_ops.project_root, config)
+        dead = _make_request('census-dead', 'census-dead', git_ops.project_root, config)
+        await queue.put(live)
+        await queue.put(dead)
+        _decide(dead, how)
+
+        try:
+            assert lane_state(lane, dead.request_id) is None, (
+                f'a {how}-decided request is still listed: {lane_entry(lane, dead.request_id)!r}'
+            )
+            live_entry = lane_entry(lane, live.request_id)
+            assert live_entry is not None, 'the undecided request vanished with it'
+            assert live_entry['state'] == 'queued'
+            assert live_entry['waiter_alive'] is True
+            snapshot = lane.snapshot()
+            assert snapshot['depth'] == 1, f'depth counts a decided request: {snapshot["entries"]!r}'
+            assert snapshot['head_of_line'] == live.task_id
+
+            clock.time += 2460
+            assert lane_state(lane, dead.request_id) is None, (
+                'a decided request resurfaced once it had aged past the specimen age'
+            )
+        finally:
+            live.result.cancel()
+
+    async def test_cancelled_request_in_a_halted_lane_buffer_is_not_listed(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        verifier = FakeVerifier()
+        lane = make_lane(git_ops, queue, verifier=verifier)
+        dead_wt = await _make_branch_with_file(
+            git_ops, 'buffered-dead', 'file_buffered_dead.py', 'dead = 1\n',
+        )
+        live_wt = await _make_branch_with_file(
+            git_ops, 'buffered-live', 'file_buffered_live.py', 'live = 1\n',
+        )
+        dead = _make_request('buffered-dead', 'buffered-dead', dead_wt, config)
+        live = _make_request('buffered-live', 'buffered-live', live_wt, config)
+
+        async with running_lane(lane) as run:
+            lane.halt_lane('normal', 'test: hold the buffer')
+            await queue.put(dead)
+            await _until_buffered(lane, queue, dead)
+            dead.result.cancel()
+
+            assert lane_state(lane, dead.request_id) is None, (
+                f'a cancelled buffered request is still listed: '
+                f'{lane_entry(lane, dead.request_id)!r}'
+            )
+            assert lane.snapshot()['depth'] == 0
+
+            lane.unhalt_lane('normal')
+            await queue.put(live)
+            outcome = await run.outcome(live)
+
+            assert outcome.status == 'done', f'{outcome!r}'
+            assert dead.task_id not in verifier.verified, (
+                f'the cancelled request consumed a verify: {verifier.verified!r}'
+            )
+            assert lane_state(lane, dead.request_id) is None
 
 
 # ---------------------------------------------------------------------------
