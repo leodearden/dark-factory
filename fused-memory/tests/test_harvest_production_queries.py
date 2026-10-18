@@ -80,10 +80,9 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
 
     Narrower than the bake-off module's version of this test, and
     deliberately so: the hazard THAT one names —
-    ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``,
-    reached from ``read_transform_selection`` only via ``bake_off()``,
-    serving ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check —
-    cannot reach this key at all, because no script asks it for
+    ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``
+    serving whichever object a test module last registered — cannot reach
+    this key at all, because no script asks it for
     ``'harvest_production_queries'``.
 
     What is real here is smaller: TWO test modules register
