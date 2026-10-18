@@ -2679,27 +2679,13 @@ def run_census(
     neither filed nor listed)
     -> ``disposition.backfill``, which links every historical
     ``source=legibility_census`` task to the entry its title was filed under,
-    in the first run it can reach the store -> the outcome feedback
-    (plans/census-incremental-prd.md L5, D8): ONE *status_fetcher* read
-    (``_read_statuses``) feeds ``disposition.read_outcomes`` over every
-    back-linked entry; each entry governed by a done task is re-verified at
-    *as_of_sha* in a second *verify_fn* call (``_reverify``, the same model,
-    within what *max_verify_clusters* leaves after the novel clusters; a
-    headroom cap there leaves them inconclusive and never defers the run);
-    ``disposition.project`` re-derives each entry's status from its tasks
-    (``fixed`` only from a re-verify that found it gone, INV-3); a finding
-    re-verified present files again superseding its done task, and one whose
-    task was cancelled without an acceptance reason files again once it
-    recurs (is sighted this run). An entry whose earlier ticket still awaits
-    the curator is held, since that ticket may become its live task: no
-    re-verify, no re-filing, and no second ticket from ``dispose`` below
-    (``Outcomes.awaiting``). The read precedes ``resolve_tickets``, so a
-    ticket the curator decided since the last run holds its entry for that
-    one run ->
+    in the first run it can reach the store -> the outcome feedback of
+    plans/census-incremental-prd.md L5 (D8), over ONE *status_fetcher* read
+    and a second *verify_fn* call inside what *max_verify_clusters* leaves ->
     ``_filing_queue``, which pairs
     each fileable cluster with the entry it was promoted to and adds every
-    earlier-withheld entry that has since recurred, then the re-filings ->
-    ``build_task_payloads``
+    earlier-withheld entry that has since recurred, carrying the re-filings
+    onto it -> ``build_task_payloads``
     over that queue -> ``disposition.dispose``, contract §8 over
     *task_store*: a finding whose key a live, accepted or done task already
     carries, that a live task matches semantically, or whose key an earlier
