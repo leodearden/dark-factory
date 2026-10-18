@@ -1795,6 +1795,56 @@ class TestCuratorZotDuplicateSweepConfig:
             CuratorConfig(zot_duplicate_search_limit=0)
 
 
+class TestCurationDeferralConfig:
+    """Task 4503: the knobs behind parking a submission the curator could not judge."""
+
+    def test_defaults(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        cfg = CuratorConfig()
+        assert cfg.deferral_backoff_base_seconds == 60.0
+        assert cfg.deferral_backoff_max_seconds == 1800.0
+        assert cfg.deferral_max_seconds == 1800.0
+        assert TicketJanitorConfig().curation_backlog_escalation_min_attempts == 2
+
+    @pytest.mark.parametrize(
+        'field',
+        ['deferral_backoff_base_seconds', 'deferral_backoff_max_seconds', 'deferral_max_seconds'],
+    )
+    @pytest.mark.parametrize('value', [0.0, -1.0])
+    def test_seconds_must_be_positive(self, field, value):
+        with pytest.raises(ValidationError):
+            CuratorConfig(**{field: value})
+
+    def test_backlog_escalation_needs_at_least_one_attempt(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        with pytest.raises(ValidationError):
+            TicketJanitorConfig(curation_backlog_escalation_min_attempts=0)
+        assert TicketJanitorConfig(
+            curation_backlog_escalation_min_attempts=1,
+        ).curation_backlog_escalation_min_attempts == 1
+
+    def test_backoff_max_below_base_is_rejected_naming_both(self):
+        with pytest.raises(ValidationError) as excinfo:
+            CuratorConfig(deferral_backoff_base_seconds=120.0, deferral_backoff_max_seconds=90.0)
+        message = str(excinfo.value)
+        assert '120' in message
+        assert '90' in message
+
+    def test_backoff_max_equal_to_base_is_accepted(self):
+        cfg = CuratorConfig(deferral_backoff_base_seconds=90.0, deferral_backoff_max_seconds=90.0)
+        assert cfg.deferral_backoff_max_seconds == 90.0
+
+    def test_none_is_hot_reloadable(self):
+        from fused_memory.config.reload import RELOADABLE_FIELDS
+
+        assert not {
+            leaf for leaf in RELOADABLE_FIELDS
+            if 'deferral' in leaf or 'curation_backlog' in leaf
+        }
+
+
 class TestQueueConfigTransientErrorFields:
     """Task 1936: QueueConfig exposes the error-aware retry budget knobs that
     flow into DurableWriteQueue(transient_max_attempts=..., transient_error_names=...).

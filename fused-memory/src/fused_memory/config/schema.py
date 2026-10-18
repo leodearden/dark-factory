@@ -2179,6 +2179,11 @@ class TicketJanitorConfig(BaseModel):
     interval the janitor terminalises expired pending tickets, batches
     failed rows by ``(project_id, task_id, escalation_id)``, and submits one
     info-severity ``ticket_failure`` escalation per batch.
+
+    It is also the only retrier of tickets parked ``awaiting_curation``, so
+    ``enabled=False`` strands them: they are never retried and never reach
+    ``CuratorConfig.deferral_max_seconds``, as a dead worker's pending rows
+    are never reaped.
     """
 
     enabled: bool = Field(default=True)
@@ -2186,6 +2191,7 @@ class TicketJanitorConfig(BaseModel):
     cooldown_seconds: float = Field(default=3600.0)
     batch_limit: int = Field(default=100)
     dedup_outage: DedupOutageDetectorConfig = Field(default_factory=DedupOutageDetectorConfig)
+    curation_backlog_escalation_min_attempts: int = Field(default=2, ge=1)
 
 
 class SummaryRebuildConfig(BaseModel):
@@ -2418,6 +2424,14 @@ class CuratorConfig(BaseModel):
     # which counts only hung calls and short-circuits them; this only reports.
     degraded_streak_threshold: int = Field(default=5, ge=1)
 
+    # A submission the account pool could not serve parks awaiting_curation and
+    # is retried on this backoff; deferral_max_seconds, measured from the
+    # ticket's submission, is the terminal bound past which it is created
+    # marked dedupe_skipped (fused_memory/middleware/curation_deferral.py).
+    deferral_backoff_base_seconds: float = Field(default=60.0, gt=0)
+    deferral_backoff_max_seconds: float = Field(default=1800.0, gt=0)
+    deferral_max_seconds: float = Field(default=1800.0, gt=0)
+
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
     # candidates are dropped before any LLM call. None disables the guard.
@@ -2487,6 +2501,15 @@ class CuratorConfig(BaseModel):
             "PURE-GATE instead of the TDD architect. None disables the gate."
         ),
     )
+
+    @model_validator(mode='after')
+    def _validate_deferral_backoff_bounds(self) -> 'CuratorConfig':
+        if self.deferral_backoff_max_seconds < self.deferral_backoff_base_seconds:
+            raise ValueError(
+                f'deferral_backoff_max_seconds ({self.deferral_backoff_max_seconds}) must be '
+                f'>= deferral_backoff_base_seconds ({self.deferral_backoff_base_seconds})'
+            )
+        return self
 
 
 class PathScopeAdjudicatorConfig(BaseModel):
