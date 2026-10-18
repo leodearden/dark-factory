@@ -1543,3 +1543,101 @@ def test_an_unkeyed_present_finding_that_supersedes_a_task_files_through_steps_t
     (payload,) = submit.calls
     assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == 5120
     assert decision.step is Step.CURATOR
+
+
+# ---------------------------------------------------------------------------
+# Contract §7 dispositions, rendered from an entry's status, its
+# filed_tickets and this run's task standings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "ref", "shown"),
+    [
+        ("open", None, "open"),
+        ("filed", 12, "filed:12"),
+        ("accepted", 5120, "accepted:5120"),
+        ("refuted", None, "refuted"),
+        ("fixed", "abcdef1", "fixed:abcdef1"),
+    ],
+)
+def test_a_disposition_renders_its_contract_section_7_spelling(kind, ref, shown) -> None:
+    assert str(disposition.Disposition(disposition.DispositionKind(kind), ref)) == shown
+
+
+@pytest.mark.parametrize(
+    ("kind", "ref"),
+    [("open", 12), ("refuted", "abcdef1"), ("filed", None), ("accepted", "12"), ("fixed", None), ("fixed", 12)],
+)
+def test_a_disposition_holds_its_reference_to_its_kind(kind, ref) -> None:
+    with pytest.raises(ValueError, match=kind):
+        disposition.Disposition(disposition.DispositionKind(kind), ref)
+
+
+def _shown(entry: dict, standings: dict | None = None) -> str:
+    return str(disposition.disposition_of(entry, standings or {}))
+
+
+def test_a_fixed_entry_with_its_fix_sha_is_fixed_at_that_sha() -> None:
+    entry = _entry("entry-a", status="fixed", fixed_at_sha="abcdef1", filed_tickets=[_task_row(5120)])
+
+    assert _shown(entry, {disposition.TaskRef(_ROOT, 5120): Standing.DONE}) == "fixed:abcdef1"
+
+
+def test_a_legacy_fixed_entry_without_a_fix_sha_is_open() -> None:
+    assert _shown(_entry("entry-a", status="fixed")) == "open"
+
+
+def test_an_accepted_entry_is_accepted_by_its_task() -> None:
+    entry = _entry("entry-a", status="accepted", accepted_by=5120, filed_tickets=[_task_row(5120)])
+
+    assert _shown(entry, {disposition.TaskRef(_ROOT, 5120): Standing.ACCEPTED}) == "accepted:5120"
+
+
+def test_an_entry_with_live_tasks_is_filed_under_the_newest() -> None:
+    entry = _entry("entry-a", filed_tickets=[_task_row(12), _task_row(40), _task_row(30), _task_row(50)])
+    standings = {
+        disposition.TaskRef(_ROOT, 12): Standing.FILED,
+        disposition.TaskRef(_ROOT, 30): Standing.FILED,
+        disposition.TaskRef(_ROOT, 40): Standing.DONE,
+    }
+
+    assert _shown(entry, standings) == "filed:30"
+
+
+@pytest.mark.parametrize("standing", [Standing.DONE, Standing.ABANDONED, None])
+def test_an_entry_whose_tasks_are_not_live_is_open(standing) -> None:
+    entry = _entry("entry-a", filed_tickets=[_task_row(12), _row("tkt_9")])
+    standings = {} if standing is None else {disposition.TaskRef(_ROOT, 12): standing}
+
+    assert _shown(entry, standings) == "open"
+
+
+def test_an_entry_without_back_links_is_open() -> None:
+    assert _shown(_entry("entry-a")) == "open"
+
+
+def test_task_standings_merge_the_outcome_read_with_this_runs_routed_decisions() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120)]), _entry("entry-b", filed_tickets=[_task_row(12)]))
+    outcomes = _read(cb, {"5120": "done", "12": "pending"})
+    store = FakeTaskStore(
+        metadata_hits=_key_hits(_hit(40, "done"), key=_KEY_B),
+        resolve_outcomes={"tkt_1": _outcome(task_store.TicketStatus.CREATED, 77)},
+    )
+    filings = [_filing(_KEY_A, "fresh", entry_id="entry-c"), _filing(_KEY_B, "linked to done", entry_id="entry-d")]
+    disposal, resolutions = _disposed_and_resolved(filings, store)
+
+    standings = disposition.task_standings(outcomes, disposal.resolved(resolutions).decisions)
+
+    assert dict(standings) == {
+        disposition.TaskRef(_ROOT, 5120): Standing.DONE,
+        disposition.TaskRef(_ROOT, 12): Standing.FILED,
+        disposition.TaskRef(_ROOT, 77): Standing.FILED,
+        disposition.TaskRef(_ROOT, 40): Standing.DONE,
+    }
+
+
+def test_task_standings_leave_an_unobserved_task_out() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120)]))
+
+    assert dict(disposition.task_standings(_read(cb, {}), ())) == {}
