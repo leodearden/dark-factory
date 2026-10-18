@@ -320,7 +320,8 @@ def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str
 
 
 # The role the steward's own filings carry (orchestrator.steward
-# _auto_escalate_to_human hard-codes ``agent_role='steward'``). Level-1 is the
+# _auto_escalate_to_human files under orchestrator.agents.roles.STEWARD.name,
+# which escalation cannot import). Level-1 is the
 # steward's documented recourse, so an L1 from this role — or from a harness
 # sentinel — is the EXPECTED shape and is not logged.
 _EXPECTED_L1_FILER_ROLE = 'steward'
