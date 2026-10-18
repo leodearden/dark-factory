@@ -295,16 +295,6 @@ async def test_the_redispatch_park_pops_front_requests_first(scene: Scene) -> No
     assert scene.intake.has_pending_redispatch is False
 
 
-async def test_the_shutdown_drain_empties_the_redispatch_park(scene: Scene) -> None:
-    items = (parked(request(scene, '101')), parked(request(scene, '102')))
-    for item in items:
-        scene.intake.request_redispatch(item)
-
-    assert scene.intake.drain_redispatch_for_shutdown() == items
-    assert scene.intake.pending_redispatch() == ()
-    assert scene.intake.drain_redispatch_for_shutdown() == ()
-
-
 # ---------------------------------------------------------------------------
 # (f) The lane-buffer requests the other concerns make
 # ---------------------------------------------------------------------------

@@ -699,12 +699,6 @@ class MergeIntake:
         """Pop the next parked item.  Raises IndexError when nothing is parked."""
         return self._redispatch.popleft()
 
-    def drain_redispatch_for_shutdown(self) -> tuple[SpeculativeItem, ...]:
-        """Empty the redispatch park, returning its items in dispatch order."""
-        drained = tuple(self._redispatch)
-        self._redispatch.clear()
-        return drained
-
     # ── the suffix-conflict state ──────────────────────────────────────────
 
     def note_main_sha(self, sha: str | None) -> None:

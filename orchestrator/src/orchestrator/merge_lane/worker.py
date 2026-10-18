@@ -13284,19 +13284,17 @@ class SpeculativeMergeWorker:
         self._inflight.clear()
 
         # Drain the redispatch park: items pending re-dispatch after a cascade.
-        # Re-drained until empty: the verifier may park another during the
-        # cleanup awaits.
-        while _parked := self._intake.drain_redispatch_for_shutdown():
-            for _rd in _parked:
-                if not _rd.request.result.done():
-                    _rd.request.result.set_result(shutdown)
-                # MQ-reliability kappa (task 2169): retire — parked awaiting
-                # re-dispatch, never reaches DISPATCHING again once dropped here.
-                self._retire_item(_rd.request.request_id)
-                _rd_wt = item_merge_wt(_rd)
-                if _rd_wt is not None:
-                    with contextlib.suppress(BaseException):
-                        await self._cleanup_owned_merge_worktree(_rd_wt)
+        while self._intake.has_pending_redispatch:
+            _rd = self._intake.next_redispatch()
+            if not _rd.request.result.done():
+                _rd.request.result.set_result(shutdown)
+            # MQ-reliability kappa (task 2169): retire — parked awaiting
+            # re-dispatch, never reaches DISPATCHING again once dropped here.
+            self._retire_item(_rd.request.request_id)
+            _rd_wt = item_merge_wt(_rd)
+            if _rd_wt is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cleanup_owned_merge_worktree(_rd_wt)
 
         # Send sentinels to unblock both loops
         await self._queue.put(None)  # type: ignore[arg-type]
