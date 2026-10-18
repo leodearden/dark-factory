@@ -6,15 +6,17 @@ import asyncio
 import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import README_SEED, _git, build_repo
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig, ScoringConfig
-from orchestrator.event_store import EventStore
-from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.scheduler import Scheduler, TaskAssignment, TickContext
 from orchestrator.work_product import (
     FAILURE_STREAK_ESCALATION_THRESHOLD,
     PROBE_SENTINEL,
@@ -25,6 +27,10 @@ from orchestrator.work_product import (
 NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
 SHARED_ANCHOR = '2026-10-10T08:00:00.000Z'
 TTL = ScoringConfig().continuity_probe_ttl_secs
+CREDIT = ScoringConfig().continuity_credit
+MAX_AGE = ScoringConfig().continuity_credit_max_age_secs
+NOW_TS = NOW.timestamp()
+HOUR = 3600.0
 
 
 def _task(task_id: str, *, priority: str = 'medium', pending_since: str | None = SHARED_ANCHOR) -> dict:
@@ -203,3 +209,120 @@ class TestProbeStormEscape:
         await failed_refresh()
         await failed_refresh()
         assert len(_probe_escalations(queue)) == 1
+
+
+def _ctx(tasks: list[dict]) -> TickContext:
+    return TickContext(
+        tasks=tasks,
+        status_map={t['id']: 'pending' for t in tasks},
+        tasks_by_id={t['id']: t for t in tasks},
+        max_id=max(int(t['id']) for t in tasks),
+        transitive_counts={t['id']: 0 for t in tasks},
+        candidates=tasks,
+    )
+
+
+def _scores(scheduler: Scheduler, tasks: list[dict]) -> dict[str, float]:
+    return {tid: score for score, tid, _task, _tier in scheduler._score_candidates(_ctx(tasks))}
+
+
+async def _credit_delta(scheduler: Scheduler, with_work: str, without: str) -> float:
+    """Settle one refresh, then score two otherwise identical candidates."""
+    tasks = [_task(with_work), _task(without)]
+    await _tick_and_settle(scheduler, tasks)
+    scores = _scores(scheduler, tasks)
+    return scores[with_work] - scores[without]
+
+
+def _fresh(commits_ahead: int = 2, *, age_secs: float = HOUR) -> BranchWork:
+    return BranchWork(commits_ahead=commits_ahead, tip_committed_at=NOW_TS - age_secs)
+
+
+@pytest.mark.asyncio
+class TestContinuityCredit:
+    """C3: a task with fresh, ungated work product scores exactly continuity_credit higher."""
+
+    async def test_work_product_adds_exactly_the_continuity_credit(self, store, clock):
+        scheduler = _scheduler(_RecordingReader({'10': _fresh()}), event_store=store, clock=clock)
+
+        assert await _credit_delta(scheduler, '10', '11') == pytest.approx(CREDIT, abs=1e-9)
+
+    async def test_a_zero_progress_row_from_a_prior_run_withholds_the_credit(self, tmp_path, clock):
+        db = tmp_path / 'runs.db'
+        EventStore(db, run_id='earlier-run').emit(
+            EventType.zero_progress_requeue, task_id='10', data={'consecutive': 3},
+        )
+        scheduler = _scheduler(
+            _RecordingReader({'10': _fresh()}), event_store=EventStore(db, run_id='this-run'), clock=clock,
+        )
+
+        assert await _credit_delta(scheduler, '10', '11') == 0
+
+    async def test_another_tasks_zero_progress_row_does_not_withhold_the_credit(self, store, clock):
+        store.emit(EventType.zero_progress_requeue, task_id='99', data={'consecutive': 3})
+        scheduler = _scheduler(_RecordingReader({'10': _fresh()}), event_store=store, clock=clock)
+
+        assert await _credit_delta(scheduler, '10', '11') == pytest.approx(CREDIT, abs=1e-9)
+
+    @pytest.mark.parametrize(('age_secs', 'credited'), [(MAX_AGE, True), (MAX_AGE + 1, False)])
+    async def test_the_credit_lapses_after_the_max_age(self, store, clock, age_secs, credited):
+        scheduler = _scheduler(_RecordingReader({'10': _fresh(age_secs=age_secs)}), event_store=store, clock=clock)
+
+        delta = await _credit_delta(scheduler, '10', '11')
+
+        assert delta == pytest.approx(CREDIT if credited else 0.0, abs=1e-9)
+
+    async def test_a_branch_with_nothing_ahead_earns_nothing(self, store, clock):
+        scheduler = _scheduler(_RecordingReader({'10': _fresh(commits_ahead=0)}), event_store=store, clock=clock)
+
+        assert await _credit_delta(scheduler, '10', '11') == 0
+
+    async def test_work_product_outranks_the_numeric_tie_break(self, store, clock):
+        scheduler = _scheduler(_RecordingReader({'11': _fresh(1)}), event_store=store, clock=clock)
+        tasks = [_task('10'), _task('11')]
+
+        before = await _tick_and_settle(scheduler, tasks)
+        after = await _tick(scheduler, tasks)
+
+        assert before is not None and before.task_id == '10'
+        assert after is not None and after.task_id == '11'
+
+    async def test_an_unarmed_tick_scores_without_continuity(self, store, clock):
+        scheduler = _scheduler(_RecordingReader({'10': _fresh()}), event_store=store, clock=clock)
+        tasks = [_task('10', pending_since=None), _task('11', pending_since=None)]
+        await _tick_and_settle(scheduler, tasks)
+        ctx = _ctx(tasks)
+
+        scores = {tid: score for score, tid, _task, _tier in scheduler._score_candidates(ctx)}
+
+        assert scores == {
+            tid: scheduler._compute_score_legacy('medium', scheduler._compute_age(tid, ctx.max_id), 0)
+            for tid in ('10', '11')
+        }
+
+    async def test_no_event_store_means_no_credit(self, clock):
+        reader = _RecordingReader({'10': _fresh()})
+        scheduler = _scheduler(reader, event_store=None, clock=clock)
+
+        assert await _credit_delta(scheduler, '10', '11') == 0
+        assert reader.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_the_default_reader_credits_a_real_task_branch(tmp_path, monkeypatch, store, clock):
+    monkeypatch.setenv('GIT_COMMITTER_DATE', f'{int(NOW_TS - 2 * HOUR)} +0000')
+    repo = build_repo(tmp_path / 'project', README_SEED)
+    _git(repo, 'branch', 'task/8', 'main')
+    monkeypatch.setenv('GIT_COMMITTER_DATE', f'{int(NOW_TS - HOUR)} +0000')
+    _git(repo, 'checkout', '-q', '-b', 'task/7', 'main')
+    _git(repo, 'commit', '-q', '--allow-empty', '-m', 'task 7 work')
+    _git(repo, 'checkout', '-q', 'main')
+    scheduler = Scheduler(
+        OrchestratorConfig(project_root=Path(repo), max_per_module=1, scoring=ScoringConfig()),
+        event_store=store,
+        time_source=lambda: clock[0],
+        wall_time_source=lambda: NOW,
+    )
+    scheduler.finish_startup()
+
+    assert await _credit_delta(scheduler, '7', '8') == pytest.approx(CREDIT, abs=1e-9)
