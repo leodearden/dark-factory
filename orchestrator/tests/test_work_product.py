@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import pytest
+from _call_recorder import ThreadRecordingCall
 from _git_fixtures import README_SEED, _git, build_repo
 
 from orchestrator.sentinel_l1 import SentinelL1
@@ -227,18 +228,8 @@ PROBE_FAILURE = BranchProbeError(
 )
 
 
-class _CountingLoad:
-    def __init__(self, snapshot: WorkProductSnapshot = FRESH) -> None:
-        self.snapshot = snapshot
-        self.threads: list[int] = []
-
-    @property
-    def calls(self) -> int:
-        return len(self.threads)
-
-    def __call__(self) -> WorkProductSnapshot:
-        self.threads.append(threading.get_ident())
-        return self.snapshot
+def _counting_load() -> ThreadRecordingCall[WorkProductSnapshot]:
+    return ThreadRecordingCall(FRESH)
 
 
 def _failing(exc: Exception = PROBE_FAILURE) -> Callable[[], WorkProductSnapshot]:
@@ -273,7 +264,7 @@ class TestWorkProductProbe:
         assert _Rig().probe.snapshot is WorkProductSnapshot.EMPTY
 
     async def test_a_refresh_publishes_the_loaded_snapshot(self):
-        rig, load = _Rig(), _CountingLoad()
+        rig, load = _Rig(), _counting_load()
 
         await rig.refresh(load)
 
@@ -281,7 +272,7 @@ class TestWorkProductProbe:
         assert rig.probe.snapshot is FRESH
 
     async def test_at_most_one_load_per_ttl_window(self):
-        rig, load = _Rig(), _CountingLoad()
+        rig, load = _Rig(), _counting_load()
         await rig.refresh(load)
 
         for _ in range(50):
@@ -295,7 +286,7 @@ class TestWorkProductProbe:
         assert load.calls == 2
 
     async def test_the_window_is_anchored_at_the_attempt_not_the_completion(self):
-        rig, counting = _Rig(), _CountingLoad()
+        rig, counting = _Rig(), _counting_load()
 
         def slow_load() -> WorkProductSnapshot:
             rig.clock[0] += 100
@@ -308,14 +299,14 @@ class TestWorkProductProbe:
         assert counting.calls == 1
 
     async def test_the_load_runs_off_the_event_loop_thread(self):
-        rig, load = _Rig(), _CountingLoad()
+        rig, load = _Rig(), _counting_load()
 
         await rig.refresh(load)
 
         assert load.threads and load.threads[0] != threading.get_ident()
 
     async def test_poll_never_waits_and_never_overlaps_refreshes(self):
-        rig, counting = _Rig(), _CountingLoad()
+        rig, counting = _Rig(), _counting_load()
         release = threading.Event()
 
         def blocked_load() -> WorkProductSnapshot:
@@ -341,7 +332,7 @@ class TestWorkProductProbe:
 
     async def test_a_failed_refresh_withdraws_all_credit(self):
         rig = _Rig()
-        await rig.refresh(_CountingLoad())
+        await rig.refresh(_counting_load())
 
         await rig.refresh_next_window(_failing())
 
@@ -377,7 +368,7 @@ class TestWorkProductProbe:
         await rig.refresh(_failing())
         for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD - 2):
             await rig.refresh_next_window(_failing())
-        await rig.refresh_next_window(_CountingLoad())
+        await rig.refresh_next_window(_counting_load())
         for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD - 1):
             await rig.refresh_next_window(_failing())
 
@@ -395,7 +386,7 @@ class TestWorkProductProbe:
         assert 'sqlite went away' in rig.filed[0].detail
 
     async def test_a_hot_ttl_retune_moves_the_window_on_the_next_poll(self):
-        rig, load = _Rig(), _CountingLoad()
+        rig, load = _Rig(), _counting_load()
         await rig.refresh(load)
 
         rig.ttl = 60.0

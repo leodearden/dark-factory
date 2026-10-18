@@ -5,18 +5,19 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _call_recorder import ThreadRecordingCall
 from _git_fixtures import README_SEED, _git, build_repo
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig, ScoringConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.scheduler import Scheduler, TaskAssignment, TickContext
+from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.work_product import (
     FAILURE_STREAK_ESCALATION_THRESHOLD,
     PROBE_SENTINEL,
@@ -25,12 +26,17 @@ from orchestrator.work_product import (
 )
 
 NOW = datetime(2026, 10, 12, 12, 0, 0, tzinfo=UTC)
-SHARED_ANCHOR = '2026-10-10T08:00:00.000Z'
 TTL = ScoringConfig().continuity_probe_ttl_secs
-CREDIT = ScoringConfig().continuity_credit
 MAX_AGE = ScoringConfig().continuity_credit_max_age_secs
 NOW_TS = NOW.timestamp()
 HOUR = 3600.0
+
+
+def _anchor(at: datetime) -> str:
+    return at.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+
+SHARED_ANCHOR = _anchor(NOW - timedelta(hours=52))
 
 
 def _task(task_id: str, *, priority: str = 'medium', pending_since: str | None = SHARED_ANCHOR) -> dict:
@@ -45,25 +51,16 @@ def _tasks(count: int, first_id: int = 1) -> list[dict]:
     return [_task(str(first_id + i)) for i in range(count)]
 
 
-class _RecordingReader:
-    """The one-git-child seam: counts reads and records the thread each ran on."""
-
-    def __init__(self, branches: Mapping[str, BranchWork] | None = None) -> None:
-        self.branches = dict(branches or {})
-        self.threads: list[int] = []
-
-    @property
-    def calls(self) -> int:
-        return len(self.threads)
-
-    def __call__(self) -> dict[str, BranchWork]:
-        self.threads.append(threading.get_ident())
-        return dict(self.branches)
+def _reader(branches: Mapping[str, BranchWork] | None = None) -> ThreadRecordingCall[dict[str, BranchWork]]:
+    """The one-git-child seam, counting its reads and the thread each ran on."""
+    return ThreadRecordingCall(dict(branches or {}))
 
 
-def _scheduler(reader, *, event_store: EventStore | None, clock: list[float]) -> Scheduler:
+def _scheduler(
+    reader, *, event_store: EventStore | None, clock: list[float], scoring: ScoringConfig | None = None,
+) -> Scheduler:
     scheduler = Scheduler(
-        OrchestratorConfig(max_per_module=1, max_concurrent_tasks=500, scoring=ScoringConfig()),
+        OrchestratorConfig(max_per_module=1, max_concurrent_tasks=500, scoring=scoring or ScoringConfig()),
         event_store=event_store,
         time_source=lambda: clock[0],
         wall_time_source=lambda: NOW,
@@ -104,7 +101,7 @@ class TestBoundedProbeOccupancy:
 
     @pytest.mark.parametrize('candidates', [1, 300])
     async def test_one_read_per_ttl_window_whatever_the_candidate_count(self, store, clock, candidates):
-        reader = _RecordingReader()
+        reader = _reader()
         scheduler = _scheduler(reader, event_store=store, clock=clock)
         tasks = _tasks(candidates)
 
@@ -121,7 +118,7 @@ class TestBoundedProbeOccupancy:
         assert reader.calls == 2
 
     async def test_the_read_runs_off_the_loop_thread(self, store, clock):
-        reader = _RecordingReader()
+        reader = _reader()
         scheduler = _scheduler(reader, event_store=store, clock=clock)
 
         await _tick_and_settle(scheduler, _tasks(3))
@@ -149,7 +146,7 @@ class TestBoundedProbeOccupancy:
         assert len(blocked) == 1
 
     async def test_nothing_is_probed_without_an_event_store(self, clock):
-        reader = _RecordingReader()
+        reader = _reader()
         scheduler = _scheduler(reader, event_store=None, clock=clock)
 
         for _ in range(5):
@@ -159,7 +156,7 @@ class TestBoundedProbeOccupancy:
         assert reader.calls == 0
 
     async def test_a_hot_ttl_retune_shortens_the_window_on_the_next_tick(self, store, clock):
-        reader = _RecordingReader()
+        reader = _reader()
         scheduler = _scheduler(reader, event_store=store, clock=clock)
         tasks = _tasks(3)
         await _tick_and_settle(scheduler, tasks)
@@ -211,100 +208,87 @@ class TestProbeStormEscape:
         assert len(_probe_escalations(queue)) == 1
 
 
-def _ctx(tasks: list[dict]) -> TickContext:
-    return TickContext(
-        tasks=tasks,
-        status_map={t['id']: 'pending' for t in tasks},
-        tasks_by_id={t['id']: t for t in tasks},
-        max_id=max(int(t['id']) for t in tasks),
-        transitive_counts={t['id']: 0 for t in tasks},
-        candidates=tasks,
-    )
-
-
-def _scores(scheduler: Scheduler, tasks: list[dict]) -> dict[str, float]:
-    return {tid: score for score, tid, _task, _tier in scheduler._score_candidates(_ctx(tasks))}
-
-
-async def _credit_delta(scheduler: Scheduler, with_work: str, without: str) -> float:
-    """Settle one refresh, then score two otherwise identical candidates."""
-    tasks = [_task(with_work), _task(without)]
-    await _tick_and_settle(scheduler, tasks)
-    scores = _scores(scheduler, tasks)
-    return scores[with_work] - scores[without]
-
-
 def _fresh(commits_ahead: int = 2, *, age_secs: float = HOUR) -> BranchWork:
     return BranchWork(commits_ahead=commits_ahead, tip_committed_at=NOW_TS - age_secs)
 
 
+async def _settled_winner(scheduler: Scheduler, tasks: list[dict]) -> str:
+    """Settle one probe refresh, then name the candidate the next tick dispatches."""
+    await _tick_and_settle(scheduler, tasks)
+    assignment = await _tick(scheduler, tasks)
+    assert assignment is not None
+    return assignment.task_id
+
+
+def _twins() -> list[dict]:
+    return [_task('10'), _task('11')]
+
+
 @pytest.mark.asyncio
 class TestContinuityCredit:
-    """C3: a task with fresh, ungated work product scores exactly continuity_credit higher."""
-
-    async def test_work_product_adds_exactly_the_continuity_credit(self, store, clock):
-        scheduler = _scheduler(_RecordingReader({'10': _fresh()}), event_store=store, clock=clock)
-
-        assert await _credit_delta(scheduler, '10', '11') == pytest.approx(CREDIT, abs=1e-9)
-
-    async def test_a_zero_progress_row_from_a_prior_run_withholds_the_credit(self, tmp_path, clock):
-        db = tmp_path / 'runs.db'
-        EventStore(db, run_id='earlier-run').emit(
-            EventType.zero_progress_requeue, task_id='10', data={'consecutive': 3},
-        )
-        scheduler = _scheduler(
-            _RecordingReader({'10': _fresh()}), event_store=EventStore(db, run_id='this-run'), clock=clock,
-        )
-
-        assert await _credit_delta(scheduler, '10', '11') == 0
-
-    async def test_another_tasks_zero_progress_row_does_not_withhold_the_credit(self, store, clock):
-        store.emit(EventType.zero_progress_requeue, task_id='99', data={'consecutive': 3})
-        scheduler = _scheduler(_RecordingReader({'10': _fresh()}), event_store=store, clock=clock)
-
-        assert await _credit_delta(scheduler, '10', '11') == pytest.approx(CREDIT, abs=1e-9)
-
-    @pytest.mark.parametrize(('age_secs', 'credited'), [(MAX_AGE, True), (MAX_AGE + 1, False)])
-    async def test_the_credit_lapses_after_the_max_age(self, store, clock, age_secs, credited):
-        scheduler = _scheduler(_RecordingReader({'10': _fresh(age_secs=age_secs)}), event_store=store, clock=clock)
-
-        delta = await _credit_delta(scheduler, '10', '11')
-
-        assert delta == pytest.approx(CREDIT if credited else 0.0, abs=1e-9)
-
-    async def test_a_branch_with_nothing_ahead_earns_nothing(self, store, clock):
-        scheduler = _scheduler(_RecordingReader({'10': _fresh(commits_ahead=0)}), event_store=store, clock=clock)
-
-        assert await _credit_delta(scheduler, '10', '11') == 0
+    """C3: fresh, ungated work product on '11' outranks its otherwise identical, lower-id twin '10'."""
 
     async def test_work_product_outranks_the_numeric_tie_break(self, store, clock):
-        scheduler = _scheduler(_RecordingReader({'11': _fresh(1)}), event_store=store, clock=clock)
-        tasks = [_task('10'), _task('11')]
+        scheduler = _scheduler(_reader({'11': _fresh(1)}), event_store=store, clock=clock)
 
-        before = await _tick_and_settle(scheduler, tasks)
-        after = await _tick(scheduler, tasks)
+        before = await _tick_and_settle(scheduler, _twins())
+        after = await _tick(scheduler, _twins())
 
         assert before is not None and before.task_id == '10'
         assert after is not None and after.task_id == '11'
 
+    @pytest.mark.parametrize(('lead_over_credit', 'winner'), [(-1.0, '11'), (1.0, '10')])
+    async def test_the_credit_is_worth_exactly_continuity_credit(self, store, clock, lead_over_credit, winner):
+        """'10' is one age half-life older, so it leads by half the age budget, set to the credit plus the lead."""
+        defaults = ScoringConfig()
+        scoring = ScoringConfig(age_budget=2 * (defaults.continuity_credit + lead_over_credit))
+        scheduler = _scheduler(_reader({'11': _fresh()}), event_store=store, clock=clock, scoring=scoring)
+        tasks = [
+            _task('10', pending_since=_anchor(NOW - timedelta(seconds=scoring.age_half_secs))),
+            _task('11', pending_since=_anchor(NOW)),
+        ]
+
+        assert await _settled_winner(scheduler, tasks) == winner
+
+    async def test_a_zero_progress_row_from_a_prior_run_withholds_the_credit(self, tmp_path, clock):
+        db = tmp_path / 'runs.db'
+        EventStore(db, run_id='earlier-run').emit(
+            EventType.zero_progress_requeue, task_id='11', data={'consecutive': 3},
+        )
+        scheduler = _scheduler(
+            _reader({'11': _fresh()}), event_store=EventStore(db, run_id='this-run'), clock=clock,
+        )
+
+        assert await _settled_winner(scheduler, _twins()) == '10'
+
+    async def test_another_tasks_zero_progress_row_does_not_withhold_the_credit(self, store, clock):
+        store.emit(EventType.zero_progress_requeue, task_id='99', data={'consecutive': 3})
+        scheduler = _scheduler(_reader({'11': _fresh()}), event_store=store, clock=clock)
+
+        assert await _settled_winner(scheduler, _twins()) == '11'
+
+    @pytest.mark.parametrize(('age_secs', 'winner'), [(MAX_AGE, '11'), (MAX_AGE + 1, '10')])
+    async def test_the_credit_lapses_after_the_max_age(self, store, clock, age_secs, winner):
+        scheduler = _scheduler(_reader({'11': _fresh(age_secs=age_secs)}), event_store=store, clock=clock)
+
+        assert await _settled_winner(scheduler, _twins()) == winner
+
+    async def test_a_branch_with_nothing_ahead_earns_nothing(self, store, clock):
+        scheduler = _scheduler(_reader({'11': _fresh(commits_ahead=0)}), event_store=store, clock=clock)
+
+        assert await _settled_winner(scheduler, _twins()) == '10'
+
     async def test_an_unarmed_tick_scores_without_continuity(self, store, clock):
-        scheduler = _scheduler(_RecordingReader({'10': _fresh()}), event_store=store, clock=clock)
-        tasks = [_task('10', pending_since=None), _task('11', pending_since=None)]
-        await _tick_and_settle(scheduler, tasks)
-        ctx = _ctx(tasks)
+        scheduler = _scheduler(_reader({'11': _fresh()}), event_store=store, clock=clock)
+        unanchored = [_task('10', pending_since=None), _task('11', pending_since=None)]
 
-        scores = {tid: score for score, tid, _task, _tier in scheduler._score_candidates(ctx)}
-
-        assert scores == {
-            tid: scheduler._compute_score_legacy('medium', scheduler._compute_age(tid, ctx.max_id), 0)
-            for tid in ('10', '11')
-        }
+        assert await _settled_winner(scheduler, unanchored) == '10'
 
     async def test_no_event_store_means_no_credit(self, clock):
-        reader = _RecordingReader({'10': _fresh()})
+        reader = _reader({'11': _fresh()})
         scheduler = _scheduler(reader, event_store=None, clock=clock)
 
-        assert await _credit_delta(scheduler, '10', '11') == 0
+        assert await _settled_winner(scheduler, _twins()) == '10'
         assert reader.calls == 0
 
 
@@ -312,10 +296,10 @@ class TestContinuityCredit:
 async def test_the_default_reader_credits_a_real_task_branch(tmp_path, monkeypatch, store, clock):
     monkeypatch.setenv('GIT_COMMITTER_DATE', f'{int(NOW_TS - 2 * HOUR)} +0000')
     repo = build_repo(tmp_path / 'project', README_SEED)
-    _git(repo, 'branch', 'task/8', 'main')
+    _git(repo, 'branch', 'task/10', 'main')
     monkeypatch.setenv('GIT_COMMITTER_DATE', f'{int(NOW_TS - HOUR)} +0000')
-    _git(repo, 'checkout', '-q', '-b', 'task/7', 'main')
-    _git(repo, 'commit', '-q', '--allow-empty', '-m', 'task 7 work')
+    _git(repo, 'checkout', '-q', '-b', 'task/11', 'main')
+    _git(repo, 'commit', '-q', '--allow-empty', '-m', 'task 11 work')
     _git(repo, 'checkout', '-q', 'main')
     scheduler = Scheduler(
         OrchestratorConfig(project_root=Path(repo), max_per_module=1, scoring=ScoringConfig()),
@@ -325,4 +309,4 @@ async def test_the_default_reader_credits_a_real_task_branch(tmp_path, monkeypat
     )
     scheduler.finish_startup()
 
-    assert await _credit_delta(scheduler, '7', '8') == pytest.approx(CREDIT, abs=1e-9)
+    assert await _settled_winner(scheduler, _twins()) == '11'
