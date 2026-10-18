@@ -1,6 +1,6 @@
 """Source guard: no script under ``fused-memory/scripts/`` builds its own
-``spec_from_file_location`` loader. Sibling scripts load through
-``fused_memory.utils.script_loader.load_script``.
+by-path loader from an ``importlib`` loader factory. Sibling scripts load
+through ``fused_memory.utils.script_loader.load_script``.
 
 The scope is discovered, every ``*.py`` under ``scripts/``, because the forks
 this guard prevents arrived in NEW files (tasks 5845, 6184 and 6151), which a
@@ -20,7 +20,7 @@ from _ast_guard import calls_named, parse_python_module
 
 SCRIPTS_ROOT = pathlib.Path(__file__).parent.parent / 'scripts'
 
-LOADER_FACTORY = 'spec_from_file_location'
+LOADER_FACTORIES = frozenset({'spec_from_file_location', 'spec_from_loader', 'SourceFileLoader'})
 
 # (scripts-root-relative module, TOP-LEVEL function name) pairs that may keep
 # a local loader. Per function, so an ordinary fork beside an exempt one in the
@@ -32,7 +32,7 @@ EXEMPT_LOADERS = frozenset(
         ('retro_stamp_topics.py', '_load_probe_module'),
         ('normalize_topic_slugs.py', 'load_census_module'),
         ('local_memory_models_eval/harness.py', 'load_probe_module'),
-        # Different policy; owned by the 5941 follow-up (agent-followup-5941).
+        # Different policy; migration owned by pending task 7123.
         # Reuses the cache only when it has a FusedMemoryClient attribute.
         ('normalize_topic_slugs.py', 'load_mcp_client_module'),
         # Reuses the cache only when it has a FusedMemoryClient attribute.
@@ -63,8 +63,13 @@ def _top_level_functions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFu
     ]
 
 
+def _loader_factory_calls(node: ast.AST) -> list[ast.Call]:
+    return [call for factory in LOADER_FACTORIES for call in calls_named(node, factory)]
+
+
 def _unrouted_loader_lines(path: pathlib.Path) -> list[int]:
-    if LOADER_FACTORY not in path.read_text():
+    source = path.read_text()
+    if not any(factory in source for factory in LOADER_FACTORIES):
         return []
     tree = parse_python_module(path)
     module_key = _module_key(path)
@@ -72,10 +77,10 @@ def _unrouted_loader_lines(path: pathlib.Path) -> list[int]:
         id(call)
         for fn in _top_level_functions(tree)
         if (module_key, fn.name) in EXEMPT_LOADERS
-        for call in calls_named(fn, LOADER_FACTORY)
+        for call in _loader_factory_calls(fn)
     }
     return sorted(
-        call.lineno for call in calls_named(tree, LOADER_FACTORY) if id(call) not in exempt_calls
+        call.lineno for call in _loader_factory_calls(tree) if id(call) not in exempt_calls
     )
 
 
@@ -83,7 +88,7 @@ def _unrouted_loader_lines(path: pathlib.Path) -> list[int]:
 def test_scripts_load_siblings_through_the_shared_loader(path):
     lines = _unrouted_loader_lines(path)
     assert not lines, (
-        f'{_module_key(path)} calls {LOADER_FACTORY} at line(s) {lines}. Load a sibling '
+        f'{_module_key(path)} calls an importlib loader factory at line(s) {lines}. Load a sibling '
         f"script with `{SHARED_LOADER_IMPORT}`, then `load_script(<path>, '<existing "
         f"sys.modules key>')`. A forked loader carries its own caching policy, which "
         f'drifts from the one home in fused_memory/utils/script_loader.py.'
@@ -105,6 +110,6 @@ def test_every_exemption_names_one_live_loader(module_key, function_name):
         f'{module_key} defines {len(matches)} top-level functions named {function_name}; '
         f'an exemption must name exactly one'
     )
-    assert calls_named(matches[0], LOADER_FACTORY), (
-        f'{module_key}::{function_name} no longer calls {LOADER_FACTORY}; drop its exemption'
+    assert _loader_factory_calls(matches[0]), (
+        f'{module_key}::{function_name} no longer calls a loader factory; drop its exemption'
     )
