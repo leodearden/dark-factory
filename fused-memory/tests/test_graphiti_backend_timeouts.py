@@ -8,11 +8,14 @@ return that would read as an empty store or a genuine not-found.
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, patch
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _graphiti_fake import FakeGraphitiClient
+from graphiti_core.edges import EntityEdge
 from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.nodes import EpisodicNode
 
@@ -57,6 +60,53 @@ _READS = (
 )
 
 
+def _loaded_with_hanging(attr: str) -> MagicMock:
+    """A graph object whose *attr* write hangs, as ``get_by_uuid`` would load it."""
+    loaded = MagicMock()
+    setattr(loaded, attr, AsyncMock(side_effect=_hang))
+    return loaded
+
+
+_WRITES = (
+    _TimedCall(
+        'build_communities',
+        lambda b: patch.object(b.client, 'build_communities', AsyncMock(side_effect=_hang)),
+        lambda b: b.build_communities(None),
+    ),
+    _TimedCall(
+        'build_communities',
+        lambda b: patch.object(b.client, 'build_communities', AsyncMock(side_effect=_hang)),
+        lambda b: b.build_communities([_GROUP]),
+    ),
+    _TimedCall(
+        'remove_episode',
+        lambda b: patch.object(
+            EpisodicNode, 'get_by_uuid', AsyncMock(return_value=_loaded_with_hanging('delete')),
+        ),
+        lambda b: b.remove_episode('ep-1', group_id=_GROUP),
+    ),
+    _TimedCall(
+        'remove_edge',
+        lambda b: patch.object(
+            EntityEdge, 'get_by_uuid', AsyncMock(return_value=_loaded_with_hanging('delete')),
+        ),
+        lambda b: b.remove_edge('edge-1', group_id=_GROUP),
+    ),
+    _TimedCall(
+        'update_edge',
+        lambda b: patch.object(
+            EntityEdge, 'get_by_uuid', AsyncMock(return_value=_loaded_with_hanging('save')),
+        ),
+        lambda b: b.update_edge('edge-1', group_id=_GROUP, invalid_at=datetime.now(UTC)),
+    ),
+)
+
+
+class _HangingAddEpisodeGraphitiClient(FakeGraphitiClient):
+    async def add_episode(self, **kwargs):
+        await asyncio.Event().wait()
+
+
 @pytest.fixture
 def read_budgeted_backend(mock_config, make_backend) -> GraphitiBackend:
     mock_config.queue.backend_read_timeout_seconds = _BUDGET_S
@@ -85,3 +135,32 @@ async def test_a_genuine_episode_miss_still_returns_none(read_budgeted_backend):
     missing = AsyncMock(side_effect=NodeNotFoundError('ep-1'))
     with patch.object(EpisodicNode, 'get_by_uuid', missing):
         assert await read_budgeted_backend.get_episode_by_uuid('ep-1', group_id=_GROUP) is None
+
+
+@pytest.fixture
+def write_budgeted_backend(mock_config, make_backend) -> GraphitiBackend:
+    mock_config.queue.backend_write_timeout_seconds = _BUDGET_S
+    return make_backend(mock_config)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'timed', _WRITES, ids=['build_communities-all', 'build_communities-per-group',
+                           'remove_episode', 'remove_edge', 'update_edge'],
+)
+async def test_a_write_timeout_names_store_op_and_budget(write_budgeted_backend, timed):
+    await _assert_named_timeout(write_budgeted_backend, timed)
+
+
+@pytest.mark.asyncio
+async def test_an_add_episode_timeout_names_store_op_and_budget(
+    mock_config, make_backend_over_fake_graphiti,
+):
+    mock_config.queue.backend_write_timeout_seconds = _BUDGET_S
+    backend = make_backend_over_fake_graphiti(mock_config, _HangingAddEpisodeGraphitiClient())
+    add_episode = _TimedCall(
+        'add_episode',
+        lambda b: nullcontext(),
+        lambda b: b.add_episode('n', 'body', group_id=_GROUP),
+    )
+    await _assert_named_timeout(backend, add_episode)
