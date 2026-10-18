@@ -244,9 +244,13 @@ def _iter_task_rows(result: Any) -> Iterable[Any]:
 def find_open_gate(tasks: Any, subject: str) -> dict[str, Any] | None:
     """Return the first NON-TERMINAL gate carrier for *subject*, else ``None``.
 
-    Pure and total: *tasks* is any iterable of task-row mappings (or a raw
-    ``get_tasks`` return, or ``None``), and no branch raises on a malformed
-    row — a corpus arriving from the backend is treated as untrusted.
+    Total, with no I/O beyond logging: *tasks* is any iterable of task-row
+    mappings (or a raw ``get_tasks`` return, or ``None``), and no branch
+    raises on a malformed row — a corpus arriving from the backend is
+    treated as untrusted. A row whose metadata is unreadable is skipped and
+    logged once under ``recurring_gate_guard.find_open_gate[<row id>]``, so
+    a bad STORED carrier is told apart from a bad incoming submission and
+    names the task to repair.
 
     The terminal set is imported from :data:`shared.task_statuses.TERMINAL`
     rather than re-spelled (the same single-sourcing ``live_task_write_guard``
@@ -254,7 +258,7 @@ def find_open_gate(tasks: Any, subject: str) -> dict[str, Any] | None:
     blocking a genuinely fresh gate for the same subject.
 
     Terminal filtering is re-checked here even though the tools.py call site
-    already narrows the query with ``statuses=``: this is a PURE function
+    already narrows the query with ``statuses=``: this function is
     contracted to be correct on ANY caller-supplied corpus, and a future
     caller passing an unfiltered one must not silently get a wrong answer.
     """
@@ -263,7 +267,10 @@ def find_open_gate(tasks: Any, subject: str) -> dict[str, Any] | None:
             continue
         if str(row.get('status', '')) in TERMINAL:
             continue
-        meta = raw_metadata_dict(row.get('metadata'), source='recurring_gate_guard')
+        meta = raw_metadata_dict(
+            row.get('metadata'),
+            source=f'recurring_gate_guard.find_open_gate[{row.get("id")}]',
+        )
         if extract_gate_subject(meta) != subject:
             continue
         if not is_gate_submission(meta):
