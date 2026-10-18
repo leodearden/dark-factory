@@ -23,7 +23,11 @@ from shared.usage_gate import UsageGate
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
+from orchestrator.evals.reviewer_trial.corpus import (
+    DEFAULT_FIXTURE_CWD,
+    CorpusDiff,
+    CorpusManifest,
+)
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
@@ -64,9 +68,6 @@ REVIEW_SCHEMA = {
     },
     'required': ['reviewer', 'verdict', 'issues', 'summary'],
 }
-
-# Default working directory for diffs without a project-specific cwd
-_DEFAULT_CWD = Path('/home/leo/src/dark-factory')
 
 # Results directory
 _RESULTS_DIR = Path(__file__).parent / 'results'
@@ -182,7 +183,7 @@ async def _run_single_reviewer(
     """
     role = build_trial_reviewer_role(spec)
     prompt = _build_reviewer_prompt(diff.diff_text, diff_cap_chars)
-    cwd = diff.cwd or _DEFAULT_CWD
+    cwd = diff.cwd or DEFAULT_FIXTURE_CWD
     owns_root = meta_root is None
     root = meta_root if meta_root is not None else Path(tempfile.mkdtemp(prefix='reviewer_trial_'))
     # Sum spend across ALL invocation attempts, not just the last one: an
