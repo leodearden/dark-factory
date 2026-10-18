@@ -14,6 +14,7 @@ of the contract, which projects it asks for, is
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from unittest.mock import AsyncMock, patch
 
@@ -56,13 +57,16 @@ def _install_terminal_roots(client, tmp_path, labels):
     return roots
 
 
-def _get_over_the_substrate(client, monkeypatch, canned, url):
-    """GET *url* with only ``mcp_tool_call`` canned and the runtime probe empty, on a cold unit.
+@contextlib.contextmanager
+def _over_the_substrate(monkeypatch, canned):
+    """Requests made inside run with only ``mcp_tool_call`` canned, from a cold unit.
 
     Everything above the substrate is real: the handler, the collectors,
-    ``acquire_snapshot`` and its cache. The probe is stubbed because the full
-    collector still runs it and it must dial no orchestrator. The unit cache
-    and the root rotation start, and are left, empty.
+    ``acquire_snapshot`` and its cache. Requests made inside one block share
+    that cache, as two renders inside one TTL do. The runtime probe is stubbed
+    empty because the default render's full collector runs it, and it must
+    dial no orchestrator. The unit cache and the root rotation start, and are
+    left, empty.
     """
     import dashboard.data.active_tasks as active_tasks_mod
     import dashboard.data.task_snapshot as snapshot_mod
@@ -74,7 +78,7 @@ def _get_over_the_substrate(client, monkeypatch, canned, url):
     active_tasks_mod._reset_root_rotation()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
-            return client.get(url)
+            yield
     finally:
         snapshot_mod._snapshot_cache_clear()
         active_tasks_mod._reset_root_rotation()
@@ -111,9 +115,8 @@ def _terminal_render(
         call['tool'] == 'get_statuses'
         and call['args'].get('project_root') in unmeasured
     )
-    resp = _get_over_the_substrate(
-        client, monkeypatch, canned, f'/api/v2/dashboard/tasks?terminal={terminal}',
-    )
+    with _over_the_substrate(monkeypatch, canned):
+        resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
     assert resp.status_code == 200, resp.text
     body = resp.json()
     # data.js::ON_DEMAND_KEYS.terminal.key names the body key AND the DF_DATA
@@ -239,6 +242,60 @@ class TestTerminalWindow:
         assert datetime.fromisoformat(window['as_of']) <= served_at, (
             'the window claims to be measured after it was served'
         )
+
+    def test_the_answer_reads_only_the_named_roots_unit(
+        self, client, monkeypatch, tmp_path
+    ):
+        """One root asked for, one root read — asserted at the MCP wire.
+
+        The answer carries no other root's facts, so reading another root
+        would spend that root's share of the fused-memory budget for nothing.
+        The named root's own status map IS read: the window is positioned from
+        that root's census.
+        """
+        body, calls = _terminal_render(
+            client, monkeypatch, tmp_path, terminal='dark-factory',
+            labels=('dark-factory', 'other'),
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+        )
+
+        named = str(tmp_path / 'dark-factory')
+        read_roots = {call['args'].get('project_root') for call in calls}
+        assert read_roots == {named}, (
+            f'only {named} may be read for its terminal answer, got {sorted(read_roots)}'
+        )
+        assert [call for call in calls if call['tool'] == 'get_statuses'], (
+            'the window is positioned from the named root\'s own census, so its '
+            f'status map must be read: {calls}'
+        )
+        assert body['TASKS_TERMINAL:dark-factory']['state'] == 'lower_bound'
+
+    def test_the_window_is_positioned_from_the_cached_unit(
+        self, client, monkeypatch, tmp_path
+    ):
+        """Inside one TTL, the terminal answer reuses the unit the default render cached.
+
+        The census the window is positioned from is the one the default render
+        just measured, not a second walk of the status map.
+        """
+        rows = [_terminal_row(i) for i in range(100, 110)]
+        canned = CannedMCP(
+            rows=rows, status_map={int(row['id']): row['status'] for row in rows},
+        )
+        _install_terminal_roots(client, tmp_path, ['dark-factory'])
+
+        with _over_the_substrate(monkeypatch, canned):
+            default = client.get('/api/v2/dashboard/tasks')
+            answer = client.get('/api/v2/dashboard/tasks?terminal=dark-factory')
+
+        assert default.status_code == 200, default.text
+        assert answer.status_code == 200, answer.text
+        status_walks = canned.calls_to('get_statuses')
+        assert len(status_walks) == 1, (
+            'the terminal answer re-walked the status map instead of reading '
+            f'the cached unit: {status_walks}'
+        )
+        assert answer.json()['TASKS_TERMINAL:dark-factory']['state'] == 'lower_bound'
 
     def test_the_window_is_a_lower_bound_datum_naming_the_bound(
         self, client, monkeypatch, tmp_path
@@ -462,16 +519,17 @@ class TestTerminalWindow:
         assert 'no-such-project' in (entry['reason'] or ''), (
             f'the reason must name what could not be resolved, got {entry["reason"]!r}'
         )
-        assert _terminal_get_tasks(calls) == []
+        assert calls == [], (
+            f'a name that resolves to no root must read no root at all, got {calls}'
+        )
 
     def test_no_terminal_query_carries_no_terminal_key(
         self, client, monkeypatch, tmp_path
     ):
         """(f) No terminal key at all, bare or per-project — an empty one is a claim."""
         _install_terminal_roots(client, tmp_path, ['dark-factory'])
-        resp = _get_over_the_substrate(
-            client, monkeypatch, CannedMCP(), '/api/v2/dashboard/tasks',
-        )
+        with _over_the_substrate(monkeypatch, CannedMCP()):
+            resp = client.get('/api/v2/dashboard/tasks')
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -575,11 +633,8 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(
     with patch(
         'dashboard.api.tasks.acquire_terminal_window',
         new=AsyncMock(return_value=unexplained),
-    ), caplog.at_level(logging.WARNING):
-        resp = _get_over_the_substrate(
-            client, monkeypatch, CannedMCP(),
-            f'/api/v2/dashboard/tasks?terminal={label}',
-        )
+    ), caplog.at_level(logging.WARNING), _over_the_substrate(monkeypatch, CannedMCP()):
+        resp = client.get(f'/api/v2/dashboard/tasks?terminal={label}')
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
