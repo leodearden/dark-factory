@@ -319,13 +319,13 @@ case "$FORMAT" in
         exit 2 ;;
 esac
 
-if ! printf '%s\n' "$STALE_AGE_MIN" | grep -qE '^[0-9]+$'; then
+if ! [[ "$STALE_AGE_MIN" =~ ^[0-9]+$ ]]; then
     err "--stale-age-min (or REIFY_WARM_LANE_AUDIT_STALE_AGE_MIN) is not a valid non-negative integer: '$STALE_AGE_MIN'."
     err "Run '$(basename "$0") --help' for usage."
     exit 2
 fi
 
-if ! printf '%s\n' "$SAFETY" | grep -qE '^[0-9]+(\.[0-9]+)?$' || ! awk -v s="$SAFETY" 'BEGIN{exit !(s>0)}'; then
+if ! [[ "$SAFETY" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v s="$SAFETY" 'BEGIN{exit !(s>0)}'; then
     err "--safety (or REIFY_WARM_LANE_AUDIT_SAFETY) is not a valid positive number: '$SAFETY'."
     err "Run '$(basename "$0") --help' for usage."
     exit 2
@@ -709,7 +709,7 @@ _divergent_bytes() {
         return 0
     }
     bytes="$(printf '%s\n' "$du_out" | awk '{print $1}')"
-    if ! printf '%s\n' "$bytes" | grep -qE '^[0-9]+$'; then
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
         warn "du reported non-integer size for $target; divergent size degraded to 0"
         printf '0'
         return 0
@@ -997,7 +997,7 @@ BUDGET_GIB=0
 if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
     df_out="$("$DF" -B1 --output=avail -- "$MOUNT" 2>/dev/null)" || df_out=""
     avail_bytes="$(printf '%s\n' "$df_out" | tail -n +2 | head -n 1 | awk '{print $1}')"
-    if printf '%s\n' "$avail_bytes" | grep -qE '^[0-9]+$'; then
+    if [[ "$avail_bytes" =~ ^[0-9]+$ ]]; then
         FREE_GIB=$((avail_bytes / 1073741824))
         BUDGET_GIB="$(awk -v f="$FREE_GIB" -v s="$SAFETY" 'BEGIN{printf "%d", (f/s)}')"
     else

@@ -7,7 +7,8 @@ producer exits non-zero after printing the match, or because `grep -q` closes
 the pipe on its first match and the still-writing producer dies of SIGPIPE.
 
 The behavioural suites (test_script_probe_pipelines.py,
-test_setup_host_probe_pipelines.py) pin what each fixed site DOES. This module
+test_setup_host_probe_pipelines.py, and for the warm-lane scripts the bash
+suites in orchestrator/tests/warm-lane/) pin what each fixed site DOES. This module
 pins that the defective CONSTRUCT does not come back, in every script listed in
 `_SWEPT_SCRIPTS`. Its detector is the shared `grep_q_offenders` in
 tests/scripts/shell_sections.py, guarded by
@@ -19,26 +20,36 @@ from __future__ import annotations
 import pytest
 from shell_sections import REPO_ROOT, grep_q_offenders, sets_pipefail
 
-# Every script in which the construct is forbidden, listed ONCE.
-# check_write_triage_flip_preconditions.sh and memory-metadata-coverage-census.sh
-# were already clean and are only READ here, which pins them without editing them.
+# Every script in which the construct is forbidden, listed ONCE, repo-relative.
+# check_write_triage_flip_preconditions.sh, memory-metadata-coverage-census.sh
+# and thin-warm-lane.sh were already clean and are only READ here, which pins
+# them without editing them.
 _SWEPT_SCRIPTS = tuple(
-    REPO_ROOT / "scripts" / name
-    for name in (
-        "setup-host.sh",
-        "export-data.sh",
-        "import-data.sh",
-        "deploy-w5-recon-reliability.sh",
-        "check_write_triage_flip_preconditions.sh",
-        "memory-metadata-coverage-census.sh",
-        "verify-migration.sh",
-        "run_eval_matrix.sh",
-        "deploy/install_laptop_merge_verify_trim.sh",
+    REPO_ROOT / rel
+    for rel in (
+        "scripts/setup-host.sh",
+        "scripts/export-data.sh",
+        "scripts/import-data.sh",
+        "scripts/deploy-w5-recon-reliability.sh",
+        "scripts/check_write_triage_flip_preconditions.sh",
+        "scripts/memory-metadata-coverage-census.sh",
+        "scripts/verify-migration.sh",
+        "scripts/run_eval_matrix.sh",
+        "scripts/deploy/install_laptop_merge_verify_trim.sh",
+        "orchestrator/scripts/warm-lane/provision-warm-lane-fs.sh",
+        "orchestrator/scripts/warm-lane/thin-warm-lane.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-disk-guard.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-gc-sweep.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-gc.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-audit.sh",
+        "orchestrator/scripts/warm-lane/warm-lane-degenerate-ref-check.sh",
     )
 )
 
 
-@pytest.mark.parametrize("script", _SWEPT_SCRIPTS, ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    "script", _SWEPT_SCRIPTS, ids=lambda p: p.relative_to(REPO_ROOT).as_posix()
+)
 def test_never_pipes_a_producer_into_grep_q(script):
     """No code line in a swept script may decide anything through `producer | grep --quiet PAT`.
 

@@ -153,15 +153,16 @@ SCRIPT_COVERAGE = {
 #: by construction: against the pre-port inline predicate the same block reports
 #: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
 ASSERT_FLOORS = {
-    'test_warm_lane_disk_guard.sh': 62,
-    'test_warm_lane_degenerate_ref.sh': 81,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+    'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
+    'test_warm_lane_degenerate_ref.sh': 84,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+                                             # + 3 (U8, task 5940)
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 278,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
-                                 #           + A11 12 + A11-boundary 5)
-    'test_warm_lane_gc_sweep.sh': 90,  # 86 + 4 (Block Y: bridge-cost seam contract)
-    'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
+    'test_warm_lane_gc.sh': 280,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
+                                 #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
+    'test_warm_lane_gc_sweep.sh': 102,  # 99 + 3 (G6g, task 5940)
+    'test_warm_lane_audit.sh': 229,  # 232 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
-    'test_provision_warm_lane_fs.sh': 106,  # 111 measured − 5 (Block I, xfsprogs)
+    'test_provision_warm_lane_fs.sh': 110,  # 115 measured − 5 (Block I, xfsprogs)
 }
 
 #: ``test_helpers.sh::test_summary``'s pass/fail protocol line, verbatim.

@@ -107,6 +107,7 @@ from fused_memory.reconciliation.task_filter import (
     diff_status_correction,
     filter_task_tree,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
@@ -1340,6 +1341,7 @@ class ReconciliationHarness:
         stage: TaskKnowledgeSync,
         *,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
         remediation_mode: bool = False,
     ) -> None:
         """Apply Stage-2 attributes to TaskKnowledgeSync.
@@ -1347,10 +1349,11 @@ class ReconciliationHarness:
         Mirrors _configure_consolidator for Stage 1 — both full-cycle and
         remediation paths use this helper to keep attribute wiring symmetric
         and discoverable. Stage-2-specific attributes (filtered_task_tree,
-        remediation_mode) are set here; Stage-1 wiring is handled by
-        _configure_consolidator.
+        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage-1
+        wiring is handled by _configure_consolidator.
         """
         stage.filtered_task_tree = filtered_task_tree
+        stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
         stage.remediation_mode = remediation_mode
 
     async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
@@ -3745,11 +3748,11 @@ class ReconciliationHarness:
         # Task 4115: the instant every heartbeat_at in filtered_task_tree was
         # read. Stamped HERE, immediately after the fetch returns — not later,
         # e.g. at the _maybe_remediate call below — because the S1->S3 stage
-        # loop that follows is minutes of LLM work and the remediation
-        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
-        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
-        # gate ages a cited task's heartbeat against the actual read, not a
-        # fresh clock taken well after it.
+        # loop that follows is minutes of LLM work and the claimant heartbeat
+        # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
+        # hint-attention selector (task 5093) and through _maybe_remediate ->
+        # _run_remediation_pass to the live-workflow gate, so both age a task's
+        # heartbeat against the actual read, not a fresh clock taken well after it.
         filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
@@ -3886,7 +3889,11 @@ class ReconciliationHarness:
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
                     if isinstance(stage, TaskKnowledgeSync):
-                        self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
+                        self._configure_task_sync(
+                            stage,
+                            filtered_task_tree=filtered_task_tree,
+                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                        )
 
                     # Wire harness-fetched task tree into Stage 3 for task-dump spot-check (task 1661)
                     if isinstance(stage, IntegrityCheck):
@@ -5637,22 +5644,11 @@ class ReconciliationHarness:
             # Task 4115: resolve the tree and the instant it was read as ONE unit
             # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
             # itself), so a caller's read instant can never be paired with a tree
-            # it does not describe. Caller-supplied tree: honour the caller's read
-            # instant when given AND timezone-aware; otherwise fall back to a
-            # fresh now() with a WARNING trace — loud rather than silent, since a
-            # caller that drops or malforms the instant regresses straight back to
-            # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
-            # norm). A naive (tzinfo-less) instant is treated the same as a
-            # missing one rather than handed to corroboration_for_task as-is:
-            # has_live_claimant compares it against timezone-aware heartbeats, and
-            # the resulting TypeError is caught and swallowed several frames down
-            # (see the `except Exception as _corr_exc` below), which would
-            # otherwise leave corroborated=None and silently suppress every
-            # stranded-work escalation in the pass — the opposite of this gate's
-            # fail-safe direction. The WARNING fallback is otherwise exactly the
-            # pre-4115 behaviour, which the ~30 existing direct
-            # _run_remediation_pass callers that pass a tree without an instant
-            # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+            # it does not describe. Caller-supplied tree: resolve_tree_read_instant
+            # honours the caller's instant or falls back to now() with a WARNING;
+            # the ~30 existing direct _run_remediation_pass callers that pass a
+            # tree without an instant depend on that pre-4115 fallback.
+            # Self-fetch: always stamp a fresh now() — a caller instant
             # (if one was even supplied) describes a different tree, or no tree at
             # all, and must never leak onto the tree just fetched here.
             #
@@ -5680,25 +5676,11 @@ class ReconciliationHarness:
             _tasks_snapshot_at: datetime
             if filtered_task_tree is not None:
                 remediation_tree = filtered_task_tree
-                if (
-                    filtered_task_tree_fetched_at is not None
-                    and filtered_task_tree_fetched_at.tzinfo is not None
-                ):
-                    _tasks_snapshot_at = filtered_task_tree_fetched_at
-                else:
-                    logger.warning(
-                        'reconciliation.remediation_tree_read_instant_missing',
-                        extra={
-                            'project_id': project_id,
-                            'parent_run_id': parent_run_id,
-                            'reason': (
-                                'naive_datetime'
-                                if filtered_task_tree_fetched_at is not None
-                                else 'not_supplied'
-                            ),
-                        },
-                    )
-                    _tasks_snapshot_at = datetime.now(UTC)
+                _tasks_snapshot_at = resolve_tree_read_instant(
+                    filtered_task_tree_fetched_at,
+                    event='reconciliation.remediation_tree_read_instant_missing',
+                    extra={'project_id': project_id, 'parent_run_id': parent_run_id},
+                )
             else:
                 remediation_tree = await self._fetch_filtered_task_tree(project_root)
                 _tasks_snapshot_at = datetime.now(UTC)
@@ -5855,7 +5837,12 @@ class ReconciliationHarness:
                 remediation_findings=findings,
                 filtered_task_tree=remediation_tree,
             )
-            self._configure_task_sync(stage2, filtered_task_tree=remediation_tree, remediation_mode=True)
+            self._configure_task_sync(
+                stage2,
+                filtered_task_tree=remediation_tree,
+                filtered_task_tree_fetched_at=_tasks_snapshot_at,
+                remediation_mode=True,
+            )
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []

@@ -176,6 +176,19 @@ class TestLoadTopicRegistry:
         assert 'dup-slug' in str(exc.value)
         assert 'duplicate' in str(exc.value).lower()
 
+    def test_two_slugs_that_fold_together_are_a_duplicate(self, tmp_path):
+        """'fold-me' and 'fold_me' are one topic to every consumer of the
+        registry, so carrying both would measure that topic twice."""
+        path = _write_registry(tmp_path, _registry_payload(
+            _entry_payload('fold-me'), _entry_payload('fold_me'),
+        ))
+
+        with pytest.raises(_mod().RegistryError) as exc:
+            _mod().load_topic_registry(path)
+        assert 'fold-me' in str(exc.value)
+        assert 'fold_me' in str(exc.value)
+        assert 'duplicate' in str(exc.value).lower()
+
     def test_zero_phrasings_names_the_topic(self, tmp_path):
         path = _write_registry(tmp_path, _registry_payload(
             _entry_payload('empty-phrasings', phrasings=[]),
@@ -532,6 +545,22 @@ def _of(result, source: str) -> list[dict]:
     return [c for c in result.candidates if c['derived_from'] == source]
 
 
+def _topic_census(*rows: dict) -> dict:
+    """A census whose topic table holds exactly *rows*; none gives an EMPTY table."""
+    return {'grand_total': {'topic': {'entries': [dict(row) for row in rows]}}}
+
+
+def _baseline_disclosures(calibration_rows, guard_clusters) -> dict[str, int]:
+    """What the curator and guard sources disclose with no census topic at all.
+
+    Tests assert DELTAS against this, so they do not depend on how many
+    curator/guard slugs the committed sources happen to collide on.
+    """
+    return _mod().derive_registry_candidates(
+        calibration_rows, _topic_census(), guard_clusters,
+    ).disclosures
+
+
 class TestDeriveFromCuratorGates:
     """The curator-gate census — 'each gate is a free labeled cluster'."""
 
@@ -667,6 +696,129 @@ class TestDeriveFromCensus:
         assert result.disclosures['census_rows_malformed_value'] == 3
         assert result.disclosures['census_rows_malformed_count'] == 2
 
+    @pytest.mark.parametrize('rows', [
+        pytest.param(
+            ({'value': 'twice-spelt', 'count': 7}, {'value': 'twice_spelt', 'count': 3}),
+            id='more-used-listed-first',
+        ),
+        pytest.param(
+            ({'value': 'twice_spelt', 'count': 3}, {'value': 'twice-spelt', 'count': 7}),
+            id='less-used-listed-first',
+        ),
+    ])
+    def test_census_rows_spelling_one_topic_two_ways_derive_the_more_used_row(
+        self, calibration_rows, guard_clusters, rows,
+    ):
+        """The corpus spells one topic with '-' and '_', and the census counts
+        each spelling as its own row. Both rows name ONE topic, so one entry is
+        derived, from the more-used spelling, whatever order the census file
+        happens to list them in."""
+        baseline = _baseline_disclosures(calibration_rows, guard_clusters)
+        census = _topic_census(*rows)
+        result = _mod().derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [kept] = _of(result, 'census_topic')
+        assert kept['topic'] == 'twice-spelt'
+        assert kept['provenance']['census_count'] == 7
+        assert (result.disclosures['census_topics_emitted']
+                == baseline['census_topics_emitted'] + 1)
+        assert (result.disclosures['slug_collisions_dropped']
+                == baseline['slug_collisions_dropped'] + 1)
+
+    def test_two_equally_used_census_spellings_keep_the_lexically_first(
+        self, calibration_rows, guard_clusters,
+    ):
+        """A tie is broken by the value itself, so the persisted tripwire key
+        never depends on the census file's row order."""
+        census = _topic_census(
+            {'value': 'tied_spelling', 'count': 4},
+            {'value': 'tied-spelling', 'count': 4},
+        )
+        result = _mod().derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [kept] = _of(result, 'census_topic')
+        assert kept['topic'] == 'tied-spelling'
+
+    def test_every_generated_candidate_is_kept_or_counted_as_a_collision(
+        self, calibration_rows, guard_clusters,
+    ):
+        """No candidate leaves derivation uncounted, and no two kept ones fold
+        together.
+
+        The curator and guard sources' share is read from the no-census
+        baseline, so every census row that generates a candidate must add
+        exactly one to kept-or-dropped, and the lone singleton none."""
+        m = _mod()
+        multi_entry_rows = [
+            {'value': 'pair-of-spellings', 'count': 5},
+            {'value': guard_clusters[0].topic_id.replace('-', '_'), 'count': 4},
+            {'value': 'plain-multi-one', 'count': 3},
+            {'value': 'pair_of_spellings', 'count': 2},
+            {'value': 'plain-multi-two', 'count': 2},
+        ]
+        census = _topic_census(*multi_entry_rows, {'value': 'lone-singleton', 'count': 1})
+        baseline = _baseline_disclosures(calibration_rows, guard_clusters)
+        result = m.derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        def kept_or_dropped(d: dict[str, int]) -> int:
+            return (
+                d['curator_gate_clusters'] + d['topic_guard_clusters']
+                + d['census_topics_emitted'] + d['slug_collisions_dropped']
+            )
+
+        d = result.disclosures
+        assert kept_or_dropped(d) == kept_or_dropped(baseline) + len(multi_entry_rows)
+        assert kept_or_dropped(d) - d['slug_collisions_dropped'] == len(result.candidates)
+        folded = {m.normalize_topic(c['topic']) for c in result.candidates}
+        assert len(folded) == len(result.candidates)
+
+    @pytest.mark.parametrize(('payload', 'named_location'), [
+        pytest.param({'baseline': True}, 'grand_total', id='the-2026-08-31-stub'),
+        pytest.param({'grand_total': {}}, 'topic', id='no-topic-table'),
+        pytest.param({'grand_total': {'topic': {}}}, 'entries', id='no-entries'),
+        pytest.param({'grand_total': None}, 'grand_total', id='grand-total-null'),
+    ])
+    def test_an_absent_topic_table_is_refused_by_name(
+        self, calibration_rows, guard_clusters, payload, named_location,
+    ):
+        """An absent table reads zero in every census counter, exactly like an
+        empty corpus, so it must not derive as one."""
+        m = _mod()
+        with pytest.raises(m.CensusShapeError) as exc:
+            m.derive_registry_candidates(calibration_rows, payload, guard_clusters)
+        assert named_location in str(exc.value)
+
+    @pytest.mark.parametrize(('payload', 'type_name'), [
+        pytest.param({'grand_total': 'x'}, 'str', id='grand-total-str'),
+        pytest.param({'grand_total': {'topic': 'x'}}, 'str', id='topic-str'),
+        pytest.param({'grand_total': {'topic': {'entries': {}}}}, 'dict', id='entries-dict'),
+        pytest.param({'grand_total': {'topic': {'entries': 5}}}, 'int', id='entries-int'),
+        pytest.param([], 'list', id='top-level-list'),
+    ])
+    def test_a_misshapen_topic_table_is_refused_by_name_not_crashed_on(
+        self, calibration_rows, guard_clusters, payload, type_name,
+    ):
+        m = _mod()
+        with pytest.raises(m.CensusShapeError) as exc:
+            m.derive_registry_candidates(calibration_rows, payload, guard_clusters)
+        assert type_name in str(exc.value)
+
+    def test_an_empty_topic_table_is_a_healthy_census(
+        self, calibration_rows, guard_clusters,
+    ):
+        """The census writer emits an empty list for a corpus with no topic
+        values: that census is healthy and derives zero census candidates."""
+        result = _mod().derive_registry_candidates(
+            calibration_rows, _topic_census(), guard_clusters,
+        )
+
+        assert _of(result, 'census_topic') == []
+        for counter in (
+            'census_topics_emitted', 'census_topics_skipped_singleton',
+            'census_rows_malformed_value', 'census_rows_malformed_count',
+        ):
+            assert result.disclosures[counter] == 0, counter
+
 
 class TestDeriveFromGuardClusters:
     """Guard phrases seed ORDINARY phrasings only — never the held-out one."""
@@ -688,6 +840,32 @@ class TestDeriveFromGuardClusters:
         [winner] = [c for c in result.candidates if c['topic'] == slug]
         assert winner['derived_from'] == 'topic_guard_cluster'
         assert result.disclosures['slug_collisions_dropped'] >= 1
+
+    def test_a_census_spelling_variant_of_a_guard_slug_derives_one_candidate(
+        self, calibration_rows, guard_clusters,
+    ):
+        """A census row spelling a guard slug with '_' names the SAME topic.
+
+        Deriving both would measure one topic twice under two tripwire keys.
+        The guard's exact spelling is kept, because it is the persisted key.
+        """
+        m = _mod()
+        slug = guard_clusters[0].topic_id
+        assert '-' in slug, 'premise: the guard slug must be spellable with "_"'
+        baseline = _baseline_disclosures(calibration_rows, guard_clusters)
+        census = _topic_census({'value': slug.replace('-', '_'), 'count': 9})
+        result = m.derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [kept] = [
+            c for c in result.candidates
+            if m.normalize_topic(c['topic']) == m.normalize_topic(slug)
+        ]
+        assert kept['derived_from'] == 'topic_guard_cluster'
+        assert kept['topic'] == slug
+        assert (result.disclosures['census_topics_emitted']
+                == baseline['census_topics_emitted'])
+        assert (result.disclosures['slug_collisions_dropped']
+                == baseline['slug_collisions_dropped'] + 1)
 
     def test_guard_phrases_seed_phrasings(self, derived, guard_clusters):
         by_slug = {c.topic_id: c for c in guard_clusters}
@@ -3636,6 +3814,46 @@ class TestTripwireCensusSplit:
 
         assert code == m.EXIT_RUN_FAILED
         assert str(absent) in capsys.readouterr().err
+
+
+class TestDeriveRegistryRefusesAnUnusableCensus:
+    """For --derive-registry the census IS the input, so an unusable one is bad
+    input: exit 2 naming the census, and no partial candidate set on stdout."""
+
+    def _derive(self, tmp_path, capsys, payload):
+        path = _write_census(tmp_path, payload)
+        code = _mod().main(['--derive-registry', '--census', str(path)])
+        return code, path, capsys.readouterr()
+
+    def test_a_census_without_a_topic_table_is_bad_input(self, tmp_path, capsys):
+        code, path, captured = self._derive(tmp_path, capsys, {'baseline': True})
+
+        assert code == _mod().EXIT_BAD_INPUT == 2
+        assert str(path) in captured.err
+        assert 'grand_total' in captured.err
+        assert captured.out == ''
+
+    def test_a_misshapen_topic_table_is_bad_input_not_a_traceback(self, tmp_path, capsys):
+        code, path, captured = self._derive(tmp_path, capsys, {'grand_total': 'x'})
+
+        assert code == _mod().EXIT_BAD_INPUT
+        assert str(path) in captured.err
+        assert captured.out == ''
+
+    def test_an_undecodable_census_is_bad_input(self, tmp_path, capsys):
+        code, path, captured = self._derive(tmp_path, capsys, '{not json')
+
+        assert code == _mod().EXIT_BAD_INPUT
+        assert str(path) in captured.err
+        assert captured.out == ''
+
+    def test_an_empty_topic_table_still_derives(self, tmp_path, capsys):
+        code, _, captured = self._derive(tmp_path, capsys, _topic_census())
+
+        assert code == 0
+        payload = json.loads(captured.out)
+        assert payload['_disclosures']['census_topics_emitted'] == 0
+        assert payload['entries']
 
 
 class TestCorpusCounting:

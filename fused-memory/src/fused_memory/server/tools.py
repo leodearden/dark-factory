@@ -87,7 +87,12 @@ from fused_memory.middleware.task_interceptor import (
     _is_ticket_id,
     _looks_like_task_id,
 )
-from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
+from fused_memory.models.enums import (
+    MEM0_PRIMARY,
+    MemoryCategory,
+    SourceStore,
+    routes_to_graphiti,
+)
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.citation_verifier import (
     find_live_citation_occurrences,
@@ -3256,9 +3261,12 @@ def create_mcp_server(
         declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the episode is not
         ingested — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -3295,13 +3303,14 @@ def create_mcp_server(
                 is NOT "all entities": extraction legitimately derives entities
                 no caller could predict, and this parameter names only the
                 referents the episode is ABOUT. A declaration the content
-                contradicts is REJECTED
+                contradicts — a near-miss typo of a declared task number, or
+                that number under another project — is REJECTED
                 (error_type=DeclaredReferentConflictRejected) and nothing is
-                ingested. ANY wrong shape — a bare string, a single un-wrapped
-                dict, a bad entry inside the list — is rejected as a
-                ValidationError whose message carries the accepted entry shape,
-                so you never have to guess the remedy. Absence is never
-                rejected, so omitting this always succeeds.
+                ingested; fix the id, or write `task NNN` in the content. ANY
+                wrong shape — a bare string, a single un-wrapped dict, a bad
+                entry inside the list — is rejected as a ValidationError whose
+                message carries the accepted entry shape, so you never have to
+                guess the remedy. Absence is never rejected.
                 One asymmetry against add_memory, and it is a tier below this
                 parameter: add_episode persists no metadata, so there is no
                 metadata['task_id'] fallback here — a declaration overrides
@@ -3585,23 +3594,21 @@ def create_mcp_server(
         all. A declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the write does not
         happen — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
-        Two halves of that, and they have DIFFERENT scopes — the rejection is
-        universal, the recording is not. Every add_memory call is checked for a
-        declared/prose conflict, whatever its category. But a declaration is
-        RECORDED only on a write that reaches Graphiti — an
+        A declaration is RECORDED only on a write that reaches Graphiti — an
         entities_and_relations, temporal_facts or decisions_and_rationale
-        category, or dual_write=True. On a Mem0-primary write
+        category, or dual_write=True. On an explicit Mem0-primary category
         (procedural_knowledge, preferences_and_norms,
-        observations_and_summaries) the referent set has nowhere to live: your
-        `entities` is validated against the content and then discarded, and
-        nothing downstream can tell it apart from a call that omitted the
-        parameter. So on those three categories `entities` buys you the
-        typo-catch and nothing else — which is still worth having, but do not
-        expect it to steer retrieval.
+        observations_and_summaries) without dual_write, the referent set has
+        nowhere to live: your `entities` is shape-checked, then discarded, and
+        never conflict-rejected. With category omitted it IS conflict-checked,
+        because the destination is not known until the write is classified.
 
         Content asserting that concrete, NAMED work is complete ("task N's fix
         has been applied", "re-filed as ticket tkt_...") is cross-checked
@@ -3662,17 +3669,19 @@ def create_mcp_server(
                       extraction pipeline legitimately derives entities no caller
                       could predict, and this parameter names only the referents
                       the memory is ABOUT. A declaration the content contradicts
-                      is REJECTED (error_type=DeclaredReferentConflictRejected)
-                      and nothing is written. ANY wrong shape — a bare string,
+                      — a near-miss typo of a declared task number, or that
+                      number under another project — is REJECTED
+                      (error_type=DeclaredReferentConflictRejected) and nothing
+                      is written; fix the id, or write `task NNN` in the
+                      content. ANY wrong shape — a bare string,
                       a single un-wrapped dict, a bad entry inside the list — is
                       rejected as a ValidationError whose message carries the
                       accepted entry shape, so you never have to guess the
-                      remedy. Absence is never rejected, so omitting this
-                      parameter always succeeds. RECORDED only on a write that
+                      remedy. Absence is never rejected. RECORDED only on a write that
                       reaches Graphiti (a GRAPHITI_PRIMARY category, or
-                      dual_write=True); on a Mem0-primary category it is
-                      checked for a conflict and then discarded — see the
-                      scope note above.
+                      dual_write=True); on an explicit Mem0-primary category
+                      without dual_write it is shape-checked, then discarded,
+                      and never conflict-rejected — see the scope note above.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3706,8 +3715,19 @@ def create_mcp_server(
         # through `canonicalize_project_id` — so the gate and `MemoryService`
         # classify local-vs-foreign referents identically. A raw id here would
         # let the two disagree about whether a qualifier names us.
+        #
+        # `category is None` counts as recorded: the classifier picks the
+        # destination below this boundary, and running it here too would be a
+        # second classification site (INV-5).
+        declaration_recorded = category is None or routes_to_graphiti(
+            MemoryCategory(category), dual_write=dual_write,
+        )
         if err := entities_gate(
-            entities, content=content, group_id=project_id, agent_id=agent_id,
+            entities,
+            content=content,
+            group_id=project_id,
+            agent_id=agent_id,
+            declaration_recorded=declaration_recorded,
         ):
             return err
         # MCP-markup rejection no longer happens here: task 4458 retired this

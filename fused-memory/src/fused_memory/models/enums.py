@@ -61,3 +61,13 @@ MEM0_PRIMARY: frozenset[MemoryCategory] = frozenset({
     MemoryCategory.procedural_knowledge,
     MemoryCategory.observations_and_summaries,
 })
+
+
+def routes_to_graphiti(category: MemoryCategory, *, dual_write: bool) -> bool:
+    """Whether an add_memory write of this category reaches Graphiti."""
+    return category in GRAPHITI_PRIMARY or dual_write
+
+
+def routes_to_mem0(category: MemoryCategory, *, dual_write: bool) -> bool:
+    """Whether an add_memory write of this category reaches Mem0."""
+    return category in MEM0_PRIMARY or dual_write

@@ -7,7 +7,8 @@ chains, and the three §5.6 health counters — and renders them as text.
 
 BINDING CONTRACT — READ ONLY.  Nothing in this module opens debt, files a task,
 resolves anything, or escalates.  All ledger DATA comes from α's public READ API
-(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many``); the only SQL of its
+(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many`` / ``summarize_due``);
+the only SQL of its
 own is :func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly
 less than those readers do (no DDL, no journal-mode pragma).  One consequence is not
 obvious and is enforced by :func:`build_report`'s guards: α's readers PROVISION on read
@@ -48,14 +49,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from orchestrator.flake_ledger import (
+    DUE_ITEM_STALE_AFTER,
+    DUE_ITEM_STALE_MINUTES,
     UNKNOWN_TEST_ID,
     DebtRow,
+    DueSummary,
     FlakeCallSite,
     FlakeOccurrenceRow,
     FlakeVerdict,
     list_open_debt,
     read_debt_many,
     read_occurrences,
+    summarize_due,
 )
 
 # --- PRD §10 defaults --------------------------------------------------------
@@ -588,10 +593,13 @@ def build_chains(
 
 @dataclass(frozen=True)
 class DebtReportRow:
-    """One open debt row plus its computed age (``None`` when ``opened_at`` won't parse)."""
+    """One open debt row plus its computed age (``None`` when ``opened_at`` won't parse),
+    and, when its test has items on the due list, the oldest item's ``enqueued_at``: the
+    owner filing is pending, not missing."""
 
     debt: DebtRow
     age: timedelta | None
+    pending_since: str | None = None
 
 
 @dataclass(frozen=True)
@@ -620,6 +628,7 @@ class FlakeLedgerReport:
     non_convergence: NonConvergenceCounter
     systemic: SystemicCounter
     db_status: str = LEDGER_OK
+    due: DueSummary | None = None
 
     @property
     def measured(self) -> bool:
@@ -684,7 +693,7 @@ def build_report(
     """Read the ledger at *db_path* and aggregate it into a :class:`FlakeLedgerReport`.
 
     All ledger DATA comes from α's public read API — ``list_open_debt`` /
-    ``read_occurrences`` / ``read_debt_many``; the only SQL of this module's own is
+    ``read_occurrences`` / ``read_debt_many`` / ``summarize_due``; the only SQL of this module's own is
     :func:`probe_ledger`'s ``sqlite_master`` SELECT, which decides whether those readers
     are safe to call at all.  *now* defaults to the wall clock and is injectable so the
     whole report is deterministic under test.
@@ -749,6 +758,8 @@ def build_report(
 
     since = (now - timedelta(hours=window_hours)).isoformat()
     open_rows = list_open_debt(db_path)
+    due = summarize_due(db_path, stale_before=now - DUE_ITEM_STALE_AFTER)
+    pending_since = {} if due is None else due.pending_since
     occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
     truncated = len(occurrences) >= occurrence_limit
 
@@ -782,6 +793,7 @@ def build_report(
         DebtReportRow(
             debt=row,
             age=(now - opened) if (opened := _parse_stamp(row.opened_at)) is not None else None,
+            pending_since=pending_since.get(row.test_id),
         )
         for row in open_rows
     ]
@@ -806,10 +818,30 @@ def build_report(
             distinct_tests=systemic_distinct_tests,
             window_minutes=systemic_window_minutes,
         ),
+        due=due,
     )
 
 
 # --- rendering ---------------------------------------------------------------
+
+
+def _due_line(report: FlakeLedgerReport) -> str:
+    """The due list's size and its oldest item's age, flagged once that item is past the
+    stale bound (the drain's escalation reads the same bound)."""
+    due = report.due
+    if not report.measured:
+        return 'due list: not measured'
+    if due is None:
+        return 'due list: UNREADABLE'
+    if due.oldest is None:
+        return 'due list: empty'
+    enqueued = _parse_stamp(due.oldest.enqueued_at)
+    age = None if enqueued is None else report.generated_at - enqueued
+    past = f' — PAST THE {DUE_ITEM_STALE_MINUTES}-MINUTE BOUND' if due.stale else ''
+    return (
+        f'due list: {due.size} item(s), oldest enqueued {due.oldest.enqueued_at} '
+        f'(age {format_age(age)}){past}'
+    )
 
 
 def render_report(report: FlakeLedgerReport) -> str:
@@ -855,6 +887,7 @@ def render_report(report: FlakeLedgerReport) -> str:
             '  WARNING: the occurrence read was TRUNCATED at its limit — the counters '
             'below cover a PARTIAL window, not the full one.'
         )
+    lines.append(_due_line(report))
 
     # --- section 1: open debt ---
     lines += ['', 'OPEN DEBT', '-' * 60]
@@ -866,8 +899,14 @@ def render_report(report: FlakeLedgerReport) -> str:
         # the single most consequential state this report can encounter: suppression
         # LANDS the merge (§5.7), so an unowned debt row means a flaky test is silently
         # no longer blocking anything and nobody owns fixing it.  Naming it loudly is a
-        # READ of the ledger — ι files nothing.
-        owner = f'owner={d.owner_task_id}' if d.owner_task_id else '*** NO OWNER (invariant breach) ***'
+        # READ of the ledger — ι files nothing.  An item on the due list for the test
+        # means the drain has not filed the owner YET, which is expected, not a breach.
+        if d.owner_task_id:
+            owner = f'owner={d.owner_task_id}'
+        elif row.pending_since is not None:
+            owner = f'filing pending since {row.pending_since}'
+        else:
+            owner = '*** NO OWNER (invariant breach) ***'
         # Same predicate the `over_age=N` summary below counts with — never a second
         # spelling of the comparison (INV-5).
         over = ' OVER-AGE' if _is_over_age(row.age, nc.age_threshold_days) else ''
