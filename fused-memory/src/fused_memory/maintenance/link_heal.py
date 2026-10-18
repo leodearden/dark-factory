@@ -152,9 +152,13 @@ class LinkImage:
         return {key: value for key, value in zip(LINK_KEYS, values, strict=True) if value is not None}
 
     @property
+    def triage_stamped_contest(self) -> bool:
+        """Contested by write triage: only an exactly-True marker counts."""
+        return bool(self.contested) and self.contested_by_triage is True
+
+    @property
     def hand_declared_contest(self) -> bool:
-        """Contested, and not by triage: only an exactly-True marker lifts the protection."""
-        return bool(self.contested) and self.contested_by_triage is not True
+        return bool(self.contested) and not self.triage_stamped_contest
 
 
 def apply_change(image: LinkImage, change: MetadataChange) -> LinkImage:
@@ -429,7 +433,7 @@ def _verdict_row(state: LinkState, verdict: Verdict) -> HealAction | Report:
     if kind is KindClass.HALF_LINK and state.has_children and verdict in BELONGS_VERDICTS:
         return Report.HAS_CHILDREN
     outcome = verdict_outcome(kind, verdict)
-    if state.link.contested and outcome in _NON_DETACH_HEALS:
+    if state.link.triage_stamped_contest and outcome in _NON_DETACH_HEALS:
         return Report.NO_ACTION
     return outcome
 
