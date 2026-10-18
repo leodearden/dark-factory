@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import (
     AfterValidator,
@@ -28,6 +28,7 @@ from pydantic import (
     Field,
     PlainSerializer,
     PlainValidator,
+    TypeAdapter,
     field_validator,
     model_validator,
 )
@@ -678,3 +679,223 @@ class KeepCheck(BaseModel):
     incomplete_files: tuple[str, ...] = ()
     parent_sha: _GitObjectId
     candidate_sha: _GitObjectId
+
+
+def _require_closure_not_self(ref: str, closure: Exemption | Withdrawal | None) -> None:
+    if isinstance(closure, Withdrawal):
+        _require_not_self(ref, closure.reason.ref, 'duplicate_of')
+
+
+class DefectDeclaration(BaseModel):
+    """One entry of ``metadata.defects``: a declared defect and where it stands (decision 7).
+
+    After creation it changes only through :func:`apply_event`, never by edit.
+    """
+
+    model_config = _RECORD_CONFIG
+
+    ref: DefectRefStr
+    origin: DefectOrigin
+    summary: _NonEmptyStr
+    declared_at: AwareDatetime
+    declared_by: _NonEmptyStr
+    status: DefectStatus
+    sightings: int = Field(default=1, ge=1)
+    proof: DefectProof | None = None
+    closure: Closure | None = None
+    ruling: Ruling | None = None
+
+    @model_validator(mode='after')
+    def _coheres(self) -> Self:
+        _require_coherent(self)
+        return self
+
+
+class _ClosureStanding(StrEnum):
+    NONE = 'none'
+    UNRULED = 'unruled'
+    REJECTED = 'rejected'
+    ACCEPTED = 'accepted'
+
+
+_STANDINGS_BY_STATUS: MappingProxyType[DefectStatus, frozenset[_ClosureStanding]] = (
+    MappingProxyType(
+        {
+            DefectStatus.OPEN: frozenset({_ClosureStanding.NONE, _ClosureStanding.REJECTED}),
+            DefectStatus.PROVEN: frozenset({_ClosureStanding.NONE, _ClosureStanding.REJECTED}),
+            DefectStatus.PENDING: frozenset({_ClosureStanding.UNRULED}),
+            DefectStatus.EXEMPTED: frozenset({_ClosureStanding.ACCEPTED}),
+            DefectStatus.WITHDRAWN: frozenset({_ClosureStanding.ACCEPTED}),
+        }
+    )
+)
+
+_CLOSURE_TYPE_BY_STATUS: MappingProxyType[DefectStatus, type[Exemption | Withdrawal]] = (
+    MappingProxyType({DefectStatus.EXEMPTED: Exemption, DefectStatus.WITHDRAWN: Withdrawal})
+)
+
+
+def _closure_standing(entry: DefectDeclaration) -> _ClosureStanding:
+    if entry.closure is None:
+        return _ClosureStanding.NONE
+    if entry.ruling is None:
+        return _ClosureStanding.UNRULED
+    return _ClosureStanding.ACCEPTED if entry.ruling.accepted else _ClosureStanding.REJECTED
+
+
+def _require_coherent(entry: DefectDeclaration) -> None:
+    """The one coherence rule for an entry: status, closure, ruling and proof agree.
+
+    Run at construction, and therefore again on every result :func:`apply_event` builds.
+    """
+    ref_origin = parse_ref(entry.ref).origin
+    if entry.origin is not ref_origin:
+        raise ValueError(
+            f'{entry.ref}: origin {entry.origin} does not match the ref, whose prefix '
+            f'names origin {ref_origin}'
+        )
+    if entry.proof is not None and entry.proof.ref != entry.ref:
+        raise ValueError(f'{entry.ref}: its proof is for a different ref, {entry.proof.ref}')
+    if entry.status is DefectStatus.PROVEN and entry.proof is None:
+        raise ValueError(f'{entry.ref}: a proven entry carries the proof that proved it')
+    if entry.ruling is not None and entry.closure is None:
+        raise ValueError(f'{entry.ref}: a ruling rules on a closure, and the entry has none')
+    if entry.ruling is not None and entry.ruling.subject is not RulingSubject.CLOSURE:
+        raise ValueError(
+            f'{entry.ref}: an entry carries only closure rulings, got subject {entry.ruling.subject}'
+        )
+    standing = _closure_standing(entry)
+    allowed = _STANDINGS_BY_STATUS[entry.status]
+    if standing not in allowed:
+        raise ValueError(
+            f'{entry.ref}: status {entry.status} allows a closure standing of '
+            f'{" or ".join(sorted(allowed))}, but its closure standing is {standing}'
+        )
+    closure_type = _CLOSURE_TYPE_BY_STATUS.get(entry.status)
+    if closure_type is not None and not isinstance(entry.closure, closure_type):
+        raise ValueError(
+            f'{entry.ref}: status {entry.status} needs a {closure_type.__name__} closure, '
+            f'got {type(entry.closure).__name__}'
+        )
+    _require_closure_not_self(entry.ref, entry.closure)
+
+
+# --- Events ------------------------------------------------------------------
+
+
+def _require_fresh(declaration: DefectDeclaration) -> None:
+    stale = [
+        name
+        for name, is_fresh in (
+            ('status', declaration.status is DefectStatus.OPEN),
+            ('sightings', declaration.sightings == 1),
+            ('proof', declaration.proof is None),
+            ('closure', declaration.closure is None),
+            ('ruling', declaration.ruling is None),
+        )
+        if not is_fresh
+    ]
+    if stale:
+        raise ValueError(
+            f'{declaration.ref}: a new declaration is fresh (status open, one sighting, no '
+            f'proof, closure or ruling); these fields are not: {stale}'
+        )
+
+
+class Declare(BaseModel):
+    """Declare a new defect; the creation floor every creating path reuses."""
+
+    model_config = _RECORD_CONFIG
+
+    event: Literal[DefectEventKind.DECLARE] = DefectEventKind.DECLARE
+    declaration: DefectDeclaration
+
+    @model_validator(mode='after')
+    def _is_fresh(self) -> Self:
+        _require_fresh(self.declaration)
+        return self
+
+    @property
+    def ref(self) -> str:
+        return self.declaration.ref
+
+
+class DeclareClosure(BaseModel):
+    model_config = _RECORD_CONFIG
+
+    event: Literal[DefectEventKind.DECLARE_CLOSURE] = DefectEventKind.DECLARE_CLOSURE
+    ref: DefectRefStr
+    closure: Closure
+
+    @model_validator(mode='after')
+    def _not_self(self) -> Self:
+        _require_closure_not_self(self.ref, self.closure)
+        return self
+
+
+class DeclareRetirement(BaseModel):
+    model_config = _RECORD_CONFIG
+
+    event: Literal[DefectEventKind.DECLARE_RETIREMENT] = DefectEventKind.DECLARE_RETIREMENT
+    retirement: Retirement
+
+    @model_validator(mode='after')
+    def _is_unruled(self) -> Self:
+        if self.retirement.ruling is not None:
+            raise ValueError(
+                f'{self.retirement.ref}: a retirement is declared unruled; its ruling '
+                'arrives later as a Rule'
+            )
+        return self
+
+    @property
+    def ref(self) -> str:
+        return self.retirement.ref
+
+
+class Sighting(BaseModel):
+    model_config = _RECORD_CONFIG
+
+    event: Literal[DefectEventKind.SIGHTING] = DefectEventKind.SIGHTING
+    ref: DefectRefStr
+
+
+class Proof(BaseModel):
+    model_config = _RECORD_CONFIG
+
+    event: Literal[DefectEventKind.PROOF] = DefectEventKind.PROOF
+    proof: DefectProof
+
+    @property
+    def ref(self) -> str:
+        return self.proof.ref
+
+
+class Rule(BaseModel):
+    model_config = _RECORD_CONFIG
+
+    event: Literal[DefectEventKind.RULE] = DefectEventKind.RULE
+    ref: DefectRefStr
+    ruling: Ruling
+
+
+DeclareEvent = Annotated[
+    Declare | DeclareClosure | DeclareRetirement | Sighting, Field(discriminator='event')
+]
+"""What ``declare_defect`` carries; any filer may send one."""
+
+OutcomeEvent = Annotated[Proof | Rule, Field(discriminator='event')]
+"""What ``record_defect_outcome`` carries; only the orchestrator and prove_defect.py send one."""
+
+_DECLARE_EVENT_ADAPTER: Final = TypeAdapter(DeclareEvent)
+_OUTCOME_EVENT_ADAPTER: Final = TypeAdapter(OutcomeEvent)
+
+
+def parse_declare_event(raw: object) -> DeclareEvent:
+    """Validate a wire dict as a :data:`DeclareEvent`; raises pydantic ``ValidationError``."""
+    return _DECLARE_EVENT_ADAPTER.validate_python(raw)
+
+
+def parse_outcome_event(raw: object) -> OutcomeEvent:
+    """Validate a wire dict as an :data:`OutcomeEvent`; raises pydantic ``ValidationError``."""
+    return _OUTCOME_EVENT_ADAPTER.validate_python(raw)
