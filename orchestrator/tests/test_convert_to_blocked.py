@@ -444,8 +444,8 @@ class TestConvertToBlockedEnforceFlag:
     """
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_the_flag_ships_observe_only(self) -> None:
-        """Observe-before-enforce is the SHIPPED posture, not a test-only one."""
+    def test_the_code_default_is_observe_only(self) -> None:
+        """The CODE default is log mode; a project config may opt into enforce."""
         from orchestrator.config import OrchestratorConfig
 
         assert OrchestratorConfig().convert_to_blocked_enforce is False
