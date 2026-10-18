@@ -80,6 +80,7 @@ from orchestrator.agents.roles import (
     REVIEWER_COMPREHENSIVE,
     ROLES,
     SIMPLE_TASK,
+    STEWARD,
     AgentRole,
 )
 from orchestrator.agents.triage import suggestion_hash
@@ -459,8 +460,9 @@ class _HumanHandoff(Exception):
 
 
 class _StewardReescalated(_HumanHandoff):
-    """The steward re-escalated during this wait, and hand-off L1s remain open
-    (consumed by the auto-watcher, which may promote to L2 for a human)."""
+    """The steward filed a hand-off L1 during this wait — through its own
+    give-up path or its agent's ``escalate_blocker(level=1)`` (consumed by the
+    auto-watcher, which may promote to L2 for a human)."""
 
     def __init__(self, escalations: list[Escalation]):
         super().__init__(escalations, 'Steward re-escalated to human')
@@ -476,13 +478,6 @@ class _NoStewardApplicable(_HumanHandoff):
         super().__init__(
             escalations, f'Gated by open {tier} {ids}; no steward applicable',
         )
-
-
-def _reescalations_by(steward: Any | None) -> int:
-    """How many escalations *steward* has re-escalated to L1 so far — 0 for no
-    steward, or a double that keeps no ``StewardMetrics``."""
-    count = getattr(getattr(steward, 'metrics', None), 'escalations_reescalated', 0)
-    return count if isinstance(count, int) and not isinstance(count, bool) else 0
 
 if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
@@ -14549,14 +14544,11 @@ class TaskWorkflow:
         # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
         # human intervention rather than looping; the reason says no steward
         # was applicable (D13).
-        pending_l2 = [
-            e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
-            if _needs_human(e)
-        ]
+        open_at_entry = self.escalation_queue.get_by_task(self.task_id, status='pending')
+        pending_l2 = [e for e in open_at_entry if _needs_human(e)]
         if pending_l2:
             raise _NoStewardApplicable(pending_l2, 'L2')
-        steward = self._steward
-        reescalations_at_entry = _reescalations_by(steward)
+        open_ids_at_entry = {e.id for e in open_at_entry}
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
         # window (task 3170, fix C + review fix D1).  See the method docstring
@@ -14725,7 +14717,11 @@ class TaskWorkflow:
             if is_queue_handoff(e)
         ]
         if handoff_l1:
-            if _reescalations_by(steward) > reescalations_at_entry:
+            steward_filed_one = any(
+                e.agent_role == STEWARD.name and e.id not in open_ids_at_entry
+                for e in handoff_l1
+            )
+            if steward_filed_one:
                 raise _StewardReescalated(handoff_l1)
             raise _NoStewardApplicable(handoff_l1, 'L1')
 

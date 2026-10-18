@@ -44,7 +44,7 @@ from test_workflow_merge_gating_strand import git_ops as git_ops
 from test_workflow_merge_gating_strand import git_repo as git_repo
 from test_workflow_merge_gating_strand import task_assignment as task_assignment
 
-from orchestrator.steward import StewardMetrics
+from orchestrator.agents.roles import STEWARD
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import _is_gating_escalation
 from orchestrator.workflow_types import WorkflowOutcome
@@ -78,12 +78,15 @@ def _submit_l2(queue: EscalationQueue, task_id: str, severity: str) -> Escalatio
     return esc
 
 
-def _submit_l1(queue: EscalationQueue, task_id: str, severity: str) -> Escalation:
-    """Submit a pending level-1 record at *severity* that no steward of this run filed."""
+def _submit_l1(
+    queue: EscalationQueue, task_id: str, severity: str,
+    agent_role: str = 'harness-orphan-reaper',
+) -> Escalation:
+    """Submit a pending level-1 record at *severity*, as an earlier incarnation left it."""
     esc = Escalation(
         id=queue.make_id(task_id),
         task_id=task_id,
-        agent_role='harness-orphan-reaper',
+        agent_role=agent_role,
         severity=severity,
         category='design_concern',
         summary=f'a {severity!r} L1 left by an earlier incarnation',
@@ -93,15 +96,18 @@ def _submit_l1(queue: EscalationQueue, task_id: str, severity: str) -> Escalatio
     return esc
 
 
-def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
-    """A steward that gives up on the gating L0 the way ``TaskSteward`` does:
-    files a level-1, counts it in ``metrics.escalations_reescalated`` and
-    dismisses the L0.  It acts after a short delay, as the real steward's
-    background loop does, so the wait has begun before it re-escalates."""
+def _make_handing_off_steward(
+    queue: EscalationQueue, task_id: str, filer_role: str = STEWARD.name,
+) -> type:
+    """A steward that hands the gating L0 to a human: files a level-1 under
+    *filer_role* and dismisses the L0.  With the steward's role, both producers
+    look like this in the queue — ``TaskSteward``'s own give-up path and its
+    agent's ``escalate_blocker(level=1)``.  It acts after a short delay, as the
+    real steward's background loop does, so the wait has begun before it hands
+    off."""
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
-            self.metrics = StewardMetrics()
+        def __init__(self, wt_path, cfg_dir):
             self.give_up_task: asyncio.Task | None = None
 
         def set_outcome_channel(self, channel) -> None:
@@ -116,13 +122,12 @@ def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
                 queue.submit(Escalation(
                     id=queue.make_id(task_id),
                     task_id=task_id,
-                    agent_role='steward',
+                    agent_role=filer_role,
                     severity=esc.severity,
                     category=esc.category,
                     summary=f'Steward re-escalation: {esc.summary}',
                     level=1,
                 ))
-                self.metrics.escalations_reescalated += 1
                 queue.resolve(
                     esc.id, 'Auto-dismissed: re-escalated to level 1',
                     dismiss=True, resolved_by='steward',
@@ -271,11 +276,11 @@ class TestInfoL1DoesNotHandOffAtTheWaitTail:
 @pytest.mark.asyncio
 class TestTheWaitTailNamesWhoActed:
     """An escalated wait that ends with a non-info L1 open blocks either way;
-    the reason says whether this wait's steward re-escalated (PRD D13)."""
+    the reason says whether this wait's steward handed off (PRD D13)."""
 
     async def _run_escalated(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
-        *, steward_factory, stale_l1: bool,
+        *, make_steward, stale_l1_role: str | None = None,
     ):
         stub = AgentStub()
         workflow, _, queue = _build_workflow_with_escalation(
@@ -293,38 +298,53 @@ class TestTheWaitTailNamesWhoActed:
         stale: list[Escalation] = []
 
         async def _escalate_once():
-            if not stale and stale_l1:
-                stale.append(_submit_l1(queue, task_id, 'blocking'))
+            if not stale and stale_l1_role is not None:
+                stale.append(_submit_l1(queue, task_id, 'blocking', stale_l1_role))
             _submit_gating_l0(queue, task_id)
             return WorkflowOutcome.ESCALATED
 
-        workflow._execute_verify_review_loop = _escalate_once  # type: ignore[method-assign]
-        workflow._steward_factory = steward_factory(queue, task_id)
+        monkeypatch.setattr(workflow, '_execute_verify_review_loop', _escalate_once)
+        workflow._steward_factory = make_steward(queue, task_id)
 
         report = await asyncio.wait_for(workflow.run(), 60)
-        return report, queue, stale
+        open_l1 = queue.get_by_task(task_id, status='pending', level=1)
+        return report, open_l1, stale
 
-    async def test_a_steward_reescalation_says_so(
+    async def test_a_steward_hand_off_says_so(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
     ):
-        report, queue, _ = await self._run_escalated(
+        report, open_l1, _ = await self._run_escalated(
             config, git_ops, task_assignment, monkeypatch, tmp_path,
-            steward_factory=_make_reescalating_steward, stale_l1=False,
+            make_steward=_make_handing_off_steward,
         )
 
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.reason == 'Steward re-escalated to human'
-        reescalated = queue.get_by_task(
-            task_assignment.task_id, status='pending', level=1,
-        )
-        assert [e.agent_role for e in reescalated] == ['steward']
+        assert [e.agent_role for e in open_l1] == [STEWARD.name]
 
-    async def test_an_l1_the_steward_did_not_file_names_no_steward(
+    async def test_an_l1_another_role_files_mid_wait_names_no_steward(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        report, open_l1, _ = await self._run_escalated(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            make_steward=lambda queue, task_id: _make_handing_off_steward(
+                queue, task_id, filer_role='orchestrator',
+            ),
+        )
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.reason == (
+            f'Gated by open L1 {open_l1[0].id}; no steward applicable'
+        )
+
+    @pytest.mark.parametrize('stale_l1_role', ['harness-orphan-reaper', STEWARD.name])
+    async def test_an_l1_open_before_the_wait_names_no_steward(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        stale_l1_role,
     ):
         report, _, stale = await self._run_escalated(
             config, git_ops, task_assignment, monkeypatch, tmp_path,
-            steward_factory=_make_resolving_steward, stale_l1=True,
+            make_steward=_make_resolving_steward, stale_l1_role=stale_l1_role,
         )
 
         assert report.outcome == WorkflowOutcome.BLOCKED

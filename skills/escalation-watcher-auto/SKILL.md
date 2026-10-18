@@ -153,7 +153,7 @@ result = mcp__escalation__promote_to_l2(
 #          (nothing minted, nothing folded into an existing L2)
 ```
 
-An `info_only_cluster` refusal is handled by the [info-only cluster rung](#info-only-cluster-info_only_cluster) below.
+An `info_only_cluster` refusal is handled by the [info-only cluster rung](#info-only-cluster-info_only_cluster) below. This holds for **every** `promote_to_l2` call in this skill that omits `severity`, including the per-category recipes further down: a `PROMOTED` digest line is written only for a `created`/`updated` result, never for a refusal.
 
 An `eval_lane_contained` refusal is final for the eval-lane records it names: close them instead, per [Eval-lane records](#eval-lane-records-any-category--close-never-promote), and re-promote any production members without them.
 
