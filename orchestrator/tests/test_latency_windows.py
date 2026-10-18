@@ -150,18 +150,26 @@ def test_time_window_times_each_of_its_samples() -> None:
     assert 0.0 <= window.p50_ms <= window.p99_ms <= window.max_ms
 
 
-def test_describe_lists_every_windows_p99_to_two_decimals() -> None:
+@pytest.mark.parametrize(('p99_ms', 'within'), [(49.99, True), (_BOUND_MS, False), (50.01, False)])
+def test_a_window_is_within_the_bound_only_when_its_p99_is_strictly_below_it(
+    p99_ms: float, within: bool,
+) -> None:
+    window = _window(p50_ms=1.0, p99_ms=p99_ms)
+
+    assert window.p99_within(_BOUND_MS) is within
+    assert RemeasuredWindows(windows=(window,), bound_ms=_BOUND_MS).met is within
+
+
+def test_describe_lists_every_windows_p50_p99_and_max_to_two_decimals_in_order() -> None:
     remeasured = RemeasuredWindows(
         windows=(
-            _window(p50_ms=1.0, p99_ms=61.234),
-            _window(p50_ms=1.0, p99_ms=72.5),
-            _window(p50_ms=1.0, p99_ms=12.0),
+            LatencyWindow(p50_ms=1.5, p99_ms=61.234, max_ms=99.9, samples=200),
+            LatencyWindow(p50_ms=2.25, p99_ms=72.5, max_ms=130.0, samples=200),
+            LatencyWindow(p50_ms=0.8, p99_ms=12.0, max_ms=14.1, samples=200),
         ),
         bound_ms=_BOUND_MS,
     )
 
-    described = remeasured.describe()
-
-    assert '61.23' in described
-    assert '72.50' in described
-    assert '12.00' in described
+    assert remeasured.describe() == (
+        '3 window(s) as p50/p99/max ms: 1.50/61.23/99.90, 2.25/72.50/130.00, 0.80/12.00/14.10'
+    )

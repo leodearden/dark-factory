@@ -39,6 +39,9 @@ class LatencyWindow:
             samples=len(ordered),
         )
 
+    def p99_within(self, bound_ms: float) -> bool:
+        return self.p99_ms < bound_ms
+
 
 def time_window(sample: Callable[[], object], samples: int) -> LatencyWindow:
     """Call *sample* *samples* times back to back, timing each call on the wall clock."""
@@ -63,7 +66,7 @@ class RemeasuredWindows:
 
     @property
     def met(self) -> bool:
-        return self.windows[-1].p99_ms < self.bound_ms
+        return self.windows[-1].p99_within(self.bound_ms)
 
     def describe(self) -> str:
         listed = ', '.join(
@@ -74,7 +77,7 @@ class RemeasuredWindows:
 
 
 def _is_final(window: LatencyWindow, bound_ms: float) -> bool:
-    return window.p99_ms < bound_ms or window.p50_ms >= bound_ms
+    return window.p99_within(bound_ms) or window.p50_ms >= bound_ms
 
 
 def remeasure_until_p99_within(
