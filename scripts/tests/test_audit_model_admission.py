@@ -537,6 +537,7 @@ def test_zero_scoped_hits_is_an_empty_tuple_not_none(runs_db):
     assert scan.scoped_hits == ()
     assert scan.restarts == ()
     assert scan.orchestrator_startups == ()
+    assert scan.restart_required_reloads == ()
     assert scan.unscoped_cap_hit_count == 0
 
 
@@ -636,6 +637,17 @@ def test_a_hot_applied_reload_with_nothing_restart_required_is_not_listed(runs_d
         runs_db, _at(hours=1), restart_required={},
         applied={'review.max_rounds': {'old': 3, 'new': 4}},
     )
+
+    scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
+
+    assert scan.restart_required_reloads == ()
+
+
+@pytest.mark.parametrize('restart_required', [None, [SCOPED_CAP_LEAF]], ids=['null', 'list'])
+def test_a_reload_whose_restart_required_is_not_an_object_is_not_listed(
+    runs_db, restart_required,
+):
+    _reload(runs_db, _at(hours=1), restart_required=restart_required)
 
     scan = audit_model_admission.scan_scoped_cap(runs_db, model=FABLE, since=APPLY)
 

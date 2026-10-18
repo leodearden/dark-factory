@@ -700,15 +700,9 @@ def scan_scoped_cap(
     orchestrator restarts, a cap on *model* lands on the account-level path, and
     dropping scope-less rows would hide precisely that.
 
-    Only an orchestrator STARTUP reloads a restart-tier leaf, and
-    ``orchestrator_startups`` is the witness to one: the `runs` row each
-    startup registers before it emits anything.  `service_restart` rows are
-    not that witness.  They name backing-service restarts, and for the
-    orchestrator only the merge-landed coordinator's restart REQUESTS,
-    stamped before the startup they cause; the watchdog and manual restart
-    paths record none.  They are kept, named, beside the startups.
-    ``restart_required_reloads`` pairs each reload that flagged a leaf
-    restart-required with the first of those startups after it.
+    The witness that a restart-tier leaf has been loaded is the `runs` row an
+    orchestrator startup registers (``orchestrator_startups``), which
+    ``restart_required_reloads`` pairs with each reload that flagged one.
     """
     bounds, params = _time_bounds('created_at', since, until)
     cursor = conn.execute(
@@ -1101,9 +1095,7 @@ def _scoped_cap_section(scan: ScopedCapScan, model: str, span: str) -> list[str]
         ['reloaded at', 'restart-required leaves', 'first startup after', 'run_id'],
         [_reload_row(r) for r in scan.restart_required_reloads],
     )
-    out += ['', f'`service_restart` events {span}: backing-service restarts, and the '
-                "merge-landed coordinator's orchestrator restart requests rather than "
-                'orchestrator startups:', '']
+    out += ['', f'`service_restart` events {span}:', '']
     out += markdown_table(
         ['timestamp', 'service', 'reason'],
         [(r.timestamp, r.service, r.reason or '-') for r in scan.restarts],
