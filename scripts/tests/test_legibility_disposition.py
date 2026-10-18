@@ -1603,6 +1603,96 @@ def test_an_unkeyed_present_finding_that_supersedes_a_task_files_through_steps_t
 
 
 # ---------------------------------------------------------------------------
+# Contract §8 dedup: no second curator ticket while an entry's earlier one
+# still awaits the curator
+# ---------------------------------------------------------------------------
+
+_AWAITING = {"entry-a": "tkt_7"}
+
+
+@pytest.mark.parametrize(
+    ("filing", "metadata_hits"),
+    [
+        (_present(_filing(entry_id="entry-a")), _key_hits(_hit(40, "done"))),
+        (_filing(entry_id="entry-a"), {}),
+        (_filing(None, entry_id="entry-a"), {}),
+    ],
+    ids=["step-1c-done-key-hit", "key-miss", "unkeyed"],
+)
+def test_a_filing_whose_entry_awaits_the_curator_files_no_second_ticket(filing, metadata_hits) -> None:
+    store = FakeTaskStore(metadata_hits=metadata_hits)
+    submit = _Submit()
+
+    decision = _only(disposition.dispose([filing], store=store, submit=submit, awaiting=_AWAITING))
+
+    assert submit.calls == []
+    assert "search_tasks" not in store.tools_called()
+    assert (decision.step, decision.ticket, decision.task_id) == (Step.CURATOR, None, None)
+    assert decision.awaiting_ticket == "tkt_7"
+    assert decision.routed is False
+    assert decision.back_link(_RUN) is None
+    assert decision.disposition() == "open (ticket tkt_7 pending)"
+
+
+def test_an_awaiting_decision_records_its_pending_ticket_as_json() -> None:
+    store = FakeTaskStore(metadata_hits=_key_hits(_hit(40, "done")))
+
+    decision = _only(disposition.dispose(
+        [_present(_filing(entry_id="entry-a"))], store=store, submit=_Submit(), awaiting=_AWAITING,
+    ))
+
+    record = decision.to_record()
+    assert json.loads(json.dumps(record)) == record
+    assert "tkt_7" in record["disposition"]
+
+
+@pytest.mark.parametrize(
+    ("filing", "hit"),
+    [
+        (_present(_filing(entry_id="entry-a")), _hit(501, "pending")),
+        (_filing(entry_id="entry-a"), _hit(40, "done")),
+    ],
+    ids=["live-key-hit", "done-key-hit-not-verified-present"],
+)
+def test_a_step_one_link_is_unchanged_by_a_pending_ticket(filing, hit) -> None:
+    def decided(**awaiting: Any) -> disposition.Decision:
+        store = FakeTaskStore(metadata_hits=_key_hits(hit))
+        return _only(disposition.dispose([filing], store=store, submit=_Submit(), **awaiting))
+
+    linked = decided(awaiting=_AWAITING)
+
+    assert linked == decided()
+    assert (linked.step, linked.task_id, linked.awaiting_ticket) == (Step.KEY, hit.task_id, None)
+
+
+def test_a_filing_for_an_entry_with_no_pending_ticket_is_filed_as_before() -> None:
+    store = FakeTaskStore()
+    submit = _Submit()
+
+    decision = _only(disposition.dispose(
+        [_filing(entry_id="entry-b")], store=store, submit=submit, awaiting=_AWAITING,
+    ))
+
+    assert "search_tasks" in store.tools_called()
+    assert len(submit.calls) == 1
+    assert (decision.step, decision.ticket, decision.awaiting_ticket) == (Step.CURATOR, "tkt_1", None)
+
+
+def test_a_dry_run_decides_an_awaiting_filing_and_leaves_it_out_of_unfiled() -> None:
+    disposal = disposition.dispose(
+        [_filing(entry_id="entry-a"), _filing(_KEY_B, "another finding", entry_id="entry-b")],
+        store=FakeTaskStore(),
+        submit=None,
+        awaiting=_AWAITING,
+    )
+
+    assert [(decision.filing.entry_id, decision.awaiting_ticket) for decision in disposal.decisions] == [
+        ("entry-a", "tkt_7"),
+    ]
+    assert [filing.entry_id for filing in disposal.unfiled] == ["entry-b"]
+
+
+# ---------------------------------------------------------------------------
 # Contract §7 dispositions, rendered from an entry's status, its
 # filed_tickets and this run's task standings
 # ---------------------------------------------------------------------------
