@@ -18,8 +18,22 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
+from typing import Annotated, Literal, Self
+
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    PlainValidator,
+    field_validator,
+    model_validator,
+)
 
 from shared.finding_key import KEY_PATTERN
+from shared.governed_exceptions import Debt, MalformedDisposition, owner_from_record, owner_record
 
 
 class DefectOrigin(StrEnum):
@@ -373,3 +387,294 @@ def mint_portal_ref(project: str, block: str, n: int) -> str:
 def mint_explore_ref(run: str, n: int) -> str:
     origin = DefectOrigin.EXPLORATORY
     return _mint(origin, run, _positive_int_text(origin, 'n', n))
+
+
+# --- Records -----------------------------------------------------------------
+
+_RECORD_CONFIG = ConfigDict(frozen=True, extra='forbid')
+
+
+def _grammar_checked(value: str) -> str:
+    return parse_ref(value).ref
+
+
+DefectRefStr = Annotated[str, AfterValidator(_grammar_checked)]
+"""A str field that must parse under the ref grammar; a violation is a ValidationError."""
+
+_GIT_OBJECT_ID = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+
+
+def _git_object_id(value: str) -> str:
+    if _GIT_OBJECT_ID.fullmatch(value) is None:
+        raise ValueError(
+            f'{value!r} is not a git object id: expected 40 (sha1) or 64 (sha256) '
+            'lower-case hex digits'
+        )
+    return value
+
+
+_GitObjectId = Annotated[str, AfterValidator(_git_object_id)]
+_NonEmptyStr = Annotated[str, Field(min_length=1)]
+
+
+class NodeId(BaseModel):
+    """A module-qualified pytest node id, ``<module_root>/<path>::<name>`` (decision 19)."""
+
+    model_config = _RECORD_CONFIG
+
+    module_root: _NonEmptyStr
+    path: _NonEmptyStr
+    name: _NonEmptyStr
+
+    @field_validator('path')
+    @classmethod
+    def _path_is_one_file(cls, path: str) -> str:
+        if '::' in path:
+            raise ValueError(
+                f'NodeId path {path!r} holds the node separator "::"; the test name '
+                'belongs in name, not in path'
+            )
+        return path
+
+
+class MissingSymbol(BaseModel):
+    """Decision 9's structured missing name.
+
+    ``module`` is ``e.name``, ``symbol`` is ``e.name_from`` and ``owner_type``
+    is the type of ``e.obj``; which are set depends on the exception class.
+    """
+
+    model_config = _RECORD_CONFIG
+
+    module: str | None = None
+    symbol: str | None = None
+    owner_type: str | None = None
+
+    @model_validator(mode='after')
+    def _names_something(self) -> Self:
+        if self.module is None and self.symbol is None and self.owner_type is None:
+            raise ValueError(
+                'MissingSymbol names nothing: at least one of module, symbol and '
+                'owner_type must be set'
+            )
+        return self
+
+
+_ERROR_SIDE_OUTCOMES = frozenset({SideOutcome.ERROR_ATTRIBUTED, SideOutcome.ERROR_UNATTRIBUTED})
+
+
+class SideResult(BaseModel):
+    """One node's outcome on one side (base or tip) of a proof."""
+
+    model_config = _RECORD_CONFIG
+
+    node_id: NodeId
+    outcome: SideOutcome
+    exc_type: str | None = None
+    missing_symbol: MissingSymbol | None = None
+
+    @model_validator(mode='after')
+    def _symbol_fits_outcome(self) -> Self:
+        if self.outcome is SideOutcome.ERROR_ATTRIBUTED and self.missing_symbol is None:
+            raise ValueError(
+                f'SideResult for {self.node_id}: an error_attributed outcome needs the '
+                'missing_symbol it was attributed to'
+            )
+        if self.missing_symbol is not None and self.outcome not in _ERROR_SIDE_OUTCOMES:
+            raise ValueError(
+                f'SideResult for {self.node_id}: outcome {self.outcome} is not an error, so '
+                f'it carries no missing_symbol (got {self.missing_symbol})'
+            )
+        return self
+
+
+class DefectProof(BaseModel):
+    """One proof of one ref against the pre-fix tree (decision 9).
+
+    The validator enforces field coherence only. Whether the per-node sides
+    amount to PROVEN (I4) is the proof runner's classification, not this record's.
+    """
+
+    model_config = _RECORD_CONFIG
+
+    ref: DefectRefStr
+    outcome: ProofOutcome
+    base_sha: _GitObjectId
+    tip_sha: _GitObjectId
+    measured_at: AwareDatetime
+    node_ids: tuple[NodeId, ...]
+    base: tuple[SideResult, ...]
+    tip: tuple[SideResult, ...]
+    unavailable_reason: UnavailableReason | None = None
+    runner_rc: int | None = None
+    duration_s: float = Field(ge=0)
+
+    @model_validator(mode='after')
+    def _fields_cohere(self) -> Self:
+        unavailable = self.outcome is ProofOutcome.PROOF_UNAVAILABLE
+        if unavailable != (self.unavailable_reason is not None):
+            raise ValueError(
+                f'DefectProof for {self.ref}: unavailable_reason is set iff the outcome is '
+                f'PROOF_UNAVAILABLE; got outcome={self.outcome}, '
+                f'unavailable_reason={self.unavailable_reason}'
+            )
+        if self.outcome is ProofOutcome.PROVEN and not self.node_ids:
+            raise ValueError(
+                f'DefectProof for {self.ref}: a PROVEN proof names at least one node id'
+            )
+        return self
+
+
+class Ruling(BaseModel):
+    """An accept or reject of a closure or a retirement, by the reviewer or the operator."""
+
+    model_config = _RECORD_CONFIG
+
+    subject: RulingSubject
+    accepted: bool
+    ruled_by: RuledBy
+    verdict_cycle: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode='after')
+    def _cycle_fits_ruler(self) -> Self:
+        if (self.ruled_by is RuledBy.REVIEWER) != (self.verdict_cycle is not None):
+            raise ValueError(
+                'Ruling: verdict_cycle is set iff ruled_by is reviewer (an operator ruling '
+                f'has no verdict cycle); got ruled_by={self.ruled_by}, '
+                f'verdict_cycle={self.verdict_cycle}'
+            )
+        return self
+
+
+def _debt_from_wire(value: object) -> Debt:
+    if isinstance(value, Debt):
+        return value
+    try:
+        return Debt(owner_from_record(value))
+    except MalformedDisposition as exc:
+        # MalformedDisposition is deliberately not a ValueError; pydantic wraps
+        # only ValueError, and parse_metadata catches only ValidationError.
+        raise ValueError(str(exc)) from exc
+
+
+def _debt_to_wire(debt: Debt) -> dict[str, object]:
+    return owner_record(debt.owner)
+
+
+_DebtOwner = Annotated[Debt, PlainValidator(_debt_from_wire), PlainSerializer(_debt_to_wire)]
+
+
+class Exemption(BaseModel):
+    """Decision 13's ``not_reproducible`` closure: why no proof can exist, and who owes one."""
+
+    model_config = _RECORD_CONFIG
+
+    kind: Literal['exemption'] = 'exemption'
+    reason: ExemptionReason
+    owner: _DebtOwner
+
+
+def _require_ref_iff(code: StrEnum, parameterised: StrEnum, ref: str | None) -> None:
+    if (code is parameterised) != (ref is not None):
+        raise ValueError(
+            f'reason {code} {"requires" if code is parameterised else "takes no"} ref '
+            f'(only {parameterised} names one); got ref={ref!r}'
+        )
+
+
+def _require_not_self(ref: str, named: str | None, relation: str) -> None:
+    if named == ref:
+        raise ValueError(f'{ref} cannot be {relation} itself')
+
+
+class WithdrawalReason(BaseModel):
+    model_config = _RECORD_CONFIG
+
+    reason: WithdrawalCode
+    ref: DefectRefStr | None = None
+
+    @model_validator(mode='after')
+    def _ref_iff_duplicate(self) -> Self:
+        _require_ref_iff(self.reason, WithdrawalCode.DUPLICATE_OF, self.ref)
+        return self
+
+
+class Withdrawal(BaseModel):
+    """Decision 13's withdrawal closure: the declared defect is not one to prove."""
+
+    model_config = _RECORD_CONFIG
+
+    kind: Literal['withdrawal'] = 'withdrawal'
+    reason: WithdrawalReason
+
+
+Closure = Annotated[Exemption | Withdrawal, Field(discriminator='kind')]
+
+
+class RetirementReason(BaseModel):
+    model_config = _RECORD_CONFIG
+
+    reason: RetirementCode
+    ref: DefectRefStr | None = None
+
+    @model_validator(mode='after')
+    def _ref_iff_superseded(self) -> Self:
+        _require_ref_iff(self.reason, RetirementCode.SUPERSEDED_BY, self.ref)
+        return self
+
+
+class RetirementState(StrEnum):
+    PENDING = 'pending'
+    ACCEPTED = 'accepted'
+    REJECTED = 'rejected'
+
+
+class Retirement(BaseModel):
+    """A ruled record, on the task whose diff removes a proven defect's test (decisions 13, 14).
+
+    Not a state of the defect's own entry: only this record's ruling changes it.
+    """
+
+    model_config = _RECORD_CONFIG
+
+    ref: DefectRefStr
+    reason: RetirementReason
+    ruling: Ruling | None = None
+
+    @model_validator(mode='after')
+    def _coheres(self) -> Self:
+        if self.ruling is not None and self.ruling.subject is not RulingSubject.RETIREMENT:
+            raise ValueError(
+                f'Retirement {self.ref}: its ruling must have subject retirement, '
+                f'got {self.ruling.subject}'
+            )
+        _require_not_self(self.ref, self.reason.ref, 'superseded_by')
+        return self
+
+    @property
+    def state(self) -> RetirementState:
+        if self.ruling is None:
+            return RetirementState.PENDING
+        return RetirementState.ACCEPTED if self.ruling.accepted else RetirementState.REJECTED
+
+
+class PlanCheck(BaseModel):
+    """Whether a plan reproduces the task's declared defects, and which refs the outcome is about."""
+
+    model_config = _RECORD_CONFIG
+
+    outcome: PlanCheckOutcome
+    defect_refs: tuple[DefectRefStr, ...] = ()
+
+
+class KeepCheck(BaseModel):
+    """The keep-ratchet's result for one candidate against the tree it lands on (decision 14)."""
+
+    model_config = _RECORD_CONFIG
+
+    outcome: KeepOutcome
+    removed_refs: tuple[DefectRefStr, ...] = ()
+    retired_refs: tuple[DefectRefStr, ...] = ()
+    incomplete_files: tuple[str, ...] = ()
+    parent_sha: _GitObjectId
+    candidate_sha: _GitObjectId
