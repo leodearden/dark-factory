@@ -67,7 +67,6 @@ FIX_MERGE_SUBJECT = 'Merge task/6059 into main'
 PHASE2_TASK_ID = '6067'
 LOCAL_PROJECT = 'dark_factory'
 REPLY_FAILURE_KEYS = ('error', 'error_type', '_mcp_is_error', '_raw')
-AUTHORITY_DENIALS = {'Mem0UpdateNotAuthorized', 'Mem0UpdateToolDisabled'}
 ZERO_UUID = '00000000-0000-0000-0000-000000000000'
 OBSERVATION_KEPT_MIN_RATIO = 0.85
 
@@ -327,8 +326,13 @@ def test_phase2_names_its_task_and_the_measured_fix(phase2):
     assert re.fullmatch(r'[0-9a-f]{40}', merge_commit), merge_commit
     measured = subprocess.run(
         ['git', '-C', str(REPO_ROOT), 'log', '-1', '--format=%H%x00%cI%x00%s', merge_commit],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True,
     )
+    if measured.returncode != 0:
+        pytest.fail(
+            f'fix merge commit {merge_commit} is not in the local history of {REPO_ROOT} '
+            f'(shallow clone or source export without .git?): {measured.stderr.strip()}'
+        )
     sha, merged_at, subject = measured.stdout.rstrip('\n').split('\x00')
     assert (sha, merged_at, subject) == (merge_commit, fix['merged_at'], FIX_MERGE_SUBJECT)
 
@@ -367,6 +371,4 @@ def test_phase2_authority_probe_was_a_not_found_under_the_curator_identity(phase
     assert arguments['agent_id'] == phase2['agent_id']
     assert 'content' in arguments
     assert 'metadata_patch' in arguments
-    error_type = probe['reply']['error_type']
-    assert error_type, probe['reply']
-    assert error_type not in AUTHORITY_DENIALS, probe['reply']
+    assert probe['reply']['error_type'] == 'MemoryNotFound', probe['reply']
