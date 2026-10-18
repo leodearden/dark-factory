@@ -1641,3 +1641,207 @@ def test_task_standings_leave_an_unobserved_task_out() -> None:
     cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(5120)]))
 
     assert dict(disposition.task_standings(_read(cb, {}), ())) == {}
+
+
+# ---------------------------------------------------------------------------
+# The ## Dispositions body: previous tickets -> tasks -> outcome, from the
+# JSON-safe OutcomeReport record (INV-13: three distinct states)
+# ---------------------------------------------------------------------------
+
+_NOT_YET = "_no back-linked tickets yet._"
+_NO_CHANGE = "_no outcome changed this run._"
+
+
+def _outcome_record(
+    cb: dict,
+    statuses: dict | None,
+    *,
+    store: FakeTaskStore | None = None,
+    reverified: dict | None = None,
+    sighted: tuple[str, ...] = (),
+    error: str | None = None,
+) -> dict:
+    outcomes = _read(cb, statuses, store, error=error)
+    reverified = reverified or {}
+    projected, changes = disposition.project(cb, outcomes, reverified, as_of_sha=_SHA)
+    refiled = disposition.refilings(outcomes, reverified, sighted=set(sighted))
+    dispositions = disposition.entry_dispositions(projected, disposition.task_standings(outcomes, ()))
+    record = disposition.OutcomeReport(outcomes, reverified, changes, refiled, dispositions).to_record()
+    assert json.loads(json.dumps(record)) == record
+    return record
+
+
+def _dispositions(record: dict) -> list[str]:
+    return disposition.dispositions_lines(record, observed_root=_ROOT)
+
+
+def _rows_by_entry(record: dict) -> dict[str, dict]:
+    return {row["entry_id"]: row for row in record["rows"]}
+
+
+def test_no_back_link_anywhere_renders_only_the_not_yet_placeholder() -> None:
+    record = _outcome_record(_codebook(_entry("entry-a")), {"12": "pending"})
+
+    lines = _dispositions(record)
+
+    assert record["any_back_links"] is False
+    assert lines == ["", "## Dispositions", "", _NOT_YET]
+    assert _NO_CHANGE not in lines
+
+
+def test_back_links_whose_read_changed_nothing_render_their_table_and_the_no_change_line() -> None:
+    cb = _codebook(
+        _entry("entry-a", filed_tickets=[_task_row(12)], **_IDENTITY),
+        _entry("entry-b", filed_tickets=[_row("tkt_9")]),
+    )
+
+    record = _outcome_record(cb, {"12": "pending"})
+    lines = _dispositions(record)
+
+    assert lines[:3] == ["", "## Dispositions", ""]
+    assert _NO_CHANGE in lines
+    assert _NOT_YET not in lines
+    assert record["changes"] == []
+    rows = _table(lines)
+    assert [(row["entry_id"], row["finding_key"], row["ticket"], row["task_id"], row["task_status"], row["disposition"])
+            for row in rows] == [
+        ("entry-a", _KEY_A, "", "12", "pending", "filed:12"),
+        ("entry-b", "", "tkt_9", "", "", "open"),
+    ]
+    assert [row["outcome"] for row in record["rows"]] == ["live", "ticket"]
+    assert all(row["outcome"] for row in rows)
+
+
+def test_each_changed_entry_is_named_from_and_to_its_status() -> None:
+    cb = _codebook(
+        _entry("entry-gone", filed_tickets=[_task_row(5120)]),
+        _entry("entry-accepted", filed_tickets=[_task_row(12)]),
+        _entry("entry-reopened", status="accepted", accepted_by=77, filed_tickets=[_task_row(77)]),
+    )
+    store = FakeTaskStore(tasks={12: _accepting(12), 77: _task(77, "cancelled")})
+
+    record = _outcome_record(
+        cb, {"5120": "done", "12": "cancelled", "77": "cancelled"}, store=store,
+        reverified=_reverified("gone", "entry-gone", 5120),
+    )
+    lines = _dispositions(record)
+
+    assert record["changes"] == [
+        {"entry_id": "entry-gone", "from_status": "open", "to_status": "fixed", "accepted_by": None, "fixed_at_sha": _SHA},
+        {"entry_id": "entry-accepted", "from_status": "open", "to_status": "accepted", "accepted_by": 12,
+         "fixed_at_sha": None},
+        {"entry_id": "entry-reopened", "from_status": "accepted", "to_status": "open", "accepted_by": None,
+         "fixed_at_sha": None},
+    ]
+    assert _NO_CHANGE not in lines
+    assert _NOT_YET not in lines
+    for change, needles in (
+        ("entry-gone", ("open", "fixed", _SHA)),
+        ("entry-accepted", ("open", "accepted", "12")),
+        ("entry-reopened", ("accepted", "open")),
+    ):
+        assert any(change in line and all(needle in line for needle in needles) and not line.startswith("| ")
+                   for line in lines), change
+    rows = _rows_by_entry(record)
+    assert (rows["entry-gone"]["outcome"], rows["entry-gone"]["disposition"]) == ("gone", f"fixed:{_SHA}")
+    assert (rows["entry-accepted"]["outcome"], rows["entry-accepted"]["disposition"]) == ("accepted", "accepted:12")
+    assert (rows["entry-reopened"]["outcome"], rows["entry-reopened"]["disposition"]) == ("abandoned", "open")
+
+
+def test_each_reverify_result_is_its_own_outcome_and_the_summary_counts_them() -> None:
+    cb = _codebook(
+        _entry("entry-gone", filed_tickets=[_task_row(5120)]),
+        _entry("entry-present", filed_tickets=[_task_row(5121)]),
+        _entry("entry-structural", filed_tickets=[_task_row(5122)]),
+        _entry("entry-inconclusive", filed_tickets=[_task_row(5123)]),
+        _entry("entry-deferred", filed_tickets=[_task_row(5124)]),
+        _entry("entry-fixed", status="fixed", fixed_at_sha="abcdef1", filed_tickets=[_task_row(5125)]),
+    )
+    statuses = {str(task_id): "done" for task_id in range(5120, 5126)}
+    reverified = {
+        **_reverified("gone", "entry-gone", 5120),
+        **_reverified("present", "entry-present", 5121),
+        "entry-structural": disposition.Reverification(
+            "entry-structural", disposition.TaskRef(_ROOT, 5122), ReverifyResult.PRESENT,
+            _parsed(verified=True, route="structural"),
+        ),
+        **_reverified("inconclusive", "entry-inconclusive", 5123),
+        **_reverified("deferred", "entry-deferred", 5124),
+    }
+
+    record = _outcome_record(cb, statuses, reverified=reverified)
+    lines = _dispositions(record)
+
+    assert {entry_id: row["outcome"] for entry_id, row in _rows_by_entry(record).items()} == {
+        "entry-gone": "gone",
+        "entry-present": "present",
+        "entry-structural": "present-structural",
+        "entry-inconclusive": "inconclusive",
+        "entry-deferred": "deferred",
+        "entry-fixed": "settled",
+    }
+    assert record["reverify"] == {
+        "due": 5, "offered": 4, "gone": 1, "present": 2, "inconclusive": 1, "deferred": 1,
+    }
+    assert record["refiled"] == [{"entry_id": "entry-present", "supersedes_task": 5121, "verified_present": True}]
+    cells = {row["entry_id"]: row["outcome"] for row in _table(lines)}
+    assert _SHA in cells["entry-gone"]
+    assert "5121" in cells["entry-present"]
+    assert "not established" in cells["entry-inconclusive"]
+    assert len(set(cells.values())) == len(cells)
+    (summary,) = [line for line in lines if "re-verif" in line.lower() and not line.startswith("| ")]
+    for count in ("5", "4", "1", "2"):
+        assert count in summary
+
+
+def test_an_unobserved_task_and_another_projects_row_are_said_so() -> None:
+    cb = _codebook(
+        _entry("entry-a", filed_tickets=[_task_row(5120)]),
+        _entry("entry-b", filed_tickets=[_task_row(7, project_root=_HARNESS_ROOT)]),
+    )
+
+    record = _outcome_record(cb, {}, store=FakeTaskStore(tasks={7: _task(7, "pending")}))
+    rows = {row["entry_id"]: row for row in _table(_dispositions(record))}
+
+    assert _rows_by_entry(record)["entry-a"]["outcome"] == "unobserved"
+    assert "5120" in rows["entry-a"]["outcome"]
+    assert (rows["entry-a"]["project_root"], rows["entry-b"]["project_root"]) == ("", _HARNESS_ROOT)
+    assert (rows["entry-b"]["task_status"], rows["entry-b"]["disposition"]) == ("pending", "filed:7")
+
+
+def test_a_get_statuses_failure_names_the_error_and_that_no_status_changed() -> None:
+    cb = _codebook(_entry("entry-a", status="accepted", accepted_by=5120, filed_tickets=[_task_row(5120)]))
+
+    record = _outcome_record(cb, None, error="get_statuses returned a tool-error envelope: boom")
+    lines = _dispositions(record)
+
+    assert record["statuses_error"] == "get_statuses returned a tool-error envelope: boom"
+    (failure,) = [line for line in lines if "boom" in line and not line.startswith("| ")]
+    assert "no status changed" in failure
+    assert record["changes"] == []
+    assert _rows_by_entry(record)["entry-a"]["disposition"] == "accepted:5120"
+
+
+def test_an_abandoned_task_is_eligible_to_re_file_and_re_filed_once_sighted() -> None:
+    cb = _codebook(
+        _entry("entry-sighted", filed_tickets=[_task_row(12)]),
+        _entry("entry-quiet", filed_tickets=[_task_row(13)]),
+    )
+    store = FakeTaskStore(tasks={12: _task(12, "cancelled"), 13: _task(13, "cancelled")})
+
+    record = _outcome_record(cb, {"12": "cancelled", "13": "cancelled"}, store=store, sighted=("entry-sighted",))
+
+    assert [row["outcome"] for row in record["rows"]] == ["abandoned", "abandoned"]
+    assert record["refiled"] == [{"entry_id": "entry-sighted", "supersedes_task": None, "verified_present": False}]
+    cells = {row["entry_id"]: row["outcome"] for row in _table(_dispositions(record))}
+    assert cells["entry-sighted"] != cells["entry-quiet"]
+
+
+def test_a_task_that_does_not_govern_its_entry_says_which_does() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_task_row(40), _task_row(41)]))
+
+    record = _outcome_record(cb, {"40": "done", "41": "pending"})
+
+    assert [(row["task_id"], row["outcome"]) for row in record["rows"]] == [(40, "outranked"), (41, "live")]
+    cells = [row["outcome"] for row in _table(_dispositions(record))]
+    assert "41" in cells[0]
