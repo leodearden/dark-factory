@@ -17,6 +17,7 @@ from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 from orchestrator.agents.premise_refutation_guidance import PREMISE_REFUTATION_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
+from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
@@ -1768,7 +1769,9 @@ still ends up staged.
 # _REVIEWER_HEURISTICS_TEMPLATE is the EDITABLE judgment guidance (the
 # blocking-vs-suggestion rules, CODE_QUALITY_GUIDANCE per PRD
 # tier1-prompt-optimization D-3, and the specialization footer) that a pinned
-# artifact may override.
+# artifact may override. It is the incumbent (ReviewBriefing.DIFF_ONLY)
+# generation; the context-complete generation (task 5369) differs from it in
+# Rule 2 alone, and both come out of _reviewer_heuristics_template.
 #
 # Both templates are per-role (interpolate {name}/{specialization}) and built
 # via build_reviewer_prompt_spec(name, specialization) rather than module-level
@@ -1824,40 +1827,86 @@ the severity rules below say:
    the brief; the implementer is told to quote the order there.
 """
 
-_REVIEWER_HEURISTICS_TEMPLATE = """\
-## Rules
-
-1. **Be specific.** Every issue must have a file location and concrete description.
-2. **Blocking means broken.** Use `blocking` ONLY for issues that will cause runtime errors,
-   data corruption, security vulnerabilities, or API contract violations **within the scope
-   of this task**. Do not block on:
+_DO_NOT_BLOCK_ON = """\
    - Design concerns that are valid but outside this task's scope
    - Edge cases that cannot occur given the task's stated constraints
    - Missing features that belong in a follow-up task
    - Formatting or layout preferences
+"""
 
+_BLOCKING_MEANS_BROKEN = """\
+2. **Blocking means broken.** Use `blocking` ONLY for issues that will cause runtime errors,
+   data corruption, security vulnerabilities, or API contract violations **within the scope
+   of this task**. Do not block on:
+""" + _DO_NOT_BLOCK_ON + """
    Naming and structure are NOT preferences: judge them under the code-quality heuristics
    below. A heuristic violation is always reportable; it is `blocking` only when it also
    meets this rule's definition of broken, and otherwise a `suggestion`.
+"""
+
+# The context-complete generation's Rule 2 (task 5369). "Broken" stays a
+# blocking ground; the second ground replaces the unanchored design/quality
+# blocking language with a cited heuristic plus the next change it taxes.
+# Worded for every project: one roles.py prompt serves them all.
+_BLOCK_ON_A_STATED_GROUND = """\
+2. **Block only on a stated ground.** Use `blocking` ONLY when you can state one of these
+   about the change, within this task's scope: it is broken (a runtime error, data
+   corruption, a security vulnerability or an API-contract violation); or it violates a
+   code-quality heuristic below that you cite by number and name, AND you name the concrete
+   next change it makes costlier or riskier — e.g. a name that lies about what the code
+   does, a new reach-back import, a status string that is really an enum, a test that
+   patches a private dotted path. Anything you cannot state either way is a `suggestion`.
+   Do not block on:
+""" + _DO_NOT_BLOCK_ON + """
+   Naming and structure are NOT preferences: judge them under the code-quality heuristics
+   below.
+"""
+
+
+def _reviewer_heuristics_template(rule_2: str) -> str:
+    """The reviewer HEURISTICS template around *rule_2*, the one part generations vary."""
+    return """\
+## Rules
+
+1. **Be specific.** Every issue must have a file location and concrete description.
+""" + rule_2 + """\
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
 """ + CODE_QUALITY_GUIDANCE + """
 ## Your Specialization: {specialization}
 """
 
+
+_REVIEWER_HEURISTICS_TEMPLATE = _reviewer_heuristics_template(_BLOCKING_MEANS_BROKEN)
+
+_REVIEWER_HEURISTICS_TEMPLATES: dict[ReviewBriefing, str] = {
+    ReviewBriefing.DIFF_ONLY: _REVIEWER_HEURISTICS_TEMPLATE,
+    ReviewBriefing.CONTEXT_COMPLETE: _reviewer_heuristics_template(_BLOCK_ON_A_STATED_GROUND),
+}
+
 # Bumped whenever _REVIEWER_CONTRACT_TEMPLATE changes materially, so a stale
 # per-(prompt, model, harness) pinned artifact stops resolving and falls back
 # to the (new) in-code baseline instead of pairing new heuristics with an
 # outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
+# Each generation has its own, so a pinned incumbent artifact can never
+# resolve for the context-complete role, whose prompt_id is the same.
 _REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v1'
 
+_REVIEWER_PROMPT_HARNESS_VERSIONS: dict[ReviewBriefing, str] = {
+    ReviewBriefing.DIFF_ONLY: _REVIEWER_PROMPT_HARNESS_VERSION,
+    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v1',
+}
 
-def build_reviewer_prompt_spec(name: str, specialization: str) -> PromptSpec:
+
+def build_reviewer_prompt_spec(
+    name: str, specialization: str, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+) -> PromptSpec:
     """Build the per-role reviewer :class:`PromptSpec` for (name, specialization).
 
     Both templates interpolate ``{name}``/``{specialization}``, so — unlike
     the curator's single global spec — every reviewer role gets its own
-    ``PromptSpec`` (``prompt_id=f'reviewer_{name}'``).
+    ``PromptSpec`` (``prompt_id=f'reviewer_{name}'``). *briefing* picks the
+    HEURISTICS generation; the CONTRACT is the same for every generation.
     """
     return PromptSpec(
         prompt_id=f'reviewer_{name}',
@@ -1865,12 +1914,17 @@ def build_reviewer_prompt_spec(name: str, specialization: str) -> PromptSpec:
             _REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization)
             + REVIEWER_INV12_BLOCKERS
         ),
-        baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATE.format(specialization=specialization),
+        baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATES[briefing].format(
+            specialization=specialization,
+        ),
     )
 
 
-def _reviewer_role(name: str, specialization: str) -> AgentRole:
-    spec = build_reviewer_prompt_spec(name, specialization)
+def build_reviewer_role(
+    name: str, specialization: str, briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY,
+) -> AgentRole:
+    """The ``reviewer_<name>`` role of the *briefing* generation."""
+    spec = build_reviewer_prompt_spec(name, specialization, briefing)
     return AgentRole(
         name=f'reviewer_{name}',
         system_prompt=spec.in_code_constant,
@@ -1881,12 +1935,11 @@ def _reviewer_role(name: str, specialization: str) -> AgentRole:
         default_max_turns=30,
         mcp_families=frozenset({'verdict_tools'}),
         prompt_spec=spec,
-        prompt_harness_version=_REVIEWER_PROMPT_HARNESS_VERSION,
+        prompt_harness_version=_REVIEWER_PROMPT_HARNESS_VERSIONS[briefing],
     )
 
 
-REVIEWER_COMPREHENSIVE = _reviewer_role(
-    'comprehensive',
+_COMPREHENSIVE_SPECIALIZATION = (
     'Comprehensive code review covering ALL of the following areas:\n\n'
     '1. **Test coverage and quality**: Are the right behaviors tested? '
     'Meaningful assertions? Untested failure modes? Edge cases? '
@@ -1920,7 +1973,13 @@ REVIEWER_COMPREHENSIVE = _reviewer_role(
     'The discriminator is executable — if fully rewording the surrounding '
     'sentence while keeping the identifier leaves the check green, it is '
     'referential integrity, not a wording pin. See '
-    '`orchestrator/tests/test_marker_registration_drift.py`.',
+    '`orchestrator/tests/test_marker_registration_drift.py`.'
+)
+
+REVIEWER_COMPREHENSIVE = build_reviewer_role('comprehensive', _COMPREHENSIVE_SPECIALIZATION)
+
+REVIEWER_COMPREHENSIVE_CONTEXT_COMPLETE = build_reviewer_role(
+    'comprehensive', _COMPREHENSIVE_SPECIALIZATION, ReviewBriefing.CONTEXT_COMPLETE,
 )
 
 
@@ -2881,6 +2940,16 @@ git add -- .
 
 
 ALL_REVIEWERS = [REVIEWER_COMPREHENSIVE]
+
+_REVIEWERS: dict[ReviewBriefing, list[AgentRole]] = {
+    ReviewBriefing.DIFF_ONLY: ALL_REVIEWERS,
+    ReviewBriefing.CONTEXT_COMPLETE: [REVIEWER_COMPREHENSIVE_CONTEXT_COMPLETE],
+}
+
+
+def reviewers_for(briefing: ReviewBriefing) -> list[AgentRole]:
+    """The reviewer roster a dispatch of the *briefing* generation runs."""
+    return _REVIEWERS[briefing]
 
 ROLES = {
     'architect': ARCHITECT,

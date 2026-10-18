@@ -30,6 +30,8 @@ from pydantic_settings import (
 )
 from shared.task_metadata import KNOWN_ROLE_NAMES
 
+from orchestrator.agents.review_briefing import ReviewBriefing
+
 # Strictly one-way (config -> config_census_ignore): the census-ignore grammar
 # and audit are kept OUT of this already-oversized module, and that module
 # depends only on stdlib plus shared/, so there is no cycle.
@@ -521,6 +523,10 @@ class ReviewConfig(BaseModel):
     # --until-idle post-loop review stays unconditional.
     full_review_min_interval_secs: float = Field(default=86400.0)
     full_review_min_tasks: int = Field(default=20)
+    # Which reviewer generation a task's review dispatches (task 5369): the
+    # incumbent diff-only briefing, or the context-complete 'd2' one. Read
+    # fresh at each review, so a reload flips it — or kills it — live.
+    reviewer_briefing: ReviewBriefing = Field(default=ReviewBriefing.DIFF_ONLY)
 
 
 _DEFAULT_SKIP_THRESHOLD: dict[str, int] = {
@@ -6372,6 +6378,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_on_complete',
         'review.full_review_min_interval_secs',
         'review.full_review_min_tasks',
+        'review.reviewer_briefing',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
         # Cold-verify shared-venv pre-provision command (task 2997) — green-tier
