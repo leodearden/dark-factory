@@ -431,7 +431,12 @@ class TestDispatchAdmissionDisabledGate:
 @pytest.mark.asyncio
 class TestDispatchAdmissionFailOpen:
     """DA-D6: an unreadable PSI sample must never wedge dispatch — the heavy
-    candidate dispatches normally, with a loud WARNING instead of a hold."""
+    candidate dispatches normally, with a loud WARNING instead of a hold.
+
+    The rate-limited WARNING names each degraded component whose loss
+    disables a LIVE arm (PRD plans/load-throttle-harmonisation-prd.md D2); a
+    component behind an arm that is off costs the gate nothing and is not
+    reported."""
 
     async def test_unreadable_psi_dispatches_and_logs_warning(self, caplog) -> None:
         caplog.set_level('WARNING')
@@ -453,9 +458,84 @@ class TestDispatchAdmissionFailOpen:
         assert result.task_id == 'H'
         assert 'H' in scheduler._dispatched
         assert [e for e in event_store.events if e[0] == 'dispatch_deferred'] == []
-        assert any(record.levelname == 'WARNING' for record in caplog.records), (
-            'an unreadable PSI sample should be logged, not silently swallowed'
+        [warning] = _unreadable_warnings(caplog)
+        assert 'host PSI' in warning
+        assert 'failing open' in warning
+
+    async def test_degraded_runqueue_behind_a_live_arm_is_named(self, caplog) -> None:
+        caplog.set_level('WARNING')
+        sample = _psi(runqueue_read_ok=False)
+
+        dispatched = await _dispatch_one_heavy(sample, PsiAdmissionConfig(runqueue_ratio=4.0))
+
+        assert dispatched == 'H'
+        [warning] = _unreadable_warnings(caplog)
+        assert 'runqueue' in warning
+
+    async def test_degraded_own_cgroup_behind_a_live_arm_is_named(self, caplog) -> None:
+        caplog.set_level('WARNING')
+        own_cgroup = '/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice'
+        sample = _psi(own_read_ok=False, own_cgroup=own_cgroup)
+
+        dispatched = await _dispatch_one_heavy(
+            sample, PsiAdmissionConfig(own_cpu_some_avg10=50.0)
         )
+
+        assert dispatched == 'H'
+        [warning] = _unreadable_warnings(caplog)
+        assert own_cgroup in warning
+
+    async def test_degraded_components_behind_off_arms_are_not_reported(self, caplog) -> None:
+        caplog.set_level('WARNING')
+        five_field_sample = PsiSample(
+            cpu_some10=0.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True,
+        )
+
+        dispatched = await _dispatch_one_heavy(five_field_sample, PsiAdmissionConfig())
+
+        assert dispatched == 'H'
+        assert _unreadable_warnings(caplog) == []
+
+    async def test_degradation_warning_is_rate_limited_across_ticks(self, caplog) -> None:
+        caplog.set_level('WARNING')
+        clock = _FakeClock()
+        scheduler = Scheduler(
+            OrchestratorConfig(
+                max_per_module=1, psi_admission=PsiAdmissionConfig(runqueue_ratio=4.0),
+            ),
+            time_source=clock,
+        )
+        scheduler.finish_startup()
+        scheduler._read_psi_sample = lambda: _psi(runqueue_read_ok=False)
+        scheduler._dispatched = {'inflight1'}
+        scheduler.get_tasks = AsyncMock(
+            return_value=[_heavy_task('H1', files=['h1']), _heavy_task('H2', files=['h2'])]
+        )
+
+        assert await scheduler.acquire_next() is not None
+        clock.advance(10.0)  # well within the 180s rate-limit window
+        assert await scheduler.acquire_next() is not None
+
+        assert len(_unreadable_warnings(caplog)) == 1
+
+
+def _unreadable_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == 'WARNING' and 'unreadable' in r.getMessage()
+    ]
+
+
+async def _dispatch_one_heavy(sample: PsiSample, psi_cfg: PsiAdmissionConfig) -> str | None:
+    """Offer one heavy candidate with the floor met; return what dispatched."""
+    scheduler = Scheduler(OrchestratorConfig(max_per_module=1, psi_admission=psi_cfg))
+    scheduler.finish_startup()
+    scheduler._read_psi_sample = lambda: sample
+    scheduler._dispatched = {'inflight1'}
+    scheduler.get_tasks = AsyncMock(return_value=[_heavy_task('H')])
+    result = await scheduler.acquire_next()
+    return None if result is None else result.task_id
 
 
 @pytest.mark.asyncio
