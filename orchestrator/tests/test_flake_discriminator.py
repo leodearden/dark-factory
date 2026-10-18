@@ -29,6 +29,7 @@ exclusively (neither existing file uses pytest ``monkeypatch``).
 from __future__ import annotations
 
 import asyncio
+import shlex
 from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -628,6 +629,38 @@ class TestConfirmIsolatedRerunVerdictMergeGate:
             )
 
         assert s.runner == 'builder-07', s.runner
+
+    def test_xdist_loadgroup_ids_are_rerun_and_recorded_without_their_group_suffix(
+        self, tmp_path: Path,
+    ) -> None:
+        """Task 7091: pytest rejects ``<id>@<group>`` as 'not found', which once
+        turned every loadgroup flake into fails_in_isolation."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        grouped_output = (
+            'FAILED orchestrator/tests/test_x.py::test_y[p]@grp - AssertionError: boom\n'
+            'FAILED orchestrator/tests/test_x.py::TestBox::test_z@grp - AssertionError: boom\n'
+            '2 failed, 21081 passed in 1500.00s\n'
+        )
+
+        with patch.object(verify_module, 'run_verification', rv):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(test_output=grouped_output), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s.verdict
+        assert s.test_ids == (
+            'orchestrator/tests/test_x.py::test_y[p]',
+            'orchestrator/tests/test_x.py::TestBox::test_z',
+        ), s.test_ids
+        rerun_command = rv.call_args.args[2].test_command
+        assert 'orchestrator/tests/test_x.py::test_y[p]' in shlex.split(rerun_command), rerun_command
+        assert '@grp' not in rerun_command, rerun_command
 
 
 # ---------------------------------------------------------------------------
