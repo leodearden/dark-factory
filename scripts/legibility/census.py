@@ -1897,25 +1897,37 @@ def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pen
     return queue
 
 
+def _carrying(pending: PendingFiling, refiling: disposition.Refiling) -> PendingFiling:
+    """*pending* carrying *refiling*: the done task it supersedes and, for a
+    cluster this run's verifier did not see, the re-verify Verdict's
+    remediation."""
+    cluster = pending.cluster
+    if refiling.found is not None and not pending.verified_present:
+        cluster = _with_verdict(cluster, refiling.found)
+    return replace(
+        pending,
+        cluster=cluster,
+        verified_present=pending.verified_present or refiling.verified_present,
+        supersedes_task=refiling.supersedes_task,
+    )
+
+
 def _with_refilings(
     queue: list[PendingFiling], refiled: Sequence[disposition.Refiling], cb: dict,
 ) -> list[PendingFiling]:
-    """*queue* followed by each *refiled* entry not already in it, as its
-    entry's cluster carrying the re-verify Verdict's remediation, if any."""
+    """*queue* with each *refiled* entry carried onto its queued filing, and
+    every other one appended as its entry's cluster."""
     entries = {entry["id"]: entry for entry in cb.get("entries") or []}
-    queued = {pending.entry_id for pending in queue}
-    refilings = []
-    for refiling in refiled:
-        if refiling.entry_id in queued:
-            continue
-        cluster = _entry_cluster(cb, entries[refiling.entry_id])
-        refilings.append(PendingFiling(
-            cluster if refiling.found is None else _with_verdict(cluster, refiling.found),
-            entry_id=refiling.entry_id,
-            verified_present=refiling.verified_present,
-            supersedes_task=refiling.supersedes_task,
-        ))
-    return [*queue, *refilings]
+    unqueued = {refiling.entry_id: refiling for refiling in refiled}
+    merged = []
+    for pending in queue:
+        refiling = None if pending.entry_id is None else unqueued.pop(pending.entry_id, None)
+        merged.append(pending if refiling is None else _carrying(pending, refiling))
+    appended = [
+        _carrying(PendingFiling(_entry_cluster(cb, entries[entry_id]), entry_id=entry_id), refiling)
+        for entry_id, refiling in unqueued.items()
+    ]
+    return [*merged, *appended]
 
 
 def _read_statuses(status_fetcher) -> tuple[Mapping[str, Any] | None, str | None]:
@@ -2697,7 +2709,8 @@ def run_census(
     filed, so it is never filed twice; a raised exception, or a result
     carrying no ticket id, is logged and reported, never counted in
     ``filed_ticket_ids``) -> each routed decision's C1 back-link onto its
-    entry, then ``disposition.resolve_tickets`` within its D7 budget ->
+    entry and the run's ``disposition.with_follow_ups``, then
+    ``disposition.resolve_tickets`` within its D7 budget ->
     ``codebook.validate`` again (raises and aborts before any artifact is
     written) -> write the JSON record beside *report_path*
     (``build_census_record``) and the
@@ -3247,6 +3260,10 @@ def run_census(
     updated_codebook = disposition.with_back_links(
         updated_codebook,
         [link for decision in disposal.decisions if (link := decision.back_link(run_id)) is not None],
+    )
+    updated_codebook = disposition.with_follow_ups(
+        updated_codebook, reverified=reverified, refiled=refiled, decisions=disposal.decisions,
+        run_id=run_id, as_of_sha=as_of_sha,
     )
     updated_codebook, resolutions = disposition.resolve_tickets(
         updated_codebook, store=task_store, run_id=run_id,

@@ -10123,7 +10123,8 @@ def _reverifying_verify_fn(answer: str):
     """A verify_fn whose novel-cluster call verifies every cluster (mechanical,
     in-tree remediation) and whose re-verify call -- clusters carrying
     disposition.REVERIFY_ENTRY -- answers by *answer*: "gone" (rejected with a
-    refuting Verdict), "present" (verified, mechanical), "verdictless"
+    refuting Verdict), "present" (verified, mechanical), "structural"
+    (verified, structural), "verdictless"
     (rejected without a Verdict, the default verifier's fail-closed path) or
     "headroom" (raises CensusHeadroomExhausted). Records every call."""
     calls = []
@@ -10136,8 +10137,9 @@ def _reverifying_verify_fn(answer: str):
             return {"verified": [{**c, "verdict": found} for c in clusters], "rejected": [], "fixed": []}
         if answer == "headroom":
             raise mod.CensusHeadroomExhausted(stage="verify", reason="capped mid-reverify", unverified=len(marked))
-        if answer == "present":
-            found = _fake_verdict(_IN_TREE_REMEDIATION)
+        if answer in ("present", "structural"):
+            route = verdict.Route.MECHANICAL if answer == "present" else verdict.Route.STRUCTURAL
+            found = _fake_verdict(_IN_TREE_REMEDIATION, route=route)
             return {"verified": [{**c, "verdict": found} for c in marked], "rejected": [], "fixed": []}
         if answer == "gone":
             return {"verified": [], "rejected": [{**c, "verdict": _REFUTING_VERDICT} for c in marked], "fixed": []}
@@ -10561,3 +10563,133 @@ def test_run_census_files_no_second_ticket_for_a_recurrence_whose_entry_awaits_t
     assert entries["entry-spurious"]["filed_tickets"] == [pending_row]
     [row] = _filed_rows(kwargs)
     assert row["disposition"] == "open (ticket tkt_0 pending)"
+
+
+# ---------------------------------------------------------------------------
+# Review amendments: a follow-up answers its done or abandoned task's outcome
+# once (no re-verify or re-filing per run without end), and a re-verify that
+# finds a queued entry present is carried onto its queued filing
+# ---------------------------------------------------------------------------
+
+_REFUSED = {"tkt_1": task_store.TicketOutcome(task_store.TicketStatus.REFUSED, None, "a duplicate of done work")}
+
+
+def _later_outcome_run(tmp_path, first, answer: str, store: FakeTaskStore) -> dict[str, Any]:
+    """The run after *first*, whose linked task is still done and whose re-verify answers *answer*."""
+    return _duplicate_only_kwargs(
+        tmp_path, store,
+        status_fetcher=_counting_status_fetcher({str(_LINKED_TASK): "done"}),
+        verify_fn=_reverifying_verify_fn(answer),
+        **_next_run(first),
+    )
+
+
+def test_run_census_reverifies_a_present_structural_finding_once_per_done_task(tmp_path):
+    first = _outcome_kwargs(tmp_path, "structural")
+    mod.run_census(**first)
+    assert len(_reverify_calls(first["verify_fn"])) == 1
+    assert first["submit_fn"].calls == []
+    [first_row] = _run_record(first)["dispositions"]["rows"]
+    assert first_row["outcome"] == "present-structural"
+    follow_up = _persisted_entry_a(first)[disposition.FOLLOW_UP]
+    assert (follow_up["kind"], follow_up["task_id"], follow_up["run_id"], follow_up["as_of_sha"]) == (
+        "present-structural", _LINKED_TASK, first["run_id"], first["as_of_sha"],
+    )
+    second = _later_outcome_run(tmp_path, first, "structural", FakeTaskStore())
+
+    outcome = mod.run_census(**second)
+
+    assert outcome.status == "done"
+    assert _reverify_calls(second["verify_fn"]) == []
+    assert second["submit_fn"].calls == []
+    dispositions = _run_record(second)["dispositions"]
+    assert (dispositions["reverify"]["due"], dispositions["reverify"]["offered"]) == (0, 0)
+    [row] = dispositions["rows"]
+    assert row["outcome"] == "answered"
+    assert first["run_id"] in row["detail"]
+    assert f"{second['config'].models.census_verify} verify=0," in _run_record(second)["cost_note"]
+    assert _persisted_entry_a(second)[disposition.FOLLOW_UP] == follow_up
+
+
+def test_run_census_files_nothing_after_the_curator_refused_its_superseding_refiling(tmp_path):
+    first = _outcome_kwargs(tmp_path, "present")
+    first["task_store"] = FakeTaskStore(resolve_outcomes=_REFUSED)
+    mod.run_census(**first)
+    [payload] = first["submit_fn"].calls
+    assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
+    first_rows = _persisted_entry_a(first)["filed_tickets"]
+    assert [(row["ticket"], row["resolution"]) for row in first_rows] == [(None, "created"), ("tkt_1", "refused")]
+    second = _later_outcome_run(tmp_path, first, "present", FakeTaskStore(resolve_outcomes=_REFUSED))
+
+    outcome = mod.run_census(**second)
+
+    assert outcome.status == "done"
+    assert _reverify_calls(second["verify_fn"]) == []
+    assert second["submit_fn"].calls == []
+    assert _persisted_entry_a(second)["filed_tickets"] == first_rows
+    rows = _rows_by_task(second)
+    assert rows[_LINKED_TASK]["outcome"] == "answered"
+    assert all(needle in rows[_LINKED_TASK]["detail"] for needle in ("tkt_1", "refused"))
+    assert _run_record(second)["dispositions"]["refiled"] == []
+
+
+def test_run_census_refiles_again_after_its_superseding_ticket_reached_no_curator(tmp_path):
+    first = _outcome_kwargs(tmp_path, "present")
+    first["submit_fn"] = _make_rejecting_submit_fn()
+    mod.run_census(**first)
+    assert disposition.FOLLOW_UP not in _persisted_entry_a(first)
+    second = _later_outcome_run(tmp_path, first, "present", FakeTaskStore())
+
+    mod.run_census(**second)
+
+    assert len(_reverify_calls(second["verify_fn"])) == 1
+    [payload] = second["submit_fn"].calls
+    assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
+
+
+def test_run_census_does_not_refile_a_recurring_abandoned_entry_the_curator_refused(tmp_path):
+    def abandoned_run(**overrides):
+        kwargs = _cancelled_kwargs(
+            tmp_path, acceptance_reason=None, keyed=True, status="accepted", accepted_by=_LINKED_TASK,
+            resolve_outcomes=_REFUSED,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    first = abandoned_run()
+    mod.run_census(**first)
+    assert len(first["submit_fn"].calls) == 1
+    first_rows = _persisted_entry_a(first)["filed_tickets"]
+    assert [(row["ticket"], row["resolution"]) for row in first_rows] == [(None, "created"), ("tkt_1", "refused")]
+    second = abandoned_run(**_next_run(first))
+
+    outcome = mod.run_census(**second)
+
+    assert outcome.status == "done"
+    assert second["submit_fn"].calls == []
+    assert _run_record(second)["dispositions"]["refiled"] == []
+    assert _rows_by_task(second)[_LINKED_TASK]["outcome"] == "answered"
+    assert _persisted_entry_a(second)["filed_tickets"] == first_rows
+
+
+def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tmp_path):
+    sightings = [
+        {"date": "2026-07-01", "project": "dark_factory", "session": session,
+         "origin_phase": "implement", "manifested_phase": "merge"}
+        for session in ("s-old-1", "s-old-2")
+    ]
+    kwargs = _outcome_kwargs(
+        tmp_path, "present", sightings=sightings, **{mod.ENTRY_FILING_KEY: mod.ENTRY_FILING_WITHHELD},
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.released_entry_ids == ("entry-a",)
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
+    assert str(_LINKED_TASK) in payload["title"].removeprefix(disposition.task_title("Some confusion cluster"))
+    assert _IN_TREE_REMEDIATION["path"] in payload["description"]
+    [filed] = _filed_rows(kwargs)
+    assert "re-verify not yet run" not in filed["disposition"]
+    [row] = _run_record(kwargs)["dispositions"]["rows"]
+    assert row["outcome"] == "present"

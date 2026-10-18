@@ -1484,9 +1484,12 @@ def test_refilings_re_file_a_present_mechanical_finding_and_a_recurring_abandone
     refiled = disposition.refilings(outcomes, reverified, sighted={"entry-abandoned", "entry-live", "entry-elsewhere"})
 
     assert tuple(refiled) == (
-        disposition.Refiling("entry-present", 5120, True, _parsed(verified=True)),
-        disposition.Refiling("entry-abandoned", None, False, None),
+        disposition.Refiling("entry-present", disposition.TaskRef(_ROOT, 5120), Standing.DONE, _parsed(verified=True)),
+        disposition.Refiling("entry-abandoned", disposition.TaskRef(_ROOT, 12), Standing.ABANDONED),
     )
+    present, abandoned = refiled
+    assert (present.supersedes_task, present.verified_present) == (5120, True)
+    assert (abandoned.supersedes_task, abandoned.verified_present) == (None, False)
 
 
 # ---------------------------------------------------------------------------
@@ -2015,3 +2018,267 @@ def test_a_task_held_by_an_unobserved_sibling_names_no_ticket() -> None:
     assert rows[5120]["detail"]
     assert "tkt_" not in rows[5120]["detail"]
     assert rows[5518]["outcome"] == "unobserved"
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups: what one run did about its governing task's outcome answers
+# that outcome, so a later run neither re-verifies nor re-files the entry
+# while the same task governs with the same standing (review amendments)
+# ---------------------------------------------------------------------------
+
+FollowUpKind = disposition.FollowUpKind
+
+
+def _structural_follow_up(task_id: int = 5120) -> disposition.FollowUp:
+    return disposition.FollowUp(
+        disposition.TaskRef(_ROOT, task_id), Standing.DONE, _OLD_RUN, FollowUpKind.PRESENT_STRUCTURAL, as_of_sha=_SHA,
+    )
+
+
+def _refiled_follow_up(
+    task_id: int = 5120, ticket: str = "tkt_7", standing: Standing = Standing.DONE,
+) -> disposition.FollowUp:
+    return disposition.FollowUp(
+        disposition.TaskRef(_ROOT, task_id), standing, _OLD_RUN, FollowUpKind.REFILED, ticket=ticket,
+    )
+
+
+def _followed(entry_id: str, follow_up: disposition.FollowUp | dict, *rows: dict) -> dict:
+    entry = _entry(entry_id, filed_tickets=list(rows))
+    entry[disposition.FOLLOW_UP] = follow_up if isinstance(follow_up, dict) else follow_up.to_field()
+    return entry
+
+
+def _ticket_row(ticket: str, resolution: Resolution, task_id: int | None = None) -> dict:
+    return _row(ticket, run_id=_OLD_RUN, task_id=task_id, resolution=resolution)
+
+
+def test_a_follow_up_round_trips_through_its_codebook_field() -> None:
+    for follow_up in (_structural_follow_up(), _refiled_follow_up(standing=Standing.ABANDONED)):
+        field = follow_up.to_field()
+
+        assert json.loads(json.dumps(field)) == field
+        assert disposition.FollowUp.from_field(field) == follow_up
+        assert codebook.validate(_codebook(_followed("entry-a", follow_up, _task_row(5120)))) == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"kind": FollowUpKind.PRESENT_STRUCTURAL, "as_of_sha": _SHA, "ticket": "tkt_7"},
+        {"kind": FollowUpKind.PRESENT_STRUCTURAL},
+        {"kind": FollowUpKind.PRESENT_STRUCTURAL, "as_of_sha": _SHA, "standing": Standing.ABANDONED},
+        {"kind": FollowUpKind.REFILED},
+        {"kind": FollowUpKind.REFILED, "ticket": "tkt_7", "standing": Standing.FILED},
+        {"kind": FollowUpKind.REFILED, "ticket": "tkt_7", "run_id": ""},
+    ],
+    ids=[
+        "structural-with-ticket", "structural-without-sha", "structural-answering-abandoned",
+        "refiled-without-ticket", "answering-live", "no-run",
+    ],
+)
+def test_a_follow_up_holds_its_kind_to_its_fields(fields) -> None:
+    arguments = {"task": disposition.TaskRef(_ROOT, 5120), "standing": Standing.DONE, "run_id": _OLD_RUN, **fields}
+
+    with pytest.raises(ValueError, match="follow-up"):
+        disposition.FollowUp(**arguments)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {**_refiled_follow_up().to_field(), "task_id": "5120"},
+        {key: value for key, value in _refiled_follow_up().to_field().items() if key != "run_id"},
+        {**_refiled_follow_up().to_field(), "kind": "guessed"},
+        ["refiled", 5120],
+    ],
+    ids=["string-task-id", "no-run-id", "unknown-kind", "not-a-mapping"],
+)
+def test_a_malformed_follow_up_field_is_refused_saying_what_is_wrong(field) -> None:
+    with pytest.raises(ValueError, match="follow-up"):
+        disposition.FollowUp.from_field(field)
+
+
+def test_a_present_structural_follow_up_takes_its_done_task_off_the_reverify_queue() -> None:
+    cb = _codebook(_followed("entry-a", _structural_follow_up(), _task_row(5120)))
+
+    outcomes = _read(cb, {"5120": "done"})
+
+    assert outcomes.due == ()
+    answer = _entry_outcome(outcomes, "entry-a").answer
+    assert answer is not None
+    assert (answer.follow_up, answer.curator) == (_structural_follow_up(), None)
+
+
+@pytest.mark.parametrize(
+    ("follow_up", "statuses", "tasks"),
+    [
+        (_structural_follow_up(task_id=5119), {"5119": "done", "5120": "done"}, {}),
+        (
+            _refiled_follow_up(standing=Standing.ABANDONED),
+            {"5120": "done"},
+            {},
+        ),
+    ],
+    ids=["another-task-governs", "the-task-is-now-done-not-abandoned"],
+)
+def test_a_follow_up_of_another_task_or_standing_answers_nothing(follow_up, statuses, tasks) -> None:
+    rows = [_task_row(int(task_id)) for task_id in statuses]
+    cb = _codebook(_followed("entry-a", follow_up, *rows, _ticket_row("tkt_7", Resolution.REFUSED)))
+
+    outcomes = _read(cb, statuses, FakeTaskStore(tasks=tasks))
+
+    assert _entry_outcome(outcomes, "entry-a").answer is None
+    assert outcomes.due == (_due("entry-a", 5120),)
+
+
+@pytest.mark.parametrize(
+    ("row", "curator"),
+    [
+        (_ticket_row("tkt_7", Resolution.REFUSED), Resolution.REFUSED),
+        (_ticket_row("tkt_7", Resolution.COMBINED, task_id=5120), Resolution.COMBINED),
+    ],
+    ids=["refused", "combined-into-the-done-task"],
+)
+def test_a_refiling_the_curator_refused_or_combined_into_its_task_answers_it(row, curator) -> None:
+    cb = _codebook(_followed("entry-a", _refiled_follow_up(), _task_row(5120), row))
+
+    outcomes = _read(cb, {"5120": "done"})
+
+    assert outcomes.due == ()
+    answer = _entry_outcome(outcomes, "entry-a").answer
+    assert answer is not None
+    assert answer.curator is curator
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _ticket_row("tkt_7", Resolution.CREATED, task_id=9000),
+        _ticket_row("tkt_7", Resolution.COMBINED, task_id=9000),
+        _ticket_row("tkt_7", Resolution.FAILED),
+        _ticket_row("tkt_other", Resolution.REFUSED),
+    ],
+    ids=["created-then-abandoned", "combined-elsewhere-then-abandoned", "failed", "another-ticket-refused"],
+)
+def test_a_refiling_the_curator_did_not_settle_answers_nothing(row) -> None:
+    cb = _codebook(_followed("entry-a", _refiled_follow_up(), _task_row(5120), row))
+    store = FakeTaskStore(tasks={9000: _task(9000, "cancelled")})
+
+    outcomes = _read(cb, {"5120": "done", "9000": "cancelled"}, store)
+
+    assert _entry_outcome(outcomes, "entry-a").answer is None
+    assert outcomes.due == (_due("entry-a", 5120),)
+
+
+def test_a_recurring_abandoned_entry_whose_refiling_the_curator_refused_is_not_refiled() -> None:
+    cb = _codebook(
+        _followed(
+            "entry-refused", _refiled_follow_up(12, standing=Standing.ABANDONED),
+            _task_row(12), _ticket_row("tkt_7", Resolution.REFUSED),
+        ),
+        _entry("entry-fresh", filed_tickets=[_task_row(13)]),
+    )
+    store = FakeTaskStore(tasks={12: _task(12, "cancelled"), 13: _task(13, "cancelled")})
+    outcomes = _read(cb, {"12": "cancelled", "13": "cancelled"}, store)
+
+    refiled = disposition.refilings(outcomes, {}, sighted={"entry-refused", "entry-fresh"})
+
+    assert [refiling.entry_id for refiling in refiled] == ["entry-fresh"]
+
+
+def test_a_malformed_follow_up_answers_nothing_and_is_warned_about(caplog) -> None:
+    entry = _followed("entry-a", {"kind": "guessed"}, _task_row(5120))
+
+    with caplog.at_level("WARNING", logger="legibility.disposition"):
+        outcomes = _read(_codebook(entry), {"5120": "done"})
+
+    assert outcomes.due == (_due("entry-a", 5120),)
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert any("entry-a" in message and disposition.FOLLOW_UP in message for message in warnings)
+
+
+def _curator_decision(entry_id: str, ticket: str | None) -> disposition.Decision:
+    return disposition.Decision(_filing(entry_id=entry_id), Step.CURATOR, ticket=ticket)
+
+
+def test_with_follow_ups_records_a_structural_present_and_each_ticketed_refiling() -> None:
+    cb = _codebook(*(_entry(entry_id) for entry_id in (
+        "entry-structural", "entry-present", "entry-abandoned", "entry-unticketed", "entry-gone",
+    )))
+    before = copy.deepcopy(cb)
+    reverified = {
+        "entry-structural": disposition.Reverification(
+            "entry-structural", disposition.TaskRef(_ROOT, 5121), ReverifyResult.PRESENT,
+            _parsed(verified=True, route="structural"),
+        ),
+        **_reverified("present", "entry-present", 5120),
+        **_reverified("present", "entry-unticketed", 5123),
+        **_reverified("gone", "entry-gone", 5124),
+    }
+    refiled = (
+        disposition.Refiling("entry-present", disposition.TaskRef(_ROOT, 5120), Standing.DONE, _parsed(verified=True)),
+        disposition.Refiling("entry-abandoned", disposition.TaskRef(_ROOT, 12), Standing.ABANDONED),
+        disposition.Refiling(
+            "entry-unticketed", disposition.TaskRef(_ROOT, 5123), Standing.DONE, _parsed(verified=True),
+        ),
+    )
+    decisions = (
+        _curator_decision("entry-present", "tkt_1"),
+        _curator_decision("entry-abandoned", "tkt_2"),
+        _curator_decision("entry-unticketed", None),
+    )
+
+    recorded = disposition.with_follow_ups(
+        cb, reverified=reverified, refiled=refiled, decisions=decisions, run_id=_RUN, as_of_sha=_SHA,
+    )
+
+    assert cb == before
+    follow_ups = {
+        entry["id"]: entry.get(disposition.FOLLOW_UP) for entry in recorded["entries"]
+    }
+    assert follow_ups == {
+        "entry-structural": disposition.FollowUp(
+            disposition.TaskRef(_ROOT, 5121), Standing.DONE, _RUN, FollowUpKind.PRESENT_STRUCTURAL, as_of_sha=_SHA,
+        ).to_field(),
+        "entry-present": disposition.FollowUp(
+            disposition.TaskRef(_ROOT, 5120), Standing.DONE, _RUN, FollowUpKind.REFILED, ticket="tkt_1",
+        ).to_field(),
+        "entry-abandoned": disposition.FollowUp(
+            disposition.TaskRef(_ROOT, 12), Standing.ABANDONED, _RUN, FollowUpKind.REFILED, ticket="tkt_2",
+        ).to_field(),
+        "entry-unticketed": None,
+        "entry-gone": None,
+    }
+    assert codebook.validate(recorded) == []
+
+
+def test_an_answered_task_says_how_it_was_answered_and_is_not_due() -> None:
+    cb = _codebook(
+        _followed("entry-structural", _structural_follow_up(), _task_row(5120)),
+        _followed("entry-refused", _refiled_follow_up(5121), _task_row(5121), _ticket_row("tkt_7", Resolution.REFUSED)),
+        _followed(
+            "entry-abandoned", _refiled_follow_up(12, "tkt_8", standing=Standing.ABANDONED),
+            _task_row(12), _ticket_row("tkt_8", Resolution.REFUSED),
+        ),
+    )
+    store = FakeTaskStore(tasks={12: _task(12, "cancelled")})
+
+    record = _outcome_record(
+        cb, {"5120": "done", "5121": "done", "12": "cancelled"}, store=store, sighted=("entry-abandoned",),
+    )
+
+    answered = {
+        row["entry_id"]: row for row in record["rows"] if row["task_id"] is not None
+    }
+    assert {entry_id: row["outcome"] for entry_id, row in answered.items()} == {
+        "entry-structural": "answered", "entry-refused": "answered", "entry-abandoned": "answered",
+    }
+    assert (record["reverify"]["due"], record["refiled"], record["changes"]) == (0, [], [])
+    cells = {row["entry_id"]: row["outcome"] for row in _table(_dispositions(record)) if row["task_id"]}
+    assert cells["entry-structural"].startswith("done -> ")
+    assert all(needle in cells["entry-structural"] for needle in (_SHA, "structural", _OLD_RUN))
+    assert cells["entry-refused"].startswith("done -> ")
+    assert all(needle in cells["entry-refused"] for needle in ("tkt_7", "refused", _OLD_RUN))
+    assert cells["entry-abandoned"].startswith("cancelled -> ")
+    assert all(needle in cells["entry-abandoned"] for needle in ("tkt_8", "refused"))

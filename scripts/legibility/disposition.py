@@ -692,6 +692,140 @@ class TaskRef:
     task_id: int
 
 
+FOLLOW_UP = "follow_up"
+_ANSWERED_STANDINGS = frozenset({Standing.DONE, Standing.ABANDONED})
+
+
+class FollowUpKind(enum.StrEnum):
+    PRESENT_STRUCTURAL = "present-structural"
+    REFILED = "refiled"
+
+
+@dataclass(frozen=True)
+class FollowUp:
+    """What run *run_id* did about governing *task*'s outcome while it stood
+    *standing*, recorded on the entry under FOLLOW_UP: re-verified the
+    finding present at *as_of_sha* under a structural verdict, which contract
+    §6 files nothing for, or re-filed it under *ticket*."""
+
+    task: TaskRef
+    standing: Standing
+    run_id: str
+    kind: FollowUpKind
+    as_of_sha: str | None = None
+    ticket: str | None = None
+
+    def __post_init__(self) -> None:
+        errors = _follow_up_errors(self)
+        if errors:
+            raise ValueError(f"follow-up of {self.task}: {'; '.join(errors)}")
+
+    def to_field(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "standing": self.standing.value,
+            "project_root": self.task.project_root,
+            "task_id": self.task.task_id,
+            "run_id": self.run_id,
+            "as_of_sha": self.as_of_sha,
+            "ticket": self.ticket,
+        }
+
+    @classmethod
+    def from_field(cls, field: object) -> FollowUp:
+        """The FollowUp a FOLLOW_UP field records; ValueError says what is wrong."""
+        if not isinstance(field, Mapping):
+            raise ValueError(f"follow-up field is not a mapping: {field!r}")
+        try:
+            task = TaskRef(field["project_root"], field["task_id"])
+            standing, kind, run_id = Standing(field["standing"]), FollowUpKind(field["kind"]), field["run_id"]
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"follow-up field {dict(field)!r} is malformed: {exc!r}") from exc
+        return cls(task, standing, run_id, kind, as_of_sha=field.get("as_of_sha"), ticket=field.get("ticket"))
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _follow_up_errors(follow_up: FollowUp) -> list[str]:
+    """The one statement of a FollowUp's invariant: which fields its kind
+    carries, and that it answers a done or abandoned task."""
+    errors = []
+    if not _is_text(follow_up.task.project_root) or type(follow_up.task.task_id) is not int:
+        errors.append(f"task must name a project root and an integer task id, got {follow_up.task!r}")
+    if not _is_text(follow_up.run_id):
+        errors.append(f"run_id must be non-empty text, got {follow_up.run_id!r}")
+    if follow_up.standing not in _ANSWERED_STANDINGS:
+        errors.append(f"a follow-up answers a done or abandoned task, not a {follow_up.standing.value} one")
+    if follow_up.kind is FollowUpKind.PRESENT_STRUCTURAL:
+        if follow_up.standing is not Standing.DONE:
+            errors.append("only a done task is re-verified")
+        if not _is_text(follow_up.as_of_sha) or follow_up.ticket is not None:
+            errors.append(
+                f"a present-structural follow-up carries an as_of_sha and no ticket, "
+                f"got as_of_sha={follow_up.as_of_sha!r} ticket={follow_up.ticket!r}"
+            )
+    elif not _is_text(follow_up.ticket):
+        errors.append(f"a refiled follow-up carries its ticket, got {follow_up.ticket!r}")
+    return errors
+
+
+@dataclass(frozen=True)
+class Answer:
+    """A follow-up that settled its task's outcome: a present-structural
+    re-verify, or a re-filing whose ticket the *curator* refused or combined
+    into that task."""
+
+    follow_up: FollowUp
+    curator: Resolution | None = None
+
+    def __str__(self) -> str:
+        follow_up = self.follow_up
+        if follow_up.kind is FollowUpKind.PRESENT_STRUCTURAL:
+            return (
+                f"re-verified present at {follow_up.as_of_sha} in run {follow_up.run_id}, but structural "
+                "(contract §6: not re-filed); not re-verified while this task decides the entry"
+            )
+        decided = "refused" if self.curator is Resolution.REFUSED else "combined into this task"
+        return (
+            f"re-filing {follow_up.ticket} from run {follow_up.run_id} {decided} by the curator; "
+            "not re-filed while this task decides the entry"
+        )
+
+
+def _recorded_follow_up(entry: Mapping[str, Any]) -> FollowUp | None:
+    field = entry.get(FOLLOW_UP)
+    if field is None:
+        return None
+    try:
+        return FollowUp.from_field(field)
+    except ValueError as exc:
+        logger.warning(
+            "disposition: entry %r has a malformed %s field, so it answers nothing: %s", entry["id"], FOLLOW_UP, exc,
+        )
+        return None
+
+
+def _answer(follow_up: FollowUp, rows: Iterable[Mapping[str, Any]]) -> Answer | None:
+    """*follow_up* as an Answer once it settled its task: a present-structural
+    one at once, a re-filing once the curator refused its ticket or combined
+    it into that task."""
+    if follow_up.kind is FollowUpKind.PRESENT_STRUCTURAL:
+        return Answer(follow_up)
+    for row in rows:
+        if row.get("ticket") != follow_up.ticket:
+            continue
+        if row.get("resolution") == Resolution.REFUSED.value:
+            return Answer(follow_up, Resolution.REFUSED)
+        combined_into = (row.get("project_root"), row.get("task_id"))
+        if row.get("resolution") == Resolution.COMBINED.value and combined_into == (
+            follow_up.task.project_root, follow_up.task.task_id,
+        ):
+            return Answer(follow_up, Resolution.COMBINED)
+    return None
+
+
 @dataclass(frozen=True)
 class TaskOutcome:
     """One back-linked task as this run read it. *ref* None is a ticket that
@@ -709,13 +843,15 @@ class TaskOutcome:
 class EntryOutcome:
     """What one codebook entry's back-linked tasks say, read this run.
     *awaiting* holds the tickets of its rows the curator has not decided, in
-    row order."""
+    row order; *answer* is an earlier run's follow-up that already settled
+    the governing task's outcome, so it is neither re-verified nor re-filed."""
 
     entry_id: str
     finding_key: str | None
     entry_status: str
     tasks: tuple[TaskOutcome, ...]
     awaiting: tuple[str, ...] = ()
+    answer: Answer | None = None
 
     @property
     def hold(self) -> str | None:
@@ -779,13 +915,13 @@ class Outcomes:
     @property
     def due(self) -> tuple[Reverify, ...]:
         """The re-verify queue, in codebook order: each entry governed by a
-        done task that is not already fixed or retired."""
+        done task that is not already fixed or retired, nor answered."""
         due: list[Reverify] = []
         for entry in self.entries:
             governing = entry.governing
             if governing is None or governing.ref is None or governing.standing is not Standing.DONE:
                 continue
-            if entry.entry_status not in _SETTLED_STATUSES:
+            if entry.entry_status not in _SETTLED_STATUSES and entry.answer is None:
                 due.append(Reverify(entry.entry_id, governing.ref))
         return tuple(due)
 
@@ -841,7 +977,14 @@ def _entry_outcome(entry: Mapping[str, Any], read: Callable[[TaskRef, str | None
             seen.add(ref)
             tasks.append(read(ref, row.get("ticket")))
     awaiting = tuple(row["ticket"] for row in rows if _awaits_curator(row))
-    return EntryOutcome(entry["id"], entry.get("finding_key"), entry["status"], tuple(tasks), awaiting)
+    outcome = EntryOutcome(entry["id"], entry.get("finding_key"), entry["status"], tuple(tasks), awaiting)
+    governing = outcome.governing
+    follow_up = _recorded_follow_up(entry)
+    if follow_up is None or governing is None or (governing.ref, governing.standing) != (
+        follow_up.task, follow_up.standing,
+    ):
+        return outcome
+    return replace(outcome, answer=_answer(follow_up, rows))
 
 
 def read_outcomes(
@@ -1054,13 +1197,23 @@ def project(
 
 @dataclass(frozen=True)
 class Refiling:
-    """An entry to file again this run: still present after its done task
-    (superseding it, contract §8 step 1c), or abandoned and sighted again."""
+    """An entry to file again this run, answering its governing *task*: a
+    done task whose finding a re-verify still found present (*found*), which
+    the filing supersedes (contract §8 step 1c), or an abandoned task whose
+    finding was sighted again."""
 
     entry_id: str
-    supersedes_task: int | None
-    verified_present: bool
+    task: TaskRef
+    standing: Standing
     found: verdict.Verdict | None = None
+
+    @property
+    def verified_present(self) -> bool:
+        return self.standing is Standing.DONE
+
+    @property
+    def supersedes_task(self) -> int | None:
+        return self.task.task_id if self.verified_present else None
 
 
 def refilings(
@@ -1068,17 +1221,71 @@ def refilings(
 ) -> tuple[Refiling, ...]:
     """The entries to file again, in codebook order. A present finding is
     re-filed only when its verdict routes mechanical (contract §6); an
-    abandoned one only when it recurred this run (in *sighted*)."""
+    abandoned one only when it recurred this run (in *sighted*) and no
+    earlier re-filing answered its task."""
     refiled: list[Refiling] = []
     for outcome in outcomes.entries:
         again = reverified.get(outcome.entry_id)
         governing = outcome.governing
         if again is not None and again.result is ReverifyResult.PRESENT and again.found is not None:
             if files(again.found):
-                refiled.append(Refiling(outcome.entry_id, again.task.task_id, True, again.found))
-        elif governing is not None and governing.standing is Standing.ABANDONED and outcome.entry_id in sighted:
-            refiled.append(Refiling(outcome.entry_id, None, False))
+                refiled.append(Refiling(outcome.entry_id, again.task, Standing.DONE, again.found))
+        elif (
+            governing is not None
+            and governing.ref is not None
+            and governing.standing is Standing.ABANDONED
+            and outcome.answer is None
+            and outcome.entry_id in sighted
+        ):
+            refiled.append(Refiling(outcome.entry_id, governing.ref, Standing.ABANDONED))
     return tuple(refiled)
+
+
+def _follow_ups(
+    reverified: Mapping[str, Reverification],
+    refiled: Iterable[Refiling],
+    decisions: Iterable[Decision],
+    *,
+    run_id: str,
+    as_of_sha: str,
+) -> dict[str, FollowUp]:
+    recorded = {
+        entry_id: FollowUp(again.task, Standing.DONE, run_id, FollowUpKind.PRESENT_STRUCTURAL, as_of_sha=as_of_sha)
+        for entry_id, again in reverified.items()
+        if again.result is ReverifyResult.PRESENT and again.found is not None and not files(again.found)
+    }
+    tickets = {decision.filing.entry_id: decision.ticket for decision in decisions if decision.ticket is not None}
+    for refiling in refiled:
+        ticket = tickets.get(refiling.entry_id)
+        if ticket is not None:
+            recorded[refiling.entry_id] = FollowUp(
+                refiling.task, refiling.standing, run_id, FollowUpKind.REFILED, ticket=ticket,
+            )
+    return recorded
+
+
+def with_follow_ups(
+    cb: dict,
+    *,
+    reverified: Mapping[str, Reverification],
+    refiled: Iterable[Refiling],
+    decisions: Iterable[Decision],
+    run_id: str,
+    as_of_sha: str,
+) -> dict:
+    """A new codebook whose entries record, under FOLLOW_UP, what this run did
+    about their governing task's outcome: a re-verify that found the finding
+    present under a structural verdict, or a re-filing a curator ticket now
+    holds. A re-filing that reached no ticket records nothing, so a later run
+    tries it again."""
+    result = copy.deepcopy(cb)
+    follow_ups = _follow_ups(reverified, refiled, decisions, run_id=run_id, as_of_sha=as_of_sha)
+    for entry in result.get("entries") or []:
+        follow_up = follow_ups.get(entry["id"])
+        if follow_up is not None:
+            entry[FOLLOW_UP] = follow_up.to_field()
+    codebook.assert_no_deletion(cb, result)
+    return result
 
 
 def disposition_of(entry: Mapping[str, Any], standings: Mapping[TaskRef, Standing]) -> Disposition:
@@ -1327,6 +1534,7 @@ class RowOutcome(enum.StrEnum):
     INCONCLUSIVE = "inconclusive"
     DEFERRED = "deferred"
     SETTLED = "settled"
+    ANSWERED = "answered"
     OUTRANKED = "outranked"
     HELD = "held"
     UNOBSERVED = "unobserved"
@@ -1377,6 +1585,8 @@ class OutcomeReport:
             return RowOutcome.HELD, entry.hold
         if governing.ref != task.ref:
             return RowOutcome.OUTRANKED, governing.ref.task_id
+        if entry.answer is not None:
+            return RowOutcome.ANSWERED, str(entry.answer)
         if task.standing is Standing.ABANDONED:
             refiled = any(refiling.entry_id == entry.entry_id for refiling in self.refiled)
             return RowOutcome.ABANDONED, "re-filed this run" if refiled else "not sighted this run"
@@ -1436,6 +1646,7 @@ _OUTCOME_CELLS = {
     RowOutcome.INCONCLUSIVE: "done -> re-verify inconclusive ({detail})",
     RowOutcome.DEFERRED: "done -> re-verify deferred by the verify cap (re-queued next run)",
     RowOutcome.SETTLED: "done -> entry already {detail}",
+    RowOutcome.ANSWERED: "{task_status} -> {detail}",
     RowOutcome.OUTRANKED: "{task_status} (task {detail} decides the entry)",
     RowOutcome.HELD: "{task_status} (not acted on: {detail})",
     RowOutcome.UNOBSERVED: "unobserved ({detail})",
