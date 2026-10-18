@@ -94,6 +94,12 @@ from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+from orchestrator.work_product import (
+    BranchWork,
+    WorkProductProbe,
+    WorkProductSnapshot,
+    read_branch_work,
+)
 
 # How long a task's age-anchor record outlives the last write that recorded
 # it (task 5352).  Every age-guard write re-records every anchor in the active
@@ -2250,6 +2256,7 @@ class Scheduler:
         wall_time_source: Callable[[], datetime] | None = None,
         state_snapshot_path: Path | None = None,
         jitter_source: Callable[[float, float], float] | None = None,
+        branch_work_reader: Callable[[], Mapping[str, BranchWork]] | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -2399,6 +2406,14 @@ class Scheduler:
         self._merge_phase_at: dict[str, float] = {}
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
+        # The continuity probe's one git child (task 3820, PRD C3); git.* is
+        # restart-only, so binding the branch names at construction is correct.
+        self._branch_work_reader: Callable[[], Mapping[str, BranchWork]] = branch_work_reader or partial(
+            read_branch_work,
+            Path(self._project_root),
+            main_branch=config.git.main_branch,
+            branch_prefix=config.git.branch_prefix,
+        )
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
@@ -2503,6 +2518,14 @@ class Scheduler:
         self._fm_read_failure_streak: int = 0
         # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
         self._anchor_gate = AnchorCoverageGate()
+        # The continuity work-product probe (task 3820, PRD C3).  The lambdas
+        # close over self, so a hot TTL retune and the late attribute-injected
+        # escalation_queue are both honoured.
+        self.work_product = WorkProductProbe(
+            ttl_secs=lambda: self.config.scoring.continuity_probe_ttl_secs,
+            clock=self._time_source,
+            escalate=lambda l1: file_sentinel_l1(self.escalation_queue, l1),
+        )
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
         # this — a runtime check for the "startup reconcile sweeps run
@@ -7909,6 +7932,17 @@ class Scheduler:
             file_sentinel_l1(self.escalation_queue, verdict.escalation)
         return verdict.armed
 
+    def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
+        """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3)."""
+        return WorkProductSnapshot(branches=self._branch_work_reader(), zero_progress=frozenset())
+
+    def _poll_work_product(self) -> None:
+        """Start a continuity-probe refresh when one is due; with no event store there is no gate to read."""
+        store = self.event_store
+        if store is None:
+            return
+        self.work_product.poll(partial(self._load_work_product, store))
+
     def _score_candidates(self, ctx: TickContext) -> list[tuple[float, str, dict, str]]:
         """Score every candidate of the tick, best first, as ``(score, task_id, task, tier)``.
 
@@ -7947,7 +7981,8 @@ class Scheduler:
     async def _phase_select_scored(self, ctx: TickContext) -> object:
         """Score each candidate and dispatch the best available.
 
-        Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
+        First starts a continuity-probe refresh when one is due, never waiting
+        on it.  Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
         ``ctx.max_id``, ``ctx.transitive_counts``, ``ctx.psi_hold``,
         ``ctx.candidate_signals``. Writes: none on ctx (dispatch
         bookkeeping lives on ``self``). ALWAYS terminal — returns
@@ -7958,6 +7993,7 @@ class Scheduler:
         numerically smaller (older) id first, and non-numeric ids after every
         numeric one, in string order.
         """
+        self._poll_work_product()
         scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
