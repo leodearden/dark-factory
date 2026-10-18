@@ -9,15 +9,16 @@ step-15 (RED) / step-16 (GREEN):
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _graphiti_fake import FakeGraphitiClient
 
+from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.tools import create_mcp_server
-from fused_memory.services.memory_service import SearchResults
+from fused_memory.services.memory_service import MemoryService, SearchResults
 
 _PROJECT_ID = 'dark_factory'
 
@@ -384,11 +385,6 @@ class TestSearchToolBackendReadTimeoutSurfacing:
         Only `_get_instance` is patched — the swallow under test lives in
         `Mem0Backend.search` itself, between that call and the service.
         """
-        from unittest.mock import MagicMock, patch
-
-        from fused_memory.backends.mem0_client import Mem0Backend
-        from fused_memory.services.memory_service import MemoryService
-
         service = MemoryService(mock_config)
         backend = Mem0Backend(mock_config)
         backend._read_timeout = 0.05
@@ -495,10 +491,6 @@ class TestSearchToolGraphitiReadTimeoutSurfacing:
 
     @staticmethod
     def _service(mock_config, make_backend_over_fake_graphiti, fake):
-        from unittest.mock import MagicMock
-
-        from fused_memory.services.memory_service import MemoryService
-
         mock_config.queue.backend_read_timeout_seconds = 0.05
         service = MemoryService(mock_config)
         service.graphiti = make_backend_over_fake_graphiti(mock_config, fake)
