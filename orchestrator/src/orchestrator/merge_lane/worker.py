@@ -9902,6 +9902,9 @@ class SpeculativeMergeWorker:
         if self._intake.drain_into_lanes():
             self._shutdown_signaled = True
 
+    async def recompute_suffix_conflict_graph(self) -> None:
+        await self._intake.recompute_suffix_conflict_graph()
+
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
     #
     # §5.3 verify-base rule: ADVISORY BY DECISION, never enforced (task 3206).

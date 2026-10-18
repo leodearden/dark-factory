@@ -1655,7 +1655,7 @@ class _GateScene:
 
         ``enqueue_merge_request`` is what registers ``_on_finalized``, and
         ``merge_finalized`` has no other emit site — so a scene that stuffed
-        lane buffers directly would make every landing assertion blind to
+        the lane buffers directly would make every landing assertion blind to
         the payload this gate exists to read.
         """
         from orchestrator.merge_lane.intake import enqueue_merge_request

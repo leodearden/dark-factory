@@ -29,7 +29,7 @@ and a real landing drives the resume path.
       against the tip of the frozen prefix (base-chain integrity via
       check_frozen_prefix_invariant).
   I3. Reorder touches only the unfrozen suffix — recompute_suffix_conflict_graph
-      updates only lane buffers; _inflight order and base_sha are unchanged.
+      updates only the lane buffers; _inflight order and base_sha are unchanged.
   I4. Liveness / no-starvation — an item in a clique eventually becomes head
       of clique and is picked; disjoint items bypass a blocked clique.
 
@@ -59,7 +59,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Literal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 from escalation.queue import EscalationQueue
@@ -68,6 +68,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.intake_buffers import MergeIntake
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
@@ -81,9 +82,9 @@ from orchestrator.merge_lane.worker import (
     RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
-    SuffixConflictGraph,
 )
 from orchestrator.run_store import RunStore
+from orchestrator.suffix_graph import SuffixConflictGraph
 from orchestrator.verify_runner import HostLease
 
 # ── Module-level sentinel ─────────────────────────────────────────────────────
@@ -450,15 +451,8 @@ class TestTwoLayerInvariants:
         req_b = _make_req('task-b', 'task/task-b', config, git_repo)
         worker._intake.buffer_owned_request(req_b)
 
-        # Build a valid graph: textual_edges ⊆ footprint_edges;
-        # conflicts_with_main ⊆ nodes.
-        edge_pair = frozenset({req_b.request_id, 'some-other-rid'})
-        worker._suffix_conflict_graph = SuffixConflictGraph(
-            nodes=(req_b.request_id,),
-            textual_edges=frozenset(),      # empty ⊆ any set
-            footprint_edges=frozenset({edge_pair}),
-            conflicts_with_main=frozenset({req_b.request_id}),
-        )
+        # The tracker's own recompute builds the graph over that suffix.
+        await worker._intake.recompute_suffix_conflict_graph()
 
         violations = worker.two_layer_invariants(main_sha)
 
@@ -551,15 +545,18 @@ class TestTwoLayerInvariants:
         worker._intake.replace_lane('normal', [req_x, req_y])
 
         # textual edge {rid-x, rid-y} NOT in footprint_edges → contract violated.
+        # The tracker never builds such a graph, so the intake is made to report one.
         extra_edge = frozenset({'rid-x', 'rid-y'})
-        worker._suffix_conflict_graph = SuffixConflictGraph(
+        corrupt = SuffixConflictGraph(
             nodes=('rid-x', 'rid-y'),
             textual_edges=frozenset({extra_edge}),   # NOT a subset of footprint_edges
             footprint_edges=frozenset(),              # empty → textual edge is spurious
             conflicts_with_main=frozenset(),
         )
-
-        violations = worker.two_layer_invariants(main_sha)
+        with patch.object(
+            MergeIntake, 'suffix_conflict_graph', new_callable=PropertyMock, return_value=corrupt,
+        ):
+            violations = worker.two_layer_invariants(main_sha)
 
         assert violations, (
             'Expected a textual⊈footprint violation but got []'
@@ -587,14 +584,17 @@ class TestTwoLayerInvariants:
         worker._intake.buffer_owned_request(req_x)
 
         # 'rid-ghost' is in conflicts_with_main but NOT in nodes → inconsistency.
-        worker._suffix_conflict_graph = SuffixConflictGraph(
+        # The tracker never builds such a graph, so the intake is made to report one.
+        corrupt = SuffixConflictGraph(
             nodes=('rid-x',),
             textual_edges=frozenset(),
             footprint_edges=frozenset(),
             conflicts_with_main=frozenset({'rid-ghost'}),
         )
-
-        violations = worker.two_layer_invariants(main_sha)
+        with patch.object(
+            MergeIntake, 'suffix_conflict_graph', new_callable=PropertyMock, return_value=corrupt,
+        ):
+            violations = worker.two_layer_invariants(main_sha)
 
         assert violations, (
             'Expected a conflicts_with_main⊄nodes violation but got []'
@@ -1016,7 +1016,7 @@ class TestScenario2CleanRebaseRequeues:
 
     Assertions:
       - rebase_onto_main awaited once with onto=frozen_tip_sha
-      - req REMAINS in lane buffers['normal'] (re-queued, work preserved)
+      - req REMAINS in the normal lane buffer (re-queued, work preserved)
       - req.result is NOT done (no agent dispatched)
       - req.merge_first_enqueued_at unchanged (== 9999.0)
       - bounce_registry.count(branch) == 1
@@ -1354,7 +1354,7 @@ class TestScenario4And5AgingAndDisjointBypass:
     ) -> tuple[SpeculativeMergeWorker, MergeRequest, MergeRequest, MergeRequest, str]:
         """Return (worker, req_a, req_b, req_c, main_sha).
 
-        Creates real branches; populates lane buffers in FIFO order [A, C, B];
+        Creates real branches; populates the lane buffers in FIFO order [A, C, B];
         adds a frozen entry so the test also validates two_layer_invariants.
         """
         # Create branches off main.
@@ -1528,7 +1528,7 @@ class TestScenario6FrontierImmutableUnderReorder:
     """§9 scenario 6: verify frontier immutable under suffix reorder.
 
     Place in-flight verifying entries D, E (frozen, chained base→merge_commit)
-    and unfrozen suffix reqs F, G in lane buffers.
+    and unfrozen suffix reqs F, G in the lane buffers.
 
     Steps:
       1. Capture D/E base_sha, frozen_prefix(), frozen_prefix_tip(main).

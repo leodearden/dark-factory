@@ -1261,7 +1261,7 @@ class TestVerifierDispatchFillRegistersDispatching:
 
     RED until step-8 GREEN wires ``_note_transition`` at both
     ``_dispatch_item`` call sites in ``_verifier_loop``, at
-    ``_inflight_append``, at the two no-host ``redispatch park.appendleft``
+    ``_inflight_append``, at the two no-host ``request_redispatch(item, front=True)``
     sites, and around the dispatch-time remerge inside ``_dispatch_item``.
     """
 
@@ -1383,7 +1383,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         entered is fetched by DISPATCH-FILL's ``get_nowait()`` branch (the
         FIRST ``_dispatch_item`` call site). With zero free hosts forced,
         ``_dispatch_item`` returns None and the item bounces onto
-        redispatch park — this must transition
+        the redispatch park — this must transition
         AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED, not just set
         the legacy ``_dispatching_item`` field.
         """
@@ -1429,7 +1429,7 @@ class TestVerifierDispatchFillRegistersDispatching:
         ], f'unexpected transition sequence: {observed!r}'
         assert len(worker._intake.pending_redispatch()) == 1
         # _live_items must track whatever object actually ended up in
-        # redispatch park (may be a dataclasses.replace()'d copy of `item` with
+        # the redispatch park (may be a dataclasses.replace()'d copy of `item` with
         # cap_permit cleared, not `item` itself) — the lockstep invariant is
         # membership-consistency, not object identity with the original.
         assert worker._live_items[req.request_id] is worker._intake.pending_redispatch()[0]
@@ -1480,7 +1480,7 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         loop_task = asyncio.create_task(worker._verifier_loop())
         try:
-            # Let the loop find redispatch park/_verifier_queue empty and fall
+            # Let the loop find the redispatch park/_verifier_queue empty and fall
             # through to the blocking get() BEFORE the item is put — proving
             # this is genuinely the blocking-get call site, not DISPATCH-FILL's.
             for _ in range(5):
@@ -1793,9 +1793,9 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         """RUNNER_UNAVAILABLE re-merges the entry and front-queues it on
-        redispatch park — the registry must observe
+        the redispatch park — the registry must observe
         FINALIZING -> MERGING (for the duration of the ``_remerge()`` call)
-        -> REDISPATCH_PARKED (once landed on redispatch park), mirroring the
+        -> REDISPATCH_PARKED (once landed on the redispatch park), mirroring the
         dispatch-time staleness remerge window's "then back" shape.
         """
         from orchestrator.merge_lane.worker import (
@@ -2337,7 +2337,7 @@ class TestStopMidFlightRetiresEveryContainer:
     Seeds one item into each of: the lane buffer, the raw external queue (a
     previously-requeued, still-tracked item), the persistent verifier
     getter's already-harvested Future, the verifier queue, ``_inflight``,
-    and redispatch park — then calls ``stop()`` directly on a bare (never
+    and the redispatch park — then calls ``stop()`` directly on a bare (never
     ``run()``) worker, which exercises the drain logic deterministically
     without needing the merger/verifier loops actually running.
 
@@ -2359,7 +2359,6 @@ class TestStopMidFlightRetiresEveryContainer:
 
         # 1. Lane-buffered request.
         req_lb = _make_request('kappa-stop-lb', 'kappa-stop-lb', tmp_path, config)
-        worker._register_item(req_lb, initial=ItemLifecycleState.LANE_BUFFERED)
         worker._intake.buffer_owned_request(req_lb)
 
         # 2. Raw-queue request — simulates a previously-requeued, still-

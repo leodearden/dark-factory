@@ -17,7 +17,7 @@ Covers:
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's drive mechanism. Every test here used to reach into the worker: it
 seeded ``_inflight`` with a hand-built ``InflightEntry`` carrying a fake
-merge commit, pushed requests straight into lane buffers, assigned a
+merge commit, pushed requests straight into the lane buffers, assigned a
 ``suffix_conflict_graph``, then called the private
 ``bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
 test going as far as replacing three private methods with stubs purely to
@@ -59,11 +59,10 @@ from shared.task_metadata import RetryLedger
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.types import MergeBounceRegistry, QueuedBranch
 from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
-    MergeBounceRegistry,
     MergeOutcome,
     MergeRequest,
 )

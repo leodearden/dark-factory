@@ -23,8 +23,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.types import QueuedBranch
-from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker, SuffixConflictGraph
-from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
+from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
+from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH, SuffixConflictGraph
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ────────────
 

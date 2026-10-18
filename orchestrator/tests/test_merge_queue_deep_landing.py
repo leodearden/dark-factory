@@ -3238,7 +3238,7 @@ class _DeltaScene:
 
         ``enqueue_merge_request`` is what registers ``_on_finalized``, and
         ``merge_finalized`` has no other emit site (merge_queue.py:4763-4777) —
-        so a scene that stuffed lane buffers directly (γ's shortcut, valid
+        so a scene that stuffed the lane buffers directly (γ's shortcut, valid
         for a scene that lands nothing) would make every landing assertion here
         blind to the payload δ exists to produce.
         """

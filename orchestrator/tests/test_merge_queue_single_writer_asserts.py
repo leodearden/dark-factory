@@ -15,7 +15,7 @@ Covers:
                                                                 drain tolerance)
                   (5) flag ON + owner task IS the caller      → no-op
 
-See lane buffers' "Accessed only from the merger coroutine" docstring
+See the lane buffers' "Accessed only from the merger coroutine" comment in MergeIntake.__init__
 comment and ``_spawn_loop`` (stores ``self._merger_task``) for the
 single-writer discipline this enforces.
 
@@ -547,7 +547,7 @@ class TestDebugAssertsSuiteWideAndConformance:
         through a LIVE ``worker.run()`` (merger + verifier loops) to
         resolution — must complete cleanly with the debug asserts forced ON,
         proving the production merger/verifier coroutines only ever mutate
-        lane buffers/``_inflight`` from their own recorded owner task
+        the lane buffers/``_inflight`` from their own recorded owner task
         (``self._merger_task`` / ``self._verifier_task``) — i.e. the steps
         04/06 wiring produces no false-positive ``AssertionError`` under a
         real run.

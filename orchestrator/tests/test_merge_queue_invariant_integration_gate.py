@@ -880,7 +880,7 @@ class TestScenario10VerifyBaseMismatch:
             # snapshot() reads the same surface against the main SHA cached by
             # the lane's own recompute — refresh it and the violations must
             # match verbatim.
-            await lane._intake.recompute_suffix_conflict_graph()
+            await lane.recompute_suffix_conflict_graph()
             snap_violations = lane.snapshot()['two_layer_invariants']
             assert all(v in snap_violations for v in violations), (
                 f"expected snapshot()['two_layer_invariants'] to surface the same "

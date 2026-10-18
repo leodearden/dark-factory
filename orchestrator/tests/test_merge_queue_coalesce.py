@@ -480,7 +480,7 @@ class TestExclusionIdempotency:
         """(a) IN-FLIGHT NEVER ABSORBED.
 
         A request registered at ItemLifecycleState.MERGING (not in
-        lane buffers) must never be touched by the pass — its future remains
+        the lane buffers) must never be touched by the pass — its future remains
         unresolved and its task_id does not appear in the train's
         member_task_ids.
         """

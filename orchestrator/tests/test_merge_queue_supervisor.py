@@ -394,7 +394,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     git_ops: GitOps,
     config: OrchestratorConfig,
 ) -> None:
-    """Within-cap verifier restart must NOT clear _inflight or redispatch park.
+    """Within-cap verifier restart must NOT clear _inflight or the redispatch park.
 
     The supervisor path (_spawn_loop + _on_loop_task_done restart branch) must
     never touch self._inflight, self._intake.pending_redispatch(), or the seeded entries' result
