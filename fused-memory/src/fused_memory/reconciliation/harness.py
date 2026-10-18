@@ -1340,6 +1340,7 @@ class ReconciliationHarness:
         stage: TaskKnowledgeSync,
         *,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
         remediation_mode: bool = False,
     ) -> None:
         """Apply Stage-2 attributes to TaskKnowledgeSync.
@@ -1347,10 +1348,11 @@ class ReconciliationHarness:
         Mirrors _configure_consolidator for Stage 1 — both full-cycle and
         remediation paths use this helper to keep attribute wiring symmetric
         and discoverable. Stage-2-specific attributes (filtered_task_tree,
-        remediation_mode) are set here; Stage-1 wiring is handled by
-        _configure_consolidator.
+        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage-1
+        wiring is handled by _configure_consolidator.
         """
         stage.filtered_task_tree = filtered_task_tree
+        stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
         stage.remediation_mode = remediation_mode
 
     async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
@@ -3745,11 +3747,11 @@ class ReconciliationHarness:
         # Task 4115: the instant every heartbeat_at in filtered_task_tree was
         # read. Stamped HERE, immediately after the fetch returns — not later,
         # e.g. at the _maybe_remediate call below — because the S1->S3 stage
-        # loop that follows is minutes of LLM work and the remediation
-        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
-        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
-        # gate ages a cited task's heartbeat against the actual read, not a
-        # fresh clock taken well after it.
+        # loop that follows is minutes of LLM work and the claimant heartbeat
+        # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
+        # hint-attention selector (task 5093) and through _maybe_remediate ->
+        # _run_remediation_pass to the live-workflow gate, so both age a task's
+        # heartbeat against the actual read, not a fresh clock taken well after it.
         filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
@@ -3886,7 +3888,11 @@ class ReconciliationHarness:
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
                     if isinstance(stage, TaskKnowledgeSync):
-                        self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
+                        self._configure_task_sync(
+                            stage,
+                            filtered_task_tree=filtered_task_tree,
+                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                        )
 
                     # Wire harness-fetched task tree into Stage 3 for task-dump spot-check (task 1661)
                     if isinstance(stage, IntegrityCheck):
@@ -5855,7 +5861,12 @@ class ReconciliationHarness:
                 remediation_findings=findings,
                 filtered_task_tree=remediation_tree,
             )
-            self._configure_task_sync(stage2, filtered_task_tree=remediation_tree, remediation_mode=True)
+            self._configure_task_sync(
+                stage2,
+                filtered_task_tree=remediation_tree,
+                filtered_task_tree_fetched_at=_tasks_snapshot_at,
+                remediation_mode=True,
+            )
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
