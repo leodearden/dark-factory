@@ -107,6 +107,7 @@ from fused_memory.reconciliation.task_filter import (
     render_retained_done_tasks,
     select_done_since_boundary,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
 
 try:
@@ -3937,14 +3938,11 @@ class TaskKnowledgeSync(BaseStage):
         self-fetches from taskmaster and stamps the instant after the fetch.
         """
         if self.filtered_task_tree is not None:
-            read_at = self.filtered_task_tree_fetched_at
-            if read_at is None:
-                logger.warning(
-                    'reconciliation.task_tree_read_instant_missing: harness-injected '
-                    'task tree carries no read instant; ageing its claims at wall clock',
-                    extra={'project_id': self.project_id, 'run_id': self._current_run_id},
-                )
-                read_at = datetime.now(UTC)
+            read_at = resolve_tree_read_instant(
+                self.filtered_task_tree_fetched_at,
+                event='reconciliation.task_tree_read_instant_missing',
+                extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+            )
             return self.filtered_task_tree, read_at
 
         # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.

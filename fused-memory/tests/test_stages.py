@@ -3156,6 +3156,8 @@ class TestSelectTasksNeedingHintAttention:
 
     A claim is live when it carries a non-blank claimant_run_id whose heartbeat_at
     is within DEFAULT_CLAIMANT_HEARTBEAT_TTL of ``claims_read_at`` (task 5093).
+    READ_AT lies far in the past, so every live-claim exclusion below also shows
+    that freshness is judged at ``claims_read_at``, not at wall clock.
     """
 
     READ_AT = datetime(2026, 1, 1, tzinfo=UTC)
@@ -3219,11 +3221,6 @@ class TestSelectTasksNeedingHintAttention:
 
     def test_unclaimed_task_with_valid_hints_is_excluded(self):
         task = self._task(metadata={'memory_hints': {'entities': ['E'], 'queries': ['q']}})
-        assert self._select([task]) == []
-
-    def test_freshness_is_judged_at_claims_read_at_not_wall_clock(self):
-        task = self._claimed(heartbeat_age=timedelta(minutes=1))
-        assert datetime.now(UTC) - self.READ_AT > DEFAULT_CLAIMANT_HEARTBEAT_TTL * 1000
         assert self._select([task]) == []
 
     def test_mixed_input_keeps_survivors_in_order_and_is_not_mutated(self):
@@ -13610,8 +13607,13 @@ class TestStage2HintAttentionDetection:
         assert '[74]' in section, section
 
     @pytest.mark.asyncio
-    async def test_injected_tree_without_read_instant_warns_and_ages_at_wall_clock(
-        self, mock_deps, watermark, caplog
+    @pytest.mark.parametrize(
+        ('read_instant', 'reason'),
+        [(None, 'not_supplied'), (datetime(2026, 1, 1), 'naive_datetime')],
+        ids=['missing', 'naive'],
+    )
+    async def test_injected_tree_without_usable_read_instant_warns_and_ages_at_wall_clock(
+        self, mock_deps, watermark, caplog, read_instant, reason
     ):
         stage = self._stage(mock_deps)
         stage.filtered_task_tree = self._make_tree([
@@ -13619,12 +13621,15 @@ class TestStage2HintAttentionDetection:
                 75, 'pending', heartbeat_at=datetime.now(UTC) - timedelta(minutes=1)
             ),
         ])
+        stage.filtered_task_tree_fetched_at = read_instant
 
-        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+        with caplog.at_level(logging.WARNING):
             payload = await stage.assemble_payload([], watermark, [])
 
         assert '[75]' not in _extract_section(payload, self._SECTION_HEADER)
-        assert self._read_instant_missing_warnings(caplog)
+        assert [r.__dict__['reason'] for r in self._read_instant_missing_warnings(caplog)] == [
+            reason
+        ]
 
     @pytest.mark.asyncio
     async def test_self_fetched_tree_excludes_live_claimed_task_without_warning(
@@ -13640,7 +13645,7 @@ class TestStage2HintAttentionDetection:
         }
         stage = self._stage(mock_deps)
 
-        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+        with caplog.at_level(logging.WARNING):
             payload = await stage.assemble_payload([], watermark, [])
 
         section = _extract_section(payload, self._SECTION_HEADER)
