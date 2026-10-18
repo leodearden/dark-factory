@@ -37,7 +37,7 @@ from orchestrator.config import DeliveredChecksConfig, RecoveryEmissionConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
-from orchestrator.landing_evidence import LandingEvidenceVerdict
+from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
 
 _HARNESS_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
 

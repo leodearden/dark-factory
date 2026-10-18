@@ -30,9 +30,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import census as mod
-
-import config as config_mod
+from legibility import census as mod
+from legibility import config as config_mod
+from legibility import unlanded
+from legibility_task_store_fake import FakeTaskStore
 
 _DATE = "2026-08-03"
 
@@ -78,9 +79,10 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
         synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
         submit_fn=lambda payload: {"task_id": "t1"},
+        task_store=FakeTaskStore(),
         escalate_fn=lambda **kw: None,
         status_fetcher=lambda: {"statuses": {}},
-        commit=lambda **kw: None,
+        commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
         roll_back=_never_roll_back,
         codebook_dict=_minimal_v2_codebook(),
         config=config_mod.LegibilityConfig(

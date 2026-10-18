@@ -40,9 +40,13 @@ inheriting it from the dataclass not yet having the field.
 """
 
 
+_CAP_HIT_RECORDS = [{'stage': 'architect', 'cause': 'cap_hit', 'reason': ''}]
+"""``invocation_errors`` of an architect cell refused by a cap hit."""
+
+
 def _cell(
     task_id, config_name, *, trial=1, plan_quality=None, plan_steps=0,
-    role_under_test='architect', cap_tainted=False, invocation_error=None,
+    role_under_test='architect', cap_tainted=False, invocation_errors=None,
     cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None, drop_metrics=(),
 ):
     """Build a synthetic ``EvalResult`` with a production-shaped metrics dict.
@@ -69,7 +73,7 @@ def _cell(
         cost_usd=cost_usd,
         judge_cost_usd=judge_cost_usd,
         cap_tainted=cap_tainted,
-        invocation_error=invocation_error,
+        invocation_errors=invocation_errors,
     )
     metrics = {**m.to_dict(), **(extra_metrics or {})}
     for key in drop_metrics:
@@ -94,7 +98,7 @@ def _mixed_results():
     return [
         # A: one transport refusal (never got to ask the model) + two scored cells.
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+              invocation_errors=_CAP_HIT_RECORDS, drop_metrics=_PRE_SIGMA),
         _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6,
               drop_metrics=_PRE_SIGMA),
         _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4,
@@ -409,9 +413,9 @@ def test_no_scored_cells_reports_none_not_zero():
     """A candidate whose every cell was cap-tainted reports n=0, mean=None."""
     results = [
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
+              invocation_errors=_CAP_HIT_RECORDS),
         _cell('f2', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
+              invocation_errors=_CAP_HIT_RECORDS),
     ]
 
     row = mod.summarize_candidates(results)[0]
@@ -567,7 +571,7 @@ def test_cap_tainted_cell_bands_unmeasured():
     session-cap window — a property of the schedule, not of the candidate.
     """
     m = _metrics(plan_steps=5, plan_quality=0.95, cap_tainted=True,
-                 invocation_error='architect: cap_hit',
+                 invocation_errors=_CAP_HIT_RECORDS,
                  extra_metrics={'judged_without_reference': False})
 
     assert mod.band_for_cell(m, 0.80) == 'unmeasured'
@@ -602,7 +606,7 @@ def test_partition_is_exact():
         _cell('f3', 'A', plan_steps=0, plan_quality=0.0,
               extra_metrics={'judged_without_reference': False}),
         # unmeasured: cap-tainted.
-        _cell('f4', 'A', cap_tainted=True, invocation_error='architect: cap_hit',
+        _cell('f4', 'A', cap_tainted=True, invocation_errors=_CAP_HIT_RECORDS,
               extra_metrics={'judged_without_reference': False}),
     ]
 
@@ -801,7 +805,7 @@ _BAND_CELL_KWARGS = {
     'declined': dict(plan_steps=0, plan_quality=0.0,
                      extra_metrics={'judged_without_reference': False,
                                     'terminal_kind': 'false_premise'}),
-    'unmeasured': dict(cap_tainted=True, invocation_error='architect: cap_hit',
+    'unmeasured': dict(cap_tainted=True, invocation_errors=_CAP_HIT_RECORDS,
                        extra_metrics={'judged_without_reference': False,
                                       'terminal_kind': 'none'}),
 }
@@ -1366,7 +1370,7 @@ def _cap_tainted_keyless_corpus():
         _cell('f2', 'A', plan_quality=0.6, plan_steps=5,
               extra_metrics={mod.MARKER_KEY: False}),
         _cell('f3', 'A', plan_steps=5, cap_tainted=True,
-              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+              invocation_errors=_CAP_HIT_RECORDS, drop_metrics=_PRE_SIGMA),
     ]
 
 
@@ -1455,7 +1459,7 @@ def test_an_empty_admitted_pool_answers_zero_on_both_surfaces():
     """
     results = [
         _cell('f1', 'A', plan_steps=5, cap_tainted=True,
-              invocation_error='architect: cap_hit',
+              invocation_errors=_CAP_HIT_RECORDS,
               extra_metrics={mod.MARKER_KEY: False}),
     ]
 

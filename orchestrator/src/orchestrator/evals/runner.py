@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import threading
@@ -47,17 +48,25 @@ from .configs import (
     claude_endpoint_price_table,
     matrix_pairs,
 )
+from .measurement import (
+    MeasurementStage,
+    Unmeasured,
+    UnmeasuredCause,
+    classify_unmeasured,
+    clip_reason,
+    coerce_cost_usd,
+    exception_reason,
+)
 from .metrics import (
     EvalMetrics,
-    coerce_cost_usd,
     collect_metrics,
     compose_cost_source,
-    detect_invocation_error,
     is_proxied_endpoint,
     read_decline_artifacts,
     resolve_cost_usd,
     resolve_terminal_kind,
 )
+from .plan_predicates import is_scorable_plan
 from .profile import apply_eval_profile
 from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
 from .results import CellName, EvalResult, ResultStore
@@ -131,6 +140,16 @@ logger = logging.getLogger(__name__)
 # visibility rather than as an abort, because aborting a park throws away
 # banked spend that `--resume` would otherwise recover.
 _EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
+
+
+def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
+    """The ONLY MCP an eval architect may reach: plan-tools, strictly scoped.
+
+    The PAIR is the invariant (task 4757). A plan-tools config without the
+    strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
+    the live escalation (:8102) and fused-memory (:8002) servers.
+    """
+    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
 
 
 async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate | None:
@@ -773,37 +792,6 @@ async def run_eval(
                 )
 
 
-def _verdict_cost_usd(verdict: object) -> float:
-    """Defensively read a plan-judge verdict's own invocation spend.
-
-    The cost twin of the sibling defensive read
-    ``getattr(verdict, 'invocation_error', None)`` in :func:`run_architect_eval`
-    (task 3118's rationale, repeated here for the same reason): a
-    monkeypatched, legacy, or third-party ``PlanQualityVerdict`` may not carry
-    a ``cost_usd`` field at all, or may carry a non-numeric one. Either case
-    must degrade exactly ONE field to ``0.0`` — never the whole eval cell, and
-    never mistaken for a judge invocation that raised. An unguarded
-    ``verdict.cost_usd`` read left inside the caller's ``try/except Exception``
-    would swallow an ``AttributeError`` there and log "plan judge raised",
-    mis-attributing an unreadable FIELD to a judge that actually ran and
-    answered; left unguarded entirely, a non-numeric value (e.g. ``None``)
-    would raise ``TypeError`` OUTSIDE that try/except, in the
-    ``EvalMetrics(...)`` construction, crashing the whole cell.
-
-    The ``getattr`` (missing-field / wrong-object) defense stays local to this
-    function — it is specific to reading an UNTRUSTED ``verdict``, which
-    ``coerce_cost_usd`` does not know how to do. Once a candidate value is in
-    hand, the actual "is it a usable dollar figure" check — including the
-    NaN/Infinity/negative guard (amendment, reviewer robustness: a judge
-    answering a non-finite or negative cost would otherwise poison
-    ``arch_cost_usd + judge_cost_usd`` and every downstream report.py mean) —
-    is delegated to :func:`~orchestrator.evals.metrics.coerce_cost_usd`, the
-    SAME helper the judge's own producer-side return paths use, so the two
-    sides of this contract cannot drift apart.
-    """
-    return coerce_cost_usd(getattr(verdict, 'cost_usd', 0.0))
-
-
 async def run_architect_eval(
     task_path: Path,
     config: EvalConfig,
@@ -826,7 +814,9 @@ async def run_architect_eval(
     isolation + token savings). The architect runs with THIS candidate's
     model/backend/effort/env_overrides, not the hardcoded opus-high the
     implementer path pins. Its prompt ends with the replay frame, and the cell
-    is stamped ``replay_frame`` (docs/eval-replay-frame.md).
+    is stamped ``replay_frame`` (docs/eval-replay-frame.md). The architect
+    reaches plan-tools and no other MCP server (:func:`architect_eval_mcp_scope`);
+    ``evals/profile.py::EVAL_PROFILE`` documents the workflow-path counterpart.
 
     The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
     judge, against the REAL landed reference diff
@@ -834,7 +824,7 @@ async def run_architect_eval(
     ground truth since ζ fixtures frequently carry ``plan: null``), degrading to
     the deterministic :func:`score_plan_structure` floor on ANY judge failure.
     The judge is reached only for a plan that is
-    :func:`~orchestrator.evals.judge.is_scorable_plan` (task 3302), and the
+    :func:`~orchestrator.evals.plan_predicates.is_scorable_plan` (task 3302), and the
     judge REFUSES such an artifact itself (task 3303) — defense in depth around
     one predicate. Left ungated, an LLM judge returns a confident nonzero score
     for the very shape ``score_plan_structure`` short-circuits to 0.0,
@@ -846,8 +836,8 @@ async def run_architect_eval(
     was actually ASKED — with ONE deliberate exception (task 3118): when the
     architect invocation failed in a way that left NO model content to score
     AND no SCORABLE plan artifact was produced, scoring is skipped and the cell
-    records ``plan_quality=None`` plus ``cap_tainted=True`` and a stage-prefixed
-    ``invocation_error``. ``plan_quality is None`` on an architect run means
+    records ``plan_quality=None`` plus ``cap_tainted=True`` and an architect
+    ``invocation_errors`` record. ``plan_quality is None`` on an architect run means
     exactly that case, and the plan-quality aggregates EXCLUDE such cells rather
     than averaging in a fabricated zero.
 
@@ -858,7 +848,7 @@ async def run_architect_eval(
       asked; the outcome is a property of the schedule or of our configuration,
       not of the candidate. "No scorable plan" covers both an absent artifact
       and the header-only stub ``create_plan`` writes with zero steps — see
-      :func:`~orchestrator.evals.judge.is_scorable_plan`.
+      :func:`~orchestrator.evals.plan_predicates.is_scorable_plan`.
     - **Harness error** (worktree/config/briefing/artifact-read raised) →
       TAINTED, for the same reason: charging our own crash to the candidate
       would be a fabricated score.
@@ -868,14 +858,14 @@ async def run_architect_eval(
       genuine content measurement; the marker is recorded and the LLM judge is
       skipped (it would 429 in the same window), but the cell stays in the
       aggregate.
-    - **Timeout** → NOT tainted, deliberately. It is marked
-      (``architect:timeout: ...``) so it is never silently indistinguishable
+    - **Timeout** → NOT tainted, deliberately. It is marked (an architect
+      ``timeout`` record) so it is never silently indistinguishable
       from a bad plan, but unlike a cap hit it is CANDIDATE-attributable: the
       model was asked and did not finish inside the operator's budget. Excluding
       it would let a pathologically slow candidate dodge the penalty its
       competitors paid, so it keeps scoring on content (an absent plan scores
       the structural floor, 0.0) and the reliability signal is carried in BOTH
-      ``outcome='timeout'`` and ``invocation_error``.
+      ``outcome='timeout'`` and ``invocation_errors``.
     - **Ordinary content failure** (an architect that ran fine and merely
       produced a bad or absent plan) → NOT marked at all, scores 0.0. That is a
       real reliability signal, not an infra failure. When the plan is stepless
@@ -884,8 +874,8 @@ async def run_architect_eval(
       that carries nothing to judge (task 3302 gates here; task 3303 makes
       :func:`~orchestrator.evals.judge.judge_plan_quality` refuse it too, so
       the guarantee no longer depends on this call site alone).
-    - **Refusal of the JUDGE alone** → recorded in ``invocation_error``
-      (prefixed ``judge:``) but does NOT taint: the structural floor is still
+    - **Refusal of the JUDGE alone** → recorded in ``invocation_errors``
+      (stage ``judge``) but does NOT taint: the structural floor is still
       derived from a real produced plan.
 
     The result carries ``role_under_test='architect'`` and is persisted into
@@ -941,7 +931,6 @@ async def run_architect_eval(
     from orchestrator.artifacts import TaskArtifacts
     from orchestrator.evals import snapshots
     from orchestrator.evals.judge import (
-        is_scorable_plan,
         judge_plan_quality,
         score_plan_structure,
     )
@@ -1017,7 +1006,7 @@ async def run_architect_eval(
     # Set on the transport-refusal path (classified from the AgentResult) AND on
     # the timeout / harness-exception paths below, so no zero-content failure is
     # left byte-indistinguishable from a genuinely terrible plan.
-    arch_error: str | None = None
+    arch_unmeasured: Unmeasured | None = None
     # Whether that failure left NO model content to score — the input to the
     # taint decision, kept SEPARATE from the marker because the two differ for a
     # timeout: a timeout is marked (so it is legible) but is candidate-
@@ -1088,11 +1077,6 @@ async def run_architect_eval(
         #    candidate's model/backend/effort/env_overrides.
         briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-        # Wire plan-tools MCP via the SAME production seam real dispatch uses
-        # (workflow._invoke): relocated meta_root + direct-interpreter launch.
-        # strict_mcp_config stays default False so the ambient .mcp.json
-        # escalation/fused-memory servers still merge, mirroring _invoke.
-        mcp_config = _inject_plan_tools_mcp(None, worktree)
 
         async def _timed_invoke(**kwargs) -> AgentResult:
             """Bound ONE attempt by the operator's --timeout, and bank its spend.
@@ -1132,8 +1116,8 @@ async def run_architect_eval(
             stays the WINNING attempt's latency: cap waits and abandoned
             attempts are infra time, not candidate latency, and folding them in
             would corrupt the per-candidate duration the campaign compares.
-            ``coerce_cost_usd`` guards the read so a Mock/None/NaN degrades to
-            an honest 0.0 instead of poisoning the sum (metrics.py:547).
+            ``measurement.coerce_cost_usd`` guards the read so a Mock/None/NaN
+            degrades to an honest 0.0 instead of poisoning the sum.
             """
             nonlocal arch_cost_usd
             attempt = await asyncio.wait_for(
@@ -1149,6 +1133,11 @@ async def run_architect_eval(
         # unchanged. `backend` moves to the wrapper's own keyword-only
         # parameter, which forwards it into the dispatched call because a
         # custom invoke_fn is supplied.
+        #
+        # The architect is scoped to plan-tools ONLY (architect_eval_mcp_scope):
+        # plan-tools is wired through the SAME production seam real dispatch
+        # uses (relocated meta_root + direct-interpreter launch), and the strict
+        # flag drops the ambient .mcp.json's live production servers.
         result = await invoke_with_cap_retry(
             usage_gate,
             f'Architect eval {task_id} × {config.name}',
@@ -1165,7 +1154,7 @@ async def run_architect_eval(
             disallowed_tools=ARCHITECT.disallowed_tools or None,
             effort=config.effort or 'high',
             env_overrides=config.env_overrides or None,
-            mcp_config=mcp_config,
+            **architect_eval_mcp_scope(worktree),
         )
         # arch_cost_usd is banked inside _timed_invoke (every attempt), not
         # read off `result` (the last attempt only) — see its docstring. The
@@ -1193,8 +1182,12 @@ async def run_architect_eval(
         # read. Guarded so a classifier bug degrades to an unmarked cell rather
         # than nuking the whole run.
         try:
-            arch_error = detect_invocation_error(result, backend=config.backend)
-            arch_unmeasurable = arch_error is not None
+            refused = classify_unmeasured(
+                result, stage=MeasurementStage.ARCHITECT, backend=config.backend,
+            )
+            if refused is not None:
+                arch_unmeasured = dataclasses.replace(refused, cost_usd=arch_cost_usd)
+            arch_unmeasurable = arch_unmeasured is not None
         except Exception:
             logger.warning(
                 f'invocation-error classification raised for {task_id} × '
@@ -1211,7 +1204,10 @@ async def run_architect_eval(
         outcome = 'timeout'
         # MARKED but NOT unmeasurable: see the scoring block for why a timeout
         # keeps scoring on content while a cap hit does not.
-        arch_error = arch_error or f'timeout: no answer within {timeout_minutes}m'
+        arch_unmeasured = arch_unmeasured or Unmeasured(
+            MeasurementStage.ARCHITECT, UnmeasuredCause.TIMEOUT,
+            f'no answer within {timeout_minutes}m', cost_usd=arch_cost_usd,
+        )
     except AllAccountsCappedException as e:
         # Every account in the pool was capped for longer than this eval's
         # patience bound. Caught HERE, ahead of the generic handler, for two
@@ -1245,8 +1241,10 @@ async def run_architect_eval(
             f'this cell rather than stalling the campaign'
         )
         outcome = 'blocked'
-        reason = ' '.join(str(e).split())[:80]
-        arch_error = arch_error or f'cap_exhausted: {reason}'
+        arch_unmeasured = arch_unmeasured or Unmeasured(
+            MeasurementStage.ARCHITECT, UnmeasuredCause.CAP_EXHAUSTED,
+            clip_reason(str(e)), cost_usd=arch_cost_usd,
+        )
         arch_unmeasurable = True
         if artifacts is not None:
             # Best-effort: an unreadable artifact here must degrade to the
@@ -1266,10 +1264,10 @@ async def run_architect_eval(
         # a candidate failure — the candidate was never even asked, so scoring it
         # 0.0 would charge our own crash to it. Marked AND unmeasurable. An
         # already-classified transport refusal is more specific, so it wins.
-        # The reason is whitespace-collapsed and clipped so the marker stays a
-        # single short line in the result JSON and the report tables.
-        reason = ' '.join(str(e).split())[:80]
-        arch_error = arch_error or f'harness_error: {type(e).__name__}: {reason}'
+        arch_unmeasured = arch_unmeasured or Unmeasured(
+            MeasurementStage.ARCHITECT, UnmeasuredCause.HARNESS_ERROR,
+            exception_reason(e), cost_usd=arch_cost_usd,
+        )
         arch_unmeasurable = True
     finally:
         # The architect's DECLINE artifacts (task 4760) — read HERE, and only
@@ -1353,12 +1351,12 @@ async def run_architect_eval(
     #    that left NOTHING to score (see the docstring's taint table for which
     #    failures qualify and why a timeout deliberately does not).
     plan_quality: float | None = None
-    judge_error: str | None = None
+    judge_unmeasured: Unmeasured | None = None
     # The plan judge's OWN spend + invocation count (eval-revival υ). Every
     # judge-SKIPPED branch below (tainted, refused-with-a-plan, unscorable-
     # plan) leaves these at their honest zero defaults with no extra code;
     # only the healthy else-branch, where the judge is actually called, sets
-    # them from the returned verdict. judge_cost_usd is a SUBSET of the
+    # them from the returned outcome. judge_cost_usd is a SUBSET of the
     # cell's cost_usd below, not disjoint (metrics.py:69-71) — invocations is
     # stamped on the judge having been CALLED, not on the cost being nonzero,
     # since a $0.00 refusal is still an invocation.
@@ -1380,6 +1378,7 @@ async def run_architect_eval(
     # 0.0. is_scorable_plan is that short-circuit's own test, so the two can no
     # longer disagree.
     tainted = arch_unmeasurable and not is_scorable_plan(plan)
+    arch_record = arch_unmeasured.to_record() if arch_unmeasured else None
     if tainted:
         # We never got to ask the model AND no SCORABLE plan exists, so every
         # available number would be FABRICATED — and a fabricated 0.0 is
@@ -1390,7 +1389,7 @@ async def run_architect_eval(
         # the 0.0), burning an opus call on a doomed request.
         logger.warning(
             f'Architect eval {task_id} × {config.name}: invocation refused with '
-            f'no scorable plan artifact ({arch_error}) — plan judge skipped, '
+            f'no scorable plan artifact ({arch_record}) — plan judge skipped, '
             f'plan_quality=None, cell marked cap_tainted (NOT scored 0.0)'
         )
     elif arch_unmeasurable:
@@ -1406,7 +1405,7 @@ async def run_architect_eval(
         plan_quality = score_plan_structure(plan)
         logger.warning(
             f'Architect eval {task_id} × {config.name}: invocation refused '
-            f'({arch_error}) but a plan artifact exists — LLM judge skipped, '
+            f'({arch_record}) but a plan artifact exists — LLM judge skipped, '
             f'scored on the structural floor ({plan_quality}), NOT tainted'
         )
     elif not is_scorable_plan(plan):
@@ -1415,7 +1414,7 @@ async def run_architect_eval(
         # score_plan_structure short-circuits a stepless artifact to 0.0, and an
         # LLM opinion of that artifact would write a cell whose own plan_steps=0
         # CONTRADICTS its score — the shape the report-layer floor
-        # (metrics.produced_a_plan, task 3302) has to defend the existing corpus
+        # (plan_predicates.produced_a_plan, task 3302) has to defend the existing corpus
         # against.
         #
         # judge_plan_quality now refuses such an artifact ITSELF and returns the
@@ -1450,43 +1449,32 @@ async def run_architect_eval(
                 f'grade against'
             )
         try:
-            verdict = await judge_plan_quality(plan, reference_diff, task)
-            plan_quality = verdict.plan_quality
-            # getattr, not attribute access: a monkeypatched or legacy verdict
-            # without the field must not break scoring.
-            judge_error = getattr(verdict, 'invocation_error', None)
-            # The judge WAS called, whatever it answered — stamp the
-            # invocation before touching its cost, so a $0.00 refusal still
-            # counts as one call (report.py:806-809 reads the pair together;
-            # a nonzero cost beside invocations=0 would be self-contradictory).
-            # _verdict_cost_usd is a DEFENSIVE read (like the getattr above):
-            # an unreadable cost field degrades to 0.0 rather than raising
-            # here (mis-attributing the failure to "the judge raised") or
-            # later in the EvalMetrics construction (crashing the cell).
-            judge_invocations = 1
-            judge_cost_usd = _verdict_cost_usd(verdict)
+            judge_outcome = await judge_plan_quality(plan, reference_diff, task)
         except Exception as e:
             # judge_invocations/judge_cost_usd stay at their 0.0/0 defaults —
             # NOT bumped to 1 here (amendment, reviewer robustness): whether
             # invoke_agent was even reached before the raise is NOT
-            # determinable from this side (the raise could be pre-invoke, in
-            # prompt assembly, or post-invoke, in parsing/logging inside
-            # judge_plan_quality's own try/except), so crediting an
-            # invocation that may never have happened would be its own
-            # fabrication. But leaving BOTH fields at zero would make this
-            # cell byte-indistinguishable from one where the judge was
-            # SKIPPED (tainted / cap-refusal-with-a-plan / unscorable-plan) —
-            # exactly the illegibility this task exists to remove, just moved
-            # one level up. So record the fact on judge_error instead: it
-            # rides into stage_markers → invocation_error below as
-            # "judge:raised: ...", so the cell reads "judge raised, spend
-            # unknown" rather than silently looking judge-free.
-            reason = ' '.join(str(e).split())[:80]
-            judge_error = f'raised: {type(e).__name__}: {reason}'
+            # determinable from this side, so crediting an invocation that may
+            # never have happened would be its own fabrication. The judge
+            # ``raised`` record keeps the cell legible as "judge raised, spend
+            # unknown" rather than silently judge-free.
+            judge_unmeasured = Unmeasured(
+                MeasurementStage.JUDGE, UnmeasuredCause.RAISED,
+                exception_reason(e), cost_usd=0.0,
+            )
             logger.warning(
                 f'plan judge raised for {task_id}; degrading to structural floor',
                 exc_info=True,
             )
+        else:
+            # The judge WAS called, whatever it answered — a $0.00 refusal
+            # still counts as one call (report.py reads the pair together).
+            judge_invocations = 1
+            judge_cost_usd = judge_outcome.cost_usd
+            if isinstance(judge_outcome, Unmeasured):
+                judge_unmeasured = judge_outcome
+            else:
+                plan_quality = judge_outcome.value.plan_quality
         if plan_quality is None:
             plan_quality = score_plan_structure(plan)
         else:
@@ -1512,17 +1500,13 @@ async def run_architect_eval(
 
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
-    # The marker names WHICH stage failed; the join keeps the field well-defined
-    # if both ever fire (today an architect-side refusal skips the judge, so at
-    # most one does). cap_tainted keys on ``tainted``, NOT on the marker: a
-    # judge-only refusal, a timeout, and a refusal that still left a plan behind
-    # all keep a content-derived score, so excluding those cells would discard
-    # valid measurements.
-    stage_markers = [
-        f'{stage}:{marker}'
-        for stage, marker in (('architect', arch_error), ('judge', judge_error))
-        if marker
-    ]
+    # One record per stage that went unmeasured, architect first. cap_tainted
+    # keys on ``tainted``, NOT on the records: a judge-only refusal, a timeout,
+    # and a refusal that still left a plan behind all keep a content-derived
+    # score, so excluding those cells would discard valid measurements.
+    invocation_errors = [
+        u.to_record() for u in (arch_unmeasured, judge_unmeasured) if u is not None
+    ] or None
 
     # Cost provenance (Invariant P5) for the ARCHITECT component, through the
     # SAME seam collect_metrics uses on the implementer path — a proxied
@@ -1609,10 +1593,9 @@ async def run_architect_eval(
         # judge_invocations at their 0.0/0 defaults, so that spend is
         # unknowable from here and is a documented under-report, never a
         # fabricated number — but it is NOT silently indistinguishable from
-        # a judge that was SKIPPED: judge_error is set in the except block,
-        # so invocation_error below reads "judge:raised: ...", telling a
-        # reader "spend unknown", not "judge-free" (amendment, reviewer
-        # robustness).
+        # a judge that was SKIPPED: the except block mints a judge ``raised``
+        # record, telling a reader "spend unknown", not "judge-free"
+        # (amendment, reviewer robustness).
         # The architect component is the RESOLVED figure (Invariant P5), never
         # the raw CLI one; the judge component keeps its CLI figure because the
         # plan judge is always a native-cloud opus call. judge_cost_usd is still
@@ -1643,7 +1626,7 @@ async def run_architect_eval(
         turns_used=arch_turns,
         tokens_per_second=arch_tps,
         workflow_duration_ms=arch_duration_ms,
-        invocation_error='; '.join(stage_markers) or None,
+        invocation_errors=invocation_errors,
         cap_tainted=tainted,
         judge_cost_usd=judge_cost_usd,
         judge_invocations=judge_invocations,
@@ -1665,9 +1648,9 @@ async def run_architect_eval(
         f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s, '
         f'${metrics.cost_usd:.2f} incl. ${judge_cost_usd:.2f} judge)'
         + (
-            f' [{"cap_tainted" if tainted else "invocation_error"}: '
-            f'{metrics.invocation_error}]'
-            if metrics.invocation_error else ''
+            f' [{"cap_tainted" if tainted else "invocation_errors"}: '
+            f'{invocation_errors}]'
+            if invocation_errors else ''
         )
         # So a run's OWN log carries the validity bound, not just the report.
         + (' [judged_without_reference]' if judged_without_reference else '')
@@ -2260,10 +2243,11 @@ class _StubMcpSession:
 
     Handles every tool the eval ``Scheduler`` dispatches via ``dispatch_tool``:
     ``set_task_status``, ``get_task``, ``get_tasks``, ``get_statuses``,
-    ``update_task``, ``set_task_claimant``, ``get_external_statuses`` (plus
-    ``add_dependency``, stubbed defensively though not yet dispatched).  The
-    ``test_scheduler_dispatch_literal_tripwire`` guard asserts every dispatched
-    literal has a branch here.  Any other tool name raises ``NotImplementedError``.
+    ``update_task``, ``set_task_claimant``, ``get_external_statuses``,
+    ``submit_task`` (plus ``add_dependency``, stubbed defensively though not
+    yet dispatched).  The ``test_scheduler_dispatch_literal_tripwire`` guard
+    asserts every dispatched literal has a branch here.  Any other tool name
+    raises ``NotImplementedError``.
     """
 
     def __init__(self) -> None:
@@ -2295,7 +2279,8 @@ class _StubMcpSession:
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
         ``get_statuses``, ``update_task``, ``set_task_claimant``,
-        ``get_external_statuses``, ``add_dependency``.  Unknown tool names raise
+        ``get_external_statuses``, ``submit_task``, ``add_dependency``.  Unknown
+        tool names raise
         ``NotImplementedError``.
 
         .. note::
@@ -2348,6 +2333,14 @@ class _StubMcpSession:
             deps = arguments.get('deps', [])
             mapping = {d: 'done' for d in deps}
             return self._envelope(json.dumps(mapping))
+        if name == 'submit_task':
+            # Scheduler.submit_task files tasks for machine filers (auto-eval,
+            # the flake ledger). An eval run must create none, so the answer is
+            # the server's structured refusal, which parses to SubmitFailed.
+            return self._envelope(json.dumps({
+                'error': 'eval runs file no tasks',
+                'error_type': 'EvalStubRefusal',
+            }))
         if name == 'add_dependency':
             # Not currently dispatched by scheduler.py; added defensively per
             # task spec so a future dispatch site is already stubbed. Echo the id

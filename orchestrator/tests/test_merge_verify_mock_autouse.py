@@ -1,8 +1,8 @@
-"""Pin the autouse mock for orchestrator.merge_queue.run_scoped_verification.
+"""Pin the autouse mock for orchestrator.merge_lane.worker.run_scoped_verification.
 
 Task 1829: the autouse ``_mock_merge_queue_verification`` fixture in
 ``orchestrator/tests/conftest.py`` monkeypatches
-``orchestrator.merge_queue.run_scoped_verification`` to return
+``orchestrator.merge_lane.worker.run_scoped_verification`` to return
 ``VerifyResult(passed=True)`` for every test.  This is correct for the
 majority of MergeWorker tests that want a fast, deterministic verify result,
 but SILENTLY defeats tests whose purpose IS to assert that a compile-broken
@@ -11,7 +11,7 @@ member is CAUGHT by the post-merge gate (outcome blocked, not done).
 The fixture honours an ``exercise_merge_verify`` marker opt-out (mirroring
 ``exercise_dry_run_unblock`` / ``_no_dry_run_unblock``).  When a test carries
 the marker, the fixture returns early and the REAL
-``orchestrator.merge_queue.run_scoped_verification`` binding (real cargo) runs.
+``orchestrator.merge_lane.worker.run_scoped_verification`` binding (real cargo) runs.
 
 This file:
   (a) pins the default-mock behaviour so a regression shows up deterministically,
@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import orchestrator.merge_queue as mq
+import orchestrator.merge_lane.worker as mq
 from orchestrator.verify import run_scoped_verification as _real_verify
 
 

@@ -101,9 +101,8 @@ checker treats as truth is not the source of the copy it compares against.
 That renderer also PRESERVES the installed copy's host-local ``Environment=``
 values across a re-install, which is why the remediation this report prints
 ("run scripts/setup-host.sh") is now safe to follow on a host carrying nine
-aggregation roots; see the DASHBOARD_KNOWN_PROJECT_ROOTS entry in
-``DIVERGENCE_ALLOWLIST`` below.  The two repo-side
-files are held in lockstep by
+aggregation roots; see its row in ``systemd_unit_parity.py::ENV_POLICY``.
+The two repo-side files are held in lockstep by
 ``tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file``,
 which renders the template with setup-host.sh's own substitutions and asserts
 BYTE-FOR-BYTE equality with the committed unit (see the comment on that
@@ -142,13 +141,17 @@ import pathlib
 import re
 import sys
 from collections.abc import Sequence
+from typing import Final
 
 from systemd_unit_parity import (
     ABSENT,
+    ENV_POLICY,
+    SERVICE_SECTION,
     BlockText,
     Drift,
     ParityRun,
     ReportText,
+    UnitFamily,
     UnitRef,
     environment_map,
     parse_unit_directives,
@@ -165,50 +168,10 @@ from systemd_unit_parity import (
 # greps for over scripts/ (dashboard_unit_parity|DASHBOARD_UNIT_PARITY).
 LOG_TAG = "dashboard_unit_parity"
 
-# Environment variable NAMES whose VALUE is permitted to differ between the
-# committed unit and the installed one, each with the documented reason it is
-# blessed.  Presence is still required — see the Environment= branch of
-# compare_unit: allowlisting a value must never bless the variable vanishing.
-#
-# THIS IS A HOLE IN THE GATE.  Keep it small, and keep every entry's reason
-# specific enough that a reviewer can check it.  The gate's whole value comes
-# from being believable when it fires.
-DIVERGENCE_ALLOWLIST: dict[str, str] = {
-    "DASHBOARD_KNOWN_PROJECT_ROOTS": (
-        "Cost/burndown aggregation roots. The committed unit's own comment "
-        "declares the divergence deliberate: 'additional project roots are "
-        "LOCAL settings, added to the installed unit, not committed here'. "
-        "Measured 2026-08-01: the installed unit carries 9 roots, the "
-        "committed one carries this repo only. Value-comparing it would "
-        "therefore report drift on every run of a correctly-configured host, "
-        "and a gate that is always red gets switched off — taking the "
-        "accidental drift it exists to catch with it. "
-        "SECOND CONSUMER (task 4793): scripts/render_systemd_unit.py now "
-        "PRESERVES this variable's installed value when setup-host.sh "
-        "re-renders the unit. Its HOST_LOCAL_ENVIRONMENT is the host-local "
-        "SUBSET of this allowlist, not the allowlist itself — the two entries "
-        "here are on it for opposite reasons, and preserving the other one "
-        "would pin the data root at the previous checkout. Held by "
-        "tests/scripts/test_render_systemd_unit.py::"
-        "test_host_local_environment_is_a_subset_of_the_divergence_allowlist "
-        "and ::test_host_local_environment_excludes_project_root. So editing "
-        "THIS dict has a second blast radius: adding a name here does not make "
-        "it preserved, but removing one that the renderer preserves turns this "
-        "gate red on every correctly-configured host."
-    ),
-    "DASHBOARD_PROJECT_ROOT": (
-        "The dashboard's data root. The committed unit hardcodes "
-        "/home/leo/src/dark-factory, while setup-host.sh renders the installed "
-        "copy from scripts/dashboard.service.template with THAT host's real "
-        "$REPO_ROOT — so a cross-copy value comparison reports drift on every "
-        "correctly-configured host that is not this one. "
-        "NOT A HOLE, unlike the entry above: the value is still checked, just "
-        "not across copies. UnitSpec.env_matches_directive relates it to the "
-        "SAME copy's WorkingDirectory= (see there for why), and the name-set "
-        "branch still makes a dropped variable drift. The two entries are a "
-        "PAIR — removing either gives back the failure the other prevents."
-    ),
-}
+# Environment variable NAMES whose VALUE may differ between the committed and
+# installed copies; presence is still compared. THIS IS A HOLE IN THE GATE: keep
+# it small. Each row's reason: plans/review-all-s25-scripts-instruments-prd.md D5.
+DIVERGENCE_ALLOWLIST: Final[frozenset[str]] = ENV_POLICY.divergence_allowlist(UnitFamily.DASHBOARD)
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
@@ -833,7 +796,7 @@ UNITS: dict[str, UnitSpec] = {
         # EnvironmentFile= is VISIBLE: it could override any Environment= the
         # name-set comparison below just checked, from a file off this tree.
         override_directives=(("Service", "EnvironmentFile"),),
-        environment_section="Service",
+        environment_section=SERVICE_SECTION,
         env_matches_directive=(
             # The dashboard's DATA ROOT (config.py's project_root falls back to
             # Path.cwd() when it is unset), so =/tmp/wrong must not read as
@@ -888,7 +851,7 @@ UNITS: dict[str, UnitSpec] = {
         # policy, so an inline injection here is the same class of hole
         # EnvironmentFile= was registered to close — on the same unit, left
         # open until now.
-        environment_section="Service",
+        environment_section=SERVICE_SECTION,
         unchecked_directives=(("Unit", "Description", _DESCRIPTION_IS_COSMETIC),),
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(

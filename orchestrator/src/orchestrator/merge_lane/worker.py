@@ -26,9 +26,11 @@ import time
 import traceback
 import uuid
 from collections.abc import (
+    AsyncIterator,
     Awaitable,
     Callable,
     Collection,
+    Coroutine,
     Iterator,
     Mapping,
     MutableSet,
@@ -44,7 +46,6 @@ from escalation.models import Escalation
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.task_metadata import RetryLedger
 
-from orchestrator import chronic_flake
 from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
@@ -63,6 +64,7 @@ from orchestrator.git_ops import (
 )
 from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.log_coalesce import ExponentialLogCoalescer
+from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
@@ -88,12 +90,7 @@ from orchestrator.merge_lane.gates import (
     _run_unscoped_typechecks,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_lane.landing_evidence import (
-    LandingEvidenceVerdict,
-    file_unattributed_landing_escalation,
-    patch_content_contained,
-    validate_landing_evidence,
-)
+from orchestrator.merge_lane.landing_evidence import patch_content_contained
 from orchestrator.merge_lane.liveness import (
     _HEARTBEAT_POLL_S,
     _MERGE_AHEAD_BOUND,
@@ -109,6 +106,7 @@ from orchestrator.merge_lane.liveness import (
     newest_content_mtime,
     release_chain_build_lane,
 )
+from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.ports import (
     ClockPort,
@@ -202,10 +200,12 @@ from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
+from orchestrator.verify_classify import reports_disk_full
 from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     HostAllocator,
+    HostLease,
     LocalRunner,
     RunnerUnavailable,
     VerifyRunner,
@@ -220,7 +220,7 @@ from orchestrator.workflow import _select_train_members
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 NEEDS_REBASE_REASON_PREFIX = 'Suffix item needs rebase onto frozen-prefix tip'
@@ -589,27 +589,19 @@ Shared by ``SpeculativeMergeWorker._finalize_inflight`` and
 halt-triggering results ever changes, this one constant updates both."""
 
 
-_ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
-"""Substrings (matched case-insensitively) that mark a disk-full failure.
-There is no structured ENOSPC field on ``VerifyResult`` — the signal only
-appears in captured tool output — so detection is a string match."""
-
-
 def _verify_hit_enospc(verify: VerifyResult) -> bool:
     """True when a failed ``VerifyResult`` bears a disk-full signature.
 
     Scans the human-readable failure report and each captured output stream
-    (test/lint/type) for any ``_ENOSPC_MARKERS`` entry.
+    (test/lint/type) with ``verify_classify.py::reports_disk_full``.
     """
-    haystack = ' '.join(
-        s for s in (
-            verify.failure_report(),
-            verify.test_output,
-            verify.lint_output,
-            verify.type_output,
-        ) if isinstance(s, str)
-    ).lower()
-    return any(marker in haystack for marker in _ENOSPC_MARKERS)
+    streams = (
+        verify.failure_report(),
+        verify.test_output,
+        verify.lint_output,
+        verify.type_output,
+    )
+    return reports_disk_full(' '.join(filter(lambda s: isinstance(s, str), streams)))
 
 
 _SPECULATION_RACE_MARKER = 'not something we can merge'
@@ -626,8 +618,7 @@ def _is_speculation_race(stderr: str) -> bool:
     """True when *stderr* from a failed merge contains the speculation-race signature.
 
     Uses a load-bearing exact substring match against ``_SPECULATION_RACE_MARKER``
-    (the git porcelain phrase ``not something we can merge``).  Mirrors the
-    ``_verify_hit_enospc`` / ``_ENOSPC_MARKERS`` pattern.
+    (the git porcelain phrase ``not something we can merge``).
     """
     return _SPECULATION_RACE_MARKER in stderr
 
@@ -920,7 +911,7 @@ async def _classify_disposition_for_outcome(
         return MergeFailureDisposition.INDETERMINATE, None, '', None
 
 
-async def _resolve_dispatch_time_merge_base(
+async def resolve_dispatch_time_merge_base(
     repo_root: Path,
     main_sha: str,
     branch_tip: str | None,
@@ -947,7 +938,7 @@ async def _resolve_dispatch_time_merge_base(
         )
         if rc != 0:
             logger.warning(
-                '_resolve_dispatch_time_merge_base: git merge-base failed '
+                'resolve_dispatch_time_merge_base: git merge-base failed '
                 '(rc=%d) for main_sha=%s branch_tip=%s: %s; degrading to '
                 'None (fail-safe, I3)',
                 rc, main_sha, branch_tip, err.strip(),
@@ -956,7 +947,7 @@ async def _resolve_dispatch_time_merge_base(
         return out.strip() or None
     except Exception:
         logger.warning(
-            '_resolve_dispatch_time_merge_base: git merge-base raised for '
+            'resolve_dispatch_time_merge_base: git merge-base raised for '
             'main_sha=%s branch_tip=%s; degrading to None (fail-safe, I3)',
             main_sha, branch_tip,
             exc_info=True,
@@ -1600,10 +1591,10 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 #                                 re-checks it a third time from its side.
 #   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
 #
-# The whole dict is merged into MergeVerifySpec.verify_env (the channel already
-# shipped to reify's remote runner AND threaded into local ModuleConfig.verify_env),
-# so no new transport is introduced.  The filter files are written into merge_wt,
-# the shared persistent merge-verify lane reify's verify.sh reads.
+# The dict is merged into the dispatched MergeVerifySpec.verify_env, and the
+# filter files are written into THIS host's merge_wt, the shared persistent
+# merge-verify lane reify's verify.sh reads: LOCAL dispatch only (see
+# verify_runner.py::MergeVerifySpec).
 # ---------------------------------------------------------------------------
 
 # Subdir under merge_wt holding the per-profile nextest filter files.
@@ -1673,7 +1664,8 @@ def _build_retry_verify_env(
         run_all_members: {failed} run_all member ids (pass-through, not transformed).
         gui_specs: {failed} gui spec files (pass-through, not transformed).
         tree_oid: attempt-0-pinned content-tree OID (REIFY_VERIFY_RETRY_TREE_OID).
-        filter_dir: directory the filter files are written under (the merge_wt).
+        filter_dir: directory the filter files are written under (the
+            dispatching host's merge_wt; produced for a local dispatch only).
 
     Returns:
         The REIFY_VERIFY_RETRY_* env dict to merge into MergeVerifySpec.verify_env.
@@ -2328,6 +2320,26 @@ def _merge_boundary_module_configs(
     return effective_merge_module_configs(config, module_configs)
 
 
+def _placeholder_local_runner(
+    merge_wt: Path, req: MergeRequest, verifier: VerifyPort,
+) -> LocalRunner:
+    """The LocalRunner a local host slot is acquired with.
+
+    Its modules are the merge boundary's (PRD §8.2), through the SAME wrapper
+    as the runner that actually drives the verify, so the two can never
+    disagree about which modules a merge covers.
+    """
+    return LocalRunner(
+        merge_wt,
+        req.config,
+        _merge_boundary_module_configs(req.config, req.module_configs),
+        None,   # task_files — derived inside _run_post_merge_verify
+        run_scoped=verifier.run_scoped,
+        run_unscoped=verifier.run_unscoped_typechecks,
+        task_id=req.task_id,
+    )
+
+
 async def _record_flake_observation(
     result: VerifyResult,
     req: MergeRequest,
@@ -2335,7 +2347,6 @@ async def _record_flake_observation(
     merge_sha: str,
     event_store: EventStore | None,
     escalation_queue: Any,
-    task_client: Any,
 ) -> None:
     """Record whatever flake observation *result* carries (PRD task ε, §5.8).
 
@@ -2358,14 +2369,6 @@ async def _record_flake_observation(
     at all, the remote host has no event store, and its streak counter died with
     its process.
 
-    Task ζ binds a FOURTH effect on the same seam — the ``flake_debt`` row and the
-    de-flake task filed against it (PRD §5.9) — and that is exactly why the binding
-    stays here rather than at the three call sites.  ``task_client`` is the only
-    piece of context the three could plausibly disagree on, since it rides on the
-    WORKER rather than on the verify: a site that forgot it would silently stop
-    enforcing the invariant for whichever observations flow through it, with no
-    failure anywhere.  One seam, one answer to who owns the debt row.
-
     Never raises (the recorder owns that guarantee), so a lost measurement can
     never fail a verify or stall the merge queue.
     """
@@ -2377,7 +2380,6 @@ async def _record_flake_observation(
         task_id=req.task_id,
         event_store=event_store,
         escalation_queue=escalation_queue,
-        task_client=task_client,
     )
 
 
@@ -2400,7 +2402,6 @@ async def _run_post_merge_verify(
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
-    task_client: Any = None,
     halt_hook: Callable[[str], None] | None = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
@@ -2422,11 +2423,6 @@ async def _run_post_merge_verify(
     raised verify to a ``'Verification error: ...'`` outcome.
 
     Args:
-        task_client: Optional task client (``submit_task`` / ``get_statuses`` /
-            ``commit_planning``) threaded to the flake recorder so a suppressed
-            merge red acquires a de-flake task at write time (PRD task ζ, §5.9).
-            Threaded like ``escalation_queue``; with ``None`` the recorder opens
-            no debt row.
         max_narrowed: Budget for the classified-infra-transient retry loop
             (task 2835) when this call's failed-only retry was actually
             NARROWED — i.e. the D2 producer inside that branch built a
@@ -2434,8 +2430,9 @@ async def _run_post_merge_verify(
             (see ``narrowed`` below).  Default ``1`` matches the legacy
             single-retry behaviour, so every existing caller that omits
             this param is byte-identical.  A non-narrowed retry (flag off,
-            or a payload that could not be built or corroborated) always
-            uses ``max_enospc`` instead, regardless of this value.
+            a payload that could not be built or corroborated, or a remote
+            dispatch) always uses ``max_enospc`` instead, regardless of this
+            value.
         narrowed_retries: Per-task counter dict for the narrowed budget
             above, mirroring ``enospc_retries`` but DECOUPLED from it (an
             earlier ENOSPC event never starves a narrowed retry, and vice
@@ -2490,10 +2487,11 @@ async def _run_post_merge_verify(
             quarantined, but the queue is NOT halted and the escalation is L1
             blocking rather than born-at-L2 (task 2886 amendment — bound the
             halt blast radius; DriftDetector Invariant 5).  Only the
-            production ``SpeculativeMergeWorker._run_inflight_verify`` call
-            site passes ``self.operator_halt``; every other (module-level or
-            test) caller omits it (default ``None`` → no halt), keeping
-            them byte-identical.  With ``verify_cross_check_remote_green`` on
+            production ``SpeculativeMergeWorker._run_inflight_verify`` and
+            ``_leased_train_verify`` call sites pass the worker's
+            ``operator_halt``; every other (module-level or test) caller
+            omits it (default ``None`` → no halt), keeping them
+            byte-identical.  With ``verify_cross_check_remote_green`` on
             (default True) the cross-check is a BLOCKING pre-land local
             re-verify, NOT a trailing detector; the halt is synchronous purely
             so it precedes any further adoption — incident 83336a32 halted +3s
@@ -2706,8 +2704,8 @@ async def _run_post_merge_verify(
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
     # legacy caller (_do_merge, _reverify_rebased_tree, reverify_member_solo,
-    # _do_train_merge, _run_cold_shadow_verify — recovery/train paths stay on
-    # the trust anchor and out of slot accounting).
+    # _run_cold_shadow_verify — recovery paths stay on the trust anchor and
+    # out of slot accounting).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
     # The caller-owned `quarantine` set is the divergence-quarantine sink for
@@ -2872,17 +2870,13 @@ async def _run_post_merge_verify(
             # that would not materially narrow (_materially_narrows) — returns
             # None and leaves `spec` untouched, so the retry runs FULL via the
             # existing _reverify_rebased_tree (M4) semantics AND stays on the
-            # legacy budget.
+            # legacy budget.  A REMOTE dispatch (runner is not None) skips the
+            # producer altogether, with the same outcome: see
+            # verify_runner.py::MergeVerifySpec.
             #
             # `not narrowed` keeps this a once-per-call operation: the loop below
             # may dispatch several times, but the subset is always attempt-0's.
-            #
-            # NOTE (task 2822): injecting into `spec` means the merged verify_env
-            # flows into BOTH the retry dispatch below AND task 2822's
-            # post-dispatch remote-green cross-check re-verify (which reuses this
-            # same `spec`) — correct and desired: a failed-only retry's local
-            # trust-anchor cross-check should scope to the same subset.
-            if req.retry_failed_only and not narrowed:
+            if req.retry_failed_only and not narrowed and runner is None:
                 # spec.verify_env is attempt-0's OWN build environment (the
                 # shared sccache backend et al).  Threading it makes the
                 # `cargo nextest list` probe model the same build the verify
@@ -2918,12 +2912,12 @@ async def _run_post_merge_verify(
             # above actually merged retry_env — earns its own SEPARATE, larger
             # budget (max_narrowed/narrowed_retries), decoupled from the legacy
             # enospc_retries/max_enospc budget so an unrelated prior ENOSPC event
-            # can never starve it.  A non-narrowed retry (flag off, or a payload
-            # that could not be built/corroborated) keeps sharing the legacy
-            # budget: at most `max_enospc` full re-verifies, which matches the
-            # pre-2835 single retry only at max_enospc == 1.  reverify_member_solo
-            # never sets retry_failed_only, so it always lands here; its budget
-            # is pinned by
+            # can never starve it.  A non-narrowed retry (flag off, a payload
+            # that could not be built/corroborated, or a remote dispatch) keeps
+            # sharing the legacy budget: at most `max_enospc` full re-verifies,
+            # which matches the pre-2835 single retry only at max_enospc == 1.
+            # reverify_member_solo never sets retry_failed_only, so it always
+            # lands here; its budget is pinned by
             # orchestrator/tests/test_merge_queue_train_attribution.py::TestReverifyMemberSoloContract::test_persistent_infra_transient_red_earns_one_full_retry
             retries, budget = (
                 (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
@@ -2966,7 +2960,6 @@ async def _run_post_merge_verify(
     record_observation = functools.partial(
         _record_flake_observation, req=req, merge_sha=merge_sha,
         event_store=event_store, escalation_queue=escalation_queue,
-        task_client=task_client,
     )
     for superseded in superseded_observations:
         await record_observation(superseded)
@@ -3226,7 +3219,7 @@ async def _run_post_merge_verify(
                 # on (default True) the cross-check is a BLOCKING pre-land local
                 # re-verify, NOT a trailing detector; the halt is synchronous
                 # purely so it precedes any further adoption.  None-safe: only the
-                # production worker call site threads self.operator_halt.
+                # production worker call sites thread operator_halt.
                 #
                 # task 2886 amendment (reviewer robustness — bound the halt blast
                 # radius): only halt the WHOLE fleet when the local FAIL is a
@@ -4852,7 +4845,7 @@ def _inflight_worktree_is_stale(
     finalization while still in the ledger, the heartbeat pins its mtime fresh
     forever, ``age <= liveness_secs`` is permanently true, and every resubmit
     for that branch coalesces onto a corpse until the process restarts.
-    :func:`orchestrator.merge_liveness.newest_content_mtime` states the same
+    :func:`orchestrator.merge_lane.liveness.newest_content_mtime` states the same
     hazard for the in-flight verify no-progress budget ("the #1728 alpha
     owner-heartbeat ... can never mask a dead/hung verify subprocess"); this
     predicate is that treatment for the coalesce arm.
@@ -5486,6 +5479,10 @@ _COALESCE_TRAIN_ID_PREFIX = 'coalesce-'
 # event has one of these states is excluded from train formation.
 _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'})
 
+# Exclusion reason for a waiting single no TaskWorkflow awaits (task 4953):
+# nothing would park it merge-deferred, so a train holding it could never land.
+COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
+
 # How long a one-strike derail marker is remembered (task 5352).  An upper
 # bound on the subject, not a tuning dial: seven days is a generous outer
 # bound on a task's residency in the merge queue, and the marker must not
@@ -5504,9 +5501,13 @@ class _TrainMergeHost(Protocol):
     the narrow statement of what the train pipeline touches.
     """
 
-    # ── Git / event dependencies ──────────────────────────────────────────
+    # ── Git / event / verify / clock dependencies ─────────────────────────
     _git_ops: GitOps
     _event_store: EventStore | None
+    _verifier: VerifyPort
+    _clock: ClockPort
+    _runner_quarantine: set[str]
+    _escalation_queue: Any
 
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
@@ -5527,10 +5528,24 @@ class _TrainMergeHost(Protocol):
     # ── WIP halt / abandon helpers ────────────────────────────────────────
     def halt_for_wip(self, reason: str) -> None: ...
     def unhalt_wip(self, reason: str | None = None) -> None: ...
+    def operator_halt(self, reason: str) -> None: ...
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
 
+    # ── verify hosts ──────────────────────────────────────────────────────
+    def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator: ...
+    def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None: ...
+    async def _cancel_and_release_tracked(self, lease: HostLease | None) -> bool: ...
+    async def _teardown_verify_task(
+        self,
+        lease: Any | None,
+        verify_task: asyncio.Task[Any] | None,
+        task_id: str,
+        *,
+        shutdown_defensive: bool = False,
+    ) -> None: ...
+
     # ── restart drain (task 5371) ─────────────────────────────────────────
-    def _note_verify_started(self, request_id: str) -> None: ...
+    def _note_verify_started(self, request_id: str, *, host: str | None = None) -> None: ...
 
 
 async def reverify_member_solo(
@@ -6163,9 +6178,9 @@ async def build_chain(
         target_depth: How deep this round actually wants to go.
 
     Returns:
-        A :class:`~orchestrator.merge_types.ChainResult`.  A non-empty result
+        A :class:`~orchestrator.merge_lane.types.ChainResult`.  A non-empty result
         HOLDS its lane and the caller MUST release it via
-        :func:`~orchestrator.merge_liveness.release_chain_build_lane`; an
+        :func:`~orchestrator.merge_lane.liveness.release_chain_build_lane`; an
         empty result never holds one.
     """
     depth = min(len(queue_snapshot), cap, target_depth)
@@ -6950,6 +6965,158 @@ async def _advance_train(
         )
 
 
+# Until task 6106 lands, a remote MemoryMax kill reads as a red train verdict.
+_TRAIN_REMOTE_VERIFY_MAX_MEMBERS = 2
+
+
+class _TrainVerifyHost:
+    """The host a train's verifies run on: the slot it leased, or unleased local."""
+
+    def __init__(
+        self,
+        worker: _TrainMergeHost,
+        allocator: HostAllocator,
+        local_factory: Callable[[], LocalRunner],
+        lease: HostLease | None,
+        task_id: str,
+    ) -> None:
+        self._worker = worker
+        self._allocator = allocator
+        self._local_factory = local_factory
+        self._lease = lease
+        self._task_id = task_id
+
+    @classmethod
+    async def acquire(
+        cls, worker: _TrainMergeHost, req: GroupMergeRequest, merge_wt: Path,
+    ) -> _TrainVerifyHost:
+        """Lease a host slot for *req*, never waiting for one.
+
+        A train of more than ``_TRAIN_REMOTE_VERIFY_MAX_MEMBERS`` members takes
+        only the local slot. No free slot leaves the train unleased on local.
+        """
+        allocator = worker._ensure_host_allocator(req.config)
+        factory = functools.partial(_placeholder_local_runner, merge_wt, req, worker._verifier)
+        if len(req.member_task_ids) > _TRAIN_REMOTE_VERIFY_MAX_MEMBERS:
+            lease = allocator.acquire_local(factory)
+        else:
+            lease = await allocator.acquire(factory, policy=req.config.verify_host_policy)
+        return cls(worker, allocator, factory, lease, req.task_id)
+
+    @property
+    def name(self) -> str:
+        return self._allocator.local_name if self._lease is None else self._lease.name
+
+    @property
+    def runner(self) -> VerifyRunner | None:
+        """The remote to dispatch the verify to; None verifies on local."""
+        if self._lease is None or self._lease.is_local:
+            return None
+        return self._lease.runner
+
+    async def fall_back_to_local(self, reason: str) -> None:
+        """Bench the unreachable remote this train leased and move to local.
+
+        The remote is quarantined through the worker's INV-A chokepoint, so the
+        reprobe sweep can re-admit it. Local is leased when free, else unleased.
+        """
+        assert self._lease is not None and not self._lease.is_local, self._lease
+        await self._allocator.quarantine_and_release(self._lease)
+        self._worker._quarantine_unreachable_host(
+            self._lease.name, reason, self._worker._clock.now(),
+        )
+        self._lease = self._allocator.acquire_local(self._local_factory)
+
+    async def run_verify(
+        self, verify: Coroutine[Any, Any, MergeOutcome | None],
+    ) -> MergeOutcome | None:
+        """Run *verify* on this host as its own task.
+
+        Interrupted, the verify is aborted on its host and reaped through the
+        worker's teardown chokepoint while it is still live.
+        """
+        verify_task = asyncio.create_task(verify)
+        try:
+            await asyncio.wait({verify_task})
+        except BaseException:
+            await self._worker._teardown_verify_task(
+                self._lease, verify_task, self._task_id, shutdown_defensive=True,
+            )
+            raise
+        return verify_task.result()
+
+    async def release(self, *, aborted: bool) -> None:
+        """Give the slot back.
+
+        An *aborted* train's slot goes back through the worker's tracked
+        cancel-release: a refused cancel parks the slot until the host probes
+        clean, and a host that never does is quarantined. Any verify it held
+        was already aborted and reaped by :meth:`run_verify`.
+        """
+        if self._lease is None:
+            return
+        if aborted:
+            await self._worker._cancel_and_release_tracked(self._lease)
+        else:
+            await self._allocator.release(self._lease)
+
+
+@contextlib.asynccontextmanager
+async def _leased_train_verify(
+    worker: _TrainMergeHost, req: GroupMergeRequest, merge_wt: Path,
+) -> AsyncIterator[Callable[..., Awaitable[MergeOutcome | None]]]:
+    """Lease a verify host for *req* and yield its verify on that host.
+
+    The yielded callable is ``_run_post_merge_verify`` on the worker's
+    injected VerifyPort. A remote that turns out unreachable is benched and
+    the same verify re-runs on local. A verify interrupted mid-run is aborted
+    on its host and reaped through the worker's teardown chokepoint before
+    the slot is cancelled and released. The lease is held until the block
+    exits: released plainly on a normal exit, cancelled and released on any
+    exception.
+    """
+    verify_once = functools.partial(
+        _run_post_merge_verify,
+        timeouts=worker._post_merge_verify_timeouts,
+        enospc_retries=worker._post_merge_verify_enospc_retries,
+        max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+        max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+        max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+        narrowed_retries=worker._post_merge_verify_narrowed_retries,
+        event_store=worker._event_store,
+        quarantine=worker._runner_quarantine,
+        halt_hook=worker.operator_halt,
+        escalation_queue=worker._escalation_queue,
+        verifier=worker._verifier,
+    )
+    host = await _TrainVerifyHost.acquire(worker, req, merge_wt)
+
+    async def train_verify(*args: Any, **kwargs: Any) -> MergeOutcome | None:
+        # Every train verify, the CAS-retry re-verifies included, restarts
+        # the restart drain's deadline clock (task 5371).
+        worker._note_verify_started(req.request_id, host=host.name)
+        runner = host.runner
+        try:
+            return await host.run_verify(verify_once(*args, runner=runner, **kwargs))
+        except RunnerUnavailable as exc:
+            if runner is None:
+                raise
+            logger.warning(
+                'Train %s: verify host %s unreachable (%s); re-running the verify on local',
+                req.train_id, host.name, exc,
+            )
+            await host.fall_back_to_local(str(exc))
+            worker._note_verify_started(req.request_id, host=host.name)
+            return await host.run_verify(verify_once(*args, runner=host.runner, **kwargs))
+
+    try:
+        yield train_verify
+    except BaseException:
+        await host.release(aborted=True)
+        raise
+    await host.release(aborted=False)
+
+
 async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
@@ -7045,7 +7212,11 @@ async def _do_train_merge(
     (c) Merge — ``merge_to_main`` performs the --no-ff merge of the TIP branch
         (which, by stacking, already carries all member commits).
     (d) Workspace verify — ``run_scoped_verification`` with ``is_merge_verify=True``
-        enforces the workspace-wide post-merge green gate (scenario 5).
+        enforces the workspace-wide post-merge green gate (scenario 5).  It
+        runs on a host leased from the worker's allocator (a remote only for
+        trains of at most ``_TRAIN_REMOTE_VERIFY_MAX_MEMBERS`` members), or
+        unleased on local when no slot is free.  A transport fault on the
+        remote re-runs the verify on local and is never a derail.
     (e) CAS advance — :func:`_advance_train`'s bounded loop atomically
         updates the main ref, re-verifying a tip rebased onto a moved main
         (item 1) and retrying a lost CAS (item 5).
@@ -7194,11 +7365,12 @@ async def _do_train_merge(
             f'but merge_worktree is None'
         )
 
-    # (e) Workspace-wide post-merge verify via the shared helper.
+    # (e) Workspace-wide post-merge verify via the shared helper, on the
+    # worker's injected VerifyPort and a leased host (_leased_train_verify).
     # _run_post_merge_verify runs the pre-verify disk guard, the scoped
     # verification (with ENOSPC prune-retry), and the timeout loop-breaker
     # bookkeeping.  Returns None when verify passes; returns a MergeOutcome
-    # (and cleans up merge_wt) when any controlled failure fires.
+    # (and cleans up merge_wt) on a controlled failure.
     # Routing note (λ, task 2589, T1): this ultimately threads role='merge'
     # and force_workspace=req.config.merge_verify_workspace into
     # run_scoped_verification (via LocalRunner._run, verify_runner.py) —
@@ -7207,51 +7379,33 @@ async def _do_train_merge(
     # builds for role='merge': merge_verify_breadth=='full' fans out to
     # every REGISTERED module's full suite per-module; =='scoped' (the
     # shipped default) stays the pre-λ opaque global workspace command.
-    verify_once = functools.partial(
-        _run_post_merge_verify,
-        timeouts=worker._post_merge_verify_timeouts,
-        enospc_retries=worker._post_merge_verify_enospc_retries,
-        max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-        max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-        max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
-        narrowed_retries=worker._post_merge_verify_narrowed_retries,
-        event_store=event_store,
-        escalation_queue=getattr(worker, '_escalation_queue', None),
-        task_client=getattr(worker, '_flake_task_client', None),
-    )
+    async with _leased_train_verify(worker, req, merge_wt) as train_verify:
+        verify_outcome = await train_verify(git_ops, req, merge_wt, merge_sha=merge_commit)
+        if verify_outcome is not None:
+            return _derail_on_train_verify_failure(
+                event_store, req, verify_outcome, started_monotonic=t0,
+            )
 
-    async def train_verify(*args: Any, **kwargs: Any) -> MergeOutcome | None:
-        # Every train verify, the CAS-retry re-verifies included, restarts
-        # the restart drain's deadline clock (task 5371).
-        worker._note_verify_started(req.request_id)
-        return await verify_once(*args, **kwargs)
-
-    verify_outcome = await train_verify(git_ops, req, merge_wt, merge_sha=merge_commit)
-    if verify_outcome is not None:
-        return _derail_on_train_verify_failure(
-            event_store, req, verify_outcome, started_monotonic=t0,
+        # (f) CAS-advance main.
+        # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
+        # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
+        # Performance (amendment, task 2154): this costs one extra git subprocess
+        # per train CAS-advance. Nothing upstream in this function already holds
+        # a resolved tip SHA to reuse — rebase_onto_main returns bool only, and
+        # the raw MergeResult from merge_to_main has no branch_tip field (that
+        # field lives only on MergedOk, single-branch's classify_and_merge
+        # result; see git_ops.py:368). The resolve is therefore an accepted,
+        # intentional best-effort cost rather than a deferred TODO.
+        _train_branch_tip = await git_ops.resolve_branch_sha(req.branch.full_name)
+        train_advance = await _advance_train(
+            worker, req,
+            merge_commit=merge_commit,
+            merge_wt=merge_wt,
+            main_sha=main_sha,
+            branch_tip_sha=_train_branch_tip,
+            train_verify=train_verify,
+            started_monotonic=t0,
         )
-
-    # (f) CAS-advance main.
-    # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
-    # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
-    # Performance (amendment, task 2154): this costs one extra git subprocess
-    # per train CAS-advance. Nothing upstream in this function already holds
-    # a resolved tip SHA to reuse — rebase_onto_main returns bool only, and
-    # the raw MergeResult from merge_to_main has no branch_tip field (that
-    # field lives only on MergedOk, single-branch's classify_and_merge
-    # result; see git_ops.py:368). The resolve is therefore an accepted,
-    # intentional best-effort cost rather than a deferred TODO.
-    _train_branch_tip = await git_ops.resolve_branch_sha(req.branch.full_name)
-    train_advance = await _advance_train(
-        worker, req,
-        merge_commit=merge_commit,
-        merge_wt=merge_wt,
-        main_sha=main_sha,
-        branch_tip_sha=_train_branch_tip,
-        train_verify=train_verify,
-        started_monotonic=t0,
-    )
     if train_advance.reverify_failure is not None:
         return _derail_on_train_verify_failure(
             event_store, req, train_advance.reverify_failure, started_monotonic=t0,
@@ -8405,7 +8559,7 @@ def _alarm_illegal_lifecycle_transition(
     transition (merge-queue-reliability PRD scope-4 kappa / task 2169).
 
     Modeled verbatim on
-    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    :func:`orchestrator.merge_lane.request_ledger._alarm_merge_request_stuck`.
     Fires at most ONCE per open episode per request_id (dedup'd via
     ``has_open_l1``). Called by :meth:`SpeculativeMergeWorker._note_transition`
     when a wired put/pop call site's belief about an item's lifecycle state
@@ -9291,6 +9445,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         provenance_conflict_sink: Any = None,
         verifier: VerifyPort = PRODUCTION_VERIFIER,
         clock: ClockPort = PRODUCTION_CLOCK,
+        remote_runners: Sequence[VerifyRunner] | None = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
@@ -9376,37 +9531,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._shadow_state_path: Path | None = (
             _root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
         ) if _root is not None else None
-        # Task ζ (PRD §5.9): the task client `_run_post_merge_verify` threads to the
-        # flake recorder, so a suppressed merge red acquires a de-flake task AT WRITE
-        # TIME.  Built here because this is the only scope holding both a scheduler
-        # and a project root; `Any` deliberately, so the worker's "never imports the
-        # scheduler" layering note stays honest — the adapter is duck-typed over
-        # `dispatch_tool` exactly as `_dry_run_handles` is over its handles.
-        #
-        # No import cycle: `chronic_flake` imports only `config`/`shared`, never
-        # `merge_queue`.  It is REUSED rather than re-derived because task 2358
-        # already built this adapter over the same seam and ζ only needed it to grow
-        # `get_statuses`/`commit_planning` — a second client would be the
-        # two-implementations-that-must-agree drift INV-5 exists to prevent.
-        #
-        # None on a bare-harness worker (no scheduler) or a mock git_ops with no
-        # project_root, mirroring `_shadow_state_path` above.  The recorder then
-        # opens no debt row at all rather than an unowned one — see
-        # `orchestrator/src/orchestrator/flake_recorder.py::record_merge_flake_suppression`.
-        #
-        # Read at TWO sites: `_run_inflight_verify`'s `_run_post_merge_verify`
-        # dispatch (the VERIFY HALF of `_verify_and_advance` — grep the former, it
-        # is the name that exists), and `_do_train_merge`'s (via `getattr`, since it takes the narrow
-        # `_TrainMergeHost` Protocol).  Both are covered by
-        # `orchestrator/tests/test_merge_queue_flake_recorder.py::TestWorkerBuildsTheFlakeTaskClient`
-        # — this construction is the one seam whose failure mode is SILENT (a site that
-        # never supplies a client stops enforcing §5.9 with nothing anywhere going red),
-        # so "the parameter is honoured" is not the same test as "the worker supplies it".
-        self._flake_task_client: Any = (
-            chronic_flake.SchedulerChronicFlakeTaskClient(scheduler, _root)
-            if scheduler is not None and _root is not None
-            else None
-        )
         # Drift-check cadence persistence (task 2886 fix 1a) — same None-safe
         # project_root-derived pattern as _shadow_state_path above.  Persisting
         # the drift land counter here (authoritative over the in-memory
@@ -9626,6 +9750,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # each of a train's inline verifies starts: where the restart drain
         # measures a verify's deadline from.
         self._phase_started: dict[str, float] = {}
+        # The host each train's current inline verify runs on, beside its
+        # _phase_started stamp and retired with it.
+        self._train_verify_host: dict[str, str] = {}
         # Cross-workflow auto-heal attempt counter; shared via
         # self.merge_worker on TaskWorkflow instances.
         self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
@@ -9719,6 +9846,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # None until first _ensure_host_allocator(config) call — lazily built
         # because config arrives per-MergeRequest, not at __init__ time.
         self._host_allocator: HostAllocator | None = None
+        # Tests supply verify hosts here; production builds them from config.
+        self._remote_runners: tuple[VerifyRunner, ...] | None = (
+            None if remote_runners is None else tuple(remote_runners)
+        )
         # γ in-flight deque: ordered list of InflightEntry objects dispatched to hosts.
         # Finalized strictly in submission order (head-first).  Empty when single-host
         # (finalize drains before the next dispatch) → byte-identical serial behaviour.
@@ -10067,6 +10198,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._note_verify_started(request_id)
         elif from_state in _RESTAMPED_STATES:
             self._phase_started.pop(request_id, None)
+            self._train_verify_host.pop(request_id, None)
         if live_obj is not None:
             self._live_items[request_id] = live_obj
 
@@ -10654,13 +10786,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The allocator shares ``self._runner_quarantine`` by reference so
         HostAllocator-driven (RunnerUnavailable) and DriftDetector-driven
         quarantines share one source of truth.
+
+        The remotes are the constructor's ``remote_runners`` when it was given
+        them, and are built from *config* otherwise.
         """
         if self._host_allocator is not None:
             return self._host_allocator
         project_root = getattr(self._git_ops, 'project_root', None)
         if project_root is not None:
-            remotes = _build_remote_runners(
-                config, project_root, quarantine=self._runner_quarantine
+            remotes = list(self._remote_runners) if self._remote_runners is not None else (
+                _build_remote_runners(config, project_root, quarantine=self._runner_quarantine)
             )
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine
@@ -13485,14 +13620,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._admission_halt_reason = None
         self._signal_resume()
 
-    def _note_verify_started(self, request_id: str) -> None:
+    def _note_verify_started(self, request_id: str, *, host: str | None = None) -> None:
         """Stamp now as the start of *request_id*'s current verify (task 5371).
 
         Called on every entry into a ``_RESTAMPED_STATES`` state and before
         each verify a train runs inline, so a deadline is always measured
-        from the verify actually running.
+        from the verify actually running. A train names the *host* that
+        verify runs on.
         """
         self._phase_started[request_id] = self._clock.now()
+        if host is None:
+            self._train_verify_host.pop(request_id, None)
+        else:
+            self._train_verify_host[request_id] = host
 
     def _verifies_in_flight(self, now: float) -> list[VerifyInFlight]:
         """Every merge verify a restart would kill now, on any host (task 5371).
@@ -13524,7 +13664,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             is_train = isinstance(request, GroupMergeRequest)
             found.append(VerifyInFlight.for_request(
                 request,
-                host=LocalRunner.name if is_train else None,
+                host=self._train_verify_host.get(rid, LocalRunner.name) if is_train else None,
                 kind=VerifyInFlightKind.held(state.value, is_train=is_train),
                 started_ts=self._phase_started.get(rid, now),
             ))
@@ -14032,7 +14172,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_queue``/``_inflight``, never halts the pipeline.  See
         ``merge_request_ledger.py``'s module docstring for the ledger
         lifecycle this sweeps, and
-        :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`
+        :func:`orchestrator.merge_lane.request_ledger._alarm_merge_request_stuck`
         for the dedup'd-escalation contract.
 
         ``threshold_s`` defaults to ``None``, resolved in-body to 1.5 ×
@@ -14040,7 +14180,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         past the cold-verify ceiling, so anything still unresolved past it is
         definitively stuck).  Read from the module global at call time, so a
         test's string-path monkeypatch of
-        ``orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
+        ``orchestrator.merge_lane.worker.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
         stays effective.
 
         The WARNING log line is dedup'd exactly like the escalation: at most
@@ -15223,64 +15363,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             len(member_task_ids), member_task_ids,
         )
 
+    async def _unwind_coalesce_train(self, train: GroupMergeRequest, main_sha: str) -> None:
+        """Hand back every member of a coalesce train that did not land (task 4953).
+
+        Each stacked member first goes back on its pre-stack tip
+        (``orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py::restore_pre_stack_tips``);
+        then the 1867 re-drive sends each still-deferred member to a solo
+        merge.  In that order because the re-drive flips members to pending
+        and the scheduler may re-dispatch them at once.  The one policy for
+        every exit of a coalesce train that does not land: derail, incomplete
+        train and admission-halt dissolution.  Never raises.
+        """
+        await restore_pre_stack_tips(self._git_ops, train)
+        try:
+            await self._redrive_coalesce_members(train, main_sha)
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
+                '— members may remain stranded', train.train_id,
+            )
+
     async def _redrive_coalesce_members(
         self, req: GroupMergeRequest, main_sha: str,
     ) -> None:
-        """Re-drive absorbed members still merge-deferred after a coalesce-train derail.
+        """Re-drive absorbed members still merge-deferred after a coalesce train
+        does not land; see ``orchestrator/src/orchestrator/merge_lane/member_redrive.py::MemberRedriver.redrive``.
 
-        For each member task still in 'merge-deferred' status (per req.status_check):
-          - If the member's branch is already an ancestor of main (double-landing
-            guard: a partner's merge brought it in), delegate to the shared
-            :func:`~orchestrator.landing_evidence.validate_landing_evidence`
-            helper (DISCOVERY mode, task 2678) to discover and attribute the
-            citation commit and confirm its effect is still present at main
-            HEAD. An ACCEPTED verdict marks the member done with
-            found_on_main provenance via
-            ``req.redrive_member(mid, True, verdict.evidence_sha)``. A
-            REJECTED verdict (no citation, a lineage mismatch, or the
-            task-1175 reverted-merge shape) is no longer silently anchored
-            on ``main_sha`` — the retired ``resolve_branch_sha(...) or
-            main_sha`` fallback fabricated provenance whenever
-            ``resolve_branch_sha`` came up empty. It now files a
-            dedup-guarded 'provenance_unattributed' escalation via
-            :meth:`_file_unattributed_landing_escalation` and flips the
-            member to pending (``req.redrive_member(mid, False, None)``) so
-            a fresh solo-merge re-attributes it.
-          - Otherwise (branch not an ancestor of main) flip it to 'pending'
-            via req.redrive_member(mid, False, None) so the scheduler
-            re-dispatches a fresh solo-merge workflow that owns the
-            merge-deferred→done transition.  The member is first un-stacked
-            from any unlanded base (:meth:`_unstack_redriven_member`, task
-            5618), so neither the re-dispatched agent nor its reviewer sees
-            another task's commits.
-
-        Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
-        are left alone — the live workflow owns their done-transition.
-
-        Per-member try/except ensures one member failure never aborts the rest or
-        kills the merger loop.  req.redrive_member=None is a back-compat no-op.
-
-        A ``StaleEvidenceRejection`` (task 2677) — the found_on_main
-        provenance-integrity gate refusing this member's done-write because
-        its evidence predates the task's most recent ``reopen_at`` — is
-        routed to ``self._provenance_conflict_sink`` (a dedupe-guarded,
-        born-at-L2 escalation) instead of falling into the generic
-        log-and-continue branch below, which would otherwise silently
-        swallow the rejection and re-attempt it on the next derail. Either
-        way the member is left un-flipped and the remaining members are
-        still processed. A ``should_skip`` pre-check (reviewer_comprehensive
-        amendment) guards the ``on_main`` re-drive attempt itself, so once a
-        member is memoized as a provenance conflict a later derail skips
-        straight past it instead of re-attempting the already-rejected
-        write — only the escalation's ``dedupe_count`` folded on repeat
-        derails before this pre-check existed. Like
-        :func:`reconcile_landed_row`, this call omits ``reopen_at`` (no
-        cheap task-metadata access from this worker) so it self-heals only
-        via the escalation-resolved invalidation arm — same known
-        limitation and same operator runbook (resolve the pending
-        ``provenance_conflict`` escalation; no task re-pend needed), see
-        that function's docstring (reviewer_comprehensive amendment, task
-        2677, robustness_self_heal_gap).
+        A member :meth:`_unwind_coalesce_train` already put back on its
+        pre-stack tip has no stack record left, so the un-stack leaves it
+        there.  req.redrive_member=None is a back-compat no-op.
         """
         if req.redrive_member is None:
             logger.warning(
@@ -15289,154 +15400,96 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 req.train_id,
             )
             return
+        await self._member_redriver().redrive(
+            req.train_id, req.member_task_ids,
+            status_check=req.status_check,
+            redrive_member=req.redrive_member,
+            strip_unlanded_base=True,
+        )
 
-        statuses = await req.status_check(req.member_task_ids)
-        deferred_mids = [
-            mid for mid in req.member_task_ids
-            if statuses.get(mid) == 'merge-deferred'
-        ]
-
-        for mid in deferred_mids:
-            try:
-                branch = f'{self._git_ops.config.branch_prefix}{mid}'
-                on_main = await self._git_ops.is_ancestor(
-                    branch, self._git_ops.config.main_branch,
-                )
-                if on_main:
-                    # reviewer_comprehensive amendment (task 2677): without
-                    # this pre-check, a member memoized as a provenance
-                    # conflict would have its doomed done-write re-attempted
-                    # on EVERY subsequent derail — only the escalation (via
-                    # dedupe_count) was deduped, not the write itself. Skip
-                    # straight to the next member instead.
-                    if (
-                        self._provenance_conflict_sink is not None
-                        and self._provenance_conflict_sink.should_skip(mid)
-                    ):
-                        logger.info(
-                            'Coalesce train %s: member %s already memoized '
-                            'as a provenance conflict — skipping re-drive '
-                            'attempt this derail',
-                            req.train_id, mid,
-                        )
-                        continue
-                    branch_tip = await self._git_ops.resolve_branch_sha(branch)
-                    verdict = await validate_landing_evidence(
-                        self._git_ops, mid, branch,
-                        branch_tip_sha=branch_tip,
-                        pattern_template=self._git_ops.config.commit_citation_pattern,
-                    )
-                    if verdict.accepted:
-                        await req.redrive_member(mid, True, verdict.evidence_sha)
-                        logger.info(
-                            'Coalesce train %s: member %s already on main — '
-                            'marked done (found_on_main, sha=%s)',
-                            req.train_id, mid, verdict.evidence_sha,
-                        )
-                    else:
-                        self._file_unattributed_landing_escalation(mid, branch, verdict)
-                        await req.redrive_member(mid, False, None)
-                        logger.info(
-                            'Coalesce train %s: member %s on main but landing '
-                            'evidence unattributable (reason=%s) — escalated, '
-                            'flipped to pending for solo-merge re-dispatch',
-                            req.train_id, mid, verdict.reason,
-                        )
-                else:
-                    await self._unstack_redriven_member(req.train_id, mid)
-                    await req.redrive_member(mid, False, None)
-                    logger.info(
-                        'Coalesce train %s: member %s not on main — '
-                        'flipped to pending for solo-merge re-dispatch',
-                        req.train_id, mid,
-                    )
-            except StaleEvidenceRejection as exc:
-                if self._provenance_conflict_sink is not None:
-                    self._provenance_conflict_sink.record_from_rejection(
-                        exc, gate_source='coalesce-redrive',
-                    )
-                logger.warning(
-                    'Coalesce train %s: member %s hit done_evidence_stale — '
-                    'evidence %s (%s) predates reopen_at %s; filed '
-                    'provenance_conflict escalation instead of re-driving',
-                    req.train_id, mid, exc.evidence_commit,
-                    exc.evidence_committed_at, exc.reopen_at,
-                )
-            except Exception:
-                logger.exception(
-                    'Coalesce train %s: re-drive failed for member %s — '
-                    'continuing with remaining members',
-                    req.train_id, mid,
-                )
-
-    async def _unstack_redriven_member(self, train_id: str, mid: str) -> None:
-        """Strip an unlanded stack base from a derailed member before re-drive.
-
-        Never raises, so the re-drive that follows always runs: a member left
-        merge-deferred with no workflow is stranded.  A member that cannot be
-        un-stacked is re-driven anyway; its solo merge admission un-stacks it
-        again, and blocks with the attributed reason if it still cannot.
-        """
-        try:
-            result = await self._git_ops.unstack_from_unlanded_base(
-                f'{self._git_ops.config.branch_prefix}{mid}',
-            )
-        except Exception:
-            logger.exception(
-                'Coalesce train %s: un-stacking member %s raised — re-driving '
-                'it anyway; its solo merge admission un-stacks it again',
-                train_id, mid,
-            )
-            return
-        if result.outcome is UnstackOutcome.UNSTACKED:
-            logger.info(
-                'Coalesce train %s: member %s un-stacked before re-drive',
-                train_id, mid,
-            )
-        elif result.stops_merge:
-            logger.warning(
-                'Coalesce train %s: member %s re-driven still stacked; its solo '
-                'merge admission will block with: %s',
-                train_id, mid, result.merge_block_reason(),
-            )
-
-    def _file_unattributed_landing_escalation(
-        self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,
-    ) -> None:
-        """Best-effort, dedup-guarded L1 escalation for unattributable
-        coalesce re-drive landing evidence (task 2678, INV-5).
-
-        Filed when :meth:`_redrive_coalesce_members` finds a member's
-        branch already an ancestor of main but
-        :func:`validate_landing_evidence` rejects the landing evidence (no
-        citation, a lineage mismatch, or an effect-absent reverted merge).
-        Non-status-blocking: the member is simply flipped to pending by the
-        caller, not held in any blocked state, and re-evaluated by its next
-        solo-merge dispatch.
-
-        Best-effort (a no-op when ``_escalation_queue`` is None, e.g. bare-
-        worker unit tests) and deduped via ``has_open_l1`` so repeated
-        coalesce derails re-observing the same unattributable evidence
-        don't stack duplicate L1s.
-
-        Delegates the actual filing (queue-None guard, dedup, ``Escalation``
-        construction, submit/log/except shape) to the shared
-        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
-        (task 2678 amendment, INV-5) — this method now only supplies
-        ``agent_role``, the one thing that distinguishes it from
-        ``Harness``'s equivalent method.
-        """
-        file_unattributed_landing_escalation(
-            self._escalation_queue, task_id, branch, verdict,
+    def _member_redriver(self) -> MemberRedriver:
+        """Built per call, so it always sees the worker's current collaborators."""
+        return MemberRedriver(
+            git_ops=self._git_ops,
+            provenance_conflict_sink=self._provenance_conflict_sink,
+            escalation_queue=self._escalation_queue,
             agent_role='orchestrator-merge-worker',
         )
 
+    def train_member_ids_in_custody(self) -> frozenset[str]:
+        """Every member of a train this lane still holds.  A held train decides
+        each member's fate on its own exit, so none of them is abandoned."""
+        return frozenset(
+            mid
+            for obj in self._live_items.values()
+            if isinstance(request := _request_of(obj), GroupMergeRequest)
+            for mid in request.member_task_ids
+        )
+
+    async def redrive_abandoned_members(
+        self, label: str, member_ids: Sequence[str], *, strip_unlanded_base: bool,
+    ) -> dict[str, MemberRedriveOutcome]:
+        """Re-drive parked members no train holds, through this worker's own
+        train callbacks (task 4737).  A member a live train holds is refused."""
+        factory = self._train_callback_factory
+        if factory is None:
+            raise RuntimeError(
+                'redrive_abandoned_members needs a train_callback_factory: without one '
+                'the lane has no scheduler to hand a parked member back to'
+            )
+        callbacks = factory(label)
+        if callbacks.redrive_member is None:
+            raise RuntimeError(
+                f'train_callback_factory built no redrive_member for {label}: '
+                'a parked member can only be handed back through it'
+            )
+        custody = self.train_member_ids_in_custody()
+        held = [mid for mid in member_ids if mid in custody]
+        if held:
+            logger.warning(
+                'Train %s: members %s are held by a live train — not re-driving them',
+                label, held,
+            )
+        outcomes = await self._member_redriver().redrive(
+            label, [mid for mid in member_ids if mid not in custody],
+            status_check=callbacks.status_check,
+            redrive_member=callbacks.redrive_member,
+            strip_unlanded_base=strip_unlanded_base,
+        )
+        return dict.fromkeys(held, MemberRedriveOutcome.HELD_BY_LIVE_TRAIN) | outcomes
+
+    def _coalesce_exclusion_reason(self, candidate: MergeRequest) -> str | None:
+        """Why the coalescing pass must leave *candidate* solo, or None.
+
+        The capability precondition comes first and outside the injectable
+        merge-ready predicate, so no injected predicate can readmit a single
+        that no workflow would park merge-deferred.
+        """
+        if not candidate.awaited_by_workflow:
+            return COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW
+        predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
+        try:
+            return predicate(candidate)
+        except Exception:  # noqa: BLE001
+            # An injected predicate raised — degrade gracefully: log the
+            # error and treat the candidate as eligible so a buggy closure
+            # does not kill the merger loop.  The default predicate is
+            # fire-safe (latest_merge_finalized swallows its own errors).
+            logger.exception(
+                'Coalesce predicate raised for request_id=%s task_id=%s '
+                'branch=%s; treating as eligible (safe-degrade)',
+                candidate.request_id, candidate.task_id, candidate.branch.bare_id,
+            )
+            return None
+
     def _default_coalesce_exclusion_reason(self, req: MergeRequest) -> str | None:
-        """Built-in merge-ready predicate (δ/1720 confidence gate).
+        """Built-in merge-ready predicate (δ/1720 confidence gate): the RISK signals.
 
         Returns an exclusion REASON string (truthy → exclude from coalescing) or
-        None (eligible).  Signals implemented here use only worker-reachable
-        substrate (no scheduler import):
+        None (eligible).  The capability precondition — a workflow awaits the
+        request — is checked before this, outside the injectable seam
+        (:meth:`_coalesce_exclusion_reason`).  Signals implemented here use only
+        worker-reachable substrate (no scheduler import):
 
           1. One-strike registry (cheapest — check first):
              If req.task_id is in self._coalesce_derailed_task_ids (a prior
@@ -15510,25 +15563,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Nothing journals a train and its absorbed singles have already left
         the journal, so a restart that drops an unstarted coalesce train
-        strands every member merge-deferred (task 4737 owns that in general).
+        strands every member merge-deferred (recovered in general by
+        ``orchestrator/src/orchestrator/merge_deferred_recovery.py::AbandonedMemberSweep``).
         Under an admission halt such a train can never start before the
-        restart, so it is dissolved first through the 1867 derail-recovery
-        re-drive: each still-deferred member goes done when already on main
-        and back to pending otherwise. Not a derail: no one-strike mark and
-        no derail event.
+        restart, so it is dissolved first through
+        :meth:`_unwind_coalesce_train`: each member goes back on its
+        pre-stack tip, then each still-deferred member goes done when already
+        on main and back to pending otherwise. Not a derail: no one-strike
+        mark and no derail event.
         """
         logger.warning(
             'Coalesce train %s: admission halted before its verify started; '
             'dissolving it and re-driving members %s to solo merges',
             train.train_id, train.member_task_ids,
         )
-        try:
-            await self._redrive_coalesce_members(train, main_sha)
-        except Exception:
-            logger.exception(
-                'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
-                '— members may remain stranded', train.train_id,
-            )
+        await self._unwind_coalesce_train(train, main_sha)
         if not train.result.done():
             train.result.set_result(MergeOutcome('superseded', reason=_COALESCE_DISSOLVED_REASON))
         self._retire_item(train.request_id)
@@ -15696,29 +15745,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._last_coalesce_signature = sig
 
         # ── δ/1720: merge-ready exclusion filter ──────────────────────────────
-        # Split structural candidates into eligible + exclusions.  The predicate
-        # returns a REASON string (truthy → exclude) or None (eligible).
-        # Run AFTER recording the debounce signature (keyed on the structural
-        # waiting set) so risk signals — which are monotonic within a process —
-        # only re-evaluate when the structural set changes, avoiding per-tick
-        # event-store reads.
-        predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
+        # Split structural candidates into eligible + exclusions.  Each REASON
+        # string (truthy → exclude) or None (eligible) comes from
+        # _coalesce_exclusion_reason.  Run AFTER recording the debounce
+        # signature (keyed on the structural waiting set) so risk signals —
+        # which are monotonic within a process — only re-evaluate when the
+        # structural set changes, avoiding per-tick event-store reads.
         eligible: list[MergeRequest] = []
         exclusions: list[dict[str, str]] = []
         for _c in candidates:
-            try:
-                _reason = predicate(_c)
-            except Exception:  # noqa: BLE001
-                # An injected predicate raised — degrade gracefully: log the
-                # error and treat the candidate as eligible so a buggy closure
-                # does not kill the merger loop.  The default predicate is
-                # fire-safe (latest_merge_finalized swallows its own errors).
-                logger.exception(
-                    'Coalesce predicate raised for request_id=%s task_id=%s '
-                    'branch=%s; treating as eligible (safe-degrade)',
-                    _c.request_id, _c.task_id, _c.branch.bare_id,
-                )
-                _reason = None
+            _reason = self._coalesce_exclusion_reason(_c)
             if _reason:
                 exclusions.append({'request_id': _c.request_id, 'reason': _reason})
                 logger.info(
@@ -15834,6 +15870,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             status_check=callbacks.status_check,
             mark_member_done=callbacks.mark_member_done,
             redrive_member=callbacks.redrive_member,
+            member_pre_stack_tips=stack_result.pre_stack_tips,
         )
         # MQ-reliability kappa (task 2169): group_req is a brand-new
         # request_id (GroupMergeRequest.request_id auto-generated at
@@ -15854,9 +15891,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         new_buffer.append(group_req)
         self._lane_buffers['normal'] = new_buffer
 
-        # RESOLVE absorbed futures: park each absorbed workflow as merge-deferred.
-        # The existing workflow._handle_superseded consumer (α/1717) transitions
-        # the task; mark_member_done flips it done after the train lands.
+        # RESOLVE absorbed futures: every absorbed single is workflow-awaited by
+        # construction (_coalesce_exclusion_reason), so its workflow's
+        # _handle_superseded consumer (α/1717) parks the task merge-deferred;
+        # mark_member_done flips it done after the train lands.
         # Detached/cancelled requests were filtered from candidates in step 1, so
         # no set_result is ever called on a cancelled future here.
         for s_req in survivor_reqs:
@@ -16127,7 +16165,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             if outcome.status in _COALESCE_RISKY_TERMINAL_STATES:
                                 self._mark_coalesce_derailed(req.member_task_ids)
                             # 1867: durable re-drive — re-drive any absorbed members
-                            # that are still merge-deferred to solo merge.  Gated on
+                            # that are still merge-deferred to solo merge, after
+                            # handing each back on its pre-stack tip (task 4953,
+                            # _unwind_coalesce_train).  Gated on
                             # outcome != 'done' (success path owns all member flips).
                             # Broader than _COALESCE_RISKY_TERMINAL_STATES: the
                             # per-member is_ancestor guard makes all non-done outcomes
@@ -16154,14 +16194,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # TRAIN_PARTIAL_FLIP.  Covering the done-path gap is a
                             # follow-up task.
                             if outcome.status != 'done':
-                                try:
-                                    await self._redrive_coalesce_members(req, actual_main)
-                                except Exception:
-                                    logger.exception(
-                                        'Coalesce train %s: _redrive_coalesce_members '
-                                        'raised unexpectedly — members may remain stranded',
-                                        req.train_id,
-                                    )
+                                await self._unwind_coalesce_train(req, actual_main)
                         _train_decided_item = DecidedItem(
                             request=req,
                             base_sha=actual_main, speculative=False,
@@ -17826,12 +17859,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """THE cancel-release chokepoint: release the lease, RECORD a strand.
 
         Sole caller of ``HostAllocator.cancel_and_release`` — enforced by
-        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its six call
+        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its seven call
         sites are the two ``stop()`` drains (finalizing head and ``_inflight``),
         the head-failure cascade's in-body release,
         :meth:`_resolve_and_release` with ``cancel_lease=True``,
-        :meth:`_finalize_inflight`'s ``_cancel_release`` path, and
-        :meth:`_vacate_inflight_entry` (task 4582).
+        :meth:`_finalize_inflight`'s ``_cancel_release`` path,
+        :meth:`_vacate_inflight_entry` (task 4582), and an aborted train's
+        lease (``_TrainVerifyHost.release``, task 6160).
 
         MECHANISM (task 3043, reify 2026-07-25).  Against an unreachable host
         ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
@@ -17914,13 +17948,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The sole caller of BOTH steps — :meth:`_abort_remote_verify` and
         ``verify_task.cancel()`` — enforced by
         test_merge_queue_concurrent_verify.py's
-        ``TestVerifyTeardownChokepoint``. Its SEVEN callers are the two
+        ``TestVerifyTeardownChokepoint``. Its EIGHT callers are the two
         ``stop()`` drain paths (finalizing head and ``_inflight``), the
         head-failure cascade, the three ``_run_inflight_verify`` abort triggers
-        (sole-waiter abandon, operator halt, dead-verify no-progress), and —
-        added by task 3043 — ``_run_inflight_verify``'s ``finally`` orphan
-        guard, which reaps the inner verify task on any exit route the three
-        abort triggers do not cover (in practice: external cancellation).
+        (sole-waiter abandon, operator halt, dead-verify no-progress),
+        ``_run_inflight_verify``'s ``finally`` orphan guard (task 3043), which
+        reaps the inner verify task on any exit route the three abort triggers
+        do not cover (in practice: external cancellation), and a train's
+        verify interrupted mid-run (``_TrainVerifyHost.run_verify``, task 6160).
 
         ORDER IS LOAD-BEARING, and sole-callership is what now guarantees it.
         The remote cancel must fire while ``_inflight_request_id`` is still
@@ -18336,7 +18371,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             verified tree has a smallest truthful value of 1, so the shim /
             harness / direct-call paths that omit it stay byte-identical in
             meaning as well as in behaviour.
-        chain: A non-empty :class:`~orchestrator.merge_types.ChainResult` from
+        chain: A non-empty :class:`~orchestrator.merge_lane.types.ChainResult` from
             :meth:`_deep_chain_placement` (task 3185, PRD γ) — the DEEP-CHAIN
             REDIRECT, and the capability that separates γ from task 2359's
             probe.  ``probe_base`` directly above is a RELABEL: it changes the
@@ -18356,7 +18391,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                :func:`_acquire_warm_verify_worktree` would take a DIFFERENT
                lane, re-check-out a DIFFERENT commit, and can resolve to the
                serial ``_merge-verify`` lane that
-               :func:`~orchestrator.merge_liveness.acquire_chain_build_lane`
+               :func:`~orchestrator.merge_lane.liveness.acquire_chain_build_lane`
                explicitly refuses (DF-3071).  ``_is_warm_path`` therefore comes
                from ``chain.lane_warm``, and ``_verify_attempt_count`` (staged
                inside that block) is left untouched — an attempt that never
@@ -18524,7 +18559,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ordinary arm owns an ephemeral (or warm-swapped) merge worktree and
             routes through :meth:`_release_or_cleanup`, while the chain arm is
             sitting in a POOL-OWNED ``_spec-`` lane that must go back through
-            :func:`~orchestrator.merge_liveness.release_chain_build_lane`.
+            :func:`~orchestrator.merge_lane.liveness.release_chain_build_lane`.
             Handing a chain lane to ``_release_or_cleanup`` with
             ``spec_warm=False`` would ``git worktree remove`` a pooled lane —
             a permanently lost slot, and the exact hazard
@@ -18617,7 +18652,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             main_sha = item.base_sha if probe_base is None else probe_base
             verify_base = VerifyBaseFacts(
                 main_sha=main_sha,
-                merge_base_sha=await _resolve_dispatch_time_merge_base(
+                merge_base_sha=await resolve_dispatch_time_merge_base(
                     req.config.project_root, main_sha, item.merged_branch_tip,
                 ),
             )
@@ -18640,7 +18675,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
-                task_client=self._flake_task_client,
                 # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
                 # all-lane halt so a CONCLUDED cross-check divergence stops the
                 # queue the instant it is detected — BEFORE any further adoption —
@@ -21673,21 +21707,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         def _local_factory() -> LocalRunner:
             assert _item_for_factory.merge_wt is not None, \
                 'dispatch path: merge_wt must be non-None for a real item'
-            return LocalRunner(
-                _item_for_factory.merge_wt,
-                _req_for_factory.config,
-                # Same γ resolution as the merge boundary (PRD §8.2), through
-                # the SAME wrapper so the zero-module policy matches too: keep
-                # this slot/health placeholder consistent with the runner that
-                # actually drives the verify, so the two can never disagree
-                # about which modules a merge covers.
-                _merge_boundary_module_configs(
-                    _req_for_factory.config, _req_for_factory.module_configs,
-                ),
-                None,   # task_files — derived inside _run_post_merge_verify
-                run_scoped=self._verifier.run_scoped,
-                run_unscoped=self._verifier.run_unscoped_typechecks,
-                task_id=_req_for_factory.task_id,
+            return _placeholder_local_runner(
+                _item_for_factory.merge_wt, _req_for_factory, self._verifier,
             )
 
         lease = await allocator.acquire(_local_factory, policy=req.config.verify_host_policy)
@@ -22013,7 +22034,7 @@ def _alarm_resource_audit(
     """Submit a dedup'd L1 escalation for persisting resource-conservation violations.
 
     Modeled verbatim on
-    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    :func:`orchestrator.merge_lane.request_ledger._alarm_merge_request_stuck`.
     Fires at most ONCE while an L1 escalation is open for
     :data:`_RESOURCE_AUDIT_SENTINEL`. Callers (see
     ``SpeculativeMergeWorker._check_resource_audit``) only invoke this after

@@ -219,12 +219,26 @@ class TestBuildPairwisePriceTable:
 # over the UNION of configs (retiring the all-tasks-intersection collapse).
 # ---------------------------------------------------------------------------
 
+def _session_limit_records():
+    """The ``invocation_errors`` an architect refused by a session cap persists."""
+    from orchestrator.evals.measurement import (
+        MeasurementStage,
+        Unmeasured,
+        UnmeasuredCause,
+    )
+
+    return [Unmeasured(
+        MeasurementStage.ARCHITECT, UnmeasuredCause.CAP_HIT, 'session limit',
+        cost_usd=0.0,
+    ).to_record()]
+
+
 def _mresult(
     task_id, config_name, trial, *, quality, cost_usd, duration_ms,
     tests_pass: bool | None = True, cost_source='price_table', recovery_score=None,
     plan_quality=None, role_under_test='implementer', plan_steps=0,
     judge_invocations=0, judge_cost_usd=0.0,
-    cap_tainted=False, invocation_error=None,
+    cap_tainted=False, invocation_errors=None,
     judged_without_reference=False,
 ):
     """Build a synthetic EvalResult with a production-shaped metrics dict.
@@ -250,7 +264,7 @@ def _mresult(
         judge_invocations=judge_invocations,
         judge_cost_usd=judge_cost_usd,
         cap_tainted=cap_tainted,
-        invocation_error=invocation_error,
+        invocation_errors=invocation_errors,
         judged_without_reference=judged_without_reference,
     )
     return EvalResult(
@@ -401,7 +415,7 @@ class TestBuildCompositeReport:
             _mresult('f1', 'capped-first', 1, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=None, cap_tainted=True,
-                     invocation_error='architect:cap_hit: session limit'),
+                     invocation_errors=_session_limit_records()),
             _mresult('f1', 'capped-first', 2, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=0.82, plan_steps=6),
@@ -432,11 +446,11 @@ class TestBuildCompositeReport:
             _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=None, cap_tainted=True,
-                     invocation_error='architect:cap_hit: session limit'),
+                     invocation_errors=_session_limit_records()),
             _mresult('f1', 'mixed', 2, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='implementer',
                      plan_quality=None, cap_tainted=True,
-                     invocation_error='architect:cap_hit: session limit'),
+                     invocation_errors=_session_limit_records()),
             _mresult('f1', 'mixed', 3, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=0.6, plan_steps=6),
@@ -545,7 +559,7 @@ class TestBuildCompositeReport:
             _mresult('f1', 'capped', 1, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
                      plan_quality=None, cap_tainted=True,
-                     invocation_error='architect:cap_hit: session limit',
+                     invocation_errors=_session_limit_records(),
                      judged_without_reference=True),
             _mresult('f2', 'capped', 1, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
@@ -697,7 +711,7 @@ def _arch(task_id, config_name, trial, *, plan_quality, cost_usd, duration_ms,
         tests_pass=None, role_under_test='architect',
         plan_quality=plan_quality, plan_steps=plan_steps,
         cap_tainted=cap_tainted,
-        invocation_error='architect:cap_hit: session limit' if cap_tainted else None,
+        invocation_errors=_session_limit_records() if cap_tainted else None,
     )
 
 

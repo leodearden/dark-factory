@@ -1354,6 +1354,7 @@ def _run_single_eval(
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.report import (
         build_plan_quality_report,
+        format_invocation_errors,
         format_plan_quality_table,
     )
     from orchestrator.evals.runner import (
@@ -1405,7 +1406,8 @@ def _run_single_eval(
                     # error must not read to the operator as a transient cap window.
                     # The marker that follows always names the actual cause.
                     taint = (
-                        f' unmeasurable: {result.metrics.get("invocation_error")}'
+                        ' unmeasurable: '
+                        f'{format_invocation_errors(result.metrics.get("invocation_errors"))}'
                         if result.metrics.get('cap_tainted') else ''
                     )
                     # `steps=` is echoed BESIDE the score (task 3302) because it is
@@ -1811,10 +1813,13 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
                 f'\nJudging {task_id} '
                 f'({len(result_dicts)} contenders, max {max_rounds} rounds)...'
             )
-            rounds_used = await run_elo_tournament(
+            tally = await run_elo_tournament(
                 result_dicts, task, pool, max_rounds,
             )
-            click.echo(f'  {task_id}: {rounds_used} judge calls')
+            click.echo(
+                f'  {task_id}: {tally.judged} judged, '
+                f'{tally.unmeasured} unmeasured (excluded from Elo)'
+            )
 
             # Save state after each task (crash resilience)
             save_state(state)

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from shared.cli_invoke import (
+    BUDGET_EXHAUSTED_SUBTYPE,
     AgentFailureKind,
     AllAccountsCappedException,
     classify_agent_failure,
@@ -31,7 +32,7 @@ from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
-from orchestrator.merge_completion import merge_completion_eligible
+from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
@@ -66,13 +67,6 @@ DRY_RUN_PROPOSAL_SCHEMA: dict[str, Any] = {
 
 _RISK_LABELS: frozenset[str] = frozenset({'low', 'medium', 'human-review-required'})
 _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
-
-# Stable subtype values emitted by the CLI when the cost cap fires.
-# Mirrors the canonical value used in shared/src/shared/usage_gate.py and
-# fused-memory/src/fused_memory/middleware/task_curator.py — the Claude CLI
-# emits ``error_max_budget_usd`` (with the ``_usd`` suffix) on cost-cap
-# exhaustion, not ``error_max_budget``.
-_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
 
 # Transient HOST infra wedges (e.g. a pre-turn-1 kill at the
 # UnblockAutoConfig.timeout ceiling -> empty stdout + timed_out) are
@@ -121,8 +115,7 @@ def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG00
     which would mis-classify those failures as 'budget_exhausted' and produce
     misleading operator-visible status fields in metadata.
     """
-    subtype = getattr(result, 'subtype', '') or ''
-    return subtype in _BUDGET_SUBTYPES
+    return getattr(result, 'subtype', None) == BUDGET_EXHAUSTED_SUBTYPE
 
 
 def _failure_diagnostics(result: Any) -> dict[str, Any]:

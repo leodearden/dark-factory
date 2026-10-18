@@ -16,8 +16,8 @@ within days:
      ``branch_content_in_main``
   4. the stranded-in-progress sweep
      (``orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded``)
-  5. ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._redrive_coalesce_members``
-     (coalesce re-drive)
+  5. ``orchestrator/src/orchestrator/merge_lane/member_redrive.py::MemberRedriver.redrive``
+     (the parked-member re-drive)
   6. and 7. the escalation server's
      ``escalation/src/escalation/server.py::merge_status`` query, both
      git-authority arms — a read-only report rather than a recovery action,
@@ -216,7 +216,7 @@ if TYPE_CHECKING:
 
     from orchestrator.git_ops import GitOps
 
-logger = logging.getLogger('orchestrator.landing_evidence')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 async def patch_content_contained(

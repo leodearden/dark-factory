@@ -21,6 +21,7 @@ from uuid import uuid4
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
 from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
@@ -28,7 +29,6 @@ from fused_memory.backends.falkor_indices import (
     expected_index_set,
     normalize_index_records,
 )
-from fused_memory.backends.mem0_client import is_missing_collection_error
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
@@ -107,6 +107,7 @@ from fused_memory.reconciliation.task_filter import (
     diff_status_correction,
     filter_task_tree,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
@@ -475,8 +476,17 @@ def _finding_has_citation_failures(finding: dict) -> bool:
     return bool(finding.get('citation_failures'))
 
 
+def _finding_is_superseded(finding: dict) -> bool:
+    """True iff a later finding of the same run retired this claim (task 4653,
+    ``server/recon_report.py::ReconReportState.add_finding`` ``supersedes``), so
+    the row is a record of the claim, not a standing one.  Truthiness, so the
+    always-projected ``superseded_by: None`` reads as standing."""
+    return bool(finding.get('superseded_by'))
+
+
 def _finding_is_live_actionable(finding: dict) -> bool:
-    """Return True iff *finding* is actionable and not superseded.
+    """Return True iff *finding* is actionable and not superseded
+    (composes ``_finding_is_superseded``).
 
     Task 4653: ``add_finding(..., supersedes=...)`` lets a later finding of a
     run mark an earlier one historical, stamping the target's
@@ -502,7 +512,7 @@ def _finding_is_live_actionable(finding: dict) -> bool:
     never-cited placeholder, so counting it as either would corrupt the
     drop-cause attribution that split exists to get right.
     """
-    return bool(finding.get('actionable', False)) and not finding.get('superseded_by')
+    return bool(finding.get('actionable', False)) and not _finding_is_superseded(finding)
 
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -1331,6 +1341,7 @@ class ReconciliationHarness:
         stage: TaskKnowledgeSync,
         *,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
         remediation_mode: bool = False,
     ) -> None:
         """Apply Stage-2 attributes to TaskKnowledgeSync.
@@ -1338,10 +1349,11 @@ class ReconciliationHarness:
         Mirrors _configure_consolidator for Stage 1 — both full-cycle and
         remediation paths use this helper to keep attribute wiring symmetric
         and discoverable. Stage-2-specific attributes (filtered_task_tree,
-        remediation_mode) are set here; Stage-1 wiring is handled by
-        _configure_consolidator.
+        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage-1
+        wiring is handled by _configure_consolidator.
         """
         stage.filtered_task_tree = filtered_task_tree
+        stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
         stage.remediation_mode = remediation_mode
 
     async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
@@ -1741,9 +1753,6 @@ class ReconciliationHarness:
             None when statuses is empty (fail-open: no supersede attempted, and
             no memory-service calls are made).  Otherwise a record dict:
               - found=False when no cached project_status_correction memory exists.
-              - found=False plus collection_missing=True when the project's Mem0
-                collection was never provisioned — an empty result, NOT an
-                error (task 2949); logged at INFO so found=False stays legible.
               - diverged=False, superseded=False when the cached memory matches
                 the live census (no-op).
               - diverged=True, superseded=True, memory_id, old, new when the
@@ -1759,46 +1768,10 @@ class ReconciliationHarness:
             return None
 
         try:
-            try:
-                memories = await self.memory.get_memories_by_metadata(
-                    project_id=project_id,
-                    filters={'kind': PROJECT_STATUS_CORRECTION_KIND},
-                )
-            except Exception as exc:
-                # A project whose Qdrant collection was never provisioned has no
-                # cached corrections — an EMPTY RESULT, not a failed read.  Left
-                # to the outer handler it would return an `error` record that
-                # Stage 3 re-flags as an unresolved integrity issue every cycle
-                # (task 2949).  Narrow by construction: anything else — a 500, a
-                # TimeoutError, any other exception — re-raises into the outer
-                # handler unchanged, so real failures still surface loudly.
-                #
-                # DELIBERATELY SCOPED to this call site.  The same un-provisioned
-                # collection still raises from every other Mem0 read in the cycle
-                # (targeted.py, standing_decision_writer.py, summary_pool.py,
-                # scope_freshness.py, stages/task_knowledge_sync.py all reach the
-                # same scroll_by_metadata), so a brand-new project can still see
-                # errors from those paths.  Task 2949 scopes the fix to the
-                # status_correction path and keeps scroll_by_metadata's
-                # no-silent-fail contract untouched for its other callers —
-                # including hot pool-GC loops that would pay for a proactive
-                # collection_exists round-trip.  Generalising the degradation to
-                # the whole read surface is filed as a follow-up.
-                if not is_missing_collection_error(exc):
-                    raise
-                logger.info(
-                    'reconciliation.status_correction_collection_missing',
-                    extra={'project_id': project_id},
-                )
-                return {
-                    'available': True,
-                    'found': False,
-                    'diverged': False,
-                    'superseded': False,
-                    # Distinguishes "collection absent" from "collection
-                    # genuinely empty" for an operator reading found=False.
-                    'collection_missing': True,
-                }
+            memories = await self.memory.get_memories_by_metadata(
+                project_id=project_id,
+                filters={'kind': PROJECT_STATUS_CORRECTION_KIND},
+            )
             if not memories:
                 return {
                     'available': True,
@@ -3775,11 +3748,11 @@ class ReconciliationHarness:
         # Task 4115: the instant every heartbeat_at in filtered_task_tree was
         # read. Stamped HERE, immediately after the fetch returns — not later,
         # e.g. at the _maybe_remediate call below — because the S1->S3 stage
-        # loop that follows is minutes of LLM work and the remediation
-        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
-        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
-        # gate ages a cited task's heartbeat against the actual read, not a
-        # fresh clock taken well after it.
+        # loop that follows is minutes of LLM work and the claimant heartbeat
+        # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
+        # hint-attention selector (task 5093) and through _maybe_remediate ->
+        # _run_remediation_pass to the live-workflow gate, so both age a task's
+        # heartbeat against the actual read, not a fresh clock taken well after it.
         filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
@@ -3916,7 +3889,11 @@ class ReconciliationHarness:
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
                     if isinstance(stage, TaskKnowledgeSync):
-                        self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
+                        self._configure_task_sync(
+                            stage,
+                            filtered_task_tree=filtered_task_tree,
+                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                        )
 
                     # Wire harness-fetched task tree into Stage 3 for task-dump spot-check (task 1661)
                     if isinstance(stage, IntegrityCheck):
@@ -4885,8 +4862,8 @@ class ReconciliationHarness:
         The filter runs BEFORE the ``if items:`` fall-through, so a run whose
         every finding was retired behaves exactly like a run that flagged
         nothing: an older completed run still gets its turn, and no empty
-        "Prior Stage 3 Findings" section is rendered.  ``.get`` is fail-open —
-        a finding dict that never carried the key is unaffected.
+        "Prior Stage 3 Findings" section is rendered.  A finding dict that never
+        carried the key is unaffected.
         """
         try:
             recent = await self.journal.get_recent_runs(project_id, limit=3)
@@ -4900,7 +4877,7 @@ class ReconciliationHarness:
                     items = s3_report.get('items_flagged', [])
                 else:
                     items = s3_report.items_flagged
-                items = [f for f in items if not f.get('superseded_by')]
+                items = [f for f in items if not _finding_is_superseded(f)]
                 if items:
                     return items
         except Exception as e:
@@ -4919,6 +4896,11 @@ class ReconciliationHarness:
         for dedup), so findings that differ only in non-identity fields do not inflate the
         count.  Counted per-run — duplicates within one run's items_flagged do not count
         twice.
+
+        A row its own run superseded (``_finding_is_superseded``) is a record of the
+        claim, not an occurrence, so it is skipped before it is fingerprinted.  The skip
+        is per row: a standing copy beside a retired one still counts the run.  Pinned by
+        ``tests/test_harness.py::test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation``.
 
         The default lookback is ``max(5, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)`` so
         that raising the threshold never silently caps the count below the gate value.
@@ -4962,6 +4944,8 @@ class ReconciliationHarness:
                 # Count this run once if any item matches the target fingerprint
                 for item in items:
                     try:
+                        if _finding_is_superseded(item):
+                            continue
                         fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, item)
                     except Exception:
                         any_item_fp_failed = True
@@ -5660,22 +5644,11 @@ class ReconciliationHarness:
             # Task 4115: resolve the tree and the instant it was read as ONE unit
             # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
             # itself), so a caller's read instant can never be paired with a tree
-            # it does not describe. Caller-supplied tree: honour the caller's read
-            # instant when given AND timezone-aware; otherwise fall back to a
-            # fresh now() with a WARNING trace — loud rather than silent, since a
-            # caller that drops or malforms the instant regresses straight back to
-            # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
-            # norm). A naive (tzinfo-less) instant is treated the same as a
-            # missing one rather than handed to corroboration_for_task as-is:
-            # has_live_claimant compares it against timezone-aware heartbeats, and
-            # the resulting TypeError is caught and swallowed several frames down
-            # (see the `except Exception as _corr_exc` below), which would
-            # otherwise leave corroborated=None and silently suppress every
-            # stranded-work escalation in the pass — the opposite of this gate's
-            # fail-safe direction. The WARNING fallback is otherwise exactly the
-            # pre-4115 behaviour, which the ~30 existing direct
-            # _run_remediation_pass callers that pass a tree without an instant
-            # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+            # it does not describe. Caller-supplied tree: resolve_tree_read_instant
+            # honours the caller's instant or falls back to now() with a WARNING;
+            # the ~30 existing direct _run_remediation_pass callers that pass a
+            # tree without an instant depend on that pre-4115 fallback.
+            # Self-fetch: always stamp a fresh now() — a caller instant
             # (if one was even supplied) describes a different tree, or no tree at
             # all, and must never leak onto the tree just fetched here.
             #
@@ -5703,25 +5676,11 @@ class ReconciliationHarness:
             _tasks_snapshot_at: datetime
             if filtered_task_tree is not None:
                 remediation_tree = filtered_task_tree
-                if (
-                    filtered_task_tree_fetched_at is not None
-                    and filtered_task_tree_fetched_at.tzinfo is not None
-                ):
-                    _tasks_snapshot_at = filtered_task_tree_fetched_at
-                else:
-                    logger.warning(
-                        'reconciliation.remediation_tree_read_instant_missing',
-                        extra={
-                            'project_id': project_id,
-                            'parent_run_id': parent_run_id,
-                            'reason': (
-                                'naive_datetime'
-                                if filtered_task_tree_fetched_at is not None
-                                else 'not_supplied'
-                            ),
-                        },
-                    )
-                    _tasks_snapshot_at = datetime.now(UTC)
+                _tasks_snapshot_at = resolve_tree_read_instant(
+                    filtered_task_tree_fetched_at,
+                    event='reconciliation.remediation_tree_read_instant_missing',
+                    extra={'project_id': project_id, 'parent_run_id': parent_run_id},
+                )
             else:
                 remediation_tree = await self._fetch_filtered_task_tree(project_root)
                 _tasks_snapshot_at = datetime.now(UTC)
@@ -5878,7 +5837,12 @@ class ReconciliationHarness:
                 remediation_findings=findings,
                 filtered_task_tree=remediation_tree,
             )
-            self._configure_task_sync(stage2, filtered_task_tree=remediation_tree, remediation_mode=True)
+            self._configure_task_sync(
+                stage2,
+                filtered_task_tree=remediation_tree,
+                filtered_task_tree_fetched_at=_tasks_snapshot_at,
+                remediation_mode=True,
+            )
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
@@ -6010,11 +5974,14 @@ class ReconciliationHarness:
                 # None inputs and never raises on them), which leaves the verdict
                 # biased toward "not corroborated" — the direction that lets a
                 # stranded escalation through only when nothing at all vouches for
-                # the task. read_scheduler_state already returns an empty skeleton
-                # for an absent/invalid file; orchestrator_started_at returns None
-                # for an absent or unparseable lock.
+                # the task. read_scheduler_state already returns
+                # SchedulerStateSnapshot.empty() for an absent/invalid file;
+                # orchestrator_started_at returns None for an absent or
+                # unparseable lock.
                 try:
-                    _sched_state: dict | None = read_scheduler_state(Path(project_root))
+                    _sched_state: SchedulerStateSnapshot | None = read_scheduler_state(
+                        Path(project_root)
+                    )
                 except Exception:
                     _sched_state = None
                 try:

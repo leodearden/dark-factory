@@ -14,14 +14,19 @@ import re
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 import shared.proc_group as proc_group_module
 from shared.proc_group import (
+    MalformedStatLine,
     ProcessGroupMember,
+    StatFields,
+    pid_running,
     process_group_members,
     process_group_terminated,
+    read_stat_fields,
     reap_process_groups,
     scan_process_groups_under_path,
     sigkill_process_group,
@@ -218,6 +223,16 @@ def _synthetic_stat_line(
         + ' '.join(['0'] * 20)
         + '\n'
     )
+
+
+#: ``python -c`` source that renames its own process to the undecodable comm
+#: ``b'\xff\xfe'`` (prctl PR_SET_NAME), prints ``ready``, then sleeps.
+_UNDECODABLE_COMM_SLEEPER = (
+    'import ctypes, time\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'time.sleep(30)\n'
+)
 
 
 class _ShellReadinessError(AssertionError):
@@ -1580,6 +1595,160 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         assert scan_process_groups_under_path(tmp_path) == set()
 
 
+_MALFORMED_STAT_LINES = [
+    pytest.param('no closing paren here\n', id='no-closing-paren'),
+    pytest.param('810 (x) S 1 not-a-number 0\n', id='pgrp-not-an-int'),
+    pytest.param('7 (x) S\n', id='truncated'),
+    pytest.param('7 (x) S notint 7\n', id='ppid-not-an-int'),
+]
+
+_BOTH_POLICIES = pytest.mark.parametrize(
+    'skip_malformed', [pytest.param(True, id='skip'), pytest.param(False, id='raise')]
+)
+
+
+class TestReadStatFields:
+    """The one ``/proc/<pid>/stat`` reader and the malformed-line policy each caller states.
+
+    An unreadable entry (the pid is gone) is None under either policy.  A
+    malformed line is skipped (None) where that only loses one reading, and
+    raised where a None would be taken for "gone".
+    """
+
+    @_BOTH_POLICIES
+    def test_a_well_formed_line_parses_with_comm_up_to_the_last_paren(
+        self, tmp_path, skip_malformed
+    ):
+        entry = tmp_path / '4242'
+        entry.mkdir()
+        (entry / 'stat').write_text(_synthetic_stat_line(4242, 4242, state='S'))
+
+        assert read_stat_fields(entry, skip_malformed=skip_malformed) == StatFields(
+            comm='weird (name) proc', state='S', ppid=1, pgrp=4242
+        )
+
+    @_BOTH_POLICIES
+    @pytest.mark.parametrize('stat_is_a_directory', [False, True], ids=['missing', 'directory'])
+    def test_an_unreadable_entry_is_none(self, tmp_path, skip_malformed, stat_is_a_directory):
+        """A directory stays unreadable even when the suite runs as root, unlike chmod 0o000."""
+        entry = tmp_path / '600'
+        entry.mkdir()
+        if stat_is_a_directory:
+            (entry / 'stat').mkdir()
+
+        assert read_stat_fields(entry, skip_malformed=skip_malformed) is None
+
+    @pytest.mark.parametrize('text', _MALFORMED_STAT_LINES)
+    def test_a_malformed_line_raises_naming_its_path_and_text(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        with pytest.raises(MalformedStatLine) as excinfo:
+            read_stat_fields(entry, skip_malformed=False)
+
+        exc = excinfo.value
+        assert isinstance(exc, ValueError)
+        assert (exc.path, exc.text) == (entry / 'stat', text)
+        assert str(entry / 'stat') in str(exc)
+        assert repr(text) in str(exc)
+
+    @pytest.mark.parametrize('text', _MALFORMED_STAT_LINES)
+    def test_a_malformed_line_is_skipped_as_none(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        assert read_stat_fields(entry, skip_malformed=True) is None
+
+    @pytest.mark.timeout(15)
+    def test_a_live_child_is_running_and_parented_to_this_process(self):
+        with subprocess.Popen(
+            ['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) as p:
+            try:
+                fields = read_stat_fields(Path('/proc') / str(p.pid), skip_malformed=False)
+                assert fields is not None
+                assert (fields.ppid, fields.terminated) == (os.getpid(), False), fields
+            finally:
+                p.kill()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_is_terminated_and_a_reaped_pid_is_none(self):
+        """``waitid(..., WNOWAIT)`` yields the zombie by a condition wait, never a sleep."""
+        p = subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        entry = Path('/proc') / str(p.pid)
+        try:
+            p.kill()
+            os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            fields = read_stat_fields(entry, skip_malformed=False)
+            assert fields is not None
+            assert (fields.state, fields.ppid, fields.terminated) == ('Z', os.getpid(), True)
+        finally:
+            p.wait()
+
+        assert read_stat_fields(entry, skip_malformed=False) is None
+
+    @pytest.mark.timeout(15)
+    def test_an_undecodable_comm_reads_back_replaced(self):
+        with subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_SLEEPER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as p:
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                fields = read_stat_fields(Path('/proc') / str(p.pid), skip_malformed=False)
+                assert fields is not None
+                assert (fields.comm, fields.terminated) == ('��', False)
+            finally:
+                p.kill()
+
+
+class TestPidRunning:
+    """The single-pid liveness probe: a zombie is not running, and a malformed stat raises."""
+
+    @pytest.mark.timeout(15)
+    def test_a_live_child_is_running(self):
+        with subprocess.Popen(
+            ['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ) as p:
+            try:
+                assert pid_running(p.pid) is True
+            finally:
+                p.kill()
+
+    @pytest.mark.timeout(15)
+    def test_an_unreaped_zombie_and_a_reaped_pid_are_not_running(self):
+        """``waitid(..., WNOWAIT)`` yields the zombie by a condition wait, never a sleep."""
+        p = subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            p.kill()
+            os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            assert pid_running(p.pid) is False
+        finally:
+            p.wait()
+
+        assert pid_running(p.pid) is False
+
+    @pytest.mark.parametrize('pid', [0, -1])
+    def test_a_non_positive_pid_is_not_running(self, pid):
+        assert pid_running(pid) is False
+
+    @pytest.mark.parametrize('text', _MALFORMED_STAT_LINES)
+    def test_a_malformed_stat_raises_rather_than_reading_as_gone(
+        self, tmp_path, monkeypatch, text
+    ):
+        monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path)
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        with pytest.raises(MalformedStatLine):
+            pid_running(810)
+
+
 class TestProcessGroupTermination:
     """A group has terminated once every member is dead, zombies included.
 
@@ -1589,6 +1758,19 @@ class TestProcessGroupTermination:
     which is why it is not the termination criterion.
     """
 
+    @pytest.mark.parametrize(
+        'record_in',
+        [
+            pytest.param(
+                lambda state: ProcessGroupMember(pid=4242, ppid=1, state=state, comm='x'),
+                id='ProcessGroupMember',
+            ),
+            pytest.param(
+                lambda state: StatFields(comm='x', state=state, ppid=1, pgrp=1),
+                id='StatFields',
+            ),
+        ],
+    )
     @pytest.mark.parametrize(
         ('state', 'terminated'),
         [
@@ -1602,9 +1784,10 @@ class TestProcessGroupTermination:
             ('I', False),
         ],
     )
-    def test_terminated_is_true_exactly_for_zombie_and_dead_states(self, state, terminated):
-        member = ProcessGroupMember(pid=4242, ppid=1, state=state, comm='x')
-        assert member.terminated is terminated
+    def test_terminated_is_true_exactly_for_zombie_and_dead_states(
+        self, record_in, state, terminated
+    ):
+        assert record_in(state).terminated is terminated
 
     @pytest.mark.timeout(15)
     def test_a_live_group_has_one_running_member_and_is_not_terminated(self):
@@ -1662,15 +1845,8 @@ class TestProcessGroupTermination:
     @pytest.mark.timeout(15)
     def test_a_member_with_an_undecodable_comm_is_still_listed(self):
         """comm is arbitrary bytes; a member must never drop out of the walk over them."""
-        pr_set_name = 15
-        script = (
-            'import ctypes, time\n'
-            f"ctypes.CDLL(None).prctl({pr_set_name}, b'\\xff\\xfe', 0, 0, 0)\n"
-            "print('ready', flush=True)\n"
-            'time.sleep(30)\n'
-        )
         with subprocess.Popen(
-            [sys.executable, '-c', script],
+            [sys.executable, '-c', _UNDECODABLE_COMM_SLEEPER],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -1810,7 +1986,7 @@ class TestReapProcessGroups:
         real_read = proc_group_module.read_stat_fields
         monkeypatch.setattr(
             'shared.proc_group.read_stat_fields',
-            lambda entry: stat_reads.append(entry.name) or real_read(entry),
+            lambda entry, **kwargs: stat_reads.append(entry.name) or real_read(entry, **kwargs),
         )
 
         outcomes = reap_process_groups({*zombie_groups, gone_group}, grace_secs=0)

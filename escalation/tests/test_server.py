@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 import types
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -22,10 +21,12 @@ from typing import Any
 import pytest
 from _escalation_seed import seed_escalation
 from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from shared.merge_state import MergeReason
 
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
+from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
 from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
 from escalation.server import (
@@ -46,7 +47,7 @@ from escalation.server import (
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         MergeRequest,
         QueuedBranch,
         RealMergeItem,
@@ -1092,24 +1093,22 @@ class TestSeverityValidation:
 
 
 # ---------------------------------------------------------------------------
-# TestStrandedBlockedCategory: 'stranded_blocked' is registered in CATEGORIES
+# TestStrandedBlockedCategory: 'stranded_blocked' is a registered category
 # ---------------------------------------------------------------------------
 
 
 class TestStrandedBlockedCategory:
-    """CATEGORIES constant must include 'stranded_blocked' (PRD-3 D5 data-contract)."""
+    """'stranded_blocked' must be a registered category (PRD-3 D5 data-contract)."""
 
     def test_stranded_blocked_in_categories(self):
-        """'stranded_blocked' must be a member of CATEGORIES at runtime.
+        """'stranded_blocked' must be a member of EscalationCategory at runtime.
 
-        This is a data-contract assertion on a runtime constant — not a prose
-        test.  CATEGORIES is the canonical list downstream consumers (task ε,
-        task ι, task ζ) rely on to recognise the category.
+        ``escalation.categories.EscalationCategory`` is the canonical registry
+        downstream consumers (task ε, task ι, task ζ) rely on to recognise the
+        category, and the queue rejects a filing outside it.
         """
-        from escalation.server import CATEGORIES
-        assert 'stranded_blocked' in CATEGORIES, (
-            f"'stranded_blocked' missing from CATEGORIES; current list: {CATEGORIES}"
-        )
+        from escalation.categories import EscalationCategory
+        assert 'stranded_blocked' in EscalationCategory
 
 
 # ---------------------------------------------------------------------------
@@ -1328,12 +1327,11 @@ class TestResolveIssueTableBGate:
 
     @pytest.mark.asyncio
     async def test_novel_category_does_not_narrow_legality(self, tmp_path: Path):
-        """A category absent from server.CATEGORIES (e.g. 'milestone_gate') still resolves.
+        """A category outside the original agent set (e.g. 'milestone_gate') still resolves.
 
         Proves the Table B gate does not narrow legality by category — the G6
-        archive verification found live resolutions across a wide, open
-        category vocabulary that server.CATEGORIES (inert/unvalidated) does
-        not even fully list.
+        archive verification found live resolutions across a wide category
+        vocabulary, far beyond the original agent set.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
@@ -3760,7 +3758,7 @@ class TestMergeRequestDedup:
     """
 
     def _make_registry(self):
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
         return InFlightMergeRegistry()
@@ -3830,8 +3828,8 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator import merge_queue as _mq_mod  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import worker as _mq_mod
+        from orchestrator.merge_lane.worker import (
             MergeDispatchResult,
         )
 
@@ -4017,7 +4015,9 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4075,7 +4075,9 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4126,7 +4128,9 @@ class TestMergeRequestDedup:
         False — the default is a strict no-op (unchanged behavior)."""
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4184,7 +4188,7 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             register_and_enqueue_merge_request,
         )
@@ -4317,6 +4321,20 @@ class TestMergeRequestDedup:
         )
 
 
+def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object) -> None:
+    """Install *stub* where both readers of ``patch_content_contained`` look it up.
+
+    The server reads it through the façade, whose home for it is
+    ``orchestrator.merge_lane.landing_evidence``; the worker's
+    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    """
+    import orchestrator.merge_lane.landing_evidence as landing_evidence
+    import orchestrator.merge_lane.worker as worker
+
+    for module in (worker, landing_evidence):
+        monkeypatch.setattr(module, 'patch_content_contained', stub)
+
+
 # ---------------------------------------------------------------------------
 # TestMergeRequestWorkflowVerifyEmission — step-1/3 (2411): verified_green
 # ---------------------------------------------------------------------------
@@ -4347,24 +4365,20 @@ class TestMergeRequestWorkflowVerifyEmission:
         import asyncio
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         sentinel_base_sha = 's' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value=sentinel_base_sha),
         )
         # is_ancestor is stubbed False to reach the fresh-dispatch path; the
         # task-2945 patch-id backstop then runs after that miss.  Stub it False
         # (this SimpleNamespace git_ops has no project_root for a real
         # `git cherry`, and a genuine fresh dispatch is not patch-id-contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4435,22 +4449,18 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4500,22 +4510,18 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4624,7 +4630,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         # Monkeypatched for determinism even though the post-step-4 gate
@@ -4632,17 +4638,13 @@ class TestMergeRequestWorkflowVerifyEmission:
         # is None — avoids relying on a real git subprocess pre-step-4.
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the gate path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4796,7 +4798,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -4879,7 +4881,7 @@ class TestGetMergeQueue:
         import asyncio
         import time
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeRequest,
         )
@@ -4937,7 +4939,7 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
@@ -4989,7 +4991,7 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
@@ -5046,7 +5048,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5181,7 +5183,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5312,7 +5314,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5409,7 +5411,7 @@ class TestGetMergeQueue:
         # production VERIFYING->FINALIZING->GATE_REVERIFY transitions take effect.
         worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
-        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         captured_reverify_kwargs: dict = {}
 
@@ -5507,7 +5509,9 @@ class TestGetMergeQueue:
         and snapshot() reports an active 'gate_reverify' state.
         """
         from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         REBASED_SHA = 'rebased0abc'
         REBASED_FROM = 'from0sha'
@@ -5527,7 +5531,7 @@ class TestGetMergeQueue:
             merge_commit='deadbeef00000002',
         )
 
-        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         GATE_FAIL = MergeOutcome('blocked', reason='post-rebase reverify gate failed')
 
@@ -5609,7 +5613,7 @@ class TestGetMergeQueue:
         cleanly via ``unhalt_wip()``.
         """
         from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             ItemLifecycleState,  # type: ignore[reportMissingImports]
         )
 
@@ -5964,24 +5968,27 @@ class TestMergeStatus:
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'error' in result, f'Expected error key, got: {result}'
 
-    # ── step-5b: standalone unknown + hint ───────────────────────────────────
+    # ── step-5b: standalone clean miss ───────────────────────────────────────
 
-    async def test_standalone_returns_unknown_with_hint(self, tmp_path: Path) -> None:
-        """On a server with no event_store/harness, merge_status returns unknown + hint."""
+    async def test_standalone_returns_no_record_with_derived_hint(self, tmp_path: Path) -> None:
+        """On a server with no event_store/harness, merge_status returns no_record + its hint."""
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)  # standalone: no event_store, no harness
 
         result = await call_merge_status(server, request_id='mr-deadbeef')
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
-        assert result.get('state') == 'unknown', f'Expected state=unknown, got: {result}'
+        assert result.get('state') == 'no_record', f'Expected state=no_record, got: {result}'
+        assert result.get('reason') == MergeReason.never_submitted, (
+            f'Expected reason=never_submitted, got: {result}'
+        )
+        assert result.get('hint') == hint_for(MergeReason.never_submitted), (
+            f'Expected the hint derived from the reason, got: {result}'
+        )
+        assert result.get('source') == 'none', f'Expected source=none, got: {result}'
         assert result.get('generation') == 1, f'Expected generation=1, got: {result}'
         assert result.get('request_id') == 'mr-deadbeef', (
             f'Expected request_id echoed, got: {result}'
-        )
-        assert 'hint' in result, f'Expected hint key in result: {result}'
-        assert 'git log' in result['hint'].lower() or 'git' in result['hint'], (
-            f'Expected hint to mention git, got: {result["hint"]!r}'
         )
 
     # ── step-7: event-store tier + state mapping ──────────────────────────────
@@ -6036,7 +6043,7 @@ class TestMergeStatus:
         )
         assert result.get('generation') == 1
         assert result.get('request_id') == 'mr-statetest'
-        # finished_at must be an ISO-8601 string (same type as ring tier after normalisation)
+        # finished_at must be an ISO-8601 string
         fa = result.get('finished_at')
         assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
         assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
@@ -6088,8 +6095,10 @@ class TestMergeStatus:
             f'Expected resolved request_id=mr-later, got: {result.get("request_id")!r}'
         )
 
-    async def test_event_store_miss_falls_through_to_unknown(self, tmp_path: Path) -> None:
-        """An id not in the event store falls through to unknown+hint."""
+    async def test_event_store_miss_returns_no_record_with_derived_hint(
+        self, tmp_path: Path,
+    ) -> None:
+        """An id in no tier is no_record / never_submitted, with that reason's hint."""
         event_store, EventType = self._make_event_store(tmp_path)
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -6098,53 +6107,25 @@ class TestMergeStatus:
 
         result = await call_merge_status(server, request_id='mr-nothere')
 
-        assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
-        assert 'hint' in result
+        assert result.get('state') == 'no_record', f'Expected no_record, got: {result}'
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
+        assert result.get('hint') == hint_for(MergeReason.never_submitted), f'got: {result}'
 
-    # ── step-9: ring tier ─────────────────────────────────────────────────────
+    # ── the retention ring is written by merge_request, never read here ──────
 
-    async def test_ring_tier_returns_terminal_record(self, tmp_path: Path) -> None:
-        """Ring tier: a request_id in the ring returns the recorded terminal state."""
-        ring = TerminalOutcomeRetention()
-        finished = time.time() - 5.0
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-aaaa1111',
-            task_id='T-ring',
-            branch='branch-ring',
-            state='done',
-            finished_at=finished,
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await call_merge_status(server, request_id='mr-aaaa1111')
-
-        assert result.get('state') == 'done', f'Expected done from ring, got: {result}'
-        assert result.get('request_id') == 'mr-aaaa1111'
-        assert result.get('generation') == 1
-        assert result.get('outcome') == 'done'
-        # finished_at is normalised to ISO-8601 string (same type as event-store tier)
-        fa = result.get('finished_at')
-        assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
-        assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
-
-    async def test_ring_wins_over_event_store(self, tmp_path: Path) -> None:
-        """Ring tier precedes event store: ring record wins when both have the same request_id."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev')
+    async def test_retention_ring_record_is_not_read(self, tmp_path: Path) -> None:
+        """A ring record disagreeing with the event store does not answer merge_status."""
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-unread')
         event_store.emit(
             EventType.merge_finalized,
-            task_id='T-rv',
-            data={'request_id': 'mr-ringwin', 'branch': 'b-rv', 'state': 'done'},
+            task_id='T-ru',
+            data={'request_id': 'mr-ring-unread', 'branch': 'b-ru', 'state': 'conflict'},
         )
-
-        # Ring says 'blocked' — this should win over event store's 'done'
         ring = TerminalOutcomeRetention()
         ring.record(TerminalOutcomeRecord(
-            request_id='mr-ringwin',
-            task_id='T-rv',
-            branch='b-rv',
+            request_id='mr-ring-unread',
+            task_id='T-ru',
+            branch='b-ru',
             state='blocked',
         ))
 
@@ -6152,81 +6133,21 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await call_merge_status(server, request_id='mr-ringwin')
-
-        assert result.get('state') == 'blocked', (
-            f'Expected ring value (blocked) to beat event store (done), got: {result}'
-        )
-        assert result.get('outcome') == 'blocked'
-
-    async def test_ring_miss_falls_through_to_event_store(self, tmp_path: Path) -> None:
-        """Ring miss falls through to the event store tier."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-miss')
-        event_store.emit(
-            EventType.merge_finalized,
-            task_id='T-rm',
-            data={'request_id': 'mr-in-ev-only', 'branch': 'b-rm', 'state': 'conflict'},
-        )
-
-        # Ring is empty — miss should fall through to event store
-        ring = TerminalOutcomeRetention()
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
-
-        result = await call_merge_status(server, request_id='mr-in-ev-only')
+        result = await call_merge_status(server, request_id='mr-ring-unread')
 
         assert result.get('state') == 'conflict', (
-            f'Expected conflict from event-store fallback, got: {result}'
+            f'Expected the event-store row (conflict), not the ring (blocked), got: {result}'
         )
+        assert result.get('source') == 'event_store', f'got: {result}'
 
-    # ── step-7 (2554): failure reason surfaces through both durable tiers ────
+    # ── step-7 (2554): failure reason surfaces through the event-store tier ──
 
-    async def test_reason_surfaces_through_both_durable_tiers(
+    async def test_reason_surfaces_through_event_store_tier(
         self, tmp_path: Path,
     ) -> None:
-        """A terminal 'blocked' outcome's failure reason surfaces via merge_status.
-
-        (i) Ring survivor: a TerminalOutcomeRecord carrying reason= is served
-            directly from the retention ring (Tier 2).
-        (ii) Post-restart event-store: an empty ring + a merge_finalized event
-            carrying reason= in its data dict is served from the event-store
-            tier (Tier 3) — simulating a restart that dropped the ring.
-
-        RED: _OPTIONAL_TERMINAL_META_FIELDS omits 'reason' and the durable
-        resp builder has no reason plumbing, so resp['reason'] is absent in
-        both cases (the event-store tier additionally relies on step-6's
-        latest_merge_finalized row already carrying 'reason').
-        """
+        """A terminal 'blocked' outcome's free-text failure reason surfaces via merge_status."""
         REASON = 'verify failed: gui_tsc'
 
-        # (i) Ring survivor
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-reason-ring',
-            task_id='r1',
-            branch='r1',
-            state='blocked',
-            reason=REASON,
-        ))
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result_ring = await call_merge_status(server, request_id='mr-reason-ring')
-
-        assert result_ring.get('state') == 'blocked', (
-            f'Expected state=blocked from ring, got: {result_ring}'
-        )
-        assert result_ring.get('outcome') == 'blocked', (
-            f'Expected outcome=blocked from ring, got: {result_ring}'
-        )
-        assert result_ring.get('reason') == REASON, (
-            f'Expected reason={REASON!r} surfaced from ring tier, got: {result_ring}'
-        )
-
-        # (ii) Post-restart event-store: empty ring, same reason via event data.
         event_store = EventStore(tmp_path / 'runs.db', 'run-reason-ev')
         event_store.emit(
             EventType.merge_finalized,
@@ -6238,16 +6159,11 @@ class TestMergeStatus:
                 'reason': REASON,
             },
         )
-        empty_ring = TerminalOutcomeRetention()
-        esc_queue2 = EscalationQueue(tmp_path / 'esc2')
-        stub_harness2 = types.SimpleNamespace(
-            _merge_worker=None, _terminal_retention=empty_ring
-        )
-        server2 = create_server(
-            esc_queue2, harness=stub_harness2, event_store=event_store
-        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result_ev = await call_merge_status(server2, request_id='mr-reason-ev')
+        result_ev = await call_merge_status(server, request_id='mr-reason-ev')
 
         assert result_ev.get('state') == 'blocked', (
             f'Expected state=blocked from event store, got: {result_ev}'
@@ -6256,177 +6172,29 @@ class TestMergeStatus:
             f'Expected reason={REASON!r} surfaced from event-store tier, got: {result_ev}'
         )
 
-    # ── step-9 (1749): ring tier branch/task_id/alias lookup ─────────────────
+    async def test_event_store_request_id_over_branch_precedence(self, tmp_path: Path) -> None:
+        """When request_id is supplied and misses the event store, branch is NOT consulted.
 
-    async def test_ring_tier_returns_terminal_record_by_branch(
-        self, tmp_path: Path,
-    ) -> None:
-        """Ring tier: a branch= poll resolves to the ring's recorded terminal state."""
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-branchpoll',
-            task_id='T-bpoll',
-            branch='branch-bylookup',
-            state='done',
-        ))
+        Lookup applies request_id > branch > task_id precedence: if request_id
+        is given (even if it misses), the branch key is never checked.  This
+        pins the deliberate precedence choice so a regression that fell
+        through to a branch lookup on a request_id miss would be caught.
+        """
+        event_store, EventType = self._make_event_store(tmp_path)
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-other-prec', task_id='T-prec', branch='prec-branch', state='done',
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await call_merge_status(server, branch='branch-bylookup')
-
-        assert result.get('state') == 'done', (
-            f'Expected done from ring branch lookup, got: {result}'
-        )
-        assert result.get('request_id') == 'mr-branchpoll', (
-            f'Expected resolved record request_id, got: {result}'
-        )
-        assert result.get('outcome') == 'done', (
-            f'Expected outcome=done, got: {result}'
-        )
-
-    async def test_ring_tier_returns_terminal_record_by_task_id(
-        self, tmp_path: Path,
-    ) -> None:
-        """Ring tier: a task_id= poll resolves to the ring's recorded terminal state."""
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-taskpoll',
-            task_id='T-ltask',
-            branch='branch-ltask',
-            state='blocked',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await call_merge_status(server, task_id='T-ltask')
-
-        assert result.get('state') == 'blocked', (
-            f'Expected blocked from ring task_id lookup, got: {result}'
-        )
-        assert result.get('request_id') == 'mr-taskpoll', (
-            f'Expected resolved record request_id, got: {result}'
-        )
-
-    async def test_ring_wins_over_event_store_by_branch(self, tmp_path: Path) -> None:
-        """Ring branch= record wins over event store when both have the same branch."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev-branch')
-        event_store.emit(
-            EventType.merge_finalized,
-            task_id='T-rb',
-            data={'request_id': 'mr-evbranch', 'branch': 'branch-ring-wins', 'state': 'done'},
-        )
-
-        # Ring says 'blocked' for this branch — ring must win over event store's 'done'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-ringbranch',
-            task_id='T-rb',
-            branch='branch-ring-wins',
-            state='blocked',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await call_merge_status(server, branch='branch-ring-wins')
-
-        assert result.get('state') == 'blocked', (
-            f'Expected ring value (blocked) to beat event store (done) on branch= poll, '
-            f'got: {result}'
-        )
-
-    async def test_ring_tier_coalesced_id_via_alias(self, tmp_path: Path) -> None:
-        """Coalesced id resolves to primary's terminal record via alias."""
-        ring = TerminalOutcomeRetention()
-        primary = TerminalOutcomeRecord(
-            request_id='mr-primary-alias',
-            task_id='T-alias',
-            branch='branch-alias',
-            state='done',
-        )
-        ring.record(primary)
-        ring.record_alias('mr-coalesced-alias', 'mr-primary-alias')
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await call_merge_status(server, request_id='mr-coalesced-alias')
-
-        assert result.get('state') == 'done', (
-            f'Expected done from coalesced-id alias resolution, got: {result}'
-        )
-        assert result.get('request_id') == 'mr-primary-alias', (
-            f'Expected resolved primary request_id, got: {result}'
-        )
-
-    async def test_ring_request_id_over_branch_precedence(self, tmp_path: Path) -> None:
-        """When request_id is supplied and misses the ring, branch is NOT consulted.
-
-        The Tier-2 elif chain applies request_id > branch > task_id precedence:
-        if request_id is given (even if it misses the ring), the branch key is
-        never checked in the ring.  This pins the deliberate precedence choice
-        so a regression that accidentally fell through to get_by_branch on a
-        request_id miss would be caught.
-        """
-        # Ring has a record for branch 'prec-branch' but NOT for request_id 'mr-miss'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-other-prec',
-            task_id='T-prec',
-            branch='prec-branch',
-            state='done',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        # Supply both request_id (ring-miss) and branch (ring-hit).
-        # The ring tier must NOT resolve via branch because request_id is present.
         result = await call_merge_status(server, request_id='mr-miss', branch='prec-branch')
 
-        # Should fall through to unknown (not 'done' from the ring's branch record)
-        assert result.get('state') == 'unknown', (
-            f'Expected unknown (request_id-only lookup; branch ignored on ring-miss), '
+        assert result.get('state') == 'no_record', (
+            f'Expected no_record (request_id-only lookup; branch ignored on a miss), '
             f'got: {result}'
-        )
-
-    async def test_ring_wins_over_event_store_by_task_id(self, tmp_path: Path) -> None:
-        """Ring task_id= record wins over event store when both have the same task_id."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev-task')
-        event_store.emit(
-            EventType.merge_finalized,
-            task_id='T-rtask',
-            data={'request_id': 'mr-evtask', 'branch': 'b-rtask', 'state': 'done'},
-        )
-
-        # Ring says 'conflict' for this task_id — ring must win over event store's 'done'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-ringtask',
-            task_id='T-rtask',
-            branch='b-rtask',
-            state='conflict',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
-
-        result = await call_merge_status(server, task_id='T-rtask')
-
-        assert result.get('state') == 'conflict', (
-            f'Expected ring value (conflict) to beat event store (done) on task_id= poll, '
-            f'got: {result}'
-        )
-        assert result.get('outcome') == 'conflict', (
-            f'Expected outcome=conflict from ring, got: {result}'
         )
 
     # ── step-11: live-snapshot tier ───────────────────────────────────────────
@@ -6514,8 +6282,8 @@ class TestMergeStatus:
             f'Expected resolved request_id={req.request_id!r}, got: {result.get("request_id")!r}'
         )
 
-    async def test_live_snapshot_beats_ring_and_event_store(self, tmp_path: Path) -> None:
-        """Live snapshot tier wins over ring and event store for the same request_id."""
+    async def test_live_snapshot_beats_event_store(self, tmp_path: Path) -> None:
+        """Live snapshot tier wins over the event store for the same request_id."""
         loop = asyncio.get_running_loop()
         config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
@@ -6528,16 +6296,6 @@ class TestMergeStatus:
         )
         await mq.put(req)
 
-        # Ring says 'done'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id=req.request_id,
-            task_id=req.task_id,
-            branch=req.branch.bare_id,
-            state='done',
-        ))
-
-        # Event store also says 'done'
         event_store = EventStore(tmp_path / 'runs.db', 'run-prec')
         event_store.emit(
             EventType.merge_finalized,
@@ -6546,15 +6304,13 @@ class TestMergeStatus:
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=worker, _terminal_retention=ring)
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
         result = await call_merge_status(server, request_id=req.request_id)
 
-        # Live snapshot is 'queued'; ring+event store have 'done'
-        # Live must win
         assert result.get('state') == 'queued', (
-            f'Expected live state (queued) to beat ring/ev (done), got: {result}'
+            f'Expected live state (queued) to beat the event store (done), got: {result}'
         )
         assert 'position' in result, 'Live entry should carry position'
 
@@ -6583,7 +6339,7 @@ class TestMergeStatus:
         )
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
         )
@@ -6645,16 +6401,15 @@ class TestMergeStatus:
             f'verify_phase={verify_phase!r}: expected {expected!r}, got {result.get("state")!r}'
         )
 
-    # ── Tier-1 degradation: snapshot() failure falls through to durable tiers ─
+    # ── live-tier probe failure: snapshot() raising ends the walk ────────────
 
-    async def test_snapshot_failure_degrades_to_durable_tier(self, tmp_path: Path) -> None:
-        """Tier-1 fire-safe wrapper: a snapshot() exception falls through to ring/event-store.
+    async def test_snapshot_failure_is_a_live_probe_failure(self, tmp_path: Path) -> None:
+        """A snapshot() exception answers unknown / probe_failed from the live tier.
 
-        This covers the most safety-critical branch: merge_status must return a
-        durable-tier result (not propagate the exception) when the live worker
-        is present but snapshot() itself raises.
+        merge_status must not propagate the exception, and must not fall
+        through to a durable tier: a live entry it could not read may be the
+        present truth, so the event-store row below must not answer.
         """
-        # Populate the event store so the durable tier has a result to serve.
         event_store = EventStore(tmp_path / 'runs.db', 'run-snap-fail')
         event_store.emit(
             EventType.merge_finalized,
@@ -6669,21 +6424,19 @@ class TestMergeStatus:
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(
-            _merge_worker=broken_worker,
-            _terminal_retention=None,
-        )
+        stub_harness = types.SimpleNamespace(_merge_worker=broken_worker)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        # Should NOT raise; should fall through to the event-store tier.
         result = await call_merge_status(server, request_id='mr-snapfail')
 
-        assert result.get('state') == 'done', (
-            f'Expected durable-tier result after snapshot() failure, got: {result}'
+        assert result.get('state') == 'unknown', (
+            f'Expected unknown after snapshot() failure, got: {result}'
         )
+        assert result.get('reason') == MergeReason.probe_failed, f'got: {result}'
+        assert result.get('source') == 'live', f'got: {result}'
+        assert result.get('hint') == hint_for(MergeReason.probe_failed), f'got: {result}'
         assert result.get('request_id') == 'mr-snapfail'
-        assert result.get('outcome') == 'done'
-        assert 'finished_at' in result
+        assert 'outcome' not in result, f'A durable row leaked into the answer: {result}'
 
 
 # ---------------------------------------------------------------------------

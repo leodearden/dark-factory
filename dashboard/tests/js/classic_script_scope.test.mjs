@@ -42,6 +42,7 @@ import {
   VENDORED_BABEL,
   babelScriptSrcs,
   classicScriptSrcs,
+  compileAsScriptTag,
   loadVendoredBabel,
   readIndexHtml,
 } from './_served_bundle.mjs';
@@ -265,10 +266,6 @@ test('the harness actually detects a duplicate top-level const (negative control
 });
 
 // ── The text/babel .jsx tags ──────────────────────────────────────────────
-
-function compileAsScriptTag(source, filename) {
-  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
-}
 
 const PROBE_SENTINEL = 'classic-scope probe: declarations instantiated, body not run';
 

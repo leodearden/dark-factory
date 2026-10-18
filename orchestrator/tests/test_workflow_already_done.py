@@ -17,10 +17,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 from escalation.queue import EscalationQueue
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, DeliveredChecksBlock
+from orchestrator.scheduler import SetTaskStatusRejected
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
 
@@ -796,3 +798,26 @@ class TestHandleAlreadyDoneReportAttribution:
         filed = queue.get_by_task('50')
         assert {e.category for e in filed} == {'task_failure'}
         assert any(e.level == 0 for e in filed), 'the steward-facing L0 is the retry route'
+
+
+@pytest.mark.asyncio
+async def test_rejected_mark_done_blocks_the_row_and_files_an_l1(tmp_path: Path):
+    """A corroborated report whose done write the store refuses must block the
+    row behind one L1, never report DONE over the row it could not write."""
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.artifacts.write_already_done(
+        commit='abcdef1234567890', evidence='helpers.foo on main at task 42',
+    )
+    f.wf.scheduler.mark_done = AsyncMock(side_effect=SetTaskStatusRejected(
+        task_id='50', error_code='pre_done_hook_rejected',
+        raw='pre-done hook exited rc 125',
+    ))
+    queue = _arm_queue(f, tmp_path)
+
+    outcome = await f.wf._handle_already_done_report()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert f.wf.state == WorkflowState.BLOCKED
+    assert _status_writes(f)[-1] == ('50', 'blocked')
+    assert len(queue.get_by_task('50', status='pending', level=1)) == 1
+    assert outcome_allows_status(outcome, 'blocked')

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from shared.branch_names import canonical_queued_branch_name
 
+from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
@@ -30,7 +31,7 @@ from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 class MainHealthAutoHealRegistry:
@@ -880,7 +881,7 @@ class MergeRequest:
     Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
     onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
     ``req`` inside the worker's post-merge verify retry path
-    (:func:`orchestrator.merge_queue._run_post_merge_verify`).
+    (:func:`orchestrator.merge_lane.worker._run_post_merge_verify`).
 
     When set, DF BUILDS THE SUBSET ITSELF (task 3059): on a classified
     infra-transient attempt-0 red it derives the {did-not-pass} set from that
@@ -894,6 +895,17 @@ class MergeRequest:
 
     Default ``False`` remains a strict no-op: no payload is built, no probe is
     run, and every retry path behaves byte-identically."""
+    awaited_by_workflow: bool = field(default=False, kw_only=True)
+    """True when a TaskWorkflow awaits this request's result and parks the task
+    at merge-deferred on a 'superseded' outcome
+    (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_superseded``).
+
+    The coalescing pass absorbs only such requests: a coalesce train lands only
+    once every member is merge-deferred, and only a workflow parks a task
+    there. The default covers the MCP ``merge_request``, the stranded-branch
+    reaper and journal recovery, whose submitters never park. Not journaled: a
+    recovered request's workflow died with the process. Read only on single
+    requests; a GroupMergeRequest is never a coalesce candidate."""
 
 
 @dataclass(frozen=True)
@@ -973,6 +985,11 @@ class GroupMergeRequest(MergeRequest):
     """Optional async callback: re-drive an absorbed member still merge-deferred
     after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
     None when not wired (back-compat with existing test constructions)."""
+
+    member_pre_stack_tips: tuple[PreStackTip, ...] = field(default=(), kw_only=True)
+    """The tip each stacked member had before the coalescing pass stacked it,
+    so a train that does not land can hand its members back.  Empty on a
+    declared train, whose tip workflow re-fires it."""
 
 
 @dataclass
@@ -1098,7 +1115,7 @@ class CapPermit:
     """Opaque merge-ahead-cap permit token (MQ-refactor theta / task 2161).
 
     The ``_merge_ahead_cap`` analogue of :class:`SpecPermit`: returned by a
-    :class:`~orchestrator.merge_speculation_controller.PermitLedger`
+    :class:`~orchestrator.merge_lane.speculation_controller.PermitLedger`
     constructed with ``token_factory=CapPermit`` and stored on the
     :class:`RealMergeItem` that owns it (``.cap_permit``). Byte-for-byte
     mirror of :class:`SpecPermit` -- same ``eq=False`` IDENTITY (not
@@ -1257,7 +1274,7 @@ class ChainResult:
     """Result of a deep merge-ahead chain build (``plans/deep-merge-ahead-prd.md``
     §Contract, task β).
 
-    Returned by :func:`orchestrator.merge_queue.build_chain`, which
+    Returned by :func:`orchestrator.merge_lane.worker.build_chain`, which
     sequentially merges queued items in submission order onto the frozen
     head's merge commit inside ONE scratch worktree, truncating at the first
     textual conflict.  Sibling of the ``classify_and_merge`` sum type
@@ -1316,7 +1333,7 @@ class ChainResult:
 
     **Lane ownership.**  A NON-EMPTY result HOLDS ``lane``, and the caller
     MUST release it via
-    :func:`orchestrator.merge_liveness.release_chain_build_lane` (passing
+    :func:`orchestrator.merge_lane.liveness.release_chain_build_lane` (passing
     ``warm=lane_warm``) once done with the tip.  An EMPTY result never holds a
     lane (``lane is None``, ``lane_warm is False``), so a caller that skips
     the release on the empty path cannot leak one.
@@ -1367,7 +1384,7 @@ class OutcomeKind(StrEnum):
 
     A single str-compatible Enum (mirrors ``InflightStatus`` above /
     ``event_store.EventType``) enumerating every ``data['outcome']`` value
-    passed to :func:`orchestrator.merge_queue._emit_merge_attempt`. Members
+    passed to :func:`orchestrator.merge_lane.worker._emit_merge_attempt`. Members
     are ``str`` instances, so every existing ``==``/``in``/JSON comparison
     against the raw outcome strings keeps working unchanged, and
     ``EventStore.emit``'s ``json.dumps`` produces byte-identical payloads to
@@ -1488,8 +1505,8 @@ class ItemLifecycleState(StrEnum):
         omission was never a gap.
 
     This is ONLY the state vocabulary — see
-    ``orchestrator.merge_queue.ItemLifecycle`` for the request_id-keyed
-    registry, ``orchestrator.merge_queue._LEGAL_TRANSITIONS`` for the
+    ``orchestrator.merge_lane.worker.ItemLifecycle`` for the request_id-keyed
+    registry, ``orchestrator.merge_lane.worker._LEGAL_TRANSITIONS`` for the
     legal-edge table, and ``ItemLifecycle.transition()`` for the guarded
     mutator. Task iota delivers only this substrate; the sibling task kappa
     wires ``transition()`` at every put/pop call site and repoints

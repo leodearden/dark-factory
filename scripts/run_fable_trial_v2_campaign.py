@@ -856,11 +856,8 @@ def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
     fires, so such a fixture can never be discarded — the conservative
     direction, by construction rather than by care.
     """
-    from orchestrator.evals.metrics import (
-        DECLINE_KINDS,
-        produced_a_plan,
-        terminal_kind_of,
-    )
+    from orchestrator.evals.metrics import DECLINE_KINDS, terminal_kind_of
+    from orchestrator.evals.plan_predicates import produced_a_plan
 
     if metrics.get('cap_tainted'):
         return 'unmeasured'

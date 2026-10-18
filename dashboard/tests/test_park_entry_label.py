@@ -18,8 +18,7 @@ import pathlib
 import subprocess
 
 import pytest
-from _dashboard_helpers import extract_function_body, find_function_params
-from _lock_chip_matrix import node_path
+from _dashboard_helpers import extract_function_body, find_function_params, node_path
 
 _TAB_SCHEDULER = (
     pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/tab_scheduler.jsx'

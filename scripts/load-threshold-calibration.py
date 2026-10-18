@@ -10,19 +10,15 @@ per-candidate-threshold hold fractions and hold streaks against D11; drift
 between this project's ``psi_admission`` block and reify's; and which yaml
 leaves merely restate the shipped code default.
 
-STDLIB ONLY, plus ``yaml`` imported lazily inside the drift check. This is
-measured, not stylistic. The live orchestrator runs under ``uv run --frozen
---project orchestrator``, yet its /proc/<pid>/environ carries no VIRTUAL_ENV
-and no venv bin on PATH; ``deterministic_runner.py`` launches a
-``before_done`` script with ``create_subprocess_exec(script, *args)`` —
-straight through the shebang with that env inherited. So at gate time
-``#!/usr/bin/env python3`` resolves to /usr/bin/python3 (3.12.3), which HAS
-yaml but NOT ``shared``, ``sampler`` or ``orchestrator``. A top-level
-first-party import would crash the gate on import fourteen days after this
-lands, in a born-at-L2 escalation path, with no earlier signal. Keeping yaml
-lazy additionally makes the module stdlib-importable, so any test in any
-subproject can load it by path, and a missing PyYAML becomes a NAMED
-degradation instead of an import crash.
+Stdlib plus this checkout's ``sampler.metrics``, bound through
+scripts/_checkout.py. The gate's interpreter has no venv: the live
+orchestrator's /proc/<pid>/environ carries no VIRTUAL_ENV and no venv bin on
+PATH, and ``deterministic_runner.py`` launches a ``before_done`` script with
+``create_subprocess_exec(script, *args)``, straight through the shebang, so
+``#!/usr/bin/env python3`` resolves to /usr/bin/python3. The binding needs
+none, and ``sampler.metrics`` imports psutil lazily. This script never imports
+``sampler.store``, which needs aiosqlite. ``yaml`` stays lazy inside the drift
+check, so a missing PyYAML is a NAMED degradation instead of an import crash.
 
 ALWAYS EXITS 0 when it completed an analysis. Every degradation — corpus
 missing or empty, peer config absent/unreadable/unparseable, either side
@@ -57,9 +53,13 @@ import os
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, TypedDict
+
+import _checkout as _checkout
+from sampler.metrics import ARM_METRICS, TICK_CLOCK, MetricSpec
 
 # The PEER checkout, and so the one path here that must NOT follow
 # $DARK_FACTORY_ROOT: the whole point of the comparison is that it lives in a
@@ -67,19 +67,37 @@ from typing import NamedTuple, TypedDict
 DEFAULT_PEER_CONFIG = Path('/home/leo/src/reify/dark-factory-orchestrator.yaml')
 PERCENTILES = (0.50, 0.90, 0.95, 0.99)
 
-# {metric: [(ts, value) in ts order]} — what every reader here hands around.
-Series = dict[str, list[tuple[int, float]]]
+class SeriesKey(NamedTuple):
+    """One recorded series: a sampler metric, and the cgroup leaf it was read
+    at — ``None`` for a host-level metric."""
+
+    metric: str
+    leaf: str | None
+
+    def label(self) -> str:
+        """``metric`` or ``metric:leaf``, for display only; nothing parses it."""
+        return self.metric if self.leaf is None else f'{self.metric}:{self.leaf}'
+
+
+def _series_order(key: SeriesKey) -> tuple[str, str]:
+    """The one order every per-series table is reported in.
+
+    A key, not plain ``sorted()``: a host-level and a per-leaf series of one
+    metric would compare ``None`` against ``str`` and raise.
+    """
+    return key.metric, key.leaf or ''
+
+
+# {SeriesKey: [(ts, value) in ts order]} — what every reader here hands around.
+Series = dict[SeriesKey, list[tuple[int, float]]]
 
 class ArmSpec(NamedTuple):
     """Everything the report needs about one gate arm.
 
-    ``selector`` is the sampler metric recording this arm. It may name a
-    metric outright or be a ':' prefix with one series per cgroup leaf; which
-    one it is is read off the RECORDED metric name at every use site, never
-    declared here, because a declared copy of a derivable fact is free to
-    contradict the data. ``ladder`` is the candidate thresholds to evaluate
-    hold fractions at. ``unit`` labels the numbers for the human reading the
-    escalation.
+    ``selector`` is the sampler metric recording this arm; a per-leaf metric
+    yields one series per leaf, reported per leaf, never pooled. ``ladder`` is
+    the candidate thresholds to evaluate hold fractions at. ``unit`` labels
+    the numbers for the human reading the escalation.
 
     ``readability`` names the ``*_read_ok`` metric recording whether this arm
     was readable at all, or ``None`` when the collector emits none. It has no
@@ -99,41 +117,48 @@ class ArmSpec(NamedTuple):
 _PRESSURE_LADDER = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0)
 _PRESSURE_UNIT = '% of wall time stalled (PSI avg10)'
 
-# The corpus's TICK CLOCK: the one metric ``collect_load_metrics`` writes on
-# every tick it completes, readable or not — an unreadable /proc/stat is a 0.0
-# row, never a missing one. Every ``own_read_ok:<leaf>`` comes out of that same
-# call but only for the leaves discovered that tick, so a leaf's own row count
-# is not the tick count; this metric's is. Public because the lockstep test in
-# sampler/tests/test_load_metrics.py asserts the sampler really does emit it on
-# every completed tick, which is the whole of what makes it a clock.
-TICK_METRIC = 'runqueue_read_ok'
-
-# Arm name -> its ArmSpec. The `selector` half is duplicated from
-# sampler.metrics.ARM_METRIC_STEMS BY NECESSITY: that module cannot be
-# imported here, because at gate time this script runs under the system
-# python3 (see the stdlib-only note above). The reconciler is the named
-# lockstep test in sampler/tests/test_load_metrics.py, which loads this file by
-# path and asserts the two agree in both directions — so do NOT
-# "de-duplicate" this with an import, which would crash the gate.
-ARM_METRIC_SELECTORS = {
-    'mem_full_avg10': ArmSpec(
-        'psi_mem_full_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
-    'mem_some_avg10': ArmSpec(
-        'psi_mem_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
-    'io_some_avg10': ArmSpec(
-        'psi_io_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
-    'cpu_some_avg10': ArmSpec(
-        'psi_cpu_some_avg10', _PRESSURE_LADDER, _PRESSURE_UNIT, None),
+# This script's own fact about each gate arm: the thresholds to evaluate it at,
+# and the unit they are in. Its order is the report's arm order. The metric
+# recording the arm, and its readability metric, are sampler.metrics.ARM_METRICS's.
+_ARM_SCALES: dict[str, tuple[tuple[float, ...], str]] = {
+    'mem_full_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
+    'mem_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
+    'io_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
+    'cpu_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
     # A RATIO, not a percentage: procs_running / len(sched_getaffinity(0)).
     # 1.0 is "as many runnable threads as CPUs"; 4.0 is PRD D9's provisional.
-    'runqueue_ratio': ArmSpec(
-        'runqueue_ratio',
+    'runqueue_ratio': (
         (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0),
-        'runnable threads per CPU (ratio)', TICK_METRIC),
-    # One series per cgroup leaf, so ':' — reported per leaf, never pooled.
-    'own_cpu_some_avg10': ArmSpec(
-        'own_cpu_some10', _PRESSURE_LADDER, _PRESSURE_UNIT, 'own_read_ok'),
+        'runnable threads per CPU (ratio)',
+    ),
+    'own_cpu_some_avg10': (_PRESSURE_LADDER, _PRESSURE_UNIT),
 }
+
+# Every coverage row's denominator: see sampler.metrics.TICK_CLOCK.
+TICK_METRIC = TICK_CLOCK.name
+
+
+def _arm_spec(spec: MetricSpec, ladder: tuple[float, ...], unit: str) -> ArmSpec:
+    readability = spec.readability.name if spec.readability is not None else None
+    return ArmSpec(spec.name, ladder, unit, readability)
+
+
+def _arm_selectors(arm_metrics: Mapping[str, MetricSpec]) -> dict[str, ArmSpec]:
+    """Every arm's ArmSpec, in ``_ARM_SCALES`` order; the two must name the same arms."""
+    unscaled = sorted(arm_metrics.keys() - _ARM_SCALES.keys())
+    unrecorded = sorted(_ARM_SCALES.keys() - arm_metrics.keys())
+    if unscaled or unrecorded:
+        raise ValueError(
+            'the gate arms here and in sampler.metrics.ARM_METRICS differ: '
+            f'no scale here for {unscaled}, no recording metric for {unrecorded}'
+        )
+    return {
+        arm: _arm_spec(arm_metrics[arm], ladder, unit)
+        for arm, (ladder, unit) in _ARM_SCALES.items()
+    }
+
+
+ARM_METRIC_SELECTORS = _arm_selectors(ARM_METRICS)
 
 
 def pct(xs: list[float], p: float) -> float:
@@ -156,7 +181,7 @@ def pct(xs: list[float], p: float) -> float:
 
     SHARED ORIGIN, and it cannot currently be shared as code: this is a copy of
     ``scripts/merge-pytest-n-ab-analysis.py::pct``, which has the un-fixed
-    tie-break. Both files must run under the system python3 with stdlib only,
+    tie-break. Both files must run under the system python3 with no venv,
     and ``scripts/`` is not a package, so there is no module for them to import
     from and no reconciler test to write against one. Change this and the other
     one drifts silently -- read them together.
@@ -239,68 +264,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-# The two halves of a selector, as SEPARATE statements. Spelled
-# `WHERE metric = ? OR metric GLOB ?` they plan as MULTI-INDEX OR plus
-# USE TEMP B-TREE FOR ORDER BY, because one ORDER BY over the union has to be
-# sorted globally -- while the caller only ever needs ts order WITHIN a metric.
-# Apart, each is a bare index range scan with no sort at all. Measured on a
-# 700k-row probe of one stem (7 leaves x 100k ticks): 1,930 ms together against
-# 1,288 ms apart, byte-identical series. At the 30-day steady state the script's
-# docstring cites, the own_cpu_some10 stem alone is ~3.6M rows, so the temp sort
-# is the larger part of a read this gate makes on a 14-day clock.
-#
-# The sort is not the only cost avoided: a temp B-tree needs temp-file space,
-# and SQLite raises `unable to open database file` when it cannot get any --
-# turning a delivered analysis into a non-zero rc, which ε1/ε2 classify as an
-# infra fault. Observed while benchmarking this very change.
-#
-# `ORDER BY metric, ts` on the stem half, not `ORDER BY ts`: the leading column
-# is what lets the index supply the order, and the caller splits by metric
-# anyway. The cursor is iterated rather than .fetchall()'d so the row tuples do
-# not have to exist all at once alongside the Series they are copied into.
-_EXACT_SQL = 'SELECT metric, ts, value FROM samples WHERE metric = ? ORDER BY ts'
-_STEM_SQL = (
-    'SELECT metric, ts, value FROM samples WHERE metric GLOB ? ORDER BY metric, ts'
-)
+# One metric's rows, every leaf at once, in ts order: the order the
+# (metric, ts, leaf) index already holds them in, so there is no sort, and each
+# leaf's points stay in ts order as they are split out.
+_SERIES_SQL = 'SELECT leaf, ts, value FROM samples WHERE metric = ? ORDER BY ts'
 
-# The corpus TICK COUNT, counted rather than fetched. ``coverage_table`` wants
-# only how MANY ticks the corpus holds, and TICK_METRIC is written on every
-# completed tick -- ~518k rows at the 30-day steady state this script's
-# docstring cites. Reading that series to take its `len()` materialised ~518k
-# (ts, value) tuples on every run.
-#
-# WHICH runs stop paying that: the ones that do NOT select the runqueue arm --
-# the ε2 `--arm own_cpu_some_avg10` cut, and a single-PSI-arm run. ε1
-# `--arm runqueue_ratio` and the default full run still materialise the clock,
-# because the runqueue arm DECLARES TICK_METRIC as its readability series and
-# computes its coverage row from those points; those two now also pay one extra
-# index-only COUNT over the same rows. That is the deliberate price of counting
-# uniformly: the denominator stays one fact about the CORPUS rather than
-# something derived from whichever arms a run happened to select.
-#
-# Measured in this worktree against the real schema: this statement plans as
-# `SEARCH samples USING COVERING INDEX idx_samples_metric_ts (metric=?)` --
-# index-only, no table access and no temp B-tree. The series fetch it replaces
-# plans as a NON-covering `SEARCH samples USING INDEX idx_samples_metric_ts
-# (metric=?)`, because it has to read `value` off the table for every row it
-# then discards.
+# The corpus TICK COUNT, counted rather than fetched: ``coverage_table`` wants
+# only how MANY ticks the corpus holds. Counted on every run, whichever arms it
+# selects, so the denominator stays one fact about the CORPUS. Plans as
+# `SEARCH samples USING COVERING INDEX idx_samples_metric_ts_leaf (metric=?)`:
+# index-only, no table access.
 _COUNT_SQL = 'SELECT COUNT(*) FROM samples WHERE metric = ?'
 
 
-def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
-    """``{metric: [(ts, value) in ts order]}`` for every selector, one home.
+def _fetch(con: sqlite3.Connection, metrics: list[str]) -> Series:
+    """Every series recorded under *metrics*, one per leaf, points in ts order.
 
-    Shared by the value series and the readability series so the GLOB spelling
-    and its reasoning live in exactly one place (heuristic 11).
+    Shared by the value series and the readability series, so both are read
+    and keyed the same way. The cursor is iterated rather than fetched whole.
     """
     series: Series = {}
-    for selector in selectors:
-        for sql, param in (
-            (_EXACT_SQL, selector),
-            (_STEM_SQL, f'{selector}:*'),
-        ):
-            for metric, ts, value in con.execute(sql, (param,)):
-                series.setdefault(metric, []).append((int(ts), float(value)))
+    for metric in metrics:
+        for leaf, ts, value in con.execute(_SERIES_SQL, (metric,)):
+            series.setdefault(SeriesKey(metric, leaf), []).append(
+                (int(ts), float(value)))
     return series
 
 
@@ -343,25 +330,14 @@ def read_series(db: Path, arm: str | None) -> CorpusRead:
     there, nothing was read, so there is nothing to report.
 
     Opened ``file:...?mode=ro`` so a calibration run can never write to the
-    live corpus. A ':' selector matches every per-cgroup leaf under that stem,
-    each kept as its OWN series — pooling them would average unrelated
-    workloads into one meaningless number.
+    live corpus. Metrics are matched exactly, and each cgroup leaf of a
+    per-leaf metric is kept as its OWN series — pooling them would average
+    unrelated workloads into one meaningless number.
 
-    The stem match is ``GLOB``, not ``LIKE``, for two independently sufficient
-    reasons. Correctness: ``_`` is a single-character wildcard in LIKE and
-    every selector contains one, so ``own_cpu_some10:%`` also matches
-    ``own-cpu-some10:leaf`` — and this repo spells unit and slice names with
-    hyphens throughout, making that a realistic next metric name. GLOB has no
-    ``_`` wildcard. Cost: LIKE is ASCII-case-INsensitive by default, so it
-    cannot use a BINARY-collated index and this query planned as
-    ``SCAN samples``; GLOB is always case-sensitive, so the prefix
-    optimisation applies and the stem half plans as
-    ``SEARCH samples USING INDEX idx_samples_metric_ts (metric>? AND
-    metric<?)``. Measured on a 2.16M-row probe with this exact schema. At the
-    30-day steady state the corpus is ~13M rows, so the LIKE spelling was a
-    full scan per selector — the same shape of cost regression the dashboard's
-    ``/api/load`` query carried before it was bounded. Why the two halves are
-    issued as separate statements is on ``_STEM_SQL``.
+    A ``samples`` table with no ``leaf`` column is ``corpus_not_migrated``:
+    its per-leaf rows still carry the leaf inside the metric name, so none of
+    them can be read by metric and leaf. The sampler's store migrates the file
+    on its next tick.
     """
     specs = (
         [ARM_METRIC_SELECTORS[arm]] if arm else list(ARM_METRIC_SELECTORS.values())
@@ -373,6 +349,14 @@ def read_series(db: Path, arm: str | None) -> CorpusRead:
         return CorpusRead({}, {}, 0, [f'db_unavailable: {db} ({exc})'])
 
     try:
+        # No table at all leaves `columns` empty and falls through to the
+        # fetch, which raises, so db_unavailable still names that case.
+        columns = {row[1] for row in con.execute('PRAGMA table_info(samples)')}
+        if columns and 'leaf' not in columns:
+            return CorpusRead({}, {}, 0, [
+                f'corpus_not_migrated: {db} has no leaf column '
+                '(the sampler migrates it on its next tick)'
+            ])
         series = _fetch(con, selectors)
         readability = _fetch(
             con, sorted({spec.readability for spec in specs if spec.readability})
@@ -394,10 +378,10 @@ def read_series(db: Path, arm: str | None) -> CorpusRead:
 
 
 def percentile_table(
-    series: dict[str, list[float]]
-) -> dict[str, dict[str, float]]:
+    series: dict[SeriesKey, list[float]]
+) -> dict[SeriesKey, dict[str, float]]:
     return {
-        metric: {
+        key: {
             'n': len(values),
             'p50': round(pct(values, 0.50), 3),
             'p90': round(pct(values, 0.90), 3),
@@ -405,7 +389,8 @@ def percentile_table(
             'p99': round(pct(values, 0.99), 3),
             'max': round(max(values), 3),
         }
-        for metric, values in sorted(series.items())
+        for key, values in sorted(
+            series.items(), key=lambda item: _series_order(item[0]))
     }
 
 
@@ -537,11 +522,9 @@ def load_psi_admission_block(path: Path, side: str) -> tuple[dict | None, list[s
     escalation, and "reify's yaml was missing" must arrive as a sentence in the
     report rather than as a crash.
 
-    ``yaml`` is imported HERE rather than at module scope. At gate time this
-    script runs under the system python3, which happens to have PyYAML — but
-    the module must stay stdlib-importable so any subproject's test can load
-    it by path, and so a missing PyYAML degrades by name instead of crashing
-    on import.
+    ``yaml`` is imported HERE rather than at module scope, so a missing
+    PyYAML degrades by name instead of crashing on import: the gate's system
+    python3 happens to have it, and a bare interpreter does not.
 
     An ABSENT block returns ``None``, never ``{}``: "this project has not
     configured psi_admission" and "it configured an empty block" are different
@@ -787,59 +770,48 @@ def compare_blocks(local: dict | None, peer: dict | None) -> dict | None:
     }
 
 
-def _arm_for(metric: str, specs: list[ArmSpec]) -> str | None:
-    """The arm name a recorded metric belongs to (':' stems included)."""
-    stem = metric.split(':', 1)[0]
+def _arm_for(key: SeriesKey, specs: list[ArmSpec]) -> str | None:
+    """The arm name a recorded series belongs to, among the selected *specs*."""
     for arm, spec in ARM_METRIC_SELECTORS.items():
-        if spec in specs and spec.selector in (metric, stem):
+        if spec in specs and spec.selector == key.metric:
             return arm
     return None
 
 
-def _value_metric_for(metric: str, specs: list[ArmSpec]) -> str | None:
-    """The VALUE series a ``*_read_ok`` metric is evidence ABOUT, or None.
+def _value_key_for(evidence: SeriesKey, specs: list[ArmSpec]) -> SeriesKey | None:
+    """The VALUE series a readability series is evidence ABOUT, or None.
 
-    The mirror image of the two lines ``coverage_table`` uses in the forward
-    direction, written against the same ArmSpec fields and the same ':'
-    partition — so the stem/non-stem rule is stated once per direction and a
-    metric reached from either side computes an identical row.
+    The mirror image of the pairing ``coverage_table`` does forward — the same
+    ArmSpec fields and the same leaf — so a series reached from either side
+    computes an identical row. Needed because a series readable on NO tick
+    writes no value row at all, so the readability side is the only side it
+    appears on.
 
-    Needed because a series readable on NO tick writes no value row at all, so
-    the readability side is the only side it appears on.
-
-    The ``None`` is a BACKSTOP, not the thing that scopes an ``--arm`` run.
-    That is done on the FETCH side: ``read_series`` asks for exactly the
-    selected specs' own ``readability`` values, and ``_fetch`` issues an exact
-    match and a ``<selector>:*`` GLOB — so every key reaching here is already
-    one of those values, with or without a ':' tail, and a spec always matches.
-    None is returned only for a caller passing *specs* that disagree with the
-    ones the dict was fetched under. Widen that fetch — a blanket
-    ``{TICK_METRIC} | ...`` union again, or every readability metric at once —
-    and this filter will NOT hold the line: an ``--arm runqueue_ratio`` run
-    would start reporting ``own_cpu_some10:<leaf>`` rows.
+    ``None`` for evidence no selected spec declares. That is a backstop: the
+    fetch already asks for exactly the selected specs' ``readability``
+    metrics.
     """
-    stem, separator, tail = metric.partition(':')
     for spec in specs:
-        if spec.readability == stem:
-            return f'{spec.selector}:{tail}' if separator else spec.selector
+        if spec.readability == evidence.metric:
+            return SeriesKey(spec.selector, evidence.leaf)
     return None
 
 
 def hold_table(
-    series: dict[str, list[tuple[int, float]]],
+    series: Series,
     specs: list[ArmSpec],
-) -> dict[str, list[dict]]:
-    """Per metric, one entry per candidate threshold on its arm's ladder."""
+) -> dict[SeriesKey, list[dict]]:
+    """Per series, one entry per candidate threshold on its arm's ladder."""
     ladders = {spec.selector: spec.ladder for spec in specs}
-    out: dict[str, list[dict]] = {}
-    for metric, points in series.items():
-        stem = metric.split(':', 1)[0]
-        ladder = ladders.get(stem) or ladders.get(metric)
+    out: dict[SeriesKey, list[dict]] = {}
+    for key in sorted(series, key=_series_order):
+        ladder = ladders.get(key.metric)
         if ladder is None:
             continue
+        points = series[key]
         values = [v for _, v in points]
         spacing = observed_spacing([ts for ts, _ in points])
-        out[metric] = [
+        out[key] = [
             _rung(points, values, threshold, spacing)
             for threshold in ladder
         ]
@@ -870,13 +842,14 @@ def _rung(
 
 
 class Coverage(TypedDict):
-    """One metric's readable-tick coverage, as reported and as serialised.
+    """One series' readable-tick coverage, as reported and as serialised.
 
     A TypedDict rather than a ``dict[str, float]``: the entry carries three
-    counts, a fraction that is ``None`` when it cannot be known, and the NAME
-    of the readability metric the counts came from, and every consumer reads
-    those back at different types. At runtime it is a plain dict, which is
-    what lands in the JSON payload.
+    counts, a fraction that is ``None`` when it cannot be known, and the
+    readability METRIC the counts came from, and every consumer reads those
+    back at different types. The metric is bare: the leaf it was read at is
+    the value series' own. At runtime it is a plain dict, which is what lands
+    in the JSON payload.
 
     ``ticks_in_corpus`` is the fraction's denominator; ``ticks_with_a_row`` is
     not, and is reported beside it so "the leaf existed for 3 of 14 days" stays
@@ -896,8 +869,8 @@ def coverage_table(
     specs: list[ArmSpec],
     *,
     ticks_in_corpus: int,
-) -> dict[str, Coverage | None]:
-    """Per VALUE metric, the readable-tick coverage its numbers rest on.
+) -> dict[SeriesKey, Coverage | None]:
+    """Per VALUE series, the readable-tick coverage its numbers rest on.
 
     A failed read emits no value row at all, so ``hold_fraction``'s denominator
     is the number of SUCCESSFUL reads rather than the number of ticks. Without
@@ -907,9 +880,9 @@ def coverage_table(
 
     The fraction is readable ticks over *ticks_in_corpus*, the corpus tick
     count ``read_series`` counted — not over the row count of the arm's own
-    ``*_read_ok`` metric. The two agree only for a readability metric written
-    on every tick, which ``runqueue_read_ok`` is and ``own_read_ok:<leaf>`` is
-    not: that one is written only on ticks its leaf was discovered, so a leaf
+    ``*_read_ok`` series. The two agree only for a readability metric written
+    on every tick, which ``runqueue_read_ok`` is and a leaf's ``own_read_ok``
+    is not: that one is written only on ticks its leaf was discovered, so a leaf
     present for 3 days of a 14-day corpus has 3 days of rows, all readable, and
     dividing by its own row count would call that full coverage. Taken as a
     parameter rather than derived here, so the denominator is a fact about the
@@ -919,13 +892,14 @@ def coverage_table(
     host-PSI arms. Reporting a fabricated 1.0 there would be the same class of
     defect as persisting α's fail-open 0.0 as a ratio.
 
-    Keyed by the value metric so a ':' stem reports PER LEAF: one cgroup can be
+    Keyed by the value series, so a per-leaf metric reports PER LEAF, each
+    paired with the readability series of the SAME leaf: one cgroup can be
     unreadable while its siblings are fine, which is exactly the case worth
     seeing. A series with READABILITY rows and no value rows gets a row too,
-    reached backwards through ``_value_metric_for`` — because the fully
+    reached backwards through ``_value_key_for`` — because the fully
     unreadable leaf is precisely the one that writes no value row: the sampler
-    records ``own_read_ok:<leaf>`` = 0.0 on every tick it discovered the leaf
-    and nothing else. Iterating the value series alone therefore hid the exact
+    records its ``own_read_ok`` = 0.0 on every tick it discovered the leaf and
+    nothing else. Iterating the value series alone therefore hid the exact
     case this keying exists to expose.
     """
     # The UNION of both sides, because each carries a case the other cannot.
@@ -933,35 +907,33 @@ def coverage_table(
     # (no value rows to iterate). Without the value side, the four PSI arms
     # vanish — they declare no readability metric, so nothing reaches them
     # backwards, and their coverage is a reported ``None`` rather than nothing.
-    # Sorted, so the JSON payload's key order does not depend on which side a
-    # metric arrived from.
+    # Ordered, so the JSON payload's order does not depend on which side a
+    # series arrived from.
     covered = {
-        metric for metric in series if _arm_for(metric, specs) is not None
+        key for key in series if _arm_for(key, specs) is not None
     } | {
-        value_metric
+        value_key
         for evidence in readability
-        if (value_metric := _value_metric_for(evidence, specs)) is not None
+        if (value_key := _value_key_for(evidence, specs)) is not None
     }
-    out: dict[str, Coverage | None] = {}
-    for metric in sorted(covered):
-        arm = _arm_for(metric, specs)
+    out: dict[SeriesKey, Coverage | None] = {}
+    for key in sorted(covered, key=_series_order):
+        arm = _arm_for(key, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
         # Unreachable: `covered`'s series side was filtered on `_arm_for`, and
-        # every metric on its readability side was built from a SELECTED
-        # spec's own selector, so `_arm_for` resolves that too. Kept as a
-        # backstop because the alternative to skipping is an AttributeError
-        # below -- a traceback and a non-zero rc, an infra fault to ε1/ε2.
+        # every key on its readability side was built from a SELECTED spec's
+        # own selector, so `_arm_for` resolves that too. Kept as a backstop
+        # because the alternative to skipping is an AttributeError below -- a
+        # traceback and a non-zero rc, an infra fault to ε1/ε2.
         if spec is None:
             continue
         if spec.readability is None:
-            out[metric] = None
+            out[key] = None
             continue
-        _stem, separator, tail = metric.partition(':')
-        key = f'{spec.readability}:{tail}' if separator else spec.readability
-        points = readability.get(key, [])
+        points = readability.get(SeriesKey(spec.readability, key.leaf), [])
         rows = len(points)
         readable = sum(1 for _ts, value in points if value == 1.0)
-        out[metric] = {
+        out[key] = {
             'ticks_in_corpus': ticks_in_corpus,
             'ticks_with_a_row': rows,
             'readable': readable,
@@ -976,12 +948,17 @@ def coverage_table(
                 round(readable / ticks_in_corpus, 4)
                 if 0 < rows <= ticks_in_corpus else None
             ),
-            'readability_metric': key,
+            'readability_metric': spec.readability,
         }
     return out
 
 
-def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
+def _readability_label(key: SeriesKey, stats: Coverage) -> str:
+    """The readability SERIES value series *key*'s coverage was counted from."""
+    return SeriesKey(stats['readability_metric'], key.leaf).label()
+
+
+def _below_floor(key: SeriesKey, stats: Coverage) -> list[tuple[str, str]]:
     """Each cause of a KNOWN coverage's shortfall that is below the D11 floor.
 
     ``(degradation, detail)`` pairs, one per cause, each judged on its own
@@ -1013,7 +990,7 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
             'partial_presence',
             f'present on only {rows}/{corpus} corpus ticks ({rows / corpus:.1%}), '
             f'below the {D11_READABILITY_FLOOR:.0%} floor — '
-            f"`{stats['readability_metric']}` has no row on the rest (its leaf "
+            f'`{_readability_label(key, stats)}` has no row on the rest (its leaf '
             'was not discovered), so its hold fractions describe that span, not '
             'the whole corpus',
         ))
@@ -1036,7 +1013,7 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
     return out
 
 
-def _unknown_cause(stats: Coverage) -> tuple[str, str] | None:
+def _unknown_cause(key: SeriesKey, stats: Coverage) -> tuple[str, str] | None:
     """Why a coverage has NO fraction — one ``(degradation, detail)``, or None.
 
     ``_below_floor``'s mirror for the case where there is no ratio to judge,
@@ -1064,7 +1041,7 @@ def _unknown_cause(stats: Coverage) -> tuple[str, str] | None:
     if stats['readable_fraction'] is not None:
         return None
     corpus, rows = stats['ticks_in_corpus'], stats['ticks_with_a_row']
-    metric = stats['readability_metric']
+    metric = _readability_label(key, stats)
     if rows > corpus:
         return (
             'impossible_coverage',
@@ -1085,18 +1062,18 @@ def _unknown_cause(stats: Coverage) -> tuple[str, str] | None:
     )
 
 
-def _coverage_line(stats: Coverage | None) -> str:
+def _coverage_line(key: SeriesKey, stats: Coverage | None) -> str:
     """The report's one-line coverage verdict printed beside a hold ladder."""
     if stats is None:
         return (
             'Coverage: no readability metric for this arm, so the hold '
             'fractions below are over readable ticks of unknown count.'
         )
-    unknown = _unknown_cause(stats)
+    unknown = _unknown_cause(key, stats)
     if unknown is not None:
         _cause, detail = unknown
         return f'Coverage: UNKNOWN — {detail}. See degradations.'
-    causes = [cause for cause, _detail in _below_floor(stats)]
+    causes = [cause for cause, _detail in _below_floor(key, stats)]
     return (
         f"Coverage: readable on {stats['readable']}/{stats['ticks_in_corpus']} "
         f"corpus ticks ({stats['readable_fraction']:.1%}), present on "
@@ -1107,7 +1084,7 @@ def _coverage_line(stats: Coverage | None) -> str:
 
 
 def readability_degradations(
-    coverage: dict[str, Coverage | None]
+    coverage: dict[SeriesKey, Coverage | None]
 ) -> list[str]:
     """Name each series whose coverage is below the floor, or NOT KNOWN.
 
@@ -1127,12 +1104,13 @@ def readability_degradations(
     operator hunting a flaky read that never happened.
     """
     out = []
-    for metric, stats in sorted(coverage.items()):
+    for key in sorted(coverage, key=_series_order):
+        stats = coverage[key]
         if stats is None:
             continue
-        unknown = _unknown_cause(stats)
-        causes = [unknown] if unknown is not None else _below_floor(stats)
-        out += [f'{cause}: {metric} {detail}' for cause, detail in causes]
+        unknown = _unknown_cause(key, stats)
+        causes = [unknown] if unknown is not None else _below_floor(key, stats)
+        out += [f'{cause}: {key.label()} {detail}' for cause, detail in causes]
     return out
 
 
@@ -1235,6 +1213,14 @@ def commit_report(path: Path, stamp: str) -> list[str]:
     return []
 
 
+def _series_entries(table: Mapping[SeriesKey, object], field: str) -> list[dict]:
+    """A per-series table as JSON: ``[{metric, leaf, <field>: value}]``."""
+    return [
+        {'metric': key.metric, 'leaf': key.leaf, field: table[key]}
+        for key in sorted(table, key=_series_order)
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     now = datetime.now(UTC)
@@ -1247,7 +1233,8 @@ def main(argv: list[str] | None = None) -> int:
         [ARM_METRIC_SELECTORS[args.arm]] if args.arm
         else list(ARM_METRIC_SELECTORS.values())
     )
-    percentiles = percentile_table({m: [v for _, v in pts] for m, pts in series.items()})
+    percentiles = percentile_table(
+        {key: [v for _, v in pts] for key, pts in series.items()})
     holds = hold_table(series, specs)
     coverage = coverage_table(
         series, corpus.readability, specs, ticks_in_corpus=corpus.ticks_in_corpus)
@@ -1278,9 +1265,9 @@ def main(argv: list[str] | None = None) -> int:
     if percentiles:
         lines += ['| metric | n | p50 | p90 | p95 | p99 | max |',
                   '|---|---|---|---|---|---|---|']
-        for metric, stats in percentiles.items():
+        for key, stats in percentiles.items():
             lines.append(
-                f"| `{metric}` | {stats['n']} | {stats['p50']} | {stats['p90']} "
+                f"| `{key.label()}` | {stats['n']} | {stats['p50']} | {stats['p90']} "
                 f"| {stats['p95']} | {stats['p99']} | {stats['max']} |"
             )
     else:
@@ -1293,18 +1280,18 @@ def main(argv: list[str] | None = None) -> int:
               'verdicts for a dispatch throttle. It is a hold streak, not a '
               'floor-occupancy measurement — in-flight floor occupancy is not in this '
               'corpus.', '']
-    for metric, candidates in holds.items():
-        arm = _arm_for(metric, specs)
+    for key, candidates in holds.items():
+        arm = _arm_for(key, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
         in_force = configured.get(arm) if arm else None
         lines += [
-            f'### `{metric}` — {spec.unit if spec else ""}',
+            f'### `{key.label()}` — {spec.unit if spec else ""}',
             '',
             f'Configured value in force: {_in_force_label(arm, in_force, unusable_thresholds)}',
             '',
             # A hold fraction's denominator is readable ticks, not ticks, so it
             # is printed beside the coverage it was computed over — never alone.
-            _coverage_line(coverage.get(metric)),
+            _coverage_line(key, coverage.get(key)),
             '',
             '| candidate | hold fraction | <= target | longest hold run |',
             '|---|---|---|---|',
@@ -1386,9 +1373,9 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         'generated_at': now.isoformat(timespec='seconds'),
         'db': str(args.db),
-        'percentiles': percentiles,
-        'holds': holds,
-        'coverage': coverage,
+        'percentiles': _series_entries(percentiles, 'stats'),
+        'holds': _series_entries(holds, 'candidates'),
+        'coverage': _series_entries(coverage, 'coverage'),
         'configured': configured,
         # The exact counterpart of 'configured', and load-bearing for a machine
         # consumer: without it the JSON cannot distinguish "this arm was never

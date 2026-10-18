@@ -5,11 +5,7 @@ PRD ``plans/merge-lane-quality-prd.md`` task alpha. The measures are the ones
 the PRD's Background table quotes -- file lines and prose lines, per-function
 cognitive complexity, function-local (reach-back) imports, re-export shim names,
 distinct test patch targets into lane internals, and private-attribute reads
-from tests -- plus, from PRD task zeta2, ``external_importers``: for each of the
-fourteen old module paths that ``ALIAS_MODULES`` names, the number of distinct
-tracked repo files outside ``merge_lane/`` that still import it or name a path
-into it in a string (a patch target), which is the target PRD task eta drives to
-zero. The committed baseline lives at
+from tests. The committed baseline lives at
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
 enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
@@ -45,12 +41,7 @@ fixed, named cluster where a path it cannot read IS the finding. Concretely:
 * the whole-of-``orchestrator/tests`` sweep keeps the siblings' per-file
   fail-soft polarity, but records every skipped file in
   ``Enumeration.unreadable`` and marks the enumeration incomplete, and
-  ``check_against_baseline`` REFUSES to compare an incomplete enumeration;
-* the importer sweep over every tracked ``.py`` follows that same record-and-
-  refuse rule for a file it cannot read or parse, and is HARD where its input
-  is missing: ``git`` absent, failing, or pointed at a root that is not the
-  top of a work tree is a ``MetricsError`` naming the cause, because an empty
-  file list would read as zero importers -- an improvement.
+  ``check_against_baseline`` REFUSES to compare an incomplete enumeration.
 
 That last clause is what makes "a partial enumeration is distinguishable from a
 complete one in the RESULT, not only in a log line" true rather than aspirational.
@@ -89,11 +80,11 @@ import ast
 import dataclasses
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
+import _checkout as _checkout
 import source_measures
 
 from shared import safe_io
@@ -132,29 +123,15 @@ class AppendOnlyViolation(RatchetError):
 #: regeneration, because ``check_against_baseline`` compares the baseline's
 #: recorded ``params.cluster_paths`` against it and raises on a mismatch.
 CLUSTER_PATHS: tuple[str, ...] = (
-    'orchestrator/src/orchestrator/merge_queue.py',
-    'orchestrator/src/orchestrator/merge_gates.py',
-    'orchestrator/src/orchestrator/merge_types.py',
-    'orchestrator/src/orchestrator/merge_shadow.py',
-    'orchestrator/src/orchestrator/merge_liveness.py',
-    'orchestrator/src/orchestrator/merge_disposition.py',
-    'orchestrator/src/orchestrator/merge_queue_store.py',
-    'orchestrator/src/orchestrator/merge_completion.py',
-    'orchestrator/src/orchestrator/merge_drift.py',
-    'orchestrator/src/orchestrator/merge_speculation_controller.py',
-    'orchestrator/src/orchestrator/merge_request_ledger.py',
-    'orchestrator/src/orchestrator/merge_skew_tripwire.py',
     'orchestrator/src/orchestrator/lane_lifecycle.py',
     'orchestrator/src/orchestrator/offline_lane.py',
     'orchestrator/src/orchestrator/warm_lane_pool.py',
-    'orchestrator/src/orchestrator/landing_evidence.py',
-    'orchestrator/src/orchestrator/landed_outbox.py',
     'orchestrator/src/orchestrator/recover_main.py',
     # Measured (lines, cognitive) but exempt from the file-size ceiling -- see
     # SIZE_CEILING_EXEMPT.
     'orchestrator/src/orchestrator/git_ops.py',
-    # Empty until PRD task zeta1 creates the package. A glob matching nothing is
-    # NOT a failure; a literal matching nothing is.
+    # The package, holding the fourteen modules PRD task zeta2 moved into it. A
+    # glob matching nothing is NOT a failure; a literal matching nothing is.
     'orchestrator/src/orchestrator/merge_lane/**/*.py',
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
@@ -174,46 +151,6 @@ FILE_LINE_CEILING = 1500
 
 #: A function ABSENT from the baseline may not exceed this cognitive complexity.
 NEW_FUNCTION_COGNITIVE_CEILING = 15
-
-#: THE ONE COPY of the PRD task zeta2 move, as old dotted name -> new dotted
-#: name. Each old module stays importable as an alias of its new home until PRD
-#: task eta migrates its importers and deletes it. The OLD names are what
-#: ``external_importers`` counts, and each is also a ``CLUSTER_PATHS`` literal
-#: (``orchestrator/src/<dotted path>.py``), so the per-file measures keep
-#: measuring the old paths after the move; the NEW names are the migration target
-#: ``--report`` prints beside each count and the mapping task eta rewrites by.
-ALIAS_MODULES: Mapping[str, str] = MappingProxyType(
-    {
-        'orchestrator.merge_queue': 'orchestrator.merge_lane.worker',
-        'orchestrator.merge_gates': 'orchestrator.merge_lane.gates',
-        'orchestrator.merge_types': 'orchestrator.merge_lane.types',
-        'orchestrator.merge_shadow': 'orchestrator.merge_lane.shadow',
-        'orchestrator.merge_liveness': 'orchestrator.merge_lane.liveness',
-        'orchestrator.merge_disposition': 'orchestrator.merge_lane.disposition',
-        'orchestrator.merge_queue_store': 'orchestrator.merge_lane.queue_store',
-        'orchestrator.merge_completion': 'orchestrator.merge_lane.completion',
-        'orchestrator.merge_drift': 'orchestrator.merge_lane.drift',
-        'orchestrator.merge_speculation_controller': (
-            'orchestrator.merge_lane.speculation_controller'
-        ),
-        'orchestrator.merge_request_ledger': 'orchestrator.merge_lane.request_ledger',
-        'orchestrator.merge_skew_tripwire': 'orchestrator.merge_lane.skew_tripwire',
-        'orchestrator.landing_evidence': 'orchestrator.merge_lane.landing_evidence',
-        'orchestrator.landed_outbox': 'orchestrator.merge_lane.landed_outbox',
-    }
-)
-
-#: Repo-relative directory of the package the aliases forward to. Its own files
-#: are the new home, not importers of the old one.
-MERGE_LANE_PACKAGE_DIR = 'orchestrator/src/orchestrator/merge_lane/'
-
-#: Path segments that mark another tree's files: virtualenvs, vendored
-#: ``node_modules`` and nested worktrees. Never this repo's own importers.
-_FOREIGN_TREE_SEGMENTS = frozenset(
-    {'.venv', 'venv', 'site-packages', 'node_modules', '.worktrees'}
-)
-_NESTED_CLAUDE_WORKTREES = '.claude/worktrees/'
-
 
 # ---------------------------------------------------------------------------
 # Enumeration -- completeness carried in the RESULT, per INV-11.
@@ -311,13 +248,9 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
 # reachback guard's allowlist as a COUNT, which is what lets PRD task delta
 # delete the guard once the count reaches zero.
 
-#: Dotted module paths whose attributes count as lane internals when patched.
-#: `merge_lane` is here from day one, before the package exists, precisely so
-#: PRD task zeta2's `git mv` cannot make the count read 0 by relocation.
-LANE_PATCH_MODULES: tuple[str, ...] = (
-    'orchestrator.merge_queue',
-    'orchestrator.merge_lane',
-)
+#: Dotted module paths whose attributes count as lane internals when patched:
+#: the package, and through it every submodule (a leaf reads ``<sub>.<attr>``).
+LANE_PATCH_MODULES: tuple[str, ...] = ('orchestrator.merge_lane',)
 
 
 # ---------------------------------------------------------------------------
@@ -398,158 +331,6 @@ def test_file_measures_in_tree(tree: ast.Module) -> dict[str, object] | None:
 
 
 # ---------------------------------------------------------------------------
-# External importers of the alias modules (PRD task zeta2).
-#
-# WHAT IS COUNTED. For each old module of ``ALIAS_MODULES``, the number of
-# DISTINCT files that depend on it. Every import form counts -- ``import X``,
-# ``import X as Y``, ``from X import ...`` and ``from <package> import <leaf>``
-# -- at module level or inside a function, and under ``if TYPE_CHECKING:``: a
-# type-only import still breaks the day the alias is deleted. So does a string
-# constant that continues past the module name (``'orchestrator.X.attr'``, a
-# patch target): that file never imports X and breaks all the same. A bare
-# ``'orchestrator.X'`` is a logger name and does not. Detection is AST-based and
-# on FULL dotted names, so a docstring quoting a name never counts, and neither
-# does an unrelated module that merely shares a leaf
-# (``dashboard/data/merge_queue.py``). Relative imports are out of scope: the
-# only files that use them for these modules sit inside ``merge_lane/``, which
-# is excluded, and the rest of the tree imports by absolute name.
-#
-# WHAT IS NOT. The alias file itself, everything under ``merge_lane/`` (the new
-# home), and other trees' files -- virtualenvs, ``node_modules``, nested
-# worktrees. Another alias file DOES count as an importer: on the pre-move tree
-# the old modules import each other, and those edges are real fan-in until the
-# move turns each of them into a forwarding stub.
-#
-# DOMAIN, and why it is ``git ls-files`` and not a filesystem walk. The measured
-# domain is the repo's TRACKED ``.py`` files, because that is the one set that is
-# the same in every checkout. A walk of the main checkout also reaches the
-# gitignored run data (``data/``, plugin caches) and untracked scratch -- about
-# three times as many files as are tracked, and many seconds slower than the same
-# walk of a clean worktree -- so its numbers would differ from every worktree's.
-# The price is that a new file is not counted until it is added to the index; the
-# commit that adds it is what the ratchet judges. This is the instrument's one
-# git dependency, and a read-only one -- the history-comparing git work stays in
-# ``scripts/check_staged_ratchet_raise.py``.
-#
-# A cheap text prefilter (the file mentions a leaf name at all) runs before the
-# AST parse. It cannot hide a dependent, since an import or a dotted string must
-# spell the leaf, so a file that is both unparseable and silent about every leaf
-# depends on no alias and is not recorded as unreadable.
-
-_ALIAS_LEAVES = frozenset(name.rsplit('.', 1)[-1] for name in ALIAS_MODULES)
-
-
-#: ``'<old dotted name>.'`` for each alias. The trailing dot is the point: a string
-#: that CONTINUES past the module is a path into it (``patch(...)``,
-#: ``monkeypatch.setattr(...)``, ``importlib`` of a submodule) and breaks when the
-#: alias is deleted, where a bare ``'orchestrator.merge_queue'`` is a logger name
-#: and survives it.
-_ALIAS_STRING_PREFIXES = {name + '.': name for name in ALIAS_MODULES}
-_ALIAS_STRING_PREFIX_TUPLE = tuple(_ALIAS_STRING_PREFIXES)
-
-
-def _aliases_imported_by_statement(node: ast.Import | ast.ImportFrom) -> set[str]:
-    if isinstance(node, ast.Import):
-        imported = [alias.name for alias in node.names]
-    elif node.module and not node.level:
-        imported = [node.module] + [f'{node.module}.{alias.name}' for alias in node.names]
-    else:
-        return set()
-    return {name for name in imported if name in ALIAS_MODULES}
-
-
-def _aliases_named_by_string(value: str) -> set[str]:
-    if not value.startswith(_ALIAS_STRING_PREFIX_TUPLE):
-        return set()
-    return {
-        name for prefix, name in _ALIAS_STRING_PREFIXES.items() if value.startswith(prefix)
-    }
-
-
-def referenced_alias_modules(source: str, *, path: str = '<source>') -> frozenset[str]:
-    """The old dotted names of ``ALIAS_MODULES`` that *source* depends on.
-
-    Raises ``MetricsError`` naming *path* when the source cannot be parsed.
-    """
-    return referenced_alias_modules_in_tree(source_measures.parse_source(source, path=path))
-
-
-def referenced_alias_modules_in_tree(tree: ast.Module) -> frozenset[str]:
-    """``referenced_alias_modules`` over an already-parsed tree.
-
-    A module is depended on in two ways. It is IMPORTED: ``from P import m`` binds
-    the module ``P.m`` whenever that is a module, so each name in the statement
-    is also tried joined to ``P`` -- which is how ``from orchestrator import
-    merge_queue`` is read without this function knowing the word
-    ``orchestrator``. Or it is NAMED BY PATH in a string constant that continues
-    past the module, ``'orchestrator.landing_evidence._helper'``: a file that
-    patches an alias's attribute never imports it, and counting only imports
-    would let task eta read zero, delete the alias, and break that file. Neither a
-    docstring nor a bare module-name string (a logger name) counts.
-    """
-    found: set[str] = set()
-    docstring_values: set[int] = set()
-    # One walk, parents before children, so a holder has named its docstring's
-    # constant before the walk reaches it.
-    for node in ast.walk(tree):
-        if (docstring := source_measures.docstring_of(node)) is not None:
-            docstring_values.add(id(docstring.value))
-        if isinstance(node, ast.Import | ast.ImportFrom):
-            found |= _aliases_imported_by_statement(node)
-        elif (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in docstring_values
-        ):
-            found |= _aliases_named_by_string(node.value)
-    return frozenset(found)
-
-
-def is_external_importer_source(relpath: str) -> bool:
-    """False for the files an importer count must not read: the new package's
-    own files, and other trees' (virtualenv, ``node_modules``, nested worktree)."""
-    return not (
-        relpath.startswith((MERGE_LANE_PACKAGE_DIR, _NESTED_CLAUDE_WORKTREES))
-        or _FOREIGN_TREE_SEGMENTS.intersection(relpath.split('/'))
-    )
-
-
-def _mentions_an_alias_leaf(source: str) -> bool:
-    return any(leaf in source for leaf in _ALIAS_LEAVES)
-
-
-def _external_aliases_referenced_by(tree: ast.Module, relpath: str) -> frozenset[str]:
-    own_name = source_measures.src_module_name(relpath)
-    return frozenset(
-        name for name in referenced_alias_modules_in_tree(tree) if name != own_name
-    )
-
-
-def alias_importer_measure(relpath: str, counts: Mapping[str, int]) -> dict[str, int]:
-    """The ``external_importers`` entry for cluster path *relpath*; empty unless
-    *relpath* is one of the alias modules."""
-    name = source_measures.src_module_name(relpath)
-    if name is None or name not in counts:
-        return {}
-    return {'external_importers': counts[name]}
-
-
-def _require_aliases_in_cluster() -> None:
-    """Every ``ALIAS_MODULES`` key must be a ``CLUSTER_PATHS`` literal's name.
-
-    A count with no ``files`` entry to land on would be measured and dropped,
-    which reads as a measure that is fine.
-    """
-    missing = sorted(set(ALIAS_MODULES) - lane_module_names())
-    if missing:
-        raise RatchetError(
-            f'ALIAS_MODULES names {missing}, which no CLUSTER_PATHS literal '
-            'carries -- each old module must stay in the cluster so its '
-            'external_importers has a files entry to be recorded on'
-        )
-
-
-# ---------------------------------------------------------------------------
 # Report assembly, and DERIVED totals.
 
 SCHEMA_VERSION = 1
@@ -579,7 +360,6 @@ def build_report(root: Path) -> dict[str, object]:
     # numbers would be wrong anyway.
     version = source_measures.require_complexipy()
     enumeration = resolve_cluster_paths(root)
-    _require_aliases_in_cluster()
     sweep = sweep_repo(root)
 
     files: dict[str, object] = {}
@@ -596,7 +376,6 @@ def build_report(root: Path) -> dict[str, object]:
             'cognitive': cognitive.total,
             'function_local_imports': source_measures.function_local_imports_in_tree(tree),
             'reexport_names': len(source_measures.reexport_names_in_tree(tree)),
-            **alias_importer_measure(relpath, sweep.alias_importers),
         }
         for qualname, score in cognitive.per_function.items():
             functions[f'{relpath}::{qualname}'] = score
@@ -620,71 +399,30 @@ def build_report(root: Path) -> dict[str, object]:
 
 @dataclasses.dataclass(frozen=True)
 class RepoSweep:
-    """What the ONE pass over the repo's Python files found.
+    """What the ONE pass over the ``.py`` files under ``orchestrator/tests`` found.
 
-    ``tests`` is every lane-importing file under ``orchestrator/tests`` with its
-    two measures; ``alias_importers`` is the importer count of EVERY alias
-    module, zeros included (an alias reaching zero is the state task eta is
-    after and must stay recorded as zero, not vanish); ``unreadable`` names the
-    paths either measure had to skip, verbatim; ``test_tree`` is how broad the
-    test-tree half was, as counts. The swept paths themselves are deliberately not
-    accumulated: the caller has no use for a 568-entry manifest of other
+    ``tests`` is every lane-importing file there with its two measures;
+    ``unreadable`` names the paths the sweep had to skip, verbatim; ``test_tree``
+    is how broad it was, as counts. The swept paths themselves are deliberately
+    not accumulated: the caller has no use for a 568-entry manifest of other
     people's test files, and building one is how it ended up frozen in the
     committed baseline (esc-5021-7).
     """
 
     tests: dict[str, object]
-    alias_importers: Mapping[str, int]
     unreadable: tuple[str, ...]
     test_tree: TestTreeCoverage
 
 
-@dataclasses.dataclass(frozen=True)
-class _FileFindings:
-    test_measures: dict[str, object] | None
-    imported_aliases: frozenset[str]
-
-
-def _test_tree_files(root: Path) -> frozenset[str]:
-    return frozenset(
+def _test_tree_files(root: Path) -> list[str]:
+    return sorted(
         path.relative_to(root).as_posix() for path in (root / TESTS_ROOT).rglob('*.py')
     )
 
 
-def _measure_file(
-    root: Path, relpath: str, *, in_test_tree: bool, is_importer_source: bool
-) -> _FileFindings:
-    """Read *relpath* once, parse it at most once, and take every measure it is
-    in the domain of from that one tree.
-
-    A file that is not in the test tree and names no alias leaf is not parsed at
-    all: a reference to an alias must spell the leaf.
-    """
-    source = (root / relpath).read_text(encoding='utf-8')
-    is_importer = is_importer_source and _mentions_an_alias_leaf(source)
-    if not (in_test_tree or is_importer):
-        return _FileFindings(test_measures=None, imported_aliases=frozenset())
-    tree = source_measures.parse_source(source, path=relpath)
-    return _FileFindings(
-        test_measures=test_file_measures_in_tree(tree) if in_test_tree else None,
-        imported_aliases=(
-            _external_aliases_referenced_by(tree, relpath)
-            if is_importer
-            else frozenset()
-        ),
-    )
-
-
 def sweep_repo(root: Path) -> RepoSweep:
-    """Take the two open-sweep measures in ONE pass over the repo's Python files.
-
-    The two measures have different domains and keep them: the test-suite
-    measures cover every ``.py`` under ``orchestrator/tests`` on disk, as they
-    always have, and the importer count covers the tracked files outside
-    ``merge_lane/`` (see ``source_measures.tracked_python_files``). The pass walks their union
-    once, so a lane-importing test file -- which is both, and is among the
-    largest files in the repo -- is read once and parsed once rather than once
-    per measure.
+    """Take the two test-suite measures in ONE pass over every ``.py`` on disk
+    under ``orchestrator/tests``, reading and parsing each file once.
 
     THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
     unrelated mid-edit file must not redden the ratchet, which is the
@@ -692,39 +430,22 @@ def sweep_repo(root: Path) -> RepoSweep:
     the record: each skipped file lands in ``Enumeration.unreadable``, the
     enumeration goes incomplete, and ``check_against_baseline`` then refuses to
     compare at all. That split is the INV-11 seam between "this cluster file is
-    unmeasurable, which IS the finding" and "some unrelated file is mid-edit". A
-    failure to list the tracked files is not per-file and is not soft -- see
-    ``source_measures.tracked_python_files``.
+    unmeasurable, which IS the finding" and "some unrelated file is mid-edit".
     """
-    tracked = frozenset(source_measures.tracked_python_files(root))
     test_tree = _test_tree_files(root)
-    alias_importers = dict.fromkeys(ALIAS_MODULES, 0)
     tests: dict[str, object] = {}
     unreadable: list[str] = []
-    for relpath in sorted(tracked | test_tree):
-        in_test_tree = relpath in test_tree
-        is_importer_source = relpath in tracked and is_external_importer_source(
-            relpath
-        )
-        if not (in_test_tree or is_importer_source):
-            continue
+    for relpath in test_tree:
         try:
-            found = _measure_file(
-                root,
-                relpath,
-                in_test_tree=in_test_tree,
-                is_importer_source=is_importer_source,
-            )
+            source = (root / relpath).read_text(encoding='utf-8')
+            measures = test_file_measures(source, path=relpath)
         except (OSError, UnicodeDecodeError, source_measures.MetricsError):
             unreadable.append(relpath)
             continue
-        if found.test_measures is not None:
-            tests[relpath] = found.test_measures
-        for name in found.imported_aliases:
-            alias_importers[name] += 1
+        if measures is not None:
+            tests[relpath] = measures
     return RepoSweep(
         tests=tests,
-        alias_importers=MappingProxyType(alias_importers),
         unreadable=tuple(unreadable),
         test_tree=TestTreeCoverage(requested=len(test_tree), resolved=len(tests)),
     )
@@ -737,8 +458,7 @@ def _report_enumeration(
 ) -> dict[str, object]:
     """The report's enumeration block: cluster paths, test-tree counts, INV-11.
 
-    *swept_unreadable* is every path either open sweep (the test tree and the
-    alias-importer sweep) had to skip.
+    *swept_unreadable* is every path the test-tree sweep had to skip.
 
     The two halves stay APART rather than being flattened into one pair of
     lists. Flattening cost information as well as bytes: the three CLUSTER_PATHS
@@ -768,7 +488,6 @@ _SUMMED_FILE_MEASURES = (
     'cognitive',
     'function_local_imports',
     'reexport_names',
-    'external_importers',
 )
 
 
@@ -886,15 +605,7 @@ BASELINE_README = (
     'sweeps every .py under '
     'orchestrator/tests for the measures in the tests section, and that sweep '
     'is sized by --report rather than ratcheted here, so an unrelated test file '
-    'arriving never touches these bytes. The files entry of each of the fourteen '
-    'old merge-lane modules also carries external_importers: how many tracked '
-    'repo files outside orchestrator/src/orchestrator/merge_lane/ still import '
-    'that module by its old name, or name a path into it in a string such as a '
-    "patch target ('orchestrator.<old name>.<attr>'; a bare module-name string, "
-    'which is a logger name, does not count) (PRD task zeta2). It is ratcheted '
-    'like every '
-    'other measure, per module and in the derived total, and PRD task eta drives '
-    'it to 0.\n'
+    'arriving never touches these bytes.\n'
     # Composed, never paraphrased: this is the one string in the instrument that
     # changes what a blocked agent does next, and the copy that mattered was
     # always the one in THIS file.
@@ -1096,8 +807,7 @@ def write_baseline(
 
     THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
     means comparing against the copy in git HEAD, which is a dependency on git
-    HISTORY this instrument still does not have (its one git call is the
-    read-only listing of tracked files, ``source_measures.tracked_python_files``):
+    this instrument does not have:
     ``scripts/check_staged_ratchet_raise.py`` holds every git invocation that
     reads history or the index, runs in pre-commit on every branch, and calls
     ``compare_baseline_files`` here for the comparison itself, so there is one
@@ -1322,13 +1032,13 @@ def render_ledger(ledger: dict) -> str:
     ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
     rather than a churned file.
 
-    Plain ``json.dumps(indent=2)`` rather than the baseline's hand-rolled
-    one-line-per-entry writer. That writer exists for one stated reason -- ten
-    parallel PRD gamma branches each editing different per-path measures would
-    conflict inside indent=2's six-line-per-path hunks. An append-only file
-    gaining one entry per authorizing task has no such shape, so inheriting the
-    custom writer would cargo-cult a constraint that does not apply and cost
-    legibility for it.
+    Plain ``json.dumps(indent=2)``: the baseline's one-line-per-entry writer
+    would buy nothing here. It makes edits at DIFFERENT positions disjoint
+    hunks, but two concurrent authorizations both append at the tail of
+    ``raises``, which conflicts under any line layout. The conflict is loud;
+    a merge commit's resolution of it is audited in pre-commit by
+    ``ledger_merged_entries``, and a rebase's is the residual ``RAISE_REMEDY``
+    names.
     """
     body = {key: value for key, value in ledger.items() if key != '_README'}
     return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'
@@ -1909,22 +1619,6 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _alias_importer_rows(files: dict) -> list[str]:
-    """One row per alias module: its old name, the new name to migrate to, and
-    how many files still import the old one -- the number PRD task eta drives to 0."""
-    rows: dict[str, int] = {}
-    for path, entry in files.items():
-        name = source_measures.src_module_name(path)
-        if name is not None and name in ALIAS_MODULES and 'external_importers' in entry:
-            rows[name] = entry['external_importers']
-    old_width = max(map(len, rows), default=0)
-    new_width = max((len(ALIAS_MODULES[name]) for name in rows), default=0)
-    return [
-        f'  {name:<{old_width}} -> {ALIAS_MODULES[name]:<{new_width}}  {rows[name]:>7}'
-        for name in sorted(rows)
-    ]
-
-
 def _render_table(report: dict, root: Path) -> str:
     """The human-readable measure table printed by ``--report``.
 
@@ -1960,8 +1654,6 @@ def _render_table(report: dict, root: Path) -> str:
             '',
             f'function_local_imports  {totals["function_local_imports"]:>7}',
             f'reexport_names          {totals["reexport_names"]:>7}',
-            f'external_importers      {totals["external_importers"]:>7}',
-            *_alias_importer_rows(files),
             '',
             f'test suite -- {len(report.get("tests", {}))} lane-importing files '
             f'under {TESTS_ROOT}',

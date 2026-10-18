@@ -13,6 +13,8 @@ from typing import Any
 
 from shared.safe_io import atomic_write_text
 
+from .measurement import MeasurementStage, UnmeasuredCause, UnmeasuredRecord
+
 logger = logging.getLogger(__name__)
 
 RESULTS_DIR = Path(__file__).parent / 'results'
@@ -92,7 +94,50 @@ class MissingResultsDirError(ResultLoadError):
     """The results directory to load from does not exist."""
 
 
-LEGACY_METRIC_RULES: tuple[Callable[[dict[str, Any]], dict[str, Any]], ...] = ()
+_STAGES = frozenset(MeasurementStage)
+_CAUSES = frozenset(UnmeasuredCause)
+
+
+def _unclassified(reason: str) -> UnmeasuredRecord:
+    return {
+        'stage': MeasurementStage.ARCHITECT.value,
+        'cause': UnmeasuredCause.LEGACY_UNCLASSIFIED.value,
+        'reason': reason,
+    }
+
+
+def _record_from_marker(marker: str) -> UnmeasuredRecord:
+    first = marker.split(';')[0].strip()
+    stage_text, sep, rest = first.partition(':')
+    cause_text = rest.strip().partition(':')[0].strip() if sep else first
+    if stage_text not in _STAGES or cause_text not in _CAUSES:
+        return _unclassified(marker)
+    parts = marker.split(':', 2)
+    reason = parts[2].removeprefix(' ') if len(parts) == 3 else ''
+    return {'stage': stage_text, 'cause': cause_text, 'reason': reason}
+
+
+def _invocation_errors_from_marker(metrics: dict[str, Any]) -> dict[str, Any]:
+    """A pre-6734 ``invocation_error`` string as typed records (PRD §7 D3)."""
+    is_legacy = 'invocation_errors' not in metrics and (
+        'invocation_error' in metrics or metrics.get('cap_tainted')
+    )
+    if not is_legacy:
+        return dict(metrics)
+    normalized = dict(metrics)
+    marker = normalized.pop('invocation_error', None)
+    if marker:
+        normalized['invocation_errors'] = [_record_from_marker(marker)]
+    elif normalized.get('cap_tainted'):
+        normalized['invocation_errors'] = [_unclassified('')]
+    else:
+        normalized['invocation_errors'] = None
+    return normalized
+
+
+LEGACY_METRIC_RULES: tuple[Callable[[dict[str, Any]], dict[str, Any]], ...] = (
+    _invocation_errors_from_marker,
+)
 
 
 def normalize_legacy_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:

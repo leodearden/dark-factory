@@ -14,14 +14,9 @@ from typing import Any
 import pytest
 from _tasks_db_fixture import task_row, write_tasks_db
 
-from dashboard.data.claimant_invariants import (
-    HygieneTier,
-    RootInvariants,
-    ScanStatus,
-    TerminalTier,
-    scan_root_invariants,
-)
+from dashboard.data.claimant_invariants import HygieneTier, TerminalTier
 from dashboard.data.db import DbPool
+from dashboard.data.root_invariants import RootInvariants, ScanStatus, scan_root_invariants
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
 FRESH = (NOW - timedelta(minutes=1)).isoformat()
@@ -38,7 +33,9 @@ async def _scan_file(root: Path, db_path: Path) -> dict[str, Any]:
     pool = DbPool()
     try:
         conn = await pool.get(db_path)
-        record = await scan_root_invariants(root, db_path, conn, now=NOW)
+        record = await scan_root_invariants(
+            root, db_path, conn, now=NOW, pending_escalations=None
+        )
     finally:
         await pool.close_all()
     return record.to_wire()
@@ -191,13 +188,17 @@ def _assert_blind(wire: dict[str, Any]) -> None:
     assert isinstance(wire['error'], str) and wire['error']
     assert wire['terminal_tier'] is None
     assert wire['hygiene_tier'] is None
+    assert wire['chains'] is None
     assert wire['measured_at'] == NOW.isoformat()
 
 
 async def test_b2_absent_db_is_blind_not_clean(tmp_path):
     root = tmp_path / 'proj'
     db_path = _db_path(root)
-    wire = (await scan_root_invariants(root, db_path, None, now=NOW)).to_wire()
+    record = await scan_root_invariants(
+        root, db_path, None, now=NOW, pending_escalations=None
+    )
+    wire = record.to_wire()
     _assert_blind(wire)
     assert str(db_path) in wire['error']
     assert 'not found' in wire['error']
@@ -207,7 +208,10 @@ async def test_b2_absent_db_is_blind_not_clean(tmp_path):
 async def test_b2_present_but_unopened_db_is_blind_with_distinct_wording(tmp_path):
     root = tmp_path / 'proj'
     db_path = write_tasks_db(_db_path(root), [task_row(1, 'done', _CLAIMANT, STALE)])
-    wire = (await scan_root_invariants(root, db_path, None, now=NOW)).to_wire()
+    record = await scan_root_invariants(
+        root, db_path, None, now=NOW, pending_escalations=None
+    )
+    wire = record.to_wire()
     _assert_blind(wire)
     assert str(db_path) in wire['error']
     assert 'could not be opened read-only' in wire['error']
@@ -249,7 +253,10 @@ async def test_b2_a_pooled_connection_closed_under_the_scan_is_blind_not_raised(
     pool = DbPool()
     conn = await pool.get(db_path)
     await pool.close_all()
-    wire = (await scan_root_invariants(root, db_path, conn, now=NOW)).to_wire()
+    record = await scan_root_invariants(
+        root, db_path, conn, now=NOW, pending_escalations=None
+    )
+    wire = record.to_wire()
     _assert_blind(wire)
     assert wire['error'].startswith('ValueError: ')
     assert wire['rows_scanned'] is None
@@ -265,8 +272,9 @@ async def test_b2_zero_rows_scanned_is_blind(tmp_path):
 _OK_TIERS: dict[str, Any] = {
     'terminal_tier': TerminalTier(()),
     'hygiene_tier': HygieneTier(count=0, stale_count=0),
+    'chains': (),
 }
-_BLIND_TIERS: dict[str, Any] = {'terminal_tier': None, 'hygiene_tier': None}
+_BLIND_TIERS: dict[str, Any] = {'terminal_tier': None, 'hygiene_tier': None, 'chains': None}
 
 
 @pytest.mark.parametrize(
@@ -279,6 +287,12 @@ _BLIND_TIERS: dict[str, Any] = {'terminal_tier': None, 'hygiene_tier': None}
             ScanStatus.BLIND,
             {'rows_scanned': None, 'error': 'boom', **_BLIND_TIERS, 'terminal_tier': TerminalTier(())},
             'terminal_tier',
+        ),
+        (ScanStatus.OK, {'rows_scanned': 3, 'error': None, **_OK_TIERS, 'chains': None}, 'chains'),
+        (
+            ScanStatus.BLIND,
+            {'rows_scanned': None, 'error': 'boom', **_BLIND_TIERS, 'chains': ()},
+            'chains',
         ),
     ],
 )

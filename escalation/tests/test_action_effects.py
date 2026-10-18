@@ -40,8 +40,8 @@ _EXPECTED_TARGET_STATUS: dict[str, str | None] = {
 
 _VALID_ACTIONS = tuple(_EXPECTED_TARGET_STATUS)
 
-# Categories deliberately NOT in server.CATEGORIES (G6 archive check found
-# these — and more — occurring live; server.CATEGORIES is inert/unvalidated).
+# Categories outside the original agent set (G6 archive check found these —
+# and more — occurring live).
 _NOVEL_CATEGORIES = ('milestone_gate', 'ticket_failure', 'preexisting_main_break')
 _KNOWN_CATEGORIES = ('scope_violation', 'design_concern')
 

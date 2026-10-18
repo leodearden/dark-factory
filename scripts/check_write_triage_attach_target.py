@@ -40,20 +40,28 @@ from __future__ import annotations
 import argparse
 import contextlib
 import difflib
-import importlib
 import inspect
 import json
 import logging
-import re
-import sys
-import traceback
 from pathlib import Path
 from typing import Any, NamedTuple
 
-EXIT_OK = 0
-EXIT_FAIL = 1
+from _write_triage_probe_common import (
+    EXIT_FAIL,
+    EXIT_OK,
+    PROBE_LOGGER_NAME,
+    Candidate,
+    ImportMode,
+    Unverifiable,
+    import_from_tree,
+    names_a_target,
+    parent_key,
+    report_fail_closed,
+    require,
+    usable_parameters,
+)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(PROBE_LOGGER_NAME)
 
 _MODULE_NAME = 'fused_memory.server.write_triage_judge'
 
@@ -99,36 +107,10 @@ _FILLERS: tuple[Any, ...] = (None, (), '')
 #: the prompt emits whichever nonce it was handed. See ``_echoes_argument``.
 _NONCE_IDS = ('probe-nonce-alpha-9f13', 'probe-nonce-beta-4c07')
 
-#: Names that read as "this parameter designates the attach target". An echoing
-#: parameter is forgiven only when it is named for what it designates, because
-#: a real option (b) that names the target in a HEADER
-#: (``'ATTACH TARGET: ' + attach_target_id``) is structurally indistinguishable
-#: from free-text diagnostics that happens to be interpolated — the name is the
-#: only thing separating them. Target-named parameters are also tried FIRST, so
-#: a module carrying both reaches the real one.
-#:
-#: DELIBERATELY NARROW, from a measured false PASS. This set used to include
-#: ``canonical|winner|chosen|selected|primary`` — the BAND's vocabulary, for
-#: things the band already tracks for other reasons. ``canonical`` was the
-#: hole: ``build_judge_prompt(content, candidates, canonical_id=None)`` that
-#: merely interpolates the band canonical into a header line is an ordinary
-#: prompt-legibility change binding no verdict to any candidate, and it PASSED
-#: — authorising the production ``write_triage.enabled`` flip on a change that
-#: establishes nothing. The ``_echo_forgiven_note`` WARN did not mitigate it:
-#: the gate shell greps only for the PASS marker, so no operator ever sees the
-#: warning on a passing run.
-#:
-#: Only ``attach``/``target``/``candidate_id`` survive — spellings that can
-#: name the attach target and little else. Note the cost of narrowing is
-#: bounded: a parameter that genuinely MARKS the target (matches its argument
-#: against the slate) never reaches the echo control at all, so the name
-#: matters ONLY for header-style renderings that interpolate the id verbatim.
-_TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
-
 #: Emitted INSTEAD of a bare WARN when a pass rests on a parameter's NAME.
-#: A warning alone mitigates nothing here and the comment above says why: on
-#: a PASS the gate exits 0, DeterministicRunner files no escalation, and the
-#: gate's stdout is forwarded nowhere, so no operator reads it. This is a
+#: A warning alone mitigates nothing here: on a PASS the gate exits 0,
+#: DeterministicRunner files no escalation, and the gate's stdout is
+#: forwarded nowhere, so no operator reads it. This is a
 #: distinct channel a machine can act on -- the gate greps for it (as
 #: PROBE_PENDING_MARKER) and reports item 1 as satisfied-pending-eyeball, in
 #: the report's TAIL where truncation cannot reach it. Pinned from both ends
@@ -139,65 +121,14 @@ _TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
 _PENDING_MARKER = 'PASS-NEEDS-CONFIRMATION'
 
 
-class _Unverifiable(Exception):
-    """The invariant could not be evaluated. Fails closed, never passes."""
-
-
-class _ReportedWarnings(logging.Handler):
-    """Keeps WARNING+ records so the probe's own REPORT can carry them.
-
-    WHY NOT JUST STDERR. The gate used to run this probe with ``2>&1`` and
-    indent the lot into its report, so a ``logger.warning`` reached the
-    operator for free. It no longer does: the probe imports the REF's tree,
-    whose import-time chatter (measured: a multi-line
-    ``PydanticDeprecatedSince20`` from ``graphiti_core``) was competing for the
-    2000 characters of report an escalation actually forwards, so the gate now
-    captures stderr separately and quotes back only a bounded tail, only where
-    stdout carried no verdict. A warning that reaches stderr alone therefore
-    reaches nobody on a PASS -- which is precisely the run where
-    ``_echoes_payload``'s "the echo control was not exercised" note matters,
-    since a PASS authorises a production flag flip.
-
-    Records still propagate, so running the probe by hand prints them too.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-        self.messages: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.messages.append(record.getMessage())
-
-
-class _Candidate:
-    """A duck-typed ``MemoryResult`` stand-in.
-
-    ``near_duplicate_guard._cosine_of`` — the reader
-    ``select_judge_candidates`` imports — takes the per-store cosine from
-    ``metadata['store_score']``, so ``.id``/``.content``/``.metadata`` is the
-    whole contract. Constructing one avoids importing ``MemoryResult``, whose
-    module pulls in third-party deps the extracted tree may not have.
-    """
-
-    __slots__ = ('content', 'id', 'metadata')
-
-    def __init__(self, ident: str, content: str, metadata: dict[str, Any]) -> None:
-        self.id = ident
-        self.content = content
-        self.metadata = metadata
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f'<candidate {self.id}>'
-
-
-def _fixture_results(parent_key: str) -> list[_Candidate]:
+def _fixture_results(parent_field: str) -> list[Candidate]:
     """Six ordinary results plus one hoisted-parent evidence child.
 
     The child scores LOWEST, so it falls outside the top-``_SLATE_SIZE``
     window and only reaches the slate via the rescue append.
     """
     results = [
-        _Candidate(
+        Candidate(
             f'm{i}',
             f'ordinary candidate {i}',
             {'store_score': 0.90 - (i * 0.05)},
@@ -205,73 +136,28 @@ def _fixture_results(parent_key: str) -> list[_Candidate]:
         for i in range(6)
     ]
     results.append(
-        _Candidate(
+        Candidate(
             _CHILD_ID,
             'the child record that carries the evidence for the hoisted parent',
-            {'store_score': 0.40, parent_key: _CANONICAL_ID},
+            {'store_score': 0.40, parent_field: _CANONICAL_ID},
         ),
     )
     return results
 
 
-def _is_inside(path: Path, root: Path) -> bool:
-    """Is *path* under *root*, comparing PATH COMPONENTS rather than characters?"""
-    try:
-        return path.resolve().is_relative_to(root.resolve())
-    except (OSError, ValueError):
-        # An unresolvable path is not demonstrably inside the root, and this
-        # gate fails closed.
-        return False
-
-
-def _import_judge(src_root: Path) -> Any:
-    """Import the judge module out of *src_root*, shadowing any installed copy.
-
-    ``sys.path.insert(0, ...)`` puts the extracted tree ahead of site-packages,
-    so the assertion is made against the REF and not against whatever happens
-    to be installed in the interpreter running this probe.
-    """
-    if not src_root.is_dir():
-        raise _Unverifiable(f'--src-root is not a directory: {src_root}')
-    sys.path.insert(0, str(src_root))
-    try:
-        module = importlib.import_module(_MODULE_NAME)
-    except BaseException as exc:  # noqa: BLE001 - any import failure is unverifiable
-        raise _Unverifiable(
-            f'cannot import {_MODULE_NAME} from {src_root}: {exc!r}',
-        ) from exc
-    origin = getattr(module, '__file__', None)
-    # PATH CONTAINMENT, not a string prefix: `str(a).startswith(str(b))` also
-    # accepts a SIBLING whose name extends the root -- `<root>-installed/...`
-    # for `--src-root <root>` -- so the probe would report on a module the ref
-    # never shipped, which is the substitution this guard exists to catch.
-    if origin is None or not _is_inside(Path(origin), src_root):
-        raise _Unverifiable(
-            f'{_MODULE_NAME} resolved to {origin!r}, which is outside --src-root '
-            f'{src_root} — the probe would be testing the wrong tree',
-        )
-    return module
-
-
-def _require(module: Any, name: str) -> Any:
-    attr = getattr(module, name, None)
-    if attr is None:
-        raise _Unverifiable(f'{_MODULE_NAME} exposes no {name}')
-    return attr
-
-
 def _build_slate(module: Any) -> tuple[list[Any], Any, int]:
     """Return ``(slate, attach_target, index)`` from the module's own selector."""
-    select = _require(module, 'select_judge_candidates')
-    parent_key = getattr(module, 'PARENT_ID_KEY', None)
-    if not isinstance(parent_key, str) or not parent_key:
-        parent_key = 'parent_id'
+    select = require(module, 'select_judge_candidates')
     try:
         slate = list(
-            select(_fixture_results(parent_key), _SLATE_SIZE, canonical_id=_CANONICAL_ID),
+            select(
+                _fixture_results(parent_key(module)),
+                _SLATE_SIZE,
+                canonical_id=_CANONICAL_ID,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - a raising selector is unverifiable
-        raise _Unverifiable(f'select_judge_candidates raised: {exc!r}') from exc
+        raise Unverifiable(f'select_judge_candidates raised: {exc!r}') from exc
     ids = [getattr(c, 'id', None) for c in slate]
     if _CHILD_ID in ids and ids.index(_CHILD_ID) != 0:
         # The strongest case, and the one main actually produces: the rescued
@@ -305,32 +191,13 @@ def _build_slate(module: Any) -> tuple[list[Any], Any, int]:
             default=-1,
         )
         if index < 0:
-            raise _Unverifiable(
+            raise Unverifiable(
                 f'select_judge_candidates returned no candidate distinguishable '
                 f'from slate[0] (got {ids!r}); there is no attach target to '
                 'reason about, so nothing here can tell a correct fix from the '
                 'candidates[0] bug',
             )
     return slate, slate[index], index
-
-
-def _usable_parameters(fn: Any) -> list[Any]:
-    """*fn*'s parameters that can be supplied by position or by keyword.
-
-    ``*args``/``**kwargs`` are dropped, so every index used elsewhere in this
-    module -- ``_target_parameters``, ``_bind_arguments`` -- is an index into
-    THIS list and they cannot drift apart.
-    """
-    try:
-        params = list(inspect.signature(fn).parameters.values())
-    except (TypeError, ValueError):
-        return []
-    kinds = (
-        inspect.Parameter.POSITIONAL_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
-    )
-    return [p for p in params if p.kind in kinds]
 
 
 def _target_parameters(fn: Any) -> list[tuple[int, Any]]:
@@ -349,27 +216,22 @@ def _target_parameters(fn: Any) -> list[tuple[int, Any]]:
     point is whether the renderer can be TOLD which candidate the attach will
     touch, not how the argument is spelled.
     """
-    beyond = list(enumerate(_usable_parameters(fn)))[2:]
+    beyond = list(enumerate(usable_parameters(fn)))[2:]
     # Target-NAMED parameters first, ties broken by position. A module can
     # carry both an echoing free-text parameter and a real marker; the search
     # takes the FIRST combination that holds, so the real one has to be
     # reached first. ``sorted`` is stable, so declaration order survives
     # within each group.
-    return sorted(beyond, key=lambda item: not _names_a_target(item[1]))
-
-
-def _names_a_target(param: Any) -> bool:
-    """True when *param*'s NAME reads as designating the attach target."""
-    return bool(_TARGET_NAME_RE.search(param.name))
+    return sorted(beyond, key=lambda item: not names_a_target(item[1]))
 
 
 def _value_for(candidate: Any, spelling: str) -> Any:
     return candidate.id if spelling == 'id' else candidate
 
 
-def _nonce_candidate(ident: str) -> _Candidate:
+def _nonce_candidate(ident: str) -> Candidate:
     """A candidate that is in NO slate — the echo control's stand-in target."""
-    return _Candidate(ident, 'a candidate that is not on the slate', {})
+    return Candidate(ident, 'a candidate that is not on the slate', {})
 
 
 def _filled_parameters(usable: list[Any], index: int) -> list[Any]:
@@ -506,7 +368,7 @@ def _echoes_argument(
     FAILS TOWARDS THE PASS, deliberately, on two counts. A renderer that
     REFUSES an off-slate target is a validating marker, not an echo, so a raise
     reports no echo. And an echo is only DISQUALIFYING for a parameter whose
-    name does not designate the attach target (see ``_names_a_target``): a real
+    name does not designate the attach target (see ``names_a_target``): a real
     option (b) that names the target in a header — ``'ATTACH TARGET: ' +
     attach_target_id`` — echoes its argument in exactly this way, and only the
     parameter's name separates it from the false pass above.
@@ -595,9 +457,9 @@ def _search_option_b(
     attempts: list[str] = []
     rendered_any = False
     target_named_rendered = False
-    usable = _usable_parameters(build)
+    usable = usable_parameters(build)
     for index, param in _target_parameters(build):
-        named = _names_a_target(param)
+        named = names_a_target(param)
         fillers = _fillers_for(usable, index)
         for spelling in _SPELLINGS:
             for filler in fillers:
@@ -814,8 +676,8 @@ def _echoes_payload(
         # control then did NOT run, so a subsequent option-(a) PASS rests on
         # weaker evidence than one where the control executed and came back
         # clean. Say so at WARN+ rather than swallowing it -- this gate
-        # authorises a production flag flip, and stderr is folded into the
-        # report the operator reads.
+        # authorises a production flag flip, and report_fail_closed carries
+        # WARN+ records into the report the operator reads.
         logger.warning(
             'echo control not exercised for verdict word %r under field %r: '
             'parse_judge_verdict refused the decoy payload (%s: %s). Treating '
@@ -1306,7 +1168,7 @@ def _pass_scope_note() -> list[str]:
 
 def _probe(src_root: Path, out: list[str]) -> int:
     out.append(f'write_triage attach-target invariant probe — src-root={src_root}')
-    module = _import_judge(src_root)
+    module = import_from_tree(_MODULE_NAME, src_root, mode=ImportMode.FATAL)
     out.append(f'judge module: {getattr(module, "__file__", "<unknown>")}')
 
     slate, target, index = _build_slate(module)
@@ -1326,14 +1188,14 @@ def _probe(src_root: Path, out: list[str]) -> int:
         out.extend(_pass_scope_note())
         return EXIT_OK
 
-    build = _require(module, 'build_judge_prompt')
+    build = require(module, 'build_judge_prompt')
     other = slate[0]
     if other is target:
         # The fixture puts the rescued winner LAST, so this cannot happen —
         # but a swap test that compared a rendering with itself would pass
         # vacuously, which is exactly the failure mode this gate exists to
         # prevent. Refuse rather than "pass".
-        raise _Unverifiable(
+        raise Unverifiable(
             'the rescued attach target is also slate[0]; there is no second target '
             'to swap against, so the invariant is unverifiable on this slate',
         )
@@ -1354,14 +1216,14 @@ def _probe(src_root: Path, out: list[str]) -> int:
             # Not one combination produced a pair of renderings to compare, so
             # nothing was ever asserted about the invariant. Unverifiable, not
             # failed.
-            raise _Unverifiable(
+            raise Unverifiable(
                 'build_judge_prompt could not be rendered with an attach target '
                 f'({_first_few(attempts)})',
             )
         named = [
             param.name
             for _, param in _target_parameters(build)
-            if _names_a_target(param)
+            if names_a_target(param)
         ]
         if named and not search.target_named_rendered:
             # SOME parameter rendered, so the branch above did not fire -- but
@@ -1370,7 +1232,7 @@ def _probe(src_root: Path, out: list[str]) -> int:
             # (and point the reader at a remedy that may already be present),
             # so say what was actually measured. Still fails closed: an
             # unverifiable invariant is not a satisfied one.
-            raise _Unverifiable(
+            raise Unverifiable(
                 f'build_judge_prompt takes {named!r}, named for the attach target, '
                 'but no call reached it — every attempt failed before a pair of '
                 'renderings existed to compare. Only parameters that do NOT name '
@@ -1406,51 +1268,10 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help='directory containing the fused_memory package (a fused-memory/src tree)',
     )
+    # Outside report_fail_closed: a usage error is the invocation's defect, not
+    # the ref's, and keeps argparse's own exit code.
     args = parser.parse_args(argv)
-
-    warnings = _ReportedWarnings()
-    logger.addHandler(warnings)
-    out: list[str] = []
-    try:
-        rc = _probe(Path(args.src_root), out)
-    except _Unverifiable as exc:
-        out.append(f'FAIL  UNVERIFIABLE: {exc}')
-        out.append('      Failing closed — an unverifiable invariant is not a satisfied one.')
-        rc = EXIT_FAIL
-    except BaseException:  # noqa: BLE001 - the probe itself must never pass by crashing
-        # BaseException, not Exception. This probe EXECUTES arbitrary code out
-        # of the ref's own tree, and the realistic escape is SystemExit — a
-        # lazily-imported dependency's import guard, or an argparse-style bail,
-        # calling sys.exit(). SystemExit is not an Exception, so it slipped
-        # past every inner handler AND past this arm, and terminated the
-        # process with ITS OWN code. Measured: a judge whose
-        # select_judge_candidates raises SystemExit(0) exited 0 having printed
-        # zero bytes, and the gate read that as PASS and authorised the flip.
-        # _import_judge already caught BaseException for exactly this reason;
-        # the convention simply was not applied at the outer arm.
-        #
-        # This is the SINGLE CHOKEPOINT for that class: the inner handlers
-        # (_render, _option_a_verdict, _echoes_payload, _build_slate) each
-        # catch Exception for DIAGNOSTIC reasons — to attribute a failure to
-        # one combination and keep searching — and a SystemExit out of any of
-        # them lands here. Widening them individually would be both redundant
-        # and worse, since a SystemExit is never evidence about one candidate.
-        #
-        # KeyboardInterrupt is deliberately included. A gate that reports
-        # 'unverifiable' on an interrupted run is correct; one that lets a
-        # Ctrl-C read as anything else is not.
-        #
-        # argparse stays OUTSIDE this try, so --help and a bad --src-root keep
-        # their own exit codes instead of being reported as a failed probe.
-        out.append('FAIL  UNVERIFIABLE: the probe raised while evaluating the invariant.')
-        out.append('      Failing closed — an unverifiable invariant is not a satisfied one.')
-        out.extend('      ' + line for line in traceback.format_exc().splitlines())
-        rc = EXIT_FAIL
-    # LAST, so they survive a tail-truncated report, and on STDOUT, so they
-    # survive the gate dropping stderr. See _ReportedWarnings.
-    out.extend(f'WARN  {message}' for message in warnings.messages)
-    sys.stdout.write('\n'.join(out) + '\n')
-    return rc
+    return report_fail_closed(lambda out: _probe(Path(args.src_root), out))
 
 
 if __name__ == '__main__':

@@ -3014,7 +3014,7 @@ class TestDescribeDroppedClauses:
     ``has_unpreserved_chain_clauses`` answers "was anything dropped at all";
     this answers "WHAT was dropped, and is it the same tool again". Both are
     pure, which is what keeps this module logging-free — the caller
-    (``verify_plan.log_dropped_chain_clauses``) turns the answer into a record.
+    (``verify_plan._log_dropped_chain_clauses``) turns the answer into a record.
 
     Two properties are pinned here because the first version of that record
     got both wrong (task 3218, review findings 1 and 2):

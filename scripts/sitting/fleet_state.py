@@ -37,6 +37,7 @@ from _task_db_scan import (
     TaskDbProblem,
     TaskDbUnreadable,
     connect_ro,
+    runs_db_path,
     tasks_db_path,
 )
 from escalation.models import Escalation
@@ -58,7 +59,6 @@ from sitting.payloads import RejectedMarker
 Status = Literal['ok', 'source_missing', 'unreadable']
 STATUSES: tuple[Status, ...] = ('ok', 'source_missing', 'unreadable')
 
-RUNS_DB = Path('data', 'orchestrator', 'runs.db')
 LANDED_TABLES = ('events',)
 SPEND_TABLES = ('events', 'invocations', 'task_results')
 
@@ -244,10 +244,6 @@ class ProjectState:
     spend: Measurement[tuple[ModelRoleRow, ...]]
     standing_policy: Measurement[StandingPolicyRulings]
     trial: Measurement[PreparerTrial]
-
-
-def runs_db_path(project_root: Path | str) -> Path:
-    return Path(project_root) / RUNS_DB
 
 
 def project_queue_dirs(project_root: Path | str) -> tuple[str, ...]:

@@ -53,6 +53,10 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import _checkout as _checkout
+
+from shared import merge_subject, project_layout
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The three source checkouts, keyed by the census project id. Both databases
@@ -282,18 +286,6 @@ class BaselineUnresolved(RuntimeError):
     """
 
 
-def _runs_db(project_root: Path | str) -> Path:
-    """Return the orchestrator runs db inside *project_root*.
-
-    ONE spelling of the layout, shared by every caller (the census, the
-    duration stats, the ceilings guard's error message and the redrive
-    resolver), so relocating the db is a one-line change here rather than a
-    hunt through four literals — the same single-derivation discipline
-    ``_merge_subject_patterns`` applies to the landing-merge subjects.
-    """
-    return Path(project_root) / 'data' / 'orchestrator' / 'runs.db'
-
-
 def connect_ro(db_path: Path | str) -> sqlite3.Connection:
     """Open *db_path* read-only, so a live orchestrator db is never locked.
 
@@ -349,60 +341,37 @@ def _git(args: list[str], cwd: Path | str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ''
 
 
-# The two subject spellings a landing merge is written under. BOTH are in live
-# use — censused over reify's main: 2741 x "Merge task/N into main" and 74 x
-# "Merge task/N: <subject>" — and matching only the first is what stamped a
-# false `reference_unavailable` on fixtures that DO have a landing merge
-# (measured: reify_task_4026, reify_task_2379, reify_task_2573).
-_MERGE_SUBJECT_SPELLINGS = (
-    # Fully-anchored: the whole subject is known.
-    '^Merge task/{escaped_id} into main$',
-    # Prefix-anchored: the subject tail is free text, so only the head can be
-    # matched. The trailing space is load-bearing — see the docstring below.
-    '^Merge task/{escaped_id}: ',
-)
-
-
-def _merge_subject_patterns(task_id: str) -> list[str]:
-    """Return the anchored EREs matching *task_id*'s landing-merge subjects.
-
-    ONE derivation, shared by every reader, mirroring the discipline of
-    ``orchestrator/src/orchestrator/git_ops.py::_merge_subject`` — whose
-    single-source-of-truth subject is consumed by ``git_ops.py::GitOps
-    .find_merge_marker``, ``merge_to_main`` and ``advance_main`` so writer and
-    reader can never silently drift. This driver only ever READS history, so
-    it derives the accepted patterns rather than the written subject, but the
-    property is the same: adding or amending a spelling happens here, once.
-
-    Each pattern is used TWICE by ``find_merge_sha`` — as a git
-    ``--extended-regexp`` ``--grep`` pre-filter and as a Python ``re`` re-test
-    against the subject alone — so a spelling added here must be valid in both
-    engines. The two currently differ only in constructs both accept (``^``,
-    ``$``, a literal ``:``, and whatever ``re.escape`` emits for a numeric id).
-    """
-    escaped = re.escape(task_id)
-    return [s.format(escaped_id=escaped) for s in _MERGE_SUBJECT_SPELLINGS]
+# The branch naming of the three source checkouts: a task merges from
+# `task/<id>` into `main`.
+_BRANCH_PREFIX = 'task/'
+_MAIN_BRANCH = 'main'
 
 
 def find_merge_sha(repo_root: Path | str, task_id: str) -> str | None:
     """Return the task's single landing-merge SHA, else ``None``.
 
-    Two subject spellings are accepted, per ``_merge_subject_patterns``:
-    ``Merge task/<id> into main`` and ``Merge task/<id>: <subject>``.
+    Two subject spellings are accepted, both in live use (censused over
+    reify's main: 2741 x ``Merge task/<id> into main``, 74 x
+    ``Merge task/<id>: <subject>``); matching only the first is what stamped a
+    false ``reference_unavailable`` on fixtures that DO have a landing merge
+    (reify_task_4026, reify_task_2379, reify_task_2573). Their union is the
+    alternation of ONE pattern,
+    ``shared.merge_subject.merge_subject_pattern(..., legacy_colon_form=True)``,
+    derived from the same fragments as the subject the merge writer emits.
 
     ``None`` means planRate-only: either the task landed SPLIT/direct (no merge
     commit at all) or several merges carry the same id — across the UNION of
     both spellings — in which case picking one would silently invent a
     reference for the judge to grade against.
 
-    Both patterns are ``^``-anchored, which is what preserves substring-safety:
+    The pattern is ``^``-anchored, which is what preserves substring-safety:
     ``Merge task/8030 …`` cannot answer a query for task ``803`` because the
     ``0`` after ``task/803`` falls where the pattern requires a space or a
     colon. ``git_ops.py::GitOps.find_merge_marker`` gets the same property from
     ``--fixed-strings``; that is not available here because the colon form's
     subject tail is unknown, so only a PREFIX can be matched and git's
     ``--grep`` has no anchoring under ``--fixed-strings``. Hence ERE plus
-    ``^``, which also makes the trailing space in the colon pattern
+    ``^``, which also makes the trailing space in the colon arm
     load-bearing: ``Merge task/803:no-space`` is not the landing-merge shape.
 
     Two scopings keep an answer from being a commit that never landed:
@@ -416,8 +385,8 @@ def find_merge_sha(repo_root: Path | str, task_id: str) -> str | None:
     against the same pattern compiled as a Python ``re`` (no ``re.MULTILINE``,
     so ``^`` anchors to the start of the string). This mirrors
     ``git_ops.py::GitOps.find_task_citation_commit``, which defends the same
-    trap for the same reason (task 2675 FIX 2), and is why the pattern strings
-    must stay valid as BOTH an ERE and a Python ``re``. The exposure is
+    trap for the same reason (task 2675 FIX 2); the shared pattern is valid as
+    BOTH an ERE and a Python ``re`` by contract. The exposure is
     two-sided and both sides are silent: a body-only match on a non-landing
     commit would mint a fabricated reference plus a ``{source:'landed',
     passed:true}`` verify outcome, while a spurious SECOND match would trip
@@ -436,21 +405,24 @@ def find_merge_sha(repo_root: Path | str, task_id: str) -> str | None:
     the committed manifest, the any-line/``--all`` matcher, the subject-only
     ``--all`` matcher and the subject-only ``main`` matcher agree on every row.
     """
-    # git ORs multiple --grep args by default, so one invocation covers the
-    # union and `len(shas) == 1` keeps its across-spellings ambiguity meaning.
-    patterns = _merge_subject_patterns(task_id)
-    greps = [f'--grep={pattern}' for pattern in patterns]
+    pattern = merge_subject.merge_subject_pattern(
+        branch_prefix=_BRANCH_PREFIX,
+        task_id=task_id,
+        main_branch=_MAIN_BRANCH,
+        legacy_colon_form=True,
+    )
     out = _git(
-        ['log', 'main', *greps, '--extended-regexp', '-z', '--format=%H%x1f%s'],
+        ['log', 'main', f'--grep={pattern}', '--extended-regexp', '-z',
+         '--format=%H%x1f%s'],
         repo_root,
     )
-    compiled = [re.compile(pattern) for pattern in patterns]
+    subject_re = re.compile(pattern)
     shas: list[str] = []
     for entry in out.split('\0'):
         if not entry:
             continue
         sha, _sep, subject = entry.partition('\x1f')
-        if any(pattern.search(subject) for pattern in compiled):
+        if subject_re.search(subject):
             shas.append(sha.strip())
     return shas[0] if len(shas) == 1 else None
 
@@ -664,12 +636,12 @@ def enrich_from_task_db(
 
 def collect_candidates(project: str, root: Path) -> list[Candidate]:
     """Census + enrich + resolve merge/baseline for one source checkout."""
-    runs_db = _runs_db(root)
+    runs_db = project_layout.runs_db(root)
     candidates = [
         Candidate(task_id=tid, project=project, project_root=str(root))
         for tid in census_task_ids(runs_db)
     ]
-    enrich_from_task_db(candidates, root / '.taskmaster' / 'tasks' / 'tasks.db')
+    enrich_from_task_db(candidates, project_layout.tasks_db(root))
     for cand in candidates:
         cand.merge_sha = find_merge_sha(root, cand.task_id)
         ts = first_architect_invocation_ts(runs_db, cand.task_id)
@@ -709,7 +681,7 @@ def run_census(strict: bool = True) -> int:
             return 2
         cands = collect_candidates(project, root)
         counts[project] = len(cands)
-        durations.extend(census_durations_ms(_runs_db(root)))
+        durations.extend(census_durations_ms(project_layout.runs_db(root)))
         all_candidates.extend(cands)
 
     header = (f'{"project":<14}{"task":<7}{"status":<12}{"brief":>6}  '
@@ -857,7 +829,7 @@ def _build_ceilings() -> dict:
     all_max_ms = 0
     all_n = 0
     for root_str in SOURCE_CHECKOUTS.values():
-        runs_db = _runs_db(root_str)
+        runs_db = project_layout.runs_db(root_str)
         census_ms.extend(census_durations_ms(runs_db))
         root_max_ms, root_n = _all_architect_duration_stats(runs_db)
         all_max_ms = max(all_max_ms, root_max_ms)
@@ -880,7 +852,7 @@ def _build_ceilings() -> dict:
             f'{observed_max} min over n={len(minutes)} census invocation(s), '
             f'all-architect max {all_max} min over n={all_n} invocation(s). '
             f'Expected populated events.duration_ms in '
-            f'{[str(_runs_db(r)) for r in SOURCE_CHECKOUTS.values()]}. '
+            f'{[str(project_layout.runs_db(r)) for r in SOURCE_CHECKOUTS.values()]}. '
             f'Refusing to emit a ceilings block whose headroom cannot be '
             f'computed: the threshold would then be a guess, which is exactly '
             f'what this derivation exists to prevent.'
@@ -943,9 +915,10 @@ def _build_ceilings() -> dict:
 
 
 # The two accepted landing-merge spellings, in the form a reader of
-# CURATION.md sees them. `_merge_subject_patterns` carries the machine form;
-# this is the same fact rendered for prose, kept beside the sentence that
-# quotes it so a third spelling is added in one place per audience.
+# CURATION.md sees them. `shared.merge_subject.merge_subject_pattern` carries
+# the machine form; this is the same fact rendered for prose, kept beside the
+# sentence that quotes it so a third spelling is added in one place per
+# audience.
 _MERGE_SPELLINGS_PROSE = (
     '`Merge task/<id> into main` or `Merge task/<id>: <subject>`'
 )
@@ -967,7 +940,8 @@ def merge_sha_availability_block(candidates: list[dict]) -> dict:
     THIS call and the majority clause is chosen by comparing them. Counts and
     prose therefore cannot drift apart — the same
     writer-and-reader-share-one-derivation discipline this driver already
-    applies in ``_merge_subject_patterns`` and ``base_approximation``.
+    applies through ``shared.merge_subject.merge_subject_pattern`` and in
+    ``base_approximation``.
 
     Two defects this closes, both measured on the committed manifest:
 
@@ -1231,7 +1205,7 @@ def render_curation_md(manifest: dict) -> str:
         '`reference_unavailable` means no single landing merge exists under '
         'either. Both spellings are in live use (censused over reify\'s '
         '`main`: 2741 of the first, 74 of the second) and both are derived in '
-        'one place, `mint_hard_v2_fixtures.py::_merge_subject_patterns`, '
+        'one place, `shared.merge_subject.merge_subject_pattern`, '
         'mirroring `git_ops.py::_merge_subject`.')
     add('')
 
@@ -1395,7 +1369,7 @@ def _production_redrive_resolver(row_project_root: str, task_id: str):
     """The real resolver: the dual-spelling matcher plus the baseline ladder."""
     merge_sha = find_merge_sha(row_project_root, task_id)
     ts = first_architect_invocation_ts(
-        _runs_db(row_project_root), task_id,
+        project_layout.runs_db(row_project_root), task_id,
     )
     baseline_sha, baseline_source = resolve_baseline(
         row_project_root, task_id, ts,
@@ -1688,9 +1662,6 @@ def _refs_pointing_at(repo_root: Path | str, commit: str) -> list[str]:
 
 def _import_sampler():
     """Import ``task_sampler`` from this repo's orchestrator package."""
-    src = REPO_ROOT / 'orchestrator' / 'src'
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
     from orchestrator.evals import task_sampler
     return task_sampler
 
@@ -2086,7 +2057,8 @@ async def _run_mint(sampled_at: str, seed: int) -> int:
             Candidate(task_id=r['task_id'], project=project, project_root=str(root))
             for r in rows
         ]
-        enrich_from_task_db(cands, root / '.taskmaster' / 'tasks' / 'tasks.db')
+        task_store = project_layout.tasks_db(root)
+        enrich_from_task_db(cands, task_store)
         for row, cand in zip(rows, cands, strict=True):
             # The enrichment degrades to a stub (unreadable db, id absent from
             # the tasks table, blanked columns) rather than raising. Minting
@@ -2097,7 +2069,7 @@ async def _run_mint(sampled_at: str, seed: int) -> int:
                 raise RuntimeError(
                     f'_run_mint: include row {project}/{row["task_id"]} '
                     f'resolved to an empty title/description from '
-                    f'{root}/.taskmaster/tasks/tasks.db (title={cand.title!r}, '
+                    f'{task_store} (title={cand.title!r}, '
                     f'brief_chars={cand.brief_chars}). Refusing to mint a '
                     f'fixture with no brief; re-run --census to see whether '
                     f'the task id still resolves in that db.'

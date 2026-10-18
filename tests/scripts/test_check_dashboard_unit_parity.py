@@ -1540,11 +1540,22 @@ def test_registry_env_matches_directive_entries_are_declared_in_the_committed_un
             )
 
 
+def test_divergence_allowlist_is_the_policy_projection():
+    """The allowlist is ENV_POLICY's dashboard projection, and immutable across the boundary."""
+    allowlist = _load_checker().DIVERGENCE_ALLOWLIST
+
+    assert isinstance(allowlist, frozenset)
+    assert allowlist == systemd_unit_parity.ENV_POLICY.divergence_allowlist(
+        systemd_unit_parity.UnitFamily.DASHBOARD
+    )
+
+
 def test_divergence_allowlist_names_are_declared_in_a_committed_unit():
     """STALENESS GUARD, allowlist edition: no waiver for a variable nobody sets.
 
-    DIVERGENCE_ALLOWLIST is the one deliberate hole in this gate, and its own
-    comment says to keep it small and every reason checkable.  An entry naming a
+    DIVERGENCE_ALLOWLIST is the one deliberate hole in this gate, so keep it
+    small; each entry's reason lives in the PRD's "D5 policy rows"
+    (plans/review-all-s25-scripts-instruments-prd.md).  An entry naming a
     variable no committed unit declares any more is worse than useless: it is a
     standing, invisible waiver that nothing will ever remove, because nothing
     reports it.  If the variable comes back later — reused for something else —
@@ -1561,15 +1572,11 @@ def test_divergence_allowlist_names_are_declared_in_a_committed_unit():
         )
         declared |= set(systemd_unit_parity.environment_map(parsed, spec.environment_section))
 
-    for var, reason in mod.DIVERGENCE_ALLOWLIST.items():
+    for var in sorted(mod.DIVERGENCE_ALLOWLIST):
         assert var in declared, (
             f"DIVERGENCE_ALLOWLIST waives value comparison for {var}, but no "
             f"committed unit in the registry declares it. Declared: "
             f"{sorted(declared)}. Remove the entry or restore the variable."
-        )
-        assert reason.strip(), (
-            f"DIVERGENCE_ALLOWLIST entry {var} has an empty reason. Every hole "
-            "in this gate must state one specific enough for a reviewer to check."
         )
 
 
@@ -1688,11 +1695,6 @@ def test_project_root_is_allowlisted_for_cross_host_value_divergence():
         "DASHBOARD_PROJECT_ROOT is not allowlisted, so its value is compared "
         "across copies — that fires on every correctly-configured host whose "
         "repo does not live at /home/leo/src/dark-factory."
-    )
-    assert mod.DIVERGENCE_ALLOWLIST["DASHBOARD_PROJECT_ROOT"].strip(), (
-        "every allowlist entry must state its reason; this one must also name "
-        "what closes the hole (env_matches_directive), so the preamble's "
-        "'THIS IS A HOLE IN THE GATE' stays honest."
     )
 
 

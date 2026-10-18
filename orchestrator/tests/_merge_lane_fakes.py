@@ -4,8 +4,9 @@ Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
 ``FakeVerifier`` scripts the verify outcome per task id or in call order,
 and records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
-hand-advanced clock whose ``sleep`` advances it instead of waiting, and
-``healthy_verify_clock`` one on which an in-flight verify keeps writing;
+hand-advanced clock whose ``sleep`` advances it and waits at most
+``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
+in-flight verify keeps writing;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
@@ -17,6 +18,11 @@ nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``MergeOutcome`` whether it left a detached main-health probe running, and
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
 off.
+
+Since task 5037 every merge-lane module, and ``suffix_graph``, logs under
+exactly ``'orchestrator.merge_lane'``; filter caplog by that name. A
+NEGATIVE assertion over records filtered by a logger name nothing emits
+under passes vacuously, so pair it with a positive capture.
 
 Imported by bare module name (``from _merge_lane_fakes import ...``), like
 ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
@@ -32,11 +38,10 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.merge_gates import PostMergePyrightResult
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_lane.types import DiskGuardOutcome
-from orchestrator.merge_queue import MAIN_HEALTH_PROBE_PENDING_NOTE
-from orchestrator.merge_types import MergeOutcome
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
+from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
 
 
@@ -301,8 +306,13 @@ class FakeClock:
     Two independent readings, exactly as production has them: ``now`` reads
     the wall-clock ``time`` (what the lane stamps with) and ``monotonic``
     reads ``mono`` (what it measures durations against). ``sleep`` advances
-    BOTH by the requested seconds and yields once so other tasks run,
-    keeping every requested sleep in ``sleeps``.
+    BOTH by the requested seconds and really waits ``min(secs, sleep_cap)``,
+    keeping every requested sleep in ``sleeps``. The real wait stops a
+    started lane's periodic loops (``_heartbeat_loop``, ``_reprobe_loop``)
+    from spinning a core; the cap keeps their production-sized periods off
+    the wall clock. ``sleep_cap=0`` restores the bare yield, for a test that
+    drives a single loop through a production-sized poll count with nothing
+    else needing real time.
 
     ``wait_for_any`` is the lane's poll cadence, and it charges ``mono``
     the FULL requested timeout while really waiting only ``wait_cap``.
@@ -311,14 +321,15 @@ class FakeClock:
     -- reaches that budget with no real time elapsed. Every requested
     timeout lands in ``waits``.
 
-    How much real time the polled task gets before that is NOT dependable,
-    so no ``wait_cap`` buys a load-safe slack. ``sleep`` only yields, so
-    the lane's periodic loops (``_heartbeat_loop``, ``_reprobe_loop``) spin
-    ``mono`` forward at event-loop speed while the lane is otherwise idle,
-    and a parked verify's whole budget can go in under a second. A scene
-    that must not call a verify dead shows the content progress a healthy
-    verify makes -- ``healthy_verify_clock`` -- and only a scene exercising
-    the dead-verify abort leaves ``content_mtime`` frozen.
+    How much real time the polled task gets before that is NOT dependable.
+    A started lane's loops charge 150s (heartbeat 30s + reprobe 120s) per
+    ``sleep_cap`` of real sleep and the abort poll charges its full poll
+    interval per ``wait_cap``, so at the defaults a parked verify's
+    no-progress budget runs out in under a second of real time. Load
+    only lengthens that, but it is still no load-safe slack: a scene that must not call a verify dead shows the
+    content progress a healthy verify makes -- ``healthy_verify_clock`` --
+    and only a scene exercising the dead-verify abort leaves
+    ``content_mtime`` frozen.
 
     ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
     for a lane loop that measures elapsed time off this clock but waits on
@@ -344,6 +355,7 @@ class FakeClock:
         content_mtime: float | None = None,
         content_tick: float = 0.0,
         wait_cap: float = 0.02,
+        sleep_cap: float = 0.02,
     ) -> None:
         self.time = time
         self.mono = time
@@ -351,6 +363,7 @@ class FakeClock:
         self.content_mtime = content_mtime
         self.content_tick = content_tick
         self.wait_cap = wait_cap
+        self.sleep_cap = sleep_cap
         self.sleeps: list[float] = []
         self.waits: list[float] = []
         self.content_probes: list[Path] = []
@@ -374,7 +387,7 @@ class FakeClock:
         self.sleeps.append(secs)
         self.time += secs
         self.mono += secs
-        await asyncio.sleep(0)
+        await asyncio.sleep(min(secs, self.sleep_cap))
 
     async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
         self.waits.append(timeout)
@@ -434,9 +447,9 @@ def make_lane(
 
     The verifier and clock default to fresh fakes rather than to the
     production adapters, so a test that forgets to pass one still gets a
-    lane that neither shells out nor waits on the wall clock. *queue*
-    defaults to a fresh ``asyncio.Queue`` on the running loop. Anything else
-    ``MergeLane`` accepts passes through in *kwargs*.
+    lane that neither shells out nor waits out a production-sized sleep.
+    *queue* defaults to a fresh ``asyncio.Queue`` on the running loop.
+    Anything else ``MergeLane`` accepts passes through in *kwargs*.
     """
     return MergeLane(
         git_ops,

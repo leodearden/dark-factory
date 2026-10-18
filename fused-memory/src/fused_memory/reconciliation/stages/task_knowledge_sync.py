@@ -18,10 +18,13 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
 )
+from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -44,11 +47,10 @@ from fused_memory.reconciliation.flag_dedup import (
     _normalize_content_description,
     acknowledge_resolved_flags,
     compute_flag_signature,
-    confirm_task_present,
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
-    safe_get_task,
+    filter_snapshot_stat_edge_findings,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
 from fused_memory.reconciliation.live_workflow_section import (
@@ -69,6 +71,9 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
+from fused_memory.reconciliation.stage2_counter_grounding import (
+    ground_stage2_counters,
+)
 from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_GROWTH,
@@ -78,6 +83,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
 from fused_memory.reconciliation.summary_pool import (
+    trailing_incomplete_agent_run_ids,
     write_cycle_summary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
@@ -101,6 +107,7 @@ from fused_memory.reconciliation.task_filter import (
     render_retained_done_tasks,
     select_done_since_boundary,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
 
 try:
@@ -291,299 +298,6 @@ async def _acknowledge_resolved_stage1_markers(
         return 0
 
 
-#: resolve_ticket statuses that constitute a confirmed task creation (task 3046).
-_TASK_CREATED_SUCCESS_STATUSES: frozenset[str] = frozenset({'created', 'combined'})
-
-
-def _action_record_keys(
-    records: object,
-    default_project_id: str | None = None,
-    valid_statuses: frozenset[str] = _TASK_CREATED_SUCCESS_STATUSES,
-) -> set[tuple[str | None, str]]:
-    """Return the deduped ``(project_id, task_id)`` keys of *records* (task 3046).
-
-    *records* is an action-record list such as
-    ``report.stats['task_created_records']`` — the action-shaped record list
-    the '## Task-Creation Accounting' prompt section mandates Stage 2 append to
-    at the moment each ``resolve_ticket`` call confirms a creation, modeled
-    directly on ``flag_deleted_records``. A record keys only when its
-    ``status`` (case/whitespace-insensitive) is in *valid_statuses* AND it
-    carries a non-empty ``task_id``; ``failed`` is NEVER counted regardless of
-    whether a ``task_id`` is present.
-
-    This is the ``resolve_ticket``-confirmed SUBSET of the '## Verifying Task
-    Operations' confirmation rule, not the whole of it: that section also lets
-    an agent count a creation via a ``get_task`` fallback when
-    ``resolve_ticket``'s ``status`` is neither ``created``/``combined``/
-    ``failed`` but a ``task_id`` is present and a follow-up ``get_task`` call
-    verifies it. That fallback path has no dedicated ``task_created_records``
-    status value and is intentionally NOT keyed here — it still contributes to
-    the agent's own self-reported ``tasks_created``, and this helper's result
-    is only ever used to raise that self-report, never lower it, so a
-    ``get_task``-verified creation is never double-counted and never
-    suppressed by this helper (task-3046 amendment: '## Verifying Task
-    Operations' intentionally covers a strictly larger set of countable
-    creations than this Python subset does — the two are not claimed to be
-    equivalent).
-
-    Deduplication is keyed on ``(project_id, str(task_id))``, NOT on
-    ``task_id`` alone: Cross-Project Routing means the same numeric id can
-    legitimately be filed under two different projects in the same cycle
-    (Taskmaster ids are per-project), and that is two distinct tasks, not a
-    duplicate report of one. ``project_id`` is normalised the same way as
-    ``task_id`` — ``str(...).strip()`` — so ``' dark_factory'`` and
-    ``'dark_factory'`` collapse to one key instead of inflating the count
-    (task-3046 amendment). A record with no ``project_id`` (or one that is
-    blank after stripping) falls back to *default_project_id* — typically
-    the caller's own ``self.project_id`` — so an omitted field cannot
-    masquerade as a second, distinct cross-project filing of the same task.
-
-    Returning the KEY SET rather than only its length is what task 3051 needs:
-    ``_corroborate_record_keys`` iterates the actual ``(project_id, task_id)``
-    pairs so each can be confirmed against its OWN project via
-    ``taskmaster.get_task`` before it is allowed to raise a counter.
-    *valid_statuses* is a parameter rather than a constant read for the same
-    reason the key set is returned — task 4018's ``tasks_hints_updated``
-    records work (now in task 4873's scope) reuses this helper with its own accepted-status vocabulary,
-    so it is a call site rather than a second copy of these rules.
-
-    Best-effort and non-raising throughout, mirroring
-    ``_acknowledge_resolved_stage1_markers`` above: *records* must be a
-    non-empty ``list`` or this returns an empty set; non-``dict`` entries and
-    entries that raise while being inspected are silently skipped rather
-    than aborting the scan — a malformed record degrades to "not counted",
-    never to an exception that would corrupt an otherwise-good stage report.
-    """
-    if not isinstance(records, list) or not records:
-        return set()
-
-    seen: set[tuple[str | None, str]] = set()
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        try:
-            status = record.get('status')
-            if (
-                not isinstance(status, str)
-                or status.strip().lower() not in valid_statuses
-            ):
-                continue
-            task_id = record.get('task_id')
-            if task_id is None:
-                continue
-            task_id_str = str(task_id).strip()
-            if not task_id_str:
-                continue
-            project_id = record.get('project_id')
-            if project_id is None:
-                project_id_str = default_project_id
-            else:
-                project_id_str = str(project_id).strip() or default_project_id
-        except Exception:
-            continue
-        seen.add((project_id_str, task_id_str))
-
-    return seen
-
-
-def _count_valid_task_created_records(
-    records: object,
-    default_project_id: str | None = None,
-) -> int:
-    """Return the deduped count of confirmed task creations in *records* (task 3046).
-
-    A thin documented alias for ``len(_action_record_keys(...))`` — every
-    substantive rule (which statuses count, how keys are built and deduped,
-    the ``default_project_id`` fallback, the non-raising posture) is stated
-    once on :func:`_action_record_keys` so the two cannot drift into two
-    explanations of one rule.
-    """
-    return len(_action_record_keys(records, default_project_id))
-
-
-def _coerce_tasks_created_count(value: object) -> int:
-    """Best-effort int coercion for a self-reported ``tasks_created`` value (task 3046).
-
-    Stage 2 self-reports ``tasks_created`` as free-form LLM JSON, so it can
-    plausibly arrive as a clean ``int``, a numeric ``str`` (``"3"``), or a
-    ``float`` (``3.0``) instead. This coerces all three to ``int``. A
-    ``bool`` is explicitly rejected — never trusted as a count, even though
-    ``isinstance(True, int)`` holds in Python — and anything that fails
-    coercion (``None``, a non-numeric string, a list, ...) falls back to
-    ``0``, exactly like an absent value.
-
-    Without this, a non-``int`` self-report would collapse to ``0`` under a
-    bare ``isinstance(x, int)`` check, and a smaller record-derived
-    ``observed`` count could then look like an UNDERCOUNT and overwrite a
-    legitimately larger self-report — a silent downward move the
-    upward-only repair is explicitly designed never to make (task 2230 /
-    W5-mu).
-    """
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        try:
-            return int(stripped)
-        except ValueError:
-            pass
-        try:
-            return int(float(stripped))
-        except ValueError:
-            return 0
-    return 0
-
-
-class _RecordCorroboration(NamedTuple):
-    """Outcome of corroborating a set of action-record keys (task 3051).
-
-    The three buckets PARTITION the input keys — ``corroborated`` +
-    ``uncorroborated`` + ``unresolvable`` always equals the number of
-    well-formed keys handed in — so no key can be silently dropped and an
-    operator can tell "the agent invented records" (uncorroborated: we asked
-    and the task is not there) from "we could not check" (unresolvable: no
-    project root to ask against, or no taskmaster at all).
-    """
-
-    #: The keys ``taskmaster.get_task`` positively confirmed exist.
-    corroborated_keys: set[tuple[str | None, str]]
-    #: Keys looked up whose result did NOT positively confirm presence.
-    uncorroborated: int
-    #: Keys no lookup could be issued for (unresolvable project, or the
-    #: corroboration pass could not run at all).
-    unresolvable: int
-
-    @property
-    def corroborated(self) -> int:
-        """Number of positively-confirmed keys (derived, cannot drift)."""
-        return len(self.corroborated_keys)
-
-
-def _normalize_record_keys(keys: object) -> list[tuple[Any, Any]]:
-    """Best-effort projection of *keys* to a list of well-formed 2-tuples.
-
-    Non-raising: a non-iterable, or an entry that is not a 2-tuple, degrades
-    to "no such key" rather than to an exception.
-    """
-    if not isinstance(keys, Iterable):
-        return []
-    normalized: list[tuple[Any, Any]] = []
-    try:
-        for key in keys:
-            if isinstance(key, tuple) and len(key) == 2:
-                normalized.append(key)
-    except TypeError:
-        return []
-    return normalized
-
-
-async def _corroborate_record_keys(
-    taskmaster: Any,
-    known_projects: dict[str, str] | None,
-    keys: object,
-) -> _RecordCorroboration:
-    """Confirm each ``(project_id, task_id)`` key against its OWN project (task 3051).
-
-    Structurally mirrors
-    :func:`~fused_memory.reconciliation.flag_dedup.filter_false_phantom_task_creation_flags`:
-    resolve each key's ``project_id`` to a root via *known_projects*, batch
-    every resolvable lookup into ONE flat ``asyncio.gather`` of
-    :func:`~fused_memory.reconciliation.flag_dedup.safe_get_task` coroutines,
-    and classify each result with
-    :func:`~fused_memory.reconciliation.flag_dedup.confirm_task_present`.
-    Resolving per key (rather than against this stage's own root) is what makes
-    a task filed by Cross-Project Routing corroborable at all: Taskmaster ids
-    are per-project sequential integers, so the wrong root routinely lands on
-    an unrelated task that merely shares the id.
-
-    Fail-CLOSED on the increment: a key whose lookup raises, returns not-found,
-    returns an inconclusive error, or cannot be issued at all is NOT
-    corroborated, mirroring ``confirm_task_present``'s documented posture that
-    "an uncertain or absent result must never be treated as corroboration that
-    a task exists".
-
-    What corroboration proves, and what it does not: a corroborated key names
-    a task that EXISTS in that project. It does not prove THIS cycle created
-    it — an id copied from the payload, or the target of a ``combined``
-    ticket, corroborates too — so this closes the fabricated-id hole only.
-    Binding a record to this run's own creation is task 4873's scope.
-
-    Fail-SAFE for the stage: the whole body is wrapped defensively and
-    degrades to "nothing corroborated, everything unresolvable" rather than
-    raising, matching the non-raising contract
-    :func:`_acknowledge_resolved_stage1_markers` and
-    :func:`_action_record_keys` already document. That is safe because the
-    only consumer — the ``tasks_created`` repair in
-    :meth:`TaskKnowledgeSync._apply_post_flight_guards` — is UPWARD-ONLY, so
-    withholding corroboration can only ever leave a self-reported counter
-    untouched; it can never move one down.
-
-    A falsy *taskmaster* or falsy/empty *known_projects* short-circuits with
-    zero I/O and every key counted unresolvable, so the lost repair is
-    reported rather than silently absorbed.
-
-    Args:
-        taskmaster: Object with an async ``get_task(task_id, project_root)``
-            method, typically ``self.taskmaster``.
-        known_projects: Map of ``project_id -> project_root``, typically
-            ``self.known_projects``.
-        keys: The deduped ``(project_id, task_id)`` pairs from
-            :func:`_action_record_keys`.
-
-    Returns:
-        A :class:`_RecordCorroboration` partitioning the well-formed keys.
-    """
-    normalized = _normalize_record_keys(keys)
-    total = len(normalized)
-    if not taskmaster or not known_projects or not total:
-        return _RecordCorroboration(set(), 0, total)
-
-    try:
-        resolvable: list[tuple[tuple[Any, Any], str]] = []
-        unresolvable = 0
-        for key in normalized:
-            project_id = key[0]
-            root = known_projects.get(project_id) if project_id else None
-            if not root:
-                # No root to ask against -> we could not CHECK (distinct from
-                # having checked and found nothing).  Issues no lookup.
-                unresolvable += 1
-                continue
-            resolvable.append((key, root))
-
-        if not resolvable:
-            return _RecordCorroboration(set(), 0, unresolvable)
-
-        # PLAIN gather — safe_get_task normalises every exception to an error
-        # dict, so no return_exceptions=True is needed (see
-        # tests/test_gather_convention_guard.py).
-        results: list[Any] = await asyncio.gather(
-            *[safe_get_task(taskmaster, key[1], root) for key, root in resolvable]
-        )
-
-        corroborated_keys: set[tuple[str | None, str]] = set()
-        uncorroborated = 0
-        for (key, _root), result in zip(resolvable, results, strict=True):
-            if confirm_task_present(result):
-                corroborated_keys.add(key)
-            else:
-                uncorroborated += 1
-
-        return _RecordCorroboration(corroborated_keys, uncorroborated, unresolvable)
-    except Exception:
-        logger.warning(
-            'reconciliation._corroborate_record_keys: corroboration pass failed for '
-            '%d record key(s) — degrading to nothing corroborated.',
-            total,
-            exc_info=True,
-        )
-        return _RecordCorroboration(set(), 0, total)
-
-
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
     """Return True iff *created_at* falls within the current run window.
 
@@ -658,9 +372,10 @@ class Stage2FlagPartition(NamedTuple):
         stale_mismatched_run_id_ids: ``id`` strings for records whose
             ``metadata.run_id`` is present and truthy but does not match the
             current ``run_id`` AND whose ``created_at`` is out of the run
-            window.  These are normal prior-cycle residue, excluded from what
-            is rendered to the Stage 2 LLM and reaped the same way (see
-            ``stale_missing_run_id_ids`` above).
+            window, excluding ``carried_forward_ids``.  These are normal
+            prior-cycle residue, excluded from what is rendered to the Stage 2
+            LLM and reaped the same way (see ``stale_missing_run_id_ids``
+            above).
         rescued_ids: ``id`` strings for markers rescued by the run-window guard
             (a subset of ``current``).  Non-empty indicates Stage 1 producer
             drift within the CURRENT cycle — the LLM omitted or mis-stamped
@@ -669,12 +384,18 @@ class Stage2FlagPartition(NamedTuple):
             exclusively by the two rescue branches inside
             :func:`_query_stage2_flags`; this is the single source of truth for
             the rescued count (task-1381).
+        carried_forward_ids: ``id`` strings for prior-run markers routed to
+            ``current`` because their run's Stage 2 agent did not complete and
+            none has completed since (a subset of ``current``).  The single
+            source for the ``stage2_markers_carried_forward`` stat (task 5984;
+            see plans/recon-stage-startup-wedge-rca-2026-09-27.md).
     """
 
     current: list[dict]
     stale_missing_run_id_ids: list[str]
     stale_mismatched_run_id_ids: list[str]
     rescued_ids: list[str]
+    carried_forward_ids: list[str]
 
     @property
     def stale_all_ids(self) -> list[str]:
@@ -687,6 +408,8 @@ async def _query_stage2_flags(
     project_id: str,
     current_run_id: str,
     run_window_start: datetime | None = None,
+    *,
+    carry_forward_run_ids: Collection[str] = frozenset(),
 ) -> Stage2FlagPartition:
     """Query Mem0 for active Stage-2-destined flags and partition by run_id.
 
@@ -695,7 +418,7 @@ async def _query_stage2_flags(
     alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
 
-    Results are partitioned into four groups:
+    Results are partitioned into five groups:
 
     * **current** — full dict records whose ``metadata.run_id`` is present,
       non-empty, and matches ``current_run_id`` after ``str()`` coercion.
@@ -717,6 +440,10 @@ async def _query_stage2_flags(
       the run-window guard; see :attr:`Stage2FlagPartition.rescued_ids` for
       full semantics.  This is the single source of truth for the rescued
       count (task-1381).
+    * **carried_forward_ids** — subset of **current** containing out-of-window
+      markers whose string ``run_id`` is in *carry_forward_run_ids* (runs whose
+      Stage 2 agent did not complete; task 5984).  The run-window rescue takes
+      precedence, so each marker counts as rescued, carried or stale, never two.
 
     Both stale buckets are excluded from what is rendered to the Stage 2 LLM;
     residue is reaped by the in-cycle Mem0 age-GC sweep
@@ -754,7 +481,7 @@ async def _query_stage2_flags(
         carries the top-N risk — see follow-up task for a proper
         ``scroll_by_metadata`` API on Mem0Backend.
 
-    Returns ``([], [], [], [])`` on search failure (best-effort; logs WARNING).
+    Returns ``([], [], [], [], [])`` on search failure (best-effort; logs WARNING).
     """
     try:
         results = await memory_service.search(
@@ -777,7 +504,7 @@ async def _query_stage2_flags(
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return Stage2FlagPartition([], [], [], [])
+        return Stage2FlagPartition([], [], [], [], [])
 
     if len(results) == 100:
         logger.warning(
@@ -792,6 +519,7 @@ async def _query_stage2_flags(
     stale_missing_run_id_ids: list[str] = []
     stale_mismatched_run_id_ids: list[str] = []
     rescued_ids: list[str] = []
+    carried_forward_ids: list[str] = []
 
     def _rescue(flag: dict, rid: str) -> None:
         """Route a rescued marker to current and record its id.
@@ -872,6 +600,9 @@ async def _query_stage2_flags(
                     extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
                 )
                 _rescue(flag_dict, r.id)
+            elif isinstance(_rid_val, str) and _rid_val in carry_forward_run_ids:
+                current_flags.append(flag_dict)
+                carried_forward_ids.append(r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
@@ -896,7 +627,13 @@ async def _query_stage2_flags(
                 'current_run_id': run_id_str,
             },
         )
-    return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids, rescued_ids)
+    return Stage2FlagPartition(
+        current_flags,
+        stale_missing_run_id_ids,
+        stale_mismatched_run_id_ids,
+        rescued_ids,
+        carried_forward_ids,
+    )
 
 
 def _query_recon_report_findings(
@@ -3426,7 +3163,9 @@ async def _track_flag_persistence(
     TTL/terminal-task schedule, not by an immediate per-cycle delete.  The
     counter therefore no longer observes Stage 2 delete failures from
     previous cycles; it only counts Stage 1 re-flags that survive within the
-    current cycle's ``run_id``.
+    current cycle's ``run_id``, plus markers carried forward from a run whose
+    Stage 2 agent did not complete (task 5984), which gain one count per
+    Stage 2 run they are rendered to.
     """
     if not flag_ids:
         return {}
@@ -3615,6 +3354,8 @@ class TaskKnowledgeSync(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
@@ -3663,6 +3404,10 @@ class TaskKnowledgeSync(BaseStage):
     # returns (same per-run counter reset-then-inject pattern used throughout this
     # class).
     _rescued_in_window_markers: int = 0
+
+    # Count of prior-run markers carried forward because their run's Stage 2
+    # agent did not complete (task 5984); same reset-then-inject pattern.
+    _markers_carried_forward: int = 0
 
     # Count of systemic_pattern findings polled from the recon_report channel
     # (task-1966) that were newly APPENDED to combined_flags in the current
@@ -3720,6 +3465,7 @@ class TaskKnowledgeSync(BaseStage):
         # (mirrors _current_run_id overwrite pattern).
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
+        self._markers_carried_forward = 0
         self._recon_report_systemic_polled = 0
         # Reset BEFORE super().run() (task-2047 Gap 2) so a run whose
         # assemble_payload call is skipped or short-circuited can never forward
@@ -3747,6 +3493,7 @@ class TaskKnowledgeSync(BaseStage):
         # swept), but the count is observable here for operator diagnostics.
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['rescued_in_window_markers'] = self._rescued_in_window_markers
+        report.stats['stage2_markers_carried_forward'] = self._markers_carried_forward
         # --- recon_report systemic_pattern channel poll stat (task-1966) ---
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['stage2_recon_report_systemic_polled'] = self._recon_report_systemic_polled
@@ -3779,7 +3526,7 @@ class TaskKnowledgeSync(BaseStage):
                 report.stats['stage2_stage1_dups_suppressed'] = len(suppressed)
 
         # --- post-flight guards (task 1137) ---
-        await self._apply_post_flight_guards(report, prior_reports, run_id)
+        await self._apply_post_flight_guards(report, run_id)
 
         # --- deterministic per-cycle summary write (task 2229 W5-λ) ---
         # Python writes the authoritative cycle_summary ledger row directly
@@ -4069,88 +3816,25 @@ class TaskKnowledgeSync(BaseStage):
                 result['failed'],
             )
 
-    async def _apply_post_flight_guards(
-        self,
-        report: StageReport,
-        prior_reports: list[StageReport],
-        run_id: str,
-    ) -> None:
-        """Acknowledge resolved Stage 1 flag markers and normalize Stage 2 counters.
+    async def _apply_post_flight_guards(self, report: StageReport, run_id: str) -> None:
+        """Acknowledge resolved Stage 1 flag markers and ground Stage 2's counters.
 
-        ``report.stats['stage1_analytical_findings_processed']`` and
-        ``report.stats['stage1_mem0_flags_processed']`` are Stage 2's
-        self-reported flag-processing counters. The clamps that used to
-        check them against ground truth here were removed by task 2230
-        (W5-mu) and not replaced: neither counter is in
-        ``_COMPUTED_STAT_KEYS`` (stage_stats.py), so ``derive_stage_stats``
-        cannot recompute either from the write journal and
-        ``stats_verifier`` leaves both untouched. They remain purely
-        self-reported with no computed ground truth; this method only
-        normalizes their presence via ``setdefault(..., 0)`` below so
-        Stage 3's audit always sees a deterministic pair.
+        The flag-processing counters ``stage1_analytical_findings_processed``
+        and ``stage1_mem0_flags_processed`` stay purely self-reported (their
+        clamps were removed by task 2230 / W5-mu); they are only normalized to
+        a present value so Stage 3's audit sees a deterministic pair.
 
-        Terminal-state, stall-guard-freshness, post-action-mismatch, and
-        live-workflow writes are also no longer reclassified here: that write
-        class is now rejected pre-write, server-side, by ``ReconWritePolicy``
-        (task 2224), so post-hoc detection is redundant.
-
-        ``report.stats['tasks_created']`` (task 3046) is also normalized here,
-        plus repaired — UPWARD ONLY — from ``report.stats['task_created_records']``,
-        the action-shaped record list the '## Task-Creation Accounting' prompt
-        section mandates Stage 2 append to at the moment each ``resolve_ticket``
-        call confirms a creation. ``submit_task``/``resolve_ticket`` are not
-        journaled, so unlike the flag counters above, ``tasks_created`` has no
-        write-journal-derived ground truth to fall back on; a self-reported
-        undercount (e.g. a task filed mid-cycle via the Proactive Task Sample or
-        Cross-Project Routing, as in run 507bc25b) would otherwise stand
-        uncorrected. The self-reported value is coerced to ``int`` via
-        :func:`_coerce_tasks_created_count` (a numeric-``str``/``float`` self-report
-        normalizes in place; a ``bool`` or anything else uncoercible normalizes to
-        ``0``) *before* comparison, so a legitimately larger non-``int`` self-report
-        (e.g. ``"3"``) can never look like an undercount and get overwritten
-        downward — the coerced value is always what ends up in
-        ``report.stats['tasks_created']``, so normalization is real even when no
-        repair fires.
-
-        That record list is NOT trusted as unverified ground truth (task 3051).
-        It is itself pure LLM self-report — nothing journals it — so a mistaken
-        or hallucinated entry would otherwise inflate ``tasks_created`` with no
-        external check, violating the standard that a stat may only increment
-        after the underlying MCP operation is confirmed to have succeeded. Each
-        deduped ``(project_id, task_id)`` key from :func:`_action_record_keys`
-        (project-scoped via its ``default_project_id``, so a record with an
-        omitted ``project_id`` collapses onto this stage's own
-        ``self.project_id`` rather than masquerading as a second cross-project
-        filing) is therefore resolved to its OWN project's root via
-        ``self.known_projects`` and confirmed with ``taskmaster.get_task`` by
-        :func:`_corroborate_record_keys` before it may raise the counter.
-
-        The fail direction is CLOSED on the increment and SAFE for the stage: a
-        key whose lookup raises, returns not-found, returns an inconclusive
-        error, or cannot be issued at all does not count, but because the
-        repair is upward-only that can only ever WITHHOLD a repair — it never
-        moves a counter down (task 2230 / W5-mu deliberately removed symmetric
-        clamping of Stage 2's self-reported counters from this method), never
-        raises, and never aborts the stage.
-
-        Four record stats are always published so the outcome is auditable
-        rather than silent: ``task_created_records_valid`` (the deduped
-        STRUCTURALLY-valid record count, unchanged in meaning — pre-
-        corroboration), plus ``task_created_records_corroborated`` /
-        ``_uncorroborated`` / ``_unresolvable``, which partition it and let an
-        operator distinguish "the agent invented records" from "we could not
-        check". When the CORROBORATED count exceeds the coerced self-reported
-        ``tasks_created``, the pre-repair raw value is stashed under
-        ``report.stats['tasks_created_reported']``, ``tasks_created`` is
-        overwritten, and a WARNING is logged.
+        The task counters are grounded in code-side evidence by
+        :mod:`fused_memory.reconciliation.stage2_counter_grounding`, which owns
+        the rules. ``tasks_created`` has ground truth in the creation journal
+        TaskInterceptor writes for every submission that carried this run's
+        ``_causation_id``; the agent's record list remains a second channel,
+        each claim confirmed with ``get_task`` in its own project. Repairs move
+        a counter UPWARD only.
 
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
                 Mutated in place.
-            prior_reports: Stage reports for all earlier stages in this cycle.
-                Unused now that the analytical flag-counter clamp has been
-                removed; kept for signature compatibility with the sole call
-                site.
             run_id: Current reconciliation run identifier.
         """
         # ── Stage-1 flag-marker acknowledgment (task-2029 scenario b) ──────────
@@ -4169,83 +3853,20 @@ class TaskKnowledgeSync(BaseStage):
             getattr(self, '_stage2_combined_flags', []) or [],
         )
 
-        # Normalize: ensure both Stage 2 counters are always present in stats so
-        # Stage 3's audit sees a deterministic, present pair via recon_report's
-        # free-form stats passthrough.  setdefault preserves any agent-reported
-        # value.
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
 
-        # ── tasks_created accounting repair (task 3046) ─────────────────────
-        # tasks_created is a purely SELF-REPORTED counter: submit_task/resolve_ticket
-        # are not journaled (TaskInterceptor._journal_around covers only
-        # set_task_status/update_task/remove_tasks/add_dependency/remove_dependency),
-        # so derive_stage_stats cannot recompute it and stats_verifier leaves it
-        # untouched (not in _COMPUTED_STAT_KEYS).  task_created_records is the
-        # action-shaped record list the prompt now mandates — mirroring
-        # flag_deleted_records — itself an LLM claim, so each key is
-        # corroborated below (task 3051) before it may raise the counter; an increment missed on a mid-cycle
-        # proactive/cross-project filing is recovered here instead of lost
-        # (run 507bc25b reported tasks_created=0 while filing task 3045).
-        report.stats.setdefault('tasks_created', 0)
-        record_keys = _action_record_keys(
-            report.stats.get('task_created_records'),
-            default_project_id=self.project_id,
+        journal = await read_run_creation_outcomes(
+            self.journal.write_journal, run_id, default_project_id=self.project_id,
         )
-        observed = len(record_keys)
-        report.stats['task_created_records_valid'] = observed
-        reported = report.stats.get('tasks_created')
-        # Coerce before comparing (task-3046 amendment): a non-int self-report
-        # (e.g. "3" or 3.0) must not collapse to 0 and look like an undercount
-        # relative to the corroborated count — that would silently move a
-        # legitimately larger self-report DOWN, which the upward-only contract
-        # forbids.  The coerced value is written back unconditionally so the
-        # "normalize" half of this block is real even when no repair fires.
-        reported_int = _coerce_tasks_created_count(reported)
-        report.stats['tasks_created'] = reported_int
-
-        # Corroborate before repairing (task 3051).  The record list is LLM
-        # self-report, so it may only RAISE the counter for records whose task
-        # get_task confirms actually exists, each checked against its own
-        # project's root.  Fail-closed on the increment, never on the stage.
-        corroboration = await _corroborate_record_keys(
-            self.taskmaster, self.known_projects, record_keys,
-        )
-        report.stats['task_created_records_corroborated'] = corroboration.corroborated
-        report.stats['task_created_records_uncorroborated'] = corroboration.uncorroborated
-        report.stats['task_created_records_unresolvable'] = corroboration.unresolvable
-
-        if corroboration.corroborated > reported_int:
-            report.stats['tasks_created_reported'] = reported
-            report.stats['tasks_created'] = corroboration.corroborated
-            logger.warning(
-                'reconciliation.stage2_tasks_created_undercount: run_id=%s project_id=%s '
-                'self-reported tasks_created=%r but %d task_created_records were confirmed '
-                'to exist via get_task — repairing upward to %d.',
-                run_id, self.project_id, reported,
-                corroboration.corroborated, corroboration.corroborated,
-            )
-
-        # Loud degradation (task 3051): a record that could not be confirmed
-        # never raises the counter, so the repair task 3046 would have made is
-        # WITHHELD.  Withholding it silently would trade one invisible failure
-        # (an inflated counter) for another (a lost repair), so report it —
-        # under an event name distinct from the undercount repair above, and
-        # with the split spelled out, so an operator can tell "the agent
-        # invented records" (uncorroborated) from "we could not check"
-        # (unresolvable: no project root to ask against, or no taskmaster).
-        shortfall = corroboration.uncorroborated + corroboration.unresolvable
-        if shortfall:
-            logger.warning(
-                'reconciliation.stage2_task_created_records_uncorroborated: run_id=%s '
-                'project_id=%s %d of %d structurally-valid task_created_records could not '
-                'be confirmed to exist via get_task '
-                '(uncorroborated=%d unresolvable=%d) — those records did NOT raise '
-                'tasks_created, which stands at %r.',
-                run_id, self.project_id, shortfall, observed,
-                corroboration.uncorroborated, corroboration.unresolvable,
-                report.stats['tasks_created'],
-            )
+        report.stats.update(await ground_stage2_counters(
+            report.stats,
+            taskmaster=self.taskmaster,
+            known_projects=self.known_projects,
+            project_id=self.project_id,
+            run_id=run_id,
+            journal=journal,
+        ))
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
@@ -4310,6 +3931,29 @@ class TaskKnowledgeSync(BaseStage):
             },
         )
 
+    async def _resolve_task_tree(self) -> tuple[FilteredTaskTree, datetime]:
+        """The task tree this payload renders, paired with the instant it was read.
+
+        Uses the harness-injected tree when there is one (task 455); otherwise
+        self-fetches from taskmaster and stamps the instant after the fetch.
+        """
+        if self.filtered_task_tree is not None:
+            read_at = resolve_tree_read_instant(
+                self.filtered_task_tree_fetched_at,
+                event='reconciliation.task_tree_read_instant_missing',
+                extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+            )
+            return self.filtered_task_tree, read_at
+
+        # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
+        tasks_data: object = {}
+        if self.taskmaster:
+            try:
+                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+            except Exception:
+                tasks_data = {}
+        return filter_task_tree(tasks_data), datetime.now(UTC)
+
     async def assemble_payload(
         self,
         events: list[ReconciliationEvent],
@@ -4336,20 +3980,7 @@ class TaskKnowledgeSync(BaseStage):
 
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Dual-path: use harness-injected tree or self-fetch (task 455)
-        if self.filtered_task_tree is not None:
-            # Harness path: tree already fetched and filtered before run()
-            filtered = self.filtered_task_tree
-        else:
-            # Fallback path: self-fetch via taskmaster
-            # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
-            tasks_data: object = {}
-            if self.taskmaster:
-                try:
-                    tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-                except Exception:
-                    tasks_data = {}
-            filtered = filter_task_tree(tasks_data)
+        filtered, tree_read_at = await self._resolve_task_tree()
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4450,7 +4081,8 @@ class TaskKnowledgeSync(BaseStage):
         visible_active, active_tree_text = render_active_section(filtered)
 
         # Compute the hint-attention section: active tasks whose memory_hints
-        # need conversion from legacy list format (or are missing entirely).
+        # need conversion from legacy list format (or are missing entirely), less
+        # any task live-claimed when the tree was read (task 5093).
         # Gated on `if not self.remediation_mode:` — mirrors proactive_sample_section
         # (above) because hint conversion is a general-sync activity, not a Stage 1
         # remediation task. Rendered conditionally within that gate — omitted on the
@@ -4459,9 +4091,9 @@ class TaskKnowledgeSync(BaseStage):
         # always used for the prompt template slot regardless of remediation_mode.
         hint_conversion_section = ''
         if not self.remediation_mode:
-            tasks_needing_hint_attention = [
-                t for t in visible_active if _needs_hint_attention(t)
-            ]
+            tasks_needing_hint_attention = select_tasks_needing_hint_attention(
+                visible_active, claims_read_at=tree_read_at
+            )
             if tasks_needing_hint_attention:
                 hint_conversion_section = (
                     '\n### Tasks Needing Memory Hint Attention\n'
@@ -4470,8 +4102,8 @@ class TaskKnowledgeSync(BaseStage):
                 )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
-        # _query_stage2_flags is best-effort: search failures yield ([], [], [], []) internally.
-        # Returns a Stage2FlagPartition with four fields:
+        # _query_stage2_flags is best-effort: search failures yield ([], [], [], [], []) internally.
+        # Returns a Stage2FlagPartition with five fields:
         #   .current          — markers whose run_id matches the current run, OR whose
         #                       Mem0 created_at is within the run window (task-1369 guard)
         #   .stale_missing_run_id_ids  — prior-cycle markers with absent/empty run_id
@@ -4479,6 +4111,8 @@ class TaskKnowledgeSync(BaseStage):
         #   .rescued_ids      — ids of markers rescued by the run-window guard (subset of
         #                       .current); single source of truth for the rescued count
         #                       (task-1381, replaces the re-derivation over active_flags)
+        #   .carried_forward_ids — prior-run markers kept in .current because their run's
+        #                       Stage 2 agent did not complete (task 5984)
         # Both stale buckets contain only genuine prior-cycle residue (in-window same-
         # cycle markers are rescued to .current by the run-window guard) and are simply
         # excluded from `current` below, so they are never rendered to the LLM. They are
@@ -4519,9 +4153,15 @@ class TaskKnowledgeSync(BaseStage):
         # returned a non-datetime started_at, which disables the run-window guard
         # and falls those helpers back to their window-agnostic behaviour.
         self._run_window_start = run_window_start
+        carry_forward_run_ids = await trailing_incomplete_agent_run_ids(
+            getattr(self.memory, 'recon_ledger', None),
+            self.project_id,
+            self.stage_id.value,
+        )
         partition = await _query_stage2_flags(
             self.memory, self.project_id, run_id_for_markers,
             run_window_start=run_window_start,
+            carry_forward_run_ids=carry_forward_run_ids,
         )
         active_flags = partition.current
         self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
@@ -4531,6 +4171,17 @@ class TaskKnowledgeSync(BaseStage):
         # the partition predicate here, so any future change to the guard logic
         # automatically flows through to this counter without drift.
         self._rescued_in_window_markers = len(partition.rescued_ids)
+        self._markers_carried_forward = len(partition.carried_forward_ids)
+        if self._markers_carried_forward:
+            logger.info(
+                'reconciliation.stage2_markers_carried_forward',
+                extra={
+                    'project_id': self.project_id,
+                    'run_id': run_id_for_markers,
+                    'count': self._markers_carried_forward,
+                    'owed_run_ids': sorted(carry_forward_run_ids),
+                },
+            )
 
         surviving = active_flags  # active-query path is pass-through (no scope filter)
 
@@ -4544,7 +4195,7 @@ class TaskKnowledgeSync(BaseStage):
         # single GC pass (:func:`_gc_recon_markers`, called from run()) on its
         # TTL/terminal-task schedule rather than an immediate same-cycle
         # delete.  FIX D therefore only fires on Stage 1 re-flags surviving
-        # within the current run_id.
+        # within the current run_id, and on carried-forward markers (task 5984).
         surviving_ids = [f['id'] for f in surviving]
 
         persistence_counts = await _track_flag_persistence(
@@ -4954,7 +4605,11 @@ class IntegrityCheck(BaseStage):
            missing or stale, for projects whose ceiling is retired-by-design
            (e.g. autopilot_video; task 2818/2826).  Records
            report.stats['contamination_ceiling_findings_dropped'] = before - after.
-        4. Calls record_task_dump_spot_check() to record a non-destructive
+        4. Applies filter_snapshot_stat_edge_findings() to drop findings that
+           read a Mem0-only task-count snapshot stat as evidence of a missing
+           Graphiti temporal_facts edge, for every project (task 3487).  Records
+           report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
+        5. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -5011,6 +4666,15 @@ class IntegrityCheck(BaseStage):
             )
         else:
             report.stats['contamination_ceiling_findings_dropped'] = 0
+
+        # Layer 3 (finding-side) gate for snapshot-stat/missing-edge false
+        # positives (task 3487): project-agnostic, since no project ever
+        # persists a task-count snapshot as a Graphiti edge.
+        _before = len(report.items_flagged)
+        report.items_flagged = filter_snapshot_stat_edge_findings(report.items_flagged)
+        report.stats['snapshot_stat_edge_findings_dropped'] = (
+            _before - len(report.items_flagged)
+        )
 
         self.record_task_dump_spot_check(report)
         return report
@@ -5524,6 +5188,24 @@ def _needs_hint_attention(task: dict) -> bool:
     if isinstance(task_hints, list):
         return True
     return not task_hints
+
+
+def select_tasks_needing_hint_attention(
+    tasks: Iterable[dict], *, claims_read_at: datetime
+) -> list[dict]:
+    """The tasks rendered as ``### Tasks Needing Memory Hint Attention``.
+
+    A task claimed by a live orchestrator run is left out, because a Stage 2
+    hint write would race that run's own metadata writers (task 5093). Claim
+    freshness is judged at *claims_read_at*, the instant the task snapshot was
+    read, not at wall clock.
+    """
+    return [
+        t
+        for t in tasks
+        if _needs_hint_attention(t)
+        and not has_live_claimant(t, claims_read_at, DEFAULT_CLAIMANT_HEARTBEAT_TTL)
+    ]
 
 
 async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dict] | None:

@@ -176,3 +176,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: the task IS the E2E check suite; its signal is the boundary matrix green
+signal_leaves:
+- η

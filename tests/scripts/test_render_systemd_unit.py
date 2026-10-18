@@ -261,8 +261,8 @@ def test_render_template_substitutes_literally_not_as_a_regex():
 # preserved_values / apply_preserved  (step-5 / step-6)
 # ---------------------------------------------------------------------------
 # The preservation MECHANISM, exercised with an EXPLICIT `names` argument — no
-# module constant is consulted here. Which names are host-local is POLICY, and
-# it is pinned separately (see HOST_LOCAL_ENVIRONMENT below), so that a policy
+# module constant is consulted here. Which names are host-local is POLICY
+# (systemd_unit_parity.ENV_POLICY), pinned separately below, so that a policy
 # change and a mechanism regression cannot be mistaken for one another.
 
 _KNOWN_ROOTS = "DASHBOARD_KNOWN_PROJECT_ROOTS"
@@ -328,10 +328,7 @@ def _installed_with_nine_roots(repo_root="/home/leo/src/dark-factory"):
     Built by rendering rather than hand-written, so the fixture cannot drift
     into a shape the real installer would never produce.
     """
-    text = _rendered(repo_root)
-    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
-    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
-    return text.replace(single, f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}")
+    return _with_env_value(_rendered(repo_root), _KNOWN_ROOTS, NINE_ROOTS)
 
 
 def test_preserved_values_reads_the_host_local_value_off_the_installed_unit():
@@ -622,6 +619,32 @@ def test_every_unit_spec_exposes_a_tag_and_a_preserve_set():
         )
 
 
+def test_each_policy_family_has_exactly_one_rendered_unit():
+    """Every UnitFamily ENV_POLICY declares rows for is rendered by exactly one spec."""
+    import systemd_unit_parity
+
+    families = [spec.family for spec in _units().values()]
+
+    assert len(families) == len(set(families)), families
+    assert set(families) == set(systemd_unit_parity.UnitFamily)
+    assert _units()[_DASHBOARD].family is systemd_unit_parity.UnitFamily.DASHBOARD
+    assert _units()[_FUSED_MEMORY].family is systemd_unit_parity.UnitFamily.FUSED_MEMORY
+
+
+def test_every_specs_preserve_set_is_its_familys_policy_projection():
+    """The preserve set is derived from ENV_POLICY, never restated beside it."""
+    import systemd_unit_parity
+
+    for key, spec in _units().items():
+        expected = systemd_unit_parity.ENV_POLICY.host_local_names(spec.family)
+
+        assert isinstance(spec.host_local_environment, tuple), key
+        assert spec.host_local_environment == expected, (
+            f"UNITS[{key!r}] preserves {spec.host_local_environment}, but ENV_POLICY's "
+            f"host-local rows for {spec.family} are {expected}."
+        )
+
+
 def test_unit_log_tags_are_distinct_and_non_empty():
     """(c) The tag is the OPERATOR's only handle on this tool's report.
 
@@ -649,22 +672,16 @@ def test_unit_log_tags_are_distinct_and_non_empty():
 
 
 def test_dashboard_spec_is_the_modules_existing_public_surface():
-    """(d) BACK-COMPAT: the registry did not move the dashboard's constants.
+    """(d) BACK-COMPAT: the registry did not move the dashboard's log tag.
 
-    LOG_TAG and HOST_LOCAL_ENVIRONMENT are module-level names that task 4793's
-    suite asserts on directly and that the dashboard call site in setup-host.sh
-    section 8 depends on behaviourally (it passes no --unit at all). Pinning the
-    identity here is what lets the registry be an ADDITION rather than a rename:
-    if these ever diverge, the dashboard unit would be rendered with one preserve
-    set and reported under another tag.
+    LOG_TAG is a module-level name that task 4793's suite asserts on directly and
+    that the dashboard call site in setup-host.sh section 8 depends on
+    behaviourally (it passes no --unit at all). If the two ever diverge, the
+    dashboard unit would be reported under another tag.
     """
     module = _module()
     spec = _units()[_DASHBOARD]
 
-    assert spec.host_local_environment == module.HOST_LOCAL_ENVIRONMENT, (
-        f"UNITS['dashboard'].host_local_environment {spec.host_local_environment} "
-        f"!= HOST_LOCAL_ENVIRONMENT {module.HOST_LOCAL_ENVIRONMENT}"
-    )
     assert spec.log_tag == module.LOG_TAG, (
         f"UNITS['dashboard'].log_tag {spec.log_tag!r} != LOG_TAG {module.LOG_TAG!r}"
     )
@@ -681,46 +698,20 @@ def test_fused_memory_spec_preserves_the_known_project_roots():
 
 
 # ---------------------------------------------------------------------------
-# HOST_LOCAL_ENVIRONMENT — the POLICY  (step-7 / step-8)
+# The dashboard's preserve set — ENV_POLICY's host-local rows  (step-7 / step-8)
 # ---------------------------------------------------------------------------
 
 
 def _host_local():
-    import render_systemd_unit
-
-    return render_systemd_unit.HOST_LOCAL_ENVIRONMENT
+    return _units()[_DASHBOARD].host_local_environment
 
 
 def test_host_local_environment_is_not_empty():
     """An empty preserve set would make this whole module a rename of the clobber."""
     assert _host_local(), (
-        "HOST_LOCAL_ENVIRONMENT is empty, so the renderer preserves nothing and "
+        "The dashboard's preserve set is empty, so the renderer preserves nothing and "
         "the install is byte-for-byte the `sed >` clobber it replaced — while "
         "reporting success."
-    )
-
-
-def test_host_local_environment_is_a_subset_of_the_divergence_allowlist():
-    """(a) Preserving a name the checker VALUE-COMPARES would turn the gate red forever.
-
-    check_dashboard_unit_parity compares Environment= values across the
-    committed and installed copies unless the name is on DIVERGENCE_ALLOWLIST.
-    Preserve a name that is NOT on that list and every correctly-configured host
-    reports drift on every run — the always-red-gate outcome that checker's own
-    docstring warns about twice, and which a gate then gets switched off for,
-    taking the accidental drift it exists to catch with it.
-
-    Held by a guard rather than by an import, deliberately: the renderer must
-    not import the checker (see the module docstring and the section comment on
-    the environment_map lift above).
-    """
-    allowlist = set(_load_checker().DIVERGENCE_ALLOWLIST)
-
-    assert set(_host_local()) <= allowlist, (
-        f"HOST_LOCAL_ENVIRONMENT {sorted(_host_local())} is not a subset of "
-        f"DIVERGENCE_ALLOWLIST {sorted(allowlist)}. A preserved name the parity "
-        "checker value-compares makes the gate red on every correctly-"
-        "configured host."
     )
 
 
@@ -811,6 +802,30 @@ def test_every_preserved_name_is_declared_exactly_once_in_its_units_template():
                 "systemd's last-wins. apply_preserved raises either way — on the "
                 "host, mid-bring-up, rather than here."
             )
+
+
+def test_every_policy_row_is_declared_in_its_familys_template():
+    """STALENESS GUARD over the whole table: no policy for a variable nobody sets.
+
+    A row naming a variable its family's template does not declare is a standing,
+    invisible waiver or requirement that nothing reports.
+    """
+    import systemd_unit_parity
+
+    specs = {spec.family: spec for spec in _units().values()}
+    for row in systemd_unit_parity.ENV_POLICY.rows:
+        template = specs[row.unit_family].template
+        declared = systemd_unit_parity.environment_map(
+            systemd_unit_parity.parse_unit_directives(
+                (REPO_ROOT / template).read_text(encoding="utf-8")
+            ),
+            systemd_unit_parity.SERVICE_SECTION,
+        )
+
+        assert row.name in declared, (
+            f"ENV_POLICY has a row for {row.unit_family.value} {row.name}, but "
+            f"{template} declares only {sorted(declared)}."
+        )
 
 
 SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
@@ -970,6 +985,12 @@ def _env_line(text, name):
     return matches[0]
 
 
+def _with_env_value(text, name, value):
+    """*text* with its one ``Environment=<name>=`` line set to *value*."""
+    line = f"Environment={name}={_env_line(text, name)}"
+    return text.replace(line, f"Environment={name}={value}")
+
+
 def _directive(text, key):
     prefix = f"{key}="
     matches = [
@@ -1102,16 +1123,16 @@ def test_render_unit_greenfield_installs_the_single_root_default():
 
 
 def test_render_unit_defaults_its_preserve_set_to_the_policy_constant():
-    """The default preserve set is HOST_LOCAL_ENVIRONMENT, not an empty tuple.
+    """A call naming no spec preserves the dashboard spec's host-local values.
 
-    A default of () would make every call site that omits `names` silently
-    preserve nothing — the clobber back, opt-in.
+    A default preserving nothing would make every call site that omits `spec`
+    silently drop them — the clobber back, opt-in.
     """
     explicit, _p, _s = _render_unit(
         repo_root=_NEW_ROOT,
         uv_path=_NEW_UV,
         installed_text=_installed_with_nine_roots(_OLD_ROOT),
-        names=_host_local(),
+        spec=_units()[_DASHBOARD],
     )
     defaulted, _p2, _s2 = _reinstall_over_a_configured_host()
 
@@ -1342,6 +1363,9 @@ def test_main_no_preserve_ignores_the_installed_values(tmp_path, capsys):
     assert NINE_ROOTS not in text
     report = capsys.readouterr().out
     assert "--no-preserve" in report, report
+    assert f"[{_skip_codes()[0]}]" not in report, (
+        "--no-preserve reported a name absent from a unit it never read"
+    )
 
 
 def test_main_preserves_the_output_files_mode(tmp_path, capsys):
@@ -1417,6 +1441,66 @@ def test_main_removes_its_temp_file_when_the_write_fails(tmp_path, capsys, monke
     assert captured.err.count(_TAG) == len(captured.err.strip().splitlines())
 
 
+def _without_env(text, name):
+    prefix = f"Environment={name}="
+    return "".join(
+        line for line in text.splitlines(keepends=True) if not line.strip().startswith(prefix)
+    )
+
+
+def test_a_host_local_row_is_preserved_by_the_renderer_and_allowlisted_by_the_gate(
+    tmp_path, capsys
+):
+    """One ENV_POLICY row drives both CLIs: the render keeps the value, the gate passes it.
+
+    A dropped line still exits FINDING, so the PARITY is the allowlist at work
+    rather than a checker that never read the variable.
+    """
+    import systemd_unit_parity
+
+    names = systemd_unit_parity.ENV_POLICY.host_local_names(
+        systemd_unit_parity.UnitFamily.DASHBOARD
+    )
+    assert names
+    checker = _load_checker()
+    for name in names:
+        installed = tmp_path / name / "installed" / "dark-factory-dashboard.service"
+        installed.parent.mkdir(parents=True)
+        installed.write_text(
+            _with_env_value(_rendered(HARDCODED_SERVICE_REPO_ROOT), name, NINE_ROOTS),
+            encoding="utf-8",
+        )
+        gate = [
+            "--installed-dir", str(installed.parent),
+            "--repo-root", str(REPO_ROOT),
+            "--unit", "dark-factory-dashboard.service",
+        ]
+
+        rendered = _main([
+            "--unit", "dashboard",
+            "--template", str(TEMPLATE_PATH),
+            "--repo-root", HARDCODED_SERVICE_REPO_ROOT,
+            "--uv-path", HARDCODED_SERVICE_UV_PATH,
+            "--output", str(installed),
+        ])
+        written = installed.read_text(encoding="utf-8")
+        capsys.readouterr()
+        verdict = checker.main(gate)
+        parity_out = capsys.readouterr().out
+
+        assert rendered == 0
+        assert _env(written)[name] == NINE_ROOTS
+        assert verdict == systemd_unit_parity.ParityExit.PARITY, parity_out
+        assert "[ok] parity" in parity_out
+
+        installed.write_text(_without_env(written, name), encoding="utf-8")
+        dropped = checker.main(gate)
+        dropped_out = capsys.readouterr().out
+
+        assert dropped == systemd_unit_parity.ParityExit.FINDING, dropped_out
+        assert f"Environment={name}" in dropped_out
+
+
 # ---------------------------------------------------------------------------
 # --unit fused-memory — the second unit, end to end  (step-5 / step-6)
 # ---------------------------------------------------------------------------
@@ -1459,10 +1543,7 @@ def _fm_installed_with_nine_roots(repo_root=_OLD_ROOT):
     shape is under test, and a hand-made fixture can drift into a shape the real
     installer would never produce.
     """
-    text = _fm_rendered(repo_root)
-    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
-    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
-    return text.replace(single, f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}")
+    return _with_env_value(_fm_rendered(repo_root), _KNOWN_ROOTS, NINE_ROOTS)
 
 
 def _fm_cli(tmp_path, *, output_text=None, repo_root=_NEW_ROOT, unit="fused-memory"):

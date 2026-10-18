@@ -1,0 +1,3 @@
+```json
+{"cancelled":["990","977","910"],"skipped":[],"edges_added":["628->1180","1119->1184"],"notes_appended":["628","634","1082"],"released":[{"task":"1119","commit_planning_result":"deferred -> pending; manifest_stamping: path docs/prds/review-all-ops-reads-through-public-seams.capability-manifest.yaml, stamped [\"β3\"], missing_labels [], errors []"}],"errors":[]}
+```

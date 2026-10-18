@@ -305,7 +305,7 @@ def _segment(cmd: str, keyword: str) -> str:
     quote-aware) rather than a naive ``str.split('&&')``.
 
     Chaining is an ESTABLISHED pattern here, not a hypothetical:
-    ``verify_plan._scope_prefix_to_keyword``'s own docstring records that
+    ``verify_plan.scope_prefix_to_keyword``'s own docstring records that
     "every subproject's lint_command chains a ``python3 .../check_*.py <dir>``
     gate after ``ruff check``". Extracting the checker's own segment first is
     what lets the target assertions below stay true if this module later adopts
@@ -787,7 +787,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     # bridge: `pytest|ruff check|pyright scripts/tests/test_census_trigger.py`).
     #
     # What this does NOT buy is copy-paste detection, and it does not claim to:
-    # under a FILE_SCOPED render _scope_prefix_to_keyword REPLACES the declared
+    # under a FILE_SCOPED render scope_prefix_to_keyword REPLACES the declared
     # targets with the touched-file list, so a config carrying the copy-pasted
     # tests/scripts/ targets renders byte-identically — the reason assertion (4)
     # of test_scripts_diff_is_lint_gated records at length, and why that claim
@@ -965,7 +965,7 @@ def test_scripts_diff_is_lint_gated(
     #
     # This assertion deliberately does NOT claim to catch the tests/scripts/
     # copy-paste, and an earlier draft that did was WRONG. Measured against the
-    # production bridge: _scope_prefix_to_keyword REPLACES the declared targets
+    # production bridge: scope_prefix_to_keyword REPLACES the declared targets
     # with the touched-file list, so a config carrying the copy-pasted
     # `ruff check tests/scripts/` renders to
     # 'uv run --project shared ruff check scripts/tests/test_census_trigger.py'
@@ -977,7 +977,7 @@ def test_scripts_diff_is_lint_gated(
     assert SAMPLE_TOUCHED_FILE in executed.lint_command, (
         f'executed lint_command {executed.lint_command!r} does not target the '
         f'touched file {SAMPLE_TOUCHED_FILE!r} (task 3445) — '
-        'verify_plan._scope_prefix_to_keyword rewrites the declared directory '
+        'verify_plan.scope_prefix_to_keyword rewrites the declared directory '
         'target to the touched file list, so a command that does not mention it '
         'is linting some other tree than the one that changed'
     )
@@ -996,7 +996,7 @@ def test_scripts_diff_is_lint_gated(
 
     # Membership, not list equality: equality would also reject a LEGITIMATE
     # strengthening — `ruff check scripts/ && python3 scripts/check_x.py
-    # scripts`, the chained-sibling-gate shape _scope_prefix_to_keyword's
+    # scripts`, the chained-sibling-gate shape scope_prefix_to_keyword's
     # docstring says every subproject's lint_command already uses — and would
     # do so with a message accusing the author of narrowing the gate. What must
     # hold is narrower and exact: the directory itself is a ruff target
@@ -1168,7 +1168,7 @@ def test_scripts_diff_is_type_gated(
 
     (c) is the anti-copy-paste half. It cannot live on the executed value for
     the same reason the lint test's assertion (4) records:
-    ``_scope_prefix_to_keyword`` REPLACES the declared targets with the touched
+    ``scope_prefix_to_keyword`` REPLACES the declared targets with the touched
     file list, so a config carrying the sibling's ``pyright tests/scripts/``
     renders byte-identically to the correct one for a scripts/ diff. Only the
     DECLARED value can carry it, and only as exact-element membership —

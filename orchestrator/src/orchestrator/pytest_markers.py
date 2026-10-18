@@ -30,9 +30,9 @@ per-item nor the class-level tier can exhaustively enumerate (see
 :func:`per_item_marker_names` and :func:`guaranteed_marker_names`), or a
 module with zero collected items resolves to "no widening" — i.e. precisely
 today's behaviour.  Widening is only ever chosen on positive proof.  Nothing
-here raises: ``verify._safe_derive_verify_plan_dict`` swallows exceptions and
-returns None, so a raise on a mid-edit ``pyproject.toml`` would silently
-destroy the ENTIRE plan record.
+here raises: ``verify.py::_safe_derive_executed_fallback_plan`` swallows
+exceptions and returns None, so a raise on a mid-edit ``pyproject.toml``
+would silently destroy the ENTIRE plan record.
 """
 from __future__ import annotations
 
@@ -180,7 +180,7 @@ def _cli_marker_expr(test_command: str | None) -> str | None:
       expression and silently suppress a legitimate widening.
 
     FIRST-occurrence-then-truncate-at-the-chain-delimiter is deliberately the
-    same semantics ``verify_plan._scope_prefix_to_keyword`` applies when it
+    same semantics ``verify_plan.scope_prefix_to_keyword`` applies when it
     scopes the very same string (``split_chain_tail`` + ``head.find(keyword)``),
     so the marker probe and the scoper can never describe DIFFERENT pytest
     invocations of one chained command.  ``split_chain_tail`` itself is not

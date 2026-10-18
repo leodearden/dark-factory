@@ -97,7 +97,7 @@ from shared.task_claimant import (
 from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import LeaveReason, render_shape
 from orchestrator.recovery_pins import (
     records_pin_blocked_done_flip,

@@ -27,7 +27,7 @@ it.
 
 CRITICAL: every ``merge_queue`` MODULE-LEVEL function is reached as
 ``_mq.<name>``, resolved on the live module at call time, never through a
-from-import.  Consumers patch ``'orchestrator.merge_queue.<name>'``, and a
+from-import.  Consumers patch ``'orchestrator.merge_lane.worker.<name>'``, and a
 from-import would bind a reference here that such a patch cannot reach.
 Classes constructed by value (``MergeRequest``, ``SpeculativeMergeWorker`` and
 the rest) are never patched, so they stay ordinary from-imports.
@@ -41,18 +41,18 @@ from typing import Literal, TypedDict
 
 import pytest
 
-from orchestrator import merge_queue as _mq
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import (
+from orchestrator.merge_lane import worker as _mq
+from orchestrator.merge_lane.types import (
     CapPermit,
     MergeResult,
     QueuedBranch,
     RealMergeItem,
     SpecPermit,
 )
+from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
 
 # ── repo fixtures ────────────────────────────────────────────────────────────
 
@@ -445,7 +445,7 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
         return await real(git_ops, lane, warm=warm)
 
     monkeypatch.setattr(
-        'orchestrator.merge_queue.release_chain_build_lane', _recording,
+        'orchestrator.merge_lane.worker.release_chain_build_lane', _recording,
     )
     return calls
 

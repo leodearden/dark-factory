@@ -58,6 +58,7 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
@@ -630,6 +631,21 @@ INCOMPLETE_KINDS = INCOMPLETE_STRUCTURAL_KINDS | {
 """Every incompleteness kind: the vocabulary ``incomplete_kind`` is drawn from."""
 
 
+# An edge is ACTIVE iff `invalid_at` IS NULL.  `expired_at` is deliberately NOT
+# part of it: graphiti_core never sets `expired_at` without also setting
+# `invalid_at` (graphiti_core/utils/maintenance/edge_operations.py::
+# resolve_extracted_edge and ::resolve_edge_contradictions), so it retires
+# nothing `invalid_at` misses — while the restore hooks clear `invalid_at` and
+# keep `expired_at` as the restored-edge signature (redirect_node_edges), so an
+# `expired_at` clause would hide exactly the edges they restore (task 4714,
+# esc-4714-9).
+#
+# Every read answering "what is currently true?" interpolates this constant.
+# Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
+# retired edges; `count_foreign_relationships` most emphatically so.
+_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL'
+
+
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and
 # are therefore directly comparable.
@@ -640,7 +656,7 @@ INCOMPLETE_KINDS = INCOMPLETE_STRUCTURAL_KINDS | {
 # reshuffle at a boundary drops rows permanently and silently.
 _ALL_VALID_EDGES_MATCH = (
     'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
+    f'WHERE {_ACTIVE_EDGE_PREDICATE} '
 )
 _VALID_EDGE_ROWS_PAGE_TAIL = (
     'RETURN n.uuid, e.uuid, e.fact, e.name '
@@ -711,6 +727,32 @@ _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
     'SKIP {skip} LIMIT {limit}'
 )
 _EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN count(*)'
+
+# Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
+# `$prefix`/`$upper` are bound, never interpolated. The half-open range
+# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH stays
+# as the exact predicate. No invalid_at filter: a superseded edge's uuid is
+# still an id a prefix can cite. The edge pattern is DIRECTED for the
+# one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
+_ENTITY_UUID_PREFIX_MATCH = (
+    'MATCH (n:Entity) '
+    'WHERE n.uuid >= $prefix AND n.uuid < $upper AND n.uuid STARTS WITH $prefix '
+)
+_ENTITY_UUID_PREFIX_PAGE_TEMPLATE = (
+    _ENTITY_UUID_PREFIX_MATCH
+    + 'RETURN n.uuid, n.name ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
+)
+_ENTITY_UUID_PREFIX_CENSUS = _ENTITY_UUID_PREFIX_MATCH + 'RETURN count(*)'
+
+_EDGE_UUID_PREFIX_MATCH = (
+    'MATCH ()-[e:RELATES_TO]->() '
+    'WHERE e.uuid >= $prefix AND e.uuid < $upper AND e.uuid STARTS WITH $prefix '
+)
+_EDGE_UUID_PREFIX_PAGE_TEMPLATE = (
+    _EDGE_UUID_PREFIX_MATCH
+    + 'RETURN e.uuid, e.fact ORDER BY e.uuid SKIP {skip} LIMIT {limit}'
+)
+_EDGE_UUID_PREFIX_CENSUS = _EDGE_UUID_PREFIX_MATCH + 'RETURN count(*)'
 
 
 @dataclass(frozen=True)
@@ -1405,17 +1447,101 @@ _UUID_MEANS_LOAD = (
 # mode 3 (``expired_at`` added to one SET list and not its twin), and that task
 # 5264 reproduced when it cloned the then-current MENTIONS-blind ranking into a
 # second method. A test importing these constants can enforce the invariant; two
-# docstrings promising each other cannot.
+# docstrings promising each other cannot. The ordering itself is defined once, by
+# _PROVENANCE_RANK_KEYS below: the Cypher ORDER BY and the Python _survivor_first
+# are both renderings of it. The default test run checks the Python sort against
+# openCypher's ORDER BY semantics; only `-m integration` runs
+# tests/test_write_time_identity.py::TestEnumerateRankedEntityNodesLiveFalkorDB,
+# which checks the two agree on a real server.
 _PROVENANCE_RANK_CLAUSE = (
-    'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+    f'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE {_ACTIVE_EDGE_PREDICATE} '
     'WITH n, count(DISTINCT e) AS edge_count '
     'OPTIONAL MATCH (:Episodic)-[m:MENTIONS]->(n) '
     'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
 )
 
+
+@dataclass(frozen=True)
+class _RankKey:
+    """One survivor-ordering key: the expression ORDER BY sorts on, and the
+    row-dict key the same value comes back under."""
+
+    cypher: str
+    column: str
+    descending: bool
+
+
 # The ordering the clause above exists to make possible. Kept adjacent to it so
 # the projection and the sort key cannot be updated apart.
-_PROVENANCE_RANK_ORDER = 'ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC'
+_PROVENANCE_RANK_KEYS = (
+    _RankKey('provenance_rank', 'provenance_rank', descending=True),
+    _RankKey('n.created_at', 'created_at', descending=False),
+    _RankKey('n.uuid', 'uuid', descending=False),
+)
+_PROVENANCE_RANK_ORDER = 'ORDER BY ' + ', '.join(
+    f'{key.cypher} {"DESC" if key.descending else "ASC"}' for key in _PROVENANCE_RANK_KEYS
+)
+
+
+class SurvivorRankTypeError(TypeError):
+    """A survivor-rank column whose non-NULL values mix types Python cannot
+    order against each other, although Cypher's ORDER BY would.
+
+    ``column`` and ``value_types`` (sorted type names) are required keyword
+    arguments, carried as fields for the reason ``AmbiguousEntityError``
+    carries its own.
+    """
+
+    def __init__(self, *, column: str, value_types: Iterable[str]) -> None:
+        self.column = column
+        self.value_types = tuple(sorted(value_types))
+        super().__init__(
+            f'cannot rank rows survivor-first by {column!r}: its non-NULL values '
+            f'mix the types {list(self.value_types)}'
+        )
+
+
+def _survivor_first(rows: list[dict]) -> list[dict]:
+    """Return *rows* in ``_PROVENANCE_RANK_ORDER``'s order, survivor first.
+
+    One stable pass per key, least significant first. NULL sorts as the
+    largest value, openCypher's rule and FalkorDB's (measured 2026-10-12): last
+    under ASC, first under DESC.
+
+    Raises:
+        SurvivorRankTypeError: a key column mixes non-NULL value types.
+    """
+    ordered = list(rows)
+    for key in reversed(_PROVENANCE_RANK_KEYS):
+        try:
+            ordered.sort(
+                key=lambda row, column=key.column: (row[column] is None, row[column]),
+                reverse=key.descending,
+            )
+        except TypeError as exc:
+            raise SurvivorRankTypeError(
+                column=key.column,
+                value_types={
+                    type(row[key.column]).__name__
+                    for row in ordered
+                    if row[key.column] is not None
+                },
+            ) from exc
+    return ordered
+
+
+# Same-group entity nodes with their provenance rank, for the task-family census
+# (task 5662). The page is cut over non-aggregated `n` in total uuid order, and
+# only then is the rank aggregated, per page.
+_RANKED_ENTITY_NODES_MATCH = 'MATCH (n:Entity) WHERE n.group_id = $group_id '
+_RANKED_ENTITY_NODES_PAGE_TEMPLATE = (
+    _RANKED_ENTITY_NODES_MATCH
+    + 'WITH n ORDER BY n.uuid SKIP {skip} LIMIT {limit} '
+    + _PROVENANCE_RANK_CLAUSE
+    + 'RETURN n.uuid, n.name, n.created_at, edge_count, mentions_count, '
+    'edge_count + mentions_count AS provenance_rank'
+)
+_RANKED_ENTITY_NODES_CENSUS = _RANKED_ENTITY_NODES_MATCH + 'RETURN count(*)'
 
 
 def _derive_registered_graph_ids(config: FusedMemoryConfig) -> frozenset[str]:
@@ -1705,7 +1831,8 @@ class GraphitiBackend:
         llm_client, embedder: when given, used instead of
         ``build_llm_client(cfg)`` and ``build_embedder(cfg)`` respectively, so a
         per-arm caller (e.g. the arm-runner harness) can wrap the client the
-        builder built before this backend shares it.
+        builder built before this backend shares it. The backend takes
+        ownership of an injected client: ``close()`` releases it.
         """
         cfg = self.config
 
@@ -2537,6 +2664,77 @@ class GraphitiBackend:
         return stale
 
     @_canonicalize_group_args
+    async def entity_uuids_with_prefix(
+        self, prefix: str, *, group_id: str
+    ) -> list[tuple[str, str]]:
+        """Return (uuid, name) for every Entity node whose uuid starts with *prefix*.
+
+        Read by ``services/id_resolver.py::IdResolver`` to classify a uuid
+        prefix; paginated, and a structurally incomplete read raises
+        ``IncompleteEnumerationError`` rather than returning a short list.
+        """
+        return await self._uuids_with_prefix(
+            prefix,
+            group_id=group_id,
+            page_template=_ENTITY_UUID_PREFIX_PAGE_TEMPLATE,
+            census_cypher=_ENTITY_UUID_PREFIX_CENSUS,
+            method='entity_uuids_with_prefix',
+            noun='entity nodes',
+        )
+
+    @_canonicalize_group_args
+    async def edge_uuids_with_prefix(
+        self, prefix: str, *, group_id: str
+    ) -> list[tuple[str, str]]:
+        """Return (uuid, fact) for every RELATES_TO edge whose uuid starts with *prefix*.
+
+        The edge counterpart of ``entity_uuids_with_prefix``, read by the same
+        ``services/id_resolver.py::IdResolver``.
+        """
+        return await self._uuids_with_prefix(
+            prefix,
+            group_id=group_id,
+            page_template=_EDGE_UUID_PREFIX_PAGE_TEMPLATE,
+            census_cypher=_EDGE_UUID_PREFIX_CENSUS,
+            method='edge_uuids_with_prefix',
+            noun='edges',
+        )
+
+    async def _uuids_with_prefix(
+        self,
+        prefix: str,
+        *,
+        group_id: str,
+        page_template: str,
+        census_cypher: str,
+        method: str,
+        noun: str,
+    ) -> list[tuple[str, str]]:
+        """Page (uuid, label) rows matching *prefix*; the one body of the two prefix reads."""
+        if not prefix:
+            raise ValueError(f'{method} needs a non-empty prefix')
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph, page_template, census_cypher, params={'prefix': prefix, 'upper': upper},
+        )
+        matches = [
+            (row[0], row[1] or '')
+            for row in _first_row_per_uuid(paged.rows, reader=method)
+        ]
+        apply_incompleteness_policy(
+            paged,
+            method=method,
+            group_id=group_id,
+            returned_count=len(matches),
+            noun=noun,
+            consequence=(
+                f'must not be read as the full set of ids starting with {prefix!r}'
+            ),
+        )
+        return matches
+
+    @_canonicalize_group_args
     async def query_edges_by_time_range(
         self, start: str, end: str, *, group_id: str
     ) -> list[dict]:
@@ -2593,8 +2791,8 @@ class GraphitiBackend:
     async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
-        Matches the node as either source or target (undirected) and filters
-        edges where invalid_at IS NULL (i.e. not yet invalidated).
+        Matches the node as either source or target (undirected) and excludes
+        retired edges per ``_ACTIVE_EDGE_PREDICATE`` (``invalid_at`` set).
 
         Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
         unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
@@ -2613,7 +2811,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -2653,7 +2851,7 @@ class GraphitiBackend:
         WHAT IT ANSWERS, contrasted with its neighbour above.
         :meth:`get_valid_edges_for_node` answers "does this node still carry
         LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
-        ``invalid_at IS NULL``.  This one answers a different question:
+        ``_ACTIVE_EDGE_PREDICATE``.  This one answers a different question:
         "would deleting this node DESTROY ANYTHING?"  It is therefore
         deliberately UNTYPED and UNFILTERED, because
         :meth:`delete_entity_node` issues a bare
@@ -2757,8 +2955,8 @@ class GraphitiBackend:
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
-        Queries all RELATES_TO edges where invalid_at IS NULL and excludes the
-        node itself (self-loops excluded via ``m.uuid <> $uuid``).
+        Queries all active RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``) and
+        excludes the node itself (self-loops excluded via ``m.uuid <> $uuid``).
 
         Collects neighbours BEFORE deletion so the caller can refresh their
         summaries after the target node is removed (edges vanish with DETACH DELETE).
@@ -2776,7 +2974,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL AND m.uuid <> $uuid '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
             'RETURN DISTINCT m.uuid'
         )
         result = await graph.ro_query(cypher, {'uuid': uuid})
@@ -3014,8 +3212,8 @@ class GraphitiBackend:
         ``resolve_extracted_edges`` fast-path can catch, since those only
         see the edges before they converge onto the same node pair.
 
-        Queries the node's currently-valid (``invalid_at IS NULL``)
-        incident edges (undirected, so directed and reverse-directed exact
+        Queries the node's active (``_ACTIVE_EDGE_PREDICATE``) incident
+        edges (undirected, so directed and reverse-directed exact
         duplicates both collapse), delegates grouping + survivor selection
         to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
         ``bulk_remove_edges``.
@@ -3035,7 +3233,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -4525,7 +4723,7 @@ class GraphitiBackend:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
-        (non-invalidated) RELATES_TO edges, deduplicates their facts
+        RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``), deduplicates their facts
         (preserving order), joins them with newlines, and writes the result
         back to the node's summary property.
 
@@ -4730,6 +4928,45 @@ class GraphitiBackend:
             for row in _first_row_per_uuid(paged.rows, reader='enumerate_entity_nodes')
         ]
         return nodes, paged
+
+    @_canonicalize_group_args
+    async def enumerate_ranked_entity_nodes(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[list[dict], PagedRead]:
+        """Every same-group Entity node with its provenance rank, survivor-first.
+
+        Rows carry find_entity_nodes_by_name_substring's six keys (edge_count
+        counts valid RELATES_TO only) and are ordered exactly as that method and
+        find_duplicate_entity_nodes order theirs, so any partition of the rows
+        keeps survivor order. Scoped by the `n.group_id` property for the
+        task-2115 reason find_duplicate_entity_nodes gives. A separate method
+        rather than a widened enumerate_entity_nodes: task 5264, decision 7.
+
+        Returns:
+            (rows, paged), *paged* being the read's PagedRead.
+        """
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph,
+            _RANKED_ENTITY_NODES_PAGE_TEMPLATE,
+            _RANKED_ENTITY_NODES_CENSUS,
+            params={'group_id': group_id},
+            page_size=page_size,
+        )
+        rows = [
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'created_at': row[2],
+                'edge_count': row[3],
+                'mentions_count': row[4],
+                'provenance_rank': row[5],
+            }
+            for row in _first_row_per_uuid(
+                paged.rows, reader='enumerate_ranked_entity_nodes'
+            )
+        ]
+        return _survivor_first(rows), paged
 
     @_canonicalize_group_args
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
@@ -5665,7 +5902,7 @@ class GraphitiBackend:
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
-        """Shut down the driver."""
+        """Shut down the drivers, then release the SDK clients every Graphiti holds."""
         for cloned in self._cloned_drivers.values():
             with contextlib.suppress(Exception):
                 await cloned.close()
@@ -5673,13 +5910,28 @@ class GraphitiBackend:
         if self._driver is not None:
             with contextlib.suppress(Exception):
                 await self._driver.close()
+        await close_wrapped_sdk_clients(self._sdk_client_wrappers())
         self.client = None
         self._driver = None
         # Per-group clients each hold a driver that aliases an entry already
-        # closed above via the _cloned_drivers loop (or self._driver itself) —
-        # drop the references only; do NOT call .close() per-client, which
-        # would double-close the single shared FalkorDB connection.
+        # closed above via the _cloned_drivers loop (or self._driver itself), so
+        # Graphiti.close() is never called: it would double-close the single
+        # shared FalkorDB connection. Their SDK sub-clients were released above.
         self._group_clients.clear()
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
+
+    def _sdk_client_wrappers(self) -> list[object | None]:
+        """The backend's sub-clients, then those of every Graphiti it holds.
+
+        ``Graphiti.__init__`` mints its own client for any sub-client passed as
+        None, so the shared three alone would miss those.
+        """
+        graphitis = [g for g in (self.client, *self._group_clients.values()) if g is not None]
+        return [
+            self._llm_client,
+            self._embedder,
+            self._cross_encoder,
+            *(sub for g in graphitis for sub in (g.llm_client, g.embedder, g.cross_encoder)),
+        ]

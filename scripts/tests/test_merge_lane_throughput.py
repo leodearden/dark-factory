@@ -17,6 +17,7 @@ from typing import Any
 
 import merge_lane_throughput as mlt
 import pytest
+from shared.project_layout import default_project_root, runs_db
 
 # ---------------------------------------------------------------------------
 # parse_window — clock-free: ``now`` is always injected, never read inside.
@@ -1936,12 +1937,6 @@ def test_chains_tolerates_a_non_numeric_landed_via_chain():
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_runs_db_is_data_orchestrator_runs_db_under_the_root(tmp_path):
-    assert mlt.resolve_runs_db(tmp_path / 'proj') == (
-        tmp_path / 'proj' / 'data' / 'orchestrator' / 'runs.db'
-    )
-
-
 def test_project_root_flag_is_repeatable(corpus_roots):
     root_a, root_b = corpus_roots
     args = mlt.build_parser().parse_args(
@@ -1953,13 +1948,12 @@ def test_project_root_flag_is_repeatable(corpus_roots):
     ]
 
 
-def test_resolve_project_roots_normalises_every_root():
+def test_resolve_project_roots_normalises_every_root(tmp_path):
     # The root is the project LABEL, not just an input path, so '.' and a
     # trailing '/..' must not produce two different labels for one project.
-    roots = mlt.resolve_project_roots([
-        str(mlt.DEFAULT_PROJECT_ROOT / 'scripts' / '..'),
-    ])
-    assert roots == [mlt.DEFAULT_PROJECT_ROOT]
+    (tmp_path / 'scripts').mkdir()
+    roots = mlt.resolve_project_roots([str(tmp_path / 'scripts' / '..')])
+    assert roots == [tmp_path.resolve()]
     assert roots[0].is_absolute()
 
 
@@ -1986,21 +1980,19 @@ def test_main_reports_a_repeated_root_once_in_both_renderings(capsys, corpus_roo
     assert len(json.loads(raw)['projects']) == 1
 
 
-def test_project_root_defaults_to_this_checkout_when_not_given():
+def test_project_root_defaults_to_the_main_checkout_when_not_given():
     args = mlt.build_parser().parse_args([])
     # argparse's append action leaves None, not []; the default is applied by
     # resolve_project_roots so a caller passing None gets the same answer.
     assert args.project_root is None
-    roots = mlt.resolve_project_roots(args.project_root)
-    assert roots == [mlt.DEFAULT_PROJECT_ROOT]
-    assert (mlt.DEFAULT_PROJECT_ROOT / 'scripts' / 'merge_lane_throughput.py').is_file()
+    assert mlt.resolve_project_roots(args.project_root) == [default_project_root()]
 
 
 def test_collect_project_labels_its_bundle_with_the_root_it_read(corpus_roots):
     root_a, _ = corpus_roots
     bundle = mlt.collect_project(root_a, CORPUS_LO_DT, CORPUS_HI_DT)
     assert bundle['project_root'] == str(root_a)
-    assert bundle['runs_db'] == str(mlt.resolve_runs_db(root_a))
+    assert bundle['runs_db'] == str(runs_db(root_a))
     assert bundle['error'] is None
     assert bundle['window'] == (CORPUS_LO, CORPUS_HI)
 
@@ -2191,7 +2183,7 @@ def test_collect_project_reports_a_missing_db_as_a_labelled_error(tmp_path):
     assert bundle['error'] is not None
     # Loud: the message names the path that was actually looked for, so the
     # operator can see whether it was the root or the layout that was wrong.
-    assert str(mlt.resolve_runs_db(missing)) in bundle['error']
+    assert str(runs_db(missing)) in bundle['error']
     # And empty — NOT a bundle of zeros. "This DB could not be read" must never
     # render identically to "this project landed nothing in the window".
     assert bundle['sections'] == {}
@@ -2203,7 +2195,7 @@ def test_collect_project_reports_an_unreadable_db_as_a_labelled_error(tmp_path):
     (root / 'data' / 'orchestrator' / 'runs.db').write_text('not a sqlite database')
     bundle = mlt.collect_project(root, CORPUS_LO_DT, CORPUS_HI_DT)
     assert bundle['error'] is not None
-    assert str(mlt.resolve_runs_db(root)) in bundle['error']
+    assert str(runs_db(root)) in bundle['error']
     assert bundle['sections'] == {}
 
 
@@ -2616,7 +2608,7 @@ def test_main_returns_nonzero_when_a_projects_db_is_unreadable(
     )
     assert code != 0
     # Loud on stderr, naming the path actually looked for...
-    assert str(mlt.resolve_runs_db(missing)) in err
+    assert str(runs_db(missing)) in err
     # ...and the healthy project's rows are still printed.
     assert 'median 2.0' in out
     assert str(root_a) in out
@@ -2657,19 +2649,19 @@ def test_main_rejects_a_malformed_window_loudly_without_a_traceback(capsys):
     assert out == ''
 
 
-def test_main_defaults_to_this_checkout_when_no_project_root_is_given(capsys):
-    # Read-only against the real store; asserts only the LABEL, never a number
-    # (runs.db is mutated continuously by the running orchestrator).
+def test_main_defaults_to_the_main_checkout_when_no_project_root_is_given(capsys):
+    # Read-only against the main checkout's store, window-bounded; asserts
+    # only the LABEL, never a number (runs.db is mutated continuously by the
+    # running orchestrator).
+    main_checkout = default_project_root()
     code, out, _ = _run(capsys, '--window', '2026-01-01..2026-01-02', '--json')
     payload = json.loads(out)
-    assert list(payload['projects']) == [str(mlt.DEFAULT_PROJECT_ROOT)]
-    # The exit code is derived rather than hardcoded: a task worktree carries
-    # no data/orchestrator/runs.db (only the main checkout does), so a bare
-    # `assert code == 0` would pass in one tree and fail in the other — the
-    # non-hermeticity this module's docstring forbids. Deriving it pins the
-    # contract in BOTH trees: readable store -> 0, unreadable -> 1.
-    has_store = mlt.resolve_runs_db(mlt.DEFAULT_PROJECT_ROOT).is_file()
+    assert list(payload['projects']) == [str(main_checkout)]
+    # The exit code is derived rather than hardcoded: a host whose main
+    # checkout has no data/orchestrator/runs.db (a fresh clone, a CI runner)
+    # must not fail where the live host passes — the non-hermeticity this
+    # module's docstring forbids. Deriving it pins the contract on BOTH:
+    # readable store -> 0, unreadable -> 1.
+    has_store = runs_db(main_checkout).is_file()
     assert code == (0 if has_store else 1)
-    assert (payload['projects'][str(mlt.DEFAULT_PROJECT_ROOT)]['error'] is None) is (
-        has_store
-    )
+    assert (payload['projects'][str(main_checkout)]['error'] is None) is has_store

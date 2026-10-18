@@ -174,91 +174,65 @@ Four rules make this fallback loop terminate correctly. **On the `coalesce-*` ar
    automatically once the train lands (`mark_member_done` in
    `orchestrator/src/orchestrator/harness.py`, which calls `scheduler.mark_done(..., kind="merged",
    ...)`); if it already reads `done`, that flip already happened and no further write is needed.
+   The landing verdict then splits by rc: **2v** states the veto that governs both arms once, and **2a** and **2b** give only what differs between them.
 
-   - **2a. Under rc=128-with-empty-marker** — either signal saying landed settles that it *landed*,
-     but **there is no self-stamp on this arm**: 2b's veto reaches it too, and the two outcomes it
-     leaves are exhaustive — neither licenses a write. Re-read signal (b) fresh and take exactly one
-     of them:
+2v. **The veto (both arms).** This is the single statement of the veto for 2a (rc=128-with-empty-marker) and 2b (rc=1) alike; each arm's own trigger below says when a landing signal has fired. Once it has, the work *landed* — but **there is no self-stamp on either arm**: signal (b) is a **veto, not a corroborator**, and the two outcomes it leaves are exhaustive — neither licenses a write. Re-read signal (b) fresh and take exactly one of them:
 
-     - **`done`** — the automatic flip already happened: nothing to write, conclude landed and
-       proceed to cleanup.
-     - **Any other status** — `pending` from `_revert_withheld_member`, `merge-deferred`, anything
-       else, including a status you cannot read — **means do not write, ever**: keep polling under
-       rule 3's loop, and at its 20-minute wall-clock ceiling take 2b's **landed-but-not-credited**
-       exit, citing the tip merge sha and the current status — never "not landed", never resubmit,
-       never direct-merge. The harms are the three 2b states below, verbatim and unchanged by this
-       arm's missing ref.
+   - **`done`** — the automatic flip already happened: nothing to write, conclude landed and proceed to cleanup (the cleanup recipe is the arm's own; see 2a and 2b).
+   - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you cannot read — **means do not write, ever:**
 
-     - **Why this arm carries the veto** — it is rare here but reachable, and reachable by following
-       this very subsection's advice. Orchestrator cleanup will not produce rc=128 for a
-       stale-by-rebase non-tip member: `GitOps._delete_branch_if_on_main` deletes only when
-       `GitOps._branch_has_commits_beyond_main` is False, and that predicate counts `main..<branch>`
-       by **sha** (`git rev-list --count`), not by patch id, so the member's pre-rebase shas are
-       unreachable from main, the count is non-zero, and the ref is RETAINED. But 2b below tells you
-       `git branch -D task/<TASK_ID>` is safe once `git cherry` is non-empty and all-`-`; an agent
-       who takes that advice and then re-enters this ladder arrives here at rc=128 with an empty
-       own-marker. The withhold is orthogonal to whether any ref survives: `mark_member_done` →
-       `_delivered_checks_withhold` → `_revert_withheld_member`
-       (`orchestrator/src/orchestrator/harness.py`) fires when the **train** lands and sets the
-       member to `pending` regardless of ref existence, and `DeliveredChecksConfig.enabled`
-       (`orchestrator/src/orchestrator/config.py`) defaults True — so the two conditions compose.
+     - `pending` is exactly what `_revert_withheld_member` leaves behind once `mark_member_done`'s
+       `_delivered_checks_withhold` blocks the flip because the member's declared capability is
+       not verifiably on main — the member's ONLY recovery edge, documented as such in-source.
+     - `merge-deferred` is either the normal pre-merge train park (every member must already be
+       `merge-deferred` before `_do_train_merge` advances the tip) or a FAILED revert, which
+       in-source logging flags as needing operator attention rather than silently retrying.
+     - `_do_train_merge`'s `done_wip_recovery` path is an explicit "merge landed on main but
+       members were NOT flipped" split-brain that escalates rather than returning done.
 
-     - **One asymmetry, stated so it is not read as a weaker rule:** under rc=128 the branch ref is
-       gone, so 2b's `git cherry main task/<TASK_ID>` content proof is **unavailable** here and the
-       veto rests on the scheduler status alone. That is sound, because 2b already establishes that
-       the content proof **cannot discharge the veto** — it gates on patch-equivalence of this
-       branch's commits, while the withhold gates on the member's declared capability against the
-       committed main tree. Losing a proof that was never able to license a write costs this arm
-       nothing.
+     Stamping `done` over any of these overrides a deliberate orchestrator decision: it destroys
+     the member's only recovery edge, marks done a task whose declared capability is not
+     verifiably on main (which unblocks its dependents through the delivered-check dep-gate), and
+     races a scheduler re-dispatch of the same task. These are the veto's three harms, and the branch ref's existence or absence never changes them.
 
-   - **2b. Under rc=1 specifically**, signal (b) is a **veto on this arm, not a corroborator** —
-     there is no self-stamp. The veto is not scoped to rc=1: 2a above carries it too, for the same
-     harms, because the branch ref's continued existence never changed them. Once signal (a) shows
-     the tip landed, re-read signal (b) fresh:
+   - **A content proof cannot discharge the veto.** `git cherry main task/<TASK_ID>` (2b's recipe) proves this branch's commits are patch-equivalent on main, while the withhold gates on the member's declared capability against the committed main tree — a different predicate an all-`-` `git cherry` is fully compatible with, so a passing content check next to a non-`done` status is exactly the split-brain, not a reason to stamp over it.
+   - **Exit under veto:** keep polling under rule 3's loop — the flip is asynchronous, so the normal landed case reaches `done` within a tick or two and exits clean. If a non-`done` status still holds at rule 3's existing 20-minute wall-clock ceiling, stop and report to the human — report it as **landed-but-not-credited**, citing the tip merge sha and the current status (and, on 2b, the `git cherry` output), never as "not landed" — and never resubmit, never direct-merge, never self-stamp.
 
-     - **`done`** — the automatic flip already happened: nothing to write, conclude landed and
-       proceed to cleanup (step 4's cleanup recipe: `git branch -d task/<TASK_ID>` will refuse here
-       — "not fully merged" — since this ref is stale-by-rebase and not an ancestor of main; `git
-       branch -D task/<TASK_ID>` is safe once the `git cherry` check below is non-empty and every
-       line is `-`, and leaving the ref in place is also fine).
-     - **Any other status — `pending`, `merge-deferred`, or anything else — means do not write,
-       ever:**
+2a. **Under rc=128-with-empty-marker** — the trigger is **either** signal saying landed. The veto (2v) applies unchanged; this arm adds only:
 
-       - `pending` is exactly what `_revert_withheld_member` leaves behind once `mark_member_done`'s
-         `_delivered_checks_withhold` blocks the flip because the member's declared capability is
-         not verifiably on main — the member's ONLY recovery edge, documented as such in-source.
-       - `merge-deferred` is either the normal pre-merge train park (every member must already be
-         `merge-deferred` before `_do_train_merge` advances the tip) or a FAILED revert, which
-         in-source logging flags as needing operator attention rather than silently retrying.
-       - `_do_train_merge`'s `done_wip_recovery` path is an explicit "merge landed on main but
-         members were NOT flipped" split-brain that escalates rather than returning done.
+   - **Cleanup on `done`:** proceed to cleanup; the branch ref is already gone under rc=128, so there is no ref to delete.
+   - **The exit's citation omits `git cherry`:** the branch ref is gone, so 2b's `git cherry main task/<TASK_ID>` content proof is **unavailable** here and the veto rests on the scheduler status alone. That is sound, because 2v already establishes that the content proof **cannot discharge the veto**. Losing a proof that was never able to license a write costs this arm nothing.
+   - **Why this arm carries the veto** — it is rare here but reachable, and reachable by following
+     this very subsection's advice. Orchestrator cleanup will not produce rc=128 for a
+     stale-by-rebase non-tip member: `GitOps._delete_branch_if_on_main` deletes only when
+     `GitOps._branch_has_commits_beyond_main` is False, and that predicate counts `main..<branch>`
+     by **sha** (`git rev-list --count`), not by patch id, so the member's pre-rebase shas are
+     unreachable from main, the count is non-zero, and the ref is RETAINED. But 2b below tells you
+     `git branch -D task/<TASK_ID>` is safe once `git cherry` is non-empty and all-`-`; an agent
+     who takes that advice and then re-enters this ladder arrives here at rc=128 with an empty
+     own-marker. The withhold is orthogonal to whether any ref survives: `mark_member_done` →
+     `_delivered_checks_withhold` → `_revert_withheld_member`
+     (`orchestrator/src/orchestrator/harness.py`) fires when the **train** lands and sets the
+     member to `pending` regardless of ref existence, and `DeliveredChecksConfig.enabled`
+     (`orchestrator/src/orchestrator/config.py`) defaults True — so the two conditions compose.
 
-       Stamping `done` over any of these overrides a deliberate orchestrator decision: it destroys
-       the member's only recovery edge, marks done a task whose declared capability is not
-       verifiably on main (which unblocks its dependents through the delivered-check dep-gate), and
-       races a scheduler re-dispatch of the same task.
+2b. **Under rc=1 specifically** — the trigger is signal (a) showing the tip landed; signal (b) is then the veto (2v) and not a corroborator. This arm adds only:
 
-     - **Confirm by content anyway** — it is what makes the eventual report accurate, not a licence
-       to write: `git cherry main task/<TASK_ID>` — the same patch-id test
-       `GitOps.rebase_preserving_task_commits` in `orchestrator/src/orchestrator/git_ops.py` uses to
-       tell a legitimate post-rebase dedup from a genuine commit wipe — prints `-` for each of this
-       branch's commits already patch-equivalent on main and `+` for one genuinely absent; treat
-       this member as landed-by-content only when the output is **non-empty and every line starts
-       with `-`**. **An empty output is NOT landed** — a branch that never advanced past its
-       creation point also prints nothing, so `git cherry main task/<TASK_ID> | grep -q '^+' || echo
-       landed` belongs to the same unsound-idiom family this file already bans elsewhere.
-     - **This content proof cannot discharge the veto above:** it proves this branch's commits are
-       patch-equivalent on main, while the withhold gates on the member's declared capability
-       against the committed main tree — a different predicate an all-`-` `git cherry` is fully
-       compatible with, so a passing content check next to a non-`done` status is exactly the
-       split-brain, not a reason to stamp over it.
-     - **Exit under veto:** keep polling under rule 3's loop — the flip is asynchronous, so the
-       normal landed case reaches `done` within a tick or two and exits clean. If a non-`done`
-       status still holds at rule 3's existing 20-minute wall-clock ceiling, stop and report to the
-       human — report it as **landed-but-not-credited**, citing the tip merge sha, the `git cherry`
-       output, and the current status, never as "not landed" — and never resubmit, never
-       direct-merge, never self-stamp.
-3. **rc=1 does not mean resubmit here.** Right after absorption the successor is typically still in flight, so ancestry rc=1 (branch ref **exists**; its commits are not *ancestors* of main — which, for a non-tip train member, is fully compatible with the work having landed patch-equivalently) is not evidence that the `superseded` record is a stale prior round, and not a reason to give up. **The [canonical ancestry check](#canonical-ancestry-check)'s rc=1 resubmit line does not apply in this loop** — whether you arrived here via the `coalesce-*` arm or via an `mr-*` poll that came back `unknown`/unresolved, a still-in-flight successor makes rc=1 expected either way. **On the `coalesce-*` arm, rc=1 is not only a not-landed-*yet* signal — for a non-tip absorbed member it is the normal and *permanent* post-landing state, so rule 2's two landing signals are consultable under rc=1 too, on every tick, not only under rc=128-with-empty-marker.** A train merges only the tip branch (`tip_branch=tip_req.branch`), which by stacking already carries every member's commits, and that tip is rebased onto current main before the merge, rewriting each stacked commit's SHA — this member's own `task/<TASK_ID>` ref is never advanced to those rewritten commits, so it can never become an ancestor of main, and ancestry alone will never resolve this arm. rc=128 does not reliably arrive instead: a stale-by-rebase ref still carries commits beyond main, so `GitOps._delete_branch_if_on_main` retains it rather than deleting it — rc=128 is the rare outcome for a non-tip member and rc=1 is the common one, so do not re-narrow rule 2's signals back to rc=128 alone. **On the `mr-*` arm, the rc=128-with-empty-marker restriction stands as before**: the generation-advance successor merges the *same* branch at a newer SHA, so a landing makes the ref rc=0 (or rc=128 after cleanup) and a persistent rc=1 there genuinely means not-landed — rule 2's signals do not apply there (signal (a) isn't even derivable on that arm: there is no `coalesce-<TIP_ID>-<hex>` id to parse a TIP_ID from). Keep polling the branch handle under rule 1's resumed terminal set, re-running the ancestry check each tick — it re-derives the real answer from git rather than from the frozen `superseded` record, and on the `coalesce-*` arm also re-derives whether rule 2's signals have resolved it. Stop-and-report only once rc=1 still holds — with rule 2's signals, where applicable, still unresolved, or resolved-landed but vetoed by a non-`done` scheduler status (in which case take rule 2b's landed-but-not-credited exit instead of this one) — at this resumed loop's own 20-minute wall-clock ceiling (same ceiling and stop-and-report exit already used by the `task_id`/`branch` arms above and the `mr-*` arm above) — never resubmit, never direct-merge, even at expiry.
+   - **Cleanup on `done`:** step 4's cleanup recipe: `git branch -d task/<TASK_ID>` will refuse here
+     — "not fully merged" — since this ref is stale-by-rebase and not an ancestor of main; `git
+     branch -D task/<TASK_ID>` is safe once the `git cherry` check below is non-empty and every
+     line is `-`, and leaving the ref in place is also fine.
+   - **Confirm by content anyway** — it is what makes the eventual report accurate, not a licence
+     to write: `git cherry main task/<TASK_ID>` — the same patch-id test
+     `GitOps.rebase_preserving_task_commits` in `orchestrator/src/orchestrator/git_ops.py` uses to
+     tell a legitimate post-rebase dedup from a genuine commit wipe — prints `-` for each of this
+     branch's commits already patch-equivalent on main and `+` for one genuinely absent; treat
+     this member as landed-by-content only when the output is **non-empty and every line starts
+     with `-`**. **An empty output is NOT landed** — a branch that never advanced past its
+     creation point also prints nothing, so `git cherry main task/<TASK_ID> | grep -q '^+' || echo
+     landed` belongs to the same unsound-idiom family this file already bans elsewhere.
+
+3. **rc=1 does not mean resubmit here.** Right after absorption the successor is typically still in flight, so ancestry rc=1 (branch ref **exists**; its commits are not *ancestors* of main — which, for a non-tip train member, is fully compatible with the work having landed patch-equivalently) is not evidence that the `superseded` record is a stale prior round, and not a reason to give up. **The [canonical ancestry check](#canonical-ancestry-check)'s rc=1 resubmit line does not apply in this loop** — whether you arrived here via the `coalesce-*` arm or via an `mr-*` poll that came back `unknown`/unresolved, a still-in-flight successor makes rc=1 expected either way. **On the `coalesce-*` arm, rc=1 is not only a not-landed-*yet* signal — for a non-tip absorbed member it is the normal and *permanent* post-landing state, so rule 2's two landing signals are consultable under rc=1 too, on every tick, not only under rc=128-with-empty-marker.** A train merges only the tip branch (`tip_branch=tip_req.branch`), which by stacking already carries every member's commits, and that tip is rebased onto current main before the merge, rewriting each stacked commit's SHA — this member's own `task/<TASK_ID>` ref is never advanced to those rewritten commits, so it can never become an ancestor of main, and ancestry alone will never resolve this arm. rc=128 does not reliably arrive instead: a stale-by-rebase ref still carries commits beyond main, so `GitOps._delete_branch_if_on_main` retains it rather than deleting it — rc=128 is the rare outcome for a non-tip member and rc=1 is the common one, so do not re-narrow rule 2's signals back to rc=128 alone. **On the `mr-*` arm, the rc=128-with-empty-marker restriction stands as before**: the generation-advance successor merges the *same* branch at a newer SHA, so a landing makes the ref rc=0 (or rc=128 after cleanup) and a persistent rc=1 there genuinely means not-landed — rule 2's signals do not apply there (signal (a) isn't even derivable on that arm: there is no `coalesce-<TIP_ID>-<hex>` id to parse a TIP_ID from). Keep polling the branch handle under rule 1's resumed terminal set, re-running the ancestry check each tick — it re-derives the real answer from git rather than from the frozen `superseded` record, and on the `coalesce-*` arm also re-derives whether rule 2's signals have resolved it. Stop-and-report only once rc=1 still holds — with rule 2's signals, where applicable, still unresolved, or resolved-landed but vetoed by a non-`done` scheduler status (in which case take rule 2v's landed-but-not-credited exit instead of this one) — at this resumed loop's own 20-minute wall-clock ceiling (same ceiling and stop-and-report exit already used by the `task_id`/`branch` arms above and the `mr-*` arm above) — never resubmit, never direct-merge, even at expiry.
 4. **`get_merge_queue()` no longer showing the train is not a landing signal.** It means only "stop waiting on the train" — and is equally consistent with a **derail**: on any non-`done` train outcome the orchestrator re-pends the still-unlanded members for solo re-merge (`_redrive_coalesce_members`, `orchestrator/src/orchestrator/merge_lane/worker.py`), which also removes the train from the queue with nothing of yours on main. This skill elsewhere directs you to consult `get_merge_queue()` for context (§"Poll for completion" above) — do not read its absence as evidence the train landed. On queue-absence with neither of rule 2's two signals saying landed, keep polling the branch handle under rule 1's resumed terminal set to the ceiling; never flip the task on queue-absence alone.
 
 **Whichever shape `superseded_by` takes, never direct-merge and never resubmit while a successor is unresolved.**
@@ -282,7 +256,7 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 - **A verified sha (on rc=0, or on rc=128 with a non-empty marker)** → treat as done/`found_on_main` and stamp exactly what that arm specifies — `commit` **and** `note`, both required.
 - **rc=1** → not an ancestor of main. Outside the coalesce arm and with the queue healthy: **resubmit (go back to step 3).**
 - **rc=128 with an empty marker on the `coalesce-*` arm** → **not** one of the ladder's genuine not-landed outcomes below; [Follow the superseded successor](#follow-the-superseded-successor)'s **rule 2a** governs it (tip's merge marker + this task's scheduler status; either landing signal means it **landed**, and **there is no self-stamp on this arm** — a `done` status means the automatic flip already happened and nothing is left to write, any other status means never write, and the exit at the ceiling is **landed-but-not-credited**). The shared ladder carries this carve-out explicitly, so running it "in full" no longer contradicts rule 2a.
-- **rc=1 on the `coalesce-*` arm** → that resubmit line does **not** apply; [Follow the superseded successor](#follow-the-superseded-successor)'s rules 2/2b/3 govern instead. Rule 2b's `git cherry main task/<TASK_ID>` content proof is correct **there** — the branch is not an ancestor of main, so the test actually discriminates — and is unaffected by the shared doc's ban on substituting it on the rc=0 arm. Honour rule 2b's **veto**: **there is no self-stamp on this arm** either, so the scheduler status decides only which exit applies — `done` means the flip already happened and nothing is left to write; any other status means keep polling, and at the ceiling take its **landed-but-not-credited** exit (citing the tip merge sha, the `git cherry` output and the current status) rather than reporting not-landed.
+- **rc=1 on the `coalesce-*` arm** → that resubmit line does **not** apply; [Follow the superseded successor](#follow-the-superseded-successor)'s rules 2/2v/2b/3 govern instead. Rule 2b's `git cherry main task/<TASK_ID>` content proof is correct **there** — the branch is not an ancestor of main, so the test actually discriminates — and is unaffected by the shared doc's ban on substituting it on the rc=0 arm. Honour rule 2v's **veto (both arms)**: **there is no self-stamp on this arm** either, so the scheduler status decides only which exit applies — `done` means the flip already happened and nothing is left to write; any other status means keep polling, and at the ceiling take its **landed-but-not-credited** exit (citing the tip merge sha, the `git cherry` output and the current status) rather than reporting not-landed.
 - **The ladder's genuine not-landed outcomes**, and a citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) → stamp nothing. Un-evaluable proves neither verdict, so never read it as not-landed.
 
 **Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; see its 20-minute ceiling above for the bounded exit instead. **Nor does it apply when this check is reached from [Follow the superseded successor](#follow-the-superseded-successor)'s Escape** — that subsection's rule 3 governs rc=1 there instead; do not resubmit.

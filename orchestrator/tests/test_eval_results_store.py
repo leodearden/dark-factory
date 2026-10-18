@@ -292,6 +292,91 @@ def test_normalize_legacy_metrics_returns_an_equal_new_dict():
     assert normalized is not metrics
 
 
+_CANONICAL_LEGACY_REASON = (
+    'Architect eval reify_task_2324 × architect-opus-max: '
+    'all accounts capped after 1'
+)
+
+
+class TestLegacyInvocationErrorRule:
+    """D3: a pre-6734 ``invocation_error`` string loads as typed records."""
+
+    def test_the_canonical_corpus_marker_becomes_one_record(self):
+        metrics = {
+            'invocation_error': f'architect:cap_exhausted: {_CANONICAL_LEGACY_REASON}',
+            'cap_tainted': True,
+        }
+        normalized = normalize_legacy_metrics(metrics)
+        assert normalized['invocation_errors'] == [{
+            'stage': 'architect',
+            'cause': 'cap_exhausted',
+            'reason': _CANONICAL_LEGACY_REASON,
+        }]
+        assert 'invocation_error' not in normalized
+
+    def test_a_judge_marker_keeps_its_stage(self):
+        normalized = normalize_legacy_metrics(
+            {'invocation_error': 'judge:api_error: HTTP 429'}
+        )
+        assert normalized['invocation_errors'] == [
+            {'stage': 'judge', 'cause': 'api_error', 'reason': 'HTTP 429'},
+        ]
+
+    def test_a_two_marker_string_is_one_record_driven_by_the_first(self):
+        from orchestrator.evals.report import format_invocation_errors
+
+        marker = 'architect:timeout: no answer within 60m; judge:raised: RuntimeError: x'
+        normalized = normalize_legacy_metrics({'invocation_error': marker})
+        [record] = normalized['invocation_errors']
+        assert (record['stage'], record['cause']) == ('architect', 'timeout')
+        assert format_invocation_errors(normalized['invocation_errors']) == marker
+
+    def test_a_clipped_reason_keeps_its_trailing_space(self):
+        from orchestrator.evals.report import format_invocation_errors
+
+        marker = 'architect:cap_exhausted: all accounts capped after 1 '
+        normalized = normalize_legacy_metrics({'invocation_error': marker})
+        assert normalized['invocation_errors'][0]['reason'] == (
+            'all accounts capped after 1 '
+        )
+        assert format_invocation_errors(normalized['invocation_errors']) == marker
+
+    @pytest.mark.parametrize(
+        'marker', ['architect:', 'architect:bogus_cause: x', 'garbage'],
+    )
+    def test_an_unrecognised_marker_is_legacy_unclassified(self, marker):
+        normalized = normalize_legacy_metrics({'invocation_error': marker})
+        assert normalized['invocation_errors'] == [{
+            'stage': 'architect', 'cause': 'legacy_unclassified', 'reason': marker,
+        }]
+
+    def test_a_null_marker_drops_the_old_key(self):
+        normalized = normalize_legacy_metrics({'invocation_error': None})
+        assert normalized['invocation_errors'] is None
+        assert 'invocation_error' not in normalized
+
+    def test_a_tainted_cell_without_a_marker_gets_an_unclassified_record(self):
+        normalized = normalize_legacy_metrics({'cap_tainted': True})
+        assert normalized['invocation_errors'] == [{
+            'stage': 'architect', 'cause': 'legacy_unclassified', 'reason': '',
+        }]
+
+    def test_a_new_shape_cell_passes_through_unchanged(self):
+        metrics = {
+            'cap_tainted': True,
+            'invocation_errors': [
+                {'stage': 'architect', 'cause': 'cap_hit', 'reason': 'r'},
+            ],
+        }
+        assert normalize_legacy_metrics(metrics) == metrics
+
+    def test_the_input_is_not_mutated(self):
+        metrics = {'invocation_error': 'architect:cap_hit: r', 'cap_tainted': True}
+        before = dict(metrics)
+        normalize_legacy_metrics(metrics)
+        assert metrics == before
+
+
 def test_the_packaged_store_lives_beside_the_results_module():
     assert ResultStore.packaged().directory == (
         Path(results_module.__file__).parent / 'results'

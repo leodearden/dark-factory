@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -465,7 +466,7 @@ def _metadata_of(task: Mapping) -> Mapping:
 
 def _read_local_hoists(
     project_root: ProjectRoot,
-) -> tuple[bool | None, dict | None, datetime | None]:
+) -> tuple[bool | None, SchedulerStateSnapshot | None, datetime | None]:
     """The three local-file hoists, each fail-safe to None; run in ONE thread hop.
 
     A None orchestrator check lets :func:`detect_live_workflow` derive it per
@@ -477,7 +478,7 @@ def _read_local_hoists(
     except Exception:
         orch_live = None
     try:
-        sched: dict | None = read_scheduler_state(Path(project_root))
+        sched: SchedulerStateSnapshot | None = read_scheduler_state(Path(project_root))
     except Exception:
         sched = None
     try:
@@ -515,7 +516,7 @@ def _corroboration(
     task: dict,
     task_id: str,
     now: datetime,
-    scheduler_state: dict | None,
+    scheduler_state: SchedulerStateSnapshot | None,
     orchestrator_started: datetime | None,
 ) -> bool | None:
     """The task-2963 verdict for an in-progress task; None (gate inert) otherwise or on error.

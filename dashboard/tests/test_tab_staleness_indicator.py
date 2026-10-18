@@ -14,9 +14,10 @@ WHAT IS BEING PINNED. The 2026-08-27 incident ran 19.8h with every tab
 rendering a fully-populated table whose numbers had stopped advancing. The
 decision content lives in `endpoint_staleness.js` (covered by
 `dashboard/tests/js/endpoint_staleness.test.mjs`) and the recorded facts in
-`data.js` (covered by `data_poll.test.mjs`); what neither can see is whether
-`App` actually reads them, renders them, and — the acceptance that matters
-most — renders them ALONGSIDE the tab body rather than in place of it.
+`data.js` (covered by `dashboard/tests/js/data_freshness.test.mjs`); what
+neither can see is whether `App` actually reads them, renders them, and — the
+acceptance that matters most — renders them ALONGSIDE the tab body rather
+than in place of it.
 """
 
 from __future__ import annotations
