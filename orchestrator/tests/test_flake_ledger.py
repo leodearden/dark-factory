@@ -2936,8 +2936,8 @@ class TestResolveDebt:
         reads them.  Deleting one here would silently disarm class 2(a).
 
         The owner is retained too: a resolution alone does not clear it (the row still
-        names the task that closed the cycle, which ``flake_recorder._unowned_first``
-        reads).  Only a RE-ENTRY discharges it — :class:`TestReEntryDischargesTheOwner`."""
+        names the task that closed the cycle).  Only a RE-ENTRY discharges it —
+        :class:`TestReEntryDischargesTheOwner`."""
         from orchestrator.flake_ledger import read_debt
 
         db_path = tmp_path / 'runs.db'
@@ -5147,13 +5147,42 @@ class TestOneConnectionPerCall:
             f'expected 2 connections (row read + stamp), got {len(opened)}'
         )
 
+    async def test_open_debt_with_a_stale_head_check_opens_two_on_false_and_one_on_none(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """False is the row read plus the resolution stamp; None is the row read alone.
+        Neither upserts.  True keeps the three of the owned path above."""
+        from orchestrator.flake_ledger import open_debt
+
+        opened = _count_connections(monkeypatch)
+        for answer, expected in ((False, 2), (None, 1)):
+            db_path = tmp_path / str(answer) / 'runs.db'
+            await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+            client = _FakeTaskClient(tasks={'task-901': _done_task('task-901', 'deadbee')})
+
+            async def _check(task, _answer=answer):
+                return _answer
+
+            opened.clear()
+            await open_debt(
+                db_path, 'dark_factory', self.TEST_ID,
+                task_client=client, now=self.NOW, head_contains_fix=_check,
+            )
+            assert len(opened) == expected, (answer, len(opened))
+
     async def test_sync_entry_points_open_one_connection(self, tmp_path: Path, monkeypatch) -> None:
         from orchestrator.flake_ledger import (
+            delete_due_item,
+            enqueue_debt,
             list_open_debt,
+            name_stale_due_items,
             read_debt,
             read_debt_many,
+            read_due_items,
             read_occurrences,
+            record_failed_due_attempt,
             record_flake_occurrence,
+            summarize_due,
         )
 
         db_path = tmp_path / 'runs.db'
@@ -5163,10 +5192,20 @@ class TestOneConnectionPerCall:
             lambda: record_flake_occurrence(
                 db_path, 'dark_factory', _suppression(), merge_sha=None, task_id=None
             ),
+            lambda: enqueue_debt(
+                db_path, 'dark_factory', [_due_item()],
+                occurrence=_suppression(observed_at='2026-08-06T12:30:00+00:00'),
+            ),
+            lambda: enqueue_debt(db_path, 'dark_factory', [_due_item('tests/test_b.py::t')]),
             lambda: read_occurrences(db_path),
             lambda: read_debt(db_path, self.TEST_ID),
             lambda: read_debt_many(db_path, [self.TEST_ID]),
             lambda: list_open_debt(db_path),
+            lambda: read_due_items(db_path, now=self.NOW, limit=5),
+            lambda: delete_due_item(db_path, 1),
+            lambda: record_failed_due_attempt(db_path, 2, reason='x', next_attempt_at=self.NOW),
+            lambda: name_stale_due_items(db_path, 'esc-1', stale_before=self.NOW),
+            lambda: summarize_due(db_path, stale_before=self.NOW),
         ):
             opened.clear()
             call()
@@ -5303,3 +5342,344 @@ class TestFixContained:
         from orchestrator.flake_ledger import fix_contained
 
         assert fix_contained(_done_task('task-1', 'c0ffee'), ancestry) is ancestry
+
+
+def _due_item(test_id: str = 'tests/test_a.py::test_one', **overrides):
+    from orchestrator.flake_ledger import DueItem
+
+    kwargs: dict[str, Any] = {
+        'test_id': test_id,
+        'observed_at': '2026-08-06T12:00:00+00:00',
+        'call_site': 'merge_gate',
+        'head': 'a' * 40,
+        'observing_task_id': '7001',
+    }
+    kwargs.update(overrides)
+    return DueItem(**kwargs)
+
+
+_DUE_NOW = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+_DUE_FAR = datetime(2100, 1, 1, tzinfo=UTC)
+
+
+def _all_due(db_path: Path) -> list:
+    from orchestrator.flake_ledger import read_due_items
+
+    items = read_due_items(db_path, now=_DUE_FAR, limit=10_000)
+    assert items is not None
+    return items
+
+
+class TestDueList:
+    """The due list (task 6934): what an observation owes ``open_debt``, written beside
+    its occurrence rows and drained afterwards.  SYNC-ONLY CLASS."""
+
+    def test_an_items_only_enqueue_lands_canonical_items(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import enqueue_debt
+
+        db_path = tmp_path / 'runs.db'
+        enqueue_debt(
+            db_path, 'dark_factory',
+            [_due_item(observed_at='2026-08-06T12:00:00Z', head='', context='{"k": 1}')],
+            now=_DUE_NOW,
+        )
+
+        (item,) = _all_due(db_path)
+        assert (item.test_id, item.project_id) == ('tests/test_a.py::test_one', 'dark_factory')
+        assert item.observed_at == '2026-08-06T12:00:00+00:00'
+        assert (item.call_site, item.head, item.observing_task_id) == ('merge_gate', None, '7001')
+        assert item.context == '{"k": 1}'
+        assert item.enqueued_at == item.next_attempt_at == _DUE_NOW.isoformat()
+        assert (item.attempts, item.last_error, item.escalation_id) == (0, None, None)
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 0
+
+    def test_a_repeated_item_lands_once(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import enqueue_debt
+
+        db_path = tmp_path / 'runs.db'
+        for _ in range(2):
+            enqueue_debt(db_path, 'dark_factory', [_due_item()], now=_DUE_NOW)
+
+        assert len(_all_due(db_path)) == 1
+
+    def test_rows_and_items_land_in_one_call(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import due_items_for, enqueue_debt
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(test_ids=('tests/test_a.py::test_one', 'tests/test_a.py::test_two'))
+        enqueue_debt(
+            db_path, 'dark_factory', due_items_for(s, head='a' * 40, observing_task_id='7001'),
+            occurrence=s, merge_sha='a' * 40, task_id='7001', now=_DUE_NOW,
+        )
+
+        assert {i.test_id for i in _all_due(db_path)} == set(s.test_ids)
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 2
+
+    def test_a_replayed_observation_enqueues_no_item_after_the_drain_deleted_it(
+        self, tmp_path: Path,
+    ) -> None:
+        """The newly-inserted rule: an item whose row this call did NOT newly insert is a
+        replay.  The lane's items-only recovery of the same key is not a replay."""
+        from orchestrator.flake_ledger import delete_due_item, due_items_for, enqueue_debt
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression()
+        items = due_items_for(s, head='a' * 40, observing_task_id='7001')
+        enqueue_debt(db_path, 'dark_factory', items, occurrence=s, now=_DUE_NOW)
+        (item,) = _all_due(db_path)
+        assert delete_due_item(db_path, item.id)
+
+        enqueue_debt(db_path, 'dark_factory', items, occurrence=s, now=_DUE_NOW)
+        assert _all_due(db_path) == []
+
+        enqueue_debt(db_path, 'dark_factory', items, now=_DUE_NOW)
+        assert len(_all_due(db_path)) == 1
+
+    def test_the_sentinel_is_never_enqueued(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, due_items_for, enqueue_debt
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(test_ids=(UNKNOWN_TEST_ID, 'tests/test_a.py::test_one'))
+        assert [i.test_id for i in due_items_for(s, head=None, observing_task_id=None)] == [
+            'tests/test_a.py::test_one',
+        ]
+        enqueue_debt(db_path, 'dark_factory', [_due_item(UNKNOWN_TEST_ID)], now=_DUE_NOW)
+
+        assert _all_due(db_path) == []
+
+    def test_an_invalid_item_is_skipped_and_the_rest_still_land(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        from orchestrator.flake_ledger import enqueue_debt
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            enqueue_debt(
+                db_path,
+                'dark_factory',
+                [
+                    _due_item('bad_site', call_site='merge-gate'),
+                    _due_item('bad_stamp', observed_at='yesterday'),
+                    _due_item('bad_context', context={'k': 1}),
+                    _due_item(''),
+                    _due_item('tests/test_a.py::test_ok'),
+                ],
+                occurrence=_suppression(),
+                now=_DUE_NOW,
+            )
+
+        assert [i.test_id for i in _all_due(db_path)] == ['tests/test_a.py::test_ok']
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 1
+        assert caplog.text.count('skipping a due item') == 4
+
+    def test_drain_order_and_the_wait_behind_a_backed_off_item(self, tmp_path: Path) -> None:
+        """Tests by their earliest ``enqueued_at``; a test's items by ``observed_at``; and
+        a test's items at or after a not-yet-due item wait behind it."""
+        from orchestrator.flake_ledger import (
+            enqueue_debt,
+            read_due_items,
+            record_failed_due_attempt,
+        )
+
+        db_path = tmp_path / 'runs.db'
+        early, late = _DUE_NOW - timedelta(minutes=10), _DUE_NOW - timedelta(minutes=5)
+        enqueue_debt(db_path, 'p', [_due_item('b', observed_at='2026-08-06T12:00:02+00:00')], now=early)
+        enqueue_debt(db_path, 'p', [_due_item('a', observed_at='2026-08-06T12:00:01+00:00')], now=late)
+        enqueue_debt(db_path, 'p', [_due_item('b', observed_at='2026-08-06T12:00:01+00:00')], now=late)
+        enqueue_debt(db_path, 'p', [_due_item('a', observed_at='2026-08-06T12:00:00+00:00')], now=late)
+
+        due = read_due_items(db_path, now=_DUE_NOW, limit=50)
+        assert due is not None
+        assert [(i.test_id, i.observed_at[-14:-6]) for i in due] == [
+            ('b', '12:00:01'), ('b', '12:00:02'), ('a', '12:00:00'), ('a', '12:00:01'),
+        ]
+        assert [i.test_id for i in read_due_items(db_path, now=_DUE_NOW, limit=1) or []] == ['b']
+
+        record_failed_due_attempt(
+            db_path, due[0].id, reason='task_client_failed',
+            next_attempt_at=_DUE_NOW + timedelta(minutes=5),
+        )
+        waiting = read_due_items(db_path, now=_DUE_NOW, limit=50)
+        assert [(i.test_id, i.observed_at[-14:-6]) for i in waiting or []] == [
+            ('a', '12:00:00'), ('a', '12:00:01'),
+        ], 'b:12:00:02 waits behind the backed-off b:12:00:01'
+
+    def test_a_failed_attempt_counts_and_holds_the_item(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import enqueue_debt, record_failed_due_attempt
+
+        db_path = tmp_path / 'runs.db'
+        enqueue_debt(db_path, 'p', [_due_item()], now=_DUE_NOW)
+        (item,) = _all_due(db_path)
+        later = _DUE_NOW + timedelta(minutes=10)
+
+        for _ in range(2):
+            assert record_failed_due_attempt(db_path, item.id, reason='no_owner', next_attempt_at=later)
+
+        (item,) = _all_due(db_path)
+        assert (item.attempts, item.last_error, item.next_attempt_at) == (
+            2, 'no_owner', later.isoformat(),
+        )
+        assert item.enqueued_at == _DUE_NOW.isoformat(), 'the stale age never moves'
+        assert record_failed_due_attempt(db_path, 999, reason='x', next_attempt_at=later) is False
+
+    def test_delete_removes_exactly_one_item(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import delete_due_item, enqueue_debt
+
+        db_path = tmp_path / 'runs.db'
+        enqueue_debt(db_path, 'p', [_due_item('a'), _due_item('b')], now=_DUE_NOW)
+        first, second = _all_due(db_path)
+
+        assert delete_due_item(db_path, first.id) is True
+        assert delete_due_item(db_path, first.id) is False
+        assert _all_due(db_path) == [second]
+
+    def test_naming_stamps_only_the_unnamed_stale_items(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import enqueue_debt, name_stale_due_items
+
+        db_path = tmp_path / 'runs.db'
+        stale_before = _DUE_NOW - timedelta(minutes=30)
+        enqueue_debt(db_path, 'p', [_due_item('old')], now=stale_before - timedelta(minutes=1))
+        enqueue_debt(db_path, 'p', [_due_item('edge')], now=stale_before)
+        enqueue_debt(db_path, 'p', [_due_item('new')], now=_DUE_NOW)
+
+        assert name_stale_due_items(db_path, 'esc-1', stale_before=stale_before) == 2
+        assert name_stale_due_items(db_path, 'esc-2', stale_before=stale_before) == 0
+        assert {i.test_id: i.escalation_id for i in _all_due(db_path)} == {
+            'old': 'esc-1', 'edge': 'esc-1', 'new': None,
+        }
+
+    def test_the_summary_counts_the_list_and_its_stale_items(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import enqueue_debt, name_stale_due_items, summarize_due
+
+        db_path = tmp_path / 'runs.db'
+        stale_before = _DUE_NOW - timedelta(minutes=30)
+        assert summarize_due(db_path, stale_before=stale_before) == _empty_summary()
+        for i in range(12):
+            enqueue_debt(
+                db_path, 'p',
+                [_due_item(f't{i % 3}', observed_at=f'2026-08-06T12:00:{i:02d}+00:00')],
+                now=stale_before - timedelta(minutes=12 - i),
+            )
+        enqueue_debt(db_path, 'p', [_due_item('fresh')], now=_DUE_NOW)
+        name_stale_due_items(db_path, 'esc-1', stale_before=stale_before - timedelta(minutes=10))
+
+        summary = summarize_due(db_path, stale_before=stale_before)
+
+        assert summary is not None
+        assert (summary.size, summary.stale, summary.unnamed_stale) == (13, 12, 9)
+        assert summary.oldest is not None and summary.oldest.test_id == 't0'
+        assert [i.observed_at[-8:-6] for i in summary.stale_sample] == [f'{i:02d}' for i in range(10)]
+        assert summary.pending_since == {
+            't0': (stale_before - timedelta(minutes=12)).isoformat(),
+            't1': (stale_before - timedelta(minutes=11)).isoformat(),
+            't2': (stale_before - timedelta(minutes=10)).isoformat(),
+            'fresh': _DUE_NOW.isoformat(),
+        }
+
+    def test_a_failed_ledger_degrades_every_due_entry_point(self, tmp_path: Path, caplog) -> None:
+        from orchestrator.flake_ledger import (
+            delete_due_item,
+            enqueue_debt,
+            name_stale_due_items,
+            read_due_items,
+            record_failed_due_attempt,
+            summarize_due,
+        )
+
+        blocked = _blocked_path(tmp_path)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert enqueue_debt(blocked, 'p', [_due_item()], now=_DUE_NOW) is None
+            assert read_due_items(blocked, now=_DUE_NOW, limit=5) is None
+            assert delete_due_item(blocked, 1) is False
+            assert record_failed_due_attempt(blocked, 1, reason='x', next_attempt_at=_DUE_NOW) is False
+            assert name_stale_due_items(blocked, 'esc-1', stale_before=_DUE_NOW) == 0
+            assert summarize_due(blocked, stale_before=_DUE_NOW) is None
+        logged = [r for r in caplog.records if r.levelno == logging.WARNING and r.exc_info]
+        assert len(logged) == 6, [r.getMessage() for r in logged]
+
+
+def _empty_summary():
+    from orchestrator.flake_ledger import DueSummary
+
+    return DueSummary(
+        size=0, oldest=None, stale=0, unnamed_stale=0, stale_sample=(), pending_since={},
+    )
+
+
+@pytest.mark.asyncio
+class TestOpenDebtStaleHeadCheck:
+    """``open_debt``'s one new argument (task 6934; offline-lane red-path PRD D6): asked
+    about the owner the lazy close read as done, whether the evidence's head contains
+    its fix.  ASYNC-ONLY CLASS."""
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    async def _call(self, tmp_path: Path, answer, *, owner_status: str = 'done'):
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        asked: list[dict] = []
+
+        async def _check(task):
+            asked.append(dict(task))
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        task = _done_task('task-901', 'deadbee')
+        task['status'] = owner_status
+        client = _FakeTaskClient(tasks={'task-901': task}, submit_returns=_task('task-902'))
+        reported: list = []
+        before = _rows(db_path, 'SELECT * FROM flake_debt')
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=client, now=self.LATER,
+            on_regressed_after_resolution=reported.append, head_contains_fix=_check,
+        )
+        after = _rows(db_path, 'SELECT * FROM flake_debt')
+        return row, before, after, asked, reported, client
+
+    async def test_true_is_todays_close_then_re_entry(self, tmp_path: Path) -> None:
+        row, _before, (after,), asked, reported, client = await self._call(tmp_path, True)
+
+        assert [t['id'] for t in asked] == ['task-901']
+        assert row is not None and row.open_count == 2 and row.owner_task_id == 'task-902'
+        assert after['prior_resolving_commit'] == 'deadbee'
+        assert len(reported) == 1
+        assert len(client.submit_calls) == 1
+
+    async def test_false_closes_the_cycle_and_stops(self, tmp_path: Path) -> None:
+        row, (before,), (after,), _asked, reported, client = await self._call(tmp_path, False)
+
+        assert after['resolved_at'] == self.LATER.isoformat()
+        assert after['prior_resolving_commit'] == 'deadbee'
+        assert (after['open_count'], after['last_occurrence_at']) == (
+            before['open_count'], before['last_occurrence_at'],
+        ), 'no upsert'
+        assert after['owner_task_id'] == 'task-901'
+        assert row is not None
+        assert (row.resolved_at, row.prior_resolving_commit) == (self.LATER.isoformat(), 'deadbee')
+        assert reported == [] and client.submit_calls == []
+
+    @pytest.mark.parametrize('answer', [None, RuntimeError('ancestry exploded')])
+    async def test_undecided_or_raising_neither_closes_nor_upserts(
+        self, tmp_path: Path, answer,
+    ) -> None:
+        row, before, after, _asked, reported, client = await self._call(tmp_path, answer)
+
+        assert after == before
+        assert row is not None and row.resolved_at is None and row.owner_task_id == 'task-901'
+        assert row.last_occurrence_at == before[0]['last_occurrence_at']
+        assert reported == [] and client.submit_calls == []
+
+    async def test_an_owner_that_is_not_done_is_never_asked_about(self, tmp_path: Path) -> None:
+        row, _before, _after, asked, reported, _client = await self._call(
+            tmp_path, False, owner_status='pending',
+        )
+
+        assert asked == []
+        assert row is not None and row.resolved_at is None and row.open_count == 1
+        assert reported == []
