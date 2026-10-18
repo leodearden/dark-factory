@@ -1,9 +1,10 @@
 """`/api/v2/dashboard/tasks` — the per-project task snapshot (census and rows).
 
-Fans out over every known project root, reporting four distinct failure
-facts separately (offline / degraded / count-unknown / no root measured)
-rather than collapsing them into one "empty" — see the handler docstring
-for why each is its own signal.
+The default render fans out over every known project root, reporting four
+distinct failure facts separately (offline / degraded / count-unknown / no
+root measured) rather than collapsing them into one "empty" — see the
+handler docstring for why each is its own signal. A ``?terminal=<project>``
+request reads that one root instead.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from dashboard.data.task_snapshot import (
     SnapshotFailure,
     SnapshotHealth,
     TaskSnapshot,
+    acquire_snapshot,
     acquire_terminal_window,
     as_served,
     classify,
@@ -50,8 +52,10 @@ def _unknown_after_contract_break(what: str, broken: DatumContractError) -> Datu
     the same way wherever it happens. The producer validates what it builds,
     so reaching this means a datum crossed a seam it should not have.
     Degrading that one fact, and logging it with its traceback, keeps one bug
-    from 500-ing a payload whose other facts are fine. The reason names the
-    invariant, so a reader is not left guessing which one broke.
+    from 500-ing the response: a broken root leaves every other root's facts
+    standing, and a broken window still answers its key, as an explained
+    unknown carrying its receipt. The reason names the invariant, so a reader
+    is not left guessing which one broke.
     """
     logger.warning(
         '%s breaks the %s datum invariant and is served as UNKNOWN for this '
@@ -101,9 +105,8 @@ async def _terminal_window(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     label: str,
-    snapshots: dict[str, TaskSnapshot],
     *,
-    served_at: datetime,
+    now: datetime,
 ) -> Datum[list[dict]]:
     """The terminal rows ``?terminal=<label>`` asked for, as one ``Datum``.
 
@@ -111,12 +114,12 @@ async def _terminal_window(
     client that wants terminal rows is the only one that should pay for them.
     ``task_snapshot.acquire_terminal_window`` owns what the window bounds and
     why its answer is a ``LOWER_BOUND``; this resolves the label the request
-    names and hands the rows to the shaper every other task row goes through.
+    names, positions the window from that ONE root's cached unit, and hands
+    the rows to the shaper every other task row goes through.
 
-    An unresolvable *label* is ANSWERED — never raised on, and never answered
-    with an empty list. A 500 would lose the rest of a payload that is
-    otherwise fine, and an empty success reads as "this project has no
-    terminal tasks", which is a measurement nobody made.
+    An unresolvable *label* is ANSWERED as unknown, never raised on and never
+    answered with an empty list: an empty success reads as "this project has
+    no terminal tasks", which is a measurement nobody made.
     """
     root = config.project_labels.root_for(label)
     if root is None:
@@ -125,19 +128,43 @@ async def _terminal_window(
             f'no configured project root is labelled {label!r}',
             FRESHNESS_BOUND_SECONDS,
         )
-    snapshot = snapshots.get(label)
+    # The unit every render shares, under the same str(root) key the
+    # collectors use, so inside one TTL this walks no status map of its own.
+    unit = await acquire_snapshot(client, config, root, now=now)
     window = await acquire_terminal_window(
-        client, config, root, now=served_at,
+        client, config, root, now=now,
         # None when this root's census is not fresh, which is exactly what
         # makes the window unpositionable: the count the offset is computed
         # from IS the census's, so the two facts cannot disagree.
-        terminal_total=None if snapshot is None else measured_terminal_total(snapshot),
+        terminal_total=measured_terminal_total(unit),
     )
     if window.value is None:
         return window
     return replace(
-        window, value=shape_terminal_rows(label, window.value, now=served_at),
+        window, value=shape_terminal_rows(label, window.value, now=now),
     )
+
+
+async def _terminal_answer(
+    client: httpx.AsyncClient, config: DashboardConfig, label: str,
+) -> dict[str, object]:
+    """The whole ``?terminal=<label>`` answer: the window under its key, and ``served_at``.
+
+    Two instants, in the default render's order and for its reason: the
+    window and the unit it is positioned from are read at render_at, and
+    served_at is resolved only after both reads return, so the age a client
+    derives from the receipt includes the read time and can never be negative.
+    """
+    render_at = resolve_now(None)
+    window = await _terminal_window(client, config, label, now=render_at)
+    served_at = resolve_now(None)
+    try:
+        validate_datum(window, served_at)
+    except DatumContractError as broken:
+        window = _unknown_after_contract_break(
+            f'the terminal window for {label}', broken,
+        )
+    return {_terminal_key(label): window.to_wire(), 'served_at': served_at.isoformat()}
 
 
 def _terminal_key(project: str) -> str:
@@ -260,13 +287,18 @@ async def api_tasks(
 
     **``?terminal=<project>`` — terminal rows, on request only.** The default
     render stopped fetching them, so its cost no longer grows with the terminal
-    tree at all; a client that wants them asks, and gets ONE ``Datum`` in the
-    ``lower_bound`` state under the flat top-level key
-    ``TASKS_TERMINAL:<project>`` (``_terminal_key``). The key is flat because
-    the client registry applies body keys VERBATIM: the name it reads from the
-    body is the name it stores under, so a per-project key cannot be nested
-    inside a ``TASKS_TERMINAL`` map. Absent the parameter no terminal key is
-    present at all, for the same reason ``DONE_COUNTS`` is absent.
+    tree at all; a client that wants them asks, and the answer is ONE
+    ``Datum`` in the ``lower_bound`` state under the flat top-level key
+    ``TASKS_TERMINAL:<project>`` (``_terminal_key``), plus ``served_at``, and
+    nothing else: no ``TASKS_SNAPSHOT`` and no banner lists, because the
+    client applies exactly that one key (``data.js::startOnDemand``). It reads
+    only that root: its cached unit, for the count the window is positioned
+    from, and the window itself. ``?projection=`` does not apply to it. The
+    key is flat because the client registry applies body keys VERBATIM: the
+    name it reads from the body is the name it stores under, so a per-project
+    key cannot be nested inside a ``TASKS_TERMINAL`` map. Absent the parameter
+    no terminal key is present at all, for the same reason ``DONE_COUNTS`` is
+    absent.
 
     That ``lower_bound`` state IS the disclosure PRD decision 5 substitutes for
     the retired live-PRD terminal-member exemption. Task 4416 asked how a tab
@@ -296,9 +328,12 @@ async def api_tasks(
     """
     config = request.app.state.config
     http_client = request.app.state.http_client
-    # The one request-scoped input this handler takes. Absent is not the same
-    # as empty: no parameter means no terminal read and no terminal key.
+    # A PRESENT parameter, even an empty one, selects the terminal answer.
+    # Absent is not the same as empty: no parameter is the default render,
+    # with no terminal read and no terminal key.
     terminal = request.query_params.get('terminal')
+    if terminal is not None:
+        return JSONResponse(await _terminal_answer(http_client, config, terminal))
     # TWO instants, in this order. render_at is the producer's: it stamps what
     # this render measures and ages its rows, one clock read for all of them.
     # served_at is resolved only AFTER the fan-out returns, and every Datum on
@@ -322,21 +357,6 @@ async def api_tasks(
         projection, http_client, config, now=render_at,
     )
     served_at = resolve_now(None)
-    if terminal is not None:
-        window = await _terminal_window(
-            http_client, config, terminal, snapshots, served_at=served_at,
-        )
-        # Validated here like every other emitted datum, and by the same rule:
-        # a break degrades this one key.
-        try:
-            validate_datum(window, served_at)
-        except DatumContractError as broken:
-            window = _unknown_after_contract_break(
-                f'the terminal window for {terminal}', broken,
-            )
-        return JSONResponse(
-            {_terminal_key(terminal): window.to_wire(), 'served_at': served_at.isoformat()}
-        )
     offline_projects: list[str] = []
     degraded_projects: list[str] = []
     count_unknown_projects: list[str] = []
