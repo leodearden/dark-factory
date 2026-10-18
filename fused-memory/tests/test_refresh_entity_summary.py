@@ -1501,3 +1501,51 @@ class TestEdgeDedupLiveFalkorDB:
             assert len(all_edges['node-c']) == 1
         finally:
             await backend.close()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestActiveEdgePopulationLiveFalkorDB:
+    """On a real server, the single-entity and bulk reads serve one ACTIVE
+    population (task 4714, esc-4714-9).
+
+    A superseded edge (``invalid_at`` set, ``expired_at`` alongside it, as
+    graphiti_core writes them) stays out.  A restored edge (``invalid_at``
+    cleared, ``expired_at`` kept) and a legacy edge that never carried either
+    property both stay in — the server, not a mock, decides that a missing
+    property is NULL.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_and_bulk_reads_agree_on_the_active_population(
+        self, mock_config, edge_dedup_live_graph
+    ):
+        graph_name, graph = edge_dedup_live_graph
+        await graph.query(
+            "CREATE (:Entity {uuid: 'n-99', name: 'Task 99'}), "
+            "(:Entity {uuid: 'n-98', name: 'Task 98'})"
+        )
+        retired = '2024-09-01T10:00:00+00:00'
+        for edge_uuid, invalid_at, expired_at in (
+            ('e-legacy', None, None),
+            ('e-superseded', retired, retired),
+            ('e-restored', None, retired),
+        ):
+            await graph.query(
+                "MATCH (a:Entity {uuid: 'n-99'}), (b:Entity {uuid: 'n-98'}) "
+                'CREATE (a)-[:RELATES_TO {uuid: $uuid, fact: $uuid, '
+                "name: 'DEPENDS_ON', invalid_at: $invalid_at, expired_at: $expired_at}]->(b)",
+                {'uuid': edge_uuid, 'invalid_at': invalid_at, 'expired_at': expired_at},
+            )
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            single = await backend.get_valid_edges_for_node('n-99', group_id=graph_name)
+            bulk = await backend.get_all_valid_edges(group_id=graph_name)
+        finally:
+            await backend.close()
+
+        active = {'e-legacy', 'e-restored'}
+        assert {e['uuid'] for e in single} == active
+        assert {e['uuid'] for e in bulk['n-99']} == active

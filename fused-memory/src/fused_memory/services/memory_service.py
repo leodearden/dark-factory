@@ -1729,24 +1729,13 @@ def _edge_to_dict(e: Any) -> dict:
     }
 
 
-def _edge_field(edge: Any, name: str) -> Any:
-    """Read *name* off an edge that may be a Mapping or an attribute object.
-
-    Same dual handling ``_edge_to_dict`` does: the exact/topological branch
-    hands back ``EdgeDict`` mappings, the fuzzy/semantic branch hands back
-    graphiti-core ``EntityEdge`` objects.  Absent either way -> None.
-    """
-    if isinstance(edge, Mapping):
-        return edge.get(name)
-    return getattr(edge, name, None)
-
-
 def _edge_is_retired(edge: Any) -> bool:
-    """True when the edge's ``invalid_at`` is set — the Python mirror of
-    backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, which explains why
-    ``expired_at`` is deliberately not consulted (a restored edge keeps it).
+    """True when a graphiti-core ``EntityEdge``'s ``invalid_at`` is set — the
+    Python mirror of backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, which
+    explains why ``expired_at`` is deliberately not consulted (a restored edge
+    keeps it).
     """
-    return _edge_field(edge, 'invalid_at') is not None
+    return getattr(edge, 'invalid_at', None) is not None
 
 
 # Defensive: resolve the embedding-provider's RateLimitError class at module
@@ -8014,10 +8003,6 @@ class MemoryService:
 
         results = []
         for edge in edges:
-            fact = getattr(edge, 'fact', str(edge))
-            valid_at = getattr(edge, 'valid_at', None)
-            invalid_at = getattr(edge, 'invalid_at', None)
-
             # Skip superseded edges (invalid_at set means the fact has been
             # replaced by a newer edge).  Check this before anything else to
             # avoid unnecessary work on edges that will be discarded, and so a
@@ -8025,7 +8010,11 @@ class MemoryService:
             if _edge_is_retired(edge):
                 continue
 
-            temporal = _serialize_temporal(valid_at, invalid_at)
+            fact = getattr(edge, 'fact', str(edge))
+            temporal = _serialize_temporal(
+                getattr(edge, 'valid_at', None),
+                getattr(edge, 'invalid_at', None),
+            )
 
             # Extract entity names from source/target nodes
             entities = []
@@ -8198,12 +8187,11 @@ class MemoryService:
         get_valid_edges_for_node traversal returns every valid edge for the
         resolved node uuid(s), uncapped. Both branches exclude invalidated
         edges (invalid_at set): the exact branch at the Cypher level
-        (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, plus a
-        defence-in-depth Python skip in its dedup loop), and the fuzzy branch
-        via `_edge_is_retired` applied to the search() results, mirroring
-        search()'s own drop (task 312) — so neither branch surfaces superseded
-        facts (task 2726). Neither filters on `expired_at`: a restored edge
-        keeps it (task 4714).
+        (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE), and the fuzzy
+        branch via `_edge_is_retired` applied to the search() results,
+        mirroring search()'s own drop (task 312) — so neither branch surfaces
+        superseded facts (task 2726). Neither filters on `expired_at`: a
+        restored edge keeps it (task 4714).
 
         EXACT vs. FUZZY edge sets are fundamentally different — TOPOLOGICAL
         vs. SEMANTIC — and comparing them across branches will produce
@@ -8279,14 +8267,6 @@ class MemoryService:
             edges = []
             for edge_list in edge_lists:
                 for e in edge_list:
-                    # Defence in depth over the Cypher predicate (task 4714): a
-                    # retired edge must neither be returned nor consume the
-                    # dedup slot for its uuid — otherwise a duplicate-name node
-                    # contributing the same uuid as a LIVE edge would have that
-                    # live edge suppressed by its retired twin.  Hence the skip
-                    # sits ahead of the `seen` bookkeeping, not after it.
-                    if _edge_is_retired(e):
-                        continue
                     edge_uuid = e.get('uuid')
                     if edge_uuid is not None:
                         if edge_uuid in seen:
