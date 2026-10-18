@@ -9600,6 +9600,42 @@ def test_run_census_looks_up_and_resolves_a_harness_filing_in_the_harness_projec
     assert row["project_root"] == _HARNESS.project_root
 
 
+def test_run_census_links_a_recurrence_to_its_standing_promotions_entry_not_a_same_title_one(tmp_path):
+    cb = _codebook_with_standing("promoted")
+    cb["entries"].append({**_promoted_entry(), "id": "entry-same-title"})
+    kwargs = _verified_run_kwargs(tmp_path, cb)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.filed_ticket_ids == ["tkt_1"]
+    entries = {entry["id"]: entry for entry in codebook.load(kwargs["codebook_path"])["entries"]}
+    [link] = entries["entry-spurious"]["filed_tickets"]
+    assert (link["ticket"], link["step"]) == ("tkt_1", "curator")
+    assert "filed_tickets" not in entries["entry-same-title"]
+
+
+def test_run_census_writes_no_artifact_when_filing_leaves_the_codebook_invalid(tmp_path, monkeypatch):
+    resolve_tickets = disposition.resolve_tickets
+
+    def corrupting_resolve_tickets(cb, **kwargs):
+        result, resolutions = resolve_tickets(cb, **kwargs)
+        for entry in result["entries"]:
+            for row in entry.get("filed_tickets") or []:
+                row["step"] = "guess"
+        return result, resolutions
+
+    monkeypatch.setattr(disposition, "resolve_tickets", corrupting_resolve_tickets)
+    kwargs = _keyed_kwargs(tmp_path, FakeTaskStore())
+
+    with pytest.raises(RuntimeError, match="codebook filing produced an invalid codebook"):
+        mod.run_census(**kwargs)
+
+    assert kwargs["submit_fn"].calls, "the run reached the curator before the check"
+    assert not kwargs["report_path"].exists()
+    assert not kwargs["report_path"].with_suffix(".json").exists()
+    assert not kwargs["codebook_path"].exists()
+
+
 # ---------------------------------------------------------------------------
 # task 6403 step-15: RED — contract §6 (D6): a structural finding is promoted
 # and recorded in the codebook, listed under ## Structural, and NOT filed.
@@ -9775,8 +9811,9 @@ def test_run_census_backfills_a_historical_census_task_onto_its_entry_once(tmp_p
     assert "5120 -> entry-a" in section
     assert "5330" in section
 
+    later_store = _backfill_store()
     second = _duplicate_only_kwargs(
-        tmp_path, _backfill_store(),
+        tmp_path, later_store,
         codebook_dict=codebook.load(first["codebook_path"]),
         date="2026-07-21",
         run_id="census-dark_factory-20260721",
@@ -9787,8 +9824,15 @@ def test_run_census_backfills_a_historical_census_task_onto_its_entry_once(tmp_p
 
     [entry] = [e for e in codebook.load(second["codebook_path"])["entries"] if e["id"] == "entry-a"]
     assert len(entry["filed_tickets"]) == 1
+    assert codebook.load(second["codebook_path"])[codebook.HISTORICAL_BACKFILL] == {
+        "run_id": first["run_id"], "unmatched_task_ids": [5330],
+    }
+    assert later_store.arguments_of("find_tasks_by_metadata") == []
     assert _run_record(second)["filing"]["backfill"]["linked"] == []
-    assert "5120 -> entry-a" not in _filed_tasks_text(second)
+    assert _run_record(second)["filing"]["backfill"]["done_in_run"] == first["run_id"]
+    section = _filed_tasks_text(second)
+    assert "5120 -> entry-a" not in section
+    assert "5330" not in section
 
 
 def test_run_census_resolves_a_ticket_carried_over_from_an_earlier_run(tmp_path):

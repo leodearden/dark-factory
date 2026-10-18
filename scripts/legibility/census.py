@@ -1761,24 +1761,27 @@ def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
 
 def _split_fileable(
     verified: list[dict], cb: dict,
-) -> tuple[list[dict], dict[str | None, filing_policy.WithheldCluster]]:
-    """Partition *verified* by ``filing_policy.is_fileable``, counting each
-    cluster's sightings in the post-merge codebook *cb*. The clusters held
-    back are keyed by title, the key promotion resolves a cluster by: only a
+) -> tuple[list[bool], dict[str | None, filing_policy.WithheldCluster]]:
+    """Whether this run files each of *verified*, one flag per cluster in
+    order, counting each cluster's sightings in the post-merge codebook *cb*:
+    a structural one never (``disposition.files``, contract §6), a mechanical
+    one by ``filing_policy.is_fileable``. The mechanical clusters held back
+    are keyed by title, the key promotion resolves a cluster by: only a
     held-back cluster that is then PROMOTED is marked, and reported, withheld."""
     sighting_counts = _sighting_counts_by_title(cb)
-    fileable: list[dict] = []
+    files_now: list[bool] = []
     held_back: dict[str | None, filing_policy.WithheldCluster] = {}
     for cluster in verified:
         title = cluster.get("title")
         sighting_count = sighting_counts.get(title, 0)
-        if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
-            fileable.append(cluster)
-        else:
+        mechanical = disposition.files(cluster["verdict"])
+        fileable = mechanical and filing_policy.is_fileable(cluster, sighting_count=sighting_count)
+        files_now.append(fileable)
+        if mechanical and not fileable:
             held_back[title] = filing_policy.WithheldCluster(
                 title=title, sighting_count=sighting_count,
             )
-    return fileable, held_back
+    return files_now, held_back
 
 
 _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
@@ -1834,19 +1837,20 @@ class PendingFiling:
         )
 
 
-def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
+def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[PendingFiling]:
     """Every cluster to file this run, from the post-merge codebook *cb*.
 
-    Each *fileable* cluster is paired with the releasable withheld entry of
-    its title, if any -- a recurrence coded as a fresh candidate files one
-    ticket for its title, not two. Every other releasable withheld entry that
+    Each *fileable* cluster, given with the entry it was promoted to -- this
+    run, or by the standing promotion its recurrence was routed to -- or
+    None, is paired with the releasable withheld entry of its title, if any
+    -- a recurrence coded as a fresh candidate files one ticket for its
+    title, not two. Every other releasable withheld entry that
     ``filing_policy.is_fileable`` now accepts at its title's sighting count
     follows. An entry withheld THIS run is never among them: the split that
     withheld it used that same count.
 
     Each is paired with the entry its back-link lands on: the withheld entry
-    it releases, else the last entry carrying its title."""
-    entry_id_of_title = {entry["title"]: entry["id"] for entry in cb.get("entries") or []}
+    it releases, else the entry it was promoted to."""
     releasable = [
         entry for entry in cb.get("entries") or []
         if entry.get(ENTRY_FILING_KEY) == ENTRY_FILING_WITHHELD
@@ -1857,10 +1861,9 @@ def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
         entry_id_by_title.setdefault(entry["title"], entry["id"])
 
     queue = []
-    for cluster in fileable:
+    for cluster, promoted_entry_id in fileable:
         withheld_entry_id = entry_id_by_title.get(cluster.get("title"))
-        entry_id = withheld_entry_id or entry_id_of_title.get(cluster.get("title"))
-        queue.append(PendingFiling(cluster, withheld_entry_id, entry_id))
+        queue.append(PendingFiling(cluster, withheld_entry_id, withheld_entry_id or promoted_entry_id))
     paired = {pending.withheld_entry_id for pending in queue}
     sighting_counts = _sighting_counts_by_title(cb)
     for entry in releasable:
@@ -1940,6 +1943,17 @@ def _find_adjudicated_candidate(cb: dict, title: str | None) -> dict | None:
         ):
             return candidate
     return same_title[-1] if same_title else None
+
+
+def _standing_entry_id(cb: dict, title: str | None) -> str | None:
+    """The live entry the merger routes a recurrence of *title* to: that of
+    the standing promoted candidate (:func:`_find_adjudicated_candidate`
+    step 1), else ``None``."""
+    standing = _find_adjudicated_candidate(cb, title)
+    if standing is None or standing.get("disposition") != "promoted":
+        return None
+    entry_id = standing.get("promoted_to")
+    return entry_id if any(entry.get("id") == entry_id for entry in cb.get("entries") or []) else None
 
 
 DROP_NO_STANDING = "no-standing-candidate"
@@ -2557,19 +2571,23 @@ def run_census(
     entry and is listed in the report, while one whose verdict was dropped is
     neither filed nor listed)
     -> ``disposition.backfill``, which links every historical
-    ``source=legibility_census`` task to the entry its title was filed under
-    -> ``_filing_queue``, which adds every earlier-withheld entry that
-    has since recurred -> ``build_task_payloads`` over that queue ->
-    ``disposition.dispose``, contract §8 over *task_store*: a finding whose
-    key a live, accepted or done task already carries, or that a live task
-    matches semantically, is linked to that task and never refiled; the rest
-    go to *submit_fn*, best-effort; and if any key lookup cannot run, NOTHING
-    is filed (work routed for a withheld entry marks it filed, so it is never
-    filed twice; a raised exception, or a result carrying no ticket id, is
-    logged and reported, never counted in ``filed_ticket_ids``) -> each
-    routed decision's C1 back-link onto its entry, then
-    ``disposition.resolve_tickets`` within its D7 budget -> write the
-    JSON record beside *report_path* (``build_census_record``) and the
+    ``source=legibility_census`` task to the entry its title was filed under,
+    in the first run it can reach the store -> ``_filing_queue``, which pairs
+    each fileable cluster with the entry it was promoted to and adds every
+    earlier-withheld entry that has since recurred -> ``build_task_payloads``
+    over that queue -> ``disposition.dispose``, contract §8 over
+    *task_store*: a finding whose key a live, accepted or done task already
+    carries, that a live task matches semantically, or whose key an earlier
+    finding of this run was routed under, is linked to that work and never
+    refiled; the rest go to *submit_fn*, best-effort; and if any key lookup
+    cannot run, NOTHING is filed (work routed for a withheld entry marks it
+    filed, so it is never filed twice; a raised exception, or a result
+    carrying no ticket id, is logged and reported, never counted in
+    ``filed_ticket_ids``) -> each routed decision's C1 back-link onto its
+    entry, then ``disposition.resolve_tickets`` within its D7 budget ->
+    ``codebook.validate`` again (raises and aborts before any artifact is
+    written) -> write the JSON record beside *report_path*
+    (``build_census_record``) and the
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
     (done-count from *status_fetcher*, watermark from the mining window) ->
     *commit* of report + record + codebook + state -> ledger every merged
@@ -2932,16 +2950,14 @@ def run_census(
     # Split BEFORE promotion so a withheld cluster's entry is marked as it is
     # created. Promotion cannot change the count: it only copies a candidate's
     # sightings into its entry, and _sighting_counts_by_title dedups by session.
-    # A structural cluster (contract §6, D6) is promoted but never split: it
-    # is recorded, not filed.
-    fileable, held_back = _split_fileable(
-        [cluster for cluster in verified if disposition.files(cluster["verdict"])], updated_codebook,
-    )
+    # A structural cluster (contract §6, D6) is promoted but never filed.
+    files_now, held_back = _split_fileable(verified, updated_codebook)
     marked_withheld: list[filing_policy.WithheldCluster] = []
     promoted: list[census_findings.Adjudication] = []
     refuted: list[census_findings.Adjudication] = []
+    promoted_entry_ids: dict[int, str] = {}
 
-    for cluster in verified:
+    for index, cluster in enumerate(verified):
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
             # A verify verdict this run PAID FOR that resolves to no pending
@@ -2962,6 +2978,9 @@ def run_census(
                 # test_dropped_verdict_contradiction_marker_inverts_between_the_loops.
                 contradicting_disposition="rejected",
             ))
+            standing_entry_id = _standing_entry_id(updated_codebook, cluster.get("title"))
+            if standing_entry_id is not None:
+                promoted_entry_ids[index] = standing_entry_id
             continue
         found = cluster["verdict"]
         entry_fields = {
@@ -2982,7 +3001,13 @@ def run_census(
             updated_codebook, cand_id, entry_fields, finding=cluster["finding"],
         )
         promoted.append(census_findings.Adjudication(entry_fields["id"], found, cluster.get("cause")))
+        promoted_entry_ids[index] = entry_fields["id"]
 
+    fileable = [
+        (cluster, promoted_entry_ids.get(index))
+        for index, (cluster, fileable_now) in enumerate(zip(verified, files_now, strict=True))
+        if fileable_now
+    ]
     withheld = tuple(marked_withheld)
     structural = disposition.structural_findings(
         updated_codebook,
@@ -3090,6 +3115,9 @@ def run_census(
     updated_codebook, resolutions = disposition.resolve_tickets(
         updated_codebook, store=task_store, run_id=run_id,
     )
+    # The backfill, back-links and resolutions changed the codebook after the
+    # merge check, so it is held to the schema again before any artifact.
+    _require_valid(updated_codebook, "filing")
     filing_report = disposition.FilingReport(disposal, resolutions, backfilled, structural)
     filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
     cross_project_tickets = tuple(
@@ -3206,10 +3234,6 @@ def run_census(
             "fail safe until the next successful census",
             exc,
         )
-
-    # The filing back-links changed the codebook after the merge check, so it
-    # is held to the schema again before it is written.
-    _require_valid(updated_codebook, "filing")
 
     # codebook.dump() and advance_census_state() are adjacent on purpose
     # (reviewer_comprehensive finding #4): nothing else here can raise

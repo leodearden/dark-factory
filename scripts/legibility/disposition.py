@@ -179,6 +179,8 @@ class Decision:
         """The contract §7 disposition this decision gives the finding."""
         if self.standing is Standing.ACCEPTED:
             return f"accepted:{self.task_id}"
+        if self.standing is Standing.DONE:
+            return f"open (task {self.task_id} done; §8 step 1c re-verify not yet run)"
         if self.task_id is not None:
             return f"filed:{self.task_id}"
         if self.resolution is not None:
@@ -338,6 +340,17 @@ def _decide(
     return _file_with_curator(filing, submit, match.note)
 
 
+def _same_key_as(filing: Filing, earlier: Decision) -> Decision:
+    """*filing* linked to the work *earlier*, a filing of this run carrying
+    its key, was routed to."""
+    return replace(
+        earlier,
+        filing=filing,
+        step=Step.KEY,
+        note=f"same finding key as {earlier.filing.title!r}, routed earlier this run",
+    )
+
+
 def dispose(
     filings: Iterable[Filing],
     *,
@@ -345,8 +358,10 @@ def dispose(
     submit: Callable[..., Any] | None,
 ) -> Disposal:
     """Run contract §8 over *filings*. Every step-1 lookup runs before any
-    filing, so a store that cannot answer one files nothing at all. With
-    *submit* None (a dry run) the protocol stops before step 3."""
+    filing, so a store that cannot answer one files nothing at all. A filing
+    whose key an earlier filing of this run was already routed under is
+    linked to that work, never filed again. With *submit* None (a dry run)
+    the protocol stops before step 3."""
     filings = tuple(filings)
     try:
         found = [_key_lookup(filing, store) for filing in filings]
@@ -355,23 +370,29 @@ def dispose(
         return Disposal(decisions=(), unfiled=filings, unreachable=str(exc))
     decisions: list[Decision] = []
     unfiled: list[Filing] = []
+    routed_by_key: dict[str, Decision] = {}
     for filing, hit in zip(filings, found, strict=True):
-        decision = _decide(filing, hit, store=store, submit=submit)
+        earlier = None if filing.finding_key is None else routed_by_key.get(filing.finding_key)
+        decision = (
+            _decide(filing, hit, store=store, submit=submit) if earlier is None else _same_key_as(filing, earlier)
+        )
         if decision is None:
             unfiled.append(filing)
-        else:
-            decisions.append(decision)
+            continue
+        decisions.append(decision)
+        if decision.routed and filing.finding_key is not None:
+            routed_by_key.setdefault(filing.finding_key, decision)
     return Disposal(tuple(decisions), tuple(unfiled))
 
 
-
-def _row_identity(row: Mapping[str, Any]) -> tuple[Any, Any, Any]:
-    return row.get("ticket"), row.get("task_id"), row.get("step")
+def _row_identity(row: Mapping[str, Any]) -> tuple[Any, Any]:
+    return row.get("ticket"), row.get("task_id")
 
 
 def with_back_links(cb: dict, links: Iterable[BackLink]) -> dict:
-    """A new codebook with each link's C1 row on its entry; a row already
-    there is not added twice."""
+    """A new codebook with each link's C1 row on its entry; a row naming a
+    ticket and task already there is not added twice, whichever step
+    decided it."""
     result = copy.deepcopy(cb)
     entries = {entry.get("id"): entry for entry in result.get("entries") or []}
     for link in links:
@@ -434,51 +455,58 @@ def resolve_tickets(
 ) -> tuple[dict, Resolutions]:
     """Resolve every unresolved ticket row in *cb* within *budget_secs* in
     total (D7), writing each decided outcome onto its row of a new codebook.
-    It never writes task metadata (T4)."""
+    A ticket several rows hold is asked about once. It never writes task
+    metadata (T4)."""
     result = copy.deepcopy(cb)
     deadline = clock() + budget_secs
-    open_tickets = _open_tickets(result, run_id)
+    outcomes: dict[tuple[str, str], task_store.TicketOutcome] = {}
     resolved: list[ResolvedTicket] = []
     pending: list[str] = []
     errors: list[str] = []
     budget_exhausted = False
-    for index, open_ticket in enumerate(open_tickets):
-        remaining = deadline - clock()
-        if remaining <= 0:
-            budget_exhausted = True
-            pending.extend(unsent.row["ticket"] for unsent in open_tickets[index:])
-            break
+    for open_ticket in _open_tickets(result, run_id):
         row = open_ticket.row
-        try:
-            outcome = store.resolve_ticket(
-                row["project_root"], row["ticket"], timeout_secs=min(remaining, RESOLVE_CALL_CAP_SECS),
-            )
-        except task_store.StoreUnreachable as exc:
-            errors.append(f"{row['ticket']}: {exc}")
-            continue
+        asked = (row["project_root"], row["ticket"])
+        if asked not in outcomes:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                budget_exhausted = True
+                pending.append(row["ticket"])
+                continue
+            try:
+                outcomes[asked] = store.resolve_ticket(
+                    row["project_root"], row["ticket"], timeout_secs=min(remaining, RESOLVE_CALL_CAP_SECS),
+                )
+            except task_store.StoreUnreachable as exc:
+                errors.append(f"{row['ticket']}: {exc}")
+                continue
+        outcome = outcomes[asked]
         if outcome.undecided:
             pending.append(row["ticket"])
             continue
         row.update(resolution=_RESOLUTION_OF[outcome.status].value, task_id=outcome.task_id)
         resolved.append(ResolvedTicket(open_ticket.entry_id, row["ticket"], row["project_root"], outcome, open_ticket.carried))
     codebook.assert_no_deletion(cb, result)
-    return result, Resolutions(tuple(resolved), tuple(pending), budget_exhausted, tuple(errors))
+    return result, Resolutions(tuple(resolved), tuple(dict.fromkeys(pending)), budget_exhausted, tuple(errors))
 
 
 @dataclass(frozen=True)
 class Backfill:
     """The historical census tasks one backfill linked, as (task id, entry id),
-    and those whose title matched no entry."""
+    and those whose title matched no entry. *done_in_run* names the earlier
+    run whose backfill already did this, when this one looked nothing up."""
 
     linked: tuple[tuple[int, str], ...] = ()
     unmatched: tuple[task_store.TaskHit, ...] = ()
     error: str | None = None
+    done_in_run: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
             "linked": [{"task_id": task_id, "entry_id": entry_id} for task_id, entry_id in self.linked],
             "unmatched": [{"task_id": hit.task_id, "title": hit.title} for hit in self.unmatched],
             "error": self.error,
+            "done_in_run": self.done_in_run,
         }
 
 
@@ -509,9 +537,14 @@ def backfill(
     cb: dict, *, store: task_store.TaskStore, project_root: str, run_id: str,
 ) -> tuple[dict, Backfill]:
     """Link every ``source=legibility_census`` task to the entry its title was
-    filed under (plans/census-incremental-prd.md L4). Idempotent: a task
-    linked anywhere is skipped, and so is an entry whose open ticket row the
-    ticket pass owns. An unreachable store links nothing and never raises."""
+    filed under (plans/census-incremental-prd.md L4), once: the codebook's
+    ``codebook.HISTORICAL_BACKFILL`` marker records the run that did, and any
+    later run looks nothing up. A task linked anywhere is skipped, and so is
+    an entry whose open ticket row the ticket pass owns. An unreachable store
+    links nothing, sets no marker and never raises."""
+    done = cb.get(codebook.HISTORICAL_BACKFILL)
+    if done is not None:
+        return cb, Backfill(done_in_run=done["run_id"])
     try:
         hits = store.find_tasks_by_metadata(project_root, key=SOURCE_METADATA, value=CENSUS_SOURCE)
     except task_store.StoreUnreachable as exc:
@@ -535,7 +568,11 @@ def backfill(
                 resolution=Resolution.CREATED, step=Step.CURATOR,
             ))
     linked = tuple((link.task_id, link.entry_id) for link in links if link.task_id is not None)
-    return with_back_links(cb, links), Backfill(linked, tuple(unmatched))
+    result = with_back_links(cb, links)
+    result[codebook.HISTORICAL_BACKFILL] = {
+        "run_id": run_id, "unmatched_task_ids": [hit.task_id for hit in unmatched],
+    }
+    return result, Backfill(linked, tuple(unmatched))
 
 
 @dataclass(frozen=True)

@@ -132,6 +132,7 @@ def test_a_done_task_carrying_the_key_is_linked_and_not_refiled() -> None:
 
     assert submit.calls == []
     assert (decision.step, decision.standing, decision.task_id) == (Step.KEY, Standing.DONE, 40)
+    assert decision.disposition() == "open (task 40 done; §8 step 1c re-verify not yet run)"
     link = decision.back_link(_RUN)
     assert link is not None
     assert (link.task_id, link.step, link.resolution) == (40, Step.KEY, Resolution.EXISTING)
@@ -280,6 +281,49 @@ def test_an_unkeyed_filing_skips_the_key_lookup() -> None:
 
     assert "find_tasks_by_metadata" not in store.tools_called()
     assert decision.step is Step.CURATOR
+
+
+def test_a_filing_whose_key_was_routed_earlier_this_run_is_linked_to_that_work_and_never_filed() -> None:
+    store = FakeTaskStore()
+    submit = _Submit()
+    first = _filing(_KEY_A, "first title", entry_id="entry-a")
+    second = _filing(_KEY_A, "second title", entry_id="entry-b")
+    other = _filing(_KEY_B, "another finding", entry_id="entry-c")
+
+    disposal = disposition.dispose([first, second, other], store=store, submit=submit)
+
+    assert [payload["title"] for payload in submit.calls] == [first.payload["title"], other.payload["title"]]
+    assert store.arguments_of("search_tasks") == [
+        {"project_root": _ROOT, "query": filing.query, "score_threshold": disposition.SEMANTIC_SCORE_THRESHOLD}
+        for filing in (first, other)
+    ]
+    by_title = {decision.filing.title: decision for decision in disposal.decisions}
+    linked = by_title["second title"]
+    assert (linked.step, linked.ticket, linked.routed) == (Step.KEY, by_title["first title"].ticket, True)
+    assert linked.note is not None
+    assert "first title" in linked.note
+    assert disposal.unfiled == ()
+
+
+def test_a_filing_whose_key_found_no_routed_work_earlier_this_run_is_decided_on_its_own() -> None:
+    submit = _Submit(raises=RuntimeError("curator down"))
+    filings = [_filing(_KEY_A, "first title"), _filing(_KEY_A, "second title")]
+
+    disposal = disposition.dispose(filings, store=FakeTaskStore(), submit=submit)
+
+    assert len(submit.calls) == 2
+    assert [decision.step for decision in disposal.decisions] == [Step.CURATOR, Step.CURATOR]
+
+
+def test_same_key_filings_on_one_entry_leave_one_row_and_one_resolve_call() -> None:
+    filings = [_filing(_KEY_A, "first title", entry_id="entry-a"), _filing(_KEY_A, "second title", entry_id="entry-a")]
+    disposal = disposition.dispose(filings, store=FakeTaskStore(), submit=_Submit())
+    links = [link for decision in disposal.decisions if (link := decision.back_link(_RUN)) is not None]
+
+    cb = disposition.with_back_links(_codebook(_entry("entry-a")), links)
+
+    assert len(links) == 2
+    assert [row["ticket"] for row in _rows(cb, "entry-a")] == ["tkt_1"]
 
 
 # The submit_task seam's contract (fused_memory/server/tools.py::submit_task,
@@ -479,6 +523,30 @@ def test_an_unreachable_ticket_stays_unresolved_and_the_next_one_is_still_resolv
 
 
 @pytest.mark.parametrize(
+    ("outcome", "expected_rows", "expected_pending"),
+    [
+        (_outcome(task_store.TicketStatus.CREATED, 7), [("created", 7), ("created", 7)], ()),
+        (_outcome(task_store.TicketStatus.FAILED, reason="timeout"), [(None, None), (None, None)], ("tkt_1",)),
+    ],
+    ids=["decided", "undecided"],
+)
+def test_a_ticket_two_rows_hold_is_asked_about_once(outcome, expected_rows, expected_pending) -> None:
+    cb = _codebook(
+        _entry("entry-a", filed_tickets=[_row("tkt_1")]),
+        _entry("entry-b", filed_tickets=[_row("tkt_1", step=Step.KEY)]),
+    )
+    store = FakeTaskStore(resolve_outcomes={"tkt_1": outcome})
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    assert len(store.arguments_of("resolve_ticket")) == 1
+    assert [
+        (row["resolution"], row["task_id"]) for entry_id in ("entry-a", "entry-b") for row in _rows(result, entry_id)
+    ] == expected_rows
+    assert resolutions.pending == expected_pending
+
+
+@pytest.mark.parametrize(
     ("outcome", "expected"),
     [
         (_outcome(task_store.TicketStatus.CREATED, 77), (Resolution.CREATED, 77, "filed:77")),
@@ -595,13 +663,16 @@ def test_backfill_links_historical_census_tasks_to_entries_by_exact_title() -> N
     assert codebook.validate(result) == []
 
 
-def test_backfill_is_idempotent() -> None:
+def test_backfill_runs_once_and_records_the_run_that_did() -> None:
     once, _ = disposition.backfill(_historical_codebook(), store=_historical_store(), project_root=_ROOT, run_id=_RUN)
+    later = _historical_store()
 
-    twice, backfill = disposition.backfill(once, store=_historical_store(), project_root=_ROOT, run_id=_RUN)
+    twice, backfill = disposition.backfill(once, store=later, project_root=_ROOT, run_id="census-dark_factory-20261018")
 
+    assert once[codebook.HISTORICAL_BACKFILL] == {"run_id": _RUN, "unmatched_task_ids": [_UNMATCHED.task_id]}
     assert twice == once
-    assert backfill.linked == ()
+    assert later.calls == []
+    assert backfill == disposition.Backfill(done_in_run=_RUN)
 
 
 def test_an_unreachable_backfill_changes_nothing_and_never_raises() -> None:
@@ -612,6 +683,7 @@ def test_an_unreachable_backfill_changes_nothing_and_never_raises() -> None:
     )
 
     assert result == cb
+    assert codebook.HISTORICAL_BACKFILL not in result
     assert backfill.linked == ()
     assert backfill.error is not None
     assert "find_tasks_by_metadata" in backfill.error

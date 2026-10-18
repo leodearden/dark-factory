@@ -191,6 +191,20 @@ _CANDIDATE_SCHEMA = {
     "required": ["id", "title", "first_seen", "disposition", "sightings"],
 }
 
+HISTORICAL_BACKFILL = "historical_backfill"
+"""The top-level key recording the one run whose backfill linked the census
+tasks filed before back-links existed (plans/census-incremental-prd.md L4),
+and the task ids it matched to no entry."""
+
+_HISTORICAL_BACKFILL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "run_id": _RUN_ID_SCHEMA,
+        "unmatched_task_ids": {"type": "array", "items": {"type": "integer"}},
+    },
+    "required": ["run_id", "unmatched_task_ids"],
+}
+
 V2_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -198,6 +212,7 @@ V2_SCHEMA = {
         "version": {"const": 2},
         "entries": {"type": "array", "items": _ENTRY_SCHEMA},
         "candidates": {"type": "array", "items": _CANDIDATE_SCHEMA},
+        HISTORICAL_BACKFILL: _HISTORICAL_BACKFILL_SCHEMA,
     },
     "required": ["version", "entries"],
 }

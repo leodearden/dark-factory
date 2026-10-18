@@ -2804,6 +2804,27 @@ def test_a_malformed_finding_key_on_a_filed_ticket_row_is_still_rejected():
     assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "fk-ZZZ")
 
 
+def test_a_historical_backfill_marker_validates():
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = {"run_id": _C1_RUN, "unmatched_task_ids": [5330]}
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize(
+    "marker, path, offending",
+    [
+        ({"run_id": "", "unmatched_task_ids": []}, "run_id", ""),
+        ({"run_id": _C1_RUN, "unmatched_task_ids": ["5330"]}, "unmatched_task_ids/0", "5330"),
+        ({"unmatched_task_ids": []}, "", "run_id"),
+    ],
+    ids=["empty-run", "string-task-id", "no-run"],
+)
+def test_validate_rejects_a_malformed_historical_backfill_marker(marker, path, offending):
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = marker
+    assert _c1_errors_naming(codebook, f"{mod.HISTORICAL_BACKFILL}/{path}".rstrip("/"), offending)
+
+
 def test_filed_ticket_errors_accepts_a_well_formed_row_keyed_or_not():
     assert mod.filed_ticket_errors(_c1_ticket()) == []
     assert mod.filed_ticket_errors(_c1_ticket(finding_key=None)) == []
