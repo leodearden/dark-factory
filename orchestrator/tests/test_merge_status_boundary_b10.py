@@ -19,6 +19,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -264,3 +265,37 @@ async def test_b10_cross_run_lookup_p99_is_under_50_ms(
         f'on a store of {seeded.events} events / {seeded.merge_finalized} merge_finalized rows; '
         f'{remeasured.describe()}; load average {os.getloadavg()}'
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', sorted(_SHAPES))
+async def test_b10_every_cross_run_read_searches_a_partial_index(
+    production_sized_store: _SeededStore, shape: str, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = production_sized_store
+    reads = await _recorded_reads(seeded.store, shape, tmp_path / 'escalations')
+    selects = _selects_issued(seeded.store, reads, monkeypatch)
+    assert len(selects) == len(reads), (shape, reads, selects)
+    assert _plans_off_a_partial_index(seeded.store.db_path, selects) == [], shape
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('shape', 'dropped'), [
+    ('request_id_miss', 'idx_mf_request_id'),
+    ('request_id_miss', 'idx_mf_absorbs'),
+    ('request_id_miss', 'idx_mf_superseded_by'),
+    ('branch_miss', 'idx_mf_branch'),
+    ('task_id_miss', 'idx_mf_task_id'),
+])
+async def test_b10_index_check_flags_the_read_whose_partial_index_is_dropped(
+    shape: str, dropped: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = EventStore(tmp_path / 'runs.db', 'run-current')
+    reads = await _recorded_reads(store, shape, tmp_path / 'escalations')
+    selects = _selects_issued(store, reads, monkeypatch)
+    with closing(sqlite3.connect(store.db_path)) as conn:
+        conn.execute(f'DROP INDEX {dropped}')
+        conn.commit()
+    off = _plans_off_a_partial_index(store.db_path, selects)
+    assert len(off) == 1, off
