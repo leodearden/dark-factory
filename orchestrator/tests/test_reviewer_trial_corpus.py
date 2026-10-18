@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 
 import pytest
+from _briefing_helpers import (
+    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+)
 
+from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
     CorpusManifest,
@@ -256,6 +260,33 @@ def _make_context(authored: bool = False) -> FixtureContext:
         plan_reason='no plan.json survives',
         verification=None if authored else {'diff_reproduces': True},
     )
+
+
+class TestFixtureTaskRecordAsTaskDict:
+    """The fixture's task record crosses into the production briefing as a Taskmaster task dict."""
+
+    def test_the_dict_carries_taskmasters_keys(self) -> None:
+        task = _make_context().task.as_task_dict()
+
+        assert set(task) == {'id', 'title', 'description', 'details', 'testStrategy'}
+        assert task['testStrategy'] == 'Assert the report total includes the scorer cost.'
+
+    @pytest.mark.asyncio
+    async def test_every_field_reaches_the_production_task_formatter(
+        self, briefing: BriefingAssembler,
+    ) -> None:
+        record = _make_context().task
+
+        prompt = await briefing.build_architect_prompt(
+            record.as_task_dict(), worktree=None, context='',
+        )
+
+        assert record.id is not None
+        assert record.id in prompt
+        assert record.title in prompt
+        assert record.description in prompt
+        assert record.details in prompt
+        assert record.test_strategy in prompt
 
 
 class TestFixtureContextRoundTrip:
