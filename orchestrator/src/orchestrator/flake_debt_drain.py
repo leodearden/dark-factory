@@ -409,7 +409,9 @@ def _stale_detail(summary: DueSummary) -> str:
         'ancestry_unreadable means it could not tell whether the merge sha contains a '
         'finished de-flake task\'s fix; owner_deferred means a filed task has not left '
         'deferred. The drain retries every item on its own and resolves this record '
-        'once no item is stale; nothing needs re-filing.',
+        'once no item is stale; nothing needs re-filing for task_client_failed. A '
+        'persistent no_owner means the task store refused the filing, and the operator '
+        'must act.',
     ]
     return '\n'.join(lines)
 
