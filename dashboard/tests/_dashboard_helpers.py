@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import html.parser
 import json
+import os
 import re
+import shutil
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
@@ -872,6 +874,16 @@ async def make_recon_db(
     async with aiosqlite.connect(str(db_path)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+def node_path() -> str:
+    """The node binary: a skip locally, a failure under CI (CI carries node)."""
+    path = shutil.which('node')
+    if not path:
+        if os.environ.get('CI'):
+            pytest.fail('node is required in CI but not found on PATH')
+        pytest.skip('node not available')
+    return path
 
 
 # ---------------------------------------------------------------------------
