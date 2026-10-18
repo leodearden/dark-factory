@@ -456,7 +456,7 @@ async def _surface_stale_items(
         if pending:
             record_id = pending[0].id
         else:
-            from escalation.models import Escalation  # noqa: PLC0415 — optional dep
+            from escalation.models import Escalation
 
             esc = Escalation(
                 id=escalation_queue.make_id(STALE_DUE_ESCALATION_SENTINEL),

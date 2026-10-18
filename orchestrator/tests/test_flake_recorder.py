@@ -584,18 +584,12 @@ class TestRecordEnqueuesDebt:
         """``FlakeSuppression`` rides the wire unvalidated, so reading ``s.test_ids`` can
         itself fail; B12 says that costs the merge nothing, and the storm escape stays
         armed."""
-        s = _suppression()
-
-        class _Exploding:
-            def __getattr__(self, name: str):
-                return getattr(s, name)
-
-            @property
-            def test_ids(self):
+        class _UniterableIds(tuple[str, ...]):
+            def __iter__(self):
                 raise TypeError('test_ids is not iterable on this wire object')
 
-        # DELIBERATE protocol violation: the malformed wire object is the shape under test.
-        await _record(_result(_Exploding()), tmp_path)  # type: ignore[arg-type]
+        s = _suppression(test_ids=_UniterableIds(_IDS))
+        await _record(_result(s), tmp_path)
 
         assert _occurrences(tmp_path) == []
         assert _due(tmp_path) == []
