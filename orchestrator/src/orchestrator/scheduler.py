@@ -7954,7 +7954,7 @@ class Scheduler:
         task_ids = [str(t.get('id', '')) for t in ctx.candidates]
         readings = [read_pending_age(t, now) for t in ctx.candidates]
         armed = self._note_anchor_coverage(task_ids, readings)
-        work = self.work_product.snapshot
+        work, now_ts = self.work_product.snapshot, now.timestamp()
         max_age = self.config.scoring.continuity_credit_max_age_secs
 
         scored: list[tuple[float, str, dict, str]] = []
@@ -7966,7 +7966,7 @@ class Scheduler:
                     pri,
                     age_secs=reading.age_secs,
                     transitive_count=transitive,
-                    has_work_product=work.has_work_product(tid, now=now.timestamp(), max_age_secs=max_age),
+                    has_work_product=work.has_work_product(tid, now=now_ts, max_age_secs=max_age),
                 )
             else:
                 score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
