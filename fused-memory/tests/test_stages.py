@@ -13193,6 +13193,14 @@ class TestStage2HintAttentionDetection:
         """
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': [], 'metadata': {}}
 
+    def _make_claimed_task_no_hints(self, tid: int, status: str, *, heartbeat_at: datetime) -> dict:
+        """A hintless task claimed by an orchestrator run that heartbeated at *heartbeat_at*."""
+        return {
+            **self._make_task_no_hints(tid, status),
+            'claimant_run_id': 'orch-run/sess/pid=1',
+            'heartbeat_at': heartbeat_at.isoformat(),
+        }
+
     def _make_task_no_metadata(self, tid: int, status: str) -> dict:
         """Build a task dict with no ``metadata`` key at all.
 
@@ -13532,6 +13540,113 @@ class TestStage2HintAttentionDetection:
             f'Hint section references task IDs absent from the Active Task Tree: {sorted(orphaned)}\n'
             f'hint_ids={sorted(hint_ids)}, active_tree_ids={sorted(active_tree_ids)}'
         )
+
+    # ------------------------------------------------- live-claimed exclusion (task 5093)
+
+    _READ_INSTANT_MISSING_EVENT = 'reconciliation.task_tree_read_instant_missing'
+
+    def _stage(self, mock_deps) -> TaskKnowledgeSync:
+        return make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+
+    def _read_instant_missing_warnings(self, caplog) -> list[logging.LogRecord]:
+        return [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and self._READ_INSTANT_MISSING_EVENT in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_claimed_task_left_out_of_hint_section_only(self, mock_deps, watermark):
+        fetched_at = datetime.now(UTC)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(70, 'pending', heartbeat_at=fetched_at - timedelta(minutes=1)),
+            self._make_task_no_hints(71, 'pending'),
+            self._make_claimed_task_no_hints(72, 'pending', heartbeat_at=fetched_at - timedelta(minutes=30)),
+        ])
+        stage.filtered_task_tree_fetched_at = fetched_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[70]' not in section, section
+        assert '[71]' in section, section
+        assert '[72]' in section, section
+        assert '[70]' in _extract_section(payload, '### Active Task Tree')
+
+    @pytest.mark.asyncio
+    async def test_section_omitted_when_every_candidate_is_live_claimed(self, mock_deps, watermark):
+        fetched_at = datetime.now(UTC)
+        fresh = fetched_at - timedelta(minutes=1)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(70, 'pending', heartbeat_at=fresh),
+            self._make_claimed_task_no_hints(71, 'in-progress', heartbeat_at=fresh),
+        ])
+        stage.filtered_task_tree_fetched_at = fetched_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER not in payload
+
+    @pytest.mark.asyncio
+    async def test_claims_are_aged_at_the_tree_read_instant_not_wall_clock(
+        self, mock_deps, watermark
+    ):
+        read_at = datetime(2026, 1, 1, tzinfo=UTC)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(73, 'pending', heartbeat_at=read_at - timedelta(minutes=1)),
+            self._make_task_no_hints(74, 'pending'),
+        ])
+        stage.filtered_task_tree_fetched_at = read_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[73]' not in section, section
+        assert '[74]' in section, section
+
+    @pytest.mark.asyncio
+    async def test_injected_tree_without_read_instant_warns_and_ages_at_wall_clock(
+        self, mock_deps, watermark, caplog
+    ):
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(
+                75, 'pending', heartbeat_at=datetime.now(UTC) - timedelta(minutes=1)
+            ),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '[75]' not in _extract_section(payload, self._SECTION_HEADER)
+        assert self._read_instant_missing_warnings(caplog)
+
+    @pytest.mark.asyncio
+    async def test_self_fetched_tree_excludes_live_claimed_task_without_warning(
+        self, mock_deps, watermark, caplog
+    ):
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_claimed_task_no_hints(
+                    76, 'pending', heartbeat_at=datetime.now(UTC) - timedelta(minutes=1)
+                ),
+                self._make_task_no_hints(77, 'pending'),
+            ]
+        }
+        stage = self._stage(mock_deps)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[76]' not in section, section
+        assert '[77]' in section, section
+        assert not self._read_instant_missing_warnings(caplog)
 
 
 # ── Regression: cycle 8df8bdcd — Stage 2 Recently-Completed/Done-Provenance
