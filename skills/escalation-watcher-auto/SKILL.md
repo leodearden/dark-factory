@@ -236,7 +236,7 @@ result = mcp__escalation__promote_to_l2(
 )
 ```
 
-Add to digest: `PROMOTED (L2 <result['id']>): <category> — <task_id> — <summary>`
+If `result['status'] == 'refused'` (`info_only_cluster`), nothing was filed: follow the [info-only cluster rung](#info-only-cluster-info_only_cluster) instead. Otherwise add to digest: `PROMOTED (L2 <result['id']>): <category> — <task_id> — <summary>`
 
 ### Case B — causal cluster (multiple members)
 
@@ -266,13 +266,14 @@ result = mcp__escalation__promote_to_l2(
 
 Clusters are **causal, not superficial** — members need not share category or error signature; the common factor is the hypothesized underlying cause.
 
-Add to digest: `PROMOTED cluster (L2 <result['id']>): <root_cause> — <N> members: [<ids>]`
+If `result['status'] == 'refused'` (`info_only_cluster`), nothing was filed: follow the [info-only cluster rung](#info-only-cluster-info_only_cluster) instead. Otherwise add to digest: `PROMOTED cluster (L2 <result['id']>): <root_cause> — <N> members: [<ids>]`
 
 ### One-evolving-L2-per-root-cause (dedup)
 
 Pass the same `root_cause` string for escalations that share a hypothesis. The server deduplicates:
 - `status: 'created'` — new L2 was filed
 - `status: 'updated'` — an existing pending L2 with the same `root_cause` was updated (new members appended)
+- `status: 'refused'` (`info_only_cluster`) — nothing was filed or folded; follow the [info-only cluster rung](#info-only-cluster-info_only_cluster)
 
 **Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly. The one exception is a member the best-effort cascade MISSED: the drain closes it (see [Draining pending escalations](#draining-pending-escalations)).
 

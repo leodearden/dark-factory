@@ -135,6 +135,25 @@ def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Es
     return {mid: queue.get(mid) for mid in dict.fromkeys(member_ids)}
 
 
+def _partition_usable_members(
+    members: dict[str, Escalation | None],
+) -> tuple[dict[str, str], list[str]]:
+    """Split *members* into ``({id: severity} usable, [id] unusable)``.
+
+    USABLE means the id resolves AND its severity is in ``KNOWN_SEVERITIES``;
+    :func:`_derive_l2_severity` says why.  The one home of that rule for both
+    the derivation and :func:`_info_only_refusal`.
+    """
+    usable: dict[str, str] = {}
+    unusable: list[str] = []
+    for mid, member in members.items():
+        if member is not None and member.severity in KNOWN_SEVERITIES:
+            usable[mid] = member.severity
+        else:
+            unusable.append(mid)
+    return usable, unusable
+
+
 def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     """Return max(member severities) for a promoted L2, or None if none is usable.
 
@@ -184,21 +203,17 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     seed would be indistinguishable from a real info member, and the explicit
     nothing-usable branch is what carries the fail-safe.
     """
-    resolved: list[str] = []
-    unusable: list[str] = []
-    for mid, member in members.items():
-        if member is None:
-            unusable.append(mid)
-        elif member.severity not in KNOWN_SEVERITIES:
+    usable, unusable = _partition_usable_members(members)
+    for mid in unusable:
+        member = members[mid]
+        if member is not None:
             logger.warning(
                 'promote_to_l2: member escalation %s carries out-of-vocabulary '
                 'severity %r (expected one of %s); excluding it from the derived '
                 'L2 severity rather than propagating it.',
                 mid, member.severity, sorted(KNOWN_SEVERITIES),
             )
-            unusable.append(mid)
-        else:
-            resolved.append(member.severity)
+    resolved = list(usable.values())
 
     if not resolved:
         logger.warning(
@@ -225,20 +240,17 @@ def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
     """The ``info_only_cluster`` refusal for a cluster that derived ``'info'``.
 
     The refusal's ``members`` key names only the records the derivation used —
-    each one ``'info'``, so each is safe to close at L1.  Every other id goes
-    to ``unusable``: a phantom id has no record to close, and an
-    out-of-vocabulary severity is not known to be informational.  The
-    *members* argument is :func:`_read_members`' answer.
+    each one ``'info'``, since they derived ``'info'`` — so each is safe to
+    close at L1.  Every other id goes to ``unusable``: a phantom id has no
+    record to close, and an out-of-vocabulary severity is not known to be
+    informational.  The *members* argument is :func:`_read_members`' answer.
     """
-    info_ids = [
-        mid for mid, member in members.items()
-        if member is not None and member.severity == 'info'
-    ]
+    usable, unusable = _partition_usable_members(members)
     return {
         'status': 'refused',
         'code': 'info_only_cluster',
-        'members': info_ids,
-        'unusable': [mid for mid in members if mid not in info_ids],
+        'members': list(usable),
+        'unusable': unusable,
         'derived_severity': 'info',
     }
 
