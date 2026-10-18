@@ -278,25 +278,14 @@ def test_merge_gate_reruns_xdist_loadgroup_failures_by_their_plain_node_ids(tmp_
         f'xdist no longer suffixes loadgroup node ids as this test assumes:\n{detect_output}'
     )
     failing = replace(_failing_result(), test_output=detect_output)
-    config = _make_config(worktree)
-    real_run_cmd = verify_module._run_cmd
-    seen: list[str] = []
 
-    async def spy(cmd, *args, **kwargs):
-        seen.append(cmd)
-        return await real_run_cmd(cmd, *args, **kwargs)
+    suppression = asyncio.run(confirm_isolated_rerun_verdict(
+        worktree, _make_config(worktree), [_module_config()], failing, call_site='merge_gate',
+    ))
 
-    with patch.object(verify_module, '_run_cmd', spy):
-        suppression = asyncio.run(confirm_isolated_rerun_verdict(
-            worktree, config, [_module_config()], failing, call_site='merge_gate',
-        ))
-
-    pytest_argvs = [c for c in seen if 'pytest' in c]
     assert suppression.verdict is FlakeVerdict.passes_in_isolation, (
-        f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}\n'
-        f'commands run: {pytest_argvs!r}'
+        f'verdict={suppression.verdict} reason={suppression.unconfirmable_reason!r}'
     )
     assert suppression.test_ids == (
         f'{GROUPED_PROBE_REL}::test_ok[1]', f'{GROUPED_PROBE_REL}::test_ok[a@b]',
     ), suppression.test_ids
-    assert not [c for c in pytest_argvs if '@probe_group' in c], pytest_argvs

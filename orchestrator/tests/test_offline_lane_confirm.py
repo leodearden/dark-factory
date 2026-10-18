@@ -775,7 +775,7 @@ class TestRealPytestGenericLeg:
         assert evidence.outcomes == {node_id('test_flaky'): 'passed'}
 
     @pytest.mark.asyncio
-    async def test_6_a_loadgroup_detection_is_confirmed_by_its_plain_node_id(
+    async def test_an_xdist_loadgroup_detection_is_confirmed_by_its_plain_node_id(
         self, tmp_path: Path, store: RunRecordStore,
     ) -> None:
         project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok')
