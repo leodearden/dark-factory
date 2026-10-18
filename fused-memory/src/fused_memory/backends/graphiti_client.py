@@ -2077,20 +2077,16 @@ class GraphitiBackend:
 
         gids = group_ids or []
         driver = self._driver_for(gids[0]) if gids else None
-        try:
-            results = await asyncio.wait_for(
-                client.search_(
-                    query=query,
-                    config=NODE_HYBRID_SEARCH_RRF,
-                    group_ids=gids,
-                    driver=driver,
-                ),
-                timeout=self._read_timeout,
-            )
-            return (results.nodes or [])[:max_nodes]
-        except TimeoutError:
-            logger.warning(f'Graphiti search_nodes timed out after {self._read_timeout}s')
-            return []
+        results = await self._timed_read(
+            client.search_(
+                query=query,
+                config=NODE_HYBRID_SEARCH_RRF,
+                group_ids=gids,
+                driver=driver,
+            ),
+            'search_nodes',
+        )
+        return (results.nodes or [])[:max_nodes]
 
     @_canonicalize_group_args
     async def retrieve_episodes(
@@ -2108,60 +2104,57 @@ class GraphitiBackend:
 
         Raises:
             IncompleteEnumerationError: The keyset read ran out of page budget.
+            TimeoutError: The read overran its budget (class TIMEOUT POSTURE).
+                MemoryConsolidator then marks 'episodes' a degraded fetch
+                source, and get_episodes answers an error, not an empty list.
         """
         driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
-        try:
-            # The full set is still read, now in keyset pages, because the
-            # created_at sort must see every episode: a cap-truncated set would
-            # silently select the wrong episodes, not merely fewer of them. The
-            # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
-            # declined; its cost and reasons are in
-            # plans/falkordb-resultset-cap-audit.md.
-            episodes = await asyncio.wait_for(
-                _read_all_group_episodes(driver, group_ids),
-                timeout=self._read_timeout,
-            )
-            episodes = sorted(
-                episodes or [],
-                # Secondary key (uuid) makes this a total order: get_by_group_ids
-                # truncates via ORDER BY uuid DESC, so without a tie-breaker,
-                # episodes sharing created_at (batch/rapid co-ingestion, or
-                # reduced-precision storage) fall back to that upstream order,
-                # which is not guaranteed reproducible across executions and can
-                # read as non-monotonic to a strict-descending observer.
-                key=lambda ep: (
-                    _as_sortable_utc(getattr(ep, 'created_at', None)),
-                    getattr(ep, 'uuid', None) or '',
-                ),
-                reverse=True,
-            )
-            return episodes[:last_n]
-        except TimeoutError:
-            logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
-            return []
+        # The full set is still read, now in keyset pages, because the
+        # created_at sort must see every episode: a cap-truncated set would
+        # silently select the wrong episodes, not merely fewer of them. The
+        # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
+        # declined; its cost and reasons are in
+        # plans/falkordb-resultset-cap-audit.md.
+        episodes = await self._timed_read(
+            _read_all_group_episodes(driver, group_ids), 'retrieve_episodes',
+        )
+        episodes = sorted(
+            episodes or [],
+            # Secondary key (uuid) makes this a total order: get_by_group_ids
+            # truncates via ORDER BY uuid DESC, so without a tie-breaker,
+            # episodes sharing created_at (batch/rapid co-ingestion, or
+            # reduced-precision storage) fall back to that upstream order,
+            # which is not guaranteed reproducible across executions and can
+            # read as non-monotonic to a strict-descending observer.
+            key=lambda ep: (
+                _as_sortable_utc(getattr(ep, 'created_at', None)),
+                getattr(ep, 'uuid', None) or '',
+            ),
+            reverse=True,
+        )
+        return episodes[:last_n]
 
     @_canonicalize_group_args
     async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:
-        """Fetch an episode node by UUID.
+        """Fetch an episode node by UUID, or None when it does not exist.
 
         Mirrors remove_episode's driver-selection + EpisodicNode.get_by_uuid
-        call, but is fail-safe rather than propagating: a missing episode
-        (graphiti_core's NodeNotFoundError) or a timeout (matching
-        retrieve_episodes' timeout handling) both return None instead of
-        raising, since callers (e.g. the reconciliation promotion-time
-        batch-plan gate, task 2033) treat "can't determine content" as a
-        graceful fallback rather than a hard failure.
+        call.  Only a genuine miss (graphiti_core's NodeNotFoundError) returns
+        None.
+
+        Raises:
+            TimeoutError: The read overran its budget (class TIMEOUT POSTURE),
+                so a timeout is never mistaken for a missing episode.  The
+                promotion-time batch-plan gate
+                (``reconciliation/targeted.py::_should_withhold_batch_promotion``,
+                task 2033) fails open on it, as it does on None.
         """
         driver = self._driver_for(group_id)
         try:
-            return await asyncio.wait_for(
-                EpisodicNode.get_by_uuid(driver, episode_uuid),
-                timeout=self._read_timeout,
+            return await self._timed_read(
+                EpisodicNode.get_by_uuid(driver, episode_uuid), 'get_episode_by_uuid',
             )
         except GraphitiCoreNodeNotFoundError:
-            return None
-        except TimeoutError:
-            logger.warning(f'Graphiti get_episode_by_uuid timed out after {self._read_timeout}s')
             return None
 
     @_canonicalize_group_args
