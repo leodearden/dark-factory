@@ -734,7 +734,12 @@ def extract_done_count(payload) -> int:
             is re-emitted into the nightly journal as a single log line (see
             `_bounded_repr`).
     """
-    return sum(1 for status in extract_statuses(payload).values() if status == "done")
+    return count_done(extract_statuses(payload))
+
+
+def count_done(statuses: Mapping[str, Any]) -> int:
+    """How many tasks of an `extract_statuses` mapping are `"done"`."""
+    return sum(1 for status in statuses.values() if status == "done")
 
 
 def extract_statuses(payload) -> Mapping[str, Any]:

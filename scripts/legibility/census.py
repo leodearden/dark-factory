@@ -846,9 +846,9 @@ def build_task_payloads(
     Every payload names its run under ``metadata.x_finding_run``, and a cluster
     carrying a ``finding`` identity names its key under
     ``metadata.x_finding_key`` (quality-findings contract §8);
-    ``x_supersedes_task`` arrives with the re-verify path
-    (plans/census-incremental-prd.md L5). ``priority`` is the cluster's
-    severity (contract §4).
+    ``x_supersedes_task`` and its title are written afterwards, by
+    ``disposition.Filing.superseding`` (contract §8 step 1c). ``priority`` is
+    the cluster's severity (contract §4).
 
     ``title`` and ``description`` pass through
     ``shared.toolcall_markup::escape_envelope_literals`` because cluster
@@ -1283,11 +1283,14 @@ def build_method(
     probe_calls: int,
     wall_clock_secs: float,
     verify_normalisations: Mapping[str, int],
+    reverify: Mapping[str, int],
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
     (plans/census-incremental-prd.md §4.3), which carries
-    *verify_normalisations*: the verdict repairs per kind (§4.4). *selection* is ``None`` for a
+    *verify_normalisations*: the verdict repairs per kind (§4.4), and the
+    *reverify* counts of the outcome feedback (L5, D8), whose offered
+    re-verifies *verify_calls* includes. *selection* is ``None`` for a
     run with no mining window, which nulls the evidence and ledger fields it
     would have supplied; an unreadable ledger counts ``ledger_rows`` and
     ``ledger_pruned`` as ``None``, never 0."""
@@ -1312,6 +1315,7 @@ def build_method(
             "inputs_consumed_note": _INPUTS_CONSUMED_NOTE,
             **_ledger_extra(selection),
             "verify_normalisations": dict(verify_normalisations),
+            "reverify": dict(reverify),
         },
     }
 
@@ -1827,22 +1831,27 @@ def _entry_cluster(cb: dict, entry: dict) -> dict:
 class PendingFiling:
     """One cluster to file this run. Work routed for it releases the withheld
     codebook entry *withheld_entry_id* names, if any; its back-link lands on
-    *entry_id*."""
+    *entry_id*. *verified_present*: this run's verifier found it present at
+    as_of_sha; *supersedes_task*: the done task a re-filing supersedes."""
 
     cluster: dict
     withheld_entry_id: str | None = None
     entry_id: str | None = None
+    verified_present: bool = False
+    supersedes_task: int | None = None
 
     def filing(self, payload: Mapping[str, Any]) -> disposition.Filing:
         """This cluster as the dedup protocol files it, by *payload*."""
         finding = self.cluster.get("finding")
-        return disposition.Filing(
+        filing = disposition.Filing(
             entry_id=self.entry_id,
             finding_key=None if finding is None else finding.key,
             title=_cluster_title(self.cluster),
             statement=self.cluster.get("summary") or "",
             payload=payload,
+            verified_present=self.verified_present,
         )
+        return filing if self.supersedes_task is None else filing.superseding(self.supersedes_task)
 
 
 def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[PendingFiling]:
@@ -1858,7 +1867,9 @@ def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pen
     withheld it used that same count.
 
     Each is paired with the entry its back-link lands on: the withheld entry
-    it releases, else the entry it was promoted to."""
+    it releases, else the entry it was promoted to. A *fileable* cluster was
+    verified present at as_of_sha this run; a released withheld entry was
+    verified by an earlier run, so it is not."""
     releasable = [
         entry for entry in cb.get("entries") or []
         if entry.get(ENTRY_FILING_KEY) == ENTRY_FILING_WITHHELD
@@ -1871,7 +1882,9 @@ def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pen
     queue = []
     for cluster, promoted_entry_id in fileable:
         withheld_entry_id = entry_id_by_title.get(cluster.get("title"))
-        queue.append(PendingFiling(cluster, withheld_entry_id, withheld_entry_id or promoted_entry_id))
+        queue.append(PendingFiling(
+            cluster, withheld_entry_id, withheld_entry_id or promoted_entry_id, verified_present=True,
+        ))
     paired = {pending.withheld_entry_id for pending in queue}
     sighting_counts = _sighting_counts_by_title(cb)
     for entry in releasable:
@@ -1882,6 +1895,79 @@ def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pen
         if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
             queue.append(PendingFiling(cluster, entry["id"], entry["id"]))
     return queue
+
+
+def _with_refilings(
+    queue: list[PendingFiling], refiled: Sequence[disposition.Refiling], cb: dict,
+) -> list[PendingFiling]:
+    """*queue* followed by each *refiled* entry not already in it, as its
+    entry's cluster carrying the re-verify Verdict's remediation, if any."""
+    entries = {entry["id"]: entry for entry in cb.get("entries") or []}
+    queued = {pending.entry_id for pending in queue}
+    refilings = []
+    for refiling in refiled:
+        if refiling.entry_id in queued:
+            continue
+        cluster = _entry_cluster(cb, entries[refiling.entry_id])
+        refilings.append(PendingFiling(
+            cluster if refiling.found is None else _with_verdict(cluster, refiling.found),
+            entry_id=refiling.entry_id,
+            verified_present=refiling.verified_present,
+            supersedes_task=refiling.supersedes_task,
+        ))
+    return [*queue, *refilings]
+
+
+def _read_statuses(status_fetcher) -> tuple[Mapping[str, Any] | None, str | None]:
+    """The run's one get_statuses snapshot (``census_trigger.extract_statuses``),
+    or None and why it could not be read."""
+    try:
+        return census_trigger.extract_statuses(status_fetcher()), None
+    except Exception as exc:  # noqa: BLE001 - an unread snapshot leaves outcomes unobserved, never fails the run
+        return None, str(exc)
+
+
+def _reverify(
+    due: Sequence[disposition.Reverify],
+    *,
+    cb: dict,
+    verify_fn,
+    model: str,
+    remaining: int | None,
+    probe_count: list[int],
+) -> dict[str, disposition.Reverification]:
+    """Re-verify each *due* entry at as_of_sha (D8) in ONE *verify_fn* call,
+    the first *remaining* of them when the verify cap sets that, the rest
+    deferred. A cap hit inside the call leaves the offered ones inconclusive
+    and never defers the run: an unrun re-verify loses nothing, because the
+    next run's outcome read queues it again."""
+    offered = tuple(due) if remaining is None else tuple(due[:remaining])
+    deferred = tuple(due[len(offered):])
+    if deferred:
+        logger.warning(
+            "census: operator verify cap reached -- %d of %d re-verification(s) DEFERRED to the next run",
+            len(deferred), len(due),
+        )
+    if not offered:
+        return disposition.reverifications({}, offered=(), deferred=deferred)
+    entries = {entry["id"]: entry for entry in cb.get("entries") or []}
+    clusters = [
+        {
+            **{key: value for key, value in _entry_cluster(cb, entries[item.entry_id]).items() if key != "finding"},
+            disposition.REVERIFY_ENTRY: item.entry_id,
+        }
+        for item in offered
+    ]
+    try:
+        result = verify_fn(clusters, model=model) or {}
+    except CensusHeadroomExhausted as exc:
+        logger.warning("census: headroom exhausted during re-verification, so it is inconclusive: %s", exc.reason)
+        return disposition.reverifications(
+            {}, offered=offered, deferred=deferred, error=f"headroom exhausted: {exc.reason}",
+        )
+    reported_probes = result.get("headroom_probes") if isinstance(result, Mapping) else None
+    probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
+    return disposition.reverifications(result, offered=offered, deferred=deferred)
 
 
 def _promoted_from(cb: dict, entry_id: str) -> dict | None:
@@ -2580,9 +2666,20 @@ def run_census(
     neither filed nor listed)
     -> ``disposition.backfill``, which links every historical
     ``source=legibility_census`` task to the entry its title was filed under,
-    in the first run it can reach the store -> ``_filing_queue``, which pairs
+    in the first run it can reach the store -> the outcome feedback
+    (plans/census-incremental-prd.md L5, D8): ONE *status_fetcher* read
+    (``_read_statuses``) feeds ``disposition.read_outcomes`` over every
+    back-linked entry; each entry governed by a done task is re-verified at
+    *as_of_sha* in a second *verify_fn* call (``_reverify``, the same model,
+    within what *max_verify_clusters* leaves after the novel clusters; a
+    headroom cap there leaves them inconclusive and never defers the run);
+    ``disposition.project`` re-derives each entry's status from its tasks
+    (``fixed`` only from a re-verify that found it gone, INV-3); a finding
+    re-verified present files again superseding its done task ->
+    ``_filing_queue``, which pairs
     each fileable cluster with the entry it was promoted to and adds every
-    earlier-withheld entry that has since recurred -> ``build_task_payloads``
+    earlier-withheld entry that has since recurred, then the re-filings ->
+    ``build_task_payloads``
     over that queue -> ``disposition.dispose``, contract §8 over
     *task_store*: a finding whose key a live, accepted or done task already
     carries, that a live task matches semantically, or whose key an earlier
@@ -2597,7 +2694,8 @@ def run_census(
     written) -> write the JSON record beside *report_path*
     (``build_census_record``) and the
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
-    (done-count from *status_fetcher*, watermark from the mining window) ->
+    (done-count from the same *status_fetcher* snapshot, watermark from the
+    mining window) ->
     *commit* of report + record + codebook + state -> ledger every merged
     coding's session (``session_ledger``, only once the commit has landed; a
     failed write is ``CensusOutcome.ledger_write_error``, never a crash). A
@@ -3076,13 +3174,38 @@ def run_census(
         updated_codebook, store=task_store, project_root=project_root, run_id=run_id,
     )
 
+    # Outcome feedback (plans/census-incremental-prd.md L5, D8), after the
+    # backfill so the tasks it linked are read this run. Re-verifies take
+    # only what the verify cap leaves after the novel clusters.
+    statuses, statuses_error = _read_statuses(status_fetcher)
+    outcomes = disposition.read_outcomes(
+        updated_codebook, statuses=statuses, statuses_error=statuses_error,
+        observed_root=project_root, store=task_store,
+    )
+    reverified = _reverify(
+        outcomes.due,
+        cb=updated_codebook,
+        verify_fn=verify_fn,
+        model=config.models.census_verify,
+        remaining=None if max_verify_clusters is None else max(0, max_verify_clusters - len(clusters_to_verify)),
+        probe_count=probe_count,
+    )
+    updated_codebook, status_changes = disposition.project(
+        updated_codebook, outcomes, reverified, as_of_sha=as_of_sha,
+    )
+    refiled = tuple(
+        refiling
+        for refiling in disposition.refilings(outcomes, reverified, sighted=())
+        if refiling.verified_present
+    )
+
     # Positioned BEFORE codebook.dump()/advance_census_state() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
     # already-advanced codebook. Filing itself is best-effort per finding
     # (disposition.dispose): a failed submit is logged and reported, never
     # counted as filed and never fatal.
-    filing_queue = _filing_queue(fileable, updated_codebook)
+    filing_queue = _with_refilings(_filing_queue(fileable, updated_codebook), refiled, updated_codebook)
     task_payloads = build_task_payloads(
         [pending.cluster for pending in filing_queue],
         project_root=project_root, project_id=project_id, run_id=run_id,
@@ -3127,6 +3250,11 @@ def run_census(
     # merge check, so it is held to the schema again before any artifact.
     _require_valid(updated_codebook, "filing")
     filing_report = disposition.FilingReport(disposal, resolutions, backfilled, structural)
+    dispositions_record = disposition.OutcomeReport(
+        outcomes, reverified, status_changes, refiled,
+        disposition.entry_dispositions(updated_codebook, disposition.task_standings(outcomes, ())),
+    ).to_record()
+    verify_calls = len(clusters_to_verify) + dispositions_record["reverify"]["offered"]
     filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
     cross_project_tickets = tuple(
         CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
@@ -3144,14 +3272,15 @@ def run_census(
         )
 
     # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
-    # total -- and the per-cluster count is precisely what an operator using
-    # --max-verify-clusters reads this line to check. headroom-probe is the
-    # run's REAL probe spend: this function's preflight and stage gate PLUS
-    # whatever the verifier reported spending on its own in-verify detectors.
+    # total -- and the per-cluster count, novel clusters plus re-verifies, is
+    # precisely what an operator using --max-verify-clusters reads this line
+    # to check. headroom-probe is the run's REAL probe spend: this function's
+    # preflight and stage gate PLUS whatever the verifier reported spending on
+    # its own in-verify detectors.
     cost_note = (
         f"invoke calls: {config.models.census_miner} miner="
         f"{sum(s.total for s in mining_result.batch_stats)}, "
-        f"{config.models.census_verify} verify={len(clusters_to_verify)}, "
+        f"{config.models.census_verify} verify={verify_calls}, "
         f"{config.models.census_synthesis} synthesis=1, "
         f"{config.models.trickle} headroom-probe={probe_count[0]}"
     )
@@ -3171,11 +3300,12 @@ def run_census(
         refuted=len(rejected),
         unverified=len(novel_clusters) - len(clusters_to_verify),
         miner_calls=sum(s.total for s in mining_result.batch_stats),
-        verify_calls=len(clusters_to_verify),
+        verify_calls=verify_calls,
         synthesis_calls=1,
         probe_calls=probe_count[0],
         wall_clock_secs=round(time.monotonic() - started, 3),
         verify_normalisations=verify_normalisations,
+        reverify=dispositions_record["reverify"],
     )
     record = build_census_record(
         method=method,
@@ -3187,7 +3317,7 @@ def run_census(
         synthesis_md=synthesis_md,
         project_root=project_root,
         filing=filing_report.to_record(),
-        dispositions=disposition.OutcomeReport(disposition.Outcomes(), {}, (), (), {}).to_record(),
+        dispositions=dispositions_record,
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
@@ -3225,8 +3355,10 @@ def run_census(
     # census every single night -- a strictly more over-eager loop than any
     # this task set out to fix.
     #
-    # Both the fetch and the extraction are guarded. extract_done_count is what
-    # stops fused-memory's {"error", "error_type"} envelope -- which rides an
+    # The count comes from the run's one get_statuses snapshot, read above for
+    # the outcome feed (_read_statuses guards both the fetch and the
+    # extraction). census_trigger.extract_statuses is what stops
+    # fused-memory's {"error", "error_type"} envelope -- which rides an
     # isError:false JSON-RPC response and so arrives here looking like a
     # perfectly good dict -- from being counted as a done-count of 0 and
     # persisted as a REAL baseline. Such a fabricated 0 arms condition (b)
@@ -3234,15 +3366,13 @@ def run_census(
     # (task 3291; see census_trigger's module docstring for the replayed
     # measurements). See advance_census_state's docstring for why null, not 0
     # and not a carried-forward value, is the honest degradation.
-    try:
-        done_count = census_trigger.extract_done_count(status_fetcher())
-    except Exception as exc:  # noqa: BLE001 - a bad baseline must not fail the census
-        done_count = None
+    done_count = None if statuses is None else census_trigger.count_done(statuses)
+    if statuses is None:
         logger.warning(
             "census: done-count unobservable (%s) -- persisting a null "
             "last_census_done_count; the tasks-landed trigger condition will "
             "fail safe until the next successful census",
-            exc,
+            statuses_error,
         )
 
     # codebook.dump() and advance_census_state() are adjacent on purpose

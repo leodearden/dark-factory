@@ -2315,6 +2315,7 @@ def _method(**overrides):
         probe_calls=2,
         wall_clock_secs=12.5,
         verify_normalisations=verdict.count_normalisations([]),
+        reverify=_EMPTY_DISPOSITIONS["reverify"],
     )
     kwargs.update(overrides)
     return mod.build_method(**kwargs)
@@ -10296,3 +10297,14 @@ def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path, caplog):
     ]
     assert len(done_count_warnings) == 1
     assert json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))["last_census_done_count"] is None
+
+
+def test_run_census_method_and_cost_note_count_the_reverify(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone")
+
+    mod.run_census(**kwargs)
+
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["reverify"] == record["dispositions"]["reverify"]
+    assert (record["method"]["extra"]["reverify"]["offered"], record["method"]["extra"]["reverify"]["gone"]) == (1, 1)
+    assert f"{kwargs['config'].models.census_verify} verify=1," in record["cost_note"]
