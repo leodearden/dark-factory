@@ -806,13 +806,16 @@ class EventType(StrEnum):
     # candidates are exempt (DA-D4) and never produce this event.  Emitted at
     # most once per ``acquire_next`` tick — on the FIRST heavy candidate
     # skipped, across both the pinned and scored dispatch loops.
-    # data keys: {metric, value, in_flight, floor}
-    #   metric:    the PSI field name that tripped saturation, chosen in
-    #              ranked order cpu_some_avg10 > mem_some_avg10 >
-    #              mem_full_avg10 > io_some_avg10 (DA-D1)
-    #   value:     that metric's sampled avg10 value (float)
+    # data keys: {metric, in_flight, floor, sample}
+    #   metric:    the tripping PsiAdmissionConfig threshold field name, ranked
+    #              by shared/src/shared/psi.py::PsiSample.tripping_metric (rank
+    #              owned by plans/load-throttle-harmonisation-prd.md D10)
     #   in_flight: len(Scheduler._dispatched) at decision time (int)
     #   floor:     config.psi_admission.min_inflight_floor (int)
+    #   sample:    dataclasses.asdict(PsiSample) — every reading, every
+    #              per-component read_ok, and own_cgroup
+    # Rows written before task 3590 carry `value` (the metric's reading)
+    # instead of `sample`.
     dispatch_deferred = 'dispatch_deferred'
 
     # Per-tick latency breakdown for Scheduler.acquire_next, emitted once at

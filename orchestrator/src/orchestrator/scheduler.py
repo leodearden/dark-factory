@@ -7561,34 +7561,27 @@ class Scheduler:
         # assigned — so ctx.psi_sample is never None here.
         assert ctx.psi_sample is not None
         psi_sample = ctx.psi_sample
-        # DA-D1 ranked order: cpu > mem_some > mem_full > io.
-        if psi_sample.cpu_some10 >= cfg_psi.cpu_some_avg10:
-            metric, value = 'cpu_some_avg10', psi_sample.cpu_some10
-        elif psi_sample.mem_some10 >= cfg_psi.mem_some_avg10:
-            metric, value = 'mem_some_avg10', psi_sample.mem_some10
-        elif psi_sample.mem_full10 >= cfg_psi.mem_full_avg10:
-            metric, value = 'mem_full_avg10', psi_sample.mem_full10
-        else:
-            metric, value = 'io_some_avg10', psi_sample.io_some10
+        # tripping_metric's saturated(cfg_psi) precondition holds: psi_hold was
+        # set from saturated() on this same cfg object, with no await between.
+        metric = psi_sample.tripping_metric(cfg_psi)
         if self.event_store:
             self.event_store.emit(
                 EventType.dispatch_deferred,
                 task_id=deferred_task_id,
                 data={
                     'metric': metric,
-                    'value': value,
                     'in_flight': ctx.psi_in_flight,
                     'floor': cfg_psi.min_inflight_floor,
+                    'sample': asdict(psi_sample),
                 },
             )
         _now = self._time_source()
         if _now - self._last_dispatch_deferred_log >= _DISPATCH_DEFERRED_LOG_SECS:
             logger.warning(
                 'Dispatch-admission gate: deferring heavy task %s — '
-                'PSI %s=%.1f (in_flight=%d, floor=%d)',
+                'PSI %s tripped (in_flight=%d, floor=%d)',
                 deferred_task_id,
                 metric,
-                value,
                 ctx.psi_in_flight,
                 cfg_psi.min_inflight_floor,
             )
