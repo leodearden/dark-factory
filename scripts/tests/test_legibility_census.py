@@ -10066,3 +10066,233 @@ def test_main_done_line_names_an_unreachable_dedup_store_only_when_there_was_one
         assert done_line == plain
     else:
         assert done_line == f"{plain} dedup_unreachable: {unreachable}"
+
+
+# ---------------------------------------------------------------------------
+# task 6404 step-17: RED — run_census feeds a back-linked task's outcome to
+# its entry (PRD §4.8 row 9, outcome done; D8; INV-3)
+# ---------------------------------------------------------------------------
+
+_LINKED_TASK = 5120
+
+
+def _linked_row(tmp_path, task_id: int = _LINKED_TASK) -> dict[str, Any]:
+    return {
+        "ticket": None, "project_root": str(tmp_path), "run_id": _EARLIER_RUN, "finding_key": None,
+        "task_id": task_id, "resolution": "created", "step": "curator",
+    }
+
+
+def _back_linked_codebook(tmp_path, **entry_fields) -> dict:
+    """_minimal_v2_codebook whose entry-a carries a C1 row for _LINKED_TASK
+    from an earlier run."""
+    cb = _minimal_v2_codebook()
+    cb["entries"][0].update(entry_fields, filed_tickets=[_linked_row(tmp_path)])
+    return cb
+
+
+def _counting_status_fetcher(statuses: dict[str, str] | None = None, *, raises: Exception | None = None):
+    calls = []
+
+    def fetch():
+        calls.append(1)
+        if raises is not None:
+            raise raises
+        return {"statuses": dict(statuses or {})}
+
+    fetch.calls = calls
+    return fetch
+
+
+_REFUTING_VERDICT = verdict.Verdict(
+    verified=False,
+    reason="gone at as_of_sha",
+    anchor="slug:fake-verdict",
+    tags=("h13", verdict.KIND_TAG),
+    severity=verdict.DEFAULT_SEVERITY,
+    severity_reason="fake verifier",
+    route=verdict.Route.MECHANICAL,
+    remediation=None,
+)
+
+
+def _reverifying_verify_fn(answer: str):
+    """A verify_fn whose novel-cluster call verifies every cluster (mechanical,
+    in-tree remediation) and whose re-verify call -- clusters carrying
+    disposition.REVERIFY_ENTRY -- answers by *answer*: "gone" (rejected with a
+    refuting Verdict), "present" (verified, mechanical), "verdictless"
+    (rejected without a Verdict, the default verifier's fail-closed path) or
+    "headroom" (raises CensusHeadroomExhausted). Records every call."""
+    calls = []
+
+    def verify_fn(clusters, *, model):
+        calls.append({"clusters": list(clusters), "model": model})
+        marked = [cluster for cluster in clusters if disposition.REVERIFY_ENTRY in cluster]
+        if not marked:
+            found = _fake_verdict(_IN_TREE_REMEDIATION)
+            return {"verified": [{**c, "verdict": found} for c in clusters], "rejected": [], "fixed": []}
+        if answer == "headroom":
+            raise mod.CensusHeadroomExhausted(stage="verify", reason="capped mid-reverify", unverified=len(marked))
+        if answer == "present":
+            found = _fake_verdict(_IN_TREE_REMEDIATION)
+            return {"verified": [{**c, "verdict": found} for c in marked], "rejected": [], "fixed": []}
+        if answer == "gone":
+            return {"verified": [], "rejected": [{**c, "verdict": _REFUTING_VERDICT} for c in marked], "fixed": []}
+        return {"verified": [], "rejected": marked, "fixed": []}
+
+    verify_fn.calls = calls
+    return verify_fn
+
+
+def _reverify_calls(verify_fn) -> list[dict]:
+    return [call for call in verify_fn.calls if any(disposition.REVERIFY_ENTRY in c for c in call["clusters"])]
+
+
+def _persisted_entry_a(kwargs) -> dict:
+    [entry] = [e for e in codebook.load(kwargs["codebook_path"])["entries"] if e["id"] == "entry-a"]
+    return entry
+
+
+def _dispositions_table(kwargs) -> list[dict[str, str]]:
+    return _filed_table(_report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Dispositions"))
+
+
+def _outcome_kwargs(tmp_path, answer: str, *, statuses=None, batch=None, **entry_fields):
+    verify_fn = _reverifying_verify_fn(answer)
+    kwargs = _duplicate_only_kwargs(
+        tmp_path, FakeTaskStore(),
+        codebook_dict=_back_linked_codebook(tmp_path, **entry_fields),
+        status_fetcher=_counting_status_fetcher({str(_LINKED_TASK): "done"} if statuses is None else statuses),
+        verify_fn=verify_fn,
+    )
+    if batch is not None:
+        kwargs["batch_source"] = [batch]
+    return kwargs
+
+
+def test_run_census_fixes_an_entry_whose_done_task_reverifies_gone(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone")
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_entry_a(kwargs)
+    assert (entry["status"], entry["fixed_at_sha"]) == ("fixed", kwargs["as_of_sha"])
+    assert "accepted_by" not in entry
+    [call] = _reverify_calls(kwargs["verify_fn"])
+    [cluster] = call["clusters"]
+    assert cluster["title"] == "Some confusion cluster"
+    assert cluster[disposition.REVERIFY_ENTRY] == "entry-a"
+    assert call["model"] == kwargs["config"].models.census_verify
+    json.dumps(cluster)
+    assert kwargs["submit_fn"].calls == []
+    record = _run_record(kwargs)
+    assert record["method"]["cost"]["verify_calls"] == 1
+    [row] = record["dispositions"]["rows"]
+    assert (row["task_id"], row["task_status"], row["outcome"]) == (_LINKED_TASK, "done", "gone")
+    [table_row] = _dispositions_table(kwargs)
+    assert (table_row["task_id"], table_row["task_status"], table_row["disposition"]) == (
+        str(_LINKED_TASK), "done", f"fixed:{kwargs['as_of_sha']}",
+    )
+
+
+def test_run_census_refiles_an_entry_whose_done_task_reverifies_present(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "present")
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
+    assert payload["metadata"]["x_finding_run"] == kwargs["run_id"]
+    assert payload["title"].startswith(disposition.task_title("Some confusion cluster"))
+    assert str(_LINKED_TASK) in payload["title"].removeprefix(disposition.task_title("Some confusion cluster"))
+    entry = _persisted_entry_a(kwargs)
+    assert entry["status"] == "open"
+    assert "fixed_at_sha" not in entry
+    old_row, new_row = entry["filed_tickets"]
+    assert old_row == _linked_row(tmp_path)
+    assert (new_row["ticket"], new_row["run_id"]) == ("tkt_1", kwargs["run_id"])
+    [row] = _run_record(kwargs)["dispositions"]["rows"]
+    assert row["outcome"] == "present"
+    assert _run_record(kwargs)["dispositions"]["refiled"] == [
+        {"entry_id": "entry-a", "supersedes_task": _LINKED_TASK, "verified_present": True},
+    ]
+
+
+@pytest.mark.parametrize("answer", ["verdictless", "headroom"])
+def test_run_census_never_fixes_an_entry_whose_reverify_did_not_establish_gone(tmp_path, answer):
+    kwargs = _outcome_kwargs(tmp_path, answer)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_entry_a(kwargs)
+    assert entry["status"] == "open"
+    assert "fixed_at_sha" not in entry
+    assert kwargs["submit_fn"].calls == []
+    [row] = _run_record(kwargs)["dispositions"]["rows"]
+    assert row["outcome"] == "inconclusive"
+    assert _run_record(kwargs)["dispositions"]["reverify"]["inconclusive"] == 1
+
+
+def test_run_census_reverifies_only_inside_what_the_verify_cap_leaves(tmp_path):
+    batch = [_hand_digest("dup-1", "nothing new here"), _hand_digest("novel-verified", "a new confusion shape")]
+    kwargs = _outcome_kwargs(tmp_path, "gone", batch=batch)
+    kwargs["max_verify_clusters"] = 1
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [call] = kwargs["verify_fn"].calls
+    assert [cluster["title"] for cluster in call["clusters"]] == ["Silent no-op subagent contract"]
+    entry = _persisted_entry_a(kwargs)
+    assert (entry["status"], "fixed_at_sha" in entry) == ("open", False)
+    dispositions = _run_record(kwargs)["dispositions"]
+    [row] = dispositions["rows"]
+    assert row["outcome"] == "deferred"
+    assert (dispositions["reverify"]["due"], dispositions["reverify"]["deferred"]) == (1, 1)
+
+
+def test_run_census_never_reverifies_an_entry_already_fixed(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone", status="fixed", fixed_at_sha="abcdef1")
+
+    mod.run_census(**kwargs)
+
+    assert _reverify_calls(kwargs["verify_fn"]) == []
+    entry = _persisted_entry_a(kwargs)
+    assert (entry["status"], entry["fixed_at_sha"]) == ("fixed", "abcdef1")
+
+
+def test_run_census_reads_get_statuses_once_and_feeds_both_outcomes_and_the_done_count(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "done", "77": "done", "78": "pending"})
+
+    mod.run_census(**kwargs)
+
+    assert len(kwargs["status_fetcher"].calls) == 1
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert state["last_census_done_count"] == 2
+    assert _persisted_entry_a(kwargs)["status"] == "fixed"
+
+
+def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path, caplog):
+    kwargs = _outcome_kwargs(tmp_path, "gone", status="accepted", accepted_by=_LINKED_TASK)
+    kwargs["status_fetcher"] = _counting_status_fetcher(
+        raises=census_trigger.StatusFetchUnavailable("get_statuses unreachable: fused-memory down"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert len(kwargs["status_fetcher"].calls) == 1
+    entry = _persisted_entry_a(kwargs)
+    assert (entry["status"], entry["accepted_by"]) == ("accepted", _LINKED_TASK)
+    assert _reverify_calls(kwargs["verify_fn"]) == []
+    section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Dispositions")
+    assert any("fused-memory down" in line and not line.startswith("|") for line in section.splitlines())
+    done_count_warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and "done-count" in r.getMessage()
+    ]
+    assert len(done_count_warnings) == 1
+    assert json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))["last_census_done_count"] is None
