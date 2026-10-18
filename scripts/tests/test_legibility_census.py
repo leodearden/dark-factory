@@ -9258,10 +9258,12 @@ def test_run_census_row5_verdict_key_ticket(tmp_path):
     assert payload["priority"] == "high"
 
     record = _run_record(kwargs)
+    [decision] = record["filing"]["decisions"]
+    assert decision["task_id"] is not None
     [row] = record["findings"]
     assert row["key"] == _ROW5_KEY
     assert row["verdict"] == "confirmed"
-    assert row["disposition"] == "open"
+    assert row["disposition"] == f"filed:{decision['task_id']}"
     assert row["first_seen"] == run_id
     assert row["area"] == "orchestrator"
     assert check_census_report.check_findings(record) == []
@@ -10308,3 +10310,144 @@ def test_run_census_method_and_cost_note_count_the_reverify(tmp_path):
     assert record["method"]["extra"]["reverify"] == record["dispositions"]["reverify"]
     assert (record["method"]["extra"]["reverify"]["offered"], record["method"]["extra"]["reverify"]["gone"]) == (1, 1)
     assert f"{kwargs['config'].models.census_verify} verify=1," in record["cost_note"]
+
+
+
+# ---------------------------------------------------------------------------
+# task 6404 step-19: RED — run_census, PRD §4.8 row 10 (outcome: cancelled),
+# contract §7 dispositions on findings, INV-13 at run level
+# ---------------------------------------------------------------------------
+
+_LINKED_IDENTITY = census_findings.FindingIdentity.mint(
+    "orchestrator", "orchestrator/linked.py::f", ("h13", verdict.KIND_TAG),
+)
+
+
+def _cancelled_store(*, acceptance_reason: str | None, keyed: bool = False) -> FakeTaskStore:
+    metadata = {} if acceptance_reason is None else {disposition.ACCEPTANCE_REASON_METADATA: acceptance_reason}
+    hits = {}
+    if keyed:
+        hits[(disposition.FINDING_KEY_METADATA, _LINKED_IDENTITY.key)] = (
+            task_store.TaskHit(_LINKED_TASK, disposition.task_title("Some confusion cluster"), "cancelled"),
+        )
+    return FakeTaskStore(
+        tasks={_LINKED_TASK: task_store.TaskRecord(_LINKED_TASK, "a cancelled census task", "cancelled", metadata)},
+        metadata_hits=hits,
+    )
+
+
+def _cancelled_kwargs(tmp_path, *, acceptance_reason: str | None, keyed: bool = False, **entry_fields):
+    if keyed:
+        entry_fields.update(_LINKED_IDENTITY.to_fields())
+    kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "cancelled"}, **entry_fields)
+    kwargs["task_store"] = _cancelled_store(acceptance_reason=acceptance_reason, keyed=keyed)
+    return kwargs
+
+
+def _dispositions_text(kwargs) -> str:
+    return _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Dispositions")
+
+
+def test_run_census_accepts_an_entry_whose_task_was_cancelled_with_a_reason(tmp_path):
+    kwargs = _cancelled_kwargs(tmp_path, acceptance_reason="the cost is worth carrying")
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    entry = _persisted_entry_a(kwargs)
+    assert (entry["status"], entry["accepted_by"]) == ("accepted", _LINKED_TASK)
+    assert _reverify_calls(kwargs["verify_fn"]) == []
+    assert kwargs["submit_fn"].calls == []
+    [row] = _run_record(kwargs)["dispositions"]["rows"]
+    assert (row["task_id"], row["task_status"], row["outcome"]) == (_LINKED_TASK, "cancelled", "accepted")
+    [table_row] = _dispositions_table(kwargs)
+    assert table_row["disposition"] == f"accepted:{_LINKED_TASK}"
+
+
+def test_run_census_reopens_an_accepted_entry_whose_task_was_cancelled_without_a_reason(tmp_path):
+    kwargs = _cancelled_kwargs(tmp_path, acceptance_reason=None, status="accepted", accepted_by=_LINKED_TASK)
+    kwargs["batch_source"] = []
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_entry_a(kwargs)
+    assert entry["status"] == "open"
+    assert "accepted_by" not in entry
+    assert kwargs["submit_fn"].calls == []
+    record = _run_record(kwargs)["dispositions"]
+    assert record["refiled"] == []
+    assert record["changes"] == [{
+        "entry_id": "entry-a", "from_status": "accepted", "to_status": "open",
+        "accepted_by": None, "fixed_at_sha": None,
+    }]
+
+
+def test_run_census_refiles_an_abandoned_entry_when_it_recurs(tmp_path):
+    kwargs = _cancelled_kwargs(
+        tmp_path, acceptance_reason=None, keyed=True, status="accepted", accepted_by=_LINKED_TASK,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [payload] = kwargs["submit_fn"].calls
+    assert disposition.SUPERSEDES_TASK_METADATA not in payload["metadata"]
+    assert payload["metadata"][disposition.FINDING_KEY_METADATA] == _LINKED_IDENTITY.key
+    assert payload["title"] == disposition.task_title("Some confusion cluster")
+    store = kwargs["task_store"]
+    assert {"key": disposition.FINDING_KEY_METADATA, "value": _LINKED_IDENTITY.key} in [
+        {"key": call["key"], "value": call["value"]} for call in store.arguments_of("find_tasks_by_metadata")
+    ]
+    assert "search_tasks" in store.tools_called()
+    entry = _persisted_entry_a(kwargs)
+    assert entry["status"] == "open"
+    assert "accepted_by" not in entry
+    assert [row["ticket"] for row in entry["filed_tickets"]] == [None, "tkt_1"]
+    assert _run_record(kwargs)["dispositions"]["refiled"] == [
+        {"entry_id": "entry-a", "supersedes_task": None, "verified_present": False},
+    ]
+
+
+def test_run_census_findings_row_of_an_entry_fixed_this_run_says_fixed(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone", **_LINKED_IDENTITY.to_fields())
+
+    mod.run_census(**kwargs)
+
+    [row] = _run_record(kwargs)["findings"]
+    assert row["key"] == _LINKED_IDENTITY.key
+    assert row["disposition"] == f"fixed:{kwargs['as_of_sha']}"
+
+
+def test_run_census_findings_row_of_a_live_linked_entry_says_filed(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "pending"}, **_LINKED_IDENTITY.to_fields())
+
+    mod.run_census(**kwargs)
+
+    [row] = _run_record(kwargs)["findings"]
+    assert row["disposition"] == f"filed:{_LINKED_TASK}"
+
+
+def test_run_census_without_back_links_says_none_are_linked_yet(tmp_path):
+    kwargs = _duplicate_only_kwargs(tmp_path, FakeTaskStore())
+
+    mod.run_census(**kwargs)
+
+    section = _dispositions_text(kwargs)
+    assert "_no back-linked tickets yet._" in section
+    assert "_no outcome changed this run._" not in section
+
+
+def test_run_census_whose_live_linked_task_changes_nothing_says_so(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "in-progress"})
+
+    mod.run_census(**kwargs)
+
+    section = _dispositions_text(kwargs)
+    assert "_no outcome changed this run._" in section
+    assert "_no back-linked tickets yet._" not in section
+    [row] = _dispositions_table(kwargs)
+    assert (row["task_id"], row["task_status"], row["outcome"]) == (str(_LINKED_TASK), "in-progress", "live")
+    assert _persisted_entry_a(kwargs)["status"] == "open"
