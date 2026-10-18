@@ -10,7 +10,7 @@ import enum
 import logging
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -646,7 +646,11 @@ class Reverify:
     task: TaskRef
 
 
-_SETTLED_STATUSES = frozenset({"fixed", "retired"})
+_ACCEPTED_STATUS = "accepted"
+_FIXED_STATUS = "fixed"
+_RETIRED_STATUS = "retired"
+_OPEN_STATUS = "open"
+_SETTLED_STATUSES = frozenset({_FIXED_STATUS, _RETIRED_STATUS})
 
 
 @dataclass(frozen=True)
@@ -854,6 +858,115 @@ def reverifications(
     for due in deferred:
         typed[due.entry_id] = Reverification(due.entry_id, due.task, ReverifyResult.DEFERRED, reason=_CAP_DEFERRAL)
     return typed
+
+
+@dataclass(frozen=True)
+class StatusChange:
+    """One entry the projection changed, with the accepting task or fix sha it set."""
+
+    entry_id: str
+    from_status: str
+    to_status: str
+    accepted_by: int | None = None
+    fixed_at_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class _Projected:
+    status: str
+    accepted_by: int | None = None
+    fixed_at_sha: str | None = None
+
+
+def _projection(
+    entry: Mapping[str, Any], outcome: EntryOutcome, again: Reverification | None, *, as_of_sha: str,
+) -> _Projected | None:
+    """The one statement of how a task's outcome sets its entry's status
+    (INV-9); None leaves the entry as it is. Only a re-verify that found the
+    finding gone at *as_of_sha* fixes it (INV-3)."""
+    governing = outcome.governing
+    status = entry["status"]
+    if status == _RETIRED_STATUS or governing is None or governing.ref is None:
+        return None
+    if governing.standing is Standing.ACCEPTED:
+        return _Projected(_ACCEPTED_STATUS, accepted_by=governing.ref.task_id)
+    if (
+        governing.standing is Standing.DONE
+        and again is not None
+        and again.result is ReverifyResult.GONE
+        and again.task == governing.ref
+    ):
+        return _Projected(_FIXED_STATUS, fixed_at_sha=as_of_sha)
+    if status == _FIXED_STATUS and governing.standing is not Standing.FILED:
+        return None
+    return _Projected(_OPEN_STATUS if status in (_ACCEPTED_STATUS, _FIXED_STATUS) else status)
+
+
+def _projected_state(entry: Mapping[str, Any]) -> _Projected:
+    return _Projected(entry["status"], entry.get("accepted_by"), entry.get("fixed_at_sha"))
+
+
+def _apply(entry: dict[str, Any], projected: _Projected) -> None:
+    entry["status"] = projected.status
+    for field, value in (("accepted_by", projected.accepted_by), ("fixed_at_sha", projected.fixed_at_sha)):
+        if value is None:
+            entry.pop(field, None)
+        else:
+            entry[field] = value
+
+
+def project(
+    cb: dict, outcomes: Outcomes, reverified: Mapping[str, Reverification], *, as_of_sha: str,
+) -> tuple[dict, tuple[StatusChange, ...]]:
+    """A new codebook whose back-linked entries carry the status their tasks'
+    outcomes project, re-derived from the task store on every run, and the
+    entries that changed."""
+    result = copy.deepcopy(cb)
+    by_entry = {outcome.entry_id: outcome for outcome in outcomes.entries}
+    changes: list[StatusChange] = []
+    for entry in result.get("entries") or []:
+        outcome = by_entry.get(entry["id"])
+        projected = (
+            None if outcome is None
+            else _projection(entry, outcome, reverified.get(entry["id"]), as_of_sha=as_of_sha)
+        )
+        if projected is None or projected == _projected_state(entry):
+            continue
+        changes.append(StatusChange(
+            entry["id"], entry["status"], projected.status, projected.accepted_by, projected.fixed_at_sha,
+        ))
+        _apply(entry, projected)
+    codebook.assert_no_deletion(cb, result)
+    return result, tuple(changes)
+
+
+@dataclass(frozen=True)
+class Refiling:
+    """An entry to file again this run: still present after its done task
+    (superseding it, contract §8 step 1c), or abandoned and sighted again."""
+
+    entry_id: str
+    supersedes_task: int | None
+    verified_present: bool
+    found: verdict.Verdict | None = None
+
+
+def refilings(
+    outcomes: Outcomes, reverified: Mapping[str, Reverification], *, sighted: Collection[str],
+) -> tuple[Refiling, ...]:
+    """The entries to file again, in codebook order. A present finding is
+    re-filed only when its verdict routes mechanical (contract §6); an
+    abandoned one only when it recurred this run (in *sighted*)."""
+    refiled: list[Refiling] = []
+    for outcome in outcomes.entries:
+        again = reverified.get(outcome.entry_id)
+        governing = outcome.governing
+        if again is not None and again.result is ReverifyResult.PRESENT and again.found is not None:
+            if files(again.found):
+                refiled.append(Refiling(outcome.entry_id, again.task.task_id, True, again.found))
+        elif governing is not None and governing.standing is Standing.ABANDONED and outcome.entry_id in sighted:
+            refiled.append(Refiling(outcome.entry_id, None, False))
+    return tuple(refiled)
 
 
 @dataclass(frozen=True)
