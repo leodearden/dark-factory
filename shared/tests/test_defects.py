@@ -14,15 +14,18 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from shared.defects import (
+    DEFECT_TRANSITIONS,
     Declare,
     DeclareClosure,
     DeclareRetirement,
     DefectDeclaration,
+    DefectEventKind,
     DefectOrigin,
     DefectProof,
     DefectStatus,
     Exemption,
     ExemptionReason,
+    IllegalDefectTransition,
     KeepCheck,
     KeepOutcome,
     MalformedDefectRef,
@@ -47,6 +50,7 @@ from shared.defects import (
     Withdrawal,
     WithdrawalCode,
     WithdrawalReason,
+    apply_event,
     mint_explore_ref,
     mint_finding_ref,
     mint_followup_ref,
@@ -916,3 +920,195 @@ class TestEvents:
         sighting = _sighting()
         with pytest.raises(ValidationError):
             sighting.ref = _OTHER_REF
+
+
+# --- I2: apply_event --------------------------------------------------------------
+
+_O, _PE, _PR, _EX, _WD = (
+    DefectStatus.OPEN,
+    DefectStatus.PENDING,
+    DefectStatus.PROVEN,
+    DefectStatus.EXEMPTED,
+    DefectStatus.WITHDRAWN,
+)
+
+_FROM_STATES = {
+    'ABSENT': (lambda: None, None),
+    'OPEN': (_declaration, _O),
+    'OPEN_AFTER_REJECTION': (lambda: _declaration(closure=_exemption(), ruling=_REJECTED), _O),
+    'PENDING_EXEMPTION': (lambda: _declaration(status=_PE, closure=_exemption()), _PE),
+    'PENDING_WITHDRAWAL': (lambda: _declaration(status=_PE, closure=_withdrawal()), _PE),
+    'PROVEN': (lambda: _declaration(status=_PR, proof=_proof()), _PR),
+    'EXEMPTED': (
+        lambda: _declaration(status=_EX, closure=_exemption(), ruling=_ACCEPTED),
+        _EX,
+    ),
+    'WITHDRAWN': (
+        lambda: _declaration(status=_WD, closure=_withdrawal(), ruling=_ACCEPTED),
+        _WD,
+    ),
+}
+
+_EVENTS = {
+    'declare': (_declare, DefectEventKind.DECLARE),
+    'declare_closure_exemption': (_declare_closure, DefectEventKind.DECLARE_CLOSURE),
+    'declare_closure_withdrawal': (
+        lambda: DeclareClosure(ref=_REF, closure=_withdrawal()),
+        DefectEventKind.DECLARE_CLOSURE,
+    ),
+    'sighting': (_sighting, DefectEventKind.SIGHTING),
+    **{
+        f'proof_{outcome}': ((lambda o=outcome: _proof_event(o)), DefectEventKind.PROOF)
+        for outcome in ProofOutcome
+    },
+    'rule_accepted': (lambda: _rule(_ACCEPTED), DefectEventKind.RULE),
+    'rule_rejected': (lambda: _rule(_REJECTED), DefectEventKind.RULE),
+    'rule_accepted_retirement': (
+        lambda: _rule(_ruling(True, RulingSubject.RETIREMENT)),
+        DefectEventKind.RULE,
+    ),
+    'declare_retirement': (_declare_retirement, DefectEventKind.DECLARE_RETIREMENT),
+}
+
+# PRD I2, written out by hand. Every pair not listed here is refused.
+_OPEN_DESTINATIONS = {
+    'declare_closure_exemption': _PE,
+    'declare_closure_withdrawal': _PE,
+    'sighting': _O,
+    'proof_PROVEN': _PR,
+    'proof_PASSES_AT_BASE': _O,
+    'proof_FAILS_AT_TIP': _O,
+    'proof_NOT_COLLECTED': _O,
+    'proof_MARKER_NOT_STATIC': _O,
+    'proof_PROOF_UNAVAILABLE': _O,
+    'proof_PROOF_UNSUPPORTED_RUNNER': _O,
+}
+_I2_ORACLE = {
+    ('ABSENT', 'declare'): _O,
+    **{('OPEN', event): status for event, status in _OPEN_DESTINATIONS.items()},
+    **{('OPEN_AFTER_REJECTION', event): status for event, status in _OPEN_DESTINATIONS.items()},
+    ('PENDING_EXEMPTION', 'rule_accepted'): _EX,
+    ('PENDING_EXEMPTION', 'rule_rejected'): _O,
+    ('PENDING_EXEMPTION', 'sighting'): _PE,
+    ('PENDING_WITHDRAWAL', 'rule_accepted'): _WD,
+    ('PENDING_WITHDRAWAL', 'rule_rejected'): _O,
+    ('PENDING_WITHDRAWAL', 'sighting'): _PE,
+    ('PROVEN', 'proof_PROVEN'): _PR,
+    ('PROVEN', 'proof_PASSES_AT_BASE'): _O,
+    ('PROVEN', 'proof_FAILS_AT_TIP'): _O,
+    ('PROVEN', 'proof_NOT_COLLECTED'): _O,
+    ('PROVEN', 'proof_MARKER_NOT_STATIC'): _O,
+    ('PROVEN', 'proof_PROOF_UNAVAILABLE'): _PR,
+    ('PROVEN', 'proof_PROOF_UNSUPPORTED_RUNNER'): _PR,
+    ('PROVEN', 'sighting'): _PR,
+    ('EXEMPTED', 'sighting'): _EX,
+    ('WITHDRAWN', 'sighting'): _WD,
+}
+
+
+def test_oracle_names_only_real_states_and_events() -> None:
+    assert {state for state, _ in _I2_ORACLE} <= set(_FROM_STATES)
+    assert {event for _, event in _I2_ORACLE} <= set(_EVENTS)
+
+
+@pytest.mark.parametrize('state_name', list(_FROM_STATES))
+@pytest.mark.parametrize('event_name', list(_EVENTS))
+def test_i2_sweep(state_name: str, event_name: str) -> None:
+    build_entry, from_status = _FROM_STATES[state_name]
+    build_event, kind = _EVENTS[event_name]
+    entry = build_entry()
+    event = build_event()
+    expected = _I2_ORACLE.get((state_name, event_name))
+    if expected is not None:
+        result = apply_event(entry, event)
+        assert result.status is expected
+        assert DefectDeclaration.model_validate(result.model_dump(mode='json')) == result
+        return
+    with pytest.raises(IllegalDefectTransition) as excinfo:
+        apply_event(entry, event)
+    refusal = excinfo.value
+    assert refusal.ref == _REF
+    assert refusal.from_status == from_status
+    assert refusal.event is kind
+    message = str(refusal)
+    assert _REF in message
+    assert (from_status.value if from_status is not None else 'absent') in message
+    assert kind.value in message
+
+
+def _assign_item(container, key, value) -> None:
+    container[key] = value
+
+
+class TestApplyEventEffects:
+    def test_sighting_counts_and_changes_nothing_else(self) -> None:
+        before = _declaration(status=_PR, proof=_proof())
+        after = apply_event(before, _sighting())
+        assert after.sightings == before.sightings + 1
+        assert after.model_dump(exclude={'sightings'}) == before.model_dump(exclude={'sightings'})
+
+    @pytest.mark.parametrize(
+        ('entry', 'outcome', 'status'),
+        [
+            pytest.param(
+                _declaration(status=_PR, proof=_proof()),
+                ProofOutcome.PROOF_UNAVAILABLE,
+                _PR,
+                id='proven-keeps-status-records-unavailable',
+            ),
+            pytest.param(
+                _declaration(proof=_proof(ProofOutcome.PROOF_UNAVAILABLE)),
+                ProofOutcome.FAILS_AT_TIP,
+                _O,
+                id='open-records-fix-finding',
+            ),
+        ],
+    )
+    def test_proof_replaces_the_latest_proof(
+        self, entry: DefectDeclaration, outcome: ProofOutcome, status: DefectStatus
+    ) -> None:
+        event = _proof_event(outcome)
+        result = apply_event(entry, event)
+        assert result.status is status
+        assert result.proof == event.proof
+
+    def test_closure_after_rejection_replaces_closure_and_clears_ruling(self) -> None:
+        entry = _declaration(closure=_exemption(), ruling=_REJECTED)
+        new_closure = _withdrawal(WithdrawalCode.TEST_WAS_WRONG)
+        result = apply_event(entry, DeclareClosure(ref=_REF, closure=new_closure))
+        assert result.status is _PE
+        assert result.closure == new_closure
+        assert result.ruling is None
+
+    def test_accepted_rule_keeps_the_closure_and_stores_the_ruling(self) -> None:
+        result = apply_event(_declaration(status=_PE, closure=_exemption()), _rule(_ACCEPTED))
+        assert result.status is _EX
+        assert result.closure == _exemption()
+        assert result.ruling == _ACCEPTED
+
+    def test_rejected_rule_reopens_and_keeps_the_rejected_pair(self) -> None:
+        result = apply_event(_declaration(status=_PE, closure=_withdrawal()), _rule(_REJECTED))
+        assert result.status is _O
+        assert result.closure == _withdrawal()
+        assert result.ruling == _REJECTED
+
+    def test_declare_on_absent_returns_the_declaration(self) -> None:
+        event = _declare()
+        assert apply_event(None, event) == event.declaration
+
+    def test_event_for_another_ref_is_refused_naming_both(self) -> None:
+        with pytest.raises(IllegalDefectTransition) as excinfo:
+            apply_event(_declaration(), Sighting(ref=_OTHER_REF))
+        assert _REF in str(excinfo.value)
+        assert _OTHER_REF in str(excinfo.value)
+
+    def test_input_entry_is_unchanged(self) -> None:
+        entry = _declaration(status=_PE, closure=_exemption())
+        before = entry.model_dump()
+        apply_event(entry, _rule(_ACCEPTED))
+        assert entry.model_dump() == before
+
+    def test_transition_table_is_read_only(self) -> None:
+        key = next(iter(DEFECT_TRANSITIONS))
+        with pytest.raises(TypeError):
+            _assign_item(DEFECT_TRANSITIONS, key, DefectStatus.OPEN)
