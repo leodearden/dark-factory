@@ -25,6 +25,7 @@ from _fused_memory_tool_surface import (
 )
 from _tool_surface_classification import assert_tool_surface_classified
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
@@ -85,6 +86,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _suppress_same_run_human_operator_dups,
     _sweep_stale_mem0_flag_for_stage2_markers,
     retire_flag_markers_for_terminal_task,
+    select_tasks_needing_hint_attention,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
@@ -3147,6 +3149,94 @@ class TestNeedsHintAttention:
         """Task with metadata as a string returns True (defensive: non-dict metadata treated as no hints)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': 'not-a-dict'}
         assert _needs_hint_attention(task) is True
+
+
+class TestSelectTasksNeedingHintAttention:
+    """select_tasks_needing_hint_attention: hint-attention candidates minus live-claimed tasks.
+
+    A claim is live when it carries a non-blank claimant_run_id whose heartbeat_at
+    is within DEFAULT_CLAIMANT_HEARTBEAT_TTL of ``claims_read_at`` (task 5093).
+    """
+
+    READ_AT = datetime(2026, 1, 1, tzinfo=UTC)
+    CLAIMANT = 'orch-run/sess/pid=1'
+    _UNSET = object()
+
+    @classmethod
+    def _task(cls, tid: int = 1, *, claimant=_UNSET, heartbeat_at=_UNSET, metadata=None) -> dict:
+        task: dict = {'id': tid, 'title': f'T{tid}', 'status': 'pending', 'metadata': metadata or {}}
+        if claimant is not cls._UNSET:
+            task['claimant_run_id'] = claimant
+        if heartbeat_at is not cls._UNSET:
+            task['heartbeat_at'] = (
+                heartbeat_at.isoformat() if isinstance(heartbeat_at, datetime) else heartbeat_at
+            )
+        return task
+
+    @classmethod
+    def _claimed(cls, tid: int = 1, *, heartbeat_age: timedelta, metadata=None) -> dict:
+        return cls._task(
+            tid,
+            claimant=cls.CLAIMANT,
+            heartbeat_at=cls.READ_AT - heartbeat_age,
+            metadata=metadata,
+        )
+
+    def _select(self, tasks: list[dict]) -> list[dict]:
+        return select_tasks_needing_hint_attention(tasks, claims_read_at=self.READ_AT)
+
+    def test_live_claimed_hintless_task_is_excluded(self):
+        assert self._select([self._claimed(heartbeat_age=timedelta(minutes=1))]) == []
+
+    def test_unclaimed_hintless_task_is_included(self):
+        absent = self._task(1)
+        none_claimant = self._task(2, claimant=None)
+        assert self._select([absent, none_claimant]) == [absent, none_claimant]
+
+    def test_claim_just_past_the_shared_ttl_is_stale_and_included(self):
+        task = self._claimed(heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(minutes=1))
+        assert self._select([task]) == [task]
+
+    def test_claim_just_inside_the_shared_ttl_is_live_and_excluded(self):
+        task = self._claimed(heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(minutes=1))
+        assert self._select([task]) == []
+
+    @pytest.mark.parametrize('heartbeat_at', [None, 'not-a-timestamp'])
+    def test_claim_without_a_readable_heartbeat_is_included(self, heartbeat_at):
+        task = self._task(claimant=self.CLAIMANT, heartbeat_at=heartbeat_at)
+        assert self._select([task]) == [task]
+
+    def test_blank_claimant_with_fresh_heartbeat_is_included(self):
+        task = self._task(claimant='   ', heartbeat_at=self.READ_AT - timedelta(minutes=1))
+        assert self._select([task]) == [task]
+
+    def test_live_claimed_legacy_list_hints_task_is_excluded(self):
+        task = self._claimed(
+            heartbeat_age=timedelta(minutes=1),
+            metadata={'memory_hints': [{'entity': 'X', 'query': 'q'}]},
+        )
+        assert self._select([task]) == []
+
+    def test_unclaimed_task_with_valid_hints_is_excluded(self):
+        task = self._task(metadata={'memory_hints': {'entities': ['E'], 'queries': ['q']}})
+        assert self._select([task]) == []
+
+    def test_freshness_is_judged_at_claims_read_at_not_wall_clock(self):
+        task = self._claimed(heartbeat_age=timedelta(minutes=1))
+        assert datetime.now(UTC) - self.READ_AT > DEFAULT_CLAIMANT_HEARTBEAT_TTL * 1000
+        assert self._select([task]) == []
+
+    def test_mixed_input_keeps_survivors_in_order_and_is_not_mutated(self):
+        tasks = [
+            self._task(1),
+            self._claimed(2, heartbeat_age=timedelta(minutes=1)),
+            self._task(3, metadata={'memory_hints': {'entities': ['E'], 'queries': ['q']}}),
+            self._claimed(4, heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL * 3),
+            self._task(5),
+        ]
+        snapshot = [dict(t) for t in tasks]
+        assert [t['id'] for t in self._select(tasks)] == [1, 4, 5]
+        assert tasks == snapshot
 
 
 class TestRunIdValidation(BaseStageValidationTest):
