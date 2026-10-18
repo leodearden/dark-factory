@@ -124,9 +124,9 @@ envelope's top level). It resolves its `project_root` to an ABSOLUTE path
 before sending it: the MCP
 argument is interpreted by the server's cwd, not the client's, and
 fused-memory's `_normalize_project_root` hard-rejects any relative path
-(task 3291). Whatever the fetcher returns is converted to a number by
-`extract_done_count`, never by an inline `.get("statuses")` -- see that
-function for why.
+(task 3291). Whatever the fetcher returns is validated by
+`extract_statuses` (and counted by `extract_done_count`), never read by an
+inline `.get("statuses")` -- see those functions for why.
 """
 from __future__ import annotations
 
@@ -141,7 +141,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import overload
+from typing import Any, overload
 
 import yaml
 from legibility import codebook
@@ -690,9 +690,9 @@ def extract_done_count(payload) -> int:
     `StatusFetchUnavailable` if *payload* is not a usable get_statuses
     envelope.
 
-    This is the SOLE place a get_statuses payload is turned into a number,
-    and it exists because the idiom it replaces silently fabricated
-    baselines. Both `compute_tasks_landed` below and `census.run_census`
+    The count is taken over `extract_statuses(payload)`, the SOLE place a
+    get_statuses payload is validated, and that validation exists because
+    the idiom it replaces silently fabricated baselines. Both `compute_tasks_landed` below and `census.run_census`
     used to inline `sum(1 for v in (payload.get("statuses") or {}).values()
     if v == "done")`. That `or {}` swallowed *every* unusable payload into a
     done-count of 0 -- no warning, no exception, no way to tell a real
@@ -734,6 +734,18 @@ def extract_done_count(payload) -> int:
             is re-emitted into the nightly journal as a single log line (see
             `_bounded_repr`).
     """
+    return sum(1 for status in extract_statuses(payload).values() if status == "done")
+
+
+def extract_statuses(payload) -> Mapping[str, Any]:
+    """The `{task id string: status}` mapping of a get_statuses payload, or
+    raise `StatusFetchUnavailable` if *payload* is not a usable get_statuses
+    envelope (see `extract_done_count` for why each shape is rejected).
+
+    `{"statuses": {}}` is a valid, empty answer. A census run reads one
+    snapshot through here and derives both its outcome feed and its
+    done-count from it, so the two cannot disagree.
+    """
     if not isinstance(payload, dict):
         raise StatusFetchUnavailable(
             f"get_statuses payload is not a dict (got {type(payload).__name__}): "
@@ -764,7 +776,7 @@ def extract_done_count(payload) -> int:
             f"(got {type(statuses).__name__}{sized}): {_bounded_repr(statuses)}"
         )
 
-    return sum(1 for status in statuses.values() if status == "done")
+    return statuses
 
 
 def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
