@@ -1504,6 +1504,7 @@ git:
       command: "pytest -m integration"
       cwd: "fused-memory"
       fix_task_priority: "medium"
+      outage_probe: "python scripts/lane_dependency_probe.py"
     # PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the ported warm-lane bash
     # bucket moves OFF the verify hot path and onto this lane — the escape
     # plans/warm-lane-infra-repatriation-prd.md documented for exactly this

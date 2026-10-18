@@ -34,6 +34,7 @@ from orchestrator.offline_lane_runs import (
     RUN_OFFLINE_DEEP_SCRIPT,
     ConfirmRunner,
     OutputFormat,
+    command_cwd,
     junit_failing_node_ids,
 )
 from orchestrator.verify import (
@@ -312,7 +313,7 @@ def _compared(mode: ConfirmMode, detect: RunRecord, rerun: RunRecord) -> Confirm
 async def _confirm_generic(
     cmd: LaneCommand, worktree: Path, detect: RunRecord, runner: ConfirmRunner,
 ) -> Confirmed | Unconfirmable:
-    run_cwd = worktree / cmd.cwd
+    run_cwd = command_cwd(worktree, cmd)
     mode = confirm_mode(cmd, detect)
     ids = node_ids_of(_as_pytest_failures(detect))
     narrowed = mode is ConfirmMode.NARROWED

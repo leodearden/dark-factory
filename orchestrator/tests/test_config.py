@@ -20,6 +20,7 @@ from orchestrator.config import (
     CpuPriorityConfig,
     EffortConfig,
     JobserverConfig,
+    LaneCommand,
     ModelsConfig,
     ModuleConfig,
     OrchestratorConfig,
@@ -2970,6 +2971,34 @@ class TestDiffConfig:
         assert not any('_module_configs' in p for p in all_paths), (
             f'_module_configs is a PrivateAttr and must never appear in a diff path; got {all_paths}'
         )
+
+
+class TestLaneCommandOutageProbe:
+    """``LaneCommand.outage_probe`` and its timeout (plans/offline-lane-red-path-prd.md D7)."""
+
+    def test_defaults_declare_no_probe_and_a_180_second_bound(self):
+        command = LaneCommand(name='integration', command='pytest -m integration')
+
+        assert (command.outage_probe, command.outage_probe_timeout_secs) == (None, 180)
+
+    def test_a_zero_second_timeout_is_rejected(self):
+        with pytest.raises(ValidationError):
+            LaneCommand(name='integration', command='pytest', outage_probe='true', outage_probe_timeout_secs=0)
+
+    def test_both_fields_survive_a_yaml_shaped_load(self):
+        config = OrchestratorConfig.model_validate({
+            'git': {'offline_lane_commands': [{
+                'name': 'qdrant-integration',
+                'command': 'pytest -m integration',
+                'cwd': 'fused-memory',
+                'outage_probe': 'python scripts/lane_dependency_probe.py',
+                'outage_probe_timeout_secs': 60,
+            }]},
+        })
+
+        (command,) = config.git.offline_lane_commands
+        assert command.outage_probe == 'python scripts/lane_dependency_probe.py'
+        assert command.outage_probe_timeout_secs == 60
 
 
 class TestApplyReload:

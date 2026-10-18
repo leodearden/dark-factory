@@ -820,7 +820,11 @@ path, snapshotting `main` at run start and coalescing advances — it never
 gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
 test is a per-test episode that is filed as one fix task once reproduced on
 `git.offline_lane_persist_passes` spaced passes, with one bounded level-1
-escalation if the fix stays unlanded (`plans/offline-lane-red-path-prd.md`;
+escalation if the fix stays unlanded. A command that declares an outage probe
+(`outage_probe`) runs it after a red detection, and a probe that exits 75
+naming a dependency makes the pass an outage, which is escalated, not filed.
+The lane re-runs the probe alone until it passes, then closes its own
+escalation and runs the command again (`plans/offline-lane-red-path-prd.md`;
 runbook in `OPERATIONS.md`).
 Operators can inspect and pause the merge lane directly: `get_merge_queue()`
 gives a live snapshot (lane states, conflict graph, frozen prefix, metrics)
