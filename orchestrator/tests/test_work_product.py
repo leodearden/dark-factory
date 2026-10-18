@@ -4,17 +4,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import subprocess
-from collections.abc import Iterable
+import threading
+import time
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import pytest
 from _git_fixtures import README_SEED, _git, build_repo
 
+from orchestrator.sentinel_l1 import SentinelL1
 from orchestrator.work_product import (
+    FAILURE_STREAK_ESCALATION_THRESHOLD,
+    PROBE_SENTINEL,
     BranchProbeError,
     BranchWork,
+    WorkProductProbe,
     WorkProductSnapshot,
     parse_branch_work,
     read_branch_work,
@@ -205,3 +212,194 @@ class TestHasWorkProduct:
     def test_the_snapshot_is_immutable(self, field_name):
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(_snapshot(), field_name, frozenset({'10'}))
+
+
+TTL = 300.0
+FRESH = WorkProductSnapshot(
+    branches={'10': BranchWork(commits_ahead=1, tip_committed_at=NOW)}, zero_progress=frozenset(),
+)
+PROBE_FAILURE = BranchProbeError(
+    reason='git for-each-ref exited 128',
+    cmd=('git', '-C', '/srv/project', 'for-each-ref', 'refs/heads/task/'),
+    cwd='/srv/project',
+    returncode=128,
+    stderr="fatal: failed to find 'main'",
+)
+
+
+class _CountingLoad:
+    def __init__(self, snapshot: WorkProductSnapshot = FRESH) -> None:
+        self.snapshot = snapshot
+        self.threads: list[int] = []
+
+    @property
+    def calls(self) -> int:
+        return len(self.threads)
+
+    def __call__(self) -> WorkProductSnapshot:
+        self.threads.append(threading.get_ident())
+        return self.snapshot
+
+
+def _failing(exc: Exception = PROBE_FAILURE) -> Callable[[], WorkProductSnapshot]:
+    def load() -> WorkProductSnapshot:
+        raise exc
+    return load
+
+
+class _Rig:
+    """A probe on a hand-wound monotonic clock and a hot-reloadable TTL."""
+
+    def __init__(self) -> None:
+        self.clock = [0.0]
+        self.ttl = TTL
+        self.filed: list[SentinelL1] = []
+        self.probe = WorkProductProbe(
+            ttl_secs=lambda: self.ttl, clock=lambda: self.clock[0], escalate=self.filed.append,
+        )
+
+    async def refresh(self, load: Callable[[], WorkProductSnapshot]) -> None:
+        self.probe.poll(load)
+        await self.probe.join()
+
+    async def refresh_next_window(self, load: Callable[[], WorkProductSnapshot]) -> None:
+        self.clock[0] += self.ttl
+        await self.refresh(load)
+
+
+@pytest.mark.asyncio
+class TestWorkProductProbe:
+    async def test_nothing_is_credited_before_the_first_refresh(self):
+        assert _Rig().probe.snapshot is WorkProductSnapshot.EMPTY
+
+    async def test_a_refresh_publishes_the_loaded_snapshot(self):
+        rig, load = _Rig(), _CountingLoad()
+
+        await rig.refresh(load)
+
+        assert load.calls == 1
+        assert rig.probe.snapshot is FRESH
+
+    async def test_at_most_one_load_per_ttl_window(self):
+        rig, load = _Rig(), _CountingLoad()
+        await rig.refresh(load)
+
+        for _ in range(50):
+            await rig.refresh(load)
+        rig.clock[0] = TTL - 1
+        await rig.refresh(load)
+        assert load.calls == 1
+
+        rig.clock[0] = TTL
+        await rig.refresh(load)
+        assert load.calls == 2
+
+    async def test_the_window_is_anchored_at_the_attempt_not_the_completion(self):
+        rig, counting = _Rig(), _CountingLoad()
+
+        def slow_load() -> WorkProductSnapshot:
+            rig.clock[0] += 100
+            return FRESH
+
+        await rig.refresh(slow_load)
+        rig.clock[0] = TTL
+        await rig.refresh(counting)
+
+        assert counting.calls == 1
+
+    async def test_the_load_runs_off_the_event_loop_thread(self):
+        rig, load = _Rig(), _CountingLoad()
+
+        await rig.refresh(load)
+
+        assert load.threads and load.threads[0] != threading.get_ident()
+
+    async def test_poll_never_waits_and_never_overlaps_refreshes(self):
+        rig, counting = _Rig(), _CountingLoad()
+        release = threading.Event()
+
+        def blocked_load() -> WorkProductSnapshot:
+            release.wait(timeout=30)
+            return FRESH
+
+        try:
+            started_at = time.monotonic()
+            rig.probe.poll(blocked_load)
+            assert time.monotonic() - started_at < 1.0
+            await asyncio.sleep(0.05)
+            assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
+
+            rig.clock[0] = TTL + 1
+            rig.probe.poll(counting)
+            assert counting.calls == 0
+        finally:
+            release.set()
+        await rig.probe.join()
+
+        assert rig.probe.snapshot is FRESH
+        assert counting.calls == 0
+
+    async def test_a_failed_refresh_withdraws_all_credit(self):
+        rig = _Rig()
+        await rig.refresh(_CountingLoad())
+
+        await rig.refresh_next_window(_failing())
+
+        assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
+
+    async def test_a_failure_streak_escalates_once_it_reaches_the_threshold(self):
+        rig = _Rig()
+        await rig.refresh(_failing())
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD - 2):
+            await rig.refresh_next_window(_failing())
+        assert rig.filed == []
+
+        await rig.refresh_next_window(_failing())
+
+        assert len(rig.filed) == 1
+        l1 = rig.filed[0]
+        assert l1.sentinel == PROBE_SENTINEL
+        assert l1.category == 'infra_issue'
+        assert f'{FAILURE_STREAK_ESCALATION_THRESHOLD} consecutive' in l1.detail
+        assert f'{TTL:g}' in l1.detail
+        assert str(PROBE_FAILURE) in l1.detail
+
+    async def test_each_further_failure_re_files_for_the_queue_to_dedup(self):
+        rig = _Rig()
+        await rig.refresh(_failing())
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD + 1):
+            await rig.refresh_next_window(_failing())
+
+        assert len(rig.filed) == 2
+
+    async def test_one_success_resets_the_streak(self):
+        rig = _Rig()
+        await rig.refresh(_failing())
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD - 2):
+            await rig.refresh_next_window(_failing())
+        await rig.refresh_next_window(_CountingLoad())
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD - 1):
+            await rig.refresh_next_window(_failing())
+
+        assert rig.filed == []
+
+    async def test_an_unexpected_load_error_is_a_counted_failure_that_never_propagates(self):
+        rig = _Rig()
+        boom = _failing(RuntimeError('sqlite went away'))
+        await rig.refresh(boom)
+        for _ in range(FAILURE_STREAK_ESCALATION_THRESHOLD - 1):
+            await rig.refresh_next_window(boom)
+
+        assert rig.probe.snapshot is WorkProductSnapshot.EMPTY
+        assert len(rig.filed) == 1
+        assert 'sqlite went away' in rig.filed[0].detail
+
+    async def test_a_hot_ttl_retune_moves_the_window_on_the_next_poll(self):
+        rig, load = _Rig(), _CountingLoad()
+        await rig.refresh(load)
+
+        rig.ttl = 60.0
+        rig.clock[0] = 60.0
+        await rig.refresh(load)
+
+        assert load.calls == 2
