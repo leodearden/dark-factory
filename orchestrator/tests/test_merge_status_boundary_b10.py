@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -233,16 +233,12 @@ def _replay(store: EventStore, reads: tuple[_Read, ...]) -> list[object]:
     return [read.issue(store) for read in reads]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('shape', sorted(_SHAPES))
-async def test_b10_cross_run_lookup_p99_is_under_50_ms(
-    production_sized_store: _SeededStore, shape: str, tmp_path: Path,
-) -> None:
+async def _recorded_reads(store: EventStore, shape: str, escalations: Path) -> tuple[_Read, ...]:
+    """The cross-run reads merge_status issues for *shape*'s poll over *store*, its answer checked."""
     spec = _SHAPES[shape]
-    seeded = production_sized_store
     hit = spec.last_outcome_request_id is not None
     response, reads = await _poll_recording_cross_run_reads(
-        seeded.store, tmp_path / 'escalations', {spec.key: spec.value},
+        store, escalations, {spec.key: spec.value},
     )
     assert reads, f'{shape}: merge_status issued no cross-run read: {response}'
     assert response['state'] == (MergeState.stale_record if hit else MergeState.no_record), (
@@ -252,9 +248,55 @@ async def test_b10_cross_run_lookup_p99_is_under_50_ms(
     assert (None if last is None else last['request_id']) == spec.last_outcome_request_id, (
         shape, response,
     )
-
-    replayed = _replay(seeded.store, reads)
+    replayed = _replay(store, reads)
     assert any(replayed) is hit, (shape, replayed)
+    return reads
+
+
+def _selects_issued(
+    store: EventStore, reads: tuple[_Read, ...], monkeypatch: pytest.MonkeyPatch,
+) -> tuple[str, ...]:
+    """Replays *reads* once and returns each SELECT they ran on *store*'s database, parameters bound."""
+    statements: list[str] = []
+    connect = sqlite3.connect
+
+    def traced(database: str | os.PathLike[str], *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = connect(database, *args, **kwargs)
+        if Path(database) == store.db_path:
+            conn.set_trace_callback(statements.append)
+        return conn
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, 'connect', traced)
+        _replay(store, reads)
+    return tuple(s for s in statements if s.lstrip().upper().startswith('SELECT'))
+
+
+def _plans_off_a_partial_index(db_path: Path, selects: Iterable[str]) -> list[str]:
+    """The query plan of each statement that does not SEARCH events through one of the table's partial indexes."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        partial = {
+            name for (name,) in conn.execute(
+                "SELECT name FROM pragma_index_list('events') WHERE partial",
+            )
+        }
+        plans = [
+            ' | '.join(row[3] for row in conn.execute(f'EXPLAIN QUERY PLAN {select}'))
+            for select in selects
+        ]
+    return [
+        plan for plan in plans
+        if not any(plan.startswith(f'SEARCH events USING INDEX {name} (') for name in partial)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', sorted(_SHAPES))
+async def test_b10_cross_run_lookup_p99_is_under_50_ms(
+    production_sized_store: _SeededStore, shape: str, tmp_path: Path,
+) -> None:
+    seeded = production_sized_store
+    reads = await _recorded_reads(seeded.store, shape, tmp_path / 'escalations')
 
     remeasured = remeasure_until_p99_within(
         lambda: time_window(lambda: _replay(seeded.store, reads), _SAMPLES),
