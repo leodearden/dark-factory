@@ -1271,3 +1271,59 @@ class TestFormatTaskFieldSurface:
         assert not [line for line in rendered if line.startswith('**Files:**')]
         assert '**ID:** 3254' in rendered
         assert '**Dependencies:** 3659, 3212' in rendered
+
+
+@pytest.mark.asyncio
+class TestFormatTaskTestStrategy:
+    """``testStrategy`` reaches every role briefed through ``_format_task`` (task 5369).
+
+    The Taskmaster key is ``testStrategy``; before this task no role saw it.
+    Driven through the architect briefing, one of that formatter's callers.
+    """
+
+    async def test_a_test_strategy_renders_on_its_own_line(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {'id': '5369', 'title': 'A task', 'testStrategy': 'Drive the seam with a real repo.'}
+
+        prompt = await briefing.build_architect_prompt(task, context='CTX')
+
+        assert '**Test strategy:** Drive the seam with a real repo.' in prompt.splitlines()
+
+    @pytest.mark.parametrize('task', [
+        {'id': '5369', 'title': 'A task', 'testStrategy': ''},
+        {'id': '5369', 'title': 'A task'},
+    ])
+    async def test_an_empty_or_absent_test_strategy_renders_nothing(
+        self, briefing: BriefingAssembler, task: dict,
+    ):
+        prompt = await briefing.build_architect_prompt(task, context='CTX')
+
+        assert '**Test strategy:**' not in prompt
+
+
+@pytest.mark.asyncio
+class TestReviewerPromptDiffCap:
+    """The incumbent's 50,000-char diff cut is a keyword the trial can lift (task 5369)."""
+
+    async def test_a_zero_cap_inlines_a_long_diff_whole(self, briefing: BriefingAssembler):
+        diff = 'x' * 60_000 + 'TAIL'
+
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', diff, context='CTX', diff_cap_chars=0,
+        )
+
+        assert diff in prompt
+        assert '[diff truncated]' not in prompt
+
+    async def test_the_default_still_truncates_at_fifty_thousand(
+        self, briefing: BriefingAssembler,
+    ):
+        diff = 'x' * 50_000 + 'TAIL'
+
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', diff, context='CTX',
+        )
+
+        assert 'x' * 50_000 + '\n\n... [diff truncated] ...' in prompt
+        assert 'TAIL' not in prompt
