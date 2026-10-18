@@ -4726,6 +4726,8 @@ def create_server(
 
         This snapshot captures the blind spot missed by runs.db-events: a
         genuinely-queued entry with no _merge-* worktree and no merge events.
+        A request still waiting for the merger whose outcome is already decided
+        (resolved or cancelled) is never listed.
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
@@ -5249,12 +5251,14 @@ def create_server(
             cancel's _on_finalized records terminal 'abandoned' first, then forget
             removes it), so an immediate resubmit gets a FRESH entry and never
             coalesces onto / observes the cancelled corpse.
-        Still async (unchanged): MergeWorker._request_abandoned drops the queued
-        work item at its next checkpoint via the cancel→worker CancelledError seam.
-        Because retirement yields the loop (the C1 removal is awaited), the
-        merge_request _waiters.pop done-callback fires during the first cancel, so an
-        immediate double-cancel finds rec=None and resolves via the current-run tier:
-        the live tier ignores the worker's cancelled (waiter_alive False) entry.
+        Only the physical drop stays async: the merger drops the queued work item
+        when it next dequeues it
+        (orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._request_abandoned),
+        but orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot
+        stops listing a decided request at once.  Because retirement yields the
+        loop (the C1 removal is awaited), the merge_request _waiters.pop
+        done-callback fires during the first cancel, so an immediate double-cancel
+        finds rec=None, misses the live tier and answers from the current-run tier.
 
         The tool is async so that future mutation runs on the event loop (not a FastMCP
         threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
