@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -899,3 +899,244 @@ def parse_declare_event(raw: object) -> DeclareEvent:
 def parse_outcome_event(raw: object) -> OutcomeEvent:
     """Validate a wire dict as an :data:`OutcomeEvent`; raises pydantic ``ValidationError``."""
     return _OUTCOME_EVENT_ADAPTER.validate_python(raw)
+
+
+# --- I2: the defects-entry transition table ----------------------------------
+
+
+class DefectTrigger(StrEnum):
+    """What an event does to a record, finer than its kind: I2 routes on proof class and closure."""
+
+    DECLARE = 'declare'
+    DECLARE_CLOSURE = 'declare_closure'
+    SIGHTING = 'sighting'
+    PROOF_PROVEN = 'proof_proven'
+    PROOF_FIX_FINDING = 'proof_fix_finding'
+    PROOF_NO_VERDICT = 'proof_no_verdict'
+    RULE_ACCEPTED_EXEMPTION = 'rule_accepted_exemption'
+    RULE_ACCEPTED_WITHDRAWAL = 'rule_accepted_withdrawal'
+    RULE_REJECTED = 'rule_rejected'
+
+
+FIX_FINDING_OUTCOMES: frozenset[ProofOutcome] = frozenset(
+    {
+        ProofOutcome.PASSES_AT_BASE,
+        ProofOutcome.FAILS_AT_TIP,
+        ProofOutcome.NOT_COLLECTED,
+        ProofOutcome.MARKER_NOT_STATIC,
+    }
+)
+"""Outcomes that are findings about the fix (decision 10); in enforce they drive a replan."""
+
+NO_VERDICT_OUTCOMES: frozenset[ProofOutcome] = frozenset(
+    {ProofOutcome.PROOF_UNAVAILABLE, ProofOutcome.PROOF_UNSUPPORTED_RUNNER}
+)
+"""Outcomes recorded as the latest proof with no transition (I2)."""
+
+_PROOF_TRIGGERS: MappingProxyType[ProofOutcome, DefectTrigger] = MappingProxyType(
+    {
+        ProofOutcome.PROVEN: DefectTrigger.PROOF_PROVEN,
+        **dict.fromkeys(FIX_FINDING_OUTCOMES, DefectTrigger.PROOF_FIX_FINDING),
+        **dict.fromkeys(NO_VERDICT_OUTCOMES, DefectTrigger.PROOF_NO_VERDICT),
+    }
+)
+
+DEFECT_TRANSITIONS: Mapping[tuple[DefectStatus | None, DefectTrigger], DefectStatus] = (
+    MappingProxyType(
+        {
+            (None, DefectTrigger.DECLARE): DefectStatus.OPEN,
+            (DefectStatus.OPEN, DefectTrigger.DECLARE_CLOSURE): DefectStatus.PENDING,
+            (DefectStatus.OPEN, DefectTrigger.PROOF_PROVEN): DefectStatus.PROVEN,
+            (DefectStatus.OPEN, DefectTrigger.PROOF_FIX_FINDING): DefectStatus.OPEN,
+            (DefectStatus.OPEN, DefectTrigger.PROOF_NO_VERDICT): DefectStatus.OPEN,
+            (DefectStatus.PROVEN, DefectTrigger.PROOF_PROVEN): DefectStatus.PROVEN,
+            (DefectStatus.PROVEN, DefectTrigger.PROOF_FIX_FINDING): DefectStatus.OPEN,
+            (DefectStatus.PROVEN, DefectTrigger.PROOF_NO_VERDICT): DefectStatus.PROVEN,
+            (DefectStatus.PENDING, DefectTrigger.RULE_ACCEPTED_EXEMPTION): DefectStatus.EXEMPTED,
+            (DefectStatus.PENDING, DefectTrigger.RULE_ACCEPTED_WITHDRAWAL): DefectStatus.WITHDRAWN,
+            (DefectStatus.PENDING, DefectTrigger.RULE_REJECTED): DefectStatus.OPEN,
+            **{(status, DefectTrigger.SIGHTING): status for status in DefectStatus},
+        }
+    )
+)
+"""PRD I2, the single home: (from status, None when absent; trigger) -> to status.
+
+Every pair not listed is refused. The rows that keep the status are explicit:
+a sighting in every status, and a proof that is recorded without a transition.
+"""
+
+
+class IllegalDefectTransition(Exception):
+    """An event the transition table does not allow from the record's current state.
+
+    Deliberately not a ValueError: the record and the event are each well
+    formed, and it is the protocol that refuses the pair.
+
+    Attributes:
+        ref: The record's ref (the event's, when no record exists yet).
+        from_status: The record's status, or None when it does not exist.
+        event: The refused event's kind.
+        trigger: The trigger the event classified as, or None when it was
+            refused before classification.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ref: str,
+        from_status: DefectStatus | RetirementState | None,
+        event: DefectEventKind,
+        trigger: DefectTrigger | None,
+    ) -> None:
+        self.ref = ref
+        self.from_status = from_status
+        self.event = event
+        self.trigger = trigger
+        super().__init__(message)
+
+
+_AnyEvent = Declare | DeclareClosure | DeclareRetirement | Sighting | Proof | Rule
+_EntryEvent = Declare | DeclareClosure | Sighting | Proof | Rule
+
+
+def _refusal(
+    table: Iterable[tuple[StrEnum | None, DefectTrigger]],
+    *,
+    ref: str,
+    from_status: DefectStatus | RetirementState | None,
+    event: DefectEventKind,
+    trigger: DefectTrigger | None,
+    why: str,
+) -> IllegalDefectTransition:
+    state = 'absent' if from_status is None else str(from_status)
+    legal = sorted(row_trigger for row_status, row_trigger in table if row_status == from_status)
+    via = '' if trigger is None else f' (trigger {trigger})'
+    return IllegalDefectTransition(
+        f'{ref}: a {event} event{via} is refused from {state}: {why}. '
+        f'Legal triggers from {state}: {", ".join(legal) or "none"}',
+        ref=ref,
+        from_status=from_status,
+        event=event,
+        trigger=trigger,
+    )
+
+
+def _require_event_ref(
+    record_ref: str,
+    from_status: DefectStatus | RetirementState,
+    event: _AnyEvent,
+    table: Iterable[tuple[StrEnum | None, DefectTrigger]],
+) -> None:
+    if event.ref != record_ref:
+        raise _refusal(
+            table,
+            ref=record_ref,
+            from_status=from_status,
+            event=event.event,
+            trigger=None,
+            why=f'the event concerns {event.ref}, not {record_ref}',
+        )
+
+
+def _defect_refusal(
+    entry: DefectDeclaration | None, event: _AnyEvent, trigger: DefectTrigger | None, why: str
+) -> IllegalDefectTransition:
+    return _refusal(
+        DEFECT_TRANSITIONS,
+        ref=event.ref if entry is None else entry.ref,
+        from_status=None if entry is None else entry.status,
+        event=event.event,
+        trigger=trigger,
+        why=why,
+    )
+
+
+def _entry_event(entry: DefectDeclaration | None, event: _AnyEvent) -> _EntryEvent:
+    if isinstance(event, DeclareRetirement):
+        raise _defect_refusal(
+            entry,
+            event,
+            None,
+            'a retirement is a record on the removing task, never a defects-entry event',
+        )
+    return event
+
+
+def _rule_trigger(entry: DefectDeclaration | None, event: Rule) -> DefectTrigger:
+    ruling = event.ruling
+    if ruling.subject is not RulingSubject.CLOSURE:
+        raise _defect_refusal(
+            entry, event, None, f'a {ruling.subject} ruling does not apply to a defects entry'
+        )
+    if not ruling.accepted:
+        return DefectTrigger.RULE_REJECTED
+    closure = None if entry is None else entry.closure
+    if isinstance(closure, Exemption):
+        return DefectTrigger.RULE_ACCEPTED_EXEMPTION
+    if isinstance(closure, Withdrawal):
+        return DefectTrigger.RULE_ACCEPTED_WITHDRAWAL
+    raise _defect_refusal(entry, event, None, 'an accepted ruling needs a closure to accept')
+
+
+def _trigger(entry: DefectDeclaration | None, event: _EntryEvent) -> DefectTrigger:
+    match event:
+        case Declare():
+            return DefectTrigger.DECLARE
+        case DeclareClosure():
+            return DefectTrigger.DECLARE_CLOSURE
+        case Sighting():
+            return DefectTrigger.SIGHTING
+        case Proof():
+            return _PROOF_TRIGGERS[event.proof.outcome]
+        case Rule():
+            return _rule_trigger(entry, event)
+
+
+def _destination(
+    entry: DefectDeclaration | None, event: _EntryEvent, trigger: DefectTrigger
+) -> DefectStatus:
+    to_status = DEFECT_TRANSITIONS.get((None if entry is None else entry.status, trigger))
+    if to_status is None:
+        raise _defect_refusal(entry, event, trigger, 'PRD I2 has no such transition')
+    return to_status
+
+
+def _effect(
+    entry: DefectDeclaration | None, event: _EntryEvent, to_status: DefectStatus
+) -> DefectDeclaration:
+    """The entry after a transition the table allowed, always CONSTRUCTED so coherence re-runs."""
+    if isinstance(event, Declare):
+        return event.declaration
+    if entry is None:
+        raise _defect_refusal(entry, event, None, 'only a declare event creates an entry')
+    changes: dict[str, object]
+    match event:
+        case DeclareClosure():
+            changes = {'closure': event.closure, 'ruling': None}
+        case Sighting():
+            changes = {'sightings': entry.sightings + 1}
+        case Proof():
+            changes = {'proof': event.proof}
+        case Rule():
+            changes = {'ruling': event.ruling}
+    return DefectDeclaration.model_validate({**dict(entry), **changes, 'status': to_status})
+
+
+def apply_event(
+    entry: DefectDeclaration | None, event: DeclareEvent | OutcomeEvent
+) -> DefectDeclaration:
+    """The defects entry after *event*, per :data:`DEFECT_TRANSITIONS`; pure.
+
+    *entry* is None when no entry for the ref exists yet.
+
+    Raises:
+        IllegalDefectTransition: the event concerns another ref, is not a
+            defects-entry event, or I2 has no transition for it from the
+            entry's status.
+    """
+    if entry is not None:
+        _require_event_ref(entry.ref, entry.status, event, DEFECT_TRANSITIONS)
+    entry_event = _entry_event(entry, event)
+    trigger = _trigger(entry, entry_event)
+    return _effect(entry, entry_event, _destination(entry, entry_event, trigger))
