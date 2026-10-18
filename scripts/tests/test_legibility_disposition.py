@@ -3,6 +3,7 @@ becomes work and how its task links back (plans/census-incremental-prd.md L4;
 docs/quality-findings-contract.md §6, §7, §8)."""
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Sequence
@@ -1225,3 +1226,207 @@ def test_a_reverification_holds_gone_and_present_to_their_verdicts(result, found
         )
 
     assert "INV-3" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# The projection (INV-9: status and accepted_by re-derived from the task store
+# every run; INV-3: fixed only from a re-verify that found the finding gone)
+# ---------------------------------------------------------------------------
+
+_SHA = "1234567abcdef"
+ReverifyResult = disposition.ReverifyResult
+
+
+def _reverified(result: str, entry_id: str = "entry-a", task_id: int = 5120) -> dict:
+    found = {"gone": _parsed(verified=False), "present": _parsed(verified=True)}.get(result)
+    reason = None if found is not None else "not established"
+    return {entry_id: disposition.Reverification(
+        entry_id, disposition.TaskRef(_ROOT, task_id), ReverifyResult(result), found, reason,
+    )}
+
+
+def _projected(entry: dict, statuses: dict | None, *, store: FakeTaskStore | None = None, reverified=None):
+    cb = _codebook(entry)
+    before = copy.deepcopy(cb)
+    outcomes = _read(cb, statuses, store)
+
+    projected_cb, changes = disposition.project(cb, outcomes, reverified or {}, as_of_sha=_SHA)
+
+    assert cb == before
+    assert codebook.validate(projected_cb) == []
+    (projected,) = projected_cb["entries"]
+    return projected, tuple(changes)
+
+
+def _state(entry: dict) -> tuple:
+    return entry["status"], entry.get("accepted_by"), entry.get("fixed_at_sha")
+
+
+def _change(from_status: str, to_status: str, accepted_by: int | None = None, fixed_at_sha: str | None = None):
+    return disposition.StatusChange("entry-a", from_status, to_status, accepted_by, fixed_at_sha)
+
+
+def test_an_accepting_cancel_makes_the_entry_accepted_by_that_task() -> None:
+    entry = _entry("entry-a", filed_tickets=[_task_row(5120)])
+
+    projected, changes = _projected(entry, {"5120": "cancelled"}, store=FakeTaskStore(tasks={5120: _accepting(5120)}))
+
+    assert _state(projected) == ("accepted", 5120, None)
+    assert changes == (_change("open", "accepted", accepted_by=5120),)
+
+
+def test_a_stale_acceptance_whose_task_was_abandoned_returns_to_open() -> None:
+    entry = _entry("entry-a", status="accepted", accepted_by=77, filed_tickets=[_task_row(77)])
+
+    projected, changes = _projected(entry, {"77": "cancelled"}, store=FakeTaskStore(tasks={77: _task(77, "cancelled")}))
+
+    assert _state(projected) == ("open", None, None)
+    assert "accepted_by" not in projected
+    assert changes == (_change("accepted", "open"),)
+
+
+def test_an_acceptance_moves_to_the_task_that_now_governs() -> None:
+    entry = _entry("entry-a", status="accepted", accepted_by=77, filed_tickets=[_task_row(77), _task_row(80)])
+    store = FakeTaskStore(tasks={77: _accepting(77), 80: _accepting(80)})
+
+    projected, changes = _projected(entry, {"77": "cancelled", "80": "cancelled"}, store=store)
+
+    assert _state(projected) == ("accepted", 80, None)
+    assert changes == (_change("accepted", "accepted", accepted_by=80),)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"status": "accepted", "accepted_by": 77}, {"status": "fixed", "fixed_at_sha": "abcdef1"}],
+    ids=["accepted", "fixed"],
+)
+def test_live_work_reopens_an_accepted_or_fixed_entry(fields) -> None:
+    entry = _entry("entry-a", filed_tickets=[_task_row(77)], **fields)
+
+    projected, changes = _projected(entry, {"77": "pending"})
+
+    assert _state(projected) == ("open", None, None)
+    assert changes == (_change(fields["status"], "open"),)
+
+
+@pytest.mark.parametrize("status", ["open", "partially"])
+def test_live_work_leaves_an_open_or_partial_entry_as_it_is(status) -> None:
+    entry = _entry("entry-a", status=status, filed_tickets=[_task_row(77)])
+
+    projected, changes = _projected(entry, {"77": "in-progress"})
+
+    assert _state(projected) == (status, None, None)
+    assert changes == ()
+
+
+@pytest.mark.parametrize(
+    "fields", [{}, {"status": "accepted", "accepted_by": 5120}], ids=["from-open", "from-accepted"],
+)
+def test_a_done_task_whose_reverify_found_the_finding_gone_fixes_the_entry_at_as_of_sha(fields) -> None:
+    entry = _entry("entry-a", filed_tickets=[_task_row(5120)], **fields)
+
+    projected, changes = _projected(entry, {"5120": "done"}, reverified=_reverified("gone"))
+
+    assert _state(projected) == ("fixed", None, _SHA)
+    assert changes == (_change(fields.get("status", "open"), "fixed", fixed_at_sha=_SHA),)
+
+
+@pytest.mark.parametrize("result", ["present", "inconclusive", "deferred"])
+def test_a_done_task_never_fixes_without_a_gone_reverify(result) -> None:
+    accepted = _entry("entry-a", status="accepted", accepted_by=5120, filed_tickets=[_task_row(5120)])
+
+    projected, changes = _projected(accepted, {"5120": "done"}, reverified=_reverified(result))
+
+    assert _state(projected) == ("open", None, None)
+    assert changes == (_change("accepted", "open"),)
+
+
+@pytest.mark.parametrize("status", ["open", "partially", "mined-unverified"])
+@pytest.mark.parametrize("result", ["present", "inconclusive", "deferred", None])
+def test_a_done_task_without_a_gone_reverify_keeps_any_other_status(status, result) -> None:
+    entry = _entry("entry-a", status=status, filed_tickets=[_task_row(5120)])
+    reverified = None if result is None else _reverified(result)
+
+    projected, changes = _projected(entry, {"5120": "done"}, reverified=reverified)
+
+    assert _state(projected) == (status, None, None)
+    assert changes == ()
+
+
+def test_a_gone_reverify_of_a_task_that_no_longer_governs_fixes_nothing() -> None:
+    entry = _entry("entry-a", filed_tickets=[_task_row(5120), _task_row(5200)])
+
+    projected, changes = _projected(entry, {"5120": "done", "5200": "pending"}, reverified=_reverified("gone"))
+
+    assert _state(projected) == ("open", None, None)
+    assert changes == ()
+
+
+@pytest.mark.parametrize(
+    ("statuses", "tasks"),
+    [({"77": "done"}, {}), ({"77": "cancelled"}, {77: _task(77, "cancelled")})],
+    ids=["done", "abandoned"],
+)
+def test_a_fixed_entry_not_reopened_by_live_work_stays_fixed(statuses, tasks) -> None:
+    entry = _entry("entry-a", status="fixed", fixed_at_sha="abcdef1", filed_tickets=[_task_row(77)])
+
+    projected, changes = _projected(entry, statuses, store=FakeTaskStore(tasks=tasks))
+
+    assert _state(projected) == ("fixed", None, "abcdef1")
+    assert changes == ()
+
+
+@pytest.mark.parametrize(
+    ("fields", "statuses"),
+    [
+        ({"status": "retired"}, {"5120": "cancelled"}),
+        ({"status": "accepted", "accepted_by": 5120}, {}),
+        ({"status": "accepted", "accepted_by": 5120}, None),
+    ],
+    ids=["retired", "unobserved-task", "no-snapshot"],
+)
+def test_a_retired_or_ungoverned_entry_is_unchanged_whatever_the_outcomes_say(fields, statuses) -> None:
+    entry = _entry("entry-a", filed_tickets=[_task_row(5120)], **fields)
+    store = FakeTaskStore(tasks={5120: _accepting(5120)})
+
+    projected, changes = _projected(entry, statuses, store=store, reverified=_reverified("gone"))
+
+    assert projected == entry
+    assert changes == ()
+
+
+def test_an_entry_without_back_links_is_unchanged() -> None:
+    entry = _entry("entry-a", status="accepted", accepted_by=12)
+
+    projected, changes = _projected(entry, {"12": "pending"})
+
+    assert projected == entry
+    assert changes == ()
+
+
+def test_refilings_re_file_a_present_mechanical_finding_and_a_recurring_abandoned_one() -> None:
+    cb = _codebook(
+        _entry("entry-present", filed_tickets=[_task_row(5120)]),
+        _entry("entry-structural", filed_tickets=[_task_row(5121)]),
+        _entry("entry-gone", filed_tickets=[_task_row(5122)]),
+        _entry("entry-abandoned", filed_tickets=[_task_row(12)]),
+        _entry("entry-quiet", filed_tickets=[_task_row(13)]),
+        _entry("entry-live", filed_tickets=[_task_row(14)]),
+    )
+    statuses = {"5120": "done", "5121": "done", "5122": "done", "12": "cancelled", "13": "cancelled", "14": "pending"}
+    outcomes = _read(cb, statuses, FakeTaskStore(tasks={12: _task(12, "cancelled"), 13: _task(13, "cancelled")}))
+    reverified = {
+        **_reverified("present", "entry-present", 5120),
+        "entry-structural": disposition.Reverification(
+            "entry-structural", disposition.TaskRef(_ROOT, 5121), ReverifyResult.PRESENT,
+            _parsed(verified=True, route="structural"),
+        ),
+        **_reverified("gone", "entry-gone", 5122),
+    }
+
+    refiled = disposition.refilings(outcomes, reverified, sighted={"entry-abandoned", "entry-live", "entry-elsewhere"})
+
+    assert tuple(refiled) == (
+        disposition.Refiling("entry-present", 5120, True, _parsed(verified=True)),
+        disposition.Refiling("entry-abandoned", None, False, None),
+    )
