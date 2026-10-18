@@ -23,7 +23,11 @@ from _orch_helpers import (
     skip_role_config_layer,
     stamp_stock_routing_config,
 )
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AllAccountsCappedException,
+    classify_agent_failure,
+)
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
@@ -429,6 +433,7 @@ class TestBudgetExhaustedFallback:
             output='',
             structured_output=None,
         )
+        assert classify_agent_failure(agent_result).kind is AgentFailureKind.BUDGET
 
         scheduler = MagicMock()
         scheduler.update_task = AsyncMock(return_value=True)

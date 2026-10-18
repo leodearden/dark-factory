@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE, AgentResult
 from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
@@ -203,7 +203,7 @@ def _probe_hit_local_budget_cap(result: dict[str, object] | None) -> bool:
     tokens — the account is NOT capped. Distinct from account-level cap hits
     (which surface as text prefixes in stderr, not JSON subtypes).
     """
-    return result is not None and result.get('subtype') == 'error_max_budget_usd'
+    return result is not None and result.get('subtype') == BUDGET_EXHAUSTED_SUBTYPE
 
 
 def _probe_succeeded(returncode: int | None, result: dict[str, object] | None) -> bool:
