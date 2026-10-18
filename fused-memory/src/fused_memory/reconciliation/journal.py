@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import uuid as uuid_mod
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,6 +32,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.utils.sqlite_connector import Connector
 
 if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
@@ -246,7 +246,7 @@ class ReconciliationJournal:
         self,
         data_dir: Path,
         *,
-        connect: Callable[[str], Awaitable[aiosqlite.Connection]] = connect_daemon,
+        connect: Connector = connect_daemon,
     ):
         """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
 
@@ -269,8 +269,6 @@ class ReconciliationJournal:
 
         *connect* is how ``initialize`` opens the journal's one connection, given
         the ``reconciliation.db`` path; it defaults to ``connect_daemon``.
-        ``fused-memory/tests/test_recon_db_atomicity.py`` passes its own to reach
-        that connection.
         """
         self.data_dir = data_dir
         self._connect = connect

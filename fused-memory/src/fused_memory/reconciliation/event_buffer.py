@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.throughput import utc_hour_bucket
+from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
 
@@ -118,13 +119,11 @@ class EventBuffer:
         queue_stats_fn: Callable[[], Any] | None = None,
         instance_id: str | None = None,
         *,
-        connect: Callable[[str], Awaitable[aiosqlite.Connection]] = connect_daemon,
+        connect: Connector = connect_daemon,
     ):
         """*connect* is how ``initialize`` opens the buffer's one connection.
 
-        It is given the database path and defaults to ``connect_daemon``;
-        ``fused-memory/tests/test_recon_db_atomicity.py`` passes its own to
-        reach that connection.
+        It is given the database path and defaults to ``connect_daemon``.
         """
         # _in_memory is derived from the caller's intent (db_path is None),
         # not from the resolved string ':memory:'.  This means explicitly
