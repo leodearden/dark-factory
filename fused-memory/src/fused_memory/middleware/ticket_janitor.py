@@ -421,25 +421,27 @@ class TicketJanitor:
                     self._probe_failures.pop(pid, None)
                 if not alive:
                     try:
-                        reaped_ids = await self._store.mark_pending_failed_for_project(
+                        recovery = await self._store.recover_pending_for_dead_worker(
                             pid, reason='worker_dead',
                         )
                     except Exception:
                         logger.exception(
-                            'ticket_janitor: mark_pending_failed_for_project '
+                            'ticket_janitor: recover_pending_for_dead_worker '
                             'failed for %s', pid,
                         )
                         continue
+                    reaped_ids = recovery.failed_ids + recovery.reparked_ids
                     if reaped_ids:
                         logger.warning(
                             'ticket_janitor: reaped %d pending ticket(s) for '
                             'dead worker on project %s', len(reaped_ids), pid,
                         )
                         # Signal blocked resolve_ticket waiters so they wake
-                        # promptly with failed/worker_dead instead of waiting
+                        # promptly with failed/worker_dead (or
+                        # awaiting_curation, if re-parked) instead of waiting
                         # for their own timeout.  Strictly after the
-                        # terminalising UPDATE so the woken caller re-reads a
-                        # terminal row (not still-pending).  Best-effort:
+                        # recovering UPDATE so the woken caller re-reads a
+                        # row that is no longer pending.  Best-effort:
                         # a buggy callback must not crash the janitor loop.
                         if self._signal_ticket_resolved is not None:
                             for tid in reaped_ids:

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -10,7 +11,14 @@ from _fm_helpers import seed_resolved_ticket
 from shared.async_sqlite_base import CheckpointResult
 from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
-from fused_memory.middleware.ticket_store import TicketStore, _new_ticket_id
+from fused_memory.middleware.curation_deferral import DeferralPolicy
+from fused_memory.middleware.ticket_store import (
+    AWAITING_CURATION,
+    CurationBacklog,
+    OrphanedPendingRecovery,
+    TicketStore,
+    _new_ticket_id,
+)
 
 
 @pytest_asyncio.fixture
@@ -76,6 +84,8 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
             'resolved_at',
             'expires_at',
             'escalated_at',
+            'attempts',
+            'next_attempt_at',
         }
         assert expected_columns == col_names, (
             f"Missing columns: {expected_columns - col_names}; "
@@ -246,7 +256,7 @@ async def test_get_returns_row_or_none(store):
     expected_keys = {
         'ticket_id', 'project_id', 'candidate_json', 'status',
         'task_id', 'reason', 'result_json', 'created_at', 'resolved_at',
-        'expires_at', 'escalated_at',
+        'expires_at', 'escalated_at', 'attempts', 'next_attempt_at',
     }
     assert expected_keys == set(row.keys())
     assert row['ticket_id'] == ticket_id
@@ -614,11 +624,11 @@ async def test_list_tickets_filters_by_project(store):
 
 
 @pytest.mark.asyncio
-async def test_mark_pending_failed_for_project_returns_reaped_ids(store):
-    """mark_pending_failed_for_project returns the list of reaped ticket_ids.
+async def test_recover_pending_for_dead_worker_returns_reaped_ids(store):
+    """recover_pending_for_dead_worker reports the never-deferred rows it failed.
 
     Verifies:
-    * Return value is exactly the pending ticket_ids in project A (not an int).
+    * failed_ids is exactly the pending ticket_ids in project A.
     * Reaped rows are now status='failed'/reason='worker_dead' with resolved_at set.
     * A ticket in project B (different project) is NOT reaped.
     * An already-terminal ticket in A (forced to failed) is excluded from the result.
@@ -636,13 +646,12 @@ async def test_mark_pending_failed_for_project_returns_reaped_ids(store):
     b1 = await store.submit(project_id='proj-b', candidate_json='{}')
 
     # Call under test.
-    reaped = await store.mark_pending_failed_for_project('proj-a', reason='worker_dead')
+    recovery = await store.recover_pending_for_dead_worker('proj-a', reason='worker_dead')
 
-    # Return type must be a list of strings, not an int.
-    assert isinstance(reaped, list), f'expected list, got {type(reaped).__name__}'
-    assert set(reaped) == {a1, a2, a3}, (
-        f'expected exactly the 3 pending A ticket_ids, got {reaped}'
+    assert set(recovery.failed_ids) == {a1, a2, a3}, (
+        f'expected exactly the 3 pending A ticket_ids, got {recovery}'
     )
+    assert recovery.reparked_ids == ()
 
     # Reaped rows are terminal with correct fields.
     for tid in (a1, a2, a3):
@@ -675,7 +684,7 @@ async def test_a_cancelled_write_does_not_discard_a_concurrent_submit(tmp_path):
     await store.initialize()
     try:
         seed = await store.submit('p', '{}')
-        victim = asyncio.create_task(store.mark_pending_failed_for_project('p', reason='x'))
+        victim = asyncio.create_task(store.recover_pending_for_dead_worker('p', reason='x'))
         survivor = asyncio.create_task(store.submit('q', '{}'))
         await asyncio.sleep(0)
         victim.cancel()
@@ -919,3 +928,300 @@ class TestDedupHealthWindow:
         assert isinstance(health, DedupHealth)
         with pytest.raises(dataclasses.FrozenInstanceError):
             health.resolved = 1  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Curation parking — a submission the curator could not judge (task 4503)
+# ---------------------------------------------------------------------------
+
+
+_POLICY = DeferralPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0, max_defer_seconds=1800.0)
+
+
+def _rewrite_row(db_path, ticket_id: str, **columns) -> None:
+    """Pin columns of one row through an independent connection: the db file is the fixture."""
+    assignments = ', '.join(f'{name} = ?' for name in columns)
+    with sqlite3.connect(db_path, timeout=5) as conn:
+        conn.execute(
+            f'UPDATE tickets SET {assignments} WHERE ticket_id = ?',
+            (*columns.values(), ticket_id),
+        )
+
+
+async def _submitted_at(store: TicketStore, ticket_id: str) -> datetime:
+    row = await store.get(ticket_id)
+    assert row is not None
+    return datetime.fromisoformat(row['created_at'])
+
+
+async def _park(store: TicketStore, ticket_id: str, *, after_seconds: float = 10.0) -> int | None:
+    now = await _submitted_at(store, ticket_id) + timedelta(seconds=after_seconds)
+    return await store.mark_awaiting_curation(
+        ticket_id, reason='curation-deferred: all-accounts-capped', policy=_POLICY, now=now,
+    )
+
+
+class TestCurationParking:
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        return tmp_path / 'tickets.db'
+
+    @pytest.mark.asyncio
+    async def test_legacy_db_gains_attempts_and_next_attempt_at(self, tmp_path):
+        db_path = tmp_path / 'tickets.db'
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+                CREATE TABLE tickets (
+                    ticket_id   TEXT PRIMARY KEY,
+                    project_id  TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'pending',
+                    task_id     TEXT,
+                    reason      TEXT,
+                    result_json TEXT,
+                    created_at  TEXT NOT NULL,
+                    resolved_at TEXT,
+                    expires_at  TEXT NOT NULL,
+                    escalated_at TEXT
+                )
+            """)
+            conn.execute(
+                "INSERT INTO tickets (ticket_id, project_id, candidate_json, created_at, expires_at) "
+                "VALUES ('tkt_legacy', 'p', '{}', '2026-10-18T12:00:00+00:00', '2027-10-18T12:00:00+00:00')"
+            )
+
+        store = TicketStore(db_path)
+        await store.initialize()
+        try:
+            legacy = await store.get('tkt_legacy')
+            assert legacy is not None
+            assert legacy['attempts'] == 0
+            assert legacy['next_attempt_at'] is None
+            assert await _park(store, 'tkt_legacy') == 1
+        finally:
+            await store.close()
+
+        with sqlite3.connect(db_path) as conn:
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(tickets)')}
+            indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert {'attempts', 'next_attempt_at'} <= columns
+        assert 'ix_tickets_status_next_attempt' in indexes
+
+    @pytest.mark.asyncio
+    async def test_park_moves_pending_to_awaiting_curation_without_resolving(self, store):
+        tid = await store.submit('p', '{}')
+
+        attempts = await _park(store, tid)
+
+        row = await store.get(tid)
+        assert attempts == 1
+        assert row['status'] == AWAITING_CURATION == 'awaiting_curation'
+        assert row['attempts'] == 1
+        assert row['reason'] == 'curation-deferred: all-accounts-capped'
+        assert row['resolved_at'] is None
+        assert row['task_id'] is None
+
+    @pytest.mark.asyncio
+    async def test_park_schedules_by_policy_and_clamps_to_the_deadline(self, store):
+        tid = await store.submit('p', '{}')
+        submitted = await _submitted_at(store, tid)
+
+        await _park(store, tid, after_seconds=10.0)
+        first = await store.get(tid)
+        assert await store.requeue_awaiting_curation(tid) is True
+        assert await _park(store, tid, after_seconds=1750.0) == 2
+        second = await store.get(tid)
+
+        assert datetime.fromisoformat(first['next_attempt_at']) == submitted + timedelta(seconds=70)
+        assert datetime.fromisoformat(second['next_attempt_at']) == submitted + timedelta(seconds=1800)
+
+    @pytest.mark.asyncio
+    async def test_park_refuses_a_non_pending_row(self, store):
+        resolved = await store.submit('p', '{}')
+        await store.mark_resolved(resolved, status='created', task_id='7')
+        parked = await store.submit('p', '{}')
+        await _park(store, parked)
+
+        assert await _park(store, resolved) is None
+        assert await _park(store, parked) is None
+        assert await store.mark_awaiting_curation(
+            'tkt_unknown', reason='r', policy=_POLICY, now=datetime.now(UTC),
+        ) is None
+        assert (await store.get(resolved))['status'] == 'created'
+        assert (await store.get(parked))['attempts'] == 1
+
+    @pytest.mark.asyncio
+    async def test_requeue_flips_parked_to_pending_keeping_attempts(self, store):
+        tid = await store.submit('p', '{}')
+        await _park(store, tid)
+
+        assert await store.requeue_awaiting_curation(tid) is True
+
+        row = await store.get(tid)
+        assert row['status'] == 'pending'
+        assert row['attempts'] == 1
+        assert row['next_attempt_at'] is None
+        assert row['resolved_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_requeue_refuses_a_non_parked_row(self, store):
+        pending = await store.submit('p', '{}')
+        resolved = await store.submit('p', '{}')
+        await store.mark_resolved(resolved, status='created', task_id='7')
+        parked = await store.submit('p', '{}')
+        await _park(store, parked)
+        assert await store.requeue_awaiting_curation(parked) is True
+
+        assert await store.requeue_awaiting_curation(pending) is False
+        assert await store.requeue_awaiting_curation(resolved) is False
+        assert await store.requeue_awaiting_curation(parked) is False
+        assert await store.requeue_awaiting_curation('tkt_unknown') is False
+        assert (await store.get(resolved))['status'] == 'created'
+
+    @pytest.mark.asyncio
+    async def test_fetch_due_returns_due_rows_oldest_first_and_respects_limit(self, store, db_path):
+        now = datetime(2026, 10, 18, 12, 0, 10, tzinfo=UTC)
+        due_with_micros = await store.submit('p', '{}')
+        due_exactly_now = await store.submit('p', '{}')
+        due_from_restart = await store.submit('q', '{}')
+        not_yet_due = await store.submit('p', '{}')
+        still_pending = await store.submit('p', '{}')
+        for tid in (due_with_micros, due_exactly_now, due_from_restart, not_yet_due):
+            await _park(store, tid)
+        _rewrite_row(db_path, due_with_micros,
+                     created_at='2026-10-18T11:00:03+00:00', next_attempt_at='2026-10-18T12:00:09.999999+00:00')
+        _rewrite_row(db_path, due_exactly_now,
+                     created_at='2026-10-18T11:00:02.500000+00:00', next_attempt_at='2026-10-18T12:00:10+00:00')
+        _rewrite_row(db_path, due_from_restart,
+                     created_at='2026-10-18T11:00:01+00:00', next_attempt_at=None)
+        _rewrite_row(db_path, not_yet_due,
+                     created_at='2026-10-18T11:00:00+00:00', next_attempt_at='2026-10-18T12:00:10.000001+00:00')
+        _rewrite_row(db_path, still_pending, created_at='2026-10-18T10:00:00+00:00')
+
+        due = await store.fetch_due_awaiting_curation(now=now, limit=10)
+        first_two = await store.fetch_due_awaiting_curation(now=now, limit=2)
+
+        assert [row['ticket_id'] for row in due] == [due_from_restart, due_exactly_now, due_with_micros]
+        assert [row['ticket_id'] for row in first_two] == [due_from_restart, due_exactly_now]
+        assert due[0]['project_id'] == 'q'
+
+    @pytest.mark.asyncio
+    async def test_fetch_due_rejects_a_naive_now(self, store):
+        with pytest.raises(ValueError, match='timezone'):
+            await store.fetch_due_awaiting_curation(now=datetime(2026, 10, 18, 12, 0, 0), limit=10)
+
+    @pytest.mark.asyncio
+    async def test_summarise_groups_parked_rows_by_project(self, store, db_path):
+        twice = await store.submit('p', '{}')
+        once = await store.submit('p', '{}')
+        other = await store.submit('q', '{}')
+        await store.submit('p', '{}')
+        for tid in (twice, once, other):
+            await _park(store, tid)
+        await store.requeue_awaiting_curation(twice)
+        await _park(store, twice)
+        _rewrite_row(db_path, once, created_at='2026-10-18T09:00:00+00:00')
+        _rewrite_row(db_path, twice, created_at='2026-10-18T09:30:00+00:00')
+        _rewrite_row(db_path, other, created_at='2026-10-18T08:00:00+00:00')
+
+        backlog = await store.summarise_awaiting_curation()
+
+        assert backlog == [
+            CurationBacklog(project_id='p', count=2, oldest_created_at='2026-10-18T09:00:00+00:00', max_attempts=2),
+            CurationBacklog(project_id='q', count=1, oldest_created_at='2026-10-18T08:00:00+00:00', max_attempts=1),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_summarise_is_empty_with_nothing_parked(self, store):
+        await store.submit('p', '{}')
+
+        assert await store.summarise_awaiting_curation() == []
+
+    @pytest.mark.asyncio
+    async def test_cancel_from_parked_via_from_statuses(self, store):
+        tid = await store.submit('p', '{}')
+        await _park(store, tid)
+
+        refused_by_default = await store.mark_resolved(tid, status='cancelled', reason='user_cancelled')
+        assert refused_by_default is False
+        assert (await store.get(tid))['status'] == AWAITING_CURATION
+
+        cancelled = await store.mark_resolved(
+            tid, status='cancelled', reason='user_cancelled',
+            from_statuses=('pending', AWAITING_CURATION),
+        )
+
+        row = await store.get(tid)
+        assert cancelled is True
+        assert row['status'] == 'cancelled'
+        assert row['resolved_at'] is not None
+        assert row['next_attempt_at'] is None
+        assert await store.requeue_awaiting_curation(tid) is False
+
+
+# ---------------------------------------------------------------------------
+# Restart and dead-worker recovery of curation parking (task 4503)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flush_keeps_parked_rows_and_makes_them_due(store):
+    parked = await store.submit('p', '{}')
+    await _park(store, parked)
+    assert await store.fetch_due_awaiting_curation(
+        now=await _submitted_at(store, parked), limit=10,
+    ) == []
+
+    failed = await store.flush_pending_on_startup()
+
+    row = await store.get(parked)
+    assert failed == 0
+    assert row['status'] == AWAITING_CURATION
+    assert row['attempts'] == 1
+    assert row['next_attempt_at'] is None
+    assert row['resolved_at'] is None
+    due = await store.fetch_due_awaiting_curation(now=await _submitted_at(store, parked), limit=10)
+    assert [r['ticket_id'] for r in due] == [parked]
+
+
+@pytest.mark.asyncio
+async def test_flush_reparks_a_requeued_pending_row(store):
+    requeued = await store.submit('p', '{}')
+    await _park(store, requeued)
+    await store.requeue_awaiting_curation(requeued)
+    never_deferred = await store.submit('p', '{}')
+
+    failed = await store.flush_pending_on_startup()
+
+    row = await store.get(requeued)
+    assert failed == 1
+    assert row['status'] == AWAITING_CURATION
+    assert row['attempts'] == 1
+    assert row['next_attempt_at'] is None
+    assert row['resolved_at'] is None
+    fresh = await store.get(never_deferred)
+    assert (fresh['status'], fresh['reason']) == ('failed', 'server_restart')
+
+
+@pytest.mark.asyncio
+async def test_recover_for_dead_worker_reparks_requeued_and_fails_the_rest(store):
+    requeued = await store.submit('p', '{}')
+    await _park(store, requeued)
+    await store.requeue_awaiting_curation(requeued)
+    never_deferred = await store.submit('p', '{}')
+    parked = await store.submit('p', '{}')
+    await _park(store, parked)
+    parked_before = await store.get(parked)
+    other_project = await store.submit('q', '{}')
+
+    recovery = await store.recover_pending_for_dead_worker('p', reason='worker_dead')
+
+    assert recovery == OrphanedPendingRecovery(failed_ids=(never_deferred,), reparked_ids=(requeued,))
+    reparked = await store.get(requeued)
+    assert (reparked['status'], reparked['attempts'], reparked['next_attempt_at']) == (
+        AWAITING_CURATION, 1, None,
+    )
+    failed = await store.get(never_deferred)
+    assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
+    assert await store.get(parked) == parked_before
+    assert (await store.get(other_project))['status'] == 'pending'
