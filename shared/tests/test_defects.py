@@ -14,8 +14,13 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from shared.defects import (
+    Declare,
+    DeclareClosure,
+    DeclareRetirement,
+    DefectDeclaration,
     DefectOrigin,
     DefectProof,
+    DefectStatus,
     Exemption,
     ExemptionReason,
     KeepCheck,
@@ -25,16 +30,19 @@ from shared.defects import (
     NodeId,
     PlanCheck,
     PlanCheckOutcome,
+    Proof,
     ProofOutcome,
     Retirement,
     RetirementCode,
     RetirementReason,
     RetirementState,
+    Rule,
     RuledBy,
     Ruling,
     RulingSubject,
     SideOutcome,
     SideResult,
+    Sighting,
     UnavailableReason,
     Withdrawal,
     WithdrawalCode,
@@ -46,6 +54,8 @@ from shared.defects import (
     mint_portal_ref,
     mint_redmain_ref,
     mint_review_ref,
+    parse_declare_event,
+    parse_outcome_event,
     parse_ref,
 )
 from shared.finding_key import finding_key
@@ -659,3 +669,250 @@ def test_leaf_records_forbid_extra_fields(build) -> None:
     dumped = {**sample.model_dump(mode='json'), 'bogus': 1}
     with pytest.raises(ValidationError):
         type(sample).model_validate(dumped)
+
+
+# --- DefectDeclaration and events ---------------------------------------------
+
+_DECLARED_AT = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+
+
+def _declaration(**overrides: Any) -> DefectDeclaration:
+    fields: dict[str, Any] = {
+        'ref': _REF,
+        'origin': DefectOrigin.HUMAN,
+        'summary': 'Some summary',
+        'declared_at': _DECLARED_AT,
+        'declared_by': 'leo',
+        'status': DefectStatus.OPEN,
+        'sightings': 1,
+        'proof': None,
+        'closure': None,
+        'ruling': None,
+    }
+    return DefectDeclaration(**{**fields, **overrides})
+
+
+class TestDefectDeclaration:
+    def test_fresh_entry_round_trips(self) -> None:
+        _assert_round_trips(_declaration())
+
+    def test_origin_must_match_the_ref(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _declaration(origin=DefectOrigin.REVIEW)
+        message = excinfo.value.errors()[0]['msg']
+        assert 'review' in message
+        assert 'human' in message
+
+    @pytest.mark.parametrize(
+        'overrides',
+        [
+            pytest.param({'sightings': 0}, id='sightings-0'),
+            pytest.param({'summary': ''}, id='empty-summary'),
+            pytest.param({'declared_by': ''}, id='empty-declared-by'),
+            pytest.param({'declared_at': datetime(2026, 10, 18, 12, 0)}, id='naive-declared-at'),
+        ],
+    )
+    def test_field_floors(self, overrides: dict[str, Any]) -> None:
+        with pytest.raises(ValidationError):
+            _declaration(**overrides)
+
+
+_ACCEPTED = _ruling(True)
+_REJECTED = _ruling(False)
+_SELF_DUPLICATE = _withdrawal(WithdrawalCode.DUPLICATE_OF, _REF)
+
+_COHERENCE = [
+    pytest.param(DefectStatus.PENDING, None, _exemption(), None, True, id='pending-ok'),
+    pytest.param(DefectStatus.PENDING, None, None, None, False, id='pending-no-closure'),
+    pytest.param(
+        DefectStatus.PENDING, None, _exemption(), _ACCEPTED, False, id='pending-accepted-ruling'
+    ),
+    pytest.param(
+        DefectStatus.PENDING, None, _exemption(), _REJECTED, False, id='pending-rejected-ruling'
+    ),
+    pytest.param(DefectStatus.EXEMPTED, None, _exemption(), _ACCEPTED, True, id='exempted-ok'),
+    pytest.param(
+        DefectStatus.EXEMPTED, None, _withdrawal(), _ACCEPTED, False, id='exempted-withdrawal'
+    ),
+    pytest.param(
+        DefectStatus.EXEMPTED, None, _exemption(), _REJECTED, False, id='exempted-rejected'
+    ),
+    pytest.param(DefectStatus.WITHDRAWN, None, _withdrawal(), _ACCEPTED, True, id='withdrawn-ok'),
+    pytest.param(
+        DefectStatus.WITHDRAWN, None, _exemption(), _ACCEPTED, False, id='withdrawn-exemption'
+    ),
+    pytest.param(
+        DefectStatus.WITHDRAWN, None, _withdrawal(), _REJECTED, False, id='withdrawn-rejected'
+    ),
+    pytest.param(
+        DefectStatus.OPEN, None, _exemption(), _REJECTED, True, id='open-retained-rejection'
+    ),
+    pytest.param(DefectStatus.OPEN, None, _exemption(), None, False, id='open-unruled-closure'),
+    pytest.param(DefectStatus.OPEN, None, _exemption(), _ACCEPTED, False, id='open-accepted'),
+    pytest.param(
+        DefectStatus.OPEN,
+        _proof(ProofOutcome.PASSES_AT_BASE),
+        None,
+        None,
+        True,
+        id='open-latest-fix-finding',
+    ),
+    pytest.param(DefectStatus.PROVEN, _proof(), None, None, True, id='proven-ok'),
+    pytest.param(
+        DefectStatus.PROVEN,
+        _proof(),
+        _withdrawal(),
+        _REJECTED,
+        True,
+        id='proven-retained-rejection',
+    ),
+    pytest.param(DefectStatus.PROVEN, None, None, None, False, id='proven-no-proof'),
+    pytest.param(
+        DefectStatus.PROVEN, _proof(ref=_OTHER_REF), None, None, False, id='proof-other-ref'
+    ),
+    pytest.param(
+        DefectStatus.OPEN,
+        None,
+        _exemption(),
+        _ruling(False, RulingSubject.RETIREMENT),
+        False,
+        id='retirement-subject-ruling',
+    ),
+    pytest.param(DefectStatus.OPEN, None, None, _REJECTED, False, id='ruling-without-closure'),
+    pytest.param(
+        DefectStatus.PENDING, None, _SELF_DUPLICATE, None, False, id='duplicate-of-itself'
+    ),
+]
+
+
+@pytest.mark.parametrize(('status', 'proof', 'closure', 'ruling', 'ok'), _COHERENCE)
+def test_declaration_coherence(
+    status: DefectStatus,
+    proof: DefectProof | None,
+    closure: Exemption | Withdrawal | None,
+    ruling: Ruling | None,
+    ok: bool,
+) -> None:
+    fields = {'status': status, 'proof': proof, 'closure': closure, 'ruling': ruling}
+    if ok:
+        _assert_round_trips(_declaration(**fields))
+    else:
+        with pytest.raises(ValidationError):
+            _declaration(**fields)
+
+
+def _declare() -> Declare:
+    return Declare(declaration=_declaration())
+
+
+def _declare_closure() -> DeclareClosure:
+    return DeclareClosure(ref=_REF, closure=_exemption())
+
+
+def _declare_retirement() -> DeclareRetirement:
+    return DeclareRetirement(retirement=_retirement())
+
+
+def _sighting() -> Sighting:
+    return Sighting(ref=_REF)
+
+
+def _proof_event(outcome: ProofOutcome = ProofOutcome.PROVEN) -> Proof:
+    return Proof(proof=_proof(outcome))
+
+
+def _rule(ruling: Ruling = _ACCEPTED) -> Rule:
+    return Rule(ref=_REF, ruling=ruling)
+
+
+_DECLARE_EVENTS = [
+    pytest.param(_declare, Declare, id='declare'),
+    pytest.param(_declare_closure, DeclareClosure, id='declare_closure'),
+    pytest.param(_declare_retirement, DeclareRetirement, id='declare_retirement'),
+    pytest.param(_sighting, Sighting, id='sighting'),
+]
+_OUTCOME_EVENTS = [
+    pytest.param(_proof_event, Proof, id='proof'),
+    pytest.param(_rule, Rule, id='rule'),
+]
+
+
+class TestEvents:
+    @pytest.mark.parametrize(('build', 'event_type'), _DECLARE_EVENTS)
+    def test_declare_event_parses_from_the_wire(self, build, event_type: type) -> None:
+        event = build()
+        parsed = parse_declare_event(event.model_dump(mode='json'))
+        assert type(parsed) is event_type
+        assert parsed == event
+
+    @pytest.mark.parametrize(('build', 'event_type'), _OUTCOME_EVENTS)
+    def test_outcome_event_parses_from_the_wire(self, build, event_type: type) -> None:
+        event = build()
+        parsed = parse_outcome_event(event.model_dump(mode='json'))
+        assert type(parsed) is event_type
+        assert parsed == event
+
+    def test_declare_closure_wire_carries_the_closure_kind(self) -> None:
+        parsed = parse_declare_event(
+            {
+                'event': 'declare_closure',
+                'ref': _REF,
+                'closure': {
+                    'kind': 'exemption',
+                    'reason': 'needs_external_system',
+                    'owner': {'type': 'ticket', 'id': _TICKET},
+                },
+            }
+        )
+        assert isinstance(parsed, DeclareClosure)
+        assert parsed.closure == Exemption(
+            reason=ExemptionReason.NEEDS_EXTERNAL_SYSTEM, owner=Debt(TicketRef(_TICKET))
+        )
+
+    def test_declare_parser_refuses_an_outcome_event(self) -> None:
+        with pytest.raises(ValidationError):
+            parse_declare_event(_proof_event().model_dump(mode='json'))
+
+    def test_declare_parser_refuses_an_unknown_event(self) -> None:
+        with pytest.raises(ValidationError):
+            parse_declare_event({'event': 'retract', 'ref': _REF})
+
+    def test_outcome_parser_refuses_a_sighting(self) -> None:
+        with pytest.raises(ValidationError):
+            parse_outcome_event(_sighting().model_dump(mode='json'))
+
+    @pytest.mark.parametrize(('build', 'event_type'), _DECLARE_EVENTS + _OUTCOME_EVENTS)
+    def test_every_event_answers_its_ref(self, build, event_type: type) -> None:
+        assert build().ref == _REF
+
+    @pytest.mark.parametrize(
+        'overrides',
+        [
+            pytest.param(
+                {'status': DefectStatus.PROVEN, 'proof': _proof()}, id='not-open'
+            ),
+            pytest.param({'sightings': 2}, id='repeat-sighting'),
+            pytest.param({'proof': _proof(ProofOutcome.PASSES_AT_BASE)}, id='with-proof'),
+            pytest.param({'closure': _exemption(), 'ruling': _REJECTED}, id='with-closure'),
+            pytest.param(
+                {'status': DefectStatus.PENDING, 'closure': _exemption()}, id='pending'
+            ),
+        ],
+    )
+    def test_declare_takes_only_a_fresh_declaration(self, overrides: dict[str, Any]) -> None:
+        declaration = _declaration(**overrides)
+        with pytest.raises(ValidationError):
+            Declare(declaration=declaration)
+
+    def test_declare_retirement_takes_only_an_unruled_retirement(self) -> None:
+        with pytest.raises(ValidationError):
+            DeclareRetirement(retirement=_retirement(_ruling(True, RulingSubject.RETIREMENT)))
+
+    def test_declare_closure_refuses_a_duplicate_of_itself(self) -> None:
+        with pytest.raises(ValidationError):
+            DeclareClosure(ref=_REF, closure=_SELF_DUPLICATE)
+
+    def test_events_are_frozen(self) -> None:
+        sighting = _sighting()
+        with pytest.raises(ValidationError):
+            sighting.ref = _OTHER_REF
