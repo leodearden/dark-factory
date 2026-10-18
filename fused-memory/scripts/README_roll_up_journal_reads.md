@@ -41,7 +41,10 @@ RJ="uv run --frozen --project fused-memory python fused-memory/scripts/roll_up_j
 `--journal` defaults to the file fused-memory's config names
 (`reconciliation.data_dir`, read as `snapshot` reads the retention horizon;
 a relative `data_dir` is anchored at this checkout, the service's working
-directory), the live `data/reconciliation/write_journal.db`.
+directory), the live `data/reconciliation/write_journal.db`. Run it from the
+main checkout `/home/leo/src/dark-factory`, as task 7026's invocation does; from
+a worktree that default names the worktree's own (absent) `data/` and the
+command fails closed, so pass `--journal` explicitly there.
 Every command prints one JSON report on stdout, and refusals on stderr with
 exit 1.
 
@@ -321,8 +324,12 @@ build did not have yet:
 - **The cost is per row, not per transaction.** A chunk deletes ~5,000 rows
   and updates every index of cold pages, so a 5,000-rowid chunk costs ~1.4 s
   and a 2,000-rowid chunk ~0.45 s. That is why the default is now 2,000 and
-  not 5,000: the maximum then stays under fused-memory's 5000 ms
-  `busy_timeout` with room to spare.
+  not 5,000: the transaction alone then measured p95 0.58 s and max 1.94 s
+  against fused-memory's 5000 ms `busy_timeout` (see the next bullet). A
+  maximum is not guaranteed: the sustained run's 5.69 s chunk includes the
+  checkpoint after COMMIT, so its lock hold is unknown. The pilot rule (step 3 and
+  the Variance bullet) applies, with `--chunk-rowids 1000` (max 0.52 s over 25 chunks) as the
+  fallback.
 - **Lock hold vs. the reported time.** `*_chunk_seconds` include the
   auto-checkpoint that runs after COMMIT, outside the write lock. A separate run
   with checkpoints taken apart (129 chunks of 2,000 rowids) measured the

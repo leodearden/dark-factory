@@ -206,12 +206,6 @@ class TestMigrateApply:
 
         assert _rollup_counts(journal)[_PRE_EXISTING_ROLLUP[:4]] == 3 + raw_in_key
 
-
-def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:
-    code, _, err = _run(capsys, 'snapshot', '--journal', str(journal), '--out', str(out), *extra)
-    assert code == 0, err
-    return code
-
     def test_the_work_queue_scan_is_reported_apart_from_the_chunk_rate(
         self, journal, capsys, monkeypatch,
     ):
@@ -229,6 +223,12 @@ def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:
         assert report is not None
         assert report['setup_seconds'] >= 0.4
         assert report['seconds'] < 0.4
+
+
+def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:
+    code, _, err = _run(capsys, 'snapshot', '--journal', str(journal), '--out', str(out), *extra)
+    assert code == 0, err
+    return code
 
 
 class TestPanelInvariance:
