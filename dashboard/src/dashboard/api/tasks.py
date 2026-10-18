@@ -322,6 +322,21 @@ async def api_tasks(
         projection, http_client, config, now=render_at,
     )
     served_at = resolve_now(None)
+    if terminal is not None:
+        window = await _terminal_window(
+            http_client, config, terminal, snapshots, served_at=served_at,
+        )
+        # Validated here like every other emitted datum, and by the same rule:
+        # a break degrades this one key.
+        try:
+            validate_datum(window, served_at)
+        except DatumContractError as broken:
+            window = _unknown_after_contract_break(
+                f'the terminal window for {terminal}', broken,
+            )
+        return JSONResponse(
+            {_terminal_key(terminal): window.to_wire(), 'served_at': served_at.isoformat()}
+        )
     offline_projects: list[str] = []
     degraded_projects: list[str] = []
     count_unknown_projects: list[str] = []
@@ -352,25 +367,10 @@ async def api_tasks(
     no_root_measured = (
         len(set(offline_projects) | set(degraded_projects)) == total_roots
     )
-    payload: dict[str, object] = {}
-    if terminal is not None:
-        window = await _terminal_window(
-            http_client, config, terminal, snapshots, served_at=served_at,
-        )
-        # Validated here like every other emitted datum, and by the same rule:
-        # a break degrades this one key.
-        try:
-            validate_datum(window, served_at)
-        except DatumContractError as broken:
-            window = _unknown_after_contract_break(
-                f'the terminal window for {terminal}', broken,
-            )
-        payload[_terminal_key(terminal)] = window.to_wire()
     # ...and the same N goes on the wire as TASKS_PROJECT_COUNT, so the banner
     # denominates over the population its numerator is drawn from.
     return JSONResponse(
         {
-            **payload,
             'TASKS_SNAPSHOT': wire_snapshots,
             'TASKS_OFFLINE': (
                 bool(total_roots) and bool(offline_projects) and no_root_measured
