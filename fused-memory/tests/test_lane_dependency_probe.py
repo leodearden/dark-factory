@@ -25,6 +25,7 @@ from _fm_helpers import (
     FALKOR_PORT,
     QDRANT_URL,
     falkor_skipif,
+    lease_dir_fixture,  # noqa: F401  # debt: task 6997
     load_script_module,
     qdrant_skipif,
 )
@@ -45,12 +46,6 @@ def closed_port() -> int:
     with closing(socket.socket()) as probe:
         probe.bind(('127.0.0.1', 0))
         return probe.getsockname()[1]
-
-
-@pytest.fixture
-def lease_dir(tmp_path: Path) -> Path:
-    """A private lease directory: the probe's leases must never reach the one the live reaper reads."""
-    return tmp_path / 'ephemeral-collection-leases'
 
 
 def lease_files(directory: Path) -> list[str]:
