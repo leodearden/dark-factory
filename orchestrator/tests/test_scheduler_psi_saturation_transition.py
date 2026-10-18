@@ -31,6 +31,7 @@ conftest.py edit trips verify.py's has_conftest scoped-verify fallback.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from unittest.mock import AsyncMock
 
 import pytest
@@ -329,6 +330,7 @@ class TestPsiSaturationTransition:
 
         # --- (B) saturated: heavies held, deterministic still dispatches ---
         feed.set_saturated(cpu_some10=90.0)
+        saturated_sample = feed()
         await driver.run_ticks(4)
 
         assert driver.heavy_in_flight() == 2, 'saturation must not admit new heavy dispatch'
@@ -342,9 +344,9 @@ class TestPsiSaturationTransition:
         )
         assert deferred_during_saturation[0]['data'] == {
             'metric': 'cpu_some_avg10',
-            'value': 90.0,
             'in_flight': 2,
             'floor': 1,
+            'sample': asdict(saturated_sample),
         }
         assert all(
             e['task_id'] in {'H1', 'H2', 'H3', 'H4'} for e in deferred_during_saturation

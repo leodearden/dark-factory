@@ -6,11 +6,12 @@ Covers:
                   (normal-kind) candidate is deferred under PSI saturation
                   while a DETERMINISTIC candidate scored lower in the same
                   tick still dispatches; exactly one ``dispatch_deferred``
-                  event fires with the ``{metric, value, in_flight, floor}``
-                  payload.
+                  event fires with the ``{metric, in_flight, floor, sample}``
+                  payload (task 3590: ``sample`` is the whole PsiSample).
   step-3  (GUARD) Work-conserving (idle PSI never throttles) + floor/deadlock
                   -freedom (0 in-flight, or in-flight below a configured
-                  floor, always dispatches) + DA-D1 metric-ranking order.
+                  floor, always dispatches) + the reported metric's rank
+                  (PRD plans/load-throttle-harmonisation-prd.md D10).
   step-4  (GUARD) Disabled gate (no PSI read at all), fail-open on
                   unreadable PSI (DA-D6), once-per-tick event dedup, and
                   rate-limited deferral logging.
@@ -27,6 +28,7 @@ AsyncMock(return_value=[...])``, driving ``acquire_next()`` directly,
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -91,6 +93,12 @@ def _psi(
     mem_full10: float = 0.0,
     io_some10: float = 0.0,
     read_ok: bool = True,
+    runqueue_ratio: float = 0.0,
+    runqueue_read_ok: bool = False,
+    own_cpu_some10: float = 0.0,
+    own_cgroup: str = '',
+    own_read_ok: bool = False,
+    cpu_some60: float = 0.0,
 ) -> PsiSample:
     """Build a PsiSample; all metrics idle (0.0) unless overridden."""
     return PsiSample(
@@ -99,6 +107,12 @@ def _psi(
         mem_full10=mem_full10,
         io_some10=io_some10,
         read_ok=read_ok,
+        runqueue_ratio=runqueue_ratio,
+        runqueue_read_ok=runqueue_read_ok,
+        own_cpu_some10=own_cpu_some10,
+        own_cgroup=own_cgroup,
+        own_read_ok=own_read_ok,
+        cpu_some60=cpu_some60,
     )
 
 
@@ -109,6 +123,24 @@ def _psi_cfg(**overrides) -> PsiAdmissionConfig:
     place.
     """
     return PsiAdmissionConfig(cpu_some_avg10=85.0, **overrides)
+
+
+async def _sole_deferral_data(sample: PsiSample, psi_cfg: PsiAdmissionConfig) -> dict:
+    """Hold one heavy candidate on *sample*; return its dispatch_deferred data."""
+    event_store = _RecordingEventStore()
+    scheduler = Scheduler(
+        OrchestratorConfig(max_per_module=1, psi_admission=psi_cfg),
+        event_store=event_store,  # type: ignore[arg-type]
+    )
+    scheduler.finish_startup()
+    scheduler._read_psi_sample = lambda: sample
+    scheduler._dispatched = {'inflight1'}
+    scheduler.get_tasks = AsyncMock(return_value=[_heavy_task('H')])
+
+    assert await scheduler.acquire_next() is None
+    deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
+    assert len(deferred_events) == 1
+    return deferred_events[0][1]['data']
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +161,8 @@ class TestDispatchAdmissionThrottleDirection:
         )
         scheduler.finish_startup()
         # cpu_some10=90 is OVER this file's explicit cpu_some_avg10=85.0 threshold.
-        scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
+        sample = _psi(cpu_some10=90.0, read_ok=True)
+        scheduler._read_psi_sample = lambda: sample
         # >= default min_inflight_floor=1, so the floor does not suppress the hold.
         scheduler._dispatched = {'inflight1'}
 
@@ -151,10 +184,26 @@ class TestDispatchAdmissionThrottleDirection:
         assert len(deferred_events) == 1, 'exactly one dispatch_deferred event this tick'
         assert deferred_events[0][1]['data'] == {
             'metric': 'cpu_some_avg10',
-            'value': 90.0,
             'in_flight': 1,
             'floor': 1,
+            'sample': asdict(sample),
         }
+
+    async def test_payload_carries_every_component_of_the_sample(self) -> None:
+        sample = _psi(
+            mem_full10=5.0,
+            runqueue_ratio=2.0,
+            runqueue_read_ok=True,
+            own_cpu_some10=12.5,
+            own_cgroup='/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice',
+            own_read_ok=True,
+            cpu_some60=33.0,
+        )
+
+        data = await _sole_deferral_data(sample, _psi_cfg())
+
+        assert data['metric'] == 'mem_full_avg10'
+        assert data['sample'] == asdict(sample)
 
 
 # ---------------------------------------------------------------------------
@@ -246,47 +295,32 @@ class TestDispatchAdmissionFloorDeadlockFreedom:
 
 @pytest.mark.asyncio
 class TestDispatchAdmissionMetricRanking:
-    """The gating metric+value reported in the dispatch_deferred event
-    follows DA-D1 ranked order: cpu_some_avg10 > mem_some_avg10 >
-    mem_full_avg10 > io_some_avg10."""
+    """The metric reported in the dispatch_deferred event is the highest-ranked
+    tripping arm, in PRD plans/load-throttle-harmonisation-prd.md D10 rank:
+    mem_full_avg10 > runqueue_ratio > own_cpu_some_avg10 > mem_some_avg10 >
+    io_some_avg10 > cpu_some_avg10 (the legacy CPU arm ranks last)."""
 
-    async def test_cpu_and_io_both_saturated_reports_cpu(self) -> None:
-        event_store = _RecordingEventStore()
-        scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
-        )
-        scheduler.finish_startup()
-        scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, io_some10=50.0, read_ok=True)
-        scheduler._dispatched = {'inflight1'}
+    async def test_cpu_and_io_both_saturated_reports_io(self) -> None:
+        data = await _sole_deferral_data(_psi(cpu_some10=90.0, io_some10=50.0), _psi_cfg())
 
-        task_h = _heavy_task('H')
-        scheduler.get_tasks = AsyncMock(return_value=[task_h])
-
-        await scheduler.acquire_next()
-
-        deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
-        assert len(deferred_events) == 1
-        assert deferred_events[0][1]['data']['metric'] == 'cpu_some_avg10'
+        assert data['metric'] == 'io_some_avg10'
 
     async def test_io_only_saturated_reports_io(self) -> None:
-        event_store = _RecordingEventStore()
-        scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
-        )
-        scheduler.finish_startup()
-        scheduler._read_psi_sample = lambda: _psi(io_some10=50.0, read_ok=True)
-        scheduler._dispatched = {'inflight1'}
+        data = await _sole_deferral_data(_psi(io_some10=50.0), _psi_cfg())
 
-        task_h = _heavy_task('H')
-        scheduler.get_tasks = AsyncMock(return_value=[task_h])
+        assert data['metric'] == 'io_some_avg10'
 
-        await scheduler.acquire_next()
+    async def test_mem_some_outranks_io(self) -> None:
+        data = await _sole_deferral_data(_psi(mem_some10=20.0, io_some10=50.0), _psi_cfg())
 
-        deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
-        assert len(deferred_events) == 1
-        assert deferred_events[0][1]['data']['metric'] == 'io_some_avg10'
+        assert data['metric'] == 'mem_some_avg10'
+
+    async def test_mem_full_outranks_every_other_arm(self) -> None:
+        sample = _psi(cpu_some10=90.0, mem_some10=99.0, mem_full10=50.0, io_some10=99.0)
+
+        data = await _sole_deferral_data(sample, _psi_cfg())
+
+        assert data['metric'] == 'mem_full_avg10'
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +460,7 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
             if r.levelname == 'WARNING' and 'deferring heavy' in r.getMessage()
         ]
         assert len(deferral_warnings) == 1, 'the WARNING log stream is rate-limited across ticks'
+        assert 'cpu_some_avg10' in deferral_warnings[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
