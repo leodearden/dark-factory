@@ -150,6 +150,8 @@ def test_react_cdn_tags_load_one_version_of_the_production_build(index_html_body
     diagnostics back while debugging a .jsx change locally, point both tags at
     umd/<package>.development.js and drop or re-derive their integrity= (SRI
     blocks a mismatched hash). Do not commit that swap; this test fails on it.
+    dashboard/tests/js/dom_harness.mjs renders the tabs on the development build
+    of the same package, so jsx_render.test.mjs still fails on those warnings.
     """
     react = _react_umd_tag(index_html_body, _REACT_PREFIX)
     react_dom = _react_umd_tag(index_html_body, _REACT_DOM_PREFIX)
