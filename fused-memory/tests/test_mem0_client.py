@@ -1097,7 +1097,7 @@ class TestMem0BackendScrollCollectionPages:
 
         with (
             patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
-            patch('fused_memory.backends.mem0_client.asyncio.wait_for', _spy),
+            patch('fused_memory.backends.timeout_budget.asyncio.wait_for', _spy),
         ):
             got = await _drain(backend.scroll_collection_pages('c', page_size=1))
 
