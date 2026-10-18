@@ -2240,7 +2240,7 @@ class GraphitiBackend:
                 'RETURN e.content',
                 {'uuid': episode_uuid, 'group_id': group_id},
             ),
-            'redact_episode_content',
+            'redact_episode_content.read',
         )
         if not result.result_set:
             raise NodeNotFoundError(
@@ -2254,7 +2254,7 @@ class GraphitiBackend:
                 'SET e.content = $content',
                 {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
             ),
-            'redact_episode_content',
+            'redact_episode_content.write',
         )
         logger.info(
             'redact_episode_content: episode=%s group=%s old_len=%d new_len=%d',
@@ -2318,7 +2318,7 @@ class GraphitiBackend:
             edge.invalid_at = invalid_at
         if clear_invalid_at:
             edge.invalid_at = None
-        await self._timed_write(edge.save(driver), 'update_edge')
+        await self._timed_write(edge.save(driver), 'update_edge.save')
 
         if clear_invalid_at:
             # edge.save()'s map-based SET does not reliably clear a
@@ -2330,7 +2330,7 @@ class GraphitiBackend:
                     'SET e.invalid_at = NULL',
                     {'uuid': edge_uuid},
                 ),
-                'update_edge',
+                'update_edge.clear_invalid_at',
             )
 
         # Deterministically refresh both endpoint entity summaries so they

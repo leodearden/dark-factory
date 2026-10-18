@@ -7,8 +7,8 @@ return that would read as an empty store or a genuine not-found.
 """
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,6 +34,34 @@ class _TimedCall:
     op: str
     hang_upstream: Callable[[GraphitiBackend], AbstractContextManager]
     call: Callable[[GraphitiBackend], Awaitable]
+    variant: str = ''
+
+    @property
+    def id(self) -> str:
+        return f'{self.op}-{self.variant}' if self.variant else self.op
+
+
+@contextmanager
+def _all_of(*patches: AbstractContextManager) -> Iterator[None]:
+    with ExitStack() as stack:
+        for each in patches:
+            stack.enter_context(each)
+        yield
+
+
+def _graph_hanging_on(attr: str) -> Callable[[GraphitiBackend], AbstractContextManager]:
+    """Serve a FalkorDB graph whose *attr* query hangs; the other answers one episode's content."""
+    def _serve(b: GraphitiBackend) -> AbstractContextManager:
+        graph = MagicMock()
+        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[['old content']]))
+        graph.query = AsyncMock()
+        setattr(graph, attr, AsyncMock(side_effect=_hang))
+        return patch.object(b._driver, '_get_graph', MagicMock(return_value=graph))
+    return _serve
+
+
+def _redact(b: GraphitiBackend) -> Awaitable:
+    return b.redact_episode_content('ep-1', group_id=_GROUP, new_content='clean text')
 
 
 _READS = (
@@ -57,6 +85,9 @@ _READS = (
         lambda b: patch.object(EpisodicNode, 'get_by_uuid', AsyncMock(side_effect=_hang)),
         lambda b: b.get_episode_by_uuid('ep-1', group_id=_GROUP),
     ),
+    _TimedCall(
+        'redact_episode_content.read', _graph_hanging_on('ro_query'), _redact,
+    ),
 )
 
 
@@ -72,11 +103,13 @@ _WRITES = (
         'build_communities',
         lambda b: patch.object(b.client, 'build_communities', AsyncMock(side_effect=_hang)),
         lambda b: b.build_communities(None),
+        variant='all',
     ),
     _TimedCall(
         'build_communities',
         lambda b: patch.object(b.client, 'build_communities', AsyncMock(side_effect=_hang)),
         lambda b: b.build_communities([_GROUP]),
+        variant='per-group',
     ),
     _TimedCall(
         'remove_episode',
@@ -93,11 +126,24 @@ _WRITES = (
         lambda b: b.remove_edge('edge-1', group_id=_GROUP),
     ),
     _TimedCall(
-        'update_edge',
+        'update_edge.save',
         lambda b: patch.object(
             EntityEdge, 'get_by_uuid', AsyncMock(return_value=_loaded_with_hanging('save')),
         ),
         lambda b: b.update_edge('edge-1', group_id=_GROUP, invalid_at=datetime.now(UTC)),
+    ),
+    _TimedCall(
+        'update_edge.clear_invalid_at',
+        lambda b: _all_of(
+            patch.object(
+                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock(save=AsyncMock())),
+            ),
+            _graph_hanging_on('query')(b),
+        ),
+        lambda b: b.update_edge('edge-1', group_id=_GROUP, clear_invalid_at=True),
+    ),
+    _TimedCall(
+        'redact_episode_content.write', _graph_hanging_on('query'), _redact,
     ),
 )
 
@@ -122,7 +168,7 @@ async def _assert_named_timeout(backend: GraphitiBackend, timed: _TimedCall) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('timed', _READS, ids=lambda timed: timed.op)
+@pytest.mark.parametrize('timed', _READS, ids=lambda timed: timed.id)
 async def test_a_read_timeout_propagates_naming_store_op_and_budget(
     read_budgeted_backend, timed,
 ):
@@ -144,10 +190,7 @@ def write_budgeted_backend(mock_config, make_backend) -> GraphitiBackend:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'timed', _WRITES, ids=['build_communities-all', 'build_communities-per-group',
-                           'remove_episode', 'remove_edge', 'update_edge'],
-)
+@pytest.mark.parametrize('timed', _WRITES, ids=lambda timed: timed.id)
 async def test_a_write_timeout_names_store_op_and_budget(write_budgeted_backend, timed):
     await _assert_named_timeout(write_budgeted_backend, timed)
 
