@@ -2004,7 +2004,7 @@ class GraphitiBackend:
         if unverified_claim:
             source_description = f'[unverified_claim] {source_description}'
         try:
-            return await asyncio.wait_for(
+            return await self._timed_write(
                 client.add_episode(
                     name=name,
                     episode_body=content,
@@ -2015,7 +2015,7 @@ class GraphitiBackend:
                     entity_types=entity_types,
                     uuid=uuid,
                 ),
-                timeout=self._write_timeout,
+                'add_episode',
             )
         except GraphitiCoreNodeNotFoundError as exc:
             # Translate only a not-found provably about the caller's own uuid —
@@ -2162,10 +2162,7 @@ class GraphitiBackend:
         """Delete an episode by UUID."""
         driver = self._driver_for(group_id)
         node = await EpisodicNode.get_by_uuid(driver, episode_uuid)
-        await asyncio.wait_for(
-            node.delete(driver),
-            timeout=self._write_timeout,
-        )
+        await self._timed_write(node.delete(driver), 'remove_episode')
 
     @_canonicalize_group_args
     async def redact_episode_content(
@@ -2237,13 +2234,13 @@ class GraphitiBackend:
             )
 
         graph = self._graph_for(group_id)
-        result = await asyncio.wait_for(
+        result = await self._timed_read(
             graph.ro_query(
                 'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
                 'RETURN e.content',
                 {'uuid': episode_uuid, 'group_id': group_id},
             ),
-            timeout=self._read_timeout,
+            'redact_episode_content',
         )
         if not result.result_set:
             raise NodeNotFoundError(
@@ -2251,13 +2248,13 @@ class GraphitiBackend:
             )
         old_content = result.result_set[0][0] or ''
 
-        await asyncio.wait_for(
+        await self._timed_write(
             graph.query(
                 'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
                 'SET e.content = $content',
                 {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
             ),
-            timeout=self._write_timeout,
+            'redact_episode_content',
         )
         logger.info(
             'redact_episode_content: episode=%s group=%s old_len=%d new_len=%d',
@@ -2279,10 +2276,7 @@ class GraphitiBackend:
         except EdgeNotFoundError:
             logger.info(f'Edge {edge_uuid} not found (already deleted or episode-cascaded)')
             return
-        await asyncio.wait_for(
-            edge.delete(driver),
-            timeout=self._write_timeout,
-        )
+        await self._timed_write(edge.delete(driver), 'remove_edge')
 
     @_canonicalize_group_args
     async def update_edge(
@@ -2324,19 +2318,19 @@ class GraphitiBackend:
             edge.invalid_at = invalid_at
         if clear_invalid_at:
             edge.invalid_at = None
-        await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
+        await self._timed_write(edge.save(driver), 'update_edge')
 
         if clear_invalid_at:
             # edge.save()'s map-based SET does not reliably clear a
             # null-valued property on FalkorDB — force it deterministically.
             graph = self._graph_for(group_id)
-            await asyncio.wait_for(
+            await self._timed_write(
                 graph.query(
                     'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
                     'SET e.invalid_at = NULL',
                     {'uuid': edge_uuid},
                 ),
-                timeout=self._write_timeout,
+                'update_edge',
             )
 
         # Deterministically refresh both endpoint entity summaries so they
@@ -2584,17 +2578,17 @@ class GraphitiBackend:
         """
         client = self._require_client()
         if not group_ids:
-            await asyncio.wait_for(
+            await self._timed_write(
                 client.build_communities(group_ids=group_ids, driver=None),
-                timeout=self._write_timeout,
+                'build_communities',
             )
             return
         for group_id in group_ids:
-            await asyncio.wait_for(
+            await self._timed_write(
                 client.build_communities(
                     group_ids=[group_id], driver=self._driver_for(group_id)
                 ),
-                timeout=self._write_timeout,
+                'build_communities',
             )
 
     @_canonicalize_group_args
