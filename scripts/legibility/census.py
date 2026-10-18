@@ -1162,6 +1162,7 @@ SECTION_SYNTHESIS = "synthesis"
 SECTION_FINDINGS = "findings"
 SECTION_FILED_TASKS = "filed-tasks"
 SECTION_STRUCTURAL = "structural"
+SECTION_DISPOSITIONS = "dispositions"
 SECTION_WITHHELD = "withheld-clusters"
 SECTION_COST = "cost"
 """Stable machine keys for the blocks :func:`census_report_sections` emits.
@@ -1330,6 +1331,7 @@ def build_census_record(
     synthesis_md: str,
     project_root: str,
     filing: Mapping[str, Any],
+    dispositions: Mapping[str, Any],
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
@@ -1344,8 +1346,9 @@ def build_census_record(
     not carried; the codebook holds what they merged. *findings* are the
     contract §1 rows (``census_findings.FindingRow.to_record``) and
     *area_map* the ``finding_area.AreaMap.to_record`` that keyed them.
-    *filing* is ``disposition.FilingReport.to_record``, and *project_root*
-    the observed project its decisions are reported against."""
+    *filing* is ``disposition.FilingReport.to_record``, *dispositions*
+    ``disposition.OutcomeReport.to_record``, and *project_root* the observed
+    project their decisions and outcomes are reported against."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
         "run_id": method["run_id"],
@@ -1365,6 +1368,7 @@ def build_census_record(
         "matrix_md": matrix_md,
         "synthesis_md": synthesis_md,
         "filing": dict(filing),
+        "dispositions": dict(dispositions),
         "dry_run": _optional_asdict(dry_run),
         "withheld": [asdict(cluster) for cluster in withheld],
         "findings": [dict(row) for row in findings],
@@ -1590,6 +1594,10 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
     )
     emit(SECTION_FILED_TASKS, filed_tasks)
     emit(SECTION_STRUCTURAL, disposition.structural_lines(record["filing"]))
+    emit(
+        SECTION_DISPOSITIONS,
+        disposition.dispositions_lines(record["dispositions"], observed_root=record["project_root"]),
+    )
 
     if withheld:
         recorded_not_filed = [
@@ -3179,6 +3187,7 @@ def run_census(
         synthesis_md=synthesis_md,
         project_root=project_root,
         filing=filing_report.to_record(),
+        dispositions=disposition.OutcomeReport(disposition.Outcomes(), {}, (), (), {}).to_record(),
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,

@@ -2557,6 +2557,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         synthesis_md="prose",
         project_root=_RENDER_ROOT,
         filing=_filing_record("tkt_1"),
+        dispositions=_EMPTY_DISPOSITIONS,
         cost_note="cost",
     ))
     assert report == _GOLDEN_FLAGLESS_REPORT
