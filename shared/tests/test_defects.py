@@ -271,6 +271,11 @@ _PARSE_REJECTIONS = [
     pytest.param('human:2026-10-18T12:34:56Z:abcd1234', DefectOrigin.HUMAN, id='colon-timestamp'),
     pytest.param('human:20261399T999999Z:abcd1234', DefectOrigin.HUMAN, id='impossible-time'),
     pytest.param(f'redmain:{_SIGNATURE}\n', DefectOrigin.RED_MAIN, id='trailing-newline'),
+    pytest.param(
+        f'finding:{_FINDING_KEY}\n',
+        DefectOrigin.REVIEW_INSTRUMENT,
+        id='finding-trailing-newline',
+    ),
     pytest.param('portal:acme:b:0', DefectOrigin.CLIENT, id='portal-n-zero'),
     pytest.param(123, None, id='non-str'),
 ]

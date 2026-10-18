@@ -220,9 +220,11 @@ class DefectEventKind(StrEnum):
 
 # --- The ref grammar (decision 15) -------------------------------------------
 #
-# Every pattern is applied with `fullmatch` and uses explicit character
-# classes: Python's `$` also matches before a trailing newline, the trap
-# shared/src/shared/governed_exceptions.py::_LIST_ID_RE documents.
+# Every component pattern is applied with `fullmatch`, which must consume the
+# whole component. That is what makes the imported, `$`-anchored
+# shared.finding_key.KEY_PATTERN exact too: Python's `$` also matches before a
+# trailing newline (the trap shared/src/shared/governed_exceptions.py::_LIST_ID_RE
+# documents), but `fullmatch` still refuses the unconsumed newline.
 
 _POSITIVE_INT = re.compile(r'[1-9][0-9]*')
 _TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
@@ -825,7 +827,7 @@ def _require_coherent(entry: DefectDeclaration) -> None:
     if entry.proof is not None and entry.proof.ref != entry.ref:
         raise ValueError(f'{entry.ref}: its proof is for a different ref, {entry.proof.ref}')
     if entry.status is DefectStatus.PROVEN and entry.proof is None:
-        raise ValueError(f'{entry.ref}: a proven entry carries the proof that proved it')
+        raise ValueError(f'{entry.ref}: a proven entry carries its latest proof')
     if entry.ruling is not None and entry.closure is None:
         raise ValueError(f'{entry.ref}: a ruling rules on a closure, and the entry has none')
     if entry.ruling is not None and entry.ruling.subject is not RulingSubject.CLOSURE:
