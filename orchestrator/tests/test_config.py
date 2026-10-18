@@ -4590,13 +4590,13 @@ class TestReviewerBriefingConfig:
         assert OrchestratorConfig().review.reviewer_briefing is ReviewBriefing.DIFF_ONLY
 
     def test_d2_parses_to_context_complete(self):
-        config = OrchestratorConfig(review={'reviewer_briefing': 'd2'})
+        config = OrchestratorConfig.model_validate({'review': {'reviewer_briefing': 'd2'}})
 
         assert config.review.reviewer_briefing is ReviewBriefing.CONTEXT_COMPLETE
 
     def test_an_unknown_generation_is_rejected(self):
         with pytest.raises(ValidationError):
-            OrchestratorConfig(review={'reviewer_briefing': 'd3'})
+            OrchestratorConfig.model_validate({'review': {'reviewer_briefing': 'd3'}})
 
     def test_the_leaf_is_green_tier_reloadable(self):
         assert 'review.reviewer_briefing' in RELOADABLE_FIELDS
