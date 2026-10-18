@@ -6,6 +6,7 @@ against the 181 MB live store the script defaults to.
 """
 import argparse
 import json
+import re
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -729,6 +730,25 @@ def _audit(conn, **overrides):
     return audit_model_admission.audit(conn, **{**kwargs, **overrides})
 
 
+def _row_cells(line):
+    """A markdown table row's cells, split on UNESCAPED pipes only."""
+    return [cell.strip() for cell in re.split(r'(?<!\\)\|', line.strip())[1:-1]]
+
+
+def test_a_multi_line_piped_cell_stays_one_row_line_with_the_headers_cell_count():
+    lines = audit_model_admission.markdown_table(
+        ['state', 'detail'],
+        [('blocked', 'first | line\n\nsecond line\n```\ncode | here\n```'), ('done', 'abc123')],
+    )
+
+    assert len(lines) == 4
+    assert not any('\n' in line for line in lines)
+    for line in (lines[0], lines[2], lines[3]):
+        assert len(_row_cells(line)) == 2
+    assert _row_cells(lines[2])[1] == r'first \| line second line ``` code \| here ```'
+    assert lines[3] == '| done | abc123 |'
+
+
 def test_the_markdown_body_carries_the_measured_values_not_a_summary(live_shaped_db):
     body = audit_model_admission.render_markdown(_audit(live_shaped_db))
 
@@ -1285,3 +1305,65 @@ def test_the_invocations_section_renders_tier_and_subtype(runs_db):
     section = body.split('### 2.')[1].split('### 3.')[0]
     assert '| tier | subtype |' in section
     assert '| 1 | error_max_turns |' in section
+
+
+MULTI_LINE_REASON = '\n'.join([
+    'Post-merge verification failed: ruff | pytest [category: test_failure]',
+    '',
+    'Failures: tests failed',
+    '```',
+    'FAILED scripts/tests/test_x.py::test_y | AssertionError',
+    '```',
+    'Re-run with -x',
+])
+
+
+def _merger_run_blocked_by(conn, reason):
+    _fable_merger_run(conn, task_id='4782')
+    conn.seed_event(
+        _at(hours=2, minutes=30), 'merge_finalized', task_id='4782',
+        data=_merge_finalized_payload(branch='4782', state='blocked', reason=reason),
+    )
+
+
+def test_a_multi_line_merge_reason_renders_as_one_table_row_with_its_first_line(runs_db):
+    _merger_run_blocked_by(runs_db, MULTI_LINE_REASON)
+
+    body = audit_model_admission.render_markdown(_audit(runs_db))
+
+    section = body.split('### 2.')[1].split('### 3.')[0]
+    rows = [line for line in section.splitlines() if line.startswith('|')]
+    assert len(rows) == 3
+    assert [line for line in section.splitlines()[1:] if line.strip()] == rows
+    assert all(len(_row_cells(line)) == 14 for line in rows)
+    assert _row_cells(rows[2])[-1] == (
+        r'blocked (Post-merge verification failed: ruff \| pytest [category: test_failure]'
+        ' \N{HORIZONTAL ELLIPSIS} +6 lines)'
+    )
+    assert 'AssertionError' not in body
+    assert 'Re-run with -x' not in body
+    assert not any(line.lstrip().startswith('```') for line in body.splitlines())
+
+
+@pytest.mark.parametrize(('reason', 'cell'), [
+    ('merge conflict in shared/', 'blocked (merge conflict in shared/)'),
+    ('merge conflict in shared/\nsee the merge log',
+     'blocked (merge conflict in shared/ \N{HORIZONTAL ELLIPSIS} +1 line)'),
+    ('\n\n', 'blocked'),
+])
+def test_the_merge_cell_summarizes_a_reason_by_its_line_count(runs_db, reason, cell):
+    _merger_run_blocked_by(runs_db, reason)
+
+    body = audit_model_admission.render_markdown(_audit(runs_db))
+
+    section = body.split('### 2.')[1].split('### 3.')[0]
+    rows = [line for line in section.splitlines() if line.startswith('|')]
+    assert _row_cells(rows[2])[-1] == cell
+
+
+def test_render_json_keeps_the_full_multi_line_merge_reason(runs_db):
+    _merger_run_blocked_by(runs_db, MULTI_LINE_REASON)
+
+    payload = json.loads(audit_model_admission.render_json(_audit(runs_db)))
+
+    assert payload['invocations'][0]['merge_outcome']['reason'] == MULTI_LINE_REASON

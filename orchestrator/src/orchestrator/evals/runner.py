@@ -142,6 +142,16 @@ logger = logging.getLogger(__name__)
 _EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
 
 
+def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
+    """The ONLY MCP an eval architect may reach: plan-tools, strictly scoped.
+
+    The PAIR is the invariant (task 4757). A plan-tools config without the
+    strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
+    the live escalation (:8102) and fused-memory (:8002) servers.
+    """
+    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
+
+
 async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate | None:
     """Build the account-failover gate for an eval entry point, or None.
 
@@ -804,7 +814,9 @@ async def run_architect_eval(
     isolation + token savings). The architect runs with THIS candidate's
     model/backend/effort/env_overrides, not the hardcoded opus-high the
     implementer path pins. Its prompt ends with the replay frame, and the cell
-    is stamped ``replay_frame`` (docs/eval-replay-frame.md).
+    is stamped ``replay_frame`` (docs/eval-replay-frame.md). The architect
+    reaches plan-tools and no other MCP server (:func:`architect_eval_mcp_scope`);
+    ``evals/profile.py::EVAL_PROFILE`` documents the workflow-path counterpart.
 
     The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
     judge, against the REAL landed reference diff
@@ -1065,11 +1077,6 @@ async def run_architect_eval(
         #    candidate's model/backend/effort/env_overrides.
         briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-        # Wire plan-tools MCP via the SAME production seam real dispatch uses
-        # (workflow._invoke): relocated meta_root + direct-interpreter launch.
-        # strict_mcp_config stays default False so the ambient .mcp.json
-        # escalation/fused-memory servers still merge, mirroring _invoke.
-        mcp_config = _inject_plan_tools_mcp(None, worktree)
 
         async def _timed_invoke(**kwargs) -> AgentResult:
             """Bound ONE attempt by the operator's --timeout, and bank its spend.
@@ -1126,6 +1133,11 @@ async def run_architect_eval(
         # unchanged. `backend` moves to the wrapper's own keyword-only
         # parameter, which forwards it into the dispatched call because a
         # custom invoke_fn is supplied.
+        #
+        # The architect is scoped to plan-tools ONLY (architect_eval_mcp_scope):
+        # plan-tools is wired through the SAME production seam real dispatch
+        # uses (relocated meta_root + direct-interpreter launch), and the strict
+        # flag drops the ambient .mcp.json's live production servers.
         result = await invoke_with_cap_retry(
             usage_gate,
             f'Architect eval {task_id} × {config.name}',
@@ -1142,7 +1154,7 @@ async def run_architect_eval(
             disallowed_tools=ARCHITECT.disallowed_tools or None,
             effort=config.effort or 'high',
             env_overrides=config.env_overrides or None,
-            mcp_config=mcp_config,
+            **architect_eval_mcp_scope(worktree),
         )
         # arch_cost_usd is banked inside _timed_invoke (every attempt), not
         # read off `result` (the last attempt only) — see its docstring. The
@@ -2231,10 +2243,11 @@ class _StubMcpSession:
 
     Handles every tool the eval ``Scheduler`` dispatches via ``dispatch_tool``:
     ``set_task_status``, ``get_task``, ``get_tasks``, ``get_statuses``,
-    ``update_task``, ``set_task_claimant``, ``get_external_statuses`` (plus
-    ``add_dependency``, stubbed defensively though not yet dispatched).  The
-    ``test_scheduler_dispatch_literal_tripwire`` guard asserts every dispatched
-    literal has a branch here.  Any other tool name raises ``NotImplementedError``.
+    ``update_task``, ``set_task_claimant``, ``get_external_statuses``,
+    ``submit_task`` (plus ``add_dependency``, stubbed defensively though not
+    yet dispatched).  The ``test_scheduler_dispatch_literal_tripwire`` guard
+    asserts every dispatched literal has a branch here.  Any other tool name
+    raises ``NotImplementedError``.
     """
 
     def __init__(self) -> None:
@@ -2266,7 +2279,8 @@ class _StubMcpSession:
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
         ``get_statuses``, ``update_task``, ``set_task_claimant``,
-        ``get_external_statuses``, ``add_dependency``.  Unknown tool names raise
+        ``get_external_statuses``, ``submit_task``, ``add_dependency``.  Unknown
+        tool names raise
         ``NotImplementedError``.
 
         .. note::
@@ -2319,6 +2333,14 @@ class _StubMcpSession:
             deps = arguments.get('deps', [])
             mapping = {d: 'done' for d in deps}
             return self._envelope(json.dumps(mapping))
+        if name == 'submit_task':
+            # Scheduler.submit_task files tasks for machine filers (auto-eval,
+            # the flake ledger). An eval run must create none, so the answer is
+            # the server's structured refusal, which parses to SubmitFailed.
+            return self._envelope(json.dumps({
+                'error': 'eval runs file no tasks',
+                'error_type': 'EvalStubRefusal',
+            }))
         if name == 'add_dependency':
             # Not currently dispatched by scheduler.py; added defensively per
             # task spec so a future dispatch site is already stubbed. Echo the id

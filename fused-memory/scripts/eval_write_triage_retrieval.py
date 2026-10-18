@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """The LIVE-store edge of the judge eval: production retrieval and banding.
 
-``eval_write_triage_judge.py``'s seeded slate is a CONSTRUCTION — the correct
-canonical hoisted to position 0 with a synthetic top score. This module is the
-measured alternative: it drives the shipped ``retrieve_candidates``,
-``decide_band`` and ``select_judge_candidates`` so a case's slate, its attach
-target and its band are the ones production would have produced for that
-content against the live corpus.
+The seeded slate (``eval_write_triage_cases.py::seeded_plan``) is a
+CONSTRUCTION — the correct canonical hoisted to position 0 with a synthetic
+top score. This module is the measured alternative: it drives the shipped
+``retrieve_candidates``, ``decide_band`` and ``select_judge_candidates`` so a
+case's slate, its attach target and its band are the ones production would
+have produced for that content against the live corpus.
 
 Nothing here decides what "correct" means, and nothing here calls an LLM. It
-produces :class:`Slate` values; the eval script pairs them with the curator
-labels and scores them.
+produces :class:`Slate` values; ``eval_write_triage_cases.py::plan_from_slates``
+pairs them with the curator labels, and the eval scores them.
 
 Imported by path, the same way the eval script imports the calibrator —
 ``scripts/`` is not an importable package.

@@ -21,7 +21,6 @@ from fastapi.responses import JSONResponse
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
-    _all_project_roots,
     collect_census_snapshots,
     collect_tasks_with_counts,
     shape_terminal_rows,
@@ -122,7 +121,7 @@ async def _terminal_window(
     terminal tasks", which is a measurement nobody made.
     """
     root = next(
-        (r for r in _all_project_roots(config) if project_label(r) == label), None
+        (r for r in config.all_project_roots if project_label(r) == label), None
     )
     if root is None:
         return Datum(
@@ -347,7 +346,7 @@ async def api_tasks(
     # Same enumerator the collector walks, so N here is the same N it fanned
     # out over. ``bool(total_roots)`` guards the degenerate no-roots config:
     # 0 == 0 would otherwise declare an outage with nothing configured to fail.
-    total_roots = len(_all_project_roots(config))
+    total_roots = len(config.all_project_roots)
     # The loop above routes each root to at most one banner, so a root in
     # neither of these two lists had its rows read this render, with or
     # without a count, and either case vetoes the flag. An offline root's

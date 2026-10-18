@@ -38,10 +38,10 @@ from pathlib import Path
 from _dashboard_helpers import (
     destructure_bindings,
     extract_function_body,
+    node_path,
     strip_js_comments,
     walk_balanced,
 )
-from _lock_chip_matrix import node_path
 
 REDUX = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 

@@ -52,7 +52,8 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 ```
 
 **Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is **optional** and
-defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
+defaults to `<--name>-$CLAUDE_PID` (or `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a
+`claude agents` host); `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
 Pass either **only** as a deliberate operator override. Both are derived rather than documented for
 one reason (tasks 3994, 4248): the token is load-bearing on *every* heartbeat and on the final
 release, and it must not depend on this document getting one shell token right — which is exactly
@@ -69,6 +70,23 @@ process is `$CLAUDE_PID`. Verify with:
 ```bash
 ps -o comm= -p "$CLAUDE_PID"   # prints: claude
 ```
+
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still forces
+stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
+`lease-heartbeat` is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
+the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
+`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
+reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
+`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
 
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
 message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
@@ -1667,7 +1685,8 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
 #### When it runs
 
 - **Nightly at 05:30**, from `return-brief.timer`: headless on Fable, recommend-only and read-only.
-  This is the *nightly form*: investigate, then `record` preparations. The render that follows
+  This is the *nightly form*: investigate, then `record` preparations, which it does through
+  batch files in its per-run inbox (`data/sitting/inbox/<run>/`). The render that follows
   writes `data/return-brief.md` (OPERATIONS.md §12, "Cross-project return brief (05:30)"). Its
   autonomous closes are windowed on `closed_at`, and a close with no `closed_at` is listed as
   undated, not dropped.

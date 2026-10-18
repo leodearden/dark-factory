@@ -1,0 +1,10 @@
+prd: plans/invocation-outcome-prd.md
+schema_version: 1
+tasks:
+- label: kappa
+  task_id: 2143
+  title: 'W4-κ Integration gate: two-way boundary test suite'
+  note: 'Minimal sidecar written by task 6588 (plans/dashboard-prd-lanes-prd.md §9 ε): this PRD predates YAML sidecars, so only its signal leaf is declared, hand-bound to the task whose prd_task_label is kappa.'
+  capabilities: []
+signal_leaves:
+- kappa

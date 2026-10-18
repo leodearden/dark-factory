@@ -83,6 +83,13 @@ def make_task(tid: str, priority: str, files: list[str], *, status: str = 'pendi
     }
 
 
+def make_withheld_task(tid: str, priority: str, files: list[str]) -> dict:
+    """A pending, deps-satisfied task the deferred-watch gate withholds: it may hold parks but never dispatches or gets skip-bumped."""
+    task = make_task(tid, priority, files)
+    task['metadata']['deferred_watch'] = True
+    return task
+
+
 def event_matches(event_type: str, name: str) -> bool:
     return event_type.split('.')[-1] == name
 

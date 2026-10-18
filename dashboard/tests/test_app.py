@@ -9,13 +9,17 @@ response *shape*, not the contents, which exercises the shape adapters.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _dashboard_helpers import node_path
 
 from dashboard.api.burndown import _BURNDOWN_WINDOWS
 from dashboard.api.window import ServedWindow, _parse_window, with_window
+from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
@@ -493,7 +497,6 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
     import logging
     from dataclasses import replace
     from datetime import UTC, datetime, timedelta
-    from pathlib import Path
 
     import httpx
     from test_task_snapshot import CannedMCP, _raw_row
@@ -523,12 +526,10 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             asyncio.run(_measure_earlier())
+        _install_roots(client, [Path('/proj') / label])
         with patch(
             'dashboard.api.tasks.collect_tasks_with_counts',
             new=AsyncMock(return_value=([], {label: broken})),
-        ), patch(
-            'dashboard.api.tasks._all_project_roots',
-            new=lambda config: [Path('/proj') / label],
         ), caplog.at_level(logging.WARNING):
             resp = client.get('/api/v2/dashboard/tasks')
     finally:
@@ -553,7 +554,6 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client,
     """
     import logging
     from datetime import UTC, datetime
-    from pathlib import Path
 
     from dashboard.data.datum import Datum, DatumInvariant, DatumState
     from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
@@ -562,12 +562,10 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client,
     unexplained = Datum(
         [], datetime.now(UTC), DatumState.LOWER_BOUND, None, FRESHNESS_BOUND_SECONDS,
     )
+    _install_roots(client, [Path('/proj') / label])
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], _snapshots([label]))),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots',
-        new=lambda config: [Path('/proj') / label],
     ), patch(
         'dashboard.api.tasks.acquire_terminal_window',
         new=AsyncMock(return_value=unexplained),
@@ -638,12 +636,10 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When every root's read demonstrably failed, the payload sets ``offline=True``."""
+    _install_roots(client, _fake_roots(1))
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], _snapshots(['dark-factory'], offline=['dark-factory']))),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots',
-        new=lambda config: _fake_roots(1),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -728,17 +724,34 @@ def test_tasks_endpoint_asks_for_no_terminal_cap(client):
 
 
 def _fake_roots(n):
-    """N distinct project roots, for patching ``app._all_project_roots``.
+    """N distinct project roots: the roster ``_install_roots`` puts on the running config.
 
     The route-level ``client`` fixture runs against a single isolated temp
     root, so "k of N failed with k < N" is not expressible against the real
-    config at all. Patching the root enumerator is the seam ``api_tasks``
-    itself uses to learn N, so a test that patches it is asserting on the same
-    fact the handler reads — not on a parallel fixture that could drift.
+    config at all. The installed config is the same one ``api_tasks`` reads to
+    learn N, so a test that installs it is asserting on the same fact the
+    handler reads — not on a parallel fixture that could drift.
     """
-    from pathlib import Path
-
     return [Path(f'/proj/p{i}') for i in range(n)]
+
+
+class _NoRoots(DashboardConfig):
+    """The degenerate empty roster, which no stock config can spell: it always names a primary."""
+
+    @property
+    def all_project_roots(self) -> tuple[Path, ...]:
+        return ()
+
+
+def _install_roots(client, roots):
+    """Install, on the running app, a config whose roster is exactly *roots*."""
+    config = client.app.state.config
+    if roots:
+        client.app.state.config = dataclasses.replace(
+            config, project_root=roots[0], known_project_roots=list(roots[1:]),
+        )
+    else:
+        client.app.state.config = _NoRoots(**dataclasses.asdict(config))
 
 
 def _tasks_body(
@@ -767,9 +780,8 @@ def _tasks_body(
             ),
         )
     )
-    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector), patch(
-        'dashboard.api.tasks._all_project_roots', new=lambda config: _fake_roots(total_roots)
-    ):
+    _install_roots(client, _fake_roots(total_roots))
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     return resp.json()
@@ -860,7 +872,7 @@ def test_tasks_payload_carries_the_root_count_the_banner_denominates_with(client
 
     The partial-outage notice reads "k of N projects". ``k`` counts entries in
     ``TASKS_OFFLINE_PROJECTS`` — task project roots, from
-    ``active_tasks._all_project_roots``. ``N`` was
+    ``DashboardConfig.all_project_roots``. ``N`` was
     ``(DF_T.PROJECTS || []).length``, the ORCHESTRATOR-derived project list
     from /api/v2/dashboard/orchestrators — a different population. A root with
     no orchestrator, or an orchestrator with no task root, makes them diverge,
@@ -929,7 +941,7 @@ def _terminal_render(
 ):
     """``GET /tasks?terminal=<terminal>`` over a canned substrate; ``(body, calls)``.
 
-    The collector and the root enumerator are canned so the CENSUS the window
+    The collector and the roster are canned so the CENSUS the window
     is positioned from is known exactly — the window's offset is a function of
     the terminal population, so a test that cannot state that population
     cannot check the offset. ``mcp_tool_call`` is left REAL underneath, so the
@@ -937,28 +949,18 @@ def _terminal_render(
     afterwards" is precisely the defect, and which rows the server was asked
     for is observable nowhere else.
     """
-    from pathlib import Path
-
     import dashboard.data.task_snapshot as snapshot_mod
 
     if window is not None:
         monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
 
     roots = [Path('/proj') / label for label in labels]
-    rendered = {str(root) for root in roots}
     calls: list[dict] = []
 
     async def _mcp(http_client, url, tool, args, **kwargs):
-        # Only THIS render's roots are logged. The lifespan's burndown loop
-        # snapshots the real configured roots through this same patched seam
-        # as the app starts, and its reads landed here whenever the two
-        # overlapped (measured: 5 of 10 runs of this class failed on them).
-        # Nothing but the handler can reach a /proj root: only the patched
-        # enumerator below hands one out.
-        if args.get('project_root') in rendered:
-            # kwargs is kept: the per-request budget rides as ``timeout=`` and
-            # is assertable at the wire nowhere else.
-            calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
+        # kwargs is kept: the per-request budget rides as ``timeout=`` and is
+        # assertable at the wire nowhere else.
+        calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
         if tool == 'get_statuses':
             return {'statuses': {}}
         rows = sorted(terminal_rows, key=lambda row: int(row['id']))  # ORDER BY id ASC
@@ -972,12 +974,10 @@ def _terminal_render(
         return {'tasks': rows}
 
     snapshots = _snapshots(labels, count_unknown=count_unknown, done=done)
+    _install_roots(client, roots)
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], snapshots)),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots',
-        new=lambda config: list(roots),
     ), patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
         resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
     assert resp.status_code == 200, resp.text
@@ -1002,28 +1002,11 @@ def _terminal_get_tasks(calls):
     return [call for call in calls if call['tool'] == 'get_tasks']
 
 
-def _node():
-    """The ``node`` binary: a skip locally, a FAILURE under CI.
-
-    The ``test_chip_label_disambiguation.py::_node`` idiom — CI carries node,
-    so its absence there is a toolchain regression, not an optional extra.
-    """
-    import os
-    import shutil
-
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
-
-
 # The REAL client's on-demand path, run over a body handed in on stdin. The
 # three scripts load in index.html's order because each destructures the one
 # before it at module scope, and `document` stays undefined on purpose: data.js
 # starts polling only in a real browser document, so without one it loads
-# inert (data_poll.test.mjs::loadDataJs records why).
+# inert (dashboard/tests/js/_data_loader.mjs::loadDataJs records why).
 _ON_DEMAND_CLIENT = r"""
 const fs = require('fs');
 const path = require('path');
@@ -1051,7 +1034,7 @@ def _request_on_demand(body, project):
 
     redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
     result = subprocess.run(
-        [_node(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
+        [node_path(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
         input=json.dumps(body), capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, (
@@ -2480,11 +2463,10 @@ def test_last_good_rows_do_not_veto_the_outage_flag(client):
         'canned offline root', FRESHNESS_BOUND_SECONDS,
     )
     offline = replace(_snapshot(health='offline'), rows=last_good)
+    _install_roots(client, _fake_roots(1))
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([row], {'p0': offline})),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots', new=lambda config: _fake_roots(1),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
 

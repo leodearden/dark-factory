@@ -39,7 +39,7 @@ from orchestrator.merge_lane.types import MergeRequest
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 _MERGE_AHEAD_BOUND = 1
@@ -61,7 +61,7 @@ Cap invariants (all verified by integration tests):
 - Acquired at the single success-enqueue site in _merger_loop for non-speculative
   blocking-path items (trains continue before this site; speculative items are
   governed by _speculation_slot instead), stamped onto the item's
-  :attr:`~orchestrator.merge_types.RealMergeItem.cap_permit`.
+  :attr:`~orchestrator.merge_lane.types.RealMergeItem.cap_permit`.
 - Released ON-DRAIN in _verifier_loop, immediately after ``_verifier_queue.get()``
   returns a non-None item, before any branching or item reassignment.  This
   uniform placement covers all drain paths (normal verify, immediate_outcome,
@@ -146,7 +146,7 @@ def newest_content_mtime(root: Path) -> float | None:
 
     Pure, heartbeat-immune liveness signal backing the merge-worktree
     no-progress budget in
-    :meth:`orchestrator.merge_queue.SpeculativeMergeWorker._run_inflight_verify`.
+    :meth:`orchestrator.merge_lane.worker.SpeculativeMergeWorker._run_inflight_verify`.
     ``root`` itself is never stat'd, and any ``.git`` subtree is pruned from
     the walk entirely — so the #1728 alpha owner-heartbeat
     (``_touch_owned_merge_worktrees``), which calls ``os.utime`` on every
@@ -308,7 +308,7 @@ def check_merge_liveness_margin(
         safety_factor: Fraction of *liveness_secs* that constitutes the
             "comfortably below" threshold.  Default 0.75.
         logger: Logger to use for the WARNING (default: module logger, captured
-            by ``pytest caplog`` as ``orchestrator.merge_queue``).
+            by ``pytest caplog`` as ``orchestrator.merge_lane``).
 
     Returns:
         :class:`MergeLivenessAssessment` with all computed values and the
@@ -796,7 +796,7 @@ async def acquire_chain_build_lane(
     """Acquire the ONE scratch worktree a deep merge-ahead chain builds in
     (task 3184, PRD β).
 
-    Worktree-routing seam for :func:`orchestrator.merge_queue.build_chain`,
+    Worktree-routing seam for :func:`orchestrator.merge_lane.worker.build_chain`,
     mirroring :func:`_acquire_warm_verify_worktree`'s role for the verify
     path.  Exists so acquire/release are a documented matched pair at one
     place and ``build_chain`` itself contains no worktree-provisioning
@@ -844,7 +844,7 @@ async def acquire_chain_build_lane(
     Returns:
         ``(lane, warm)`` on success; ``(None, False)`` when no chain is
         possible this round.  ``build_chain`` maps ``(None, False)`` to an
-        empty :class:`~orchestrator.merge_types.ChainResult`.
+        empty :class:`~orchestrator.merge_lane.types.ChainResult`.
     """
     del config  # accepted for seam symmetry; lane choice is git_ops-resident
     try:

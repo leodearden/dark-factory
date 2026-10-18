@@ -29,6 +29,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation import citation_repair
 from fused_memory.services.memory_service import MemoryNotFoundError
+from fused_memory.utils.clip_disclosure import clip_text
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
@@ -304,21 +305,15 @@ _MAX_PURGED_TEXT_CHARS = 2_000
 _MAX_PURGED_FINDINGS = 20
 
 
-def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
-    """Cap *value* to *cap* chars, appending ``_TRUNCATION_MARKER`` if truncated.
+def _truncate_field(value: str, cap: int, *, field: str) -> tuple[str, bool]:
+    """``(value cut by clip_text, was_truncated)``, marked with the uncounted ``_TRUNCATION_MARKER``.
 
-    Returns ``(possibly-truncated value, was_truncated)``.  A *value* whose
-    length is ``<= cap`` is returned unchanged with ``False``.
-
-    Note: the marker is appended AFTER slicing to *cap*, so a truncated
-    result is ``cap + len(_TRUNCATION_MARKER)`` chars long, not exactly
-    *cap* — harmless given today's generous ``_MAX_FINDING_TEXT_CHARS``
-    bound, but relevant if *cap* is ever tightened to a hard byte/char
-    budget.
+    The marker stays uncounted because truncated text is persisted and feeds the null-null description dedup hash.
     """
-    if len(value) > cap:
-        return value[:cap] + _TRUNCATION_MARKER, True
-    return value, False
+    clip = clip_text(value, cap, field=field)
+    if clip.fact is None:
+        return clip.text, False
+    return clip.text + _TRUNCATION_MARKER, True
 
 
 # ---------------------------------------------------------------------------
@@ -1574,15 +1569,19 @@ class ReconReportState:
         # its ordering relative to the dedup check below is not load-bearing
         # the way description's is.
         warnings: list[str] = []
-        description, description_truncated = _truncate_field(description, _MAX_FINDING_TEXT_CHARS)
+        description, description_truncated = _truncate_field(
+            description, _MAX_FINDING_TEXT_CHARS, field='description'
+        )
         if description_truncated:
             warnings.append(f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars')
         suggested_action, suggested_action_truncated = _truncate_field(
-            suggested_action, _MAX_FINDING_TEXT_CHARS
+            suggested_action, _MAX_FINDING_TEXT_CHARS, field='suggested_action'
         )
         if suggested_action_truncated:
             warnings.append(f'suggested_action truncated to {_MAX_FINDING_TEXT_CHARS} chars')
-        category, category_truncated = _truncate_field(category, _MAX_FINDING_TEXT_CHARS)
+        category, category_truncated = _truncate_field(
+            category, _MAX_FINDING_TEXT_CHARS, field='category'
+        )
         if category_truncated:
             warnings.append(f'category truncated to {_MAX_FINDING_TEXT_CHARS} chars')
 
@@ -2528,7 +2527,9 @@ class ReconReportState:
         snapshot = asdict(finding)
         truncated_fields: list[str] = []
         for name in ('description', 'suggested_action'):
-            snapshot[name], was_truncated = _truncate_field(snapshot[name], _MAX_PURGED_TEXT_CHARS)
+            snapshot[name], was_truncated = _truncate_field(
+                snapshot[name], _MAX_PURGED_TEXT_CHARS, field=name
+            )
             if was_truncated:
                 truncated_fields.append(name)
         record_entry.purged_findings.append({

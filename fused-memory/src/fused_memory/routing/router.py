@@ -105,6 +105,12 @@ class ReadRouter:
             self._openai_client = AsyncOpenAI(api_key=api_key)
         return self._openai_client
 
+    async def close(self) -> None:
+        """Release the AsyncOpenAI connection pool this router holds."""
+        client, self._openai_client = self._openai_client, None
+        if client is not None:
+            await client.close()
+
     async def route(
         self,
         query: str,

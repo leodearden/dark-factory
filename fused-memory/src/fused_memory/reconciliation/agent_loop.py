@@ -267,14 +267,14 @@ class AgentLoop:
         provider = self.config.agent_llm_provider
 
         if provider == 'anthropic':
-            client = anthropic.AsyncAnthropic()
-            response = await client.messages.create(
-                model=self.config.agent_llm_model,
-                max_tokens=self.config.agent_max_tokens,
-                system=self.system_prompt,
-                messages=cast('list[MessageParam]', messages),
-                tools=tool_schemas,
-            )
+            async with anthropic.AsyncAnthropic() as client:
+                response = await client.messages.create(
+                    model=self.config.agent_llm_model,
+                    max_tokens=self.config.agent_max_tokens,
+                    system=self.system_prompt,
+                    messages=cast('list[MessageParam]', messages),
+                    tools=tool_schemas,
+                )
             self.llm_call_count += 1
             self.token_count += response.usage.input_tokens + response.usage.output_tokens
             return response
@@ -286,8 +286,6 @@ class AgentLoop:
     async def _call_openai(self, messages: list[dict[str, Any]], tool_schemas: list[ToolParam]) -> Any:
         """Call OpenAI and convert response to Anthropic-like format."""
         from openai import AsyncOpenAI
-
-        client = AsyncOpenAI()
 
         # Convert Anthropic tool schemas to OpenAI format
         openai_tools: list[Any] = []
@@ -338,7 +336,8 @@ class AgentLoop:
         }
         if openai_tools:
             create_kwargs['tools'] = openai_tools
-        response = await client.chat.completions.create(**create_kwargs)
+        async with AsyncOpenAI() as client:
+            response = await client.chat.completions.create(**create_kwargs)
 
         self.llm_call_count += 1
         if response.usage:

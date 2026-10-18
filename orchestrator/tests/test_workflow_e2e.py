@@ -32,6 +32,7 @@ from _workflow_helpers import (
 )
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator import session_registry
 from orchestrator.agents.invoke import AgentResult
@@ -358,7 +359,7 @@ class TestHappyPath:
         Fails until _submit_to_merge_queue stores merge_sha on self._merge_sha (step-15)
         and workflow.py:554 passes it as done_provenance.
         """
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         stub = AgentStub()
         scheduler = FakeScheduler()
@@ -3041,7 +3042,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3076,7 +3077,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3116,7 +3117,7 @@ class TestMarkBlockedFalseDoneGuard:
         from unittest.mock import AsyncMock, patch
 
         from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3146,7 +3147,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3183,7 +3184,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRANSIENT_INFRA_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3213,7 +3214,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -7038,10 +7039,9 @@ class TestMarkBlockedBypassDetection:
     ):
         """When done_provenance.commit IS on main, treat as legitimate done.
 
-        The first set_task_status('blocked') is rejected (because the row is
-        already done) but bypass-detection sees a valid provenance commit on
-        main and lets the existing flow continue (which falls through to the
-        steward / DONE path).
+        The set_task_status('blocked') is rejected because the row is already
+        done, and bypass-detection sees a valid provenance commit on main.  The
+        exit reports the observed done, and nothing is filed.
         """
         from orchestrator.scheduler import TerminalExitRejection
 
@@ -7076,19 +7076,14 @@ class TestMarkBlockedBypassDetection:
         scheduler.set_task_status = raising_set  # type: ignore[method-assign]
 
         outcome = await workflow._mark_blocked('synthetic reason')
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Expected BLOCKED on legitimate-done path (no steward), got {outcome!r}'
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected the observed DONE on the legitimate-done path, got {outcome!r}'
         )
+        assert outcome_allows_status(outcome, 'done')
 
-        # Legitimate done — no bypass_done L1 and no reopen.
-        bypass_l1 = [
-            e for e in queue.get_by_task(task_assignment.task_id, level=1)
-            if e.category == 'bypass_done'
-        ]
-        assert not bypass_l1, (
-            f'expected no bypass_done L1 for legitimate done, got '
-            f'{[(e.id, e.category) for e in bypass_l1]}'
-        )
+        # Legitimate done — no escalation of any category, and no reopen.
+        filed = queue.get_by_task(task_assignment.task_id)
+        assert filed == [], [(e.id, e.level, e.category) for e in filed]
 
         # The reopen_reason must NOT contain 'bypass detected'.
         assert 'bypass detected' not in scheduler.reopen_reasons.get(

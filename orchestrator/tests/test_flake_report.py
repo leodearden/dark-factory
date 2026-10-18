@@ -55,6 +55,17 @@ from orchestrator.flake_report import (
 
 _NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
 
+# Every ledger WRITE entry point; the read-only report must reach none of them.
+_WRITERS = (
+    'record_flake_occurrence',
+    'open_debt',
+    'resolve_debt',
+    'enqueue_debt',
+    'delete_due_item',
+    'record_failed_due_attempt',
+    'name_stale_due_items',
+)
+
 
 def _seed_occurrence(
     db_path: Path,
@@ -1084,7 +1095,7 @@ class TestReadOnlyContract:
         # this fails immediately rather than waiting for a call site to exercise it.
         import orchestrator.flake_report as report_module
 
-        for writer in ('record_flake_occurrence', 'open_debt', 'resolve_debt'):
+        for writer in _WRITERS:
             assert not hasattr(report_module, writer), (
                 f'flake_report must not bind the write entry point {writer}'
             )
@@ -1097,7 +1108,7 @@ class TestReadOnlyContract:
         def _boom(*args, **kwargs):
             raise AssertionError('the read-only report reached a ledger WRITE entry point')
 
-        for writer in ('record_flake_occurrence', 'open_debt', 'resolve_debt'):
+        for writer in _WRITERS:
             monkeypatch.setattr(f'orchestrator.flake_ledger.{writer}', _boom)
 
         db_path = tmp_path / 'runs.db'
@@ -1501,8 +1512,115 @@ class TestFlakeLedgerCommand:
         def _boom(*args, **kwargs):
             raise AssertionError('the flake-ledger command reached a ledger WRITE path')
 
-        for writer in ('record_flake_occurrence', 'open_debt', 'resolve_debt'):
+        for writer in _WRITERS:
             monkeypatch.setattr(f'orchestrator.flake_ledger.{writer}', _boom)
         cfg, _ = self._project(tmp_path)
         result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
         assert result.exit_code == 0, result.output
+
+
+def _seed_due(
+    db_path: Path,
+    *,
+    test_id: str,
+    enqueued_at: str,
+    observed_at: str = '2026-08-10T11:00:00+00:00',
+) -> None:
+    """Insert one flake_debt_due item with raw sqlite3 (never through enqueue_debt)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO flake_debt_due '
+            '(test_id, project_id, observed_at, call_site, head, observing_task_id, '
+            ' context, enqueued_at, next_attempt_at) '
+            "VALUES (?, 'dark_factory', ?, 'merge_gate', NULL, NULL, '{}', ?, ?)",
+            (test_id, observed_at, enqueued_at, enqueued_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestDueListInTheReport:
+    """Task 6934: an ownerless row whose test has an item on the due list is a filing
+    still PENDING, not a breach; and one line states the due list's size and age."""
+
+    def _ledger(self, tmp_path: Path) -> Path:
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        return db_path
+
+    def _line(self, rendered: str, needle: str) -> str:
+        (line,) = [ln for ln in rendered.splitlines() if needle in ln]
+        return line
+
+    def test_an_unowned_row_with_an_item_reads_filing_pending_since_its_oldest_item(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = self._ledger(tmp_path)
+        _seed_debt(db_path, test_id='pending', opened_at='2026-08-10T11:00:00+00:00',
+                   owner_task_id=None)
+        _seed_due(db_path, test_id='pending', enqueued_at='2026-08-10T11:50:00+00:00',
+                  observed_at='2026-08-10T11:00:01+00:00')
+        _seed_due(db_path, test_id='pending', enqueued_at='2026-08-10T11:40:00+00:00')
+
+        report = build_report(db_path, now=_NOW)
+
+        assert report.open_debt[0].pending_since == '2026-08-10T11:40:00+00:00'
+        line = self._line(render_report(report), '  pending  ')
+        assert 'filing pending since 2026-08-10T11:40:00+00:00' in line, line
+        assert 'NO OWNER' not in line.upper(), line
+
+    def test_an_unowned_row_with_no_item_still_renders_the_breach(self, tmp_path: Path) -> None:
+        db_path = self._ledger(tmp_path)
+        _seed_debt(db_path, test_id='orphan', opened_at='2026-08-10T11:00:00+00:00',
+                   owner_task_id=None)
+        _seed_due(db_path, test_id='someone-else', enqueued_at='2026-08-10T11:40:00+00:00')
+
+        line = self._line(render_report(build_report(db_path, now=_NOW)), '  orphan  ')
+
+        assert '*** NO OWNER (invariant breach) ***' in line, line
+
+    def test_an_owned_row_renders_its_owner_even_with_an_item(self, tmp_path: Path) -> None:
+        db_path = self._ledger(tmp_path)
+        _seed_debt(db_path, test_id='owned', opened_at='2026-08-10T11:00:00+00:00',
+                   owner_task_id='4242')
+        _seed_due(db_path, test_id='owned', enqueued_at='2026-08-10T11:40:00+00:00')
+
+        line = self._line(render_report(build_report(db_path, now=_NOW)), '  owned  ')
+
+        assert 'owner=4242' in line and 'pending' not in line, line
+
+    def test_an_empty_due_list_says_so(self, tmp_path: Path) -> None:
+        rendered = render_report(build_report(self._ledger(tmp_path), now=_NOW))
+
+        assert 'due list: empty' in rendered.splitlines(), rendered
+
+    def test_the_due_line_gives_the_count_and_the_oldest_age_within_the_bound(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = self._ledger(tmp_path)
+        _seed_due(db_path, test_id='a', enqueued_at='2026-08-10T11:45:00+00:00')
+        _seed_due(db_path, test_id='b', enqueued_at='2026-08-10T11:50:00+00:00')
+
+        line = self._line(render_report(build_report(db_path, now=_NOW)), 'due list:')
+
+        assert line == 'due list: 2 item(s), oldest enqueued 2026-08-10T11:45:00+00:00 (age 0d 0h)'
+
+    def test_the_due_line_flags_an_item_past_the_bound(self, tmp_path: Path) -> None:
+        db_path = self._ledger(tmp_path)
+        _seed_due(db_path, test_id='a', enqueued_at='2026-08-10T09:00:00+00:00')
+
+        line = self._line(render_report(build_report(db_path, now=_NOW)), 'due list:')
+
+        assert line == (
+            'due list: 1 item(s), oldest enqueued 2026-08-10T09:00:00+00:00 (age 0d 3h)'
+            ' — PAST THE 30-MINUTE BOUND'
+        )
+
+    def test_an_unread_due_list_is_unreadable_and_an_unmeasured_ledger_is_not_measured(
+        self, tmp_path: Path,
+    ) -> None:
+        assert 'due list: UNREADABLE' in render_report(_report()).splitlines()
+        absent = build_report(tmp_path / 'nope' / 'runs.db', now=_NOW)
+        assert 'due list: not measured' in render_report(absent).splitlines()

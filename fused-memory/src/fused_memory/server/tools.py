@@ -9,6 +9,8 @@ import logging
 import os
 import time
 import uuid as uuid_mod
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,11 +25,17 @@ from shared.delivered_check_polarity import (
     polarity_error,
 )
 from shared.task_statuses import ACTIVE
+from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     MEM0_MANAGED_METADATA_KEYS,
+)
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    InvalidMetadataLookupError,
+    validate_metadata_query,
 )
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
@@ -79,7 +87,12 @@ from fused_memory.middleware.task_interceptor import (
     _is_ticket_id,
     _looks_like_task_id,
 )
-from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
+from fused_memory.models.enums import (
+    MEM0_PRIMARY,
+    MemoryCategory,
+    SourceStore,
+    routes_to_graphiti,
+)
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.citation_verifier import (
     find_live_citation_occurrences,
@@ -160,6 +173,10 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
+from fused_memory.server.resolve_prefix_route import (
+    register_resolve_prefix_route,
+    resolver_unavailable_body,
+)
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.server.topic_cluster_store import TopicClusterStore, seed_topic_cluster
 from fused_memory.server.write_triage import (
@@ -201,6 +218,7 @@ from fused_memory.services.consolidation_ops import (
     patch_memory_metadata,
     read_topic_closure,
 )
+from fused_memory.services.id_resolver import IdResolver, is_uuid_prefix
 from fused_memory.services.memory_service import MemoryService, metadata_row_text
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
@@ -501,6 +519,7 @@ Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
+- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -644,6 +663,79 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
         return canonicalize_project_id(project_id), None
     except PathShapedProjectIdError as e:
         return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
+#: The refusal a read tool gives a prefix that names several ids; the uuid
+#: prefix guard refuses with the same error_type.
+_AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
+
+
+@dataclass(frozen=True)
+class _ResolvedId:
+    """The prefix named exactly one live id in the tool's namespace: read *full_id*."""
+
+    full_id: str
+
+
+@dataclass(frozen=True)
+class _PrefixResponse:
+    """The prefix named no one readable id: *body* is the tool's whole response."""
+
+    body: dict[str, Any]
+
+
+async def _resolve_or_respond(
+    id_resolver: IdResolver, project_id: str, prefix: str, *, serves: Namespace,
+) -> _ResolvedId | _PrefixResponse:
+    """Resolve a read tool's prefix-shaped id argument, or answer for the tool (PRD C4).
+
+    The response is the outage (``prefix_checked: False``, never a miss —
+    INV-11), the ambiguity refusal with its candidates, or the miss report of
+    what each namespace holds.
+    """
+    try:
+        resolution = await id_resolver.resolve_prefix(project_id, prefix)
+    except ResolverUnavailable as exc:
+        return _PrefixResponse({
+            **resolver_unavailable_body(exc),
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': False,
+        })
+    if resolution.outcome == 'ambiguous':
+        return _PrefixResponse({
+            'error': (
+                f'{prefix!r} is the prefix of {len(resolution.candidates)} ids; '
+                'pass the full uuid of the one you mean'
+            ),
+            'error_type': _AMBIGUOUS_UUID_PREFIX,
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': True,
+            'candidates': [candidate._asdict() for candidate in resolution.candidates],
+        })
+    if resolution.outcome == 'unique' and resolution.candidates[0].namespace == serves:
+        return _ResolvedId(resolution.candidates[0].id)
+    return _PrefixResponse({
+        'found': False,
+        'prefix_checked': True,
+        'prefix': prefix,
+        'project_id': project_id,
+        'namespaces': await id_resolver.miss_report(project_id, prefix, resolution),
+        'hint': _prefix_miss_hint(prefix, resolution, serves),
+    })
+
+
+def _prefix_miss_hint(prefix: str, resolution: Resolution, serves: Namespace) -> str:
+    malformed = validate_full_uuid(prefix)
+    remediation = malformed['hint'] if malformed else ''
+    if resolution.candidates:
+        elsewhere = resolution.candidates[0].namespace
+        return (
+            f'No {serves} id starts with {prefix!r}, but a live {elsewhere} id does '
+            f'(see namespaces). {remediation}'
+        )
+    return f'No live id in any namespace starts with {prefix!r}. {remediation}'
 
 
 _UPDATE_MEMORY_MODES = ('merge', 'replace')
@@ -1117,14 +1209,16 @@ def _status_page(
     return {k: statuses[k] for k in page_keys}, len(ordered)
 
 
-def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
+def _validate_paging(
+    page_size: Any, offset: Any, *, size_arg: str = 'page_size',
+) -> dict[str, Any] | None:
     """Validate shared ``page_size``/``offset`` paging inputs.
 
     Returns a ValidationError payload dict when an input is malformed, or None
-    when both are acceptable.  Shared by ``get_tasks`` and ``get_statuses`` so
-    both tools reject identical inputs identically and a future fix to the
-    bool/int guard lands in ONE place (it was previously copy-pasted, so it
-    had to be fixed twice).
+    when both are acceptable.  Shared by ``get_tasks``, ``get_statuses`` and
+    ``find_tasks_by_metadata`` so they reject identical inputs identically and
+    a future fix to the bool/int guard lands in ONE place (it was previously
+    copy-pasted, so it had to be fixed twice).
 
     ``bool`` is rejected explicitly because it is an ``int`` subclass:
     ``page_size=True`` would otherwise silently mean a 1-entry page.
@@ -1132,21 +1226,69 @@ def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
     would spin a paging caller forever.
 
     Callers must invoke this BEFORE touching the interceptor, so a malformed
-    request costs no backend work.
+    request costs no backend work. ``size_arg`` is the page-size argument's
+    name in the calling tool, so the error names what the caller passed.
     """
     if page_size is not None and (
         not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0
     ):
         return {
-            'error': 'page_size must be a positive integer',
+            'error': f'{size_arg} must be a positive integer; got {page_size!r}',
             'error_type': 'ValidationError',
         }
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         return {
-            'error': 'offset must be a non-negative integer',
+            'error': f'offset must be a non-negative integer; got {offset!r}',
             'error_type': 'ValidationError',
         }
     return None
+
+
+def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
+    """Return a ValidationError payload unless ``statuses`` is None or a list of str.
+
+    ``[]`` is valid and matches nothing. Shared by ``get_tasks`` and
+    ``find_tasks_by_metadata``, so a bare string is rejected identically by both.
+    """
+    if statuses is None or (
+        isinstance(statuses, list) and all(isinstance(s, str) for s in statuses)
+    ):
+        return None
+    return {
+        'error': f'statuses must be a list of status strings; got {statuses!r}',
+        'error_type': 'ValidationError',
+    }
+
+
+# find_tasks_by_metadata's page-size cap, and its include_value page budget in
+# serialized bytes of ``results`` (plans/task-metadata-lookup-prd.md decision 6).
+METADATA_LOOKUP_LIMIT_CAP = 100
+RESULT_BYTE_BUDGET = 48_000
+
+
+def _json_bytes(obj: Any) -> int:
+    """Serialized size as the lookup contract measures it: stdlib ``json.dumps``, UTF-8 bytes."""
+    return len(json.dumps(obj).encode('utf-8'))
+
+
+def _elided_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    elided = {'_elided': True, 'bytes': _json_bytes(row['matched_value'])}
+    return {**row, 'matched_value': elided, 'truncated_value': True}
+
+
+def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The longest prefix of *rows* whose serialized list fits ``RESULT_BYTE_BUDGET``.
+
+    Sizes add up exactly as ``json.dumps`` of the list: ``[]`` plus each row
+    plus a ``', '`` between rows. A first row too big to fit alone comes back
+    as the only row, with its value elided.
+    """
+    size = len('[]')
+    for count, row in enumerate(rows):
+        size += _json_bytes(row) + (len(', ') if count else 0)
+        if size > RESULT_BYTE_BUDGET:
+            return list(rows[:count]) if count else [_elided_row(row)]
+    return list(rows)
 
 
 def _pagination_meta(
@@ -1196,10 +1338,17 @@ def create_mcp_server(
     curator_usage_gate: UsageGate | None = None,
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
+    id_resolver: IdResolver | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+
+    def _resolver() -> IdResolver:
+        # Built per use: the resolver is stateless and its factory reads the
+        # service's CURRENT config, so a hot reload of the read timeout or
+        # collection prefix applies to the next resolution.
+        return id_resolver or IdResolver.for_memory_service(memory_service)
     _taskmaster_configured = task_interceptor is not None
 
     async def _backlog_gate(project_id: str) -> dict | None:
@@ -1452,6 +1601,13 @@ def create_mcp_server(
         # all IS the signal; the body is a fixed constant so nothing dynamic
         # can creep in and turn this back into a state read.
         return JSONResponse(_ALIVE_BODY, status_code=200)
+
+    # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
+    register_resolve_prefix_route(
+        mcp,
+        lambda project_id, prefix: _resolver().resolve_prefix(project_id, prefix),
+        known_projects=_kp,
+    )
 
     # ------------------------------------------------------------------
     # Write tools
@@ -3105,9 +3261,12 @@ def create_mcp_server(
         declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the episode is not
         ingested — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -3144,13 +3303,14 @@ def create_mcp_server(
                 is NOT "all entities": extraction legitimately derives entities
                 no caller could predict, and this parameter names only the
                 referents the episode is ABOUT. A declaration the content
-                contradicts is REJECTED
+                contradicts — a near-miss typo of a declared task number, or
+                that number under another project — is REJECTED
                 (error_type=DeclaredReferentConflictRejected) and nothing is
-                ingested. ANY wrong shape — a bare string, a single un-wrapped
-                dict, a bad entry inside the list — is rejected as a
-                ValidationError whose message carries the accepted entry shape,
-                so you never have to guess the remedy. Absence is never
-                rejected, so omitting this always succeeds.
+                ingested; fix the id, or write `task NNN` in the content. ANY
+                wrong shape — a bare string, a single un-wrapped dict, a bad
+                entry inside the list — is rejected as a ValidationError whose
+                message carries the accepted entry shape, so you never have to
+                guess the remedy. Absence is never rejected.
                 One asymmetry against add_memory, and it is a tier below this
                 parameter: add_episode persists no metadata, so there is no
                 metadata['task_id'] fallback here — a declaration overrides
@@ -3434,23 +3594,21 @@ def create_mcp_server(
         all. A declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the write does not
         happen — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
-        Two halves of that, and they have DIFFERENT scopes — the rejection is
-        universal, the recording is not. Every add_memory call is checked for a
-        declared/prose conflict, whatever its category. But a declaration is
-        RECORDED only on a write that reaches Graphiti — an
+        A declaration is RECORDED only on a write that reaches Graphiti — an
         entities_and_relations, temporal_facts or decisions_and_rationale
-        category, or dual_write=True. On a Mem0-primary write
+        category, or dual_write=True. On an explicit Mem0-primary category
         (procedural_knowledge, preferences_and_norms,
-        observations_and_summaries) the referent set has nowhere to live: your
-        `entities` is validated against the content and then discarded, and
-        nothing downstream can tell it apart from a call that omitted the
-        parameter. So on those three categories `entities` buys you the
-        typo-catch and nothing else — which is still worth having, but do not
-        expect it to steer retrieval.
+        observations_and_summaries) without dual_write, the referent set has
+        nowhere to live: your `entities` is shape-checked, then discarded, and
+        never conflict-rejected. With category omitted it IS conflict-checked,
+        because the destination is not known until the write is classified.
 
         Content asserting that concrete, NAMED work is complete ("task N's fix
         has been applied", "re-filed as ticket tkt_...") is cross-checked
@@ -3511,17 +3669,19 @@ def create_mcp_server(
                       extraction pipeline legitimately derives entities no caller
                       could predict, and this parameter names only the referents
                       the memory is ABOUT. A declaration the content contradicts
-                      is REJECTED (error_type=DeclaredReferentConflictRejected)
-                      and nothing is written. ANY wrong shape — a bare string,
+                      — a near-miss typo of a declared task number, or that
+                      number under another project — is REJECTED
+                      (error_type=DeclaredReferentConflictRejected) and nothing
+                      is written; fix the id, or write `task NNN` in the
+                      content. ANY wrong shape — a bare string,
                       a single un-wrapped dict, a bad entry inside the list — is
                       rejected as a ValidationError whose message carries the
                       accepted entry shape, so you never have to guess the
-                      remedy. Absence is never rejected, so omitting this
-                      parameter always succeeds. RECORDED only on a write that
+                      remedy. Absence is never rejected. RECORDED only on a write that
                       reaches Graphiti (a GRAPHITI_PRIMARY category, or
-                      dual_write=True); on a Mem0-primary category it is
-                      checked for a conflict and then discarded — see the
-                      scope note above.
+                      dual_write=True); on an explicit Mem0-primary category
+                      without dual_write it is shape-checked, then discarded,
+                      and never conflict-rejected — see the scope note above.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3555,8 +3715,19 @@ def create_mcp_server(
         # through `canonicalize_project_id` — so the gate and `MemoryService`
         # classify local-vs-foreign referents identically. A raw id here would
         # let the two disagree about whether a qualifier names us.
+        #
+        # `category is None` counts as recorded: the classifier picks the
+        # destination below this boundary, and running it here too would be a
+        # second classification site (INV-5).
+        declaration_recorded = category is None or routes_to_graphiti(
+            MemoryCategory(category), dual_write=dual_write,
+        )
         if err := entities_gate(
-            entities, content=content, group_id=project_id, agent_id=agent_id,
+            entities,
+            content=content,
+            group_id=project_id,
+            agent_id=agent_id,
+            declaration_recorded=declaration_recorded,
         ):
             return err
         # MCP-markup rejection no longer happens here: task 4458 retired this
@@ -4876,9 +5047,21 @@ def create_mcp_server(
 
         Args:
             project_id: Project scope (required)
-            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up
+            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up, or
+                an 8-31 lowercase-hex prefix of one
 
         Returns:
+            For a PREFIX that names exactly one live memory: that memory's
+            hit or miss below, plus ``resolved_from_prefix``. For any other
+            prefix: the miss report ``{'found': False, 'prefix_checked': True,
+            'prefix', 'project_id', 'namespaces', 'hint'}`` listing what each
+            namespace (mem0, mem0_tombstone, graphiti_node, graphiti_edge)
+            holds, with ``mem0_tombstone: None`` when the tombstone store could
+            not be read; ``{'error_type': 'ambiguous_uuid_prefix', 'candidates', ...}``
+            when it names several ids; ``{'error_type': 'resolver_unavailable',
+            'store', 'prefix_checked': False, ...}`` when a store could not be
+            read. Any other non-uuid id is a ``ValidationError`` with a ``hint``.
+
             ``{'found': True, 'memory_id', 'project_id', 'content', 'metadata'}``
             on a hit (``metadata`` is the full raw Qdrant payload); ``{'found':
             False, 'memory_id', 'project_id'}`` on a genuine miss — plus
@@ -4914,6 +5097,15 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(memory_id):
+            match await _resolve_or_respond(_resolver(), project_id, memory_id, serves='mem0'):
+                case _PrefixResponse(body=response):
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, memory_id = memory_id, full_id
+        elif err := validate_full_uuid(memory_id, field_name='memory_id'):
+            return err
         record = await memory_service.get_memory_by_id(
             project_id=project_id,
             memory_id=memory_id,
@@ -4924,6 +5116,8 @@ def create_mcp_server(
                 'memory_id': memory_id,
                 'project_id': project_id,
             }
+            if resolved_from_prefix is not None:
+                miss['resolved_from_prefix'] = resolved_from_prefix
             # A miss may be a DELIBERATE reap rather than a never-existed. The
             # lookup is guarded and the key omitted when empty, so this can
             # only ever add information to an answer that is already correct —
@@ -4960,6 +5154,8 @@ def create_mcp_server(
             'content': record['content'],
             'metadata': record['metadata'],
         }
+        if resolved_from_prefix is not None:
+            hit['resolved_from_prefix'] = resolved_from_prefix
         # ADDITIVE ONLY (task 3129): a canonical gains its group; a CHILD keeps
         # its own content/metadata/memory_id and gains only grouped.parent —
         # replacing a child's body with its parent's would make a citation
@@ -5095,8 +5291,15 @@ def create_mcp_server(
         want to confirm its identity without the fuzzy/semantic matching that
         can mask duplicate-node pathology.
 
+        An 8-31 lowercase-hex PREFIX naming exactly one Entity node is read
+        through to it (the result gains ``resolved_from_prefix``, as does the
+        NodeNotFoundError, with the resolved ``entity_uuid``, if the node is
+        gone by read time); any other prefix returns get_memory_by_id's miss
+        report, ambiguity refusal or ``resolver_unavailable`` shape instead of
+        a NodeNotFoundError.
+
         Args:
-            entity_uuid: UUID of the Entity node to look up
+            entity_uuid: UUID of the Entity node to look up, or a prefix of one
             project_id: Project scope (required)
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
@@ -5107,6 +5310,26 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(entity_uuid):
+            match await _resolve_or_respond(
+                _resolver(), project_id, entity_uuid, serves='graphiti_node',
+            ):
+                case _PrefixResponse(body=response):
+                    await _log_read(
+                        operation='get_entity_by_uuid',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={'entity_uuid': entity_uuid},
+                        result_summary={
+                            'prefix_checked': response['prefix_checked'],
+                            'outcome': response.get('error_type', 'miss_report'),
+                        },
+                    )
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, entity_uuid = entity_uuid, full_id
         try:
             result = await memory_service.get_entity_by_uuid(
                 entity_uuid=entity_uuid, project_id=project_id
@@ -5123,6 +5346,8 @@ def create_mcp_server(
                     'has_summary': bool(result.get('summary')),
                 },
             )
+            if resolved_from_prefix is not None:
+                return {**result, 'resolved_from_prefix': resolved_from_prefix}
             return result
         except NodeNotFoundError as e:
             # Expected diagnostic outcome, not a backend failure — this tool
@@ -5137,7 +5362,10 @@ def create_mcp_server(
                 params={'entity_uuid': entity_uuid},
                 result_summary={'found': False},
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            miss = {'error': str(e), 'error_type': type(e).__name__}
+            if resolved_from_prefix is not None:
+                miss |= {'entity_uuid': entity_uuid, 'resolved_from_prefix': resolved_from_prefix}
+            return miss
         except Exception as e:
             await _log_read(
                 operation='get_entity_by_uuid',
@@ -8312,16 +8540,9 @@ def create_mcp_server(
         _paging_error = _validate_paging(page_size, offset)
         if _paging_error is not None:
             return _paging_error
-        if statuses is not None and not isinstance(statuses, list):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
-        if statuses is not None and any(not isinstance(s, str) for s in statuses):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
+        _statuses_error = _validate_statuses(statuses)
+        if _statuses_error is not None:
+            return _statuses_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -9481,6 +9702,92 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def find_tasks_by_metadata(
+        project_root: str,
+        key: str,
+        value: Any = None,
+        statuses: Any = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: Any = False,
+    ) -> dict[str, Any]:
+        """Exact lookup of the tasks whose top-level ``metadata[key]`` matches ``value``.
+
+        Searches every status, including ``deferred`` and ``cancelled``, which
+        ``search_tasks`` does not. Semantics: plans/task-metadata-lookup-prd.md.
+
+        Args:
+            project_root: Absolute path to project root.
+            key: One top-level metadata key matching ``[A-Za-z0-9_][A-Za-z0-9_-]*``.
+            value: Omit to match every task carrying ``key`` (even as JSON null).
+                A str or int matches a scalar by equality or a list by
+                membership, type-strictly: 40 does not match "40". bool, float,
+                dict and list values are rejected.
+            statuses: Optional list of task statuses to search within
+                (default: all); an unknown status is a ValidationError.
+            limit: Page size >= 1; values above 100 are clamped to 100 (default 50).
+            offset: Zero-based index into the matches, ordered by task id.
+            tag: Tag context (optional).
+            include_value: True adds ``matched_value``, the whole ``metadata[key]``.
+
+        Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
+        ``updated_at``), ``tasks_with_key`` (how many tasks in the searched
+        statuses carry ``key``), ``pagination`` (page on ``has_more`` with
+        ``offset += returned``), ``malformed_metadata_ids`` when some task's
+        metadata is not a JSON object, and the echoed arguments. An ``error``
+        payload means the lookup failed; it never means "no match".
+        """
+        paging_error = _validate_paging(limit, offset, size_arg='limit')
+        if paging_error is not None:
+            return paging_error
+        statuses_error = _validate_statuses(statuses)
+        if statuses_error is not None:
+            return statuses_error
+        page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
+        try:
+            validate_metadata_query(
+                key=key, value=value, statuses=statuses, include_value=include_value,
+            )
+        except InvalidMetadataLookupError as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        normalized = _normalize_project_root(project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        found = await task_interceptor.find_tasks_by_metadata(
+            normalized, key, value,
+            statuses=statuses, limit=page_size, offset=offset, tag=tag,
+            include_value=include_value,
+        )
+        results = _fit_rows_to_budget(found['results']) if include_value else found['results']
+        pid = resolve_project_id(normalized)
+        response: dict[str, Any] = {
+            'project_id': pid,
+            'project_root': normalized,
+            'key': key,
+            'value': value,
+            'statuses': statuses,
+            'results': results,
+            'tasks_with_key': found['tasks_with_key'],
+            'pagination': _pagination_meta(
+                total=found['total'], offset=offset, page_size=page_size,
+                returned=len(results),
+            ),
+        }
+        if found['malformed_metadata_ids']:
+            response['malformed_metadata_ids'] = found['malformed_metadata_ids']
+        await _log_read(
+            'find_tasks_by_metadata',
+            project_id=pid,
+            result_summary={
+                'project_id': pid, 'key': key,
+                'total': found['total'], 'returned': len(results),
+            },
+        )
+        return response
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
         """Cancel a pending curator ticket by its ticket_id.
 
@@ -10510,15 +10817,15 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Snapshot dict with keys: skip_counts, parks, effective_priorities,
-            pin_queue, overrides, current_holders, snapshot_at.
-            Returns the empty skeleton when no snapshot file exists yet.
+            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        snapshot = await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        return snapshot.to_json()
 
     @mcp.tool()
     @mcp_tool_errors()

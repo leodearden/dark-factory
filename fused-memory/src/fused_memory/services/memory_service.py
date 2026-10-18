@@ -69,6 +69,8 @@ from fused_memory.models.enums import (
     ClassificationFallback,
     MemoryCategory,
     SourceStore,
+    routes_to_graphiti,
+    routes_to_mem0,
 )
 from fused_memory.models.memory import (
     AddEpisodeResponse,
@@ -83,7 +85,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
 )
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import Scope, build_known_projects_map
 from fused_memory.reconciliation.flag_record_contract import (
     enforce_flag_record_write_contract,
 )
@@ -160,7 +162,7 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
     from fused_memory.reconciliation.journal import ReconciliationJournal
-    from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+    from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
 
@@ -177,8 +179,12 @@ _T = TypeVar('_T')
 # backend can consume the whole shutdown budget or starve the durable-flush
 # SQLite closes (_write_journal/_event_buffer) that run after it. The paired
 # outer step budget lives in server/main.py as _MEMORY_CLOSE_STEP_TIMEOUT and
-# must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
+# must dominate MemoryService.close_budget_secs() (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
+
+# SDK connection-pool releases (classifier, router) only close local idle sockets: httpx opens its TLS streams with standard_compatible=False, so no close waits on the peer.
+# They run after every durable-flush close and lose nothing if cut short.
+_POOL_RELEASE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes
 # from its Graphiti ones, whose group_id is the bare project_id
@@ -279,6 +285,33 @@ def metadata_row_text(row: Mapping[str, Any]) -> str:
     """
     payload = row.get('metadata')
     return _mem0_content(payload) if isinstance(payload, dict) else ''
+
+
+def _decode_mem0_tombstone(record: ReconLedgerRecord) -> dict | None:
+    """A ``mem0_tombstone`` row's payload plus its own timestamps, or ``None`` (one WARNING).
+
+    The one decode behind ``MemoryService.get_mem0_deletion_tombstone`` and
+    ``MemoryService.find_mem0_deletion_tombstones``; that first method's
+    docstring says why the row's timestamps are added under their own names.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        logger.warning(
+            'mem0 tombstone: unreadable payload for memory_id=%s in project=%s; '
+            'reporting no tombstone',
+            record.task_id,
+            record.project_id,
+            extra={'project_id': record.project_id, 'memory_id': record.task_id},
+        )
+        return None
+    return {
+        **payload,
+        'tombstone_created_at': record.created_at,
+        'tombstone_expires_at': record.expires_at,
+    }
 
 
 def _mem0_category(meta: dict) -> MemoryCategory | None:
@@ -1698,6 +1731,15 @@ def _edge_to_dict(e: Any) -> dict:
     }
 
 
+def _edge_is_retired(edge: Any) -> bool:
+    """True when a graphiti-core ``EntityEdge``'s ``invalid_at`` is set — the
+    Python mirror of backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, which
+    explains why ``expired_at`` is deliberately not consulted (a restored edge
+    keeps it).
+    """
+    return getattr(edge, 'invalid_at', None) is not None
+
+
 # Defensive: resolve the embedding-provider's RateLimitError class at module
 # load. If the openai SDK is absent or its exception hierarchy is renamed,
 # _is_rate_limit_or_quota_error still works via its duck-typed fallback checks
@@ -2012,7 +2054,11 @@ _ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS: float = 5.0
 #: * ``'failed'``      — we tried and the backend did not cooperate. An
 #:   INFRASTRUCTURE signal, deliberately not folded into the refusal bucket:
 #:   conflating them would let a FalkorDB outage read as a scanner regression
-#:   in leaf iota's rate, and would feed a false repair-storm streak.
+#:   in leaf iota's rate, and would feed a false repair-storm streak. It also
+#:   covers a repair DEFERRED because zeta's lookup of the target was degraded
+#:   (:attr:`ReferentFinding.uuid_lookup_degraded`): nothing was written, since
+#:   "could not look" is neither "absent" (mint) nor "present" (resolve), and
+#:   the backend not answering is the same infrastructure signal.
 REFERENT_REPAIR_OUTCOMES: tuple[str, ...] = (
     'repaired', 'unrepairable', 'degenerate', 'failed',
 )
@@ -2145,7 +2191,8 @@ class ReferentRepair:
     #: * DUPLICATE-NAME REFUSAL — composed from ``AmbiguousEntityError``'s
     #:   STRUCTURED fields, a fact neither pass held until the write attempt.
     #:
-    #: On the ``'failed'`` arm it carries the exception text.
+    #: On the ``'failed'`` arm it carries the exception text, or, for a repair
+    #: deferred on a degraded target lookup, eta's sentence saying so.
     reason: str = ''
 
     def __post_init__(self) -> None:
@@ -2233,7 +2280,12 @@ class ReferentRepairStats:
 
     @property
     def failed(self) -> int:
-        """Findings whose repair was ATTEMPTED and did not complete."""
+        """Findings whose repair the backend thwarted; nothing was written.
+
+        Both populations — attempted and raised, or deferred on a degraded
+        target lookup — are defined by the ``'failed'`` bullet of
+        :data:`REFERENT_REPAIR_OUTCOMES`.
+        """
         return sum(1 for r in self.repairs if r.outcome == 'failed')
 
     @property
@@ -2288,11 +2340,11 @@ class MemoryService:
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
         self.recon_journal: ReconciliationJournal | None = None
-        # {project_id: project_root} registry snapshot (task 3088). Injected by
-        # set_known_projects at server startup — MemoryService is constructed
-        # before build_known_projects_map runs, so it cannot arrive by
-        # constructor. Used to resolve an escalation queue's filesystem root
-        # from the project_id update_memory carries.
+        # {project_id: project_root}, seeded below from DASHBOARD_KNOWN_PROJECT_ROOTS
+        # alone, never config.taskmaster.project_root (see the module docstring of
+        # middleware/mem0_update_storm_escalator.py); startup replaces it. The
+        # seed reaches EVERY `_known_projects` consumer, not only the storm
+        # alarm — see `set_known_projects`.
         self._known_projects: dict[str, str] = {}
         # INV-4 storm escape for update_memory's silent-rewrite primitive (task
         # 3088). Both are constructed UNCONDITIONALLY — never obtained from
@@ -2301,8 +2353,11 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
+        self._mem0_update_storm_counters: KeyedStormCounters[tuple[str, str]] = (
+            KeyedStormCounters()
+        )
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        self.set_known_projects(build_known_projects_map(primary_root=''))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
         # keyed per `agent_id` for the same attribution reason as the registry
         # above.
@@ -2446,13 +2501,13 @@ class MemoryService:
 
     @property
     def mem0_update_storm_tracked_agents(self) -> frozenset[str]:
-        """The ``agent_id`` labels holding an ``update_memory`` storm window.
+        """The ``agent_id`` labels holding an ``update_memory`` storm window in any project.
 
         ``agent_id`` is caller-supplied and unbounded, so evicting dormant
         agents is a real memory bound on a long-lived server and belongs in the
         interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
         """
-        return self._mem0_update_storm_counters.tracked_keys
+        return frozenset(agent for agent, _ in self._mem0_update_storm_counters.tracked_keys)
 
     @property
     def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
@@ -2492,13 +2547,24 @@ class MemoryService:
     def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
         """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
 
-        The same snapshot ``server/main.py`` builds with
-        ``build_known_projects_map`` and already hands to ``ReconciliationHarness``
-        and ``TicketJanitor``. Injected rather than derived so this stays pure
-        data with no lifetime coupling to any conditionally-constructed
-        component — the ``update_memory`` storm alarm must keep working with
-        reconciliation disabled, which is exactly the degraded configuration
-        where an unattended rewrite loop is least likely to be noticed.
+        The ONE injection point for the registry. ``__init__`` seeds it with
+        the ``DASHBOARD_KNOWN_PROJECT_ROOTS`` roots, and ``server/main.py``
+        replaces that seed with the full startup snapshot it builds with
+        ``build_known_projects_map`` and also hands to ``ReconciliationHarness``
+        and ``TicketJanitor``. Pure data with no lifetime coupling to any
+        conditionally-constructed component — the ``update_memory`` storm alarm
+        must keep working with reconciliation disabled, which is exactly the
+        degraded configuration where an unattended rewrite loop is least likely
+        to be noticed.
+
+        The seed deliberately widens EVERY ``_known_projects`` consumer, not
+        only the ``update_memory`` storm alarm. A never-wired service built with
+        ``DASHBOARD_KNOWN_PROJECT_ROOTS`` set already has active producer
+        referent narrowing, a resolvable dead-letter and entity-mint root and an
+        exact-match ``_project_id_from_queue_group_id`` arm. That holds for an
+        operator script that builds a ``MemoryService`` with no startup wiring
+        too, which therefore also pays the seed's path I/O and logs this
+        method's INFO line (and a WARNING per phantom root) at construction.
 
         Copied on entry so a later mutation of the caller's map cannot change
         resolution out from under an in-flight escalation.
@@ -2508,9 +2574,9 @@ class MemoryService:
         # project_root resolution actually happens.
         self._mem0_update_storm_escalator.set_known_projects(self._known_projects)
         # The PERMISSIVE arm is logged too, not only the populated one. An
-        # empty registry is a real window rather than a hypothetical: this
-        # service is constructed before `build_known_projects_map` runs (see
-        # `__init__`), and while it lasts every producer referent scan stays
+        # empty registry is a real window rather than a hypothetical: with
+        # DASHBOARD_KNOWN_PROJECT_ROOTS unset, the `__init__` seed is empty until
+        # startup wiring, and while it lasts every producer referent scan stays
         # permissive — junk qualifiers like 'localhost:6379' keep minting
         # referents — with nothing else in the log to say so. The remedy is the
         # same one the three existing `_known_projects`-miss messages already
@@ -2567,15 +2633,12 @@ class MemoryService:
 
         logger.info('MemoryService initialized')
 
-    async def _safe_close(
-        self, label: str, resource: Any, timeout: float | None = None
-    ) -> None:
+    async def _safe_close(self, label: str, resource: Any, timeout: float) -> None:
         """Close one resource, time-boxed and logging any failure without re-raising.
 
-        Each close is bounded by ``timeout`` (default: the module-level
-        ``_SUBCLOSE_TIMEOUT``, read at call time so it can be monkeypatched) so a
-        hung network-driver teardown can neither consume the whole shutdown budget
-        nor starve the durable-flush closes that run after it. The bound applies
+        Each close is bounded by ``timeout`` so a hung network-driver teardown
+        can neither consume the whole shutdown budget nor starve the
+        durable-flush closes that run after it. The bound applies
         UNIFORMLY to every resource, including the durable-flush SQLite closes
         (durable_queue/write_journal/event_buffer), not just the graphiti/mem0
         network drivers — see the cancel-branch comment below for why hard-bounding
@@ -2583,8 +2646,6 @@ class MemoryService:
         Both the timeout and the generic-failure paths swallow the error so close()
         continues through every resource.
         """
-        if timeout is None:
-            timeout = _SUBCLOSE_TIMEOUT
         start = time.monotonic()
         try:
             close_task = asyncio.ensure_future(resource.close())
@@ -2641,17 +2702,27 @@ class MemoryService:
                 time.monotonic() - start,
             )
 
+    def _bounded_closes(self) -> tuple[tuple[str, Any, float], ...]:
+        """Each sub-close close() runs, in order, with its time budget."""
+        return (
+            ('durable_queue', self.durable_queue, _SUBCLOSE_TIMEOUT),
+            ('graphiti', self.graphiti, _SUBCLOSE_TIMEOUT),
+            ('mem0', self.mem0, _SUBCLOSE_TIMEOUT),
+            ('write_journal', self._write_journal, _SUBCLOSE_TIMEOUT),
+            ('event_buffer', self._event_buffer, _SUBCLOSE_TIMEOUT),
+            ('planned_episode_registry', self.planned_episode_registry, _SUBCLOSE_TIMEOUT),
+            ('classifier', self.classifier, _POOL_RELEASE_TIMEOUT),
+            ('router', self.router, _POOL_RELEASE_TIMEOUT),
+        )
+
+    def close_budget_secs(self) -> float:
+        """Worst-case seconds close() can take: every sub-close's budget, summed."""
+        return sum(timeout for _, _, timeout in self._bounded_closes())
+
     async def close(self) -> None:
-        if self.durable_queue:
-            await self._safe_close('durable_queue', self.durable_queue)
-        await self._safe_close('graphiti', self.graphiti)
-        await self._safe_close('mem0', self.mem0)
-        if self._write_journal:
-            await self._safe_close('write_journal', self._write_journal)
-        if self._event_buffer:
-            await self._safe_close('event_buffer', self._event_buffer)
-        if self.planned_episode_registry:
-            await self._safe_close('planned_episode_registry', self.planned_episode_registry)
+        for label, resource, timeout in self._bounded_closes():
+            if resource is not None:
+                await self._safe_close(label, resource, timeout)
 
     # ------------------------------------------------------------------
     # Journal helper
@@ -2792,8 +2863,10 @@ class MemoryService:
         A BOUND METHOD for the same call-time-resolution reason
         ``_record_queue_terminal_outcome``'s docstring gives: ``server/main.py``
         calls ``initialize()`` (which constructs the queue) BEFORE
-        ``set_known_projects()``, so ``_known_projects`` is still empty when the
-        hook is wired and must be read at call time.
+        ``set_known_projects()``, so when the hook is wired ``_known_projects``
+        holds only the ``__init__`` seed (empty when
+        ``DASHBOARD_KNOWN_PROJECT_ROOTS`` is unset) and must be read at call
+        time to see the startup snapshot.
 
         PROJECT ROOT resolution has NO FALLBACK, exactly as in
         ``_record_entity_mint``. Falling back to
@@ -4151,13 +4224,14 @@ class MemoryService:
                         # is prerequisite to that narrowing.
                         #
                         # FAIL-CLOSED ON AN EMPTY REGISTRY, on purpose, matching
-                        # `ReferentFinding.resolvable` defaulting to False:
-                        # MemoryService is constructed before
-                        # `build_known_projects_map` runs, so `{}` is a real
+                        # `ReferentFinding.resolvable` defaulting to False: with
+                        # DASHBOARD_KNOWN_PROJECT_ROOTS unset, the `__init__`
+                        # seed is `{}` until startup wiring, so `{}` is a real
                         # window, and "permissive until populated" would leave
-                        # exactly that window open. The registry arrives via
-                        # `set_known_projects`, which is the injection point to
-                        # look at if this ever skips more than expected.
+                        # exactly that window open. Both the seed and the
+                        # startup snapshot arrive via `set_known_projects`,
+                        # which is the injection point to look at if this ever
+                        # skips more than expected.
                         #
                         # CONFINED TO THE MEMBERSHIP ARM. The pairing arm fires
                         # only when the endpoint IS declared, where the write
@@ -4485,11 +4559,12 @@ class MemoryService:
         THE THIRD OUTCOME IS REPORTED, NOT COLLAPSED. The two paragraphs above
         describe DELIBERATE collapses — absent and duplicate-name-group are one
         answer because eta treats them as one. A backend that would not answer
-        at all is a different thing entirely, and returning a bare ``None`` for
-        it made "could not look" indistinguishable from "not there" at the one
-        site eta reads (``minted=finding.new_endpoint_uuid is None``). Hence the
+        at all is a different thing entirely, and a bare ``None`` for it would
+        make "could not look" indistinguishable from "not there". Hence the
         pair: the uuid, and whether the lookup was DEGRADED. See
-        :attr:`ReferentFinding.uuid_lookup_degraded`.
+        :attr:`ReferentFinding.uuid_lookup_degraded`; eta defers a degraded
+        finding rather than resolving-or-minting off it
+        (:meth:`_repair_edge_findings`).
 
         Returns:
             ``(uuid_or_None, degraded)``. ``degraded`` is ``True`` only for the
@@ -4564,28 +4639,14 @@ class MemoryService:
           statements earlier. zeta's ``new_endpoint_uuid`` is demoted to what
           its own docstring already calls it: an audit convenience.
 
-        THE THREE PRE-WRITE GUARDS, in the order they are evaluated. Each
-        RECORDS the finding and moves on; none of them drops it, and none is
-        reachable after a write has begun:
+        THE PRE-WRITE GUARDS — which findings are recorded and left alone
+        rather than repaired, in what order, and under which outcome — are
+        listed once, in :meth:`_repair_edge_findings`, where they are
+        evaluated.
 
-        1. ZETA-UNRESOLVABLE — zeta determined no single target. Recorded with
-           zeta's own reason, verbatim: NEVER GUESS.
-        2. IMPLAUSIBLE TARGET — zeta determined one, from the whole-set
-           fallback, and it is not plausible
-           (:func:`_implausible_target_reason`). Refused BEFORE
-           ``ensure_entity_node``, so the phantom node is never minted.
-        3. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
-           nodes, and the backend raises rather than collapsing them.
-
-        Guards 1 and 2 are evaluated in :meth:`_repair_edge_findings` before the
-        write block; guard 3 is the backend's, surfaced as
-        ``AmbiguousEntityError`` and caught there. All three book
-        ``outcome='unrepairable'`` — the edge was left alone — which is what
-        keeps a refusal out of ``failed``, where a FalkorDB outage belongs.
-
-        WHY GUARD 3 IS A REFUSAL HERE AND A COLLAPSE ELSEWHERE. The >=2-match
-        ``merge_entities`` collapse remains licensed on exactly one path, the
-        episode-write dedup of the PRD's seam S1 (see
+        WHY A DUPLICATE-NAME GROUP IS REFUSED HERE AND COLLAPSED ELSEWHERE.
+        The >=2-match ``merge_entities`` collapse remains licensed on exactly
+        one path, the episode-write dedup of the PRD's seam S1 (see
         ``plans/fm-memory-identity-prd.md``, whose S1 scope amendment names this
         task) — and that path reaches ``_resolve_or_create_entity`` DIRECTLY,
         never ``ensure_entity_node``. A repair is not that path: collapsing two
@@ -4714,7 +4775,7 @@ class MemoryService:
         counters leaf iota samples and differences.
 
         THE PER-GROUP STREAK counts CONSECUTIVE EPISODES that needed a repair,
-        and its update rule is a three-way branch, not a two-way one:
+        and its update rule is a four-way branch, evaluated in this order:
 
         * ``repaired >= 1`` -> ``+1``, by exactly one however many endpoints
           moved. The streak's unit is the EPISODE; the per-episode repair count
@@ -4723,6 +4784,12 @@ class MemoryService:
           proportional would let a single wide episode breach the threshold on
           its own, which is precisely the "one bad write" case this alarm is
           not for.
+        * zero repairs and at least one ``'failed'`` record -> UNCHANGED, and
+          the key is not created. An infrastructure fault (a write the backend
+          refused, or a repair deferred on a degraded target lookup) is no
+          evidence either way: resetting on it would let a FalkorDB blip
+          mid-storm disarm the alarm, and incrementing on it would let an
+          outage page as a scanner regression.
         * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
           HEALTH SIGNAL: we looked at this episode's edge endpoints and none
           needed moving.
@@ -4752,7 +4819,7 @@ class MemoryService:
         Returns:
             The group's streak AFTER the increment, when this pass incremented
             it — i.e. the reading the storm gate thresholds. ``None`` on the
-            other two arms. Returning the value rather than having the caller
+            other three arms. Returning the value rather than having the caller
             re-read the dict is what keeps the gate from firing on a pass that
             merely LEFT a breached streak in place: an episode that checked
             nothing performs no repair, so it must not re-page an alarm it
@@ -4770,6 +4837,8 @@ class MemoryService:
             streak = self._referent_repair_streaks.get(group_id, 0) + 1
             self._referent_repair_streaks[group_id] = streak
             return streak
+        if repair_stats.failed:
+            return None
         if stats.endpoints_checked:
             self._referent_repair_streaks[group_id] = 0
         return None
@@ -5147,24 +5216,36 @@ class MemoryService:
         degenerate predicate reads as a gate on the whole edge rather than as
         another branch inside the per-finding loop.
 
-        THREE PRE-WRITE DISPOSITIONS, in order, all recording
-        ``outcome='unrepairable'`` and all refusing before anything is written:
+        FOUR PRE-WRITE DISPOSITIONS, in the order they are evaluated. Each
+        RECORDS the finding and moves on — none drops it — and all four stop
+        before anything is written:
 
         1. ZETA-UNRESOLVABLE — no target was determined at all. Carries zeta's
            own ``reason`` verbatim (NEVER GUESS, the structural default).
-        2. IMPLAUSIBLE TARGET — a target WAS determined, from the whole-set
-           fallback, and it is not one this pass may mint a node for. See
-           :func:`_implausible_target_reason`.
-        3. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
-           nodes, and collapsing them is not this path's act to make.
+        2. DEGRADED-LOOKUP DEFERRAL — a target WAS determined, but zeta's
+           lookup of its node was degraded
+           (:attr:`ReferentFinding.uuid_lookup_degraded`), so neither resolving
+           nor minting is grounded. Deferred BEFORE ``ensure_entity_node``.
+        3. IMPLAUSIBLE TARGET — a target WAS determined, from the whole-set
+           fallback, and it is not one this pass may mint a node for
+           (:func:`_implausible_target_reason`). Refused BEFORE
+           ``ensure_entity_node``, so the phantom node is never minted.
+        4. DUPLICATE-NAME REFUSAL — the target name resolves to two or more
+           nodes, and collapsing them is not this path's act to make. The
+           backend's guard: ``ensure_entity_node`` raises
+           ``AmbiguousEntityError`` and the write block's arm catches it.
 
-        They are distinguishable by ``reason``, which is the field that exists
-        to say why; the outcome vocabulary is deliberately not widened.
+        The three refusals (1, 3, 4) record ``outcome='unrepairable'`` — the
+        edge was left alone — and are distinguishable by ``reason``, which is
+        the field that exists to say why; the outcome vocabulary is
+        deliberately not widened. Disposition 2 records ``'failed'``: it is the
+        backend not answering, not a refusal, and keeping refusals out of
+        ``'failed'`` is what leaves that bucket meaning a FalkorDB outage.
 
         TWO GUARDS PER FINDING, NOT ONE, split at the commit point. The first
         wraps ``ensure_entity_node`` + ``reassign_edge`` — everything that can
         fail with NOTHING written — and its generic ``except`` records
-        ``'failed'``; disposition 3's ``AmbiguousEntityError`` is peeled off
+        ``'failed'``; disposition 4's ``AmbiguousEntityError`` is peeled off
         AHEAD of that one, because a refusal is not a fault (see the arm's own
         comment). The second guard wraps only the post-write summary backstop,
         whose failures cannot un-write the move that already landed and
@@ -5212,6 +5293,33 @@ class MemoryService:
                 ))
                 continue
 
+            if finding.uuid_lookup_degraded:
+                # DEFERRED, not resolved-or-minted off a lookup that could not
+                # look. Why this books 'failed': REFERENT_REPAIR_OUTCOMES'
+                # 'failed' bullet.
+                logger.warning(
+                    'Referent repair DEFERRED for edge %s (%s end): the lookup '
+                    'of target %r was degraded, so the edge is left unrepaired '
+                    'and recorded as failed: %s',
+                    finding.edge_uuid, finding.which_end, intended.node_name,
+                    finding.to_dict(),
+                )
+                repair_stats.repairs.append(ReferentRepair(
+                    edge_uuid=finding.edge_uuid,
+                    which_end=finding.which_end,
+                    outcome='failed',
+                    old_endpoint_uuid=finding.old_endpoint_uuid,
+                    check=finding.check,
+                    intended_referent=intended.node_name,
+                    reason=(
+                        f'the lookup of repair target {intended.node_name!r} '
+                        'was DEGRADED (the backend did not answer), so whether '
+                        'that node exists is unknown; the repair is deferred '
+                        'rather than resolving-or-minting off an incomplete read'
+                    ),
+                ))
+                continue
+
             if not finding.target_cited:
                 # TARGET PLAUSIBILITY, and it must refuse BEFORE the write
                 # below — that ordering is the whole user-observable signal.
@@ -5238,10 +5346,12 @@ class MemoryService:
                 # same site for `minted=` — so this is a second read of an
                 # existing dependency, not a new one, and it costs no round-trip
                 # inside the lock where every query serializes same-group
-                # writes. A stale `None` can only ever REFUSE: it covers absent,
-                # duplicate-name group AND a degraded lookup, and in all three
-                # cases the direction is fail-closed. (The duplicate-name case
-                # is refused twice over — guard (c) below would refuse it too.)
+                # writes. A stale `None` can only ever REFUSE: it covers absent
+                # and duplicate-name group, and in both cases the direction is
+                # fail-closed. (The duplicate-name case is refused twice over —
+                # the DUPLICATE-NAME REFUSAL below would refuse it too.) A
+                # degraded lookup never reaches here: it was deferred above, so
+                # this guard never reads an existence answer nobody could check.
                 # This is EVIDENCE, not the repair TARGET: the target still
                 # comes from `ensure_entity_node`'s return, so the standing
                 # objection to branching on `new_endpoint_uuid` — "a SECOND site
@@ -5422,12 +5532,11 @@ class MemoryService:
                 check=finding.check,
                 new_endpoint_uuid=target_uuid,
                 intended_referent=intended.node_name,
-                # zeta found no single pre-existing node keyed by this name
-                # moments earlier under this same lock, so ensure_entity_node
-                # took its mint-or-collapse path. The two are deliberately not
-                # distinguished here — zeta collapses them to one `None` on
-                # purpose, and telling them apart would cost a second query
-                # inside the identity lock to sharpen a telemetry count.
+                # zeta found no pre-existing node keyed by this name moments
+                # earlier under this same lock, so ensure_entity_node minted.
+                # A degraded lookup was deferred above and never reaches here,
+                # and a duplicate-name group raised AmbiguousEntityError before
+                # this record was built, so `None` here means only "absent".
                 minted=finding.new_endpoint_uuid is None,
                 moved=moved,
                 summaries_refreshed=refreshed,
@@ -5863,7 +5972,8 @@ class MemoryService:
 
         ``'streaks'`` IS A GAUGE, NOT A COUNTER, and the only entry here that
         can go DOWN: group_id -> consecutive episodes whose repair pass moved
-        something, cleared by a pass that looked and found nothing. It is the
+        something, cleared by a pass that looked and found nothing (a pass
+        whose repairs the backend thwarted clears nothing). It is the
         value the storm gate thresholds, exposed so an operator can see how
         close a project is to the alarm rather than only learning at the breach.
         A group appears only once a pass has produced evidence about it, so an
@@ -6662,16 +6772,14 @@ class MemoryService:
         make, and needs a second counting site — it is not a thing this method
         can fix by moving one call.
 
-        The tool-boundary ``entities_gate`` is category-INDEPENDENT and does
-        run on this path (pinned by
-        ``tests/server/test_entities_gate_ingestion.py::...
-        test_the_gate_is_category_independent``), so a CONFLICTING declaration
-        on a Mem0-primary write is still rejected even though an agreeing one
-        would have been inert. That asymmetry is intended: the gate polices
-        whether the caller's stated referents match its own prose, which is a
-        fact about the caller and not about routing. It costs nothing an
-        undeclaring caller pays — absence is never rejected, so an agent that
-        omits ``entities`` (``/reflect`` as shipped) cannot lose a write here.
+        The tool-boundary ``entities_gate`` shape-checks every declaration but
+        conflict-checks only one that will be RECORDED: an explicit
+        Mem0-primary category without ``dual_write`` discards the declaration
+        here, so a conflict verdict could only cost a false rejection (pinned
+        by
+        ``tests/server/test_entities_gate_ingestion.py::TestAddMemoryEntitiesGate::test_a_mem0_primary_write_is_never_conflict_rejected``).
+        Both sides read :func:`~fused_memory.models.enums.routes_to_graphiti`,
+        so they cannot disagree about which writes record it.
 
         Deliberately UNVALIDATED here: gamma's ``_declared_referents`` owns the
         TOTAL ``InputValidationError`` contract, and a direct service caller
@@ -6734,13 +6842,10 @@ class MemoryService:
         #   what makes this cover Graphiti-primary writes, which never reach
         #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
         #
-        # `write_mem0` is HOISTED above the call (task 3508) so ONE expression
+        # `write_mem0` is HOISTED above the call (task 3508) so ONE value
         # answers both "does this write go to Mem0" and the seam's
-        # `reaches_mem0`. Never restate it: a copy that forgot `dual_write`
-        # would refuse valid canonical writes that do land in Mem0.
-        write_mem0 = (
-            resolved_category in MEM0_PRIMARY or dual_write
-        )
+        # `reaches_mem0`.
+        write_mem0 = routes_to_mem0(resolved_category, dual_write=dual_write)
 
         await _apply_memory_metadata_validation(
             meta,
@@ -6758,9 +6863,7 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        write_graphiti = (
-            resolved_category in GRAPHITI_PRIMARY or dual_write
-        )
+        write_graphiti = routes_to_graphiti(resolved_category, dual_write=dual_write)
         # `write_mem0` is computed above, hoisted to feed the validation
         # seam's `reaches_mem0`. See the comment at that call site.
 
@@ -7895,17 +7998,18 @@ class MemoryService:
 
         results = []
         for edge in edges:
-            fact = getattr(edge, 'fact', str(edge))
-            valid_at = getattr(edge, 'valid_at', None)
-            invalid_at = getattr(edge, 'invalid_at', None)
-
             # Skip superseded edges (invalid_at set means the fact has been
             # replaced by a newer edge).  Check this before anything else to
-            # avoid unnecessary work on edges that will be discarded.
-            if invalid_at is not None:
+            # avoid unnecessary work on edges that will be discarded, and so a
+            # dropped edge consumes no rank.
+            if _edge_is_retired(edge):
                 continue
 
-            temporal = _serialize_temporal(valid_at, invalid_at)
+            fact = getattr(edge, 'fact', str(edge))
+            temporal = _serialize_temporal(
+                getattr(edge, 'valid_at', None),
+                getattr(edge, 'invalid_at', None),
+            )
 
             # Extract entity names from source/target nodes
             entities = []
@@ -8077,11 +8181,12 @@ class MemoryService:
         search() call. The exact-match branch does NOT use edge_limit: its
         get_valid_edges_for_node traversal returns every valid edge for the
         resolved node uuid(s), uncapped. Both branches exclude invalidated
-        edges (invalid_at set): the exact branch at the Cypher level (WHERE
-        e.invalid_at IS NULL), and the fuzzy branch via an explicit
-        invalid_at filter applied to the search() results, mirroring
-        search()'s own drop (task 312) — so neither branch surfaces
-        superseded facts (task 2726).
+        edges (invalid_at set): the exact branch at the Cypher level
+        (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE), and the fuzzy
+        branch via `_edge_is_retired` applied to the search() results,
+        mirroring search()'s own drop (task 312) — so neither branch surfaces
+        superseded facts (task 2726). Neither filters on `expired_at`: a
+        restored edge keeps it (task 4714).
 
         EXACT vs. FUZZY edge sets are fundamentally different — TOPOLOGICAL
         vs. SEMANTIC — and comparing them across branches will produce
@@ -8201,10 +8306,10 @@ class MemoryService:
         node_data = [_node_to_dict(n) for n in nodes]
         # Drop superseded edges (invalid_at set) so the fuzzy/semantic branch
         # presents the same valid-edge semantics as the exact/topological branch
-        # (get_valid_edges_for_node's Cypher WHERE invalid_at IS NULL) and as
-        # search() (task 312, ~line 2588) — otherwise an agent resolving via the
-        # fuzzy fallback could silently act on a stale fact (task 2726).
-        edge_data = [_edge_to_dict(e) for e in edges if getattr(e, 'invalid_at', None) is None]
+        # (get_valid_edges_for_node's Cypher _ACTIVE_EDGE_PREDICATE) and as
+        # search() (task 312) — otherwise an agent resolving via the fuzzy
+        # fallback could silently act on a stale fact (task 2726).
+        edge_data = [_edge_to_dict(e) for e in edges if not _edge_is_retired(e)]
 
         return {'nodes': node_data, 'edges': edge_data}
 
@@ -8611,24 +8716,43 @@ class MemoryService:
             return None
         if record is None:
             return None
+        return _decode_mem0_tombstone(record)
+
+    async def find_mem0_deletion_tombstones(
+        self, project_id: str, prefix: str
+    ) -> list[dict] | None:
+        """Every readable tombstone whose memory id starts with *prefix*, or ``None``.
+
+        Feeds the uuid-prefix miss report (PRD C4, task 5323): the tombstone
+        store is keyed by the full id, so a prefix needs a listing, read in
+        one query. Each row decodes exactly as :meth:`get_mem0_deletion_tombstone`
+        decodes it, tagged with its ``memory_id``.
+
+        ``None`` means the tombstone store could not be read: no ledger is
+        wired, or the listing raised (one WARNING). It is never ``[]``, which a
+        reader would take for "nothing with this prefix was reaped" (INV-11).
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return None
         try:
-            payload = json.loads(record.payload_json)
-        except (TypeError, ValueError):
-            payload = None
-        if not isinstance(payload, dict):
+            records = await ledger.mem0_tombstones_with_prefix(project_id, prefix)
+        except Exception:
             logger.warning(
-                'get_mem0_deletion_tombstone: unreadable tombstone payload for '
-                'memory_id=%s in project=%s; reporting no tombstone',
-                memory_id,
+                'find_mem0_deletion_tombstones: tombstone store listing FAILED for '
+                'prefix=%s in project=%s; reporting tombstones unchecked',
+                prefix,
                 project_id,
-                extra={'project_id': project_id, 'memory_id': memory_id},
+                exc_info=True,
+                extra={'project_id': project_id, 'prefix': prefix},
             )
             return None
-        return {
-            **payload,
-            'tombstone_created_at': record.created_at,
-            'tombstone_expires_at': record.expires_at,
-        }
+        found: list[dict] = []
+        for record in records:
+            decoded = _decode_mem0_tombstone(record)
+            if decoded is not None:
+                found.append({'memory_id': record.task_id, **decoded})
+        return found
 
     # ------------------------------------------------------------------
     # Read: cycle_summary ledger presence (task 2436, τ1)
@@ -9413,10 +9537,15 @@ class MemoryService:
         cheap to correct; counting patches would drown the signal that a silent
         content-rewrite loop is running.
 
-        One counter per ``agent_id``, so two independently-busy agents cannot
-        sum into a false alarm. The threshold and window are read LIVE off the
-        shared config and passed into ``record()`` per call — captured once,
-        they would make both green-tier leaves restart-only in disguise.
+        One counter per ``(agent_id, project_id)``. Two independently-busy
+        agents cannot sum into a false alarm, and one agent's amendments in
+        another project cannot inflate the count filed into this project's
+        queue, so the number is reproducible from this project's own journal
+        rows. Recon stage ids (``recon-stage-<stage>``) are project-independent,
+        which is why the project is part of the key. The threshold and window
+        are read LIVE off the shared config and passed into ``record()`` per
+        call — captured once, they would make both green-tier leaves
+        restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
         cfg = getattr(self.config, 'mem0_update', None)
@@ -9428,7 +9557,7 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._mem0_update_storm_counters.record(
-            label,
+            (label, project_id),
             threshold=threshold,
             window_seconds=float(window_seconds),
             label=label,

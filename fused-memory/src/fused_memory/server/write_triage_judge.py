@@ -66,7 +66,7 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
-from fused_memory.utils.clip_disclosure import TruncationFact
+from fused_memory.utils.clip_disclosure import TruncationFact, clip_text
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
@@ -350,11 +350,11 @@ JUDGE_PROMPT_CHAR_BUDGET = 27_000
 
 
 def _elide(text: object, field_chars: int) -> str:
-    """*text* as a string, bounded by *field_chars* and marked if cut."""
-    body = text if isinstance(text, str) else str(text or '')
-    if len(body) <= field_chars:
-        return body
-    return body[:field_chars] + _ELIDED_MARKER
+    """*text* cut to *field_chars* by clip_text, marked with the judge's own ``_ELIDED_MARKER``."""
+    clip = clip_text(text, field_chars, field='judge_field')
+    if clip.fact is None:
+        return clip.text
+    return clip.text + _ELIDED_MARKER
 
 
 class JudgePromptElisions(NamedTuple):

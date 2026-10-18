@@ -16,7 +16,7 @@ This module reuses the bare-worker git_repo/git_config/git_ops fixtures and
 _setup_repo from test_merge_queue_resource_audit.py (per-file duplication
 convention — see that module's docstring), along with its
 _mkdir_worktree/_GRACE/_NOW age-test helper pattern. It imports
-orchestrator.merge_queue LOCALLY inside each test so a not-yet-implemented
+orchestrator.merge_lane.worker LOCALLY inside each test so a not-yet-implemented
 symbol never breaks collection of the rest of the file during the RED steps.
 
 Unlike test_merge_queue_resource_audit.py's pure-sync worktree_ledger_violations
@@ -139,9 +139,10 @@ async def _wait_until(predicate, *, what: str, timeout: float = 10.0) -> None:
     """Poll *predicate* until true, or fail after *timeout* REAL seconds.
 
     A running worker drives its loops off the injected clock, whose sleep()
-    advances fake time instead of waiting, so the observable being waited for
-    normally lands within a few event-loop iterations. The wall-clock
-    deadline is only a backstop against a wedged loop.
+    charges the full period while waiting at most ``FakeClock.sleep_cap`` of
+    real time, so the observable being waited for normally lands within a
+    few such polls. The
+    wall-clock deadline is only a backstop against a wedged loop.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -181,7 +182,7 @@ class TestReapOrphanedMergeWorktreesCore:
     """
 
     async def test_aged_orphan_reaped_and_ledger_clears(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -204,7 +205,7 @@ class TestReapOrphanedMergeWorktreesCore:
         assert worker.snapshot()['resource_audit']['worktree_ledger'] == []
 
     async def test_fresh_orphan_within_grace_not_reaped(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -241,7 +242,7 @@ class TestReapOrphanedMergeWorktreesPreservation:
     async def test_sweep_reaps_only_the_genuine_orphan(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -307,7 +308,7 @@ class TestReapOrphanedMergeWorktreesReadoption:
     async def test_recovered_branch_readopts_its_aged_worktree(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -359,7 +360,7 @@ class TestReapOrphanedMergeWorktreesFailOpen:
     async def test_missing_worktree_base_returns_empty_report_without_raising(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         assert not git_ops.worktree_base.exists()
@@ -371,7 +372,7 @@ class TestReapOrphanedMergeWorktreesFailOpen:
     async def test_cleanup_failure_for_one_path_does_not_abort_the_sweep(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -402,7 +403,7 @@ class TestReapOrphanedMergeWorktreesFailOpen:
     async def test_find_inflight_failure_for_one_branch_does_not_abort_the_sweep(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -441,7 +442,7 @@ class TestReapOrphanedMergeWorktreesFailOpen:
         if os.geteuid() == 0:
             pytest.skip('root bypasses directory permissions: the scan cannot be failed')
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -507,7 +508,7 @@ class TestReapShape1InterruptedTeardown:
     ) -> None:
         import shutil
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
@@ -563,7 +564,7 @@ class TestPeriodicReapHelper:
     async def test_first_call_reaps_orphan_preserves_owned(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # _last_reap_at is seeded from the injected clock at construction, so
         # a clock at 0.0 is what makes "a sweep is due" deterministic against
@@ -610,7 +611,7 @@ class TestPeriodicReapHelper:
         )
 
     async def test_reap_is_rate_limited_by_interval(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # See test_first_call_reaps_orphan_preserves_owned for the clock
         # seed: at 0.0 the first call below is due against this test's _NOW.
@@ -671,7 +672,7 @@ class TestPeriodicReapHelper:
         since _NOW is far past any interval.  The second poll is placed an
         hour out, comfortably past the shipped 300s interval, so it fires.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), clock=FakeClock(time=_NOW),
@@ -712,8 +713,9 @@ class TestHeartbeatLoopReapWiring:
     ``run()``/``stop()`` pair with a ``FakeClock`` injected, because the
     loop measures BOTH its poll period (``_HEARTBEAT_POLL_S``) and the
     reap's rate limit against ``self._clock``: a clock whose ``sleep()``
-    advances time instead of waiting makes a 30s poll and a 300s reap
-    interval elapse immediately, so neither needs shrinking.
+    charges the full period while waiting at most ``FakeClock.sleep_cap`` of
+    real time makes a 30s poll and a 300s reap interval elapse in a few such
+    waits, so neither needs shrinking.
 
     test_running_worker_reaps_an_aged_orphan: RED until step-6 GREEN wires
     ``await self._maybe_reap_orphaned_merge_worktrees(self._clock.now())``
@@ -734,7 +736,7 @@ class TestHeartbeatLoopReapWiring:
         heartbeat poll — so this pins the wiring end to end rather than
         pinning that a substituted helper was called.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), clock=FakeClock(time=_NOW),
@@ -770,7 +772,7 @@ class TestHeartbeatLoopReapWiring:
     async def test_heartbeat_loop_survives_raising_reap(
         self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), clock=FakeClock(time=_NOW),
@@ -815,7 +817,7 @@ class TestHeartbeatLoopReapWiring:
         stalling on the first hung sweep indefinitely (task 3018 amendment;
         reviewer_comprehensive robustness finding at merge_queue.py:10440).
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), clock=FakeClock(time=_NOW),
@@ -883,7 +885,7 @@ class TestHeartbeatLoopReapWiring:
         try-block (task 3018 amendment; reviewer_comprehensive test-coverage
         finding at test_merge_queue_orphan_reaper.py:592).
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), clock=FakeClock(time=_NOW),
@@ -994,7 +996,7 @@ class TestPeriodicReapDestructiveFloor:
         below that 2x ceiling, so it would not actually clear a slow cold
         verify.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         floor = SpeculativeMergeWorker.PERIODIC_REAP_MIN_AGE_SECS
         detection_grace = SpeculativeMergeWorker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
@@ -1022,7 +1024,7 @@ class TestPeriodicReapDestructiveFloor:
         self, git_ops: GitOps,
     ) -> None:
         """A tree in the detect-but-do-not-destroy band must NOT be reaped."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Clock at 0.0 seeds the reap clock there too, which is what makes
         # "a sweep is due" deterministic against _NOW — see
@@ -1060,7 +1062,7 @@ class TestPeriodicReapDestructiveFloor:
         It is simply not destroyed yet.  Raising the destruction floor must
         NOT have silently raised the detection threshold with it.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Clock at 0.0 seeds the reap clock there too, which is what makes
         # "a sweep is due" deterministic against _NOW — see
@@ -1084,7 +1086,7 @@ class TestPeriodicReapDestructiveFloor:
 
     async def test_tree_past_periodic_floor_is_reaped(self, git_ops: GitOps) -> None:
         """Past the destruction floor, the periodic sweep still reclaims."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Clock at 0.0 seeds the reap clock there too, which is what makes
         # "a sweep is due" deterministic against _NOW — see
@@ -1121,7 +1123,7 @@ class TestPeriodicReapDestructiveFloor:
         parameter defaults back to RESOURCE_AUDIT_WORKTREE_GRACE_SECS so that
         caller's behaviour is unchanged.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE

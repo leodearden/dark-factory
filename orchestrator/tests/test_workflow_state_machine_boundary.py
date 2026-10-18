@@ -93,9 +93,9 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.module_charter import derive_modules
-from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
+from orchestrator.scheduler import BlastRadiusResult, SetTaskStatusRejected, TaskAssignment
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -662,6 +662,48 @@ class TestStateMachineLegalityAndConsistency:
         assert outcome_allows_status(report.outcome, last_status)
         assert report.phase == workflow.machine.state
 
+    async def test_row6_rejected_merged_done_write_exits_blocked_on_a_blocked_row(
+        self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
+    ):
+        """Reify 7286: the merged-done write is refused after a clean merge.
+
+        The run must leave a 'blocked' row behind one L1 and report BLOCKED,
+        never a DONE over the claimed 'in-progress' row.
+        """
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
+        tid = workflow.task_id
+
+        async def _refuse_done(task_id, *, kind, sha, note=None):
+            raise SetTaskStatusRejected(
+                task_id=tid, error_code='pre_done_hook_rejected',
+                raw='pre-done hook exited rc 125',
+            )
+
+        monkeypatch.setattr(scheduler, 'mark_done', _refuse_done)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses[tid][-1] == 'blocked'
+        assert outcome_allows_status(report.outcome, 'blocked')
+        assert report.phase == workflow.machine.state == WorkflowState.BLOCKED
+        assert _exit_contract_records(caplog, 'violation') == []
+        l1s = queue.get_by_task(tid, status='pending', level=1)
+        assert len(l1s) == 1, [(e.level, e.category, e.summary) for e in l1s]
+        assert 'set_task_status(done) rejected' in l1s[0].summary
+
     async def test_row6_allaccountscapped_blocked_run_is_consistent(
         self, config, git_ops, task_assignment, monkeypatch,
     ):
@@ -688,6 +730,42 @@ class TestStateMachineLegalityAndConsistency:
         assert last_status == 'blocked'
         assert outcome_allows_status(report.outcome, last_status)
         assert report.phase == workflow.machine.state
+
+    async def test_row6_exit_while_an_action_teardown_owns_the_row_is_unjudged(
+        self, config, git_ops, task_assignment, monkeypatch, caplog,
+    ):
+        """A Table-B restart tears the slot down mid-run: the harness writes
+        'pending' and absorbs this workflow's own 'blocked' write.  The row is
+        the teardown's, so the outcome<->status half goes unjudged — the same
+        carve-out as eval mode and a hard cancel."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        tid = workflow.task_id
+
+        async def raise_cap_exc(*args, **kwargs):
+            scheduler.blocked_write_suppressed_ids.add(tid)
+            await scheduler.set_task_status(tid, 'pending')
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses[tid][-1] == 'pending'
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert _exit_contract_events(event_store) == []
 
     async def test_row6_warmlane_requeued_run_is_consistent(self, tmp_path: Path):
         """REQUEUED run (reuses test_workflow_warm_lane_requeue setup)."""
@@ -936,6 +1014,72 @@ class TestStateMachineLegalityAndConsistency:
         assert [
             esc.category for esc in queue.get_by_task(workflow.task_id, status='pending')
         ] == ['bypass_done']
+
+    @pytest.mark.parametrize('site', ['architect', 'simple'])
+    async def test_row6_plan_phase_exit_meeting_a_cancelled_row_ends_the_run(
+        self, config, git_ops, task_assignment, monkeypatch, caplog, site,
+    ):
+        """The task is cancelled while its planning agent runs, so the agent's
+        unactionable_task exit meets a cancelled row and reports CANCELLED.
+
+        Neither dispatch site may read CANCELLED as "keep going": the plan
+        site must not fall through toward EXECUTE, and the simple-task site
+        must not mistake it for its REQUEUED fall-through sentinel and head
+        for an architect.  Either move leaves the absorbing CANCELLED state,
+        which crashes the run.
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        if site == 'simple':
+            task_assignment = replace(task_assignment, task={
+                **task_assignment.task, 'metadata': {'complexity': 'simple'},
+            })
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, AgentStub(),
+        )
+        record_write = scheduler.set_task_status
+
+        async def _cancelled_row_refuses_the_park(
+            task_id: str, status: str, **kwargs,
+        ):
+            if status != 'blocked':
+                await record_write(task_id, status, **kwargs)
+                return
+            await record_write(task_id, 'cancelled')
+            raise TerminalExitRejection(
+                task_id, old_status='cancelled', target_status=status,
+                raw='terminal-exit gate',
+            )
+
+        dispatched: list[Path] = []
+
+        async def _agent_reports_unactionable(*, cwd: Path, **kwargs) -> AgentResult:
+            dispatched.append(cwd)
+            TaskArtifacts(
+                cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name),
+            ).write_unactionable_task(reason='the spec contradicts itself', evidence='ev')
+            return AgentResult(success=True, output='', cost_usd=0.5)
+
+        monkeypatch.setattr(scheduler, 'set_task_status', _cancelled_row_refuses_the_park)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', _agent_reports_unactionable)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+        caplog.set_level(logging.ERROR, logger='orchestrator.workflow')
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert report.phase == workflow.machine.state == WorkflowState.CANCELLED
+        assert scheduler.statuses[workflow.task_id][-1] == 'cancelled'
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.workflow' and r.levelno >= logging.ERROR
+        ] == []
+        assert len(dispatched) == 1, 'only the reporting agent may be paid for'
 
     async def test_row6_none_status_does_not_crash_normal_run(
         self, config, git_ops, task_assignment, monkeypatch,

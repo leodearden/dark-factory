@@ -11,7 +11,7 @@ The seam lives in a dedicated module so that reify (task κ, external dep
 dark_factory:1888) can import only this module — without pulling in the 11 k-line
 merge_queue.py and its heavy git/verify dependency tree.
 
-Public surface (also re-exported from orchestrator.merge_queue for in-subsystem
+Public surface (also re-exported from orchestrator.merge_lane.worker for in-subsystem
 consumers):
   Footprint
   OverlapFootprintDetector

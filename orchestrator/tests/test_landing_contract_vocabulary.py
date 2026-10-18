@@ -20,8 +20,8 @@ import enum
 
 import pytest
 
-from orchestrator import landing_evidence
-from orchestrator.landing_evidence import (
+from orchestrator.merge_lane import landing_evidence
+from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     LandingMethod,
     LandingReason,

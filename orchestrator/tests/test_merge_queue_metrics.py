@@ -40,8 +40,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.ports import VerifyPort
-from orchestrator.merge_queue import MergeMetrics, MergeRequest
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeMetrics, MergeRequest
 
 _STOP_TIMEOUT = 30.0
 

@@ -19,7 +19,9 @@ was added 2026-09-18 from the exception-register PRD's own incident
 evidence (`plans/inv12-exceptions-owned-or-ratified-prd.md`); INV-13 was
 added 2026-09-25 from the two-empty-ledgers investigation — four
 never-written ledgers, each with a live reader rendering emptiness as
-healthy (tasks 3790, 4863, 4718, 5890). They gate `/prd`
+healthy (tasks 3790, 4863, 4718, 5890); INV-14 was added 2026-10-12 from
+the `/review-all` sampler-vocabulary finding (`fk-e86a10b9e217`, task
+6773). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -404,9 +406,7 @@ deliberate permanent ruling rather than debt. No entry may be neither.
 Inline suppressions are in scope, under their own register and ratchet.
 Entries predating the register's seeding may carry no disposition, but their
 count may only fall, never rise; every entry added or touched after it
-carries one. The ratification table lands with the mechanism (House pattern,
-step γ2) and is not in the tree yet, so `Debt(owner)` is today's only
-available disposition.
+carries one.
 
 **Checkable design question(s)**: Does this feature add or touch an
 allow-list, registry, or inline suppression whose entries silence a
@@ -438,7 +438,15 @@ and entries remain.
 **House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
 disposition vocabulary, the ratification table, the inline-marker grammar,
 the multiset ratchet kernel, the exception register and the owner-liveness
-sweep. Re-point this at the landed paths once the mechanism lands.
+sweep. The landed mechanism is `shared/src/shared/governed_exceptions.py`
+(the disposition vocabulary and the inline-marker grammar),
+`shared/src/shared/ratchet.py` (the multiset ratchet kernel),
+`scripts/exception_register.py` (the exception register and the
+ratification-table loader), `scripts/inline_suppressions.py` (the
+inline-suppression gate and ratchet) and
+`docs/legibility/exception-ratifications.yaml` (the ratification table). The
+owner-liveness sweep (PRD step η) has not landed yet; the PRD is its only
+reference.
 
 **Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
 adjacent — both ask who owns a thing and what notices when the owner is
@@ -502,6 +510,40 @@ proof is the fixture-seeded row, a guard-shaped mistake made by a reader. A
 walker facing a swallowed exception checks INV-11; facing a test of a check,
 INV-10; facing a report, gate or counter over a store, INV-13.
 
+## INV-14 `sampler-vocabulary-one-table`
+
+**Rule**: The load sampler's metric vocabulary has one declaring table,
+`sampler.metrics.METRIC_GROUPS`. The emitted names, the per-group admission
+sets, the gate-arm table, the calibration selectors and the dashboard's
+served metrics are projections computed from it. No other Python module
+spells a metric name, and a parity test between two spellings is not
+compliance. One known second spelling remains outside the guard's scope: the
+Host load card's presentation list (`METRICS` in
+`dashboard/src/dashboard/static/redux/tab_overview.jsx`), which renders only
+the names it lists; a served metric missing from it is not displayed.
+
+**Checkable design question(s)**: Does this feature add, rename or read a
+load-sampler metric, an admission rule, an arm-to-metric mapping, or a
+dashboard-served metric? Is it a projection of `METRIC_GROUPS`, or a new
+spelling that something must reconcile?
+
+**Evidence**: at `6551b75aba` the vocabulary had five homes and four
+reconciler tests, and the dashboard dropped unknown names silently
+(`fk-e86a10b9e217`, run `review-all-dark_factory-20261008`).
+
+**House pattern**: `sampler/src/sampler/metrics.py::METRIC_GROUPS`, with
+`arm_metrics`, `exact_metric_names` and `TICK_CLOCK` as its projections and
+`sampler/src/sampler/sampler.py::run_tick` admitting each group against its
+own entry; the guard `sampler/tests/test_vocabulary_one_table.py` drives a
+spec added to an injected table through every projection and AST-scans the
+consumers for a metric name spelled outside the table.
+
+**Family boundary**: INV-5 `no-lockstep-duplication` governs duplicated
+logic in general and accepts a drift test as a house pattern; this
+invariant governs one named vocabulary and rejects the drift test as its
+enforcement. INV-9 `one-fact-one-home` governs world-facts written to
+records; this governs a code vocabulary.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
@@ -523,4 +565,5 @@ INV-9 fixtures added 2026-08-24; INV-10 fixtures added 2026-08-30;
 INV-11 fixtures added with the `no-silent-fail-soft` promotion; INV-12
 fixtures added 2026-09-18 with the `exceptions-owned-or-ratified`
 invariant; INV-13 fixtures added 2026-09-25 with the
-`readers-prove-their-producer` invariant).
+`readers-prove-their-producer` invariant; INV-14 fixtures added 2026-10-12
+with the `sampler-vocabulary-one-table` invariant).

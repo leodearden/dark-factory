@@ -190,7 +190,11 @@ It is strictly read-only: it opens no debt, files no task, resolves
 nothing and escalates nothing. It will not create a ledger DB for a
 project that has none, and it will not add the flake tables to a
 `runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
-and exits 0 instead.
+and exits 0 instead. On a ledger that predates the due list, its first read adds that one empty table, as every ledger entry point does.
+
+**The due list and `filing pending`.** A suppressed test no longer gets its de-flake task during the merge. The merge writes the test's occurrence row and one item on the ledger's due list (`flake_debt_due`, in the same `runs.db`) in one local transaction, and the orchestrator's `flake-debt-drain` background service files the owner afterwards, every 30 seconds, through the same `open_debt` rule as before. Until that filing completes, an open debt row with no owner and an item on the due list reads `filing pending since <time>` (its oldest item's enqueue time): expected, and normally gone within a minute. An ownerless row with no item still reads `*** NO OWNER (invariant breach) ***`. The `due list:` line gives the list's size and the age of its oldest item, and says `PAST THE 30-MINUTE BOUND` once that item has waited longer. A failed filing is retried after 5 minutes, then 10, 20, 40, and hourly after that; nothing is dropped, and nothing caps how many de-flake tasks a burst files. A suppression at a merge sha that does not contain a finished de-flake task's fix closes that task's cycle without a regression escalation.
+
+**The drain's escalation.** When any item has waited on the due list for more than 30 minutes, the drain opens one level-1 `infra_issue` escalation (task id `__flake_debt_due_stale__`, role `orchestrator-flake-debt-drain`) naming how many items are stale, the oldest, its test and its last error, amends it as that changes, and resolves it itself once no item is stale. The usual cause is fused-memory being unreachable (`last_error` reads `task_client_failed`): restore fused-memory and the drain catches up on its own; nothing needs re-filing. A `no_owner` that persists means the task store refused the filing (the orchestrator log carries its reply), which the drain cannot cure: escalate to the operator, since `orchestrator flake-ledger` is read-only and cannot set an owner. `ancestry_unreadable` means the drain could not tell whether the observation's merge sha contains the finished de-flake task's fix (`git merge-base --is-ancestor` failed, for example because the sha is gone); `owner_deferred` means a filed task has not left `deferred`. If you resolve the escalation while items are still stale, the drain does not re-open it for those items; it opens a new one only for items that become stale later.
 
 **Read the header line before the counters.** A report only measures
 anything when the ledger was actually readable. If the header says
@@ -201,6 +205,71 @@ a broken or absent ledger to go fix, not a clean bill of health. A
 `WARNING: … TRUNCATED` line means the opposite problem: the window held
 more occurrences than one read returns, so the counters cover a partial
 window.
+
+### The offline lane's red path
+
+What the offline lane does with a red test, from the pass that sees it to
+the fix task and its escalation, is specified in
+`plans/offline-lane-red-path-prd.md`; this subsection is only where to look.
+
+**Where a pass is recorded.** Every pass writes
+`data/orchestrator/offline-lane/<command-slug>/<YYYYmmddTHHMMSS-head6>/record.json`
+(the slug is the command name lower-cased with runs of other characters
+turned into `-`; the legacy legs use `legacy_numeric` and `legacy_infra`),
+next to the per-phase `detect.log`, `confirm.log` and `*.junit.xml`.
+`record.json` names the command, leg, head, pass id, the `detect` and
+`confirm` run blocks (`null` for a phase that did not run), the `outcome`,
+and `effect`: `tests_counted`, `episodes_started`,
+`episodes_extended`, `episodes_ended`, `threshold_reached`, `stale_heads`,
+`no_decision`, `tasks_filed` and `escalations_raised`. `effect` is `null` while
+a pass is still running, and stays `null` if the pass was cut short (it is
+written after the engine observes).
+
+**Where a held red is remembered.** `data/orchestrator/guards/offline_lane_episodes.json`
+holds one record per command, with one `episodes[]` element per failing
+test. A red held at 1 of 2 looks like an element with one entry in
+`counted_passes`, `covering_task_id: null`, `filed_at: null` and
+`ended_at: null`. Once the test has been reproduced on enough counted
+passes, the same element has `covering_task_id` and `filed_at` set; a
+cleared test gets `ended_at`. A filing that could not be made is kept as
+`filing_due: true` (with `filing_failure`) and retried at the start of every
+pass as well as on the poll tick.
+
+**The three knobs**, all under `git:` and all hot-reloadable with
+`mcp__escalation__reload_config` (read `applied` in the reply):
+
+- `git.offline_lane_persist_passes` (2): spaced counted passes a test must be
+  reproduced on before one fix task is filed for it. `1` restores filing on
+  the first reproduced pass.
+- `git.offline_lane_recheck_secs` (1800): the least spacing between two counted
+  passes, and how long a held red waits before the lane re-runs the command
+  (that recheck applies to generic commands only; the legacy numeric and infra
+  legs do not recheck); also how long a filing may stay due before it is
+  escalated.
+- `git.offline_lane_red_unlanded_hours` (24): how long a held episode may go
+  unextended before it expires, and how long after a fix task was filed a
+  still-red test counts as unlanded.
+
+**Escalations.** The lane files them as role `orchestrator-offline-lane`,
+level 1, against a per-command sentinel task id `__offline_lane__<command-slug>`
+(look them up with `mcp__escalation__get_task_escalations`). Category
+`dependency_discovered` means a fix task has not landed its fix
+`red_unlanded_hours` after it was filed; the detail names the task, its live
+status and the record directories. Category `infra_issue` is one of three records the lane keeps for itself.
+The stuck-write record means a fix-task filing has stayed due for
+`recheck_secs` and every retry failed; the detail carries the reason. The lane
+resolves that record itself once no filing is due. The outage and broken-probe
+records are described under *Outages* below.
+
+**Retention.** Pass directories older than 14 days are pruned, except those an
+episode (live or ended) still counts. Entries in the episode store expire
+after 14 days without a write.
+
+#### Outages and the flake ledger
+
+**Outages.** A command may declare `outage_probe`; dark-factory's `qdrant-integration` runs `python scripts/lane_dependency_probe.py` in `fused-memory/`. After a red detection run the lane runs the probe once, at normal priority, bounded by `outage_probe_timeout_secs` (180). If it exits 0 the red goes on to the confirm as usual. If it exits 75 with a first stdout line `<dependency>: <reason>`, the pass is an outage: no confirm, no fix task and no ledger row, and each held episode gets `had_outage_pass: true`. The lane then opens one `infra_issue` level-1 escalation on the command's sentinel, naming the dependency and the pass directory, and amends it only when the probe's answer changes. While the command's `last_probe_result` reads `outage`, the lane re-runs the probe alone every `recheck_secs` on its idle poll, and held reds are not rechecked. When the probe exits 0, the lane resolves its own record and any level-2 whose only member it is (a level-2 with other members is amended instead), then runs the command again. The lane also closes the outage record when the probe turns broken, or when the probe or the command is removed or disabled. You do not need to close it. If you resolve it while the dependency is still down, the lane opens nothing until the next red pass whose probe fails. Any other probe result is a broken probe: another exit code, 75 with no line, a crash, or the timeout. The red is then handled as if no probe were declared, and a second `infra_issue` record says the probe is broken until a probe next exits 0, or 75 with a name. To run the probe by hand: `cd fused-memory && python scripts/lane_dependency_probe.py; echo $?`. Name dependencies (`qdrant falkordb embedder chat-model`) to check only those. Exit 75 means "this dependency is not usable", and the printed line names it. Any other non-zero exit is a defect in the probe. The command's record in `offline_lane_episodes.json` carries `last_probe_result` (the probe object), `last_probe_at`, `outage_escalation_id` and `probe_broken_escalation_id`.
+
+Appended by later leaves of plans/offline-lane-red-path-prd.md.
 
 ### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
 
@@ -236,6 +305,102 @@ Retention is one policy for the whole tree: `.log`, `.json` and `.gz` are
 deleted past 30 days, then oldest-first until the tree is under 500MB
 (`verify.py::_prune_archive`). `flaky-ledger.jsonl` sits one level up, in
 `data/verify-logs/` itself, and is deliberately outside that sweep.
+
+### Reading a task-verify admission wait
+
+Before a gated verify leg (role `task`, a task's own verify, or role
+`background`, the main-tip sweep and the review checkpoint) takes its
+cross-process flock slot in `shared.verify_admission`, it queues in an
+in-process admission gate (`orchestrator/src/orchestrator/verify_admission_gate.py`).
+The gate decides whose turn it is. The flock stays behind it as the
+cross-process safety net. Merge verifies are ungated and touch neither. Design
+and contract: `plans/verify-admission-fifo-prd.md`.
+
+**The knobs.** All three are green-tier through `reload_config`:
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `verify_admission_order` | `unordered` | `unordered`: the turn goes to a random waiter, as the flock's poll race did before the gate. `arrival`: the lowest (role class, plan arrival, leg sequence), so task legs go before background legs. A verify call's legs, retries included, share one arrival stamp. |
+| `verify_admission_background_promote_secs` | `7200` | A background waiter queued this long ranks with the task class but keeps its original arrival: it never overtakes a task that arrived before it, and later tasks stop overtaking it. |
+| `verify_admission_wait_alarm_secs` | `43200` | The waiter age that raises `verify_admission_wait_aged`. |
+
+The order and the slot count (`verify_admission_task_slots`) apply from the
+next grant, the promotion age from the next ranking, and the alarm age from the
+next watch tick.
+
+**The events.** They are written to `<project_root>/data/orchestrator/runs.db`,
+table `events`, keyed by `event_type`, with the payload as JSON in `data`. Each
+payload shape is stated once, in the comment on its `EventType` member in
+`orchestrator/src/orchestrator/event_store.py`, and a plan's legs are
+`orchestrator/src/orchestrator/verify_admission_record.py::AdmissionLeg`:
+
+- `verify_admission_plan`: one row per gated verify call, written when it
+  returns with an admitted leg (`outcome` `returned`), or when it raises while
+  admission is on (`outcome` `raised`). A cancelled call writes none. `legs`
+  holds one entry per admitted test leg, retries and env-recovery re-runs
+  included.
+- `verify_admission_heartbeat`: written by the harness `verify-admission-watch`
+  service every 300s, and only while a waiter is queued.
+- `verify_admission_wait_aged`: written by the same watch when the oldest
+  waiter past the alarm age first appears, and again only when that waiter
+  changes. It only reports the age; nothing times a wait out.
+
+**Reading a task stuck in `phase=verify`.** Start with the latest heartbeats:
+
+```bash
+sqlite3 data/orchestrator/runs.db <<'SQL'
+SELECT timestamp,
+       json_extract(data, '$.depth')                              AS depth,
+       json_extract(data, '$.oldest.task_id')                     AS oldest_task,
+       round(json_extract(data, '$.oldest_wait_secs') / 3600, 1)  AS oldest_h,
+       json_extract(data, '$.holders')                            AS holders,
+       json_extract(data, '$.order')                              AS "order"
+FROM events
+WHERE event_type = 'verify_admission_heartbeat'
+ORDER BY id DESC LIMIT 5;
+SQL
+```
+
+- `depth` is how many legs are queued, `oldest` is the longest waiter, and
+  `holders` shows who has the turns now and for how long. A task listed among
+  the holders is running, not waiting. On a running orchestrator, no heartbeat
+  newer than about 300s means nothing is queued.
+- `verify_admission_wait_aged` names the oldest waiter that has passed the
+  alarm age.
+- After the verify returns, its `verify_admission_plan` legs split each
+  leg's wait in two. `waited_secs` is the time queued in this process's gate.
+  `flock_wait_secs` is the time from the gate's grant until the cross-process
+  flock slot was held, so a slot held by another process shows up there.
+  `held_secs` runs from the grant until the turn was handed back, the flock
+  wait included. `slot_held = false` means the flock failed open, so that leg
+  ran without cross-process gating. `order` records which ordering admitted
+  it:
+
+```bash
+sqlite3 data/orchestrator/runs.db <<'SQL'
+SELECT e.timestamp,
+       json_extract(leg.value, '$.module')           AS module,
+       json_extract(leg.value, '$.waited_secs')      AS waited_secs,
+       json_extract(leg.value, '$.flock_wait_secs')  AS flock_wait_secs,
+       json_extract(leg.value, '$.held_secs')        AS held_secs,
+       json_extract(leg.value, '$.slot_held')        AS slot_held,
+       json_extract(leg.value, '$.order')            AS "order"
+FROM events AS e, json_each(e.data, '$.legs') AS leg
+WHERE e.event_type = 'verify_admission_plan' AND e.task_id = '<task_id>'
+ORDER BY e.id DESC;
+SQL
+```
+
+A call that raised, typically a `VerifyInfraError` that the workflow then
+retries as a new call, writes a row with `outcome` `raised` and no legs. Its
+wait is not measured, and this leg query shows nothing for it.
+
+**Measuring the ordering.** Split the rows by each event's `order` field, never
+by date: a reload can flip the order at any moment, and a plan whose legs ran
+under both orders records `order` as null. Arrival order targets the tail of
+the wait (p90 and max), not the mean wait or the throughput. Leg statistics
+leave out every raised call, so count the `outcome` `raised` rows in the same
+window before treating a p90 or a max as complete.
 
 ### Reading the merge-lane throughput baseline
 
@@ -508,6 +673,7 @@ session:
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
 | `mcp__fused-memory__get_statuses` | Compact `{id: status}` map — cheap when you only need status, not full records |
+| `mcp__fused-memory__find_tasks_by_metadata` | Which tasks carry metadata key K (with value V), every status incl. deferred/cancelled — paged |
 | `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
 | `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
 
@@ -834,6 +1000,76 @@ The stand-off budget is **green tier** — retune it live with
 `mcp__escalation__reload_config`, no restart (the value is re-read per
 advance).
 
+### Abandoned merge-deferred members (task 4737)
+
+A task parks at `merge-deferred` to wait for a train. Train state lives only
+in the merge worker's memory, so a restart, or a train derail that raced the
+member's own park write, can leave members parked with nothing that will ever
+move them again. The generic stranded reconcile still never touches
+`merge-deferred`. This sweep owns that status instead. It runs as the last
+step of every stranded-reconcile pass (`stranded_reconcile_interval_secs`,
+default 900s). It has no config knob of its own.
+
+**What counts as abandoned.** A `merge-deferred` member with **none** of
+these owners:
+
+- a train the merge worker still holds lists it;
+- a live workflow holds it;
+- a live claimant holds it (`claimant_run_id` with a heartbeat inside
+  `claimant_liveness_ttl_secs`);
+- an open escalation pins it;
+- a peer of its declared train (`metadata.train`) is still active in any
+  other non-terminal status (`pending`, `in-progress`, `blocked`,
+  `infra-hold`, …), or is itself held.
+
+A member must be abandoned on **two consecutive passes** before anything
+happens. A failed task listing resets that count.
+
+**What recovery does.** It runs through the merge lane's own re-drive, so the
+outcomes match a train derail:
+
+- **Branch already on main, landing attributable** → `done`, provenance kind
+  `found_on_main`.
+- **Branch already on main, landing not attributable** (no commit cites the
+  task) → a `provenance_unattributed` escalation, and the member is
+  re-pended rather than credited with a landing nobody can attribute.
+- **Branch already on main, but a `metadata.delivered_checks` capability
+  check withholds the done-write** → the member is reverted to `pending` and
+  re-dispatched normally.
+- **Branch not on main** → un-stacked off any unlanded train base (from the
+  durable stack-base ledger refs) and re-pended.
+- **Declared train** → re-driven through its **tip** (the last member by
+  train order), **not** un-stacked, because only the tip's branch carries
+  every member's commits. If the tip is not on main it is re-pended and the
+  other members stay parked: when the re-dispatched tip parks again, it finds
+  every member `merge-deferred` and enqueues the train's group merge itself.
+  If the tip is already on main, the train landed, so the other members are
+  re-driven in the same pass, each settled from git by the outcomes above.
+
+**The escalation.** Each target the sweep acted on gets one
+`merge_deferred_abandoned` record from `harness-merge-deferred-recovery`
+(on the tip, for a declared train), deduped only against an open record of
+the same category **and** severity, so an open receipt never hides a later
+failure:
+
+- an `info` L0 (`close_only`) when every member was recovered. It is a
+  receipt: it never pins, and at L0 it is invisible to the open-L1 checks a
+  workflow treats as a human hand-off, so the re-dispatched member runs
+  normally.
+- a `blocking` L1 (`investigate_stranded_merge_deferred`) when any member was
+  not: a re-drive error, stale done-evidence, or a memoized provenance
+  conflict. That record pins the member, so the sweep leaves it alone until
+  you resolve it. Inspect the branch against main, settle the member's status
+  by hand, then close the escalation.
+
+**Holding a member during a hand-carry.** `merge-deferred` is no longer a
+hold the sweep ignores, and Table A still refuses `merge-deferred → deferred`.
+To keep the sweep off a member you are carrying by hand, do one of these:
+
+- set a live claimant with `set_task_claimant` and keep its heartbeat fresh;
+- keep a non-`info` escalation at L1 or above open on it. An `info` record
+  never pins, and neither does an L0 whose filing incarnation is dead.
+
 ---
 
 ## 6. Config reload vs restart
@@ -856,6 +1092,15 @@ takes no arguments: it always re-reads that process's own
 - `unblock_auto.*`
 - `session_resume.*` (whole submodel, including the `restore_from_archive`
   rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
+- `scoring.*` (whole submodel: the dispatch-score sub-budgets `cpm_budget`,
+  `cpm_d_cap`, `age_budget`, `age_half_secs` and `continuity_credit`, plus
+  the anchor-coverage arming threshold `new_scoring_min_anchor_coverage`), so
+  scoring is retuned without a fleet restart (PRD D8). A retune that breaks
+  the no-tier-crossing or continuity-subordination invariant is rejected and
+  rolled back whole. Normative homes:
+  `orchestrator/src/orchestrator/config.py::ScoringConfig` and
+  `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §C2. The legacy
+  formula's `age_alpha` / `cpm_beta` stay restart-only.
 - `verify_env`
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
@@ -2261,7 +2506,9 @@ exhaustions, each prefixed with the label:
   headroom`, where each per-digest reason reads `<label>: all 7 pool accounts
   capped`. The run exits **0**: a deferral rather than an incident (task
   4736), with a WARNING-level escalation. It self-clears at the weekly reset,
-  so there is nothing to do.
+  and the deferred date is retried automatically once a night finishes (see
+  "Retried nights" under "Legibility trickle health probe (04:30)"), so there
+  is nothing to do.
 - `<label>: no pool accounts resolved — check that the unit's EnvironmentFile
   supplies the CLAUDE_OAUTH_TOKEN_* vars named in config/usage-accounts.yaml`.
   This is a config fault and will never clear on its own. It is paired with a
@@ -2394,6 +2641,32 @@ is how an operator ends up tuning the sampler for a crashed coder:
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
+
+**Retried nights** (task 5678). A night that did not finish (a non-zero exit,
+or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
+`trickle-state.json`, as `{date: unfinished attempts}`. A DEFERRED night
+records `capped: true` and still reads `productive`, since its digests were
+built, but it leaves `last_productive_at` unchanged, since it coded nothing.
+The next night whose own pass finishes runs one extra pass for the oldest
+owed date, with its own byte budget. That pass skips sessions the session
+ledger already holds and never launches a census. It rewrites only `retry_backlog`, so the rest of the
+file, and the progress probe's verdict, still describe the scheduled night. A
+failed retry exits the unit non-zero, exactly like a failed night. In the
+journal, grep `retrying <date> from the retry backlog`, and the WARNING
+`abandoning <date>`: a date past `RETRY_MAX_AGE_DAYS` or `RETRY_MAX_ATTEMPTS`
+(`scripts/legibility/trickle_state.py`) is dropped from the backlog. Its
+sessions stay minable by the census within `census.ledger_retention_days`.
+A date the timer never ran at all (the host down across several 03:00s, or a
+catch-up that starts after UTC midnight) enters `retry_backlog` with 0
+attempts (task 6548). The gap is measured from `last_scheduled_target_date`,
+the target of the last SCHEDULED pass
+(`scripts/legibility/trickle_state.py::never_run_dates`). A manual
+`nightly.py run --date` pass never moves that cursor, so a backfill is not
+mistaken for a gap. When every later night finishes, an outage of up to
+`RETRY_MAX_AGE_DAYS` missed nights is fully recovered, one date per night;
+each later night that does not finish costs the oldest owed date. Never-run
+dates already past the window are abandoned in one WARNING,
+`abandoning <n> never-run date(s) <first>..<last>`.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own
@@ -2658,13 +2931,20 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
 
 1. **Prepare.** A headless `claude --print` run on Fable follows the
    prepare-sitting mode's nightly form and records its judgement (options,
-   ramifications, a recommendation or an explicit no-lean) with
-   `prepare_sitting.py record`. It is read-only by construction: it runs
+   ramifications, a recommendation or an explicit no-lean). Its one write
+   channel is a per-run inbox, `data/sitting/inbox/<run>/`: it writes JSON
+   batch files there and runs `prepare_sitting.py record --from <file>`.
+   It is read-only otherwise, by construction: it runs
    under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`, and its
-   environment sets `SITTING_NIGHTLY_CONFINED`, under which
-   `prepare_sitting.py` refuses anything but `brief` and `record` into
-   `data/sitting/`, including `--apply-closes` and `--ledger`. Its only MCP
+   denylist of every apply verb, both in `nightly_prepare.py`, reading no
+   settings file (`--setting-sources ''`), and its
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
+   allow rule plus the absence of settings files confine the agent's own
+   file writes to that inbox. `prepare_sitting.py` confines in code what
+   `record` reads (a `.json` file directly in that inbox, never stdin or
+   another path, so never an earlier night's batch) and where it writes
+   (the default store in `data/sitting/`), and refuses everything but `brief`
+   and `record`, including `--apply-closes` and `--ledger`. Its only MCP
    servers are the `escalation` and `fused-memory` blocks of the checkout's
    `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
    on the project config being approved for a headless run, and playwright
@@ -2685,6 +2965,7 @@ is no commit seam, unlike the 05:00 census:
 | `data/return-brief.md` | The page |
 | `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
+| `data/sitting/inbox/<run>/` | The night's batch files, kept for forensics |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
 from the repo root:
@@ -2709,11 +2990,15 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run failed, timed out or hit a usage limit;
-  its log line carries both stream tails. That is routine, not an incident:
+- `prepare=1` means the Fable run failed, timed out, hit a usage limit or
+  recorded nothing; its log line carries both stream tails, or, for a run
+  that recorded nothing, the counts of what the inbox offered and could not decode. That is
+  routine, not an incident:
   the page is still written, and items the run did not reach show as
   `awaiting preparation`. The page's header says how fresh the preparation
-  is.
+  is. A run that finished well logs `nightly_prepare: done (... recorded=<n>
+  of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
+  means the agent's entries failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
   PATH.
 - `brief=` other than 0 means the page was not written. That is the one

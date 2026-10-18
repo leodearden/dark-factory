@@ -11,11 +11,12 @@ extraction, no behaviour change" stays checkable by diff.
 This module is NOT a CLI in its own right — the leading underscore marks it as
 importable-by-sibling-scripts only. It hosts three tiers:
 
-* **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
+* **Tier 1, discovery** (:func:`tasks_db_path`, :func:`runs_db_path`,
   :func:`decode_metadata`, :func:`resolve_project_roots`,
   :func:`discover_project_roots`, :func:`discover_db_paths`) — adopted by ALL
-  FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525).
-  :func:`decode_metadata` is the exception to "adopted by all four": it is
+  FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525). The store
+  paths and the known/default roots delegate to ``shared.project_layout``
+  (task 6713). :func:`decode_metadata` is the exception to "adopted by all four": it is
   used only by the two AUDIT scripts (task 4782), which are the only ones
   that decode a ``metadata`` column at all. :func:`connect_ro`, with
   :class:`TaskDbUnreadable` and :class:`TaskDbProblem`, is the same tier's
@@ -137,18 +138,28 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import _checkout as _checkout
+from shared.project_layout import (
+    StrPath,
+    default_project_root,
+    known_project_roots,
+    runs_db,
+    tasks_db,
+)
+
 # ---------------------------------------------------------------------------
 # Tier 1 — tasks.db discovery (adopted by all three sweep scripts).
 # ---------------------------------------------------------------------------
 
-# Multi-project discovery fallback, mirroring
-# scripts/migrate_metadata_modules_to_files.py's DEFAULT_ROOTS.
-_DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
 
-
-def tasks_db_path(project_root: str) -> Path:
+def tasks_db_path(project_root: StrPath) -> Path:
     """``<root>/.taskmaster/tasks/tasks.db`` — the live task store."""
-    return Path(project_root) / ".taskmaster" / "tasks" / "tasks.db"
+    return tasks_db(project_root)
+
+
+def runs_db_path(project_root: StrPath) -> Path:
+    """``<root>/data/orchestrator/runs.db`` — the orchestrator's event log."""
+    return runs_db(project_root)
 
 
 def decode_metadata(raw: object) -> dict:
@@ -324,11 +335,10 @@ def resolve_project_roots(
     if project_roots is not None:
         return list(project_roots)
 
-    environ = env if env is not None else os.environ
-    roots_env = (environ.get("DASHBOARD_KNOWN_PROJECT_ROOTS") or "").strip()
-    if roots_env:
-        return [r.strip() for r in roots_env.split(",") if r.strip()]
-    return list(_DEFAULT_PROJECT_ROOTS)
+    known = known_project_roots(env if env is not None else os.environ)
+    if known:
+        return [str(root) for root in known]
+    return [str(default_project_root())]
 
 
 def discover_project_roots(

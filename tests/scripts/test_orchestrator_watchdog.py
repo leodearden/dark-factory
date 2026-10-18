@@ -5524,12 +5524,12 @@ def test_boundary10_recover_pending_merges_link_seam() -> None:
     recovery function the drain gate's crash-safety story depends on is
     present and callable.
 
-    Uses pytest.importorskip("orchestrator.merge_queue_store") so the
+    Uses pytest.importorskip("orchestrator.merge_lane.queue_store") so the
     otherwise stdlib-only watchdog suite still collects and passes in a
     minimal env where the orchestrator package/venv is not importable.
     """
-    pytest.importorskip("orchestrator.merge_queue_store")
-    from orchestrator.merge_queue_store import recover_pending_merges
+    pytest.importorskip("orchestrator.merge_lane.queue_store")
+    from orchestrator.merge_lane.queue_store import recover_pending_merges
 
     assert callable(recover_pending_merges), (
         "the drain gate's force-restart-mid-merge path (scenario 5) relies "

@@ -33,9 +33,10 @@ Verify these before starting. If anything is missing, ask the user — don't gue
    `/home/leo/src/dark-factory`). The `escalation` package (watcher) lives here.
 2. **This session's `escalation` MCP must point at 8103**, and `fused-memory` at
    8002. The stock repo `.mcp.json` points `escalation` at 8102 — wrong queue.
-   Launch via the recon-watch config (see "Launching" below); confirm with
-   `mcp__escalation__get_pending_escalations()` returning recon findings
-   (ids like `esc-recon-<hex>-N`, categories `recon_*`).
+   Launch via the recon-watch config (see "Launching" below); confirm the
+   binding from the store-identity block on `get_pending_escalations` reading
+   `kind=reconciliation`, which holds even on an empty queue (how to read it:
+   the empty-result bullet in "Failure Modes" below).
 3. **The 8103 server is up** — it runs inside `fused-memory.service`. If
    `get_pending_escalations` errors, the service is down → tell the user
    (priority 1, system stability); do not try to start it yourself.
@@ -98,7 +99,8 @@ a supervised, always-on rotation rather than a single-owner actor. The lease nam
 2289 specified and that `build_lease_name('recon-watcher', '<project>')` already produces.
 
 **Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is optional and
-defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves the same way. Pass either only
+defaults to `<--name>-$CLAUDE_PID` (or `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a
+`claude agents` host); `--pid` is optional and resolves the same way. Pass either only
 as a deliberate operator override. Both are derived rather than documented because the token is
 load-bearing on every heartbeat and on the final release, and must not depend on this document
 getting one shell token right (tasks 3994, 4248). It has to be **re-derivable**, not carried: each
@@ -111,6 +113,23 @@ call — hence the CLI re-derives it on every verb.
 the first already dead), so a slug built on it would not match your own later heartbeat. The
 long-lived `claude` process is `$CLAUDE_PID` — verify with `ps -o comm= -p "$CLAUDE_PID"`, which
 prints `claude`.
+
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still forces
+stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
+`lease-heartbeat` is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
+
+**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
+the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
+`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
+reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
+`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
 
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
@@ -189,37 +208,10 @@ lease held by recon-watcher-df-1348600 (pid 1348600 is not running, but its hear
 A fresh heartbeat means you **stand down** even when the pid reads as not running: staleness needs
 BOTH a dead pid AND a heartbeat past the TTL.
 
-**A detached `recon-watch/loop.sh` tree on this queue is not a second closer (task 5876).** A
-process probe may show a `scripts/watcher-rearm.sh --queue-dir …/data/reconciliation/escalations`
-you did not start, with its `escalation.watcher` python child, under an ancestor
-`/bin/bash …/.claude/recon-watch/loop.sh`. That is a host-local helper **not tracked in this
-repo**; its own header is the only other statement of this contract. It is a detached re-arm loop,
-reparented away from any Claude session so it survives the harness background-task reaper, and it
-outlives the session that launched it — so a fresh watcher session routinely finds it already
-running. It only arms the watcher and journals fires under `~/.claude/recon-watch/` (`history.log`,
-`fired-*.json`). Its tree holds no `claude` process: it never calls `resolve_issue` and closes
-nothing. Two read-only inotify watchers on one queue are harmless redundancy — each fire is
-observed twice (once by your watcher, once journaled by the loop), and there is still exactly one
-closer.
-
-It **deliberately never heartbeats, claims or releases** the `recon-watcher-<project>` lease. A
-lease becomes reclaimable only when BOTH its holder pid is dead AND its heartbeat is past
-`orchestrator/src/orchestrator/session_registry.py::LEASE_HEARTBEAT_TTL`. A detached process that
-kept heartbeating after its owning session died would pin that lease at `holder_liveness=orphaned`
-indefinitely: every later watcher would take the orphaned stand-down above, and the 8103 queue
-would have no closer. So:
-- **A stale or reapable lease at startup while loop.sh runs is this contract working** — not a
-  fault, and nothing to report. `lease-reap`, then `lease-claim`, exactly as above.
-- **The heartbeat is yours alone.** The loop will never keep your lease alive — not even if you
-  read fires from its journal instead of re-arming your own watcher — so heartbeat every Main Loop
-  cycle regardless.
-- **Only the lease verdict says whether a second closer exists** (`lease-claim`'s `decision=` /
-  `holder_liveness=`), never the process table: a watcher tree with no `claude` process in it
-  cannot close anything.
-- **Do not stop or kill it.** You did not start it, so "Process safety" (under "Starting the
-  watcher") forbids it.
-- **Its `history.log` is corroboration only** — e.g. repeated re-fires of one id reveal a pending
-  record missing from the exclude file. The drain (`get_pending_escalations`) stays authoritative.
+**A leftover `loop.sh` never touches this lease (task 5885).** A `scripts/watcher-rearm.sh` tree
+under a `~/.claude/recon-watch/loop.sh` ancestor never claims, heartbeats or releases
+`recon-watcher-<project>`, so it changes no lease verdict; see "One watcher: the session's own"
+under "Starting the watcher".
 
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
 and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
@@ -348,9 +340,8 @@ cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess, also touch the
 `recon-watcher-<project>` lease claimed at session startup, so a second session's `lease-claim`
-observes this one as alive and stands down. No other process heartbeats this lease — not even a
-running `recon-watch/loop.sh` (see "Claiming the Recon Watcher Lease" above) — so this call is its
-only keep-alive:
+observes this one as alive and stands down. No other process heartbeats this lease, so this call is
+its only keep-alive:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
@@ -487,9 +478,19 @@ default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 `<queue-dir>/.watcher-rearm-exclude` here). `--exclude-file` — not
 `--baseline` — is what is actually consistent across both watcher skills.
 
+**One watcher: the session's own (task 5885).** This skill runs exactly one watcher: the Main
+Loop's step-2 background task. The queue directory is the durable record and the drain is
+authoritative; the watcher is only a wake signal, so a detached re-arm loop whose fire journal no
+session reads adds nothing. The hand-written, never-tracked `~/.claude/recon-watch/loop.sh` was
+retired for that reason — do not recreate one. A watcher the harness reaps needs no second watcher
+to cover it, because step 3 sees the reap: as `KILLED`, or, when only the python child caught a
+SIGTERM, as the exit-0-with-empty-stdout non-fire (both under
+"Distinguishing the exits at step 3"). If a process probe still shows a `scripts/watcher-rearm.sh`
+on this queue under a `loop.sh` ancestor, it is that leftover. Its tree holds no `claude` process and closes nothing. Mention it to
+the human once and leave it running, per the rule below.
+
 **Process safety:** only stop watcher processes you started via background task
-controls. Never `pkill` by pattern. A `recon-watch/loop.sh` tree is not one you
-started, so this rule covers it too.
+controls. Never `pkill` by pattern.
 
 ### Reading the invariants gauge
 
@@ -1199,8 +1200,13 @@ known so you don't re-investigate them each cycle.
 - **"Too many open files"** after many watcher restart cycles → fd pool
   exhaustion from accumulated background tasks; tell the user to start a fresh
   session.
-- **`get_pending_escalations` errors / empty when you expect items** → confirm
-  this session's `escalation` server points at **8103**, not 8102. The stock
-  repo `.mcp.json` is 8102.
+- **`get_pending_escalations` empty when you expect items** → read the
+  `THIS ENDPOINT SERVES:` block ending that tool's own description in your
+  tool listing (rendered by
+  `escalation/src/escalation/server.py::_render_store_identity_block`).
+  `kind=reconciliation` → this queue answered; nothing is pending.
+  `kind=project` (e.g. `project=dark_factory`) → wrong store, an orchestrator
+  queue: relaunch per "Launching" above. No block → the server cannot vouch
+  for its store; tell the human rather than read `[]` as absence.
 - **8103 server unreachable** → fused-memory.service is down. Priority 1: tell
   the human; do not start services yourself.

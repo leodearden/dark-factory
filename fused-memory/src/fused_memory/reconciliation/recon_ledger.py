@@ -482,6 +482,27 @@ class ReconLedgerStore:
             project_id, RECORD_KIND_MEM0_TOMBSTONE, task_id=memory_id
         )
 
+    async def mem0_tombstones_with_prefix(
+        self, project_id: str, prefix: str
+    ) -> list[ReconLedgerRecord]:
+        """Return the tombstones in *project_id* whose memory id starts with *prefix*, by id.
+
+        The uuid-prefix miss report's reach into a store keyed by the full id
+        (task 5323), in one query: each row is the record
+        :meth:`get_mem0_tombstone` returns for its id. ``substr`` equality,
+        not ``LIKE``: LIKE folds case and reads ``%``/``_`` as wildcards, and
+        a prefix is a literal.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND substr(task_id, 1, ?) = ?
+            ORDER BY task_id
+            """,
+            (project_id, RECORD_KIND_MEM0_TOMBSTONE, len(prefix), prefix),
+        )
+        return [_record_from_row(row) for row in rows]
+
     async def list_by_kind(
         self, project_id: str, record_kind: str, state: str
     ) -> list[ReconLedgerRecord]:

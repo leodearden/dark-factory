@@ -39,6 +39,7 @@ from shared.cli_invoke import (
     is_server_error_status,
     is_timed_out_with_progress,
     is_zero_output_timeout,
+    no_mcp_servers_config,
     read_transcript_records,
     transcript_exists,
 )
@@ -104,8 +105,8 @@ from orchestrator.git_ops import (
     _run,
     is_wip_safety_commit,
 )
-from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
     LandingVerdict,
@@ -427,7 +428,7 @@ if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
-    from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
+    from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
     from orchestrator.scheduler import SchedulerFacade
     from orchestrator.usage_gate import UsageGate
 
@@ -674,86 +675,6 @@ def compute_preexisting_main_break_fingerprint(
         )
     except Exception:
         return ''
-
-
-def compute_failing_test_set_fingerprint(failing_test_ids: list[str]) -> str:
-    """Dedup key for the offline-deep lane's confirmed-red fix-task spawn (β3).
-
-    Keyed on the sorted CONFIRMED failing-test ID SET — NEVER ``main_sha``
-    (DB3/C3). The model helper above (``compute_preexisting_main_break_fingerprint``)
-    keys on a probe/main_sha, which advances every merge; reusing that shape
-    here would spawn a fresh fix task + escalation on EVERY offline-lane
-    advance while red — the exact flood PRD §7/§10/§11 forbids. Keying on the
-    failing-test SET instead means one open fix task absorbs the same red
-    across advances (via an appended suspect range), while a genuinely
-    different failing set gets its own task.
-
-    ``compute_content_fingerprint`` already sorts ``affected_ids`` and ignores
-    ``description``, so the result is order-independent over the input list.
-
-    Returns '' on any exception (fail-safe — an empty fingerprint degrades to
-    the log-only path, never a crash).
-    """
-    try:
-        from escalation.dedupe import compute_content_fingerprint
-        return compute_content_fingerprint(
-            'offline_lane_red', '', sorted(failing_test_ids),
-        )
-    except Exception:
-        return ''
-
-
-def build_offline_lane_fix_task_arguments(
-    failing_test_ids: list[str],
-    suspect_range: str,
-    fingerprint: str,
-    project_root: str | Path,
-    head: str,
-    priority: str = 'high',
-) -> dict:
-    """Build the ``submit_task`` argument block for an offline-lane fix task (β3).
-
-    Modeled on :meth:`TaskWorkflow._spawn_main_health_fix_task`'s argument
-    block (title/description/priority/project_root/metadata), but routed
-    THROUGH the standard TDD→PR→merge gate rather than the high/red-main
-    lane: ``status='pending'`` and ``metadata.merge_lane='normal'`` (never
-    the B3 red-main fix-forward path — that class hard-aborts to a human;
-    D1/§10 "the fix goes through the gate").
-
-    ``metadata.failing_tests`` is stored sorted (matching the fingerprint's
-    own sort) and ``metadata.suspect_ranges`` is seeded as a single-element
-    list so the caller can append further ranges as the same fingerprint
-    recurs across advances (C3) without restructuring the field.
-
-    *priority* is the filed fix task's priority (task 2789, D3). Defaults to
-    ``'high'`` so the legacy numeric/infra call sites in
-    :meth:`OfflineLaneWorker._file_new_fix_task` stay byte-identical; a
-    generic per-project command supplies its own ``LaneCommand.fix_task_priority``.
-    """
-    sorted_ids = sorted(failing_test_ids)
-    test_list = ', '.join(sorted_ids)
-    title = f'offline-lane: fix {len(sorted_ids)} failing test(s) ({test_list})'
-    description = (
-        f'The offline-deep lane confirmed a red run with failing tests: '
-        f'{test_list}.\n\nSuspect commit range: {suspect_range}\n'
-        f'Head at detection: {head}\n\n'
-        f'This task was auto-filed by the offline-deep lane worker (β3). It '
-        f'merges via the standard gate, never the red-main fix-forward path.'
-    )
-    return {
-        'title': title,
-        'description': description,
-        'status': 'pending',
-        'priority': priority,
-        'project_root': str(project_root),
-        'metadata': {
-            'merge_lane': 'normal',
-            'spawn_context': 'offline_lane_red',
-            'offline_lane_fingerprint': fingerprint,
-            'failing_tests': sorted_ids,
-            'suspect_ranges': [suspect_range],
-        },
-    }
 
 
 def _line_ranges_stackable(
@@ -1731,7 +1652,7 @@ class TaskWorkflow:
         Called immediately after ``_enter_merge_deferred`` writes the
         merge-deferred status.  Evaluates whether this task is the tip of a
         complete train and, if so, builds and enqueues a
-        :class:`~orchestrator.merge_queue.GroupMergeRequest` from self's
+        :class:`~orchestrator.merge_lane.worker.GroupMergeRequest` from self's
         context (branch/worktree/task_files/module_configs/config).
 
         Gating (step-6 adds full guards; initial impl fires unconditionally
@@ -1757,7 +1678,7 @@ class TaskWorkflow:
         Returns the mapped ``WorkflowOutcome``, or ``None`` to signal the caller
         to park the workflow as ``MERGE_DEFERRED``.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRAIN_INCOMPLETE_REASON_PREFIX,
             TRAIN_VERIFY_FAILED_REASON_PREFIX,
             GroupMergeRequest,
@@ -2205,23 +2126,23 @@ class TaskWorkflow:
         the state machine stays under pyright's complexity threshold.
 
         Returns ``WorkflowOutcome.DONE`` on success; ``BLOCKED`` (with L1)
-        when the persistence layer refuses or ``_merge_sha`` is missing.
+        when the persistence layer refuses.  The DONE phase is entered only
+        once the done write has landed, so a refused write reaches
+        ``_mark_blocked`` from a working machine and leaves a 'blocked' row
+        plus an L1.  A missing ``_merge_sha`` exits DONE without writing the
+        row (task 3113).
         """
         await self._reconcile_metadata_files_for_done()
         if not self._merge_sha:
-            # Should never happen on the happy path — _submit_to_merge_queue
-            # always populates _merge_sha on success.  Defensive bail-out
-            # rather than passing done_provenance=None (which the server
-            # gate now rejects with done_provenance_required).
+            # Eval mode and the coalesced already_merged case reach here; task 3113 owns this exit.
             logger.error(
                 'Task %s: SUCCESS path reached without _merge_sha — '
-                'cannot construct done_provenance',
+                'cannot construct done_provenance; exiting DONE without '
+                'writing the done row',
                 self.task_id,
             )
-            return await self._mark_blocked(
-                'Internal: SUCCESS without merge_sha — provenance unconstructable',
-                escalate_to_human=True,
-            )
+            self._enter_phase(WorkflowState.DONE)
+            return WorkflowOutcome.DONE
         # task 3057: this stamp is DELIBERATELY NOT routed through
         # `gate_mark_done_on_delivered_checks`, unlike the eleven
         # attribution-shaped seams in this module, harness.py and
@@ -2253,6 +2174,7 @@ class TaskWorkflow:
                 f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         # task 2681/ζ: consume the write-ahead LandedRow on the happy path so it
         # no longer survives to the next startup (closing the RC-3 stale-row
         # window); only after a SUCCESSFUL mark_done — a rejected done-write
@@ -2775,11 +2697,9 @@ class TaskWorkflow:
                     # _execute_iterations will see no pending steps and
                     # return cleanly, allowing VERIFY to take over.
                     pass  # fall through to the post-PLAN section below
-                elif simple_outcome == WorkflowOutcome.DONE:
-                    # SIMPLE_TASK reported task_already_done.
-                    return simple_outcome
-                elif simple_outcome == WorkflowOutcome.BLOCKED:
-                    # SIMPLE_TASK reported unactionable_task — terminal.
+                elif simple_outcome != WorkflowOutcome.REQUEUED:
+                    # An exit handler's verdict (DONE, BLOCKED, ESCALATED,
+                    # CANCELLED) ends this dispatch.
                     return simple_outcome
                 else:
                     # Fallthrough sentinel — drop the plan so the
@@ -2826,34 +2746,16 @@ class TaskWorkflow:
             else:
                 self._enter_phase(WorkflowState.PLAN)
                 plan_outcome = await self._plan()
-                if plan_outcome == WorkflowOutcome.REQUEUED:
-                    return WorkflowOutcome.REQUEUED
-                if plan_outcome == WorkflowOutcome.BLOCKED:
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.waste_detected,
-                            task_id=self.task_id, phase='plan',
-                            data={'waste_type': 'replan_after_failure'},
-                        )
-                    return plan_outcome  # _plan() already called _mark_blocked
-                if plan_outcome == WorkflowOutcome.DONE:
-                    # _handle_already_done_report set status=done with provenance
-                    # and returned DONE.  Falling through to EXECUTE/VERIFY/MERGE
-                    # wastes effort and (per the 2026-05-04 incident) can orphan a
-                    # merge-queue halt if the workflow gets soft-cancelled
-                    # mid-merge.
+                if plan_outcome == WorkflowOutcome.BLOCKED and self.event_store:
+                    self.event_store.emit(
+                        EventType.waste_detected,
+                        task_id=self.task_id, phase='plan',
+                        data={'waste_type': 'replan_after_failure'},
+                    )
+                if plan_outcome != WorkflowOutcome.PLANNED:
+                    # Only PLANNED continues to execute/verify/review; any other
+                    # outcome already settled this dispatch (tasks 2911, 6052).
                     return plan_outcome
-                if plan_outcome == WorkflowOutcome.ESCALATED:
-                    # _mark_blocked returned ESCALATED: status='blocked' was already
-                    # written, an L1 escalation is open, the steward handed off to
-                    # a human.  Falling through to the post-PLAN ghost-loop guard
-                    # would mistake any architect scratch in the worktree for
-                    # "prior merge survived" and try to flip status to 'done'
-                    # (the done_provenance gate currently blocks the DB write but
-                    # the workflow logs a fake DONE — don't lie).  See task 2911
-                    # incident 2026-05-06; mirrors 9760ba74bf for the DONE case.
-                    return plan_outcome
-                # WorkflowOutcome.PLANNED falls through to execute/verify/review.
 
             # ── Ghost-loop early exit (before EXECUTE) ───────────
             # Journal-first (PRD workflow-state-machine α, MP-1/MP-2): a
@@ -3049,29 +2951,24 @@ class TaskWorkflow:
                 # Not 'cancelled' (must be 'done' given TERMINAL_STATUSES).
                 # Reuse the bypass-discrimination helper: returns BLOCKED when a
                 # bypass is detected (reopen + bypass_done L1 already filed), or
-                # None when provenance is legitimate (commit reachable from main).
-                bypass_outcome = await self._handle_terminal_exit_on_block(
+                # DONE when provenance is legitimate (commit reachable from main).
+                terminal_outcome = await self._handle_terminal_exit_on_block(
                     exc,
                     reason=(
                         f'terminal at dispatch (old_status={exc.old_status!r})'
                     ),
                     detail='preempt: task terminal at dispatch',
                 )
-                if bypass_outcome is not None:
-                    # Bypass done detected — helper already reopened the row and
-                    # filed an L1 with category='bypass_done'.
-                    return bypass_outcome
-
-                # Legitimate done: provenance commit is reachable from main.
-                # The row is already terminal-done out-of-band (e.g. a human
-                # marked done during the ~3s acquire→dispatch window). Accept it.
-                logger.info(
-                    'Task %s: already legitimately done at dispatch (old_status=%r) '
-                    '— accepting, no reopen, no escalation',
-                    self.task_id, exc.old_status,
-                )
-                self._enter_phase(WorkflowState.DONE)
-                return WorkflowOutcome.DONE
+                if terminal_outcome is WorkflowOutcome.DONE:
+                    # The row is already terminal-done out-of-band (e.g. a human
+                    # marked done during the ~3s acquire→dispatch window).
+                    logger.info(
+                        'Task %s: already legitimately done at dispatch '
+                        '(old_status=%r) — accepting, no reopen, no escalation',
+                        self.task_id, exc.old_status,
+                    )
+                    self._enter_phase(WorkflowState.DONE)
+                return terminal_outcome
 
             # A persistence-layer rejection escaped one of the workflow's
             # set_task_status / mark_done call sites without an explicit
@@ -3485,12 +3382,16 @@ class TaskWorkflow:
           release and DONE-cleanup gate carry);
         * a hard cancel: ``_enter_phase`` never persists status, so a
           forcibly-torn-down workflow leaves the row as it was — the harness
-          R3 grace window and reconcile sweep own it.
+          R3 grace window and reconcile sweep own it;
+        * an in-flight Table-B action teardown (restart/abandon), which owns
+          the row: ``orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status``.
 
         A raising ``get_status`` (its contract is ``str | None``, so only a
         non-conforming double does this) reads as an unknown row.
         """
         if self._worktree_external or cancel_kind == 'hard':
+            return None, None
+        if self.scheduler.blocked_writes_suppressed(self.task_id) is True:
             return None, None
         try:
             status_row = await self.scheduler.get_status(self.task_id)
@@ -3563,7 +3464,6 @@ class TaskWorkflow:
         # Wait for steward to finish any pending work (suggestion triage, etc.)
         await self._ensure_steward_started()
         await self._await_steward_completion(skip_if_idle=True)
-        self._enter_phase(WorkflowState.DONE)
         return await self._finalise_merged_done()
 
     async def _resume_merge_retry_if_pending(
@@ -3864,6 +3764,8 @@ class TaskWorkflow:
                         # re-verify (the implement-phase site is covered
                         # separately by TestTaskLaneVerifyHoldsLease).
                         role='task',
+                        task_id=self.task_id,
+                        event_store=self.event_store,
                     )
                 if not verify.passed:
                     if verify.timed_out:
@@ -4399,6 +4301,15 @@ class TaskWorkflow:
         worktree's source code rather than the main tree's editable installs.
         Local ``[tool.uv.sources]`` dependencies (e.g. ``shared``) are
         pulled in automatically via relative editable paths.
+
+        Never uninstalls, and covers the whole workspace (task 3443): a
+        workspace shares one root ``.venv`` and a bare ``uv sync`` is exact,
+        so it prunes that venv down to one member's closure. ``--inexact``
+        makes it never uninstall, so it cannot undo what
+        ``verify_cold_preprovision_command`` or a steward provisioned, and the
+        parallel per-prefix syncs commute; ``--all-packages`` installs every
+        workspace member, which also heals a venv an earlier exact sync
+        stripped.
         """
         assert self.worktree is not None
 
@@ -4419,6 +4330,7 @@ class TaskWorkflow:
             project_dir = str(worktree / prefix)
             proc = await asyncio.create_subprocess_exec(
                 'uv', 'sync', '--project', project_dir,
+                '--inexact', '--all-packages',
                 cwd=str(self.worktree),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -4768,6 +4680,7 @@ class TaskWorkflow:
         try:
             await self.scheduler.set_task_status(self.task_id, 'pending')
         except TerminalExitRejection as exc:
+            self._note_exit_status_write('pending', None)
             return self._observed_terminal_outcome(exc.old_status)
         except SetTaskStatusRejected as exc:
             logger.error(
@@ -6944,7 +6857,6 @@ class TaskWorkflow:
             'setting status done with provenance',
             self.task_id, commit[:12],
         )
-        self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done()
         try:
             await self.scheduler.mark_done(
@@ -6968,6 +6880,7 @@ class TaskWorkflow:
                 f'Architect already_done rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _hold_unattributed_already_done(
@@ -7195,9 +7108,11 @@ class TaskWorkflow:
                         'marker': marker,
                     },
                 )
-            await self._persist_blocked_row(
+            observed = await self._persist_blocked_row(
                 why=f'architect-desync merge already in flight for {tip[:12]}',
             )
+            if observed is not None:
+                return observed
             self._enter_phase(WorkflowState.BLOCKED)
             return WorkflowOutcome.BLOCKED
 
@@ -7207,7 +7122,7 @@ class TaskWorkflow:
             'verify is the gate)',
             self.task_id, tip[:12],
         )
-        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         req = await submit_verified_green_merge_request(
             task_id=self.task_id,
@@ -7253,13 +7168,17 @@ class TaskWorkflow:
         # replan it while this MergeRequest is still queued.  'blocked' with no
         # escalation is instead LEAVE-shaped, and the merge callback (or the
         # found_on_main reconciler) flips it done once main actually moves.
-        await self._persist_blocked_row(
+        observed = await self._persist_blocked_row(
             why=f'architect-desync merge enqueued for {tip[:12]}',
         )
+        if observed is not None:
+            return observed
         self._enter_phase(WorkflowState.BLOCKED)
         return WorkflowOutcome.BLOCKED
 
-    async def _persist_blocked_row(self, *, why: str, status: str = 'blocked') -> None:
+    async def _persist_blocked_row(
+        self, *, why: str, status: str = 'blocked',
+    ) -> WorkflowOutcome | None:
         """Durably write the park *status* for a non-escalating terminal exit.
 
         ``_handle_ready_to_merge_report``'s two success-shaped exits (merge
@@ -7284,11 +7203,17 @@ class TaskWorkflow:
 
         * :class:`TerminalExitRejection` is the BENIGN already-terminal race —
           the merge done-callback or the found_on_main reconciler beat us to
-          ``mark_done``.  That row is correct; log at info and leave it
-          terminal.  Never reopen, never retry (unlike ``_mark_blocked``'s
-          bypass trip-wire, a terminal row here is the EXPECTED good outcome).
+          ``mark_done``, or the task was cancelled.  That row is correct; log
+          at info and leave it terminal.  Never reopen, never retry (unlike
+          ``_mark_blocked``'s bypass trip-wire, a terminal row here is the
+          EXPECTED good outcome).
         * Any other exception is logged at warning and swallowed; the
           found_on_main reconciler remains the durable backstop.
+
+        Same contract as :meth:`_repend_for_requeue`: a non-None return is the
+        observed terminal (:meth:`_observed_terminal_outcome`), and it WINS
+        over the park — the caller returns it instead of BLOCKED/ESCALATED.
+        ``None`` means the write landed or its failure was ledgered.
         """
         try:
             await self.scheduler.set_task_status(self.task_id, status)
@@ -7299,6 +7224,8 @@ class TaskWorkflow:
                 'leaving it (%s)',
                 self.task_id, status, exc.old_status, why,
             )
+            self._note_exit_status_write(status, None)
+            return self._observed_terminal_outcome(exc.old_status)
         except Exception as exc:
             logger.warning(
                 'Task %s: %s-row write failed (%s): %s — continuing; the '
@@ -7308,6 +7235,7 @@ class TaskWorkflow:
             self._note_exit_status_write(status, exc)
         else:
             self._note_exit_status_write(status, None)
+        return None
 
     def _schedule_architect_merge_done(
         self, fut: asyncio.Future, *, tip: str, evidence: str,
@@ -7358,7 +7286,7 @@ class TaskWorkflow:
         reconciler still marks it done on the next sweep.
         """
         try:
-            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 logger.info(
@@ -9980,6 +9908,7 @@ class TaskWorkflow:
                         archive_root=self.config.project_root / 'data' / 'verify-logs',
                         force_workspace=self._train is not None,
                         role='task',
+                        event_store=self.event_store,
                     )
             except VerifyInfraError as exc:
                 last_infra_exc = exc
@@ -11075,13 +11004,13 @@ class TaskWorkflow:
         paths suppress task-status transitions — the caller retries
         the merge in-place instead of requeueing via the scheduler.
         """
-        from orchestrator.merge_disposition import MergeFailureDisposition
         from orchestrator.merge_lane import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             WaiterRecord,
         )
+        from orchestrator.merge_lane.disposition import MergeFailureDisposition
         from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             AttachAction,
             MergeRequest,
             OutcomeKind,
@@ -11116,7 +11045,7 @@ class TaskWorkflow:
             # outcome on the NORMAL ladder (no forced ``escalate_to_human``).
             # Import directly from merge_gates (NOT the merge_queue shim) to keep
             # hot merge_queue.py out of this task's lock scope.
-            from orchestrator.merge_gates import (
+            from orchestrator.merge_lane.gates import (
                 CROSS_REPO_DELIVERABLE_REASON_PREFIX,
                 is_cross_repo_task,
             )
@@ -11223,7 +11152,7 @@ class TaskWorkflow:
                     # shim) for the same reason recorded on the cross-repo
                     # import above: keep hot merge_queue.py out of this task's
                     # lock scope.
-                    from orchestrator import merge_gates as _merge_gates
+                    from orchestrator.merge_lane import gates as _merge_gates
                     already_landed = await _merge_gates.resolve_already_landed_branch(
                         list(self._task_files),
                         self._base_commit,
@@ -11367,7 +11296,7 @@ class TaskWorkflow:
         first_enqueued_at = await self._stamp_first_merge_enqueue()
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
-        from orchestrator.merge_queue import QueuedBranch, lane_for_task_metadata
+        from orchestrator.merge_lane.worker import QueuedBranch, lane_for_task_metadata
         merge_request = MergeRequest(
             task_id=self.task_id,
             branch=QueuedBranch.parse(branch_name, self.config.git.branch_prefix),
@@ -11379,6 +11308,7 @@ class TaskWorkflow:
             result=future,
             lane=lane_for_task_metadata(self.task.get('metadata')),
             merge_first_enqueued_at=first_enqueued_at,
+            awaited_by_workflow=True,
         )
 
         attached = False
@@ -11546,7 +11476,7 @@ class TaskWorkflow:
         # exit cleanly without creating an escalation, reporting WHICH terminal
         # it was (γ3 / boundary #14b — collapsing both onto DONE reported a
         # cancellation as a completion and tripped run()'s SM-2 check).
-        from orchestrator.merge_queue import WORKTREE_MISSING_REASON_PREFIX
+        from orchestrator.merge_lane.worker import WORKTREE_MISSING_REASON_PREFIX
         if result.reason.startswith(WORKTREE_MISSING_REASON_PREFIX):
             try:
                 status = await self.scheduler.get_status(self.task_id)
@@ -11568,7 +11498,7 @@ class TaskWorkflow:
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
         from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
@@ -11702,7 +11632,7 @@ class TaskWorkflow:
         """Schedule a high-lane fix task for a confirmed main-health break.
 
         Builds a submit_task argument block with:
-        - title/description from :func:`~orchestrator.merge_queue.compose_fix_main_brief`
+        - title/description from :func:`~orchestrator.merge_lane.worker.compose_fix_main_brief`
         - ``merge_lane='high'`` so the fix merges via the HIGH lane
         - Correlation keys so the auto-watcher can link it to its escalation:
           ``spawn_context``, ``main_health_signature``, ``main_health_escalation_id``
@@ -11710,7 +11640,7 @@ class TaskWorkflow:
         Delegates the actual POST to :meth:`_post_submit_tasks` via
         ``asyncio.create_task`` so the caller is not blocked.
         """
-        from orchestrator.merge_queue import compose_fix_main_brief
+        from orchestrator.merge_lane.worker import compose_fix_main_brief
 
         title, description = compose_fix_main_brief(category, cause_hint, detail)
         arguments = {
@@ -11758,7 +11688,7 @@ class TaskWorkflow:
         from escalation.dedupe import DedupeConfig, content_fingerprint_key
         from escalation.models import Escalation
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS,
             is_auto_heal_eligible,
         )
@@ -12367,7 +12297,7 @@ class TaskWorkflow:
         3. Otherwise call ``merge_queue.reverify_member_solo`` (verify-only;
            never advances main) and return its result.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             SoloVerifyResult,
             reverify_member_solo,
         )
@@ -13625,6 +13555,12 @@ class TaskWorkflow:
         if 'verdict_tools' in role.mcp_families and cwd:
             mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
+        # Strict scoping (EVAL_PROFILE, task 4757) is a no-op without a truthy
+        # --mcp-config, so a role whose families composed none gets the
+        # zero-server one rather than keeping the worktree's ambient .mcp.json.
+        if self.config.strict_mcp_config and not mcp_config:
+            mcp_config = no_mcp_servers_config()
+
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
         # by passing resume_session_id to invoke_with_cap_retry.  Otherwise,
@@ -13918,6 +13854,7 @@ class TaskWorkflow:
                 allowed_tools=role.allowed_tools or None,
                 disallowed_tools=role.disallowed_tools or None,
                 mcp_config=mcp_config,
+                strict_mcp_config=self.config.strict_mcp_config,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
                 sandbox_extras=sandbox_extras,
@@ -15056,7 +14993,7 @@ class TaskWorkflow:
         guard's only route to a recovery-DONE goes through this method, so a
         recovery-DONE always carries an explicit provenance ``basis`` — either
         ``'journal'`` (a caller's :meth:`MergeProvenance.lookup` call found a
-        :class:`~orchestrator.landed_outbox.LandedRow`) or ``'fallback'`` (the
+        :class:`~orchestrator.merge_lane.landed_outbox.LandedRow`) or ``'fallback'`` (the
         legacy :meth:`_has_prior_implementation` heuristic). Extracted and
         generalized from the pre-PLAN guard's original DONE tail.
 
@@ -15120,7 +15057,6 @@ class TaskWorkflow:
         ) is not None:
             return None
         self._merge_recovery_basis = basis
-        self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done(override_files=files)
         try:
             await self.scheduler.mark_done(
@@ -15135,6 +15071,7 @@ class TaskWorkflow:
                 f'Recovery-DONE rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        self._enter_phase(WorkflowState.DONE)
         return WorkflowOutcome.DONE
 
     async def _discovered_landing_sha(
@@ -16044,7 +15981,7 @@ class TaskWorkflow:
         exc: TerminalExitRejection,
         reason: str,
         detail: str,
-    ) -> WorkflowOutcome | None:
+    ) -> WorkflowOutcome:
         """Detect ``update_task(status='done')`` bypass after a terminal-exit rejection.
 
         When ``set_task_status('blocked')`` raises ``TerminalExitRejection``
@@ -16056,8 +15993,7 @@ class TaskWorkflow:
            ``WorkflowOutcome.CANCELLED`` immediately (before any ``get_task``
            round-trip or provenance read).
         1. Legitimate done (``old_status == 'done'``, provenance commit reachable
-           from main) — return ``None`` so the existing flow continues; the
-           post-steward branch at ``current == 'done'`` returns DONE.
+           from main) — return ``WorkflowOutcome.DONE``; nothing is filed.
         2. Bypass (``old_status == 'done'``, provenance missing or commit not on
            main) — reopen the row via
            ``set_task_status('blocked', reopen_reason='bypass detected: …')``,
@@ -16088,7 +16024,7 @@ class TaskWorkflow:
                         'commit %s is reachable from main — legitimate done',
                         self.task_id, commit[:12],
                     )
-                    return None
+                    return WorkflowOutcome.DONE
             except Exception:
                 logger.warning(
                     'Task %s: ancestor check failed during bypass detection',
@@ -16331,50 +16267,45 @@ class TaskWorkflow:
                 detail=(detail or reason),
                 category=(disposition.category if disposition is not None else None),
                 blocked_from_phase=pre_block_state,
+                block_category=category,
             )
             return outcome
 
         if not merge_phase:
             self._enter_phase(WorkflowState.BLOCKED)
-            _status_set_ok = False
             try:
                 await self.scheduler.set_task_status(self.task_id, block_status)
-                _status_set_ok = True
             except TerminalExitRejection as exc:
-                bypass_outcome = await self._handle_terminal_exit_on_block(
+                self._note_exit_status_write(block_status, None)
+                return _record(await self._handle_terminal_exit_on_block(
                     exc, reason, detail or reason,
+                ))
+            # Best-effort staleness-reference stamp (task 2557): records
+            # the confirmed block transition so BriefingAssembler can
+            # tell a stale persisted dry_run_proposals entry (from a
+            # PRIOR block cycle, re-blocked without a fresh investigation)
+            # apart from a fresh one. Awaited synchronously here, BEFORE
+            # the fire-and-forget _spawn_dry_run_unblock below appends its
+            # own later-timestamped proposal — so a fresh investigation's
+            # proposal.timestamp always lands after last_blocked_at.
+            # Default metadata_mode ('merge') preserves sibling keys
+            # (incl. dry_run_proposals). Never raises — mirrors the
+            # existing best-effort dry_run proposal-list trim in
+            # dry_run_unblock.py.
+            try:
+                await self.scheduler.update_task(
+                    self.task_id, {'last_blocked_at': datetime.now(UTC).isoformat()},
                 )
-                if bypass_outcome is not None:
-                    return _record(bypass_outcome)
-                # Legitimate done — fall through; the existing post-steward
-                # flow below handles current==done by returning DONE.
-            if _status_set_ok:
-                # Best-effort staleness-reference stamp (task 2557): records
-                # the confirmed block transition so BriefingAssembler can
-                # tell a stale persisted dry_run_proposals entry (from a
-                # PRIOR block cycle, re-blocked without a fresh investigation)
-                # apart from a fresh one. Awaited synchronously here, BEFORE
-                # the fire-and-forget _spawn_dry_run_unblock below appends its
-                # own later-timestamped proposal — so a fresh investigation's
-                # proposal.timestamp always lands after last_blocked_at.
-                # Default metadata_mode ('merge') preserves sibling keys
-                # (incl. dry_run_proposals). Never raises — mirrors the
-                # existing best-effort dry_run proposal-list trim in
-                # dry_run_unblock.py.
-                try:
-                    await self.scheduler.update_task(
-                        self.task_id, {'last_blocked_at': datetime.now(UTC).isoformat()},
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        '_mark_blocked: last_blocked_at stamp failed for task %s '
-                        '(best-effort, continuing): %s',
-                        self.task_id, exc,
-                    )
-                self._spawn_dry_run_unblock(
-                    reason, detail or reason,
-                    block_class=(disposition.block_class if disposition is not None else None),
+            except Exception as exc:
+                logger.warning(
+                    '_mark_blocked: last_blocked_at stamp failed for task %s '
+                    '(best-effort, continuing): %s',
+                    self.task_id, exc,
                 )
+            self._spawn_dry_run_unblock(
+                reason, detail or reason,
+                block_class=(disposition.block_class if disposition is not None else None),
+            )
         elif spawn_dry_run:
             # Post-merge red-main class: merge_phase suppressed the status
             # transition and the spawn above, but this IS the mechanically
@@ -16449,11 +16380,13 @@ class TaskWorkflow:
                     reason, detail or reason, category=category,
                     root_cause=root_cause,
                 )
-                await self._park_merge_phase_row(
+                observed = await self._park_merge_phase_row(
                     merge_phase, block_status,
                     why=f'escalate_to_human short-circuit: {reason[:80]}',
                 )
-                return _record(WorkflowOutcome.BLOCKED)
+                return _record(
+                    observed if observed is not None else WorkflowOutcome.BLOCKED,
+                )
 
             # Don't create a duplicate if level-1 already pending — but only a
             # SAME-signature L1 should suppress the steward-facing L0 (task 2757):
@@ -16603,10 +16536,12 @@ class TaskWorkflow:
                     # which is what makes run()'s ESCALATED-branch comment
                     # ("status='blocked' was already written") true on every
                     # path rather than only the non-merge ones.
-                    await self._park_merge_phase_row(
+                    observed = await self._park_merge_phase_row(
                         merge_phase, block_status,
                         why=f'steward re-escalated to human: {reason[:80]}',
                     )
+                    if observed is not None:
+                        return _record(observed)
                     logger.info(
                         'Task %s: L1 escalation open — steward handed '
                         'off to human; exiting ESCALATED',
@@ -16771,15 +16706,17 @@ class TaskWorkflow:
                     '(steward consumer dead; L1 already filed)',
                     self.task_id, len(orphan_l0),
                 )
-        await self._park_merge_phase_row(
+        observed = await self._park_merge_phase_row(
             merge_phase, block_status,
             why=f'BLOCKED fall-through: {reason[:80]}',
         )
-        return _record(WorkflowOutcome.BLOCKED)
+        return _record(
+            observed if observed is not None else WorkflowOutcome.BLOCKED,
+        )
 
     async def _park_merge_phase_row(
         self, merge_phase: bool, block_status: str, *, why: str,
-    ) -> None:
+    ) -> WorkflowOutcome | None:
         """Write the park status for a ``merge_phase=True`` SLOT-EXITING return.
 
         Called from all three of :meth:`_mark_blocked`'s slot-exiting returns —
@@ -16811,13 +16748,19 @@ class TaskWorkflow:
         time, so entering BLOCKED here keeps SM-2's ``report.phase ==
         machine.state`` check satisfied.
 
+        Returns ``_persist_blocked_row``'s observed terminal, which the caller
+        reports instead of its BLOCKED/ESCALATED; BLOCKED is entered only when
+        there is none.  ``None`` when *merge_phase* is False.
+
         See spec §8-E2 and the MERGE_PHASE_RATIONALE paragraph in
         :meth:`_mark_blocked`'s docstring for why the entry gate stays.
         """
         if not merge_phase:
-            return
-        await self._persist_blocked_row(why=why, status=block_status)
-        self._enter_phase(WorkflowState.BLOCKED)
+            return None
+        observed = await self._persist_blocked_row(why=why, status=block_status)
+        if observed is None:
+            self._enter_phase(WorkflowState.BLOCKED)
+        return observed
 
     def _durable_ref_suffix(self) -> str:
         """Durable git identifiers to append to an L1 escalation's detail.

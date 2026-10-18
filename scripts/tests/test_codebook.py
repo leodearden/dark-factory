@@ -2039,7 +2039,8 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 
 
 # ---------------------------------------------------------------------------
-# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687).
+# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687,
+# 5729).
 # Each asserts that a committed §7.3 coding record and the merger-owned
 # registry still agree; the comparison itself is single-sourced here, so each
 # guard states only what is distinctive about its own correction and a fix to
@@ -2057,9 +2058,68 @@ _SIGHTING_PAYLOAD_FIELDS = (
     "evidence_quote",
 )
 
+# What apply_coding_records copies from the record's header into every
+# sighting it appends (the session is how a sighting is found, so it is the
+# lookup key rather than a compared field).
+_SIGHTING_HEADER_FIELDS = ("date", "project")
+
 
 def _sightings_for(holder: dict, session: str) -> list[dict]:
     return [s for s in holder.get("sightings") or [] if s.get("session") == session]
+
+
+def _session_record(record_path: Path, session: str) -> dict:
+    """The one §7.3 coding record in JSONL *record_path* that carries
+    *session*, asserted valid."""
+    records = [
+        json.loads(line)
+        for line in record_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    mine = [r for r in records if r.get("session") == session]
+    assert len(mine) == 1, (
+        f"expected exactly one {session!r} record in {record_path}, found "
+        f"{len(mine)}; sessions present: "
+        f"{sorted({r.get('session') for r in records})}"
+    )
+    assert mod.validate_coding_record(mine[0]) == [], (
+        f"invalid §7.3 coding record for session {session!r}"
+    )
+    return mine[0]
+
+
+def _live_entry(codebook: dict, entry_id: str) -> dict:
+    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
+    assert len(entries) == 1, (
+        f"expected exactly one {entry_id!r} entry, found {len(entries)}"
+    )
+    return entries[0]
+
+
+def _assert_sighting_carries(record: dict, payload: dict, holder: dict) -> None:
+    """Assert *holder* carries exactly one sighting for *record*'s session,
+    and that it is what the sole writer appends for *payload*: the record's
+    header fields and the payload's fields, verbatim. This is the
+    in-place-rewrite detector for a committed sighting."""
+    session = record["session"]
+    carried = _sightings_for(holder, session)
+    assert len(carried) == 1, (
+        f"expected exactly one {session!r} sighting on {holder.get('id')!r}, "
+        f"found {len(carried)}"
+    )
+    expected = {field: record[field] for field in _SIGHTING_HEADER_FIELDS} | {
+        field: payload[field] for field in _SIGHTING_PAYLOAD_FIELDS if payload.get(field)
+    }
+    drift = {
+        field: (want, carried[0].get(field))
+        for field, want in expected.items()
+        if carried[0].get(field) != want
+    }
+    assert drift == {}, (
+        f"the {session!r} sighting on {holder.get('id')!r} no longer matches the "
+        "committed record — a committed sighting was rewritten in place "
+        f"{{field: (record, codebook)}}: {drift}"
+    )
 
 
 def _assert_correction_absorbed(
@@ -2091,7 +2151,7 @@ def _assert_correction_absorbed(
         session would be counted in `correction_skipped` with its field
         writes lost.
     (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
-        sighting carries the record's payload field for field. This is the
+        sighting carries the record field for field. This is the
         in-place-rewrite detector for the merger-owned YAML, and it is what
         proves the correction's full text is carried verbatim — which is why
         no caller needs to pin cause or note prose.
@@ -2116,21 +2176,7 @@ def _assert_correction_absorbed(
     stays owned by `test_live_codebook_is_v2_and_validates_green`.
     """
     # (0) WELL-FORMED.
-    records = [
-        json.loads(line)
-        for line in record_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    mine = [r for r in records if r.get("session") == session]
-    assert len(mine) == 1, (
-        f"expected exactly one {session!r} record in {record_path}, found "
-        f"{len(mine)}; sessions present: "
-        f"{sorted({r.get('session') for r in records})}"
-    )
-    record = mine[0]
-    assert mod.validate_coding_record(record) == [], (
-        f"invalid §7.3 coding record for session {session!r}"
-    )
+    record = _session_record(record_path, session)
     corrections = record.get("corrections") or []
     assert len(corrections) == 1, (
         f"expected exactly one correction in the {session!r} record, got "
@@ -2142,9 +2188,7 @@ def _assert_correction_absorbed(
     assert correction.get("entry_id") == entry_id
 
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
-    assert len(entries) == 1, f"expected exactly one {entry_id!r} entry"
-    entry = entries[0]
+    entry = _live_entry(codebook, entry_id)
 
     # (1) AGREEMENT — entry fields, then the provenance sighting.
     field_drift = {
@@ -2157,21 +2201,7 @@ def _assert_correction_absorbed(
         f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
         f"{field_drift}"
     )
-
-    carried = _sightings_for(entry, session)
-    assert len(carried) == 1, (
-        f"expected exactly one {session!r} sighting on {entry_id!r}, found "
-        f"{len(carried)}"
-    )
-    sighting_drift = {
-        field: (correction[field], carried[0].get(field))
-        for field in _SIGHTING_PAYLOAD_FIELDS
-        if correction.get(field) and correction[field] != carried[0].get(field)
-    }
-    assert sighting_drift == {}, (
-        f"the {session!r} sighting no longer matches the committed record "
-        f"{{field: (record, codebook)}}: {sighting_drift}"
-    )
+    _assert_sighting_carries(record, correction, entry)
 
     # (2) WITHDRAWN — the refuted framing is gone from the one field
     #     build_codebook_index renders unconditionally.
@@ -2531,6 +2561,107 @@ def test_live_codebook_withdraws_the_refuted_em_dash_framing():
 
 
 # ---------------------------------------------------------------------------
+# task 5729 (live-file guard) — the ef7f6a5c census-verifier sighting misfiled
+# on entry-cand-20260919-2 is annotated there and re-routed to
+# entry-cand-20260722-18, through the sole writer.
+# ---------------------------------------------------------------------------
+
+_T5729_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-5729-corrections.jsonl"
+)
+_T5729_ANNOTATION_SESSION = "task-5729-ef7f6a5c-reroute"
+_T5729_MISFILED_SESSION = "ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf"
+_T5729_MISFILED_DATE = "2026-09-20"
+_T5729_HOME_ENTRY_ID = "entry-cand-20260722-18"
+_T5729_MISFILED_NOTE = (
+    "The periodic-census verifier encountered the em-dash issue itself while "
+    "verifying the cluster. Turns 42, 46, 54, 83, 97 show repeated "
+    "ansi_c_string encoding rejections when constructing heredocs with "
+    "embedded em-dashes. Error neighborhoods confirm SyntaxError with U+2014 "
+    "character and multiple failed Bash commands attempting to work with the "
+    "problematic em-dash pattern."
+)
+
+
+def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
+    """The misfiled sighting is annotated where it was filed and re-routed to
+    the entry whose mechanism it shows, both through the sole writer.
+
+    (1) ANNOTATION — a note-only correction on the misfiled entry, absorbed as
+        `_assert_correction_absorbed` defines it, the entry still open.
+    (2) REPLACES NO EXPLANATION — the annotation supplies no title, cause or
+        status.
+    (3) ANNOTATED, NOT RETRACTED — the misfiled sighting keeps its own note.
+    (4) LINK — the annotation names the session it annotates and its new home.
+    (5) ROUTE — one match op, under the real session and date, on the home
+        entry, naming where it was misfiled; carried once, field for field.
+    (6) ROUTE NO-OP — re-applying the route changes nothing.
+    """
+    _, correction, entry = _assert_correction_absorbed(
+        _T5729_RECORD_PATH,
+        _T5729_ANNOTATION_SESSION,
+        _T5687_ENTRY_ID,
+        refuted_tokens=_T5687_REFUTED_TOKENS,
+        expected_status="open",
+        original_sightings={_T5729_MISFILED_SESSION: _T5729_MISFILED_DATE},
+    )
+
+    # (2) REPLACES NO EXPLANATION.
+    rewritten = {"title", "cause", "status"} & correction.keys()
+    assert rewritten == set(), (
+        f"the {_T5729_ANNOTATION_SESSION!r} correction writes {sorted(rewritten)} "
+        f"of {_T5687_ENTRY_ID!r} — that entry's framing is owned by task 5687's "
+        "record; this one only annotates a sighting"
+    )
+
+    # (3) ANNOTATED, NOT RETRACTED.
+    notes = [s.get("note") for s in _sightings_for(entry, _T5729_MISFILED_SESSION)]
+    assert notes == [_T5729_MISFILED_NOTE], (
+        f"the {_T5729_MISFILED_SESSION!r} sighting of {_T5687_ENTRY_ID!r} now "
+        f"carries {notes!r} — a dated observation is immutable: it is corrected "
+        "by the sibling annotation sighting, never rewritten"
+    )
+
+    # (4) LINK.
+    unnamed = [
+        ident
+        for ident in (_T5729_MISFILED_SESSION, _T5729_HOME_ENTRY_ID)
+        if ident not in correction["note"]
+    ]
+    assert unnamed == [], (
+        f"the annotation note does not name {unnamed} — naming them is the only "
+        "link from an annotation to the sighting it annotates and its new home"
+    )
+
+    # (5) ROUTE.
+    route = _session_record(_T5729_RECORD_PATH, _T5729_MISFILED_SESSION)
+    assert route.get("date") == _T5729_MISFILED_DATE, (
+        f"the route must keep the observation's own date, not {route.get('date')!r}"
+    )
+    assert not route.get("corrections") and not route.get("candidates"), (
+        "the route only adds a sighting; it rewrites no entry and files nothing new"
+    )
+    matches = route.get("matches") or []
+    assert len(matches) == 1, f"expected exactly one match op, got {len(matches)}"
+    match = matches[0]
+    assert match.get("entry_id") == _T5729_HOME_ENTRY_ID
+    assert _T5687_ENTRY_ID in match.get("note", ""), (
+        f"the route note does not name {_T5687_ENTRY_ID!r}, where the sighting "
+        "was misfiled and still stands"
+    )
+
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+    _assert_sighting_carries(route, match, _live_entry(codebook, _T5729_HOME_ENTRY_ID))
+
+    # (6) ROUTE NO-OP.
+    merge = _merge_one(codebook, route)
+    assert _report(merge) == _clean_report(), (
+        f"re-applying the route changed something — the committed codebook has "
+        f"not fully absorbed it: {merge.summary()}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # task 6402 (census PRD leaf L3, C1): finding identity, run history and ticket
 # fields on entries and candidates. Every field is optional; each rejection
 # names the field path and carries the offending value (INV-2).
@@ -2661,6 +2792,50 @@ def test_validate_rejects_a_filed_ticket_row_missing_its_step():
     del row["step"]
     codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[row]))
     assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "step")
+
+
+def test_a_back_link_filed_before_finding_keys_existed_validates():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key=None)]))
+    assert mod.validate(codebook) == []
+
+
+def test_a_malformed_finding_key_on_a_filed_ticket_row_is_still_rejected():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key="fk-ZZZ")]))
+    assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "fk-ZZZ")
+
+
+def test_a_historical_backfill_marker_validates():
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = {"run_id": _C1_RUN, "unmatched_task_ids": [5330]}
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize(
+    "marker, path, offending",
+    [
+        ({"run_id": "", "unmatched_task_ids": []}, "run_id", ""),
+        ({"run_id": _C1_RUN, "unmatched_task_ids": ["5330"]}, "unmatched_task_ids/0", "5330"),
+        ({"unmatched_task_ids": []}, "", "run_id"),
+    ],
+    ids=["empty-run", "string-task-id", "no-run"],
+)
+def test_validate_rejects_a_malformed_historical_backfill_marker(marker, path, offending):
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = marker
+    assert _c1_errors_naming(codebook, f"{mod.HISTORICAL_BACKFILL}/{path}".rstrip("/"), offending)
+
+
+def test_filed_ticket_errors_accepts_a_well_formed_row_keyed_or_not():
+    assert mod.filed_ticket_errors(_c1_ticket()) == []
+    assert mod.filed_ticket_errors(_c1_ticket(finding_key=None)) == []
+
+
+def test_filed_ticket_errors_names_the_offending_field_or_value():
+    unresolved = _c1_ticket()
+    del unresolved["resolution"]
+
+    assert any("guess" in error for error in mod.filed_ticket_errors(_c1_ticket(step="guess")))
+    assert any("resolution" in error for error in mod.filed_ticket_errors(unresolved))
 
 
 def test_validate_rejects_an_accepted_entry_without_accepted_by():

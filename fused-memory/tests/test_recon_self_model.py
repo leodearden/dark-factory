@@ -662,6 +662,75 @@ class TestPremiseLint:
             setattr(v, 'premise', 'mutated')  # noqa: B010
 
 
+class TestMarkerDeletionPremise:
+    """The rule flags "Stage 3 / remediation / the LLM deletes a marker"
+    within one clause. A clause ends at `.`, `;`, a newline or a negation cue
+    (not/never/n't); a line break inside the subject or marker name does not
+    end it."""
+
+    INVARIANT = 'markers_deleted_only_by_gc'
+
+    def _invariants(self, text: str) -> set[str]:
+        return {v.invariant for v in m.premise_lint(text)}
+
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'The LLM removes the stage1_flag_marker once resolved.',
+            'Remediation purges the flag_for_stage2 records.',
+            'stage3 clears the marker',
+            'Stage\n3 deletes the marker.',
+            'Stage 3 deletes the flag\nmarker.',
+            'Stage 3 deletes the stale entries and the marker.',
+        ],
+    )
+    def test_flags_the_claim(self, claim):
+        assert self.INVARIANT in self._invariants(claim)
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'Stage 3 remediation does not delete the flag marker.',
+            "Stage 3 remediation doesn't remove the marker.",
+            'Stage 3 never clears the stage1_flag_marker.',
+            'Stage 3 deletes the stale task, not the marker.',
+            'Stage 3 remediation deletes the task; GC later deletes the marker.',
+            'GC deletes the marker after Stage 3 runs.',
+            'Stage 3 remediation runs\nGC deletes the marker on terminal task.',
+        ],
+    )
+    def test_does_not_flag(self, text):
+        assert self.INVARIANT not in self._invariants(text)
+
+    BUDGET_SECONDS = 1.0
+
+    @pytest.mark.parametrize(
+        ('near_miss', 'length'),
+        [
+            ('stage 3 deletes ', 4_800),
+            ('stage 3 ', 40_000),
+        ],
+        ids=['subject-verb-pairs', 'subjects'],
+    )
+    def test_lint_time_is_linear_in_clause_length(self, near_miss, length):
+        """`premise_lint` runs synchronously on the `submit_task` path; the
+        real claim in the clause after the near-misses pins correctness
+        alongside cost."""
+        text = (
+            near_miss * (length // len(near_miss))
+            + '. '
+            + 'Stage 3 remediation deletes the flag marker.'
+        )
+        started = time.perf_counter()
+        invariants = self._invariants(text)
+        elapsed = time.perf_counter() - started
+        assert self.INVARIANT in invariants
+        assert elapsed < self.BUDGET_SECONDS, (
+            f'premise_lint took {elapsed:.3f}s on {len(text)} characters '
+            f'(budget {self.BUDGET_SECONDS}s)'
+        )
+
+
 class TestNegativeProbeSetPremise:
     """Task 4644: a negative mixed-store probe set licenses "0 of N
     reproduced" and nothing stronger. Run cd53b227 promoted one negative probe
