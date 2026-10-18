@@ -4772,6 +4772,7 @@ class TaskWorkflow:
         revalidation_changed_files: list[str] = []
         build_prompt: PromptBuilder
         existing_plan = self.artifacts.read_plan()
+        finalized_before_invoke = existing_plan.get('_finalized_at')
         if (
             existing_plan
             and existing_plan.get('steps')
@@ -5159,7 +5160,7 @@ class TaskWorkflow:
             return outcome
 
         # Stamp provenance and acquire lock (run_id — task 3563; see _drive)
-        await self._stamp_authored_plan()
+        await self._stamp_architect_plan(finalized_before_invoke)
         self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
@@ -5245,6 +5246,24 @@ class TaskWorkflow:
                 },
             )
         return drift
+
+    async def _stamp_architect_plan(self, finalized_before_invoke: object) -> None:
+        """Mint the text fingerprint only when this pass confirmed the plan.
+
+        confirm_plan() rewrites ``_finalized_at``, so an unchanged marker means
+        the architect left the prior plan untouched (salvaged after a cap, or
+        exited without confirming) and the plan keeps the fingerprint it has.
+        """
+        assert self.artifacts is not None
+        if self.plan.get('_finalized_at') != finalized_before_invoke:
+            await self._stamp_authored_plan()
+        else:
+            self.artifacts.stamp_plan_provenance(self.session_id)
+
+    def _stamped_task_text_fp(self) -> str | None:
+        assert self.artifacts is not None
+        fp = self.artifacts.read_plan().get(PLAN_TASK_TEXT_FP_KEY)
+        return fp if isinstance(fp, str) else None
 
     async def _stamp_authored_plan(self) -> None:
         """Provenance-stamp a plan just authored against ``self.task`` and mirror its text fingerprint."""
@@ -8186,6 +8205,7 @@ class TaskWorkflow:
                 f'Task {self.task_id}: review cycle {review_cycle}, '
                 f'{len(reviews.blocking_issues)} blocking issues'
             )
+            stamped_fp = self._stamped_task_text_fp()
             await self._replan(reviews)
             # Re-stamp provenance — architect may have overwritten plan.json
             assert self.artifacts is not None
@@ -8202,7 +8222,9 @@ class TaskWorkflow:
                 )
             if outcome := await self._validate_prerequisites_or_block('replan'):
                 return outcome
-            await self._stamp_authored_plan()
+            self.artifacts.stamp_plan_provenance(
+                self.session_id, task_text_fp=stamped_fp,
+            )
             # Task 2874: the architect may have WIDENED plan.files while
             # addressing review feedback ("you may add new steps"), so route
             # the possibly-widened files through the same scope-

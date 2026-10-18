@@ -743,3 +743,47 @@ async def test_mirror_failure_never_fails_the_plan(tmp_path: Path, mirror_failur
     assert f.artifacts.read_plan()['_task_text_fp'] == task_text_fingerprint(
         'd, amended', None,
     )
+
+
+def _finalize_fixture_plan(f: _Fixture) -> None:
+    plan_path = f.artifacts.root / 'plan.json'
+    plan = json.loads(plan_path.read_text())
+    plan['_finalized_at'] = '2026-10-01T00:00:00+00:00'
+    plan_path.write_text(json.dumps(plan))
+
+
+def _untouching_architect(f: _Fixture, *, success: bool) -> None:
+    """An architect that never calls confirm_plan(): budget-capped, or done early."""
+    async def _leave_plan(_role, build_prompt, *args, **kwargs) -> AgentResult:
+        await build_prompt()
+        return AgentResult(
+            success=success, output='', cost_usd=3.0, duration_ms=60_000, turns=40,
+        )
+
+    f.wf._invoke = AsyncMock(side_effect=_leave_plan)  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize('success', [False, True], ids=['capped', 'no_confirm'])
+@pytest.mark.parametrize(
+    'stale_fp', [task_text_fingerprint('d', None), None], ids=['stamped', 'unstamped'],
+)
+@pytest.mark.asyncio
+async def test_unconfirmed_revalidation_never_mints_a_fingerprint(
+    tmp_path: Path, success: bool, stale_fp: str | None,
+):
+    """The amended text must not be certified onto a plan no architect re-read,
+    or the drift would self-clear and the stale plan would skip forever."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_description='d, amended',
+        plan_text_fp=stale_fp,
+    )
+    _finalize_fixture_plan(f)
+    _untouching_architect(f, success=success)
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert f.artifacts.read_plan().get('_task_text_fp') == stale_fp
+    assert _mirror_writes(f) == []
+    assert 'plan_text_fp' not in f.wf.task['metadata']
