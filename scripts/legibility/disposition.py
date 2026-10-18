@@ -215,7 +215,9 @@ class BackLink:
 
 @dataclass(frozen=True)
 class Decision:
-    """What the dedup protocol decided for one Filing, and at which step."""
+    """What the dedup protocol decided for one Filing, and at which step.
+    *awaiting_ticket* is an earlier run's ticket for the filing's entry that
+    the curator still holds, which stopped this one before steps 2-3."""
 
     filing: Filing
     step: Step
@@ -224,6 +226,7 @@ class Decision:
     task_id: int | None = None
     resolution: Resolution | None = None
     note: str | None = None
+    awaiting_ticket: str | None = None
 
     @property
     def routed(self) -> bool:
@@ -240,8 +243,9 @@ class Decision:
             return str(Disposition(kind, self.task_id))
         if self.resolution is not None:
             return f"{_OPEN} (ticket {self.ticket} {self.resolution.value})"
-        if self.ticket is not None:
-            return f"{_OPEN} (ticket {self.ticket} pending)"
+        pending = self.ticket if self.ticket is not None else self.awaiting_ticket
+        if pending is not None:
+            return f"{_OPEN} (ticket {pending} pending)"
         return str(_OPEN)
 
     def with_outcome(self, outcome: task_store.TicketOutcome) -> Decision:
@@ -416,14 +420,21 @@ def _decide(
     *,
     store: task_store.TaskStore,
     submit: Callable[..., Any] | None,
+    awaiting: str | None,
 ) -> Decision | None:
-    if found is None:
-        return _past_step_one(filing, store=store, submit=submit)
-    if found.standing is Standing.DONE and filing.verified_present:
-        superseding = filing if filing.supersedes_task is not None else filing.superseding(found.task_id)
+    """Contract §8 for one filing after its step-1 lookup found *found*. A
+    filing that would go on to steps 2-3 while its entry's earlier ticket
+    *awaiting* is undecided stops there: that ticket may yet be its task."""
+    onward, note = filing, None
+    if found is not None:
+        if found.standing is not Standing.DONE or not filing.verified_present:
+            return Decision(filing, Step.KEY, found.standing, task_id=found.task_id, resolution=Resolution.EXISTING)
+        onward = filing if filing.supersedes_task is not None else filing.superseding(found.task_id)
         note = f"§8 step 1c: done task {found.task_id} carries the key and the finding is still present"
-        return _past_step_one(superseding, store=store, submit=submit, note=note)
-    return Decision(filing, Step.KEY, found.standing, task_id=found.task_id, resolution=Resolution.EXISTING)
+    if awaiting is not None:
+        held = f"§8 dedup: ticket {awaiting}, filed for this entry by an earlier run, still awaits the curator"
+        return Decision(onward, Step.CURATOR, awaiting_ticket=awaiting, note=_notes(note, held))
+    return _past_step_one(onward, store=store, submit=submit, note=note)
 
 
 def _same_key_as(filing: Filing, earlier: Decision) -> Decision:
@@ -442,13 +453,17 @@ def dispose(
     *,
     store: task_store.TaskStore,
     submit: Callable[..., Any] | None,
+    awaiting: Mapping[str, str] | None = None,
 ) -> Disposal:
     """Run contract §8 over *filings*. Every step-1 lookup runs before any
     filing, so a store that cannot answer one files nothing at all. A filing
     whose key an earlier filing of this run was already routed under is
-    linked to that work, never filed again. With *submit* None (a dry run)
-    the protocol stops before step 3."""
+    linked to that work, never filed again; nor is one whose entry is in
+    *awaiting* (entry id -> the earlier run's ticket the curator has not
+    decided, :attr:`Outcomes.awaiting`) once step 1 sends it onward. With
+    *submit* None (a dry run) the protocol stops before step 3."""
     filings = tuple(filings)
+    held_tickets = awaiting or {}
     try:
         found = [_key_lookup(filing, store) for filing in filings]
     except task_store.StoreUnreachable as exc:
@@ -459,8 +474,11 @@ def dispose(
     routed_by_key: dict[str, Decision] = {}
     for filing, hit in zip(filings, found, strict=True):
         earlier = None if filing.finding_key is None else routed_by_key.get(filing.finding_key)
+        held_by = None if filing.entry_id is None else held_tickets.get(filing.entry_id)
         decision = (
-            _decide(filing, hit, store=store, submit=submit) if earlier is None else _same_key_as(filing, earlier)
+            _decide(filing, hit, store=store, submit=submit, awaiting=held_by)
+            if earlier is None
+            else _same_key_as(filing, earlier)
         )
         if decision is None:
             unfiled.append(filing)
