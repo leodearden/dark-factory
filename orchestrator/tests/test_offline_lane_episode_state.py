@@ -36,9 +36,11 @@ from _lane_episode_fakes import (
     _red,
     _run,
 )
+from shared.lane_probe import OUTAGE_EXIT_STATUS
 
 from orchestrator.guard_state import PersistentMap
 from orchestrator.offline_lane_confirm import (
+    Outage,
     Unconfirmable,
     UnconfirmableReason,
 )
@@ -50,9 +52,16 @@ from orchestrator.offline_lane_episode_state import (
     EpisodeStore,
     LanePolicy,
     PassObservation,
+    apply_outage,
+    recheck_due,
     unconfirmable_node,
 )
 from orchestrator.offline_lane_filing import EvidenceNote
+from orchestrator.offline_lane_records import ProbeKind, ProbeResult
+
+OUTAGE_PROBE = ProbeResult(ProbeKind.OUTAGE, OUTAGE_EXIT_STATUS, 'qdrant: get collections: ConnectError',
+                           'qdrant: get collections: ConnectError', 1.5)
+PI_KEYS = ('probe_broken_escalation_id', 'last_probe_at', 'probe_record_behind')
 
 # --- records and store -------------------------------------------------------------
 
@@ -75,12 +84,15 @@ def _full_record() -> CommandRecord:
         ended,
         rechecks={HEAD1: 1},
         outage_escalation_id='esc-2',
-        last_probe_result={'result': 'up'},
+        last_probe_result=OUTAGE_PROBE,
         last_pass_started_at=T0,
         last_pass_head=HEAD1,
         last_pass_id='p0',
         last_green_head=HEAD0,
         stuck_filing_escalation_id='esc-3',
+        probe_broken_escalation_id='esc-4',
+        last_probe_at=T0 + SPACED,
+        probe_record_behind=True,
     )
 
 
@@ -88,6 +100,40 @@ def test_a_command_record_survives_a_json_round_trip():
     record = _full_record()
 
     assert CommandRecord.from_json(json.loads(json.dumps(record.to_json()))) == record
+
+
+def test_a_record_written_before_the_probe_fields_loads_whole_with_their_defaults(tmp_path: Path):
+    payload = _full_record().to_json()
+    for key in PI_KEYS:
+        del payload[key]
+    _stored_raw(tmp_path, COMMAND, payload)
+
+    record = EpisodeStore(tmp_path, clock=Clock()).load(COMMAND)
+
+    assert record == replace(
+        _full_record(), probe_broken_escalation_id=None, last_probe_at=None, probe_record_behind=False,
+    )
+    assert record.episodes[A].covering_task_id == '9001'
+    assert (record.episodes[A].escalation_id, record.outage_escalation_id) == ('esc-1', 'esc-2')
+
+
+@pytest.mark.parametrize('key', ['last_pass_id', 'last_probe_result', 'outage_escalation_id'])
+def test_a_record_missing_a_key_older_than_the_probe_fields_is_refused(key: str):
+    payload = _full_record().to_json()
+    del payload[key]
+
+    with pytest.raises(ValueError, match=key):
+        CommandRecord.from_json(payload)
+
+
+def test_an_outage_observation_carries_the_probe_that_answered_it():
+    with pytest.raises(ValueError):
+        replace(_observation(), outcome=Outage(OUTAGE_PROBE))
+
+
+def test_a_legacy_observation_carries_no_probe():
+    with pytest.raises(ValueError):
+        replace(_observation(), leg='numeric', lane_command=None, probe=OUTAGE_PROBE)
 
 
 def test_a_due_episode_without_its_reproduce_line_is_refused():
@@ -479,3 +525,48 @@ def test_no_unlanded_escalation_for_a_contained_released_stale_or_unread_task(ve
     applied = _apply(_record(_covered(last_counted_started_at=at - SPACED)), _red(at=at), verdicts={A: verdict})
 
     assert applied.unlanded == ()
+
+
+# --- D5's outage row and D12's outage hold -----------------------------------------
+
+
+def _outage_pass(**fields) -> PassObservation:
+    return replace(_observation(**fields), outcome=Outage(OUTAGE_PROBE), probe=OUTAGE_PROBE)
+
+
+def test_apply_pass_refuses_an_outage_pass():
+    with pytest.raises(ValueError, match='apply_outage'):
+        _apply(_record(_episode()), _outage_pass())
+
+
+def test_an_outage_pass_marks_every_live_episode_and_changes_nothing_else():
+    live = _episode(A)
+    covered = _covered(B)
+    ended = _episode(C, ended_at=T0)
+    record = replace(
+        _record(live, covered, ended, rechecks={HEAD0: 1}, last_pass_started_at=T0, last_pass_head=HEAD0,
+                last_pass_id='p0', last_green_head=HEAD0),
+        leg=None, fix_task_priority=None,
+    )
+
+    after = apply_outage(record, _outage_pass(pass_id='p1', head=HEAD1, at=T0 + 2 * SPACED))
+
+    assert after.episodes == {
+        A: replace(live, had_outage_pass=True),
+        B: replace(covered, had_outage_pass=True),
+        C: ended,
+    }
+    assert after == replace(record, episodes=after.episodes, leg='generic', fix_task_priority='medium')
+
+
+def test_apply_outage_takes_an_outage_pass_only():
+    with pytest.raises(ValueError):
+        apply_outage(_record(_episode()), _red())
+
+
+def test_no_recheck_falls_due_while_the_command_is_in_an_outage():
+    record = _record(_episode(last_counted_started_at=T0), last_pass_started_at=T0)
+    now = T0 + POLICY.recheck
+
+    assert recheck_due(record, HEAD1, POLICY, now) is not None
+    assert recheck_due(replace(record, last_probe_result=OUTAGE_PROBE), HEAD1, POLICY, now) is None

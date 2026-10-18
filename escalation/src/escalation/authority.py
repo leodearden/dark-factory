@@ -81,12 +81,16 @@ PROMOTE_ALLOWED: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY})
 # under a caller-chosen REAL id, it becomes a record every veto predicate reads
 # on that task, so the alarm about a hold becomes part of the hold
 # (esc-5469-11).
-# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE; the full
-# WHY is at orchestrator/src/orchestrator/recovery_emission.py::
+# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE and
+# orchestrator.offline_lane_escalations.LANE_ESCALATION_ROLE; the full WHY is at
+# orchestrator/src/orchestrator/recovery_emission.py::
 # RECOVERY_VETO_STREAK_SENTINEL_PREFIX. Duplicated (not imported) to preserve
 # the escalation -> orchestrator layer direction; pinned in lockstep by
 # tests/test_authority.py.
-PROMOTE_SENTINEL_BOUND_ROLES: frozenset[str] = frozenset({'orchestrator-recovery-veto-streak'})
+PROMOTE_SENTINEL_BOUND_ROLES: frozenset[str] = frozenset({
+    'orchestrator-recovery-veto-streak',
+    'orchestrator-offline-lane',
+})
 
 
 # ---------------------------------------------------------------------------

@@ -153,34 +153,73 @@ class TestAddMemoryEntitiesGate:
         mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_the_gate_is_category_independent(self):
-        """A Mem0-primary category that never routes to Graphiti STILL rejects.
+    @pytest.mark.parametrize(
+        'category',
+        ['observations_and_summaries', 'preferences_and_norms', 'procedural_knowledge'],
+    )
+    async def test_a_mem0_primary_write_is_never_conflict_rejected(self, category):
+        """The declaration on this write is discarded, so a conflict verdict
+        could only cost a false rejection (task 6059).
 
-        Scoping the gate to `write_graphiti` is the tempting optimization and
-        it is unimplementable at this seam: `category=None` auto-classifies
-        BELOW the tool boundary, so the tool structurally cannot know the
-        destination store without running the classifier a second time (INV-5).
-        It is also wrong on the merits — a declaration contradicting its own
-        prose is a defective assertion whichever store it lands in, and
-        accepting it for Mem0 writes would teach agents that `entities` is
-        advisory.
+        `search` answers no hits, so the procedural near-duplicate guard finds
+        nothing to block on and every category must reach the write.
         """
-        for category in ('observations_and_summaries', 'preferences_and_norms', None):
-            mock_service = AsyncMock()
-            _pass_through(mock_service)
-            server = create_mcp_server(mock_service)
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        _pass_through(mock_service)
+        server = create_mcp_server(mock_service)
 
-            result = await _call(server, category=category, entities=_CONFLICTING)
+        result = await _call(server, category=category, dual_write=False, entities=_CONFLICTING)
 
-            assert result.get('error_type') == 'DeclaredReferentConflictRejected', (
-                f'category={category!r} escaped the gate: {result!r}'
-            )
-            mock_service.add_memory.assert_not_called()
+        assert 'error' not in result, f'{result!r}'
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dual_write_still_rejects(self):
+        mock_service = AsyncMock()
+        _pass_through(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(
+            server, category='observations_and_summaries', dual_write=True, entities=_CONFLICTING,
+        )
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unclassified_write_still_rejects(self):
+        """`category=None` is classified BELOW the tool boundary, so the tool
+        cannot know the destination without running the classifier twice
+        (INV-5)."""
+        mock_service = AsyncMock()
+        _pass_through(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, category=None, entities=_CONFLICTING)
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_mem0_primary_write_still_rejects_a_malformed_declaration(self):
+        mock_service = AsyncMock()
+        _pass_through(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, category='observations_and_summaries', entities=_MALFORMED)
+
+        assert result.get('error_type') == 'ValidationError', f'{result!r}'
+        mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_rejection_is_cheap_no_embedding_round_trip(self):
         """Gate ORDERING: a self-contradictory declaration must not pay for the
         near-duplicate guard's embedding search or write triage's judge call.
+
+        dual_write=True keeps the declaration recorded, so it is conflict-
+        checked; the near-duplicate guard ignores dual_write, so the control
+        still reaches `search`.
 
         The control below is load-bearing — without it this assertion would
         also pass if `search` were simply never reachable for this input, and
@@ -190,7 +229,9 @@ class TestAddMemoryEntitiesGate:
         _pass_through(mock_service)
         server = create_mcp_server(mock_service)
 
-        await _call(server, category='procedural_knowledge', entities=_CONFLICTING)
+        await _call(
+            server, category='procedural_knowledge', dual_write=True, entities=_CONFLICTING,
+        )
 
         mock_service.search.assert_not_called()
 
@@ -198,7 +239,7 @@ class TestAddMemoryEntitiesGate:
         _pass_through(control)
         control_server = create_mcp_server(control)
 
-        await _call(control_server, category='procedural_knowledge')
+        await _call(control_server, category='procedural_knowledge', dual_write=True)
 
         assert control.search.call_count, (
             'the control never reached the near-duplicate search, so the '
@@ -420,7 +461,7 @@ class TestAddEpisodeEntitiesGate:
             server,
             content=_COMPLETION_CONTENT,
             agent_id='recon-stage-task_knowledge_sync',
-            entities=_CONFLICTING,
+            entities=[{'kind': 'task', 'id': 5253}],
         )
 
         assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'

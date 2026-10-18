@@ -66,7 +66,7 @@ inspects the executed ``ModuleConfig``(s) / ``VerifyResult.plan`` /
 ``VerifyResult.summary``. The CONSUMER/merge-gate side drives the REAL
 ``_run_post_merge_verify`` chokepoint (merge_queue.py), opting OUT of the
 autouse ``_mock_merge_queue_verification`` stub via
-``@pytest.mark.exercise_merge_verify`` so ``orchestrator.merge_queue.
+``@pytest.mark.exercise_merge_verify`` so ``orchestrator.merge_lane.worker.
 run_scoped_verification`` stays bound to the REAL function — which, in turn,
 calls the SAME patched ``orchestrator.verify.run_verification`` fake. One
 patched seam, two chokepoints, both real end-to-end.
@@ -124,7 +124,7 @@ from orchestrator import verify, verify_plan
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
@@ -738,7 +738,7 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
         shared_git_ops = _make_git_ops(tmp_path)
         probe_spy = AsyncMock(wraps=verify_failure_is_preexisting_on_main)
         with patch(
-            'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
             new=probe_spy,
         ):
             outcome1 = await _drive_merge_gate(
@@ -991,7 +991,7 @@ def _three_module_train_registry(
     scoped``). A ``None`` ``type_check_command`` keeps
     ``_run_unscoped_typechecks``'s ``active`` list empty, so neither call
     ever spawns a real, unpatched ``pyright`` subprocess — that function is
-    reached via ``orchestrator.merge_queue``'s OWN imported
+    reached via ``orchestrator.merge_lane.worker``'s OWN imported
     ``run_verification`` reference, a DIFFERENT binding from the
     ``orchestrator.verify.run_verification`` seam this module patches
     everywhere else, so it would not be faked away like the scoped phase is.
@@ -1076,7 +1076,7 @@ class TestRow7TrainAmortizationOneFullBreadthVerify:
         lane = MergeLane(git_ops, queue, event_store=spy_events)
 
         with (
-            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=_spy_verify),
+            patch('orchestrator.merge_lane.worker.run_scoped_verification', side_effect=_spy_verify),
             patch.object(verify, 'run_verification', new=run_verification_fake),
         ):
             outcome = await merge_through_lane(lane, queue, req)

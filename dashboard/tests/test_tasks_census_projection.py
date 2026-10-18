@@ -414,7 +414,7 @@ def _census_client(mode: str, url: str = '', body: dict | None = None):
     import subprocess
     from pathlib import Path
 
-    from _lock_chip_matrix import node_path
+    from _dashboard_helpers import node_path
 
     redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
     result = subprocess.run(

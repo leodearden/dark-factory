@@ -23,6 +23,7 @@ from orchestrator.guard_state import guard_path
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
+    Outage,
     Unconfirmable,
 )
 from orchestrator.offline_lane_episode_state import (
@@ -109,7 +110,7 @@ def _observation(
     pass_id: str = 'p1',
     at: datetime = T0 + SPACED,
     head: str = HEAD1,
-    outcome: Confirmed | Unconfirmable | None = None,
+    outcome: Confirmed | Unconfirmable | Outage | None = None,
     detect: RunRecord | None = None,
     notes: tuple[EvidenceNote, ...] = (),
 ) -> PassObservation:
@@ -292,7 +293,8 @@ class FakeLedgerClient:
 
 
 class FakeAncestry:
-    def __init__(self) -> None:
+    def __init__(self, *, deep_worktree: Path = Path('/nonexistent/_offline-deep')) -> None:
+        self.persistent_offline_deep_worktree_path = deep_worktree
         self.answers: dict[tuple[str, str], bool | None] = {}
         self.calls: list[tuple[str, str]] = []
         self.failure: Exception | None = None

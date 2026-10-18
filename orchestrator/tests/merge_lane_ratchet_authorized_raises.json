@@ -3313,6 +3313,96 @@
           "current": 31945
         }
       ]
+    },
+    {
+      "task_id": "6861",
+      "reason": "GitOps.is_ancestor_checked: the ancestry read tells a git error (None) from a no (False), so the lane engine's D10 'no decision' row and \u03b50's drain can read it; is_ancestor delegates to it (net-additive: +10 lines, +2 cognitive, +1 prose in git_ops.py; every other measure fell or held \u2014 offline_lane.py 957->381 lines)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1444,
+          "current": 1446
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15997,
+          "current": 16007
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9318,
+          "current": 9319
+        }
+      ]
+    },
+    {
+      "task_id": "5037",
+      "reason": "Task 5037 re-points test string patch targets from the pre-package satellite aliases (orchestrator.merge_gates, orchestrator.merge_liveness) to orchestrator.merge_lane.<submodule>. LANE_PATCH_MODULES listed only orchestrator.merge_queue among the old paths, so these same names were patched before but invisible to the measure; they now count as '<submodule>.<leaf>' (gates._run, gates._check_plan_files_touched_in_branch, gates.resolve_already_landed_branch, liveness._MERGE_AHEAD_BOUND, liveness.per_host_inflight_bound). No new coupling: each patch hits the identical binding the alias named.",
+      "measures": [
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_convert_to_blocked.py",
+          "baseline": 3,
+          "current": 5
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_gates_drop_guard_rename.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_gates_equivalence_rename.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_gates_plan_files_rename.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_serial_lane_tripwire.py",
+          "baseline": 1,
+          "current": 2
+        }
+      ]
+    },
+    {
+      "task_id": "5037",
+      "reason": "Task 5037 rewrote the line 'from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402' in orchestrator/tests/conftest.py, which changed its INV-12 inline-suppression key, so scripts/inline_suppressions.py --check rejected the suppression as new and unowned. Rather than mint a debt owner for it, the import moved into _isolated_merge_provenance, the only fixture that uses the two names, where it needs no E402 suppression. That trades one suppression for one function-local import (6 -> 7); lines hold at 1254.",
+      "measures": [
+        {
+          "measure": "function_local_imports",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 6,
+          "current": 7
+        },
+        {
+          "measure": "total:function_local_imports",
+          "key": "<cluster>",
+          "baseline": 22,
+          "current": 23
+        }
+      ]
+    },
+    {
+      "task_id": "6862",
+      "reason": "new lane-importing test file test_offline_lane_policy_reload.py enters the ratchet with one private read, OfflineLaneWorker._run_once; test_offline_lane.py already reads _run_once about 20 times among its 38 private reads, and the worker has no public single-pass entry point",
+      "measures": [
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6556,
+          "current": 6557
+        }
+      ]
     }
   ]
 }

@@ -35,6 +35,7 @@ _SWEPT_SCRIPTS = tuple(
         "scripts/memory-metadata-coverage-census.sh",
         "scripts/verify-migration.sh",
         "scripts/run_eval_matrix.sh",
+        "scripts/deploy/install_laptop_merge_verify_trim.sh",
         "orchestrator/scripts/warm-lane/provision-warm-lane-fs.sh",
         "orchestrator/scripts/warm-lane/thin-warm-lane.sh",
         "orchestrator/scripts/warm-lane/warm-lane-disk-guard.sh",

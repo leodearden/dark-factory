@@ -58,6 +58,7 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
@@ -630,6 +631,21 @@ INCOMPLETE_KINDS = INCOMPLETE_STRUCTURAL_KINDS | {
 """Every incompleteness kind: the vocabulary ``incomplete_kind`` is drawn from."""
 
 
+# An edge is ACTIVE iff `invalid_at` IS NULL.  `expired_at` is deliberately NOT
+# part of it: graphiti_core never sets `expired_at` without also setting
+# `invalid_at` (graphiti_core/utils/maintenance/edge_operations.py::
+# resolve_extracted_edge and ::resolve_edge_contradictions), so it retires
+# nothing `invalid_at` misses — while the restore hooks clear `invalid_at` and
+# keep `expired_at` as the restored-edge signature (redirect_node_edges), so an
+# `expired_at` clause would hide exactly the edges they restore (task 4714,
+# esc-4714-9).
+#
+# Every read answering "what is currently true?" interpolates this constant.
+# Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
+# retired edges; `count_foreign_relationships` most emphatically so.
+_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL'
+
+
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and
 # are therefore directly comparable.
@@ -640,7 +656,7 @@ INCOMPLETE_KINDS = INCOMPLETE_STRUCTURAL_KINDS | {
 # reshuffle at a boundary drops rows permanently and silently.
 _ALL_VALID_EDGES_MATCH = (
     'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
+    f'WHERE {_ACTIVE_EDGE_PREDICATE} '
 )
 _VALID_EDGE_ROWS_PAGE_TAIL = (
     'RETURN n.uuid, e.uuid, e.fact, e.name '
@@ -1438,7 +1454,7 @@ _UUID_MEANS_LOAD = (
 # tests/test_write_time_identity.py::TestEnumerateRankedEntityNodesLiveFalkorDB,
 # which checks the two agree on a real server.
 _PROVENANCE_RANK_CLAUSE = (
-    'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+    f'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE {_ACTIVE_EDGE_PREDICATE} '
     'WITH n, count(DISTINCT e) AS edge_count '
     'OPTIONAL MATCH (:Episodic)-[m:MENTIONS]->(n) '
     'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
@@ -1815,7 +1831,8 @@ class GraphitiBackend:
         llm_client, embedder: when given, used instead of
         ``build_llm_client(cfg)`` and ``build_embedder(cfg)`` respectively, so a
         per-arm caller (e.g. the arm-runner harness) can wrap the client the
-        builder built before this backend shares it.
+        builder built before this backend shares it. The backend takes
+        ownership of an injected client: ``close()`` releases it.
         """
         cfg = self.config
 
@@ -2774,8 +2791,8 @@ class GraphitiBackend:
     async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
-        Matches the node as either source or target (undirected) and filters
-        edges where invalid_at IS NULL (i.e. not yet invalidated).
+        Matches the node as either source or target (undirected) and excludes
+        retired edges per ``_ACTIVE_EDGE_PREDICATE`` (``invalid_at`` set).
 
         Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
         unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
@@ -2794,7 +2811,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -2834,7 +2851,7 @@ class GraphitiBackend:
         WHAT IT ANSWERS, contrasted with its neighbour above.
         :meth:`get_valid_edges_for_node` answers "does this node still carry
         LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
-        ``invalid_at IS NULL``.  This one answers a different question:
+        ``_ACTIVE_EDGE_PREDICATE``.  This one answers a different question:
         "would deleting this node DESTROY ANYTHING?"  It is therefore
         deliberately UNTYPED and UNFILTERED, because
         :meth:`delete_entity_node` issues a bare
@@ -2938,8 +2955,8 @@ class GraphitiBackend:
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
-        Queries all RELATES_TO edges where invalid_at IS NULL and excludes the
-        node itself (self-loops excluded via ``m.uuid <> $uuid``).
+        Queries all active RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``) and
+        excludes the node itself (self-loops excluded via ``m.uuid <> $uuid``).
 
         Collects neighbours BEFORE deletion so the caller can refresh their
         summaries after the target node is removed (edges vanish with DETACH DELETE).
@@ -2957,7 +2974,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL AND m.uuid <> $uuid '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
             'RETURN DISTINCT m.uuid'
         )
         result = await graph.ro_query(cypher, {'uuid': uuid})
@@ -3195,8 +3212,8 @@ class GraphitiBackend:
         ``resolve_extracted_edges`` fast-path can catch, since those only
         see the edges before they converge onto the same node pair.
 
-        Queries the node's currently-valid (``invalid_at IS NULL``)
-        incident edges (undirected, so directed and reverse-directed exact
+        Queries the node's active (``_ACTIVE_EDGE_PREDICATE``) incident
+        edges (undirected, so directed and reverse-directed exact
         duplicates both collapse), delegates grouping + survivor selection
         to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
         ``bulk_remove_edges``.
@@ -3216,7 +3233,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -4706,7 +4723,7 @@ class GraphitiBackend:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
-        (non-invalidated) RELATES_TO edges, deduplicates their facts
+        RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``), deduplicates their facts
         (preserving order), joins them with newlines, and writes the result
         back to the node's summary property.
 
@@ -5885,7 +5902,7 @@ class GraphitiBackend:
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
-        """Shut down the driver."""
+        """Shut down the drivers, then release the SDK clients every Graphiti holds."""
         for cloned in self._cloned_drivers.values():
             with contextlib.suppress(Exception):
                 await cloned.close()
@@ -5893,13 +5910,28 @@ class GraphitiBackend:
         if self._driver is not None:
             with contextlib.suppress(Exception):
                 await self._driver.close()
+        await close_wrapped_sdk_clients(self._sdk_client_wrappers())
         self.client = None
         self._driver = None
         # Per-group clients each hold a driver that aliases an entry already
-        # closed above via the _cloned_drivers loop (or self._driver itself) —
-        # drop the references only; do NOT call .close() per-client, which
-        # would double-close the single shared FalkorDB connection.
+        # closed above via the _cloned_drivers loop (or self._driver itself), so
+        # Graphiti.close() is never called: it would double-close the single
+        # shared FalkorDB connection. Their SDK sub-clients were released above.
         self._group_clients.clear()
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
+
+    def _sdk_client_wrappers(self) -> list[object | None]:
+        """The backend's sub-clients, then those of every Graphiti it holds.
+
+        ``Graphiti.__init__`` mints its own client for any sub-client passed as
+        None, so the shared three alone would miss those.
+        """
+        graphitis = [g for g in (self.client, *self._group_clients.values()) if g is not None]
+        return [
+            self._llm_client,
+            self._embedder,
+            self._cross_encoder,
+            *(sub for g in graphitis for sub in (g.llm_client, g.embedder, g.cross_encoder)),
+        ]

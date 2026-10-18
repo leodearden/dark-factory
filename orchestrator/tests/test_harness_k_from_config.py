@@ -49,11 +49,11 @@ class TestHarnessKFromConfig:
     Patching strategy
     -----------------
     _start_merge_worker does a LOCAL import:
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             _MERGE_AHEAD_BOUND, SpeculativeMergeWorker,
             enforce_merge_liveness_margin, enforce_persistent_worktree_serial_lane,
         )
-    Patching the SOURCE module attribute (``orchestrator.merge_queue.*``) is
+    Patching the SOURCE module attribute (``orchestrator.merge_lane.worker.*``) is
     what the local import picks up at call time; patching ``orchestrator.harness.*``
     would have no effect because no module-level binding exists there.
     """
@@ -62,7 +62,7 @@ class TestHarnessKFromConfig:
         """Helper: build harness, patch, call _start_merge_worker, return mocks."""
         h = _build_harness(config)
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()), \
@@ -208,7 +208,7 @@ class TestStartMergeWorkerK2LivenessRepro:
 
         h = _build_harness(config)
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()), \

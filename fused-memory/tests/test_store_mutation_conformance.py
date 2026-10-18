@@ -767,6 +767,7 @@ EXPECTED_GUARDED_SCRIPTS: frozenset[str] = frozenset({
     'clear_malformed_empty_memory.py',
     'consolidate_namespace_families.py',
     'invalidate_fabricated_shipping_edges.py',
+    'lane_dependency_probe.py',
     'migrate_cross_graph_leak.py',
     'normalize_topic_slugs.py',
     'prune_recon_cycle_summaries.py',

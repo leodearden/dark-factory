@@ -806,9 +806,9 @@ on the offline lane. A further bump remains the wrong answer.
 
 **What the relocation costs, stated plainly.** Coverage moves post-merge, so a
 regression no longer blocks a merge. It surfaces instead through the lane's
-existing red path — confirm re-run (the flake filter) → node-id extraction →
-`compute_failing_test_set_fingerprint` → dedup'd autofiled fix task at `high` →
-L0 INFO escalation → staged L2 promotion — within one advance. Coverage is
+red path — a narrowed confirm re-run (the flake filter) → a held episode →
+one autofiled fix task at `high` once the red is reproduced on two spaced
+passes → one escalation if it outlives its task — within two passes. Coverage is
 *moved*, not lost, but it is strictly weaker than a pre-merge gate, and two
 obligations follow:
 

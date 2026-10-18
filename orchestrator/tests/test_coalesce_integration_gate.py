@@ -102,7 +102,7 @@ def _no_predecessor_interlock():
     """
     from unittest.mock import AsyncMock, patch
 
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
     return patch.object(
         SpeculativeMergeWorker, '_await_unadvanced_predecessor',
@@ -151,7 +151,7 @@ class TestScenario1:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             MergeOutcome,
             SpeculativeMergeWorker,
             enqueue_merge_request,
@@ -214,7 +214,7 @@ class TestScenario1:
         gate_entered = asyncio.Event()
 
         with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
+            'orchestrator.merge_lane.worker.run_scoped_verification',
             _gated_verify(gate_release, gate_entered),
         ):
             worker_task = asyncio.create_task(worker.run())
@@ -387,7 +387,7 @@ class TestScenario2:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Three branches:
         #   s21: adds file_overlap.py → old-side point range (0,0) on file_overlap.py
@@ -555,7 +555,7 @@ class TestScenario3:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Three disjoint-file branches — all mutually line-stackable.
         wt1 = await _make_branch_with_file(git_ops, 'ig_s31', 'file_s31.py', 's31 = 1\n')
@@ -726,7 +726,7 @@ class TestScenario4:
     ):
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             ItemLifecycleState,
             SpeculativeMergeWorker,
@@ -850,7 +850,7 @@ class TestBookkeeping:
 
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Two disjoint-file branches — both line-stackable → coalesce into 1 train.
         wt1 = await _make_branch_with_file(git_ops, 'ig_bk1', 'file_bk1.py', 'bk1 = 1\n')
@@ -902,7 +902,7 @@ class TestBookkeeping:
         gate_entered = asyncio.Event()
 
         with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
+            'orchestrator.merge_lane.worker.run_scoped_verification',
             _gated_verify(gate_release, gate_entered),
         ):
             worker_task = asyncio.create_task(worker.run())
@@ -953,7 +953,7 @@ class TestBookkeeping:
         # look-ahead) and DecidedItem has no cap_permit field at all
         # (never acquired _merge_ahead_cap), so trains are structurally exempt
         # from Mechanism 1 rather than merely defaulted to False.
-        from orchestrator.merge_queue import DecidedItem, GroupMergeRequest
+        from orchestrator.merge_lane.worker import DecidedItem, GroupMergeRequest
         train_items = [
             item for item in captured_items
             if isinstance(getattr(item, 'request', None), GroupMergeRequest)

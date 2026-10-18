@@ -27,8 +27,7 @@ from typing import Any, TypeVar
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
-from _dashboard_helpers import ScriptTagCollector
-from _lock_chip_matrix import node_path
+from _dashboard_helpers import ScriptTagCollector, node_path
 
 # ---------------------------------------------------------------------------
 # The finder

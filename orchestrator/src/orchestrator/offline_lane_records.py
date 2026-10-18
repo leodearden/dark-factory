@@ -32,7 +32,6 @@ LEGACY_INFRA_COMMAND = 'legacy_infra'
 LEGACY_COMMANDS: frozenset[str] = frozenset({LEGACY_NUMERIC_COMMAND, LEGACY_INFRA_COMMAND})
 
 _FAILURE_KINDS = frozenset({'failed', 'error'})
-_PROBE_RESULTS = frozenset({'up', 'outage', 'broken'})
 _PASS_ID_TIMESTAMP_FORMAT = '%Y%m%dT%H%M%S'
 _PASS_ID_TIMESTAMP_RE = re.compile(r'^\d{8}T\d{6}(?=-)')
 _SHELL_SIGNAL_RANGE = range(129, 193)
@@ -55,6 +54,17 @@ class Leg(StrEnum):
 class EndedBy(StrEnum):
     EXIT = 'exit'
     SIGNAL = 'signal'
+
+
+class ProbeKind(StrEnum):
+    """A ``ProbeResult.result``: D7's three readings of one outage probe's exit."""
+
+    UP = 'up'
+    OUTAGE = 'outage'
+    BROKEN = 'broken'
+
+
+_PROBE_RESULTS = frozenset(ProbeKind)
 
 
 def classify_exit(returncode: int) -> EndedBy:

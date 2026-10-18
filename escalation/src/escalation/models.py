@@ -643,7 +643,7 @@ class Escalation:
     # The evidence commit whose landing this filing could NOT attribute — the
     # `verdict.probe['citation']` of the rejected landing-evidence verdict
     # (task 4499).  Written at FILING time by
-    # `orchestrator.landing_evidence::file_unattributed_landing_escalation`,
+    # `orchestrator.merge_lane.landing_evidence::file_unattributed_landing_escalation`,
     # and read back AFTER the record has been resolved as the identity half of
     # the `(task_id, category, citation_sha)` triple that suppresses an
     # identical refile.  That read-after-resolve is the whole point: the reject

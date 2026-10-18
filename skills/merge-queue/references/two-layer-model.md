@@ -135,16 +135,18 @@ occupant when two entries share a host.
 
 ## 7. As-built symbol map
 
-> **Where the code lives (task 5036, PRD `plans/merge-lane-quality-prd.md` ζ2).** The lane is the
-> package `orchestrator/src/orchestrator/merge_lane/`; Location cells below are relative to it
-> unless they name another file. The old `orchestrator.merge_*` module paths
-> (`orchestrator/src/orchestrator/merge_queue.py`, `merge_types.py`, `merge_gates.py`, …) are now
-> thin module aliases that resolve to the new modules, and task 5037 deletes them — cite the
-> new paths. The façade `orchestrator.merge_lane` (`merge_lane/__init__.py`) lazily exports the
-> public surface (`MergeLane`, the request entry points, the value types, the reason constants,
-> the ports). `merge_queue.py` became `worker.py`; the other `merge_`-prefixed modules dropped the
-> prefix. `git_ops.py`, `lane_lifecycle.py`, `warm_lane_pool.py`, `offline_lane.py`,
-> `recover_main.py` and `suffix_graph.py` stayed outside the package.
+> **Where the code lives (tasks 5036 and 5037, PRD `plans/merge-lane-quality-prd.md` ζ2 and η).**
+> The lane is the package `orchestrator/src/orchestrator/merge_lane/`; Location cells below are
+> relative to it unless they name another file. The old `orchestrator.merge_*` module paths
+> (`merge_queue`, `merge_types`, `merge_gates`, … directly under `orchestrator`) were deleted by
+> task 5037 and no aliases remain, so importing one raises `ModuleNotFoundError`.
+> Importers use `orchestrator.merge_lane.<submodule>`, or the façade `orchestrator.merge_lane`
+> (`merge_lane/__init__.py`) for the names it exports: the public surface (`MergeLane`, the
+> request entry points, the value types, the reason constants, the ports). `merge_queue.py`
+> became `worker.py`; the other `merge_`-prefixed modules dropped the prefix. Every lane module
+> logs under the one logger name `orchestrator.merge_lane`. `git_ops.py`, `lane_lifecycle.py`,
+> `warm_lane_pool.py`, `offline_lane.py`, `recover_main.py` and `suffix_graph.py` stayed outside
+> the package.
 
 | Symbol | Location | Description |
 |--------|----------|-------------|
@@ -369,9 +371,8 @@ zero churn.
 
 **Reach-back convention:** the two tracker methods resolve the three worker-resident constants
 they read (`MERGE_LANES`, `MERGE_BOUNCE_CAP`, `NEEDS_REBASE_REASON_PREFIX`, all in
-`merge_lane/worker.py`) through a function-local deferred `from orchestrator.merge_queue import
-<name>` import (the `orchestrator.merge_queue` alias, until task 5037 re-points it at
-`orchestrator.merge_lane.worker`) rather than a top-level import, keeping `suffix_graph.py` free of
+`merge_lane/worker.py`) through a function-local deferred `from orchestrator.merge_lane.worker
+import <name>` import rather than a top-level import, keeping `suffix_graph.py` free of
 any top-level import of the worker (which would be a cycle, since the worker imports this module).
 
 | Symbol | Location | Description |

@@ -573,6 +573,8 @@ class EventType(StrEnum):
     # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
     reservation_install_blocked = 'reservation_install_blocked'
+    # reservation_expired reasons: owner-state ones on scheduler.py::Scheduler._park_hold_refusal,
+    # pin-phase ones on pin_reservation.py::PinReleaseReason.
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'
@@ -728,8 +730,14 @@ class EventType(StrEnum):
     # Audit (task 1333): exhaustive repo search found ZERO in-repo consumers
     # that ever filtered reservation_installed by data.reason == 'reserve_now'.
     # Downstream consumers outside this repo must migrate; see CHANGELOG.md.
+    # reserve_now_refused (task 6518): producer
+    # scheduler.py::Scheduler._phase_reserve_now, when the owner fails the
+    # park-hold predicate; the flag is consumed and nothing installs.  Data
+    # {reason}, in the owner-state reservation_expired vocabulary documented
+    # on scheduler.py::Scheduler._park_hold_refusal.
     reserve_now_armed = 'reserve_now_armed'
     reserve_now_consumed = 'reserve_now_consumed'
+    reserve_now_refused = 'reserve_now_refused'
 
     # Worktree hygiene (Fix B/C) — emitted when an orphaned or identity-
     # mismatched worktree is relocated to the sibling ``-orphaned`` base

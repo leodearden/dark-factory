@@ -35,6 +35,17 @@ _LEGACY_CONFIG_NAMES: Final = (
     'orchestrator/config.yaml',
 )
 
+_ON_OFF: Final = {'on': True, 'off': False}
+
+
+def _parse_on_off(var: str, raw: str) -> bool:
+    """Read an on/off env switch, refusing any other spelling loudly."""
+    try:
+        return _ON_OFF[raw.strip().lower()]
+    except KeyError:
+        spellings = ' or '.join(repr(s) for s in _ON_OFF)
+        raise ValueError(f'{var} must be {spellings}, got {raw!r}') from None
+
 
 def _read_escalation_url(yaml_path: Path) -> str | None:
     """Parse *yaml_path* and return its escalation MCP URL, or None.
@@ -198,6 +209,13 @@ class DashboardConfig:
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
     escalation_urls: dict[str, str] = field(default_factory=dict)
+    # Whether lifespan starts the two background samplers
+    # (dashboard/src/dashboard/loops.py::_burndown_loop / ::_metrics_loop), the
+    # only writers of the burndown and metrics history the charts read.
+    # Env DASHBOARD_SAMPLERS=on|off, default on. Under off that history stops
+    # accruing while every page still serves; that is how the test suite's
+    # function-scoped clients run (dashboard/tests/conftest.py::samplers_off).
+    samplers_enabled: bool = True
 
     def __post_init__(self) -> None:
         """Normalize all Path fields to their canonical (symlink-resolved) forms.
@@ -346,6 +364,8 @@ class DashboardConfig:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
         if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
             kwargs['known_project_roots'] = [Path(p.strip()) for p in roots.split(',') if p.strip()]
+        if (samplers := os.environ.get('DASHBOARD_SAMPLERS')) is not None:
+            kwargs['samplers_enabled'] = _parse_on_off('DASHBOARD_SAMPLERS', samplers)
 
         config = cls(**kwargs)
         if root is None:

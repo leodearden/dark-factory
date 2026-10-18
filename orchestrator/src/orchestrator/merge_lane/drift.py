@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from orchestrator.merge_lane.ports import VerifyPort
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 def _build_remote_runners(
@@ -129,7 +129,7 @@ def _load_drift_check_state(path: Path) -> DriftCheckState:
     Fail-safe: returns a default ``DriftCheckState()`` on any error (file not
     found, unreadable, unparseable JSON, or missing/wrong-typed keys) so the
     orchestrator never fails to start due to a corrupt state file.  Exact
-    mirror of :func:`orchestrator.merge_shadow._load_shadow_compare_state`.
+    mirror of :func:`orchestrator.merge_lane.shadow._load_shadow_compare_state`.
 
     Args:
         path: Path to the JSON state file (typically
@@ -149,7 +149,7 @@ def _save_drift_check_state(path: Path, state: DriftCheckState) -> None:
     """Persist the drift-check cadence state to a JSON file.
 
     Creates parent directories as needed.  Exact mirror of
-    :func:`orchestrator.merge_shadow._save_shadow_compare_state`.
+    :func:`orchestrator.merge_lane.shadow._save_shadow_compare_state`.
 
     Args:
         path: Destination path for the JSON state file.

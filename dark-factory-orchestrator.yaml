@@ -787,16 +787,26 @@ timeouts:
 # correctness-free speed knob: the lockfile alone determines WHAT is installed
 # and npm's cache is keyed by integrity, so a cache hit is always the right
 # bytes — it just avoids a registry round-trip on every cold worktree.
-# MEASURED 2026-08-28 with an empty, isolated npm cache (the worst case, and the
-# one a fresh host actually sees): 15.9s. Warm cache: ~2s.
+# The same install also provisions the dashboard DOM harness's devDependencies
+# (jsdom, react, react-dom; task 4899), which dashboard/tests/js/ needs.
+# It runs only on a COLD verify, so a task worktree that cold-verified before a
+# package-lock.json change keeps its old node_modules. The harness then fails,
+# naming the stale package and `npm ci` as the remedy. Merge verify is always
+# cold, so main is unaffected. Re-provisioning on lockfile drift is ticket
+# tkt_0RVST44N7D57CY4ERSJCVJ3QW2.
+# MEASURED 2026-10-14, with those added, against an empty isolated npm cache
+# (the worst case, and the one a fresh host actually sees): 14.5s. Warm cache:
+# 10.6s. Both were taken at load average ~105 on 32 cores; the pyright-only
+# 2026-08-28 figures were 15.9s and ~2s.
 #
 # DISK, stated because it is a real per-worktree cost and nobody should have to
-# rediscover it: this leaves a 37MB `node_modules/` in every cold-verified
-# worktree (gitignored, and pyright/ruff/pytest are all given explicit targets
-# so nothing walks it). Context, measured the same day on this host: the `.venv`
-# each worktree already carries is 156-803MB, so this adds roughly 5-24% to a
-# worktree's footprint, on 2.0T free. If that ever stops being a rounding error
-# the answer is worktree GC, not dropping the pin.
+# rediscover it: this leaves a 70MB `node_modules/` in every cold-verified
+# worktree (37MB of it pyright; measured 2026-10-14). It is gitignored, and
+# pyright/ruff/pytest are all given explicit targets, so nothing walks it.
+# Context, measured 2026-08-28 on this host: the `.venv` each worktree already
+# carries is 156-803MB, so this adds roughly 9-45% to a worktree's footprint,
+# on 2.0T free. If that ever stops being a rounding error the answer is
+# worktree GC, not dropping the pin.
 verify_cold_preprovision_command: "uv sync --all-packages && npm ci --no-audit --no-fund --prefer-offline"
 
 # TEMPORARY manual override (watcher, 2026-07-13) to break the cross-project
@@ -1494,6 +1504,7 @@ git:
       command: "pytest -m integration"
       cwd: "fused-memory"
       fix_task_priority: "medium"
+      outage_probe: "python scripts/lane_dependency_probe.py"
     # PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the ported warm-lane bash
     # bucket moves OFF the verify hot path and onto this lane — the escape
     # plans/warm-lane-infra-repatriation-prd.md documented for exactly this

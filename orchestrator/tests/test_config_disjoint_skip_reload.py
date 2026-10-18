@@ -23,7 +23,7 @@ from orchestrator.config import (
 )
 
 if TYPE_CHECKING:
-    from orchestrator.merge_types import MergeRequest
+    from orchestrator.merge_lane.types import MergeRequest
 
 
 class TestDisjointSkipGateDefault:
@@ -85,7 +85,7 @@ class TestDisjointSkipBlockers:
     ):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import (
+        from orchestrator.merge_lane.gates import (
             _disjoint_skip_blockers,
             note_queue_verified_main_tip,
         )
@@ -97,7 +97,7 @@ class TestDisjointSkipBlockers:
     def test_unverified_drift_blocks(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import _disjoint_skip_blockers
+        from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         cfg = OrchestratorConfig(merge_verify_breadth='scoped')
         blockers = _disjoint_skip_blockers(self._req(cfg), rebased_onto='0' * 40)
         assert len(blockers) == 1 and 'unverified drift' in blockers[0]
@@ -105,7 +105,7 @@ class TestDisjointSkipBlockers:
     def test_kill_switch_restores_legacy_trust(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import _disjoint_skip_blockers
+        from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         cfg = OrchestratorConfig(
             merge_verify_breadth='scoped',
             merge_disjoint_skip_requires_verified_drift=False,
@@ -120,7 +120,7 @@ class TestDisjointSkipBlockers:
         does not reach this arm."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import (
+        from orchestrator.merge_lane.gates import (
             _disjoint_skip_blockers,
             note_queue_verified_main_tip,
         )
@@ -138,6 +138,6 @@ class TestDisjointSkipBlockers:
         own fail-CLOSED policy."""
         from types import SimpleNamespace
 
-        from orchestrator.merge_gates import _disjoint_skip_blockers
+        from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         req = cast('MergeRequest', SimpleNamespace(task_id='t'))
         assert _disjoint_skip_blockers(req, rebased_onto='0' * 40) != []

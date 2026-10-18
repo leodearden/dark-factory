@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _dashboard_helpers import node_path
 
 from dashboard.api.burndown import _BURNDOWN_WINDOWS
 from dashboard.api.window import ServedWindow, _parse_window, with_window
@@ -954,21 +955,12 @@ def _terminal_render(
         monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
 
     roots = [Path('/proj') / label for label in labels]
-    rendered = {str(root) for root in roots}
     calls: list[dict] = []
 
     async def _mcp(http_client, url, tool, args, **kwargs):
-        # Only THIS render's roots are logged. The lifespan's burndown loop
-        # snapshots the real configured roots through this same patched seam
-        # as the app starts, and its reads landed here whenever the two
-        # overlapped (measured: 5 of 10 runs of this class failed on them).
-        # Nothing but the handler can reach a /proj root: the config installed
-        # below is the only place one is named, and the burndown loop bound its
-        # config at lifespan start, so it never sees that one.
-        if args.get('project_root') in rendered:
-            # kwargs is kept: the per-request budget rides as ``timeout=`` and
-            # is assertable at the wire nowhere else.
-            calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
+        # kwargs is kept: the per-request budget rides as ``timeout=`` and is
+        # assertable at the wire nowhere else.
+        calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
         if tool == 'get_statuses':
             return {'statuses': {}}
         rows = sorted(terminal_rows, key=lambda row: int(row['id']))  # ORDER BY id ASC
@@ -1010,23 +1002,6 @@ def _terminal_get_tasks(calls):
     return [call for call in calls if call['tool'] == 'get_tasks']
 
 
-def _node():
-    """The ``node`` binary: a skip locally, a FAILURE under CI.
-
-    The ``test_chip_label_disambiguation.py::_node`` idiom — CI carries node,
-    so its absence there is a toolchain regression, not an optional extra.
-    """
-    import os
-    import shutil
-
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
-
-
 # The REAL client's on-demand path, run over a body handed in on stdin. The
 # three scripts load in index.html's order because each destructures the one
 # before it at module scope, and `document` stays undefined on purpose: data.js
@@ -1059,7 +1034,7 @@ def _request_on_demand(body, project):
 
     redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
     result = subprocess.run(
-        [_node(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
+        [node_path(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
         input=json.dumps(body), capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, (

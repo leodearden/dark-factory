@@ -628,6 +628,12 @@ def _add_lane_script(tmp_path: Path, relative_path: str, body: str) -> None:
     script.chmod(0o755)
 
 
+#: The worker logs ``run() pass failed`` on ``orchestrator.offline_lane`` and each sub-run line on
+#: ``orchestrator.offline_lane_pass``; their common parent hears both.
+_LANE_LOGGERS = 'orchestrator'
+_SUB_RUN_LOGGER = 'orchestrator.offline_lane_pass'
+
+
 class _LaneLogWatch(logging.Handler):
     """Remembers the first ``run() pass failed`` line the lane worker logs, and every sub-run line."""
 
@@ -666,10 +672,10 @@ async def _drive_one_pass(
     which it does only after the seam that wrote the record returns.
     """
     watch = _LaneLogWatch()
-    lane_logger = logging.getLogger('orchestrator.offline_lane')
-    assert sub_run_label is None or lane_logger.isEnabledFor(logging.INFO), (
-        'awaiting a sub-run line needs the lane logger at INFO'
+    assert sub_run_label is None or logging.getLogger(_SUB_RUN_LOGGER).isEnabledFor(logging.INFO), (
+        'awaiting a sub-run line needs the pass logger at INFO'
     )
+    lane_logger = logging.getLogger(_LANE_LOGGERS)
     lane_logger.addHandler(watch)
     task = asyncio.create_task(worker.run())
     try:
@@ -747,7 +753,7 @@ class TestLanePassRecords:
     async def test_a_green_pass_records_its_detect_run_and_output(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             worker = await _run_one_pass(
                 tmp_path,
                 "printf '=== 3 passed in 0.10s ===\\n'; exit 0",
@@ -849,7 +855,7 @@ class TestLanePassRecords:
     async def test_a_signal_ended_run_records_ended_by_signal(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, command: str, returncode: int
     ) -> None:
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             worker = await _run_one_pass(tmp_path, command, until_phase=Phase.DETECT, until_logged=True)
 
         record = _current_pass_record(worker)
@@ -955,7 +961,7 @@ class TestLegacyLegRecords:
             "echo '  RESULT: FAIL (test_x.sh)'\nexit 1",
         )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.CONFIRM)
 
         record = _current_pass_record(worker, LEGACY_INFRA_COMMAND)
@@ -977,7 +983,7 @@ class TestLegacyLegRecords:
         worker = _lane_worker(tmp_path, offline_lane_infra_enabled=True)
         _add_lane_script(tmp_path, RUN_ALL_INFRA_SCRIPT, 'kill -9 $$')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             await _drive_one_pass(worker, LEGACY_INFRA_COMMAND, Phase.DETECT, sub_run_label='infra')
 
         assert ['ended_by=signal' in line for line in _sub_run_logs(caplog, 'infra')] == [True]
@@ -1003,7 +1009,7 @@ class TestLegacyLegRecords:
         worker = _lane_worker(tmp_path, offline_lane_legacy_numeric_enabled=True)
         _add_lane_script(tmp_path, RUN_OFFLINE_DEEP_SCRIPT, body)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane'):
+        with caplog.at_level(logging.INFO, logger=_SUB_RUN_LOGGER):
             await _drive_one_pass(worker, LEGACY_NUMERIC_COMMAND, Phase.DETECT, sub_run_label='numeric')
 
         record = _current_pass_record(worker, LEGACY_NUMERIC_COMMAND)
