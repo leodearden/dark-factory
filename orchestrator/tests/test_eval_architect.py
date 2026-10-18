@@ -34,6 +34,7 @@ import pytest
 # sentinel exists to avoid.
 from _campaign_gate_helpers import NO_INJECTED_GATE as _NO_INJECTED_GATE
 from _campaign_gate_helpers import eval_base_config
+from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator.evals.judge import PlanQualityVerdict
 from orchestrator.evals.measurement import (
@@ -5252,3 +5253,295 @@ class TestArchitectCellPersistsTerminalKind:
         assert result.outcome == 'done'
         assert isinstance(result.metrics['plan_quality'], float)
         assert result.metrics['terminal_kind'] == 'planned'
+
+
+# ---------------------------------------------------------------------------
+# Characterization of the persisted scoring fields, one row per exit (task 6737)
+#
+# Recorded against run_architect_eval BEFORE it was split into invoke →
+# classify → assemble. Only each row's harness call may change; the expected
+# literals are the evidence that the split moved no persisted field.
+# ---------------------------------------------------------------------------
+
+_SCORING_FIELDS = (
+    'plan_quality', 'cap_tainted', 'invocation_errors', 'plan_steps',
+    'judge_invocations', 'judge_cost_usd', 'judged_without_reference',
+    'cost_usd', 'cost_source', 'terminal_kind', 'tests_pass',
+    'role_under_test', 'replay_frame', 'input_tokens', 'output_tokens',
+    'cache_read_tokens', 'cache_create_tokens', 'turns_used',
+    'tokens_per_second', 'workflow_duration_ms', 'is_local_model',
+)
+
+
+def _characterized_cfg(**over):
+    from orchestrator.evals.configs import EvalConfig
+
+    return EvalConfig(
+        over.pop('name', 'architect-sonnet-high'), 'claude',
+        over.pop('model', 'sonnet'), 'high', role='architect', **over,
+    )
+
+
+# The default hermetic invoke's usage (see _run_architect_eval_hermetic) and
+# the all-zero usage of an attempt that never returned.
+_DEFAULT_INVOKE_USAGE = {
+    'input_tokens': 12000, 'output_tokens': 3000,
+    'cache_read_tokens': 48000, 'cache_create_tokens': 6000,
+    'turns_used': 9, 'tokens_per_second': 656.89,
+    'workflow_duration_ms': 4567, 'is_local_model': False,
+}
+_NO_USAGE = {
+    'input_tokens': 0, 'output_tokens': 0,
+    'cache_read_tokens': 0, 'cache_create_tokens': 0,
+    'turns_used': 0, 'tokens_per_second': 0.0,
+    'workflow_duration_ms': 0, 'is_local_model': False,
+}
+_ARCHITECT_CELL_STAMPS = {
+    'tests_pass': None, 'role_under_test': 'architect',
+    'replay_frame': 'honest-frame-v1',
+}
+_JUDGED_077 = {
+    'plan_quality': 0.77, 'cap_tainted': False, 'invocation_errors': None,
+    'plan_steps': 4, 'judge_invocations': 1, 'judge_cost_usd': 0.0,
+    'terminal_kind': 'planned',
+}
+_FLOORED_STEPLESS = {
+    'outcome': 'done', 'plan_quality': 0.0, 'cap_tainted': False,
+    'invocation_errors': None, 'plan_steps': 0, 'judge_invocations': 0,
+    'judge_cost_usd': 0.0, 'judged_without_reference': False,
+    'cost_usd': 1.23, 'cost_source': 'cli',
+}
+_CAP_HIT_RECORD = {
+    'stage': 'architect', 'cause': 'cap_hit',
+    'reason': "You've hit your session limit · resets 8pm",
+}
+_CAP_EXHAUSTED_RECORD = {
+    'stage': 'architect', 'cause': 'cap_exhausted',
+    'reason': 'x: all accounts capped after 3 retries (10.0s elapsed)',
+}
+_UNSPENT_UNJUDGED = {
+    'judge_invocations': 0, 'judge_cost_usd': 0.0,
+    'judged_without_reference': False, 'cost_usd': 0.0, 'cost_source': 'cli',
+}
+
+
+_PERSISTED_FIELD_ROWS = [
+    pytest.param(
+        lambda: {'produced_plan': _well_formed_plan()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_JUDGED_077,
+            'outcome': 'done', 'judged_without_reference': False,
+            'cost_usd': 1.23, 'cost_source': 'cli',
+        },
+        id='healthy-scorable-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': {}},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_FLOORED_STEPLESS,
+            'terminal_kind': 'none',
+        },
+        id='healthy-stepless-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': _create_plan_stub()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_FLOORED_STEPLESS,
+            'terminal_kind': 'none',
+        },
+        id='healthy-create-plan-stub',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': {}, 'arch_result': _cap_agent_result()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [_CAP_HIT_RECORD], 'plan_steps': 0,
+            'terminal_kind': 'none', 'workflow_duration_ms': 1200,
+        },
+        id='cap-refusal-no-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': _well_formed_plan(), 'arch_result': _cap_agent_result()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [_CAP_HIT_RECORD], 'plan_steps': 4,
+            'terminal_kind': 'planned', 'workflow_duration_ms': 1200,
+        },
+        id='cap-refusal-scorable-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': _well_formed_plan(), 'invoke_side_effect': TimeoutError()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'timeout', 'plan_quality': 0.0, 'cap_tainted': False,
+            'invocation_errors': [{
+                'stage': 'architect', 'cause': 'timeout',
+                'reason': 'no answer within 60m',
+            }],
+            'plan_steps': 0, 'terminal_kind': 'none',
+        },
+        id='timeout',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'invoke_side_effect': RuntimeError('boom'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [{
+                'stage': 'architect', 'cause': 'harness_error',
+                'reason': 'RuntimeError: boom',
+            }],
+            'plan_steps': 0, 'terminal_kind': 'none',
+        },
+        id='harness-error-at-invoke',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'orch_config_side_effect': RuntimeError('x'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [{
+                'stage': 'architect', 'cause': 'harness_error',
+                'reason': 'RuntimeError: x',
+            }],
+            'plan_steps': 0, 'terminal_kind': 'none',
+        },
+        id='harness-error-at-orch-config',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(), 'patch_cap_retry': True,
+            'invoke_side_effect': AllAccountsCappedException(3, 10.0, 'x'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [_CAP_EXHAUSTED_RECORD], 'plan_steps': 4,
+            'terminal_kind': 'planned',
+        },
+        id='cap-exhausted-scorable-plan',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': {}, 'patch_cap_retry': True,
+            'invoke_side_effect': AllAccountsCappedException(3, 10.0, 'x'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [_CAP_EXHAUSTED_RECORD], 'plan_steps': 0,
+            'terminal_kind': 'none',
+        },
+        id='cap-exhausted-no-plan',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'judge_return': Unmeasured(
+                MeasurementStage.JUDGE, UnmeasuredCause.UNPARSEABLE,
+                'JSONDecodeError: Expecting value', cost_usd=0.6,
+            ),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE,
+            'outcome': 'done', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [{
+                'stage': 'judge', 'cause': 'unparseable',
+                'reason': 'JSONDecodeError: Expecting value',
+            }],
+            'plan_steps': 4, 'judge_invocations': 1, 'judge_cost_usd': 0.6,
+            'judged_without_reference': False, 'cost_usd': 1.83,
+            'cost_source': 'cli', 'terminal_kind': 'planned',
+        },
+        id='judge-unparseable',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'judge_side_effect': RuntimeError('judge exploded'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE,
+            'outcome': 'done', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [{
+                'stage': 'judge', 'cause': 'raised',
+                'reason': 'RuntimeError: judge exploded',
+            }],
+            'plan_steps': 4, 'judge_invocations': 0, 'judge_cost_usd': 0.0,
+            'judged_without_reference': False, 'cost_usd': 1.23,
+            'cost_source': 'cli', 'terminal_kind': 'planned',
+        },
+        id='judge-raised',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'task_override': _arch_task_no_reference(), 'reference_diff': '',
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_JUDGED_077,
+            'outcome': 'done', 'judged_without_reference': True,
+            'cost_usd': 1.23, 'cost_source': 'cli',
+        },
+        id='judge-blind-no-reference',
+    ),
+    pytest.param(
+        lambda: {
+            'cfg': _characterized_cfg(
+                name='architect-candidate', model='qwen3-coder',
+                env_overrides=dict(_PROXY_ENV),
+            ),
+            'produced_plan': _well_formed_plan(),
+            'arch_result': _token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            'orch_prices': {
+                'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20},
+            },
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_JUDGED_077,
+            'outcome': 'done', 'judged_without_reference': False,
+            'cost_usd': 0.9, 'cost_source': 'price_table',
+            'input_tokens': 1000000, 'output_tokens': 500000,
+            'cache_read_tokens': 0, 'cache_create_tokens': 0, 'turns_used': 3,
+            'tokens_per_second': 109481.06, 'workflow_duration_ms': 4567,
+            'is_local_model': True,
+        },
+        id='proxied-candidate-priced',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': {},
+            'declines': {'false_premise': _decline_artifact()},
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_FLOORED_STEPLESS,
+            'terminal_kind': 'false_premise',
+        },
+        id='false-premise-decline',
+    ),
+]
+
+
+@pytest.mark.asyncio
+class TestPersistedScoringFieldsAreStable:
+    @pytest.mark.parametrize(('scenario', 'expected'), _PERSISTED_FIELD_ROWS)
+    async def test_persisted_scoring_fields(self, scenario, expected, tmp_path):
+        harness_kwargs = scenario()
+        cfg = harness_kwargs.pop('cfg', None) or _characterized_cfg()
+        store = ResultStore(tmp_path)
+
+        await _run_architect_eval_hermetic(cfg, store=store, **harness_kwargs)
+
+        (cell,) = store.load_all()
+        observed = {'outcome': cell.outcome} | {
+            field: cell.metrics[field] for field in _SCORING_FIELDS
+        }
+        assert observed == pytest.approx(expected)
