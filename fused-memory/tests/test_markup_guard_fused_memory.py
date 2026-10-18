@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -72,6 +73,50 @@ _KNOWN_PROJECTS = {_PROJECT_ID: _PROJECT_ROOT}
 #: bouncing off the authorization gate before the write.
 _AGENT_ID = 'recon-stage-9'
 _CLEAN_CONTENT = 'a deterministic cycle summary for the merge lane'
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    text = path.read_text(encoding='utf-8')
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _residue_loss_specimens() -> list[tuple[str, str]]:
+    """``(raw_value, declared project_id)`` for every measured residue loss.
+
+    The 2026-08-23..27 refusals whose payload the guard destroyed because the
+    leak in ``add_memory.content`` ate the routing key. Non-empty is asserted so
+    a moved corpus fails loudly; exact counts are not (PRD G6, see
+    shared/tests/test_toolcall_markup_corpus.py::TestCommittedCorpus).
+    """
+    records = _read_jsonl(
+        _REPO_ROOT / 'plans' / 'toolcall-markup-containment-prd.residue-loss-2026-08-27.jsonl'
+    )
+    specimens = [
+        (record['raw_value'], record['identity_present_in_payload']['project_id'])
+        for record in records
+    ]
+    assert specimens, 'the residue-loss corpus is empty or has moved'
+    return specimens
+
+
+def _unrepairable_add_memory_specimens() -> list[dict[str, Any]]:
+    """Every committed corpus record ``repair()`` refuses for ``add_memory``.
+
+    Keys are the corpus's own: ``value``, ``param``, ``schema_params``,
+    ``supplied`` and the fully-qualified ``tool``.
+    """
+    specimens = [
+        record
+        for record in _read_jsonl(
+            _REPO_ROOT / 'shared' / 'tests' / 'fixtures' / 'toolcall_markup_corpus.jsonl'
+        )
+        if record['expected_outcome'] == 'unrepairable'
+        and record['tool'] == 'mcp__fused-memory__add_memory'
+    ]
+    assert specimens, 'the unrepairable add_memory corpus slice is empty or has moved'
+    return specimens
 
 
 def _leaked(clean: str, param: str, value: str) -> str:
