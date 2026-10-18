@@ -36,10 +36,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _orch_helpers import idle_psi_sample
+from _psi_admission_yaml import write_config_with_nondefault_psi_admission
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.scheduler import Scheduler
+
+
+@pytest.fixture(autouse=True)
+def _nondefault_psi_admission_yaml(monkeypatch, tmp_path) -> None:
+    """Run every test here against a yaml whose psi_admission differs from code."""
+    monkeypatch.setenv(
+        'ORCH_CONFIG_PATH', str(write_config_with_nondefault_psi_admission(tmp_path))
+    )
 
 
 def _pending_task(
@@ -138,6 +147,27 @@ class TestAutouseFixtureDefaultsToIdlePsi:
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0
+
+
+class TestNonDefaultPsiAdmissionYaml:
+    """Guard test for this module's ``_nondefault_psi_admission_yaml`` fixture.
+
+    The explicit ``psi_admission=`` at every construction in the scheduler PSI
+    test files is load-bearing only while a bare config really inherits a
+    non-default block; this keeps the fixture from rotting into a no-op.
+    """
+
+    def test_bare_config_inherits_a_block_differing_on_every_leaf(self) -> None:
+        bare = OrchestratorConfig().psi_admission
+        code_default = PsiAdmissionConfig()
+
+        assert bare.enabled is False
+        assert bare.min_inflight_floor == 3
+        assert [
+            name
+            for name in PsiAdmissionConfig.model_fields
+            if getattr(bare, name) == getattr(code_default, name)
+        ] == []
 
 
 @pytest.mark.real_psi_reader
