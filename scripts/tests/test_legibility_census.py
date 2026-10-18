@@ -1379,6 +1379,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
         mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
         mod.SECTION_STRUCTURAL,
+        mod.SECTION_DISPOSITIONS,
         mod.SECTION_COST,
     ]
 
@@ -1530,6 +1531,10 @@ _no findings touched this run._
 ## Structural
 
 _no structural findings this run._
+
+## Dispositions
+
+_no back-linked tickets yet._
 
 ## Cost
 
@@ -1714,6 +1719,9 @@ def _report_section(report: str, title: str) -> str:
     return report.split(f"\n## {title}\n", 1)[1].split("\n## ", 1)[0]
 
 
+_EMPTY_DISPOSITIONS = disposition.OutcomeReport(disposition.Outcomes(), {}, (), (), {}).to_record()
+
+
 def _render_kwargs(**overrides) -> dict[str, Any]:
     """The flagless `render_report` keyword set, with *overrides* applied.
 
@@ -1734,6 +1742,7 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
         synthesis_md="prose",
         project_root=_RENDER_ROOT,
         filing=_filing_record("tkt_1"),
+        dispositions=_EMPTY_DISPOSITIONS,
         cost_note="cost",
     )
     kwargs.update(overrides)
@@ -2437,6 +2446,7 @@ def test_census_report_sections_flagless_key_set_and_order():
         mod.SECTION_FINDINGS,
         mod.SECTION_FILED_TASKS,
         mod.SECTION_STRUCTURAL,
+        mod.SECTION_DISPOSITIONS,
         mod.SECTION_COST,
     ]
 
@@ -9715,6 +9725,48 @@ def test_structural_renders_on_every_report_right_after_filed_tasks(case):
     keys = [section.key for section in mod.census_report_sections(record)]
     assert keys.index(mod.SECTION_STRUCTURAL) == keys.index(mod.SECTION_FILED_TASKS) + 1
     assert "Structural" in check_census_report.level2_titles(mod.render_report(record))
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_dispositions_renders_on_every_report_right_after_structural(case):
+    record = _census_record(**_REPORT_FLAG_CASES[case])
+    keys = [section.key for section in mod.census_report_sections(record)]
+    assert keys.index(mod.SECTION_DISPOSITIONS) == keys.index(mod.SECTION_STRUCTURAL) + 1
+    assert keys.index(mod.SECTION_STRUCTURAL) == keys.index(mod.SECTION_FILED_TASKS) + 1
+    assert "Dispositions" in check_census_report.level2_titles(mod.render_report(record))
+
+
+def _back_linked_dispositions() -> dict[str, Any]:
+    row = {
+        "ticket": None, "project_root": _RENDER_ROOT, "run_id": _EARLIER_RUN, "finding_key": None,
+        "task_id": 5120, "resolution": "created", "step": "curator",
+    }
+    cb = {"version": 2, "entries": [{
+        "id": "entry-a", "title": "a", "severity": "low", "status": "open", "origin_phase": "unknown",
+        "manifested_phase": "unknown", "sightings": [], "filed_tickets": [row],
+    }], "candidates": []}
+    outcomes = disposition.read_outcomes(
+        cb, statuses={"5120": "pending"}, statuses_error=None, observed_root=_RENDER_ROOT, store=FakeTaskStore(),
+    )
+    standings = disposition.task_standings(outcomes, ())
+    return disposition.OutcomeReport(outcomes, {}, (), (), disposition.entry_dispositions(cb, standings)).to_record()
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["empty", "linked"])
+def test_dispositions_section_is_the_disposition_rendering_of_the_record(linked):
+    dispositions = _back_linked_dispositions() if linked else _EMPTY_DISPOSITIONS
+    record = _census_record(dispositions=dispositions)
+    lines = _section(mod.census_report_sections(record), mod.SECTION_DISPOSITIONS).lines
+    assert record["dispositions"] == dispositions
+    assert lines == tuple(disposition.dispositions_lines(record["dispositions"], observed_root=record["project_root"]))
+    assert lines[:3] == ("", "## Dispositions", "")
+
+
+def test_build_census_record_requires_the_dispositions_record():
+    kwargs = _render_kwargs()
+    del kwargs["dispositions"]
+    with pytest.raises(TypeError, match="dispositions"):
+        mod.build_census_record(**kwargs)
 
 
 def test_structural_section_is_the_disposition_rendering_of_the_record():
