@@ -8,13 +8,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING
 
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.landing_evidence import patch_content_contained
-
-if TYPE_CHECKING:
-    from orchestrator.git_ops import GitOps
-
 
 
 class TipRelation(Enum):

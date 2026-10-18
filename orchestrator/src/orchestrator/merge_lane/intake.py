@@ -15,9 +15,10 @@ import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.liveness import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 from orchestrator.merge_lane.tip_relation import (
     _C3_DUPLICATE_IN_VERIFY_CODE,
@@ -36,10 +37,6 @@ from orchestrator.merge_lane.types import (
     TerminalOutcomeRetention,
     _InFlightEntry,
 )
-
-if TYPE_CHECKING:
-    from orchestrator.event_store import EventStore
-    from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger('orchestrator.merge_lane')
 

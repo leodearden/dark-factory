@@ -11,11 +11,12 @@ import collections
 import dataclasses
 import logging
 from collections.abc import Callable, Collection, Iterable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 from escalation.models import Escalation
 
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.halt import HaltState
 from orchestrator.merge_lane.intake import _aging_key, _emit_merge_coalesced, _normalize_lane
 from orchestrator.merge_lane.types import (
@@ -26,10 +27,6 @@ from orchestrator.merge_lane.types import (
     SpeculativeItem,
 )
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
-
-if TYPE_CHECKING:
-    from orchestrator.event_store import EventStore
-    from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -512,14 +509,12 @@ class MergeIntake:
         Returns True when the shutdown sentinel (None) was consumed, after
         buffering every item that arrived before it.
         """
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return False
+        while not self._queue.empty():
+            item = self._queue.get_nowait()
             if item is None:
                 return True  # sentinel consumed — all prior items already buffered
             self.buffer_owned_request(item)
+        return False
 
     def pop_next_pickable(self) -> MergeRequest | None:
         """Return the next pickable request using clique-scoped aging (ζ=1891).
@@ -690,10 +685,8 @@ class MergeIntake:
 
     def request_redispatch(self, item: SpeculativeItem, *, front: bool = False) -> None:
         """Park *item* for re-dispatch: at the back, or ahead of everything with *front*."""
-        if front:
-            self._redispatch.appendleft(item)
-        else:
-            self._redispatch.append(item)
+        park = self._redispatch.appendleft if front else self._redispatch.append
+        park(item)
 
     def next_redispatch(self) -> SpeculativeItem:
         """Pop the next parked item.  Raises IndexError when nothing is parked."""
