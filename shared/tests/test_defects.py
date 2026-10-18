@@ -51,6 +51,7 @@ from shared.defects import (
     WithdrawalCode,
     WithdrawalReason,
     apply_event,
+    apply_retirement_event,
     mint_explore_ref,
     mint_finding_ref,
     mint_followup_ref,
@@ -1112,3 +1113,97 @@ class TestApplyEventEffects:
         key = next(iter(DEFECT_TRANSITIONS))
         with pytest.raises(TypeError):
             _assign_item(DEFECT_TRANSITIONS, key, DefectStatus.OPEN)
+
+
+# --- Retirement lifecycle: apply_retirement_event ------------------------------------
+
+_SUPERSEDED = RetirementReason(reason=RetirementCode.SUPERSEDED_BY, ref=_OTHER_REF)
+
+_RETIREMENT_FROM_STATES = {
+    'ABSENT': (lambda: None, None),
+    'PENDING': (_retirement, RetirementState.PENDING),
+    'ACCEPTED': (
+        lambda: _retirement(_ruling(True, RulingSubject.RETIREMENT)),
+        RetirementState.ACCEPTED,
+    ),
+    'REJECTED': (
+        lambda: _retirement(_ruling(False, RulingSubject.RETIREMENT)),
+        RetirementState.REJECTED,
+    ),
+}
+
+_RETIREMENT_EVENTS = {
+    'declare_retirement': (
+        lambda: DeclareRetirement(retirement=Retirement(ref=_REF, reason=_SUPERSEDED)),
+        DefectEventKind.DECLARE_RETIREMENT,
+    ),
+    'rule_accepted': (
+        lambda: _rule(_ruling(True, RulingSubject.RETIREMENT)),
+        DefectEventKind.RULE,
+    ),
+    'rule_rejected': (
+        lambda: _rule(_ruling(False, RulingSubject.RETIREMENT)),
+        DefectEventKind.RULE,
+    ),
+    'rule_accepted_closure': (lambda: _rule(_ACCEPTED), DefectEventKind.RULE),
+    'declare': (_declare, DefectEventKind.DECLARE),
+    'declare_closure': (_declare_closure, DefectEventKind.DECLARE_CLOSURE),
+    'sighting': (_sighting, DefectEventKind.SIGHTING),
+    'proof_PROVEN': (_proof_event, DefectEventKind.PROOF),
+}
+
+# PRD I2 / decision 13, written out by hand. Every pair not listed here is refused.
+_RETIREMENT_ORACLE = {
+    ('ABSENT', 'declare_retirement'): RetirementState.PENDING,
+    ('PENDING', 'rule_accepted'): RetirementState.ACCEPTED,
+    ('PENDING', 'rule_rejected'): RetirementState.REJECTED,
+    ('REJECTED', 'declare_retirement'): RetirementState.PENDING,
+}
+
+
+def test_retirement_oracle_names_only_real_states_and_events() -> None:
+    assert {state for state, _ in _RETIREMENT_ORACLE} <= set(_RETIREMENT_FROM_STATES)
+    assert {event for _, event in _RETIREMENT_ORACLE} <= set(_RETIREMENT_EVENTS)
+
+
+@pytest.mark.parametrize('state_name', list(_RETIREMENT_FROM_STATES))
+@pytest.mark.parametrize('event_name', list(_RETIREMENT_EVENTS))
+def test_retirement_sweep(state_name: str, event_name: str) -> None:
+    build_record, from_state = _RETIREMENT_FROM_STATES[state_name]
+    build_event, kind = _RETIREMENT_EVENTS[event_name]
+    record = build_record()
+    event = build_event()
+    expected = _RETIREMENT_ORACLE.get((state_name, event_name))
+    if expected is not None:
+        result = apply_retirement_event(record, event)
+        assert result.state is expected
+        assert Retirement.model_validate(result.model_dump(mode='json')) == result
+        return
+    with pytest.raises(IllegalDefectTransition) as excinfo:
+        apply_retirement_event(record, event)
+    refusal = excinfo.value
+    assert refusal.ref == _REF
+    assert refusal.from_status == from_state
+    assert refusal.event is kind
+
+
+class TestApplyRetirementEventEffects:
+    def test_redeclaring_a_rejected_retirement_carries_the_new_reason_unruled(self) -> None:
+        rejected = _retirement(_ruling(False, RulingSubject.RETIREMENT))
+        event = DeclareRetirement(retirement=Retirement(ref=_REF, reason=_SUPERSEDED))
+        result = apply_retirement_event(rejected, event)
+        assert result.reason == _SUPERSEDED
+        assert result.ruling is None
+
+    def test_rule_stores_the_ruling(self) -> None:
+        ruling = _ruling(True, RulingSubject.RETIREMENT, RuledBy.OPERATOR)
+        result = apply_retirement_event(_retirement(), _rule(ruling))
+        assert result.ruling == ruling
+        assert result.reason == _retirement().reason
+
+    def test_rule_for_another_ref_is_refused_naming_both(self) -> None:
+        event = Rule(ref=_OTHER_REF, ruling=_ruling(True, RulingSubject.RETIREMENT))
+        with pytest.raises(IllegalDefectTransition) as excinfo:
+            apply_retirement_event(_retirement(), event)
+        assert _REF in str(excinfo.value)
+        assert _OTHER_REF in str(excinfo.value)
