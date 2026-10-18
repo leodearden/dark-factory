@@ -1225,3 +1225,42 @@ async def test_recover_for_dead_worker_reparks_requeued_and_fails_the_rest(store
     assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
     assert await store.get(parked) == parked_before
     assert (await store.get(other_project))['status'] == 'pending'
+
+
+# ---------------------------------------------------------------------------
+# The 4718 dedup-outage window and curation parking (task 4503, decision 16)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_health_excludes_parked_rows(store, tmp_path):
+    now = datetime.now(UTC)
+    await seed_resolved_ticket(
+        store, tmp_path / 'tickets.db', 'proj', status='created', latency_s=90.0,
+        resolved_at=now - timedelta(minutes=5), reason='create: new work',
+    )
+    for _ in range(3):
+        await _park(store, await store.submit('proj', '{}'))
+
+    health = await store.dedup_health('proj', since=now - timedelta(hours=6))
+
+    assert health.resolved == 1
+    assert health.median_resolve_seconds == pytest.approx(90.0, abs=1e-3)
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_after_parking_counts_its_parked_latency(store, tmp_path):
+    tid = await store.submit('proj', '{}')
+    submitted = datetime.now(UTC) - timedelta(seconds=900)
+    _rewrite_row(tmp_path / 'tickets.db', tid, created_at=submitted.isoformat())
+    await store.mark_awaiting_curation(
+        tid, reason='curation-deferred: all-accounts-capped', policy=_POLICY,
+    )
+    await store.requeue_awaiting_curation(tid)
+    await store.mark_resolved(tid, status='combined', task_id='12', reason='combine: same as 12')
+
+    health = await store.dedup_health('proj', since=submitted - timedelta(hours=1))
+
+    assert health.resolved == 1
+    assert health.combined == 1
+    assert health.median_resolve_seconds == pytest.approx(900.0, abs=30.0)
