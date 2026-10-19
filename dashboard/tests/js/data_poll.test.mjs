@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { loadDataJs, drain } from './_data_loader.mjs';
+import { loadDataJs, drain, quietly } from './_data_loader.mjs';
 import {
   COSTS_PATH,
   CURATOR_PATH,
@@ -1114,4 +1114,98 @@ test('pacing: a service time inflated by a wall-clock jump can never hold an end
   api.pollTick(opts);
   await drain();
   assert.equal(server.count(CURATOR_PATH), 2, `held off past ${EXPECTED_BACKOFF_MAX_MS}ms after its request started`);
+});
+
+// ---------------------------------------------------------------------------
+// A chip change that finds a windowed endpoint in flight (task 5833). The
+// in-flight guard refuses the forced attempt, and the hold the old-window
+// answer then arms must not delay the chosen window past the next tick.
+// ---------------------------------------------------------------------------
+
+async function pollAt(api, server, opts, at) {
+  await server.advanceTo(at);
+  api.pollTick(opts);
+  await drain();
+}
+
+test('chip change in flight: the pacing hold the superseded answer arms does not delay the chosen window past the next tick, and the deferred force is spent once', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+  const costsUrls = () => server.urls.filter(u => pollKey(u) === COSTS_PATH);
+
+  await pollAt(api, server, opts, 0);
+  await server.advanceTo(1000);
+  const chip = api.refreshDFData('7d', opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 1, 'precondition: the chip found costs in flight');
+
+  await pollAt(api, server, opts, 3000);
+  await server.advanceTo(4000);
+  await chip;
+
+  await pollAt(api, server, opts, 6000);
+  assert.equal(
+    server.count(COSTS_PATH),
+    2,
+    'the tick after the superseded answer landed must ask for the chosen window, not wait out the hold that answer armed',
+  );
+  assert.equal(costsUrls().at(-1), `${COSTS_PATH}?window=7d`);
+
+  await pollAt(api, server, opts, 9000);
+  await pollAt(api, server, opts, 12_000);
+  assert.equal(
+    server.count(COSTS_PATH),
+    2,
+    'the deferred force is spent by the attempt it forced: the timer path honours that answer\'s own pacing again',
+  );
+
+  await pollAt(api, server, opts, 15_000);
+  assert.equal(server.count(COSTS_PATH), 3);
+});
+
+test('chip change in flight: the failure backoff the superseded answer arms is waived once for the chosen window, without escalating', async () => {
+  let t = 0;
+  const urls = [];
+  let failHeld;
+  const fetchImpl = url => {
+    urls.push(url);
+    if (pollKey(url) !== COSTS_PATH) return Promise.resolve({ ok: true, json: async () => ({}) });
+    if (failHeld === undefined) return new Promise((_, reject) => { failHeld = reject; });
+    return Promise.reject(new Error('costs still down'));
+  };
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+  const deps = {
+    fetchImpl,
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: () => 0,
+    clearTimeoutImpl: () => {},
+  };
+  const opts = { state: api.createPollState(), deps, jitterMaxMs: 0 };
+  const costsUrls = () => urls.filter(u => pollKey(u) === COSTS_PATH);
+  const costsFailures = () => win.DF_DATA.__stale[COSTS_PATH].failures;
+
+  await quietly(async () => {
+    api.pollTick(opts);
+    await drain();
+    await api.refreshDFData('7d', opts);
+
+    t = 1000;
+    failHeld(new Error('costs went down mid-flight'));
+    await drain();
+    assert.equal(costsFailures(), 1, 'the superseded answer still counts as a failure');
+
+    t = 3000;
+    api.pollTick(opts);
+    await drain();
+    assert.deepEqual(costsUrls(), [`${COSTS_PATH}?window=24h`, `${COSTS_PATH}?window=7d`]);
+    assert.equal(costsFailures(), 1, 'a deferred chip attempt that fails must not escalate the timer path\'s backoff');
+
+    t = 6000;
+    api.pollTick(opts);
+    await drain();
+    assert.equal(costsFailures(), 2, 'the deferred force is spent: the next ordinary attempt\'s failure escalates again');
+  });
 });
