@@ -906,7 +906,9 @@ const EXPECTED_BACKOFF_MAX_MS = 60000;
 
 // A virtual event loop: every sleep and every response resolves at a virtual
 // instant, and each endpoint answers after its configured service time. The
-// no-op timer pair keeps refreshOne's 30s deadline from arming a real timer.
+// no-op timer pair keeps refreshOne's 30s deadline from arming a real timer,
+// so no deadline ever fires here: a test that needs one to fire belongs in
+// data_attempt_deadline.test.mjs, on its makeVirtualEndpoint.
 function makeVirtualServer(serviceMsByPath) {
   let clock = 0;
   const timers = [];
