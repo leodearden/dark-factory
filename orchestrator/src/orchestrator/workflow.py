@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
@@ -1101,6 +1102,24 @@ class _PriorImplStatus(NamedTuple):
 
     base_commit: str | None
     """SHA read from metadata.json, or None if the file is absent."""
+
+
+class _LandingMiss(Enum):
+    """Why :meth:`TaskWorkflow._recover_landed_branch` stamped nothing; each value is its L1 wording."""
+
+    JOURNAL_WITHHELD = (
+        'landed-outbox journal row present, but the delivered-checks guard '
+        'withheld the recovery'
+    )
+    NO_BRANCH_HEAD = 'journal miss; branch head unresolved (git rev-parse HEAD was empty)'
+    NOT_LANDED = 'journal miss; branch not found landed on main with recorded work'
+    UNATTRIBUTABLE = (
+        'journal miss; branch work is on main but has no attributable landing evidence'
+    )
+    FALLBACK_WITHHELD = (
+        'journal miss; branch work landed attributably, but the delivered-checks '
+        'guard withheld the recovery'
+    )
 
 
 _MIN_ABBREV_SHA_LEN = 7
@@ -2263,9 +2282,9 @@ class TaskWorkflow:
             resolved = await self._recover_landed_branch(
                 head, main_sha, guard='post-MERGE',
             )
-            if resolved is not None:
+            if isinstance(resolved, WorkflowOutcome):
                 return resolved
-            verdict = await self._unresolved_landing_verdict(head, main_sha)
+            verdict = resolved.value
         except WorkflowCancelled:
             raise
         except Exception as exc:
@@ -2281,30 +2300,11 @@ class TaskWorkflow:
                 f'branch_head: {head or "(unresolved)"}\n'
                 f'main_sha: {main_sha or "(unresolved)"}\n'
                 f'verdict: {verdict}\n'
-                'the merge phase reported success with no merge_sha; known '
-                'routes are the merge queue returning already_merged (a '
-                'coalesced duplicate submission, or a restart-replayed orphan) '
-                'and the branch observed on main after a steward resolution'
+                'routes into a sha-less merge success: orchestrator/src/'
+                'orchestrator/workflow.py::TaskWorkflow._finalise_without_merge_sha'
             ),
             escalate_to_human=True,
         )
-
-    async def _unresolved_landing_verdict(self, head: str, main_sha: str) -> str:
-        """Why :meth:`_recover_landed_branch` found nothing to stamp, for the L1 detail."""
-        if MergeProvenance.lookup(self.task_id) is not None:
-            return (
-                'landed-outbox journal row present, but the delivered-checks '
-                'guard withheld the recovery'
-            )
-        if not head:
-            return 'journal miss; branch head unresolved (git rev-parse HEAD was empty)'
-        if await self._branch_work_landed_on_main(head, main_sha, wt_head=None):
-            return (
-                'journal miss; branch work is on main but has no attributable '
-                'landing evidence, or the delivered-checks guard withheld the '
-                'recovery'
-            )
-        return 'journal miss; branch not found landed on main with recorded work'
 
     async def _reconcile_metadata_files_for_done(
         self, *, override_files: list[str] | None = None,
@@ -2387,26 +2387,27 @@ class TaskWorkflow:
 
     async def _persist_metadata_files(
         self, files: list[str] | None, *, log_context: str,
-    ) -> list[str]:
+    ) -> list[str] | None:
         """The one orchestrator-side write seam for ``metadata.files``.
 
         A read-modify-write through :meth:`_merge_fresh_metadata`, so sibling
         keys (``memory_hints``, ``_causation_id``) survive and backend keys win
         on collision.  ``files=None`` means "uncomputable here; keep what the
         backend has".  The chosen list is sanitized to file-level paths
-        (``sanitize_files_for_persist``) and mirrored into
-        ``self.task['metadata']`` optimistically before the write — the backend
-        stays the authority and is re-read on the next reconcile.  Exceptions
-        propagate: each caller owns its failure policy.  Returns the persisted
-        list.
+        (``sanitize_files_for_persist``).  ``self.task['metadata']`` mirrors the
+        payload only once ``update_task`` reports it landed, so in-session reads
+        never see a record the backend refused.  Exceptions propagate: each
+        caller owns its failure policy.  Returns the persisted list, or None
+        when the backend refused the write.
         """
         merged = await self._merge_fresh_metadata(
             self.task.get('metadata') or {}, log_context=log_context,
         )
         chosen = (merged.get('files') or []) if files is None else files
         merged['files'] = sanitize_files_for_persist(chosen)
+        if not await self.scheduler.update_task(self.task_id, merged):
+            return None
         self.task['metadata'] = merged
-        await self.scheduler.update_task(self.task_id, merged)
         return merged['files']
 
     def _enter_phase(self, new_state: WorkflowState) -> None:
@@ -4497,16 +4498,14 @@ class TaskWorkflow:
         """Shared blast-radius-expansion + ``self.modules``/``_module_configs``
         sync — the scope-reconciliation choke point (task 2505) used by every
         path that (re)establishes plan.files against the scheduler's file-lock
-        set: ``_plan()``, ``_apply_revalidation_skip()``, ``_run_simple_task()``,
-        and ``_set_task_scope()``.
+        set: the plan boundary (:meth:`_reconcile_plan_scope`) and
+        ``_set_task_scope()``.
 
         Derives the module set from *plan_files*; if it already matches
-        ``self.modules`` the locks are left alone and an applied result is
-        returned, but a ``metadata.files`` whose module set diverges from the
-        plan's is first repaired from *plan_files*
-        (:meth:`_heal_metadata_files_if_diverged`, task 3113). Otherwise asks
-        the scheduler to expand/reconcile the lock
-        via ``handle_blast_radius_expansion`` (``persist_files=plan_files`` —
+        ``self.modules`` this is a no-op (returns an applied result without
+        touching the scheduler or ``metadata.files`` — each caller owns what
+        that branch persists). Otherwise asks the scheduler to expand/reconcile
+        the lock via ``handle_blast_radius_expansion`` (``persist_files=plan_files`` —
         this call persists ``metadata.files=plan_files`` on EVERY successful
         refinement (widen, narrow, or shift) AND on the lock-conflict/requeue
         branch (task 2868); the ONLY non-persist path is its no-op early return
@@ -4523,7 +4522,6 @@ class TaskWorkflow:
             plan_files, self.config.lock_depth, task_id=self.task_id,
         )
         if set(new_modules) == set(self.modules):
-            await self._heal_metadata_files_if_diverged(plan_files, new_modules)
             return BlastRadiusResult(applied=True)
         expansion = await self.scheduler.handle_blast_radius_expansion(
             self.task_id, self.modules, new_modules,
@@ -4539,9 +4537,24 @@ class TaskWorkflow:
         self._module_configs = self._resolve_module_configs()
         return expansion
 
-    async def _heal_metadata_files_if_diverged(
-        self, plan_files: list[str], plan_modules: list[str],
-    ) -> bool:
+    async def _reconcile_plan_scope(self, plan_files: list[str]) -> BlastRadiusResult:
+        """The plan boundary's scope reconcile, for ``_plan()``, ``_apply_revalidation_skip()`` and ``_run_simple_task()``.
+
+        :meth:`_reconcile_scope_locks`, then — when it left the module set as
+        it was, so the scheduler persisted nothing — a repair of a diverged
+        ``metadata.files`` from *plan_files*
+        (:meth:`_heal_metadata_files_if_diverged`, task 3113).
+        ``_set_task_scope`` persists its own file-level grant on that branch
+        and calls the choke point directly, so each path writes
+        ``metadata.files`` at most once.
+        """
+        modules_before = set(self.modules)
+        reconciled = await self._reconcile_scope_locks(plan_files)
+        if reconciled.applied and set(self.modules) == modules_before:
+            await self._heal_metadata_files_if_diverged(plan_files)
+        return reconciled
+
+    async def _heal_metadata_files_if_diverged(self, plan_files: list[str]) -> None:
         """Restore ``metadata.files`` from *plan_files* when their module sets differ (task 3113).
 
         Compared at module granularity like :meth:`_check_scope_invariant`, but
@@ -4551,16 +4564,17 @@ class TaskWorkflow:
         direction is FROM plan.files, the authoritative source, whose persisted
         mirror ``metadata.files`` is (module_charter Contract 1).  The
         predicate is divergence, not emptiness: reify 5602 re-dispatched with a
-        non-empty but wrong record.  Fail-open: a failed write is logged and
-        leaves the record as it was, so a repair never fails a plan, and the
-        MERGE-entry tripwire stays the backstop.  Returns whether it healed.
+        non-empty but wrong record.  Fail-open: a write that raises or is
+        refused is logged and leaves both the backend record and
+        ``self.task['metadata']`` as they were, so a repair never fails a plan,
+        and the MERGE-entry tripwire stays the backstop.
         """
+        lock_depth = self.config.lock_depth
+        plan_modules = derive_modules(plan_files, lock_depth, task_id=self.task_id)
         recorded = (self.task.get('metadata') or {}).get('files') or []
-        recorded_modules = derive_modules(
-            recorded, self.config.lock_depth, task_id=self.task_id,
-        )
+        recorded_modules = derive_modules(recorded, lock_depth, task_id=self.task_id)
         if set(recorded_modules) == set(plan_modules):
-            return False
+            return
         logger.warning(
             'Task %s: metadata.files diverges from plan.files at the plan '
             'boundary — healing from plan.files. metadata files=%s modules=%s; '
@@ -4568,18 +4582,19 @@ class TaskWorkflow:
             self.task_id, recorded, sorted(recorded_modules),
             plan_files, sorted(plan_modules),
         )
+        failure = 'the backend refused the write'
         try:
-            await self._persist_metadata_files(
+            healed = await self._persist_metadata_files(
                 plan_files, log_context='scope heal (unchanged lock set)',
             )
         except Exception as exc:
+            healed, failure = None, repr(exc)
+        if healed is None:
             logger.warning(
                 'Task %s: metadata.files heal write failed (%s); leaving the '
                 'record for the MERGE-entry tripwire',
-                self.task_id, exc,
+                self.task_id, failure,
             )
-            return False
-        return True
 
     async def _set_task_scope(self, new_files: list[str]) -> BlastRadiusResult:
         """Orchestrator-side single choke point for widening a task's file
@@ -5375,7 +5390,7 @@ class TaskWorkflow:
             f'from {len(plan_files)} files: {plan_modules}'
         )
 
-        if not (expansion := await self._reconcile_scope_locks(plan_files)).applied:
+        if not (expansion := await self._reconcile_plan_scope(plan_files)).applied:
             # Annotate the requeue so the per-task retry-cap report can
             # name *why* — without this, three blast-radius requeues in a
             # row produce a cap-exhaust report with phase/reason='unknown'
@@ -5385,7 +5400,7 @@ class TaskWorkflow:
                 'Plan expansion',
             )
         # self.modules/_module_configs already updated by
-        # _reconcile_scope_locks on success (unchanged if the module set is).
+        # _reconcile_plan_scope on success (unchanged if the module set is).
 
         # Write plan decisions to memory
         await self._write_decisions_to_memory()
@@ -5541,7 +5556,7 @@ class TaskWorkflow:
         # overlapping module — fall through to the architect path which
         # already handles the requeue case.
         plan_files = plan.get('files', [])
-        if not (scope := await self._reconcile_scope_locks(plan_files)).applied:
+        if not (scope := await self._reconcile_plan_scope(plan_files)).applied:
             logger.info(
                 'Task %s: revalidation skip declined — blast-radius '
                 'expansion denied (re-pend error: %r)',
@@ -5549,7 +5564,7 @@ class TaskWorkflow:
             )
             return None
         # self.modules/_module_configs already updated by
-        # _reconcile_scope_locks on success (unchanged if the module set is).
+        # _reconcile_plan_scope on success (unchanged if the module set is).
 
         # Bump revalidation stamp + base commit (mirrors confirm_plan).
         try:
@@ -5740,7 +5755,7 @@ class TaskWorkflow:
             # Silent no-op on lock conflict (same as before this was
             # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
             # fail out here, it just doesn't re-tighten the lock.
-            await self._reconcile_scope_locks(plan_files)
+            await self._reconcile_plan_scope(plan_files)
 
         await self._stamp_optimistic_path('simple_task')
 
@@ -5797,7 +5812,7 @@ class TaskWorkflow:
 
         A NARROW single-key merge write, mirroring ``_stamp_simple_saturated``
         below (task 3579).  Both call sites stamp immediately after
-        ``_reconcile_scope_locks``, which persists the refined
+        ``_reconcile_plan_scope``, whose lock refinement persists the refined
         ``metadata.files`` backend-only and never refreshes
         ``self.task['metadata']`` — so writing the whole in-memory blob at
         shallow-merge mode would re-assert the stale dispatch-time ``files``
@@ -15650,15 +15665,14 @@ class TaskWorkflow:
         recovered = await self._recover_landed_branch(
             branch_head, main_sha, guard='pre-MERGE',
         )
-        if recovered is not None:
+        if isinstance(recovered, WorkflowOutcome):
             return recovered
         # Re-check is_ancestor (cheap, redundant on this path only) purely to
         # scope the breadcrumb to the spurious-merge-signal sub-case (ancestor
         # but no work) — a normal divergent (non-ancestor) merge must stay
         # silent.
-        if (
-            await self.git_ops.is_ancestor(branch_head, main_sha)
-            and not self._has_prior_implementation(wt_head=None).has_work
+        if recovered is _LandingMiss.NOT_LANDED and await self.git_ops.is_ancestor(
+            branch_head, main_sha,
         ):
             logger.warning(
                 f'Task {self.task_id}: branch appears merged at '
@@ -15669,7 +15683,7 @@ class TaskWorkflow:
 
     async def _recover_landed_branch(
         self, branch_head: str, main_sha: str, *, guard: str,
-    ) -> WorkflowOutcome | None:
+    ) -> WorkflowOutcome | _LandingMiss:
         """The merge-phase already-landed ladder, shared by the pre- and post-MERGE guards.
 
         Journal first (MP-1): a :meth:`MergeProvenance.lookup` row stamps
@@ -15679,30 +15693,33 @@ class TaskWorkflow:
         (:meth:`_discovered_landing_sha`).  Both stamps go through the
         :meth:`_finalise_recovery_done` chokepoint (MP-2, delivered checks,
         reject-to-L1); *guard* labels their notes.  An empty *branch_head*
-        skips the git tier.  Returns None when nothing resolved.
+        skips the git tier.  Returns the stamped outcome, or the
+        :class:`_LandingMiss` naming the rung that stamped nothing.
         """
         row: LandedRow | None = MergeProvenance.lookup(self.task_id)
         if row is not None:
-            return await self._finalise_recovery_done(
+            stamped = await self._finalise_recovery_done(
                 basis='journal', sha=row.advanced_sha, kind='merged',
                 note=f'landed-outbox journal hit ({guard} recovery)',
             )
+            return _LandingMiss.JOURNAL_WITHHELD if stamped is None else stamped
+        if not branch_head:
+            return _LandingMiss.NO_BRANCH_HEAD
         # wt_head=None: the merge phase runs after a rebase, where a
         # post-rebase HEAD may coincide with base_commit even on a
         # genuinely-implemented branch, so this caller must keep the
         # iteration-log fallback rather than the SHA-primary signal (see
         # _has_prior_implementation's docstring and task 2504).
-        if not branch_head or not await self._branch_work_landed_on_main(
-            branch_head, main_sha, wt_head=None,
-        ):
-            return None
+        if not await self._branch_work_landed_on_main(branch_head, main_sha, wt_head=None):
+            return _LandingMiss.NOT_LANDED
         evidence_sha = await self._discovered_landing_sha(guard, branch_head)
         if evidence_sha is None:
-            return None
-        return await self._finalise_recovery_done(
+            return _LandingMiss.UNATTRIBUTABLE
+        stamped = await self._finalise_recovery_done(
             basis='fallback', sha=evidence_sha, kind='found_on_main',
             note=f'branch already on main at merge phase ({guard} recovery)',
         )
+        return _LandingMiss.FALLBACK_WITHHELD if stamped is None else stamped
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.

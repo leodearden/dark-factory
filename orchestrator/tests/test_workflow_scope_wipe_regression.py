@@ -9,7 +9,8 @@ MERGE-entry tripwire fired.
 
 The heal's predicate is module-set divergence between ``metadata.files`` and
 plan.files, not emptiness, and it restores from plan.files, the authoritative
-source.  This file imports no merge-lane module on purpose.
+source.  It belongs to the plan boundary alone: the scope grant persists its
+own file-level set, so a diverged record is written once on either path.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeScheduler
 from escalation.queue import EscalationQueue
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.module_charter import derive_modules
 from orchestrator.workflow import TaskWorkflow
@@ -35,11 +37,20 @@ _PLAN_FILES = [
 ]
 
 
-class _RefusingScheduler(FakeScheduler):
+class _RaisingScheduler(FakeScheduler):
     async def update_task(
         self, task_id: str, metadata: str | dict, *, append: bool = False,
     ) -> bool:
         raise RuntimeError('fused-memory down')
+
+
+class _RefusingScheduler(FakeScheduler):
+    """The production failure shape: ``update_task`` answers False, never raises."""
+
+    async def update_task(
+        self, task_id: str, metadata: str | dict, *, append: bool = False,
+    ) -> bool:
+        return False
 
 
 def _modules(files: list[str]) -> list[str]:
@@ -88,7 +99,7 @@ async def test_unchanged_lock_set_heals_wiped_metadata_files(tmp_path: Path):
         modules=_modules(_PLAN_FILES),
     )
 
-    result = await wf._reconcile_scope_locks(list(_PLAN_FILES))
+    result = await wf._reconcile_plan_scope(list(_PLAN_FILES))
 
     assert result.applied
     assert fs.blast_radius_calls == []
@@ -109,7 +120,7 @@ async def test_unchanged_lock_set_heals_non_empty_but_divergent_files(tmp_path: 
         modules=_modules(_PLAN_FILES),
     )
 
-    result = await wf._reconcile_scope_locks(list(_PLAN_FILES))
+    result = await wf._reconcile_plan_scope(list(_PLAN_FILES))
 
     assert result.applied
     assert fs.blast_radius_calls == []
@@ -124,7 +135,7 @@ async def test_module_equivalent_metadata_is_not_rewritten(tmp_path: Path):
         tmp_path, metadata={'files': subset}, modules=_modules(_PLAN_FILES),
     )
 
-    result = await wf._reconcile_scope_locks(list(_PLAN_FILES))
+    result = await wf._reconcile_plan_scope(list(_PLAN_FILES))
 
     assert result.applied
     assert fs.update_task_calls == []
@@ -135,7 +146,7 @@ async def test_empty_plan_and_empty_metadata_writes_nothing(tmp_path: Path):
     assert _modules([]) == []
     wf, fs = _make(tmp_path, metadata={'files': []}, modules=[])
 
-    result = await wf._reconcile_scope_locks([])
+    result = await wf._reconcile_plan_scope([])
 
     assert result.applied
     assert fs.update_task_calls == []
@@ -148,7 +159,7 @@ async def test_module_change_still_routes_through_blast_radius_only(tmp_path: Pa
     assert set(held) != set(_modules(_PLAN_FILES))
     wf, fs = _make(tmp_path, metadata={'files': []}, modules=held)
 
-    result = await wf._reconcile_scope_locks(list(_PLAN_FILES))
+    result = await wf._reconcile_plan_scope(list(_PLAN_FILES))
 
     assert result.applied
     assert [persist for _cur, _need, persist in fs.blast_radius_calls] == [_PLAN_FILES]
@@ -164,7 +175,7 @@ async def test_wiped_record_no_longer_trips_merge_entry_tripwire(tmp_path: Path)
     wf.escalation_queue = queue
     wf.plan = {'files': list(_PLAN_FILES)}
 
-    await wf._reconcile_scope_locks(list(_PLAN_FILES))
+    await wf._reconcile_plan_scope(list(_PLAN_FILES))
     fs.task_data[_TASK_ID] = {'id': _TASK_ID, 'metadata': _persisted(fs)}
     await wf._check_scope_invariant()
 
@@ -178,15 +189,37 @@ async def test_wiped_record_no_longer_trips_merge_entry_tripwire(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_heal_write_failure_is_fail_open(tmp_path: Path):
+@pytest.mark.parametrize('scheduler_cls', [_RaisingScheduler, _RefusingScheduler])
+async def test_heal_write_failure_is_fail_open(
+    tmp_path: Path, scheduler_cls: type[FakeScheduler],
+):
     """A repair must never fail a plan; the MERGE-entry tripwire stays the backstop."""
     held = _modules(_PLAN_FILES)
     wf, _ = _make(
         tmp_path, metadata={'files': []}, modules=held,
-        scheduler=_RefusingScheduler(),
+        scheduler=scheduler_cls(),
     )
 
-    result = await wf._reconcile_scope_locks(list(_PLAN_FILES))
+    result = await wf._reconcile_plan_scope(list(_PLAN_FILES))
 
     assert result.applied
     assert wf.modules == held
+    assert wf.task['metadata']['files'] == []
+
+
+@pytest.mark.asyncio
+async def test_scope_grant_on_a_diverged_record_writes_files_once(tmp_path: Path):
+    wf, fs = _make(
+        tmp_path, metadata={'files': [], 'memory_hints': _HINTS},
+        modules=_modules(_PLAN_FILES),
+    )
+    wf.artifacts = TaskArtifacts(tmp_path / 'wt')
+    wf.artifacts.init(_TASK_ID, 'T', 'd')
+
+    result = await wf._set_task_scope(list(_PLAN_FILES))
+
+    assert result.applied
+    assert fs.blast_radius_calls == []
+    payload = _persisted(fs)
+    assert payload['files'] == _PLAN_FILES
+    assert payload['memory_hints'] == _HINTS

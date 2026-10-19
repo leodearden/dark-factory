@@ -4987,8 +4987,8 @@ class TestRecoverBeforeExecuteGhostLoop:
         # ACTION #2 (Layer C): the pre-computed branch diff must be threaded
         # through override_files into metadata.files — this is what closes
         # task 2125's phantom-done (which stamped metadata.files=[]).
-        # _reconcile_metadata_files_for_done optimistically sets
-        # self.task['metadata'] before the (fake) scheduler.update_task call,
+        # _reconcile_metadata_files_for_done mirrors the payload into
+        # self.task['metadata'] once the (fake) scheduler.update_task lands,
         # so we can assert directly against workflow.task here.
         stamped_files = workflow.task.get('metadata', {}).get('files')
         assert stamped_files, (

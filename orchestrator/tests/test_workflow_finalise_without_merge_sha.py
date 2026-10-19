@@ -1,24 +1,24 @@
 """A merge-phase SUCCESS with no ``_merge_sha`` resolves honestly or blocks (task 3113).
 
 ``_finalise_merged_done`` used to exit DONE without writing the done row
-whenever ``_merge_sha`` was unset.  The routes there are a merge queue
-``already_merged`` result (a coalesced duplicate submission, as in reify
-5367/5602, or a restart-replayed orphan, as in the 2026-10-17 specimens reify
-9062, solar-challenge 748 and solar 846/270) and the steward-resolved "branch
-on main" break.  The task never reached ``done``, and the theta exit-contract
-gate (task 3546) waits on this exit being honest.
+whenever ``_merge_sha`` was unset, so the task never reached ``done`` and the
+theta exit-contract gate (task 3546) waited on that exit being honest.  The
+routes into that tail are listed once, in
+``workflow.py::TaskWorkflow._finalise_without_merge_sha``.
 
 The DONE tail now runs the shared already-merged recovery ladder and stamps an
 honest provenance; when nothing attributes the landing, it blocks with an L1
 from the still-working machine.  Eval mode keeps its DONE-without-row exit.
 
 Driven through ``_workflow_helpers._make``'s git stubs and a real git worktree
-for ``git rev-parse HEAD``.  This file imports no merge-lane module on purpose.
+for ``git rev-parse HEAD``.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -75,7 +75,7 @@ async def test_unresolvable_missing_merge_sha_blocks_and_files_l1(tmp_path: Path
     assert 'blocked' in _status_writes(f)
     (esc,) = queue.get_by_task(f.wf.task_id, status='pending')
     assert esc.level == 1
-    assert 'merge_sha' in esc.detail
+    assert 'no merge_sha' in esc.summary
     assert 'not found landed on main' in esc.detail
 
 
@@ -167,3 +167,40 @@ async def test_withheld_recovery_blocks_instead_of_done(tmp_path: Path):
     f.mark_done.assert_not_awaited()
     (esc,) = queue.get_by_task(f.wf.task_id, status='pending')
     assert esc.level == 1
+    assert 'landed attributably, but the delivered-checks guard withheld' in esc.detail
+
+
+async def _reply_already_merged(merge_queue: asyncio.Queue) -> None:
+    """The merge worker's answer for a branch already on main: success, no merge_sha."""
+    request = await merge_queue.get()
+    request.result.set_result(SimpleNamespace(status='already_merged', merge_sha=None))
+
+
+@pytest.mark.asyncio
+async def test_already_merged_queue_reply_blocks_through_the_merge_phase(
+    tmp_path: Path,
+):
+    """The real route: the queue's sha-less ``already_merged`` reaches the DONE tail."""
+    f = await _fixture(tmp_path, branch_on_main=False)
+    queue = _arm_escalation_queue(f, tmp_path)
+    wf = f.wf
+    wf.merge_queue = merge_queue = asyncio.Queue()
+    wf.config.max_merge_retries = 1
+    wf.config.max_pre_merge_retries = 1
+    wf.config.merge_train_former_enabled = False
+    wf.scheduler.get_task = AsyncMock(return_value={'id': wf.task_id, 'metadata': {}})
+    wf.git_ops.rebase_onto_main = AsyncMock(return_value=False)
+    wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
+    wf._ensure_steward_started = AsyncMock()
+    wf._await_steward_completion = AsyncMock()
+
+    worker = asyncio.create_task(_reply_already_merged(merge_queue))
+    outcome = await wf._merge_and_finalise('task/50')
+    await worker
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert wf.state == WorkflowState.BLOCKED
+    f.mark_done.assert_not_awaited()
+    (esc,) = queue.get_by_task(wf.task_id, status='pending')
+    assert esc.level == 1
+    assert 'not found landed on main' in esc.detail
