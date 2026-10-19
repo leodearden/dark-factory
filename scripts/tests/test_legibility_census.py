@@ -40,6 +40,7 @@ from legibility import (
     filing_policy,
     finding_area,
     invariants,
+    prescreen,
     session_ledger,
     session_runner,
     task_store,
@@ -1374,6 +1375,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
         mod.SECTION_HEADER,
         mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
+        mod.SECTION_SCREENED,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
         mod.SECTION_FINDINGS,
@@ -1427,6 +1429,25 @@ def test_render_report_is_deterministic_no_clock():
     assert mod.render_report(_census_record()) == mod.render_report(_census_record())
 
 
+_NO_INSTRUMENT_RECORDS_NOTE = (
+    "/review: no record matching review/reports/review-dark_factory-<YYYYMMDD>[-<n>].json; "
+    "/hotspot-survey: no record matching plans/bug-hotspot-survey-<YYYY-MM-DD>[-<n>]-full-findings.json; "
+    "/review-all: no record matching plans/review-all-dark_factory-<YYYYMMDD>[-<n>].json"
+)
+"""The inputs note of a project carrying no other instrument's record."""
+
+_NOTHING_SCREENED = prescreen.ScreenReport(
+    screen=prescreen.Screen((), (), ()),
+    attached=(),
+    re_observed=(),
+    inputs=prescreen.InstrumentFindings((), _NO_INSTRUMENT_RECORDS_NOTE, ()),
+)
+
+
+def test_the_golden_inputs_note_is_what_a_project_without_instrument_records_reads(tmp_path):
+    assert prescreen.load_instrument_findings(tmp_path, "dark_factory").note == _NO_INSTRUMENT_RECORDS_NOTE
+
+
 _SAMPLE_METHOD: dict[str, Any] = {
     "run_id": "census-dark_factory-20260714",
     "as_of_sha": "a" * 40,
@@ -1450,7 +1471,8 @@ _SAMPLE_METHOD: dict[str, Any] = {
     },
     "inputs_consumed": [],
     "extra": {
-        "inputs_consumed_note": "no other instrument's report is read yet",
+        "inputs_consumed_note": _NO_INSTRUMENT_RECORDS_NOTE,
+        "screened": _NOTHING_SCREENED.counts(),
         "ledger_created_this_run": False,
         "ledger_state": "ok",
         "ledger_pruned": 0,
@@ -1495,7 +1517,14 @@ cost:
   wall_clock_secs: 12.5
 inputs_consumed: []
 extra:
-  inputs_consumed_note: no other instrument's report is read yet
+  inputs_consumed_note: '/review: no record matching review/reports/review-dark_factory-<YYYYMMDD>[-<n>].json;
+    /hotspot-survey: no record matching plans/bug-hotspot-survey-<YYYY-MM-DD>[-<n>]-full-findings.json;
+    /review-all: no record matching plans/review-all-dark_factory-<YYYYMMDD>[-<n>].json'
+  screened:
+    title: 0
+    session: 0
+    key: 0
+    cross_instrument: 0
   ledger_created_this_run: false
   ledger_state: ok
   ledger_pruned: 0
@@ -1508,6 +1537,12 @@ extra:
 - stop reason: saturated
   - batch 0: dup_rate=0.50 (total=10, succeeded=10, failed=0, saturated=False)
   - batch 1: dup_rate=0.90 (total=10, succeeded=10, failed=0, saturated=True)
+
+## Screened
+
+- per rule: title 0, session 0, key 0, cross_instrument 0
+- inputs consumed: none
+- inputs note: /review: no record matching review/reports/review-dark_factory-<YYYYMMDD>[-<n>].json; /hotspot-survey: no record matching plans/bug-hotspot-survey-<YYYY-MM-DD>[-<n>]-full-findings.json; /review-all: no record matching plans/review-all-dark_factory-<YYYYMMDD>[-<n>].json
 
 ## Origin x Manifestation Matrix
 
@@ -1552,7 +1587,11 @@ leaked into the unflagged path (and therefore into every flagless run: an
 operator run with no flags, or a trickle launch whose census.trickle_caps
 are null). A deliberate change to
 the flagless report may move this lock, in a commit whose message says why;
-that record is what distinguishes it from a leak."""
+that record is what distinguishes it from a leak.
+
+Moved by task 6405 (census PRD leaf L6): ``## Screened`` renders on every
+run, flagless included (check_census_report.SECTIONS requires it), and the
+Method block gains ``extra.screened`` and the real inputs note."""
 
 
 def _capped_mining_result(*, stop_reason, max_batches, batches=2):
@@ -1744,6 +1783,7 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
         filing=_filing_record("tkt_1"),
         dispositions=_EMPTY_DISPOSITIONS,
         cost_note="cost",
+        screened=_NOTHING_SCREENED.to_record(),
     )
     kwargs.update(overrides)
     return kwargs
@@ -2316,6 +2356,9 @@ def _method(**overrides):
         wall_clock_secs=12.5,
         verify_normalisations=verdict.count_normalisations([]),
         reverify=_EMPTY_DISPOSITIONS["reverify"],
+        screened=_NOTHING_SCREENED.counts(),
+        inputs_consumed=(),
+        inputs_consumed_note=_NO_INSTRUMENT_RECORDS_NOTE,
     )
     kwargs.update(overrides)
     return mod.build_method(**kwargs)
@@ -2360,7 +2403,12 @@ def test_build_method_since_is_none_text_without_a_prior_census():
 
 
 def test_build_method_verification_cost_and_inputs_consumed():
-    method = _method()
+    screened = {"title": 1, "session": 0, "key": 2, "cross_instrument": 0}
+    method = _method(
+        screened=screened,
+        inputs_consumed=("review-dark_factory-20261009", "review-all-dark_factory-20261008"),
+        inputs_consumed_note=None,
+    )
 
     assert method["verification"] == {
         "confirmed": 2, "weakened": 0, "refuted": 1, "unverified": 4,
@@ -2373,8 +2421,31 @@ def test_build_method_verification_cost_and_inputs_consumed():
         "embedding_calls": 0,
         "wall_clock_secs": 12.5,
     }
+    assert method["inputs_consumed"] == ["review-dark_factory-20261009", "review-all-dark_factory-20261008"]
+    assert method["extra"]["screened"] == screened
+    assert method["extra"]["inputs_consumed_note"] is None
+
+
+def test_build_method_says_why_no_instrument_report_was_consumed():
+    method = _method()
+
     assert method["inputs_consumed"] == []
-    assert method["extra"]["inputs_consumed_note"]
+    assert method["extra"]["inputs_consumed_note"] == _NO_INSTRUMENT_RECORDS_NOTE
+
+
+def test_build_census_record_requires_the_screen_report():
+    kwargs = _render_kwargs()
+    del kwargs["screened"]
+    with pytest.raises(TypeError, match="screened"):
+        mod.build_census_record(**kwargs)
+
+
+def test_the_census_record_carries_the_screen_report_and_renders_it():
+    record = json.loads(json.dumps(_census_record()))
+
+    assert record["screened"] == _NOTHING_SCREENED.to_record()
+    assert "Screened" in check_census_report.level2_titles(mod.render_report(record))
+    assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
 
 
 def test_build_method_evidence_comes_from_the_selection(tmp_path):
@@ -2442,6 +2513,7 @@ def test_census_report_sections_flagless_key_set_and_order():
         mod.SECTION_HEADER,
         mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
+        mod.SECTION_SCREENED,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
         mod.SECTION_FINDINGS,
@@ -2479,7 +2551,8 @@ def test_census_report_sections_verification_is_gated_and_positioned():
     assert mod.SECTION_VERIFICATION not in _section_keys()
 
     keys = _section_keys(verify_coverage=mod.VerifyCoverage(novel=5, offered=2, cap=2))
-    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_VERIFICATION)
+    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_SCREENED)
+    assert keys.index(mod.SECTION_SCREENED) < keys.index(mod.SECTION_VERIFICATION)
     assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_MATRIX)
 
 
@@ -2496,7 +2569,8 @@ def test_census_report_sections_unresolved_verdicts_is_gated_and_positioned():
     assert mod.SECTION_UNRESOLVED_VERDICTS not in _section_keys(dropped_verdicts=())
 
     keys = _section_keys(dropped_verdicts=_sample_dropped_verdicts())
-    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
+    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_SCREENED)
+    assert keys.index(mod.SECTION_SCREENED) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
     assert keys.index(mod.SECTION_UNRESOLVED_VERDICTS) < keys.index(mod.SECTION_MATRIX)
 
     keys = _section_keys(
@@ -2560,6 +2634,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         filing=_filing_record("tkt_1"),
         dispositions=_EMPTY_DISPOSITIONS,
         cost_note="cost",
+        screened=_NOTHING_SCREENED.to_record(),
     ))
     assert report == _GOLDEN_FLAGLESS_REPORT
 
