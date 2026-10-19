@@ -434,6 +434,21 @@ class TicketStore:
             for row in rows
         ]
 
+    async def oldest_awaiting_curation(
+        self, project_id: str, *, defer_reason: DeferReason, limit: int,
+    ) -> list[dict]:
+        """Return the project's tickets parked for *defer_reason*, oldest ``created_at`` first."""
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM tickets
+            WHERE project_id = ? AND status = ? AND defer_reason = ?
+            ORDER BY created_at, ticket_id
+            LIMIT ?
+            """,
+            (project_id, AWAITING_CURATION, defer_reason.value, limit),
+        )
+        return [dict(r) for r in rows]
+
     async def flush_pending_on_startup(self) -> int:
         """Recover the tickets a previous server run left non-terminal.
 

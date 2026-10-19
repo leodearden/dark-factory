@@ -1516,11 +1516,13 @@ class TestCurationBacklogEscalation:
 
     @pytest.mark.asyncio
     async def test_the_detail_lists_at_most_twenty_tickets(self, store, tmp_path, pid):
-        for n in range(21):
-            await _park(store, pid, title=f't{n}', deferrals=2)
+        parked_oldest_first = [
+            await _park(store, pid, title=f't{n}', deferrals=2) for n in range(21)
+        ]
 
         await self._janitor(store, tmp_path, pid).tick()
 
         [record] = self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)
         detail = json.loads(record.detail)
-        assert (detail['count'], len(detail['tickets'])) == (21, 20)
+        assert detail['count'] == 21
+        assert [t['ticket_id'] for t in detail['tickets']] == parked_oldest_first[:20]

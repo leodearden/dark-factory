@@ -1178,6 +1178,29 @@ class TestCurationParking:
         assert all(type(group.defer_reason) is DeferReason for group in backlog)
 
     @pytest.mark.asyncio
+    async def test_oldest_awaiting_curation_is_filtered_ordered_and_limited(self, store, db_path):
+        capped, auth_failed = DeferReason.ALL_ACCOUNTS_CAPPED, DeferReason.ACCOUNTS_AUTH_FAILED
+        newest, oldest, middle, wrong_reason, other_project = [
+            await store.submit(project, '{}') for project in ('p', 'p', 'p', 'p', 'q')
+        ]
+        unparked = await store.submit('p', '{}')
+        for tid, reason in [
+            (newest, capped), (oldest, capped), (middle, capped),
+            (wrong_reason, auth_failed), (other_project, capped),
+        ]:
+            await _park(store, tid, reason=reason)
+        for tid, created_at in [
+            (oldest, '2026-10-18T08:00:00+00:00'), (middle, '2026-10-18T09:00:00+00:00'),
+            (newest, '2026-10-18T10:00:00+00:00'), (wrong_reason, '2026-10-18T07:00:00+00:00'),
+            (other_project, '2026-10-18T06:00:00+00:00'), (unparked, '2026-10-18T05:00:00+00:00'),
+        ]:
+            _rewrite_row(db_path, tid, created_at=created_at)
+
+        rows = await store.oldest_awaiting_curation('p', defer_reason=capped, limit=2)
+
+        assert [row['ticket_id'] for row in rows] == [oldest, middle]
+
+    @pytest.mark.asyncio
     async def test_summarise_is_empty_with_nothing_parked(self, store):
         await store.submit('p', '{}')
 

@@ -65,7 +65,6 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.middleware.curation_deferral import DeferReason, backlog_severity
-from fused_memory.middleware.ticket_store import AWAITING_CURATION
 from fused_memory.models.scope import build_known_projects_map
 from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
@@ -437,35 +436,27 @@ class TicketJanitor:
         except Exception:
             logger.exception('ticket_janitor: summarise_awaiting_curation failed')
             return
-        parked_per_project: defaultdict[str, int] = defaultdict(int)
-        for backlog in backlogs:
-            parked_per_project[backlog.project_id] += backlog.count
         for backlog in backlogs:
             if backlog.max_attempts < self._curation_backlog_min_attempts:
                 continue
             try:
-                await self._escalate_one_curation_backlog(
-                    backlog, parked_in_project=parked_per_project[backlog.project_id],
-                )
+                await self._escalate_one_curation_backlog(backlog)
             except Exception:
                 logger.exception(
                     'ticket_janitor: curation-backlog escalation failed for %s/%s',
                     backlog.project_id, backlog.defer_reason,
                 )
 
-    async def _escalate_one_curation_backlog(
-        self, backlog: CurationBacklog, *, parked_in_project: int,
-    ) -> None:
+    async def _escalate_one_curation_backlog(self, backlog: CurationBacklog) -> None:
         now = time.monotonic()
         key = (backlog.project_id, _CURATION_BACKLOG, backlog.defer_reason.value)
         if self._cooldown_blocks(key, now):
             return
         severity = backlog_severity(backlog.defer_reason)
-        parked = await self._store.list_tickets(
+        parked = await self._store.oldest_awaiting_curation(
             backlog.project_id,
-            status=AWAITING_CURATION,
-            since=datetime.fromisoformat(backlog.oldest_created_at),
-            limit=parked_in_project,
+            defer_reason=backlog.defer_reason,
+            limit=_CURATION_BACKLOG_DETAIL_TICKETS,
         )
         tickets = [
             {
@@ -476,8 +467,7 @@ class TicketJanitor:
                 'next_attempt_at': row['next_attempt_at'],
             }
             for row in parked
-            if row['defer_reason'] == backlog.defer_reason.value
-        ][:_CURATION_BACKLOG_DETAIL_TICKETS]
+        ]
         esc_id = await asyncio.to_thread(
             file_folded_escalation,
             self._known_projects.get(backlog.project_id),
