@@ -3235,9 +3235,10 @@ _ENV_DRIFT_SENTINEL = '__env_drift__'
 
 # Escalation category for env divergence.  A named constant rather than two
 # string literals because the dedup pre-check and the filed Escalation MUST
-# spell it identically — Escalation.category is prose, not a checked contract
-# (see escalation/src/escalation/models.py::Escalation), so a typo on either
-# side would silently disable dedup and file one L1 per drift check forever.
+# spell it identically.  It must also be registered in
+# escalation/src/escalation/categories.py::EscalationCategory: has_open_l1 and
+# submit both refuse an unregistered category, and check_env_safely would
+# swallow that refusal, so the detector would never file.
 _ENV_DIVERGENCE_CATEGORY = 'verify_env_divergence'
 
 

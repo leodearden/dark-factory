@@ -40,7 +40,8 @@ from orchestrator.verify import VerifyResult
 # conftest.py::_isolate_orch_config is AUTOUSE and pins ORCH_CONFIG_PATH at this
 # repo's OWN dark-factory-orchestrator.yaml, which DECLARES verify_env_probes.
 # A real OrchestratorConfig built in a test therefore INHERITS them, and
-# merge_drift.py::_run_drift_check calls check_env with no `local_run` — so the
+# orchestrator/src/orchestrator/merge_lane/drift.py::_run_drift_check calls
+# check_env with no `local_run` — so the
 # local fingerprint is captured through verify_runner.py::env_probe_local_run,
 # i.e. real create_subprocess_exec calls against whatever is on PATH (npx, uv,
 # node, python3, plus the hardcoded rustc/cargo/sccache), none of them

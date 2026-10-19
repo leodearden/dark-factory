@@ -1092,12 +1092,13 @@ verify_env:
 # cosmetic probe difference would cost more than the finding; if this should
 # ever gate, that is a deliberate operator decision, not a silent one.
 #
-# INERT UNTIL LEVER C IS ON. _maybe_run_drift_check returns early on an empty
-# enabled_verify_runners, and this file declares no verify_runners, so nothing
-# below runs today. It is landed now so the probe set is already correct when
-# the runners are enabled. RESTART-ONLY (deliberately absent from
-# RELOADABLE_FIELDS): the probe list is only consulted alongside the
-# verify_runners pool, which is itself restart-only.
+# LIVE ON THIS PROJECT. This file enables the `laptop` verify runner with
+# verify_drift_check_every_n_lands: 10, so these probes run on both hosts at the
+# first drift check after the deploy that carries them, and every 10 lands after
+# that. The first check is expected to report the real tool skew measured below
+# as ONE deduped L1 — designed behaviour, not a defect. RESTART-ONLY
+# (deliberately absent from RELOADABLE_FIELDS): the probe list is only
+# consulted alongside the verify_runners pool, which is itself restart-only.
 #
 # THE PROBE SEAM IS THE VERIFY SEAM, ON BOTH SIDES.
 #   - REMOTE: RemoteRunner.env_probe_run issues `ssh <host> <cmd>` — the same

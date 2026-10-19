@@ -42,7 +42,8 @@ def _make_config(*, verify_runners=None, main_branch='main', drift_every_n=20):
     conftest.py::_isolate_orch_config is autouse and points ORCH_CONFIG_PATH at
     this repo's own dark-factory-orchestrator.yaml, which declares probes — so
     without this a config built here inherits them, and
-    merge_drift.py::_run_drift_check would capture the LOCAL fingerprint
+    orchestrator/src/orchestrator/merge_lane/drift.py::_run_drift_check would
+    capture the LOCAL fingerprint
     through verify_runner.py::env_probe_local_run: real, untimed
     subprocesses (npx/uv/node/python3 plus rustc/cargo/sccache) spawned by
     tests that are about runner-pool wiring, not about env probing.  Any test
