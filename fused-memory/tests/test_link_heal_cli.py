@@ -24,6 +24,7 @@ import yaml
 from _fm_helpers import load_script_module
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
+    COMPLETION_META,
     DF,
     REIFY,
     WITHOUT_LINK_HEAL_PREFIX,
@@ -56,7 +57,6 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
-from fused_memory.memory_metadata import ORCHESTRATOR_COMPLETION_SOURCE
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
@@ -798,9 +798,6 @@ class TestApplyFromAdjudicator:
         assert harness.mem0.write_count == 0
 
 
-COMPLETION_META = {'source': ORCHESTRATOR_COMPLETION_SOURCE, 'task_id': '4242'}
-
-
 def seed_completion_children(
     harness: LinkHealHarness, *projects: str, first: int = 400,
 ) -> None:
@@ -895,6 +892,27 @@ class TestApplyDeterministic:
         assert applied['counts']['approved_plan_sha256'] == planned['plan_sha256']
         assert workspace.pending(RunSource.DETERMINISTIC) == 0
         assert workspace.pending(RunSource.CORPUS) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_completion_detach_a_corpus_plan_ledgered_first_drains_only_through_its_apply(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        seed_completion_children(harness, DF)
+        corpus = await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+        _code, deterministic = await plan_deterministic(env, workspace, capsys, '--project', DF)
+
+        _code, drained = await apply(env, workspace, capsys, '--deterministic')
+        _code, applied = await apply(
+            env, workspace, capsys, '--approved-plan-sha', corpus['plan_sha256'],
+        )
+
+        assert corpus['counts']['planned_by_action'] == {'detach': 1, 'relabel': 1}
+        assert deterministic['counts']['already_pending'] == 1
+        assert plan_document_actions(deterministic) == []
+        assert drained['counts']['applied'] == 0
+        assert applied['counts']['applied'] == 2
+        assert workspace.pending(RunSource.CORPUS) == 0
 
     @pytest.mark.asyncio
     async def test_deterministic_and_adjudicator_together_is_a_usage_error(self, harness, workspace):

@@ -20,6 +20,7 @@ import pytest_asyncio
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     CHILD,
+    COMPLETION_META,
     DEFAULT_LIMITS,
     DF,
     PARENT,
@@ -55,7 +56,6 @@ from fused_memory.server.grouped_read import (
     SIGHTING_KIND,
 )
 
-COMPLETION_META = {'source': ORCHESTRATOR_COMPLETION_SOURCE, 'task_id': '4242'}
 COMPLETION_TEXT = 'task 4242 completed: the link healer shipped'
 
 REIFY_CHILD = '66666666-6666-4666-8666-666666666666'
@@ -270,6 +270,24 @@ class TestUndo:
             PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND, CONTESTED_METADATA_KEY: True,
         }
         replan = await run_deterministic_plan(harness, ledger, tmp_path / 'replan.json')
+        assert replan.counts.undo_suppressed == 1
+        assert ledger.run_actions(replan.run_id) == []
+
+    @pytest.mark.asyncio
+    async def test_an_undone_dangling_detach_suppresses_the_completion_detach_of_that_child(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link(child_text=COMPLETION_TEXT, parent_text=None)
+        first = await run_deterministic_plan(harness, ledger, tmp_path / 'first.json')
+        (dangling,) = ledger.run_actions(first.run_id)
+        writer = ledger.start_run(RunSource.DETERMINISTIC, writes=True)
+        ledger.set_outcome(dangling.action_id, ActionState.APPLIED, writer, None)
+        ledger.mark_undone(dangling.action_id, ledger.start_run(RunSource.UNDO, writes=True))
+        harness.mem0.payload(DF, CHILD)['source'] = ORCHESTRATOR_COMPLETION_SOURCE
+
+        replan = await run_deterministic_plan(harness, ledger, tmp_path / 'replan.json')
+
+        assert dangling.planned.basis_source is BasisSource.DETERMINISTIC
         assert replan.counts.undo_suppressed == 1
         assert ledger.run_actions(replan.run_id) == []
 

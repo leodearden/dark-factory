@@ -49,6 +49,7 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
+from fused_memory.memory_metadata import ORCHESTRATOR_COMPLETION_SOURCE
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.scope import Scope
@@ -75,6 +76,9 @@ CHILD = '11111111-1111-4111-8111-111111111111'
 PARENT = '22222222-2222-4222-8222-222222222222'
 CHILD_TEXT = 'the child note about link healing'
 PARENT_TEXT = 'the parent note about link healing'
+
+#: The provenance the orchestrator stamps on a task completion record (task 6961).
+COMPLETION_META = {'source': ORCHESTRATOR_COMPLETION_SOURCE, 'task_id': '4242'}
 
 DEFAULT_LIMITS = RunLimits(
     max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,

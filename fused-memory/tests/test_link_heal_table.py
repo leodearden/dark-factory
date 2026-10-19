@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _link_heal_harness import COMPLETION_META
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -40,7 +41,6 @@ from fused_memory.maintenance.link_heal import (
     undo_changes,
 )
 from fused_memory.maintenance.link_heal_store import LiveRecord, MetadataChange, text_sha256
-from fused_memory.memory_metadata import ORCHESTRATOR_COMPLETION_SOURCE
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -293,7 +293,6 @@ class TestUndoChanges:
             assert None not in (change.patch or {}).values()
 
 
-COMPLETION_META = {'source': ORCHESTRATOR_COMPLETION_SOURCE, 'task_id': '4242'}
 CHAINED_PARENT_META = {PARENT_ID_KEY: '33333333-3333-3333-3333-333333333333'}
 
 
