@@ -78,6 +78,7 @@ from fused_memory.server.consolidation import (
     ProposalShapeCode,
     proposal_shape_codes,
 )
+from fused_memory.topic_slug import is_valid_topic_slug
 from fused_memory.utils.validation import is_full_uuid
 from shared.project_id import project_id_for_root
 from shared.project_layout import CheckoutRootError, default_project_root
@@ -260,23 +261,40 @@ async def migrate(ctx: RunContext, gates: Iterable[OpenGate]) -> tuple[GateRepor
 
 
 async def migrate_gate(ctx: RunContext, gate: OpenGate) -> GateReport:
+    """One gate, isolated: a store failure is reported on this gate and never ends the run."""
     topic = declared_gate_topic(gate.metadata)
     if topic is None:
-        return GateReport(
-            task_id=gate.task_id,
-            topic=None,
-            disposition=Disposition.REFUSED,
-            reasons=(Reason(MigrationCode.GATE_TOPIC_UNUSABLE),),
-        )
-    assessment = await assess(ctx, gate, topic)
+        return _refused(gate, None, MigrationCode.GATE_TOPIC_UNUSABLE)
+    scroll_ids = await _scroll_topic(ctx, topic)
+    if isinstance(scroll_ids, MigrationCode):
+        return _refused(gate, topic, scroll_ids)
+    assessment = await assess(ctx, gate, topic, scroll_ids)
     return _dispose(ctx, assessment)
 
 
-async def assess(ctx: RunContext, gate: OpenGate, topic: str) -> Assessment:
-    scrolled = await ctx.memory.get_memories_by_metadata(
-        ctx.project_id, {'topic': topic}, limit=closure_cli.SCROLL_LIMIT,
+def _refused(gate: OpenGate, topic: str | None, code: MigrationCode) -> GateReport:
+    return GateReport(
+        task_id=gate.task_id, topic=topic, disposition=Disposition.REFUSED, reasons=(Reason(code),),
     )
-    scroll_ids = [str(row['id']) for row in scrolled if isinstance(row, Mapping) and row.get('id')]
+
+
+async def _scroll_topic(ctx: RunContext, topic: str) -> tuple[str, ...] | MigrationCode:
+    """The live topic scroll's ids, or why it cannot stand for the whole cluster."""
+    try:
+        rows = await ctx.memory.get_memories_by_metadata(
+            ctx.project_id, {'topic': topic}, limit=closure_cli.SCROLL_LIMIT,
+        )
+    except Exception:
+        logger.warning('topic %r: the member scroll failed', topic, exc_info=True)
+        return MigrationCode.MEMBER_SCROLL_UNAVAILABLE
+    if not isinstance(rows, list) or len(rows) >= closure_cli.SCROLL_LIMIT:
+        return MigrationCode.MEMBER_SCROLL_INCOMPLETE
+    return tuple(str(row['id']) for row in rows if isinstance(row, Mapping) and row.get('id'))
+
+
+async def assess(
+    ctx: RunContext, gate: OpenGate, topic: str, scroll_ids: Sequence[str],
+) -> Assessment:
     observed_only = _observed_only(gate.block, scroll_ids)
     facts = await read_cluster_facts(
         ctx.memory,
@@ -478,10 +496,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_claims(values: Sequence[str]) -> dict[str, str]:
+    """``{topic: claim}`` from repeated ``--claim TOPIC=TEXT``; a malformed one is a UsageError."""
     claims: dict[str, str] = {}
     for value in values:
-        topic, _, text = value.partition('=')
-        claims[topic.strip()] = text.strip()
+        topic, separator, text = value.partition('=')
+        topic = topic.strip()
+        if not separator:
+            raise UsageError(f'--claim {value!r} is not TOPIC=TEXT')
+        if not is_valid_topic_slug(topic):
+            raise UsageError(f'--claim topic {topic!r} is not a well-formed topic slug')
+        if topic in claims:
+            raise UsageError(f'--claim topic {topic!r} is given more than once')
+        claims[topic] = text.strip()
     return claims
 
 
