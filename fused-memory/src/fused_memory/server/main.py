@@ -573,6 +573,10 @@ async def run_server():
 
     # Initialize write journal
     from fused_memory.services.write_journal import WriteJournal
+    from fused_memory.services.write_ops_retention import (
+        prune_write_ops_pass,
+        run_periodic_write_ops_prune,
+    )
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
@@ -612,18 +616,11 @@ async def run_server():
     # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
     # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
     # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
-    # it would corrupt the very telemetry it is pruning. A first run against the
-    # current backlog will legitimately need many restarts to drain, which the
-    # prune discloses at WARNING rather than hiding. Fire-and-forget.
-    _wj = config.write_journal
-    _write_ops_pruned = await write_journal.prune_write_ops(
-        read_older_than_days=_wj.read_retention_days,
-        search_older_than_days=_wj.search_retention_days,
-        write_older_than_days=_wj.write_retention_days,
-        batch_size=_wj.prune_batch_size,
-        max_rows=_wj.prune_max_rows_per_run,
-        max_seconds=_wj.prune_max_seconds,
-    )
+    # it would corrupt the very telemetry it is pruning. The periodic loop
+    # started below now carries the drain, not successive restarts; this pass
+    # catches up after downtime, and every partial pass discloses its backlog at
+    # WARNING. Fire-and-forget.
+    _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
     if _write_ops_pruned:
         logger.info(
             f'write_ops retention prune at startup: {_write_ops_pruned} rows'
@@ -1179,6 +1176,16 @@ async def run_server():
     else:
         logger.info('  Summary rebuild loop: disabled')
 
+    write_ops_prune_task = asyncio.create_task(
+        run_periodic_write_ops_prune(write_journal, config.write_journal),
+    )
+    logger.info(
+        '  Write-ops prune loop: every %.0fs, each pass bounded by %.0fs / %d rows',
+        config.write_journal.prune_interval_seconds,
+        config.write_journal.prune_max_seconds,
+        config.write_journal.prune_max_rows_per_run,
+    )
+
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
         task_interceptor.remint_broken_recurrence_chains,
@@ -1358,6 +1365,9 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        write_ops_prune_task.cancel()
+        with contextlib.suppress(BaseException):
+            await write_ops_prune_task
         if remint_sweep_task is not None:
             remint_sweep_task.cancel()
             with contextlib.suppress(BaseException):

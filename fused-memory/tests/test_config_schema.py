@@ -4164,9 +4164,10 @@ class TestWriteJournalConfig:
         assert section.read_retention_days == 30.0
         assert section.search_retention_days == 365.0
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
         assert section.prune_max_rows_per_run == 500_000
         assert section.prune_max_seconds == 30.0
+        assert section.prune_interval_seconds == 1800.0
 
     def test_search_rows_outlive_task_read_rows(self):
         section = FusedMemoryConfig().write_journal
@@ -4185,12 +4186,22 @@ class TestWriteJournalConfig:
             'RED: the rejection must name the field an operator has to fix'
         )
 
+    def test_a_zero_prune_interval_is_rejected(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(prune_interval_seconds=0)
+        assert 'prune_interval_seconds' in str(excinfo.value), (
+            'RED: a zero interval would spin the periodic prune loop'
+        )
+
     def test_values_load_from_yaml(self, tmp_path, monkeypatch):
         config_data = {
             'write_journal': {
                 'read_retention_days': 7.0,
                 'search_retention_days': 90.0,
                 'prune_max_seconds': 5.0,
+                'prune_interval_seconds': 600.0,
             },
         }
         config_file = tmp_path / 'config.yaml'
@@ -4202,9 +4213,10 @@ class TestWriteJournalConfig:
         assert section.read_retention_days == 7.0, 'RED: the section must be tunable'
         assert section.search_retention_days == 90.0
         assert section.prune_max_seconds == 5.0
+        assert section.prune_interval_seconds == 600.0
         # Unmentioned leaves keep their defaults rather than being clobbered.
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
 
 
 class TestWriteJournalGrowthAlarmConfig:
