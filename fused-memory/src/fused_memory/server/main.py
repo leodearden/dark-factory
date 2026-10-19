@@ -44,10 +44,6 @@ from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
-from fused_memory.services.write_ops_retention import (  # noqa: E402
-    prune_write_ops_pass,
-    run_periodic_write_ops_prune,
-)
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
@@ -577,6 +573,10 @@ async def run_server():
 
     # Initialize write journal
     from fused_memory.services.write_journal import WriteJournal
+    from fused_memory.services.write_ops_retention import (
+        prune_write_ops_pass,
+        run_periodic_write_ops_prune,
+    )
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
