@@ -30,8 +30,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from escalation.categories import EscalationCategory
+from escalation.models import Escalation, EvidenceEntry
+from escalation.queue import EscalationQueue
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from shared.memory_eval_limits import (
+    Alarm,
     EvaluationResult,
     LimitsConfig,
     evaluate_series,
@@ -47,7 +51,13 @@ from shared.memory_eval_metrics import (
     metrics_artifact_path,
     report_artifact_path,
 )
-from shared.memory_eval_verdicts import RunnerFailureRecord, VerdictEntry, verdict_entries
+from shared.memory_eval_verdicts import (
+    RUNNER_FAILURE_FINGERPRINT,
+    RunnerFailureRecord,
+    StormEscape,
+    VerdictEntry,
+    verdict_entries,
+)
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.utils.target_store_preflight import TargetStoreMissing, assert_queue_dir_populated
@@ -255,6 +265,228 @@ def evaluate_evals(
                 scope=eval_id, phase='evaluate', error_type=type(exc).__name__, message=str(exc),
             ))
     return runs, failures
+
+
+AGENT_ROLE = 'memory-eval-runner'
+PROGRAM_TASK_ID = 'memory-eval-program'
+
+_REMEDIATION: dict[str, str] = {
+    'tripwire': (
+        'Remediation: a probe item that passed before now fails. Read the failing item in '
+        'the M1 report, fix the regression in the corpus or retrieval path, and resolve '
+        'this once a later run shows the item passing.'
+    ),
+    'proportion': (
+        'Remediation: the rate moved the bad way beyond the derived alpha. Compare this '
+        "run's M1 report with the baseline runs to find the change that moved it."
+    ),
+    'count': (
+        'Remediation: the event count moved the bad way beyond the derived alpha. Compare '
+        "this run's M1 report with the baseline runs to find what produced the events."
+    ),
+}
+
+
+def eval_task_id(eval_id: str) -> str:
+    return f'memory-eval-{eval_id}'
+
+
+@dataclass(frozen=True)
+class FilingContext:
+    run_stamp: str
+    project_id: str
+    run_report_path: Path
+    verdicts_path: Path
+
+    @property
+    def measured_at(self) -> str:
+        return f'run_stamp={self.run_stamp}'
+
+
+@dataclass(frozen=True)
+class Filing:
+    task_id: str
+    fingerprint: str
+    summary: str
+    detail: str
+    evidence: tuple[EvidenceEntry, ...]
+
+
+@dataclass(frozen=True)
+class FilingOutcome:
+    filed: tuple[str, ...]
+    suppressed: tuple[str, ...]
+
+
+def file_once(queue: EscalationQueue, filing: Filing, *, project_id: str) -> str | None:
+    """The one place this runner builds an Escalation; None when that fingerprint is still open."""
+    if queue.has_open_l1(
+        filing.task_id,
+        category=EscalationCategory.EVAL_REGRESSION,
+        dedupe_fingerprint=filing.fingerprint,
+    ):
+        return None
+    return queue.submit(Escalation(
+        id=queue.make_id(filing.task_id),
+        task_id=filing.task_id,
+        agent_role=AGENT_ROLE,
+        severity='blocking',
+        category=EscalationCategory.EVAL_REGRESSION,
+        summary=filing.summary,
+        detail=filing.detail,
+        level=1,
+        dedupe_fingerprint=filing.fingerprint,
+        project_id=project_id,
+        evidence=list(filing.evidence),
+    ))
+
+
+def _num(value: float | None) -> str:
+    return 'n/a' if value is None else f'{value:g}'
+
+
+def _subject(entry: VerdictEntry) -> str:
+    return f'{entry.metric_id}[{entry.item}]' if entry.item is not None else entry.metric_id
+
+
+def _matching_alarm(run: EvalRun, entry: VerdictEntry) -> Alarm:
+    for alarm in run.result.alarms:
+        if (alarm.metric_id, alarm.item_key) == (entry.metric_id, entry.item):
+            return alarm
+    raise ValueError(f'{run.eval_id}: no evaluator alarm matches entry {_subject(entry)}.')
+
+
+def _limit_line(run: EvalRun, alarm: Alarm) -> str:
+    if alarm.rule_kind == 'tripwire':
+        return f'limit: grandfather_set_hash={run.result.grandfather_hash}'
+    return f'limit: alpha={alarm.alpha!r} p_value={alarm.p_value!r}'
+
+
+def alarm_filing(run: EvalRun, entry: VerdictEntry, context: FilingContext) -> Filing:
+    alarm = _matching_alarm(run, entry)
+    subject = _subject(entry)
+    detail = [
+        f'eval_id: {run.eval_id}',
+        f'metric_id: {entry.metric_id}',
+        *([f'item: {entry.item}'] if entry.item is not None else []),
+        f'rule_kind: {entry.rule_kind}',
+        *([f'direction: {alarm.direction}'] if alarm.direction is not None else []),
+        f'value: {_num(alarm.value)}',
+        f'baseline: {_num(alarm.baseline)}',
+        _limit_line(run, alarm),
+        f'baseline_run_stamps: {", ".join(run.result.baseline_run_stamps) or "none"}',
+        f'evaluator: {alarm.detail}',
+        f'limits artifact: {run.limits_path}',
+        f'M1 metrics: {run.metrics_path}',
+        f'M1 report: {run.report_path}',
+        f'run report: {context.run_report_path}',
+        f'verdicts: {context.verdicts_path}',
+        _REMEDIATION[entry.rule_kind],
+    ]
+    return Filing(
+        task_id=eval_task_id(run.eval_id),
+        fingerprint=entry.fingerprint,
+        summary=(
+            f'memory-eval {run.eval_id}: {subject} regressed at {context.run_stamp} '
+            f'(value {_num(alarm.value)} vs baseline {_num(alarm.baseline)})'
+        ),
+        detail='\n'.join(detail),
+        evidence=(EvidenceEntry(
+            observation=f'{run.eval_id} {subject}: {alarm.detail}',
+            measured_at=context.measured_at,
+            ref=str(run.metrics_path),
+        ),),
+    )
+
+
+def storm_filing(
+    storm: StormEscape, alarm_entries: Sequence[VerdictEntry], context: FilingContext,
+) -> Filing:
+    if storm.aggregate_fingerprint is None:
+        raise ValueError('storm_filing: the storm block is not triggered.')
+    detail = [
+        f'{storm.alarm_count} alarm(s) in run {context.run_stamp} exceed storm_alarm_limit '
+        f'K={storm.alarm_limit}; per-metric escalations were collapsed into this one.',
+        *(f'- {e.eval_id} {_subject(e)}: value {_num(e.value)}' for e in alarm_entries),
+        f'run report: {context.run_report_path}',
+        f'verdicts: {context.verdicts_path}',
+        'Remediation: this many alarms at once usually share one cause (a store outage, a '
+        'corpus migration, a probe change). Find that cause from the run report first.',
+    ]
+    return Filing(
+        task_id=PROGRAM_TASK_ID,
+        fingerprint=storm.aggregate_fingerprint,
+        summary=(
+            f'memory-eval storm at {context.run_stamp}: {storm.alarm_count} alarms exceed '
+            f'K={storm.alarm_limit}; see {context.run_report_path}'
+        ),
+        detail='\n'.join(detail),
+        evidence=(EvidenceEntry(
+            observation=f'{storm.alarm_count} alarm entries > storm_alarm_limit {storm.alarm_limit}',
+            measured_at=context.measured_at,
+            ref=str(context.verdicts_path),
+        ),),
+    )
+
+
+def _failure_observation(failure: RunnerFailureRecord) -> str:
+    exit_part = f' exit_code={failure.exit_code}' if failure.exit_code is not None else ''
+    return f'{failure.scope} {failure.phase}: {failure.error_type}{exit_part}'
+
+
+def failure_filing(failures: Sequence[RunnerFailureRecord], context: FilingContext) -> Filing:
+    scopes = ', '.join(failure.scope for failure in failures)
+    detail = [
+        *(f'- {_failure_observation(f)}\n  {f.message}' for f in failures),
+        f'run report: {context.run_report_path}',
+        f'verdicts: {context.verdicts_path}',
+        'Remediation: the named evals did not produce or judge a series this run, so they '
+        'carry no verdict. Fix the cause in the journal (journalctl --user -u '
+        'fused-memory-memory-eval.service); this stays open across runs until resolved.',
+    ]
+    return Filing(
+        task_id=PROGRAM_TASK_ID,
+        fingerprint=RUNNER_FAILURE_FINGERPRINT,
+        summary=(
+            f'memory-eval runner: {len(failures)} failure(s) at {context.run_stamp} '
+            f'({scopes}); see {context.run_report_path}'
+        ),
+        detail='\n'.join(detail),
+        evidence=tuple(
+            EvidenceEntry(
+                observation=_failure_observation(failure),
+                measured_at=context.measured_at,
+                ref=str(context.run_report_path),
+            )
+            for failure in failures
+        ),
+    )
+
+
+def file_run_escalations(
+    queue: EscalationQueue,
+    evals: Sequence[EvalRun],
+    storm: StormEscape,
+    failures: Sequence[RunnerFailureRecord],
+    context: FilingContext,
+) -> FilingOutcome:
+    """File this run's eval_regression escalations; never resolves anything."""
+    alarms = [(run, entry) for run in evals for entry in run.entries if entry.verdict == 'alarm']
+    if storm.triggered:
+        filings = [storm_filing(storm, [entry for _, entry in alarms], context)]
+    else:
+        filings = [alarm_filing(run, entry, context) for run, entry in alarms]
+    if failures:
+        filings.append(failure_filing(failures, context))
+    filed: list[str] = []
+    suppressed: list[str] = []
+    for filing in filings:
+        esc_id = file_once(queue, filing, project_id=context.project_id)
+        if esc_id is None:
+            suppressed.append(filing.fingerprint)
+        else:
+            filed.append(esc_id)
+    return FilingOutcome(filed=tuple(filed), suppressed=tuple(suppressed))
 
 
 def _default_queue_dir() -> Path:
