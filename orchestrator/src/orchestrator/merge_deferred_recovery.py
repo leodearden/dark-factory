@@ -1,9 +1,9 @@
 """Find merge-deferred members nothing will ever move again, and recover them (task 4737).
 
 A member parks merge-deferred to wait for a train.  It stays owned while a
-train the merge lane holds lists it, a live workflow holds it, a live claimant
-or a pinning escalation holds it, or a peer of its declared train is still
-active.  A member with none of these owners is abandoned.  The operator's view
+train the merge lane holds lists it, a live single merge request was submitted
+under its id (task 7022), a live workflow holds it, a live claimant or a
+pinning escalation holds it, or a peer of its declared train is still active.  A member with none of these owners is abandoned.  The operator's view
 of the sweep, including how to hold a member by hand, is OPERATIONS.md
 § "Abandoned merge-deferred members (task 4737)".
 """
@@ -37,8 +37,8 @@ MERGE_DEFERRED_ABANDONED_CATEGORY = 'merge_deferred_abandoned'
 _AGENT_ROLE = 'harness-merge-deferred-recovery'
 _RUNBOOK = 'OPERATIONS.md § "Abandoned merge-deferred members (task 4737)"'
 _ABSENT_OWNERS = (
-    'no train in merge-lane custody, no live workflow, no live claimant, '
-    'no pinning escalation and no active declared-train peer'
+    'no train in merge-lane custody, no live single merge request, no live workflow, '
+    'no live claimant, no pinning escalation and no active declared-train peer'
 )
 _LANDED: frozenset[MemberRedriveOutcome] = frozenset({
     MemberRedriveOutcome.ON_MAIN_ATTRIBUTED,
@@ -53,6 +53,7 @@ _NOT_ACTED_ON: frozenset[MemberRedriveOutcome] = frozenset({
 
 class ParkedOwner(enum.StrEnum):
     TRAIN_CUSTODY = 'train_custody'
+    SINGLE_REQUEST = 'single_request'
     WORKFLOW = 'workflow'
     EXTERNAL_HOLD = 'external_hold'
     TRAIN_PEER_ACTIVE = 'train_peer_active'
@@ -117,6 +118,7 @@ class OwnershipView:
     """Every ownership signal, read at one instant."""
 
     custody: frozenset[str]
+    single_requests: frozenset[str]
     workflow_held: frozenset[str]
     externally_held: frozenset[str]
     declared_trains: Mapping[str, tuple[TrainPeer, ...]]
@@ -124,6 +126,7 @@ class OwnershipView:
     def holds(self, task_id: str) -> bool:
         return (
             task_id in self.custody
+            or task_id in self.single_requests
             or task_id in self.workflow_held
             or task_id in self.externally_held
         )
@@ -146,6 +149,8 @@ class RecoveryTarget:
 def owner_of(member: ParkedMember, view: OwnershipView) -> ParkedOwner:
     if member.task_id in view.custody:
         return ParkedOwner.TRAIN_CUSTODY
+    if member.task_id in view.single_requests:
+        return ParkedOwner.SINGLE_REQUEST
     if member.task_id in view.workflow_held:
         return ParkedOwner.WORKFLOW
     if member.task_id in view.externally_held:
@@ -212,6 +217,12 @@ class ParkedMemberLane(Protocol):
     ) -> Mapping[str, MemberRedriveOutcome]: ...
 
 
+class LiveMergeRequests(Protocol):
+    """The task ids live merge requests were submitted under; InFlightMergeRegistry is one."""
+
+    def task_ids_in_flight(self) -> frozenset[str]: ...
+
+
 class ParkedTaskStore(Protocol):
     """What the sweep needs of the task store; the Scheduler is one."""
 
@@ -249,6 +260,7 @@ class AbandonedMemberSweep:
         self,
         *,
         lane: ParkedMemberLane | None,
+        requests: LiveMergeRequests,
         tasks: ParkedTaskStore,
         escalations: EscalationQueue | None,
         claimant_ttl: timedelta,
@@ -259,13 +271,13 @@ class AbandonedMemberSweep:
         snapshot = await _snapshot(tasks, claimant_ttl)
         if snapshot is None:
             return _NOTHING_SWEPT
-        view = _ownership_view(snapshot, lane, tasks, escalations)
+        view = _ownership_view(snapshot, lane, requests, tasks, escalations)
         owners = {member.task_id: owner_of(member, view) for member in snapshot.members}
         abandoned = [m for m in snapshot.members if owners[m.task_id] is ParkedOwner.NONE]
         self._suspects = frozenset(member.task_id for member in abandoned)
         outcomes: dict[str, MemberRedriveOutcome] = {}
         for target in recovery_targets(abandoned, view):
-            if target.redrive_id in previous:
+            if target.redrive_id in previous and not _submitted_since_view(requests, target):
                 target_outcomes = await _recover(lane, target)
                 outcomes.update(target_outcomes)
                 _file_escalation(escalations, target, target_outcomes)
@@ -281,6 +293,19 @@ class AbandonedMemberSweep:
             sorted(report.suspects), {tid: str(o) for tid, o in outcomes.items()},
         )
         return report
+
+
+def _submitted_since_view(requests: LiveMergeRequests, target: RecoveryTarget) -> bool:
+    """A re-drive of an earlier target yields the loop, so a merge request for
+    this one may have been submitted since the view was read."""
+    submitted = requests.task_ids_in_flight().intersection(target.members)
+    if submitted:
+        logger.info(
+            'Abandoned merge-deferred sweep: %s submitted a merge request since this '
+            'pass read its owners — not re-driving %s', ', '.join(sorted(submitted)),
+            target.label,
+        )
+    return bool(submitted)
 
 
 async def _snapshot(tasks: ParkedTaskStore, claimant_ttl: timedelta) -> _Snapshot | None:
@@ -306,6 +331,7 @@ async def _snapshot(tasks: ParkedTaskStore, claimant_ttl: timedelta) -> _Snapsho
 def _ownership_view(
     snapshot: _Snapshot,
     lane: ParkedMemberLane,
+    requests: LiveMergeRequests,
     tasks: ParkedTaskStore,
     escalations: EscalationQueue | None,
 ) -> OwnershipView:
@@ -315,6 +341,7 @@ def _ownership_view(
     task_ids = {m.task_id for m in snapshot.members} | {p.task_id for p in snapshot.peers}
     return OwnershipView(
         custody=lane.train_member_ids_in_custody(),
+        single_requests=requests.task_ids_in_flight(),
         workflow_held=frozenset(tid for tid in task_ids if tasks.is_actively_held(tid)),
         externally_held=frozenset(
             m.task_id for m in snapshot.members if _externally_held(m, escalations)
