@@ -10,7 +10,7 @@ schema_version: 1
 # several paths passes on any one of them, so every required path has its own check.
 tasks:
 - label: α
-  task_id: null
+  task_id: 7177
   title: 'state.py: schema constants, return validator, state home, append-only JSONL, the one store reader; fixture and fake store'
   capabilities:
   - name: lookup-tool-wired
@@ -89,7 +89,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/state.py
 - label: ρ
-  task_id: null
+  task_id: 7178
   title: 'find_tasks_by_metadata(include_rows=True): metadata and dependencies per row under the byte budget, echoed'
   capabilities:
   - name: lookup-layering
@@ -182,7 +182,7 @@ tasks:
       kind: manual
       reason: requires the running service restarted onto the landed code; asserted by the fused-memory suite's boundary rows and observed live by the next lead
 - label: β
-  task_id: null
+  task_id: 7186
   title: 'apply_return.py and record.py: validate, move, append, digest, --check, --from-store, idempotence'
   capabilities:
   - name: state-library
@@ -225,7 +225,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/apply_return.py
 - label: γ
-  task_id: null
+  task_id: 7187
   title: 'program_doc.py: render into the home, .state/ snapshot, heading self-check, --publish, --roster, --handoff'
   capabilities:
   - name: state-library
@@ -273,7 +273,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/program_doc.py
 - label: δ
-  task_id: null
+  task_id: 7190
   title: 'gen_brief.py: wave-aware brief at spawn time; --spawn creates the sessions.json entry and prints the pointer-prompt command'
   capabilities:
   - name: state-library
@@ -321,7 +321,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/gen_brief.py
 - label: ε
-  task_id: null
+  task_id: 7188
   title: 'clerk_batch.py: write (batch, CLERK_RULES prompt, release/repath recipes, --scan over moves), ingest'
   capabilities:
   - name: state-library
@@ -360,7 +360,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/clerk_batch.py
 - label: ζ
-  task_id: null
+  task_id: 7189
   title: 'gate_check.py (both trigger-chain forms) and seam_scan.py'
   capabilities:
   - name: state-library
@@ -388,7 +388,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/gate_check.py
 - label: η
-  task_id: null
+  task_id: 7191
   title: 'watch_sessions.py: resolve records, archive on first sight, final vs checkpoint, apply the inbox file once'
   capabilities:
   - name: state-library
@@ -430,7 +430,7 @@ tasks:
       paths:
       - skills/review-all/scripts/program/watch_sessions.py
 - label: σ1
-  task_id: null
+  task_id: 7179
   title: 'Spawn contract: --prompt-file pointer prompt, /reflect and in-progress in the trailer, the marker instruction, CLAUDE_SPAWN_SELF_EXIT → record.self_exit, the outcome vocabulary moved to session_registry.py'
   capabilities:
   - name: trailer-and-payload
@@ -536,7 +536,7 @@ tasks:
       paths:
       - skills/spawn/spawn-claude.sh
 - label: σ2
-  task_id: null
+  task_id: 7193
   title: 'Opt-in Stop-hook self-termination in session_self_exit.py'
   capabilities:
   - name: trailer-and-record-flag
@@ -607,7 +607,7 @@ tasks:
       paths:
       - orchestrator/tests/test_session_self_exit.py
 - label: σ3
-  task_id: null
+  task_id: 7194
   title: 'Acceptance probe: one scratch tmux-lane spawn with self-exit on and a brief over 16 KB self-terminates (human-run)'
   capabilities:
   - name: self-termination
@@ -620,7 +620,7 @@ tasks:
       kind: manual
       reason: a human spawns one scratch tmux-lane session with CLAUDE_SPAWN_SELF_EXIT=1 and a >16 KB brief and records exit 0, exited last, the --resume hint, record.exit_request's pid, the launcher command length, and the measured element shapes of background_tasks and session_crons in the task
 - label: κ
-  task_id: null
+  task_id: 7195
   title: 'Skill text cites the scripts and the machine homes (SKILL.md, deliberation.md, report-format.md)'
   capabilities:
   - name: scripts-landed
@@ -698,7 +698,7 @@ tasks:
       paths:
       - tests/scripts/test_review_all_skill_text_cites_scripts.py
 - label: ω
-  task_id: null
+  task_id: 7192
   title: 'Integration gate: the fixture walk (B1–B14), every script a subprocess under python3 -I -S'
   capabilities:
   - name: all-scripts
@@ -724,7 +724,7 @@ tasks:
       paths:
       - tests/scripts/test_review_all_program_fixture_walk.py
 - label: κ2
-  task_id: null
+  task_id: 7180
   title: 'deliberation.md: the A7 author-pass sitting, the decompose gotchas (B8, B12)'
   capabilities:
   - name: a7-ruling
@@ -788,7 +788,7 @@ tasks:
       paths:
       - skills/review-all/references/deliberation.md
 - label: λ1
-  task_id: null
+  task_id: 7181
   title: 'SKILL.md: pinned worktree (B6), one area rule (B7), filing mechanics (B8), fan-out hygiene (B9), live defects (B11), cost-gate calibration (B13)'
   capabilities:
   - name: current-text
@@ -849,7 +849,7 @@ tasks:
       paths:
       - skills/review-all/SKILL.md
 - label: λ3
-  task_id: null
+  task_id: 7182
   title: 'report-format.md: area_rules, combined disposition, skill_sha, operational events, token_rule, measured-at labels (B7–B10, B13, B15)'
   capabilities:
   - name: current-text
@@ -910,7 +910,7 @@ tasks:
       paths:
       - skills/review-all/references/report-format.md
 - label: λ4
-  task_id: null
+  task_id: 7183
   title: 'orchestration.md: git-archive fallback in the area prompt (B6), synthesis hardening (B14)'
   capabilities:
   - name: current-text
@@ -959,7 +959,7 @@ tasks:
       kind: manual
       reason: a kind script check would need a checked-in script (TestCheckedInScriptCheckTargets); the leaf runs node --check on the extracted block as its own test
 - label: λ5
-  task_id: null
+  task_id: 7184
   title: 'project-overlay.md: a second metrics instrument for a mixed repo (B16)'
   capabilities:
   - name: current-text
@@ -975,7 +975,7 @@ tasks:
       paths:
       - skills/review-all/references/project-overlay.md
 - label: μ
-  task_id: null
+  task_id: 7185
   title: 'Filing client: per-call timeout on FusedMemoryClient.call_tool (B8)'
   capabilities:
   - name: client-today
