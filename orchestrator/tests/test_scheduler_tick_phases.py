@@ -10,6 +10,7 @@ suite that exercises full ticks end-to-end.
 import dataclasses
 import inspect
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -17,6 +18,7 @@ from _recording_event_store import _RecordingEventStore
 from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, apply_reload
+from orchestrator.event_store import EventStore
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.scheduler import _CONTINUE, PsiHold, Scheduler, TickContext, TickOutcome
 
@@ -770,7 +772,7 @@ class TestSelectionPhases:
             max_per_module=1,
             psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0, min_inflight_floor=1),
         )
-        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler = Scheduler(config, event_store=cast(EventStore, event_store))
         scheduler.finish_startup()
         scheduler._read_psi_sample = lambda: PsiSample(
             cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True,

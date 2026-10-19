@@ -29,6 +29,7 @@ AsyncMock(return_value=[...])``, driving ``acquire_next()`` directly,
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import cast
 from unittest.mock import AsyncMock, Mock
 
 import _psi_admission_yaml
@@ -38,6 +39,7 @@ from _recording_event_store import _RecordingEventStore
 from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
+from orchestrator.event_store import EventStore
 from orchestrator.scheduler import Scheduler
 
 _nondefault_psi_admission_yaml = _psi_admission_yaml.nondefault_psi_admission_yaml
@@ -116,7 +118,7 @@ async def _sole_deferral_data(sample: PsiSample, psi_cfg: PsiAdmissionConfig) ->
     event_store = _RecordingEventStore()
     scheduler = Scheduler(
         OrchestratorConfig(max_per_module=1, psi_admission=psi_cfg),
-        event_store=event_store,  # type: ignore[arg-type]
+        event_store=cast(EventStore, event_store),
     )
     scheduler.finish_startup()
     scheduler._read_psi_sample = lambda: sample
@@ -143,7 +145,7 @@ class TestDispatchAdmissionThrottleDirection:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
+            event_store=cast(EventStore, event_store),
         )
         scheduler.finish_startup()
         # cpu_some10=90 is OVER this file's explicit cpu_some_avg10=85.0 threshold.
@@ -207,7 +209,7 @@ class TestDispatchAdmissionWorkConserving:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
+            event_store=cast(EventStore, event_store),
         )
         scheduler.finish_startup()
         scheduler._read_psi_sample = lambda: _psi(read_ok=True)  # all metrics 0.0 — idle
@@ -241,7 +243,7 @@ class TestDispatchAdmissionFloorDeadlockFreedom:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
+            event_store=cast(EventStore, event_store),
         )
         scheduler.finish_startup()
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
@@ -319,7 +321,7 @@ class TestDispatchAdmissionV2Arms:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig()),
-            event_store=event_store,  # type: ignore[arg-type]
+            event_store=cast(EventStore, event_store),
         )
         scheduler.finish_startup()
         scheduler._read_psi_sample = lambda: _psi(
@@ -429,7 +431,7 @@ class TestDispatchAdmissionFailOpen:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
+            event_store=cast(EventStore, event_store),
         )
         scheduler.finish_startup()
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=99.0, read_ok=False)
@@ -568,7 +570,7 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
+            event_store=cast(EventStore, event_store),
         )
         scheduler.finish_startup()
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
@@ -593,7 +595,7 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
         clock = _FakeClock()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
-            event_store=event_store,  # type: ignore[arg-type]
+            event_store=cast(EventStore, event_store),
             time_source=clock,
         )
         scheduler.finish_startup()
