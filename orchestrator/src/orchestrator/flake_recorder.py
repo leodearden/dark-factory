@@ -35,7 +35,8 @@ observations do beyond the rows and the due items.  The merge-gate entry unwraps
 ``VerifyResult`` and delegates.
 
 Import discipline: this module imports ``flake_ledger`` (which depends on ``shared``
-alone) at runtime and NOTHING else from ``orchestrator``.
+alone) at runtime and NOTHING else from ``orchestrator``; ``flake_debt_drain`` reads its
+per-call-site table, never the reverse.
 ``VerifyResult`` is a ``TYPE_CHECKING``-only annotation and ``EventType`` /
 ``Escalation`` are imported lazily inside their functions, so ``flake_recorder``
 never imports ``verify`` or ``event_store`` at runtime and cannot participate in an
@@ -55,7 +56,9 @@ from escalation.categories import EscalationCategory
 
 from orchestrator.flake_ledger import (
     DebtContext,
+    DebtTrigger,
     DueItem,
+    DueRow,
     FlakeCallSite,
     FlakeSuppression,
     FlakeVerdict,
@@ -73,22 +76,91 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class RegressionOrigin:
+    """What re-opened a resolved debt, as the ``regressed_after_resolution`` escalation
+    words it: the clause naming the observation, and its label/value lines in order."""
+
+    clause: str
+    observation: tuple[tuple[str, str], ...]
+
+
+_NOT_RECORDED = '(not recorded)'
+
+
+def _merge_gate_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    return RegressionOrigin(
+        clause='a merge-gate suppression',
+        observation=(
+            ('observed at merge_sha:', item.head or '(none)'),
+            ('observing task_id:', item.observing_task_id or '(none)'),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+_LANE_CLAUSES: Final[Mapping[DebtTrigger, str]] = {
+    DebtTrigger.cleared: 'an offline-lane clear',
+    DebtTrigger.recovered: 'an offline-lane recovery',
+}
+
+
+def _offline_lane_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    if context is None:
+        return RegressionOrigin(
+            clause='an offline-lane observation',
+            observation=(
+                ('observed at head:', item.head or _NOT_RECORDED),
+                ('observed_at:', item.observed_at),
+            ),
+        )
+    return RegressionOrigin(
+        clause=_LANE_CLAUSES[context.trigger],
+        observation=(
+            ('observed at head:', item.head or _NOT_RECORDED),
+            ('trigger:', context.trigger.value),
+            ('command:', context.command or _NOT_RECORDED),
+            ('pass ids:', ', '.join(context.pass_ids) or _NOT_RECORDED),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+def _neutral_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    return RegressionOrigin(
+        clause=f'an observation at call site {item.call_site}',
+        observation=(
+            ('observed at head:', item.head or _NOT_RECORDED),
+            ('call site:', item.call_site),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class CallSiteEffects:
     """What one call site's observations do beyond the ledger rows and the due items.
 
     *live_signals*: a suppression emits ``merge_flake_suppressed`` and bumps the INV-4
     storm streak.  The merge gate's alone: the offline lane gates no merge, so a lane
     clear masks nothing (offline-lane PRD D6, call 1).
+
+    *regression_origin*: how the drain's regression escalation words the observation
+    that re-opened a resolved debt.
     """
 
     live_signals: bool
+    regression_origin: Callable[[DueRow, DebtContext | None], RegressionOrigin]
 
 
 _CALL_SITE_EFFECTS: Final[Mapping[FlakeCallSite, CallSiteEffects]] = {
-    FlakeCallSite.merge_gate: CallSiteEffects(live_signals=True),
-    FlakeCallSite.offline_lane: CallSiteEffects(live_signals=False),
+    FlakeCallSite.merge_gate: CallSiteEffects(
+        live_signals=True, regression_origin=_merge_gate_origin,
+    ),
+    FlakeCallSite.offline_lane: CallSiteEffects(
+        live_signals=False, regression_origin=_offline_lane_origin,
+    ),
 }
-_NO_ROW: Final = CallSiteEffects(live_signals=False)
+_NO_ROW: Final = CallSiteEffects(live_signals=False, regression_origin=_neutral_origin)
 
 
 def call_site_effects(call_site: str) -> CallSiteEffects:
