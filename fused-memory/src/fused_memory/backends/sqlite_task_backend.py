@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, cast, overload
 
 import aiosqlite
@@ -41,7 +43,11 @@ from shared.task_metadata import (
 )
 from shared.task_statuses import TERMINAL, TaskStatus
 
-from fused_memory.backends.defect_records import DefectRecords, DefectTaskTerminal
+from fused_memory.backends.defect_records import (
+    DEFECT_RECORD_KEYS,
+    DefectRecords,
+    DefectTaskTerminal,
+)
 from fused_memory.backends.defect_ref_lookup import require_refs_live
 from fused_memory.backends.metadata_lookup import (
     DEFAULT_LOOKUP_LIMIT,
@@ -49,6 +55,7 @@ from fused_memory.backends.metadata_lookup import (
 )
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
+    DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
@@ -3396,8 +3403,10 @@ class SqliteTaskBackend:
         # (_metadata_object_or_raise, task 6130).
         # Only metadata_mode='replace' defers: a whole-blob replace must
         # carry the STORED done_provenance through verbatim, which can only
-        # be judged against the row, so _assert_done_provenance_passthrough
-        # checks it inside the transaction below. The gate reads the RAW
+        # be judged against the row, so _assert_passthrough_only_keys
+        # checks it inside the transaction below. The same floor, from the
+        # same table (_PASSTHROUGH_ONLY_METADATA_KEYS), covers the two defect
+        # keys, whose only writers are declare_defect / record_defect_outcome. The gate reads the RAW
         # metadata_mode because _resolve_metadata_mode can itself raise, and
         # resolving first would change which error a bad call surfaces.
         # metadata.deferral has its own floor, _assert_deferral_unchanged,
@@ -3407,8 +3416,8 @@ class SqliteTaskBackend:
         parsed_metadata: dict | None = None
         if metadata is not None:
             parsed_metadata = _metadata_object_or_raise(metadata, task_id)
-            if 'done_provenance' in parsed_metadata and metadata_mode != 'replace':
-                raise DoneProvenanceWriteAuthorityError(task_id)
+            if metadata_mode != 'replace':
+                _refuse_passthrough_only_keys(parsed_metadata, task_id)
             # Same floor family, different remedy (task 3816 review
             # remediation): the wait-anchor keys are MACHINE-authored, so a
             # caller-supplied value is STRIPPED rather than rejected — see
@@ -3499,9 +3508,9 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
-            done_provenance_passed_through = False
+            passed_through: frozenset[str] = frozenset()
             if metadata_mode == 'replace' and parsed_metadata is not None:
-                done_provenance_passed_through = _assert_done_provenance_passthrough(
+                passed_through = _assert_passthrough_only_keys(
                     row['metadata'], parsed_metadata, task_id,
                 )
 
@@ -3586,7 +3595,7 @@ class SqliteTaskBackend:
                 # metadata_mode='replace' (bypasses the guard intentionally);
                 # the repair payload may not carry a done_provenance, since
                 # passthrough identity cannot be established against a blob
-                # that does not parse (_assert_done_provenance_passthrough).
+                # that does not parse (_assert_passthrough_only_keys).
                 new_metadata = _merge_metadata(
                     row['metadata'], json.dumps(incoming_metadata),
                     mode=resolved_mode,
@@ -3604,9 +3613,9 @@ class SqliteTaskBackend:
                 # An untouched legacy field (e.g. a pre-existing
                 # done_provenance missing the now-required kind) is tolerated
                 # rather than permanently blocking every future patch to the
-                # row. Under replace, a done_provenance the passthrough check
-                # admitted is not this write's responsibility either: the
-                # caller had to send it back unchanged. The same holds for an
+                # row. Under replace, a done_provenance or defect key the
+                # passthrough check admitted is not this write's responsibility
+                # either: the caller had to send it back unchanged. The same holds for an
                 # admitted echo of metadata.deferral, which
                 # _assert_deferral_unchanged checks against the stored row in
                 # every mode.
@@ -3614,8 +3623,7 @@ class SqliteTaskBackend:
                     row['metadata'], parsed_metadata, new_metadata, task_id,
                 )
                 incoming_keys = set(incoming_metadata)
-                if done_provenance_passed_through:
-                    incoming_keys.discard('done_provenance')
+                incoming_keys.difference_update(passed_through)
                 if deferral_echoed:
                     incoming_keys.discard('deferral')
                 await self._validate_metadata_on_write(
@@ -3863,7 +3871,8 @@ class SqliteTaskBackend:
         replace, and a public ``update_task`` replace drops the machine-authored
         wait anchor; this writer carries the stored anchor across instead.  It
         admits ``done_provenance`` only as a verbatim passthrough (the same
-        :func:`_assert_done_provenance_passthrough` rule update_task applies),
+        :func:`_assert_passthrough_only_keys` rule update_task applies, which
+        carries the defect keys the same way),
         refuses any change to ``files`` (``candidate_key`` derives from them),
         carries ``deferral`` through unchanged (:func:`_assert_deferral_unchanged`),
         and refuses a corrupt stored blob rather than repairing it.
@@ -3909,7 +3918,7 @@ class SqliteTaskBackend:
                 },
                 project_root=project_root, tag=tag, task_id=tid,
             ))
-            _assert_done_provenance_passthrough(row['metadata'], incoming, task_id)
+            _assert_passthrough_only_keys(row['metadata'], incoming, task_id)
             new_blob = {
                 **incoming,
                 **{key: stored[key] for key in _MACHINE_AUTHORED_METADATA_KEYS if key in stored},
@@ -4546,16 +4555,41 @@ def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict
     return loaded
 
 
-def _assert_done_provenance_passthrough(
-    stored_raw: str | None, incoming: dict, task_id: str,
-) -> bool:
-    """Refuse a whole-blob replace that would move ``metadata.done_provenance``.
+_PASSTHROUGH_ONLY_METADATA_KEYS: Mapping[str, Callable[[str], TaskmasterError]] = (
+    MappingProxyType(
+        {
+            'done_provenance': DoneProvenanceWriteAuthorityError,
+            **{
+                key: functools.partial(DefectRecordsWriteAuthorityError, key=key)
+                for key in DEFECT_RECORD_KEYS
+            },
+        }
+    )
+)
+"""Metadata keys update_task may only carry verbatim, each with its refusal, in precedence order.
 
-    The contract: update_task may never ADD, CHANGE or REMOVE
-    metadata.done_provenance. Under metadata_mode='replace' the payload must
-    carry the stored value verbatim; under every other mode the key must be
-    absent (update_task's pre-connect floor). set_task_status and the
-    privileged stamp_audit_metadata seam remain the only writers of the key.
+set_task_status (and the privileged stamp_audit_metadata seam) writes
+``done_provenance``; declare_defect / record_defect_outcome write the two
+defect keys (``fused_memory/backends/defect_records.py``).
+"""
+
+
+def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
+    """update_task's pre-connect floor outside replace: any carried key is refused, echo included."""
+    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+        if key in incoming:
+            raise refusal(task_id)
+
+
+def _assert_passthrough_only_keys(
+    stored_raw: str | None, incoming: dict, task_id: str,
+) -> frozenset[str]:
+    """Refuse a whole-blob replace that would move any :data:`_PASSTHROUGH_ONLY_METADATA_KEYS` key.
+
+    The contract: update_task may never ADD, CHANGE or REMOVE one of those
+    keys. Under metadata_mode='replace' the payload must carry the stored
+    value verbatim; under every other mode the key must be absent
+    (update_task's pre-connect floor, :func:`_refuse_passthrough_only_keys`).
     Carrying the whole blob through is the shape the orchestrator's
     read-modify-write callers already use:
     orchestrator/src/orchestrator/workflow.py::_clear_merge_retry_pending,
@@ -4577,27 +4611,27 @@ def _assert_done_provenance_passthrough(
     takes a dict.
 
     * The stored blob is absent or not a JSON object: identity cannot be
-      established, so a payload carrying done_provenance is refused, while
-      one omitting it is the corrupt-row repair replace mode exists for.
-    * Otherwise the key's presence and value must match the stored row
+      established, so a payload carrying any of the keys is refused, while
+      one omitting them is the corrupt-row repair replace mode exists for.
+    * Otherwise each key's presence and value must match the stored row
       exactly: an ADD, a CHANGE and a drop-by-omission are all refused.
 
-    Returns True exactly when the payload carried a done_provenance and it
-    was admitted as a passthrough — the licence update_task needs to exclude
-    that key from enforce-mode responsibility.
+    Returns the keys the payload carried and that were admitted as a
+    passthrough — the licence update_task needs to exclude them from
+    enforce-mode responsibility.
     """
     try:
         stored = json.loads(stored_raw) if stored_raw is not None else None
     except (TypeError, ValueError):
         stored = None
     if not isinstance(stored, dict):
-        if 'done_provenance' in incoming:
-            raise DoneProvenanceWriteAuthorityError(task_id)
-        return False
+        _refuse_passthrough_only_keys(incoming, task_id)
+        return frozenset()
     absent = object()
-    if stored.get('done_provenance', absent) != incoming.get('done_provenance', absent):
-        raise DoneProvenanceWriteAuthorityError(task_id)
-    return 'done_provenance' in incoming
+    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+        if stored.get(key, absent) != incoming.get(key, absent):
+            raise refusal(task_id)
+    return frozenset(key for key in _PASSTHROUGH_ONLY_METADATA_KEYS if key in incoming)
 
 
 _CLEARABLE_AUDIT_KEYS: frozenset[str] = frozenset({'deferral'})
@@ -4636,7 +4670,7 @@ def _assert_deferral_unchanged(
     OLD-wins merge would otherwise drop an alteration silently), and the blob
     about to be written must carry exactly the stored record (a replace that
     omits it would otherwise remove it). Identity is JSON value equality, as in
-    :func:`_assert_done_provenance_passthrough`; a corrupt or absent stored
+    :func:`_assert_passthrough_only_keys`; a corrupt or absent stored
     blob holds no record.
 
     Returns True when the payload carried the key as an admitted echo.
@@ -4670,7 +4704,7 @@ def _merge_metadata(
       applies upstream, in update_task: on a row whose stored blob does not
       parse, the repair payload may not carry a done_provenance, because
       passthrough identity cannot be established. The authority is
-      :func:`_assert_done_provenance_passthrough`.
+      :func:`_assert_passthrough_only_keys`.
     * ``'merge'`` — shallow last-write-wins: ``{**existing, **incoming}``.
       Omitted keys are preserved; every supplied key (scalar **or** list)
       overwrites wholesale.  Falls back to ``incoming`` when the existing

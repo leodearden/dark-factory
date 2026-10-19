@@ -1887,7 +1887,7 @@ since `_merge_metadata` is a shallow `{**old, **new}` with no deletion
 sentinel. Until task 3777 that made a whole-blob `'replace'` impossible on
 most of the corpus. It is now admitted when the payload carries the stored
 `done_provenance` through verbatim (the contract is
-`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_done_provenance_passthrough`),
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_passthrough_only_keys`),
 which is exactly what the migration script sends. Any other shape that
 touches the key is still refused.
 

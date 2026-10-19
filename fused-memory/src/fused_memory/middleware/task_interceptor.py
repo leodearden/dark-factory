@@ -24,6 +24,7 @@ from shared.task_transitions import derive_actor_class, is_legal_transition
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
+    DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
@@ -5921,7 +5922,11 @@ class TaskInterceptor:
            ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
            'task_id': …, …}`` shape defined in ``task_backend_errors.py`` (task C2).
            Any add, alter or removal of ``metadata.deferral`` raises
-           ``DeferralWriteAuthorityError``, returned the same way.
+           ``DeferralWriteAuthorityError``, returned the same way, and so does
+           any add, change or removal of ``metadata.defects`` /
+           ``metadata.defect_test_retirements`` (the same carry-verbatim rule as
+           ``done_provenance``): :class:`~fused_memory.backends.task_backend_errors.DefectRecordsWriteAuthorityError`,
+           ``error='defect_records_via_update_task'``, for every caller.
            The backend also rejects a metadata payload that is not a JSON object,
            in every mode, with
            :class:`~fused_memory.backends.task_backend_errors.MetadataNotAnObjectError`,
@@ -6092,6 +6097,7 @@ class TaskInterceptor:
             except (
                 StatusWriteAuthorityError,
                 DoneProvenanceWriteAuthorityError,
+                DefectRecordsWriteAuthorityError,
                 DeferralWriteAuthorityError,
                 MetadataNotAnObjectError,
             ) as e:
