@@ -502,3 +502,61 @@ class TestRunLevelRefusals:
 
         assert code == 2
         assert fake.writes() == (0, 0)
+
+
+def run_code(root: Path, fake: FakeMemoryService, *extra: str) -> int:
+    argv = ['--project-root', str(root), '--project-id', PROJECT_ID, *extra]
+    return asyncio.run(mod.run(mod.build_parser().parse_args(argv), memory=fake))
+
+
+class TestExecuteGating:
+    def test_a_store_that_cannot_be_mutated_refuses_before_any_read(
+        self, root, fake, seed_tasks, caplog, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv('MEM0_DIR', str(tmp_path / 'no-such-mem0-dir'))
+        seed_tasks([gate_row(71, TOPIC, observed=fake.seed_many(3))])
+
+        with caplog.at_level('ERROR', logger='migrate_open_consolidation_gates'):
+            code = run_code(root, fake, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 2
+        assert fake.writes() == (0, 0)
+        assert fake.reads == 0
+        assert any(
+            r.name == 'migrate_open_consolidation_gates' and 'no-such-mem0-dir' in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        ('config', 'leaf'),
+        [
+            (enabled_config(enabled=False), 'consolidation_auto.enabled'),
+            (enabled_config(enabled_projects=['someone_else']), 'consolidation_auto.enabled_projects'),
+        ],
+    )
+    def test_the_kill_switch_refuses_execute_and_allows_dry_run(
+        self, root, seed_tasks, capsys, caplog, config, leaf,
+    ):
+        fake = FakeMemoryService(consolidation_auto=config)
+        seed_tasks([gate_row(72, TOPIC, observed=fake.seed_many(3))])
+
+        code = run_code(root, fake, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 2
+        assert fake.writes() == (0, 0)
+        assert fake.reads == 0
+        assert leaf in caplog.text
+        dry_code, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+        assert dry_code == 0
+        assert gate_of(payload, 72)['disposition'] == 'would_execute'
+
+    def test_execute_proceeds_with_the_switch_on_and_a_writable_store(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        seed_tasks([])
+
+        code, payload = drive(root, fake, capsys, '--execute')
+
+        assert code == 0
+        assert payload['mode'] == 'execute'
+        assert payload['gates'] == []
