@@ -39,12 +39,10 @@ class _ExportTable(dict[str, tuple[str, str]]):
 
 _EXPORTS = _ExportTable({
     'MergeLane': (_WORKER, 'SpeculativeMergeWorker'),
-    'SpeculativeMergeWorker': (_WORKER, 'SpeculativeMergeWorker'),
     'coalesce_or_enqueue_merge_request': (_WORKER, 'coalesce_or_enqueue_merge_request'),
     'enqueue_merge_request': (_WORKER, 'enqueue_merge_request'),
     'retire_cancelled_merge_request': (_WORKER, 'retire_cancelled_merge_request'),
-    'resolve_dispatch_time_merge_base': (_WORKER, '_resolve_dispatch_time_merge_base'),
-    '_resolve_dispatch_time_merge_base': (_WORKER, '_resolve_dispatch_time_merge_base'),
+    'resolve_dispatch_time_merge_base': (_WORKER, 'resolve_dispatch_time_merge_base'),
     'patch_content_contained': (_LANDING_EVIDENCE, 'patch_content_contained'),
     'MemberRedriveOutcome': (_MEMBER_REDRIVE, 'MemberRedriveOutcome'),
     'MergeRequest': (_TYPES, 'MergeRequest'),

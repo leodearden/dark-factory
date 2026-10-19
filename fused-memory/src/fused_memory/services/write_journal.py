@@ -19,10 +19,11 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -290,6 +291,27 @@ CREATE TABLE IF NOT EXISTS referent_findings (
 CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
 
+
+def _prune_batch_sql(horizon_rows: str) -> str:
+    return (
+        'DELETE FROM write_ops WHERE id IN ('
+        'SELECT id FROM write_ops INDEXED BY idx_wo_kind_time '
+        f'WHERE {horizon_rows} AND created_at >= ? AND created_at < ? '
+        'ORDER BY created_at LIMIT ?) RETURNING created_at'
+    )
+
+
+#: One batch of ``WriteJournal.prune_write_ops`` per retention horizon, in the
+#: order it drains them: delete the oldest ``LIMIT`` rows of the horizon created
+#: in ``[resume_from, cutoff)`` and return their ``created_at``. Parameters:
+#: ``(resume_from, cutoff, limit)``. Each range-seeks idx_wo_kind_time, and
+#: INDEXED BY pins it, so a missing index errors instead of scanning.
+WRITE_OPS_PRUNE_BATCH_SQL: Mapping[str, str] = MappingProxyType({
+    'read': _prune_batch_sql("kind = 'read' AND operation <> 'search'"),
+    'search': _prune_batch_sql("kind = 'read' AND operation = 'search'"),
+    'write': _prune_batch_sql("kind = 'write'"),
+})
+
 #: Parameters: ``(since_iso_timestamp, limit)``.
 OPERATOR_TELEMETRY_QUERY = """
 SELECT
@@ -360,6 +382,7 @@ class WriteJournal:
         self.data_dir = Path(data_dir)
         self._access: AtomicConnection | None = None
         self._dropped: collections.Counter[str] = collections.Counter()
+        self._pruned_below: dict[str, str] = {}
 
     @property
     def db_path(self) -> Path:
@@ -530,7 +553,18 @@ class WriteJournal:
         that is really just the writer. Such a row also carries
         ``params['done_provenance_kind']`` and lands for a REFUSED write too,
         with ``success=0`` and the refusal in ``error``.
+
+        A ``search`` IS ALWAYS STORED AS ``kind='read'``, because the search
+        retention horizon of :meth:`prune_write_ops` selects on that pair; any
+        other ``kind`` passed with it is logged and overridden.
         """
+        if operation == 'search' and kind != 'read':
+            logger.warning(
+                "write_op %s: operation='search' journalled with kind=%r; stored as "
+                "kind='read', the kind the search retention horizon selects",
+                write_op_id, kind,
+            )
+            kind = 'read'
         try:
             async with self._require_access().write() as db:
                 await db.execute(
@@ -1141,19 +1175,20 @@ class WriteJournal:
 
         Same fire-and-forget contract as ``prune_mem0_intents`` — logs loudly,
         never raises, returns the count deleted, returns 0 when uninitialised.
-        Intended to run once at startup.
+        Runs at startup and every ``prune_interval_seconds``
+        (``services/write_ops_retention.py``).
 
         EVERY BOUND IS REQUIRED, with no default here. The six numbers have a
         single home — ``config/schema.py::WriteJournalConfig`` — and the sole
-        production caller (``server/main.py``) already passes all six from it.
-        A second copy as signature defaults would be a copy nothing reads, kept
-        equal to the first only by a drift-guard test; requiring the arguments
-        deletes the copy instead of policing it.
+        production caller, ``services/write_ops_retention.py::prune_write_ops_pass``,
+        passes all six from it. A second copy as signature defaults would be a
+        copy nothing reads, kept equal to the first only by a drift-guard test;
+        requiring the arguments deletes the copy instead of policing it.
 
         THREE HORIZONS, because the rows are not interchangeable. Measured
         2026-09-11 over a never-pruned 157-day span: non-search READS are
         34,669,782 rows (97.9% of the table — ``get_task``, ``get_tasks``,
-        ``get_statuses``, ``get_external_statuses``, ~220,800/day) and have no
+        ``get_statuses``, ``get_external_statuses``) and have no
         downstream consumer, so 30 days is generous incident-forensics headroom.
         SEARCH reads are the opposite in both directions: only 481,447 rows
         (1.36%, ~3,066/day), and they are the SOLE data source for leaf eta's
@@ -1175,30 +1210,37 @@ class WriteJournal:
         errors. A multi-minute startup DELETE would therefore corrupt the very
         telemetry it is pruning. Each batch is its own ``write()`` unit, so both
         the per-connection lock and SQLite's write lock are released between
-        batches and serving writes interleave, and the sweep stops on
-        whichever bound comes first. ``max_rows`` is only a PROXY for the risk;
-        ``max_seconds`` bounds it directly, because rows-per-second is not
-        knowable in advance — it depends on page-cache warmth and on six index
-        b-trees per delete. The deadline is checked BETWEEN batches, never
-        mid-batch.
+        batches and serving writes interleave. That matters most for the
+        periodic pass, which runs while serving: a journalled tool call waits on
+        the connection lock for at most one batch, never a whole pass, and
+        ``batch_size`` is sized for that wait in ``fused-memory/config/config.yaml``.
+        The sweep stops on whichever bound comes first. ``max_rows`` is only a
+        PROXY for the risk; ``max_seconds`` bounds it directly, because
+        rows-per-second is not knowable in advance — it depends on page-cache
+        warmth and on six index b-trees per delete. The deadline is checked
+        BETWEEN batches, never mid-batch.
 
-        WHAT "DRAINS OVER SUCCESSIVE RESTARTS" REQUIRES, stated so the claim is
-        checkable rather than hopeful. Non-search reads accrue at ~220,800/day,
-        so a sweep only makes net progress if it removes more than
-        220,800/(redeploys per day) rows — at an ASSUMED 1-3 fleet redeploys per
-        day that is ~74,000-220,800 rows per run, i.e. ~2,500-7,400 rows/sec
-        against the stock 30 s deadline. The accrual rate is measured; the
-        redeploy cadence is an estimate, not a pinned figure (see OPERATIONS.md
-        §"Fleet redeploy & watchdog"), so treat the required rate as an order of
-        magnitude and the LOGGED rate below as the real answer. Below that the backlog never clears
-        while the WARNING fires forever and reads as normal, so the achieved
-        rate is MEASURED and logged (rows and rows/sec) on every partial sweep
-        rather than assumed. If the first production run comes in under it, the
-        two ways out are raising ``prune_max_seconds`` (a config leaf, restart
-        to apply) for the drain phase, or a one-off operator-run bulk delete
-        against a stopped server, where no startup grace applies. A first run
-        against the current backlog legitimately needs many restarts either way,
-        which the WARNING discloses rather than hides.
+        EACH HORIZON RESUMES WHERE ITS LAST BATCH STOPPED. ``operation`` is not
+        in idx_wo_kind_time, so the read horizon tests ``operation <> 'search'``
+        with a table-row lookup per index entry, and its range holds every kept
+        search row older than the oldest expired read. A batch started from the
+        bottom walks all of them before deleting anything: measured 2026-10-12 on
+        the live journal, 430,040 rows took 9.4 s cold and 0.4-0.6 s warm in one
+        statement the deadline cannot interrupt, against 2 ms from a resume
+        point. ``_pruned_below`` keeps, per horizon, the ``created_at`` below
+        which every matching row is already deleted. It stays true because every
+        ``write_ops`` writer stamps ``created_at`` with the current time, so no
+        row lands behind it. It lives as long as the process, so only the first
+        batch after a start pays the walk, and that runs before READY.
+
+        WHAT NET PROGRESS REQUIRES, stated so the claim is checkable rather than
+        hopeful: rows removed per day (passes per day x rows per pass) must
+        exceed the non-search reads inserted per day. Below that the backlog
+        never clears while the WARNING fires on every pass and reads as normal.
+        The dated measurement of both sides, and the interval chosen from it,
+        live in the ``write_journal`` block of ``fused-memory/config/config.yaml``
+        (2026-10-11); the rows and rows/sec logged on every partial pass are the
+        live answer.
 
         ``terminal_status='dead'`` rows are NOT exempted, unlike the dead-letters
         ``prune_mem0_intents`` deliberately preserves: a dead ``write_ops`` row
@@ -1206,37 +1248,19 @@ class WriteJournal:
         age is the only thing that should decide its fate.
 
         THIS BOUNDS GROWTH; IT DOES NOT RECLAIM DISK. Measured on the live
-        journal: ``PRAGMA auto_vacuum`` is 0 (NONE) and ``freelist_count`` is 0.
-        With auto-vacuum off a DELETE returns pages to SQLite's freelist for
-        REUSE by later inserts; it does not return them to the filesystem, so
-        ``ls -lh`` still reports ~16 GB after a fully successful prune — and the
-        freed pages are exactly what absorbs the new per-result search detail in
-        place. Reclaiming the space needs an offline ``VACUUM``, a full-file
-        rewrite requiring another ~16 GB of scratch, which is categorically not
-        a startup operation.
+        journal: ``PRAGMA auto_vacuum`` is 0 (NONE). With auto-vacuum off a
+        DELETE returns pages to SQLite's freelist for REUSE by later inserts; it
+        does not return them to the filesystem, so ``ls -lh`` reports the same
+        size after a fully successful prune — and the freed pages are exactly
+        what absorbs the new per-result search detail in place. Reclaiming the
+        space needs an offline ``VACUUM``, a full-file rewrite requiring as much
+        scratch again, which is categorically not a startup operation.
         """
-        horizons = (
-            # Cheapest first, and each written against an index that already
-            # exists — no new DDL, because building one on this table would
-            # reintroduce the startup stall the batching exists to avoid.
-            #
-            # The two kind-scoped horizons range-seek idx_wo_kind_time
-            # (kind, created_at), so the cutoff bounds the scan. The search
-            # horizon does NOT: idx_wo_operation is on (operation) alone, so it
-            # seeks the operation='search' partition and applies created_at as
-            # a residual filter — a scan of that whole partition (~481k rows
-            # measured) on every startup, even once the horizon is drained.
-            # Correct, and cheap relative to the read horizon, but it is a
-            # partition scan and not a seek. Only widen the index to
-            # (operation, created_at) if that scan ever shows up in startup
-            # timings: the DDL cost above is the reason it is not there today.
-            ('read', "kind = 'read' AND operation <> 'search' AND created_at < ?",
-             read_older_than_days),       # idx_wo_kind_time — seek
-            ('search', "operation = 'search' AND created_at < ?",
-             search_older_than_days),     # idx_wo_operation — partition scan
-            ('write', "kind = 'write' AND created_at < ?",
-             write_older_than_days),      # idx_wo_kind_time — seek
-        )
+        older_than_days = {
+            'read': read_older_than_days,
+            'search': search_older_than_days,
+            'write': write_older_than_days,
+        }
         try:
             deadline = _monotonic() + max_seconds
             total = 0
@@ -1244,30 +1268,33 @@ class WriteJournal:
             halted = ''
             backlog: list[str] = []
 
-            for label, predicate, older_than_days in horizons:
+            for label, batch_sql in WRITE_OPS_PRUNE_BATCH_SQL.items():
                 if halted:
                     # Never attempted under this run's bounds — unknown, so
                     # reported as a backlog rather than assumed drained.
                     backlog.append(label)
                     continue
-                cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+                cutoff = (
+                    datetime.now(UTC) - timedelta(days=older_than_days[label])
+                ).isoformat()
                 while True:
                     limit = min(batch_size, max_rows - total)
                     if limit <= 0:
                         halted = 'row budget'
                         backlog.append(label)
                         break
+                    resume_from = self._pruned_below.get(label, '')
                     async with self._require_access().write() as db:
-                        cursor = await db.execute(
-                            f'DELETE FROM write_ops WHERE id IN '
-                            f'(SELECT id FROM write_ops WHERE {predicate} LIMIT ?)',
-                            (cutoff, limit),
-                        )
-                        removed = max(cursor.rowcount, 0)
+                        deleted = list(await db.execute_fetchall(
+                            batch_sql, (resume_from, cutoff, limit)
+                        ))
+                    removed = len(deleted)
                     total += removed
                     by_horizon[label] = by_horizon.get(label, 0) + removed
                     if removed < limit:
+                        self._pruned_below[label] = cutoff
                         break  # a short batch means this horizon is drained
+                    self._pruned_below[label] = max(row[0] for row in deleted)
                     if total >= max_rows:
                         halted = 'row budget'
                         backlog.append(label)
@@ -1287,18 +1314,14 @@ class WriteJournal:
                     write_older_than_days, by_horizon.get('write', 0),
                 )
             if halted:
-                # The achieved rate is the ONLY thing that says whether "drains
-                # over successive restarts" is true on this disk: reads accrue
-                # at ~220,800/day, so a sweep sustaining less than
-                # ~2,500-7,400 rows/sec (at 1-3 redeploys/day) never catches up
-                # and this WARNING would otherwise repeat forever looking normal.
+                # The achieved rate is the ONLY thing that says whether the
+                # passes keep up on this disk; see the net-progress rule above.
                 elapsed = max(_monotonic() - (deadline - max_seconds), 1e-9)
                 logger.warning(
                     'write_ops prune stopped early on the %s after %d rows in %.1fs '
-                    '(%.0f rows/sec; ~2500-7400 rows/sec is needed to beat the '
-                    '~220,800 reads/day accrual at 1-3 redeploys/day); horizons '
-                    'still holding a backlog: %s. The table drains over successive '
-                    'restarts only while that rate holds.',
+                    '(%.0f rows/sec); horizons still holding a backlog: %s. Compare '
+                    'that rate with the sizing basis in the write_journal block of '
+                    'fused-memory/config/config.yaml.',
                     halted, total, elapsed, total / elapsed, ', '.join(backlog),
                 )
             return total

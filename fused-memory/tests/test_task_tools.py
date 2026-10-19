@@ -823,6 +823,9 @@ async def test_set_task_status_accepts_merge_deferred(
         reopen_reason=None,
         agent_id=None,
         client_op_id=None,
+        deferral=None,
+        expected_stamped_at=None,
+        restamp_only=False,
     )
 
 
@@ -2396,12 +2399,13 @@ async def test_submit_task_accepts_none_metadata(
 # ---------------------------------------------------------------------------
 
 
-async def _seed_modules_carrier(interceptor, root):
+async def _seed_modules_carrier(interceptor, root, status='pending'):
     """Write a historical carrier straight through the backend, bypassing the
     submit-time guard exactly as every pre-retirement record did."""
     added = await interceptor.taskmaster.add_task(
         project_root=root, title='Legacy carrier',
         metadata=json.dumps({'files': ['src/a.py'], 'modules': ['src']}),
+        status=status,
     )
     return added['id']
 
@@ -2518,9 +2522,7 @@ async def test_commit_planning_of_modules_carrier_is_not_rejected_by_retired_key
     existing rows and mints no new carrier."""
     server, interceptor = real_task_stack
     root = str(tmp_path)
-    task_id = await _seed_modules_carrier(interceptor, root)
-    deferred = await interceptor.set_task_status(task_id, 'deferred', root)
-    assert 'error' not in deferred, deferred
+    task_id = await _seed_modules_carrier(interceptor, root, status='deferred')
 
     result = await server._tool_manager.call_tool(
         'commit_planning', {'project_root': root, 'task_ids': task_id},

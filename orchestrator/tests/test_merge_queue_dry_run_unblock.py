@@ -44,7 +44,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.git_ops import _run as _run_git
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     PRODUCTION_CLOCK,
     PRODUCTION_VERIFIER,
@@ -465,7 +465,7 @@ class TestUnscopedTypecheckFailedSpawns:
             # real scoped verification in a real `_mainprobe-` worktree.
             with (
                 patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(True, MAIN_SHA)),
                 ),
             ):
@@ -736,7 +736,7 @@ class TestHarnessWiresDryRunHandlesIntoWorker:
             # whose verify port the harness gives us no way to inject.
             with (
                 patch(
-                    'orchestrator.merge_queue.SpeculativeMergeWorker',
+                    'orchestrator.merge_lane.worker.SpeculativeMergeWorker',
                     CapturingWorker,
                 ),
                 patch.object(

@@ -8,7 +8,7 @@ Task 3539 closes a measured zombie loop at its two ENDS:
   the exact INVERSE of the truth (``plan_files_not_touched``) through
   ``_mark_blocked(..., escalate_to_human=True)``, whose default
   ``category='task_failure'`` mints the pin that fuels the loop.  The
-  already-landed carve-out (:func:`orchestrator.merge_gates.resolve_already_landed_branch`)
+  already-landed carve-out (:func:`orchestrator.merge_lane.gates.resolve_already_landed_branch`)
   recognises that shape and routes it to an honest terminal outcome on the
   NORMAL ladder, so no ``task_failure`` pin is minted at all.
 
@@ -49,6 +49,7 @@ from shared.task_statuses import TaskStatus
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.task_ground_truth import (
     BranchState,
@@ -442,8 +443,9 @@ class TestConvertToBlockedEnforceFlag:
     against ``OrchestratorConfig`` itself or it is not asserted at all.
     """
 
-    def test_the_flag_ships_observe_only(self) -> None:
-        """Observe-before-enforce is the SHIPPED posture, not a test-only one."""
+    @pytest.mark.usefixtures("code_default_config")
+    def test_the_code_default_is_observe_only(self) -> None:
+        """The CODE default is log mode; a project config may opt into enforce."""
         from orchestrator.config import OrchestratorConfig
 
         assert OrchestratorConfig().convert_to_blocked_enforce is False
@@ -1313,7 +1315,7 @@ async def _resolve(plan_files, base, head, git_ops, *, task_id, branch):
     a failing new class.  Keeping it local means the RED is exactly the eight
     cases below and nothing else.
     """
-    from orchestrator.merge_gates import resolve_already_landed_branch
+    from orchestrator.merge_lane.gates import resolve_already_landed_branch
 
     return await resolve_already_landed_branch(
         plan_files, base, head, git_ops, task_id=task_id, branch=branch,
@@ -1338,7 +1340,7 @@ class TestResolveAlreadyLandedBranch:
         """The carve-out needs its OWN prefix, or workflow-side routing that
         keys on ``PLAN_FILES_NOT_TOUCHED_REASON_PREFIX`` would still send this
         shape to a human."""
-        from orchestrator.merge_gates import (
+        from orchestrator.merge_lane.gates import (
             ALREADY_LANDED_REASON_PREFIX,
             CROSS_REPO_DELIVERABLE_REASON_PREFIX,
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
@@ -1553,7 +1555,7 @@ class TestResolveAlreadyLandedBranch:
         await _reseed(git_repo, 'task/906', parked)
 
         spy = _RunSpy(fail_when=_is_rev_list_count)
-        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', spy)
 
         assert await _resolve(
             plan_files, parked, parked, git_ops,
@@ -1586,7 +1588,7 @@ class TestResolveAlreadyLandedBranch:
 
         async def boom(*a, **k):  # noqa: ARG001
             raise RuntimeError('probe exploded')
-        monkeypatch.setattr('orchestrator.merge_gates._run', boom)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', boom)
 
         assert await _resolve(
             plan_files, parked, parked, git_ops,
@@ -1612,7 +1614,7 @@ class TestResolveAlreadyLandedBranch:
         awaiting task in a state the caller believes it left."""
         async def cancel(*a, **k):  # noqa: ARG001
             raise asyncio.CancelledError
-        monkeypatch.setattr('orchestrator.merge_gates._run', cancel)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', cancel)
 
         with pytest.raises(asyncio.CancelledError):
             await _resolve(
@@ -1776,7 +1778,7 @@ class TestResolveAlreadyLandedBranch:
         could be tightened all the way to "match nothing" and the decoy test
         would still pass.
         """
-        from orchestrator.merge_gates import ALREADY_LANDED_CITATION_PATTERN
+        from orchestrator.merge_lane.gates import ALREADY_LANDED_CITATION_PATTERN
 
         plan_files = ['src/pkg/member.py']
         landed = await _commit_on_main(
@@ -1899,7 +1901,6 @@ from unittest.mock import AsyncMock  # noqa: E402
 
 from test_workflow import _make_workflow  # noqa: E402
 
-from orchestrator.merge_gates import PlanFilesTouchedResult  # noqa: E402
 from orchestrator.workflow import WorkflowOutcome  # noqa: E402
 
 
@@ -1942,7 +1943,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
             emits.append(outcome)
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
+            'orchestrator.merge_lane.worker._emit_merge_attempt', fake_emit,
         )
 
         narrow = AsyncMock(return_value=False)
@@ -1959,12 +1960,12 @@ class TestSubmitToMergeQueueAlreadyLanded:
                 seen.append((list(plan_files), base_sha, branch_head, kw))
             return result
         monkeypatch.setattr(
-            'orchestrator.merge_gates.resolve_already_landed_branch',
+            'orchestrator.merge_lane.gates.resolve_already_landed_branch',
             fake_resolve, )
 
     @staticmethod
     def _landed():
-        from orchestrator.merge_gates import AlreadyLandedResult
+        from orchestrator.merge_lane.gates import AlreadyLandedResult
 
         return AlreadyLandedResult(
             landed_sha='9ab336bd6e' * 4,
@@ -1984,7 +1985,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         ``category='task_failure'`` from minting the escalation that pins the
         task, vetoes its recovery, and feeds it back round the loop.
         """
-        from orchestrator.merge_gates import ALREADY_LANDED_REASON_PREFIX
+        from orchestrator.merge_lane.gates import ALREADY_LANDED_REASON_PREFIX
 
         wf = _make_workflow(tmp_path=tmp_path)
         landed = self._landed()
@@ -2026,7 +2027,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         attributed by citation; the outcome must be identical and the reason
         must SAY which probe answered.
         """
-        from orchestrator.merge_gates import AlreadyLandedResult
+        from orchestrator.merge_lane.gates import AlreadyLandedResult
 
         wf = _make_workflow(tmp_path=tmp_path)
         self._stub_predicate(monkeypatch, AlreadyLandedResult(
@@ -2081,7 +2082,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         the same outcome, the same narrowing attempt, the same reason prefix
         and the same forced human ladder.
         """
-        from orchestrator.merge_gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
 
         wf = _make_workflow(tmp_path=tmp_path)
         self._stub_predicate(monkeypatch, None)
@@ -2133,7 +2134,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def boom(*a, **k):  # noqa: ARG001
             raise _ReachedEnqueue
         monkeypatch.setattr(
-            'orchestrator.merge_queue.register_and_enqueue_merge_request', boom,
+            'orchestrator.merge_lane.worker.register_and_enqueue_merge_request', boom,
         )
 
         with pytest.raises(_ReachedEnqueue):
@@ -2161,7 +2162,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
             order.append('predicate')
             return self._landed()
         monkeypatch.setattr(
-            'orchestrator.merge_gates.resolve_already_landed_branch',
+            'orchestrator.merge_lane.gates.resolve_already_landed_branch',
             fake_resolve, )
         _emits, narrow, _mark_blocked = self._wire(wf, monkeypatch)
         narrow.side_effect = lambda *a, **k: order.append('narrow') or False
@@ -2219,7 +2220,7 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check, )
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt',
+            'orchestrator.merge_lane.worker._emit_merge_attempt',
             lambda *a, **k: None,
         )
 
@@ -2417,7 +2418,7 @@ class TestLandedButPinnedZombieLoop:
 
         emits: list = []
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt',
+            'orchestrator.merge_lane.worker._emit_merge_attempt',
             lambda es, tid, outcome, **k: emits.append(outcome),  # noqa: ARG005
         )
         narrow = AsyncMock(return_value=False)

@@ -1,20 +1,27 @@
-"""How the offline lane runs a sub-run: one streaming launcher and the three detection seams.
+"""How the offline lane runs a sub-run: one streaming launcher, the three detection seams, the outage probe.
 
 Every sub-run, detection or confirm, streams its child's combined output
 straight to a file in its pass directory and leaves a run record beside it
 (``orchestrator/src/orchestrator/offline_lane_records.py::RunRecordStore``).
+The outage probe (PRD ``plans/offline-lane-red-path-prd.md`` D7) is not a sub-run:
+:func:`run_probe` answers a ``ProbeResult``, which the pass writes onto its detect record.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias
 
+from shared.lane_probe import OUTAGE_EXIT_STATUS
+from shared.proc_group import reap_process_groups, terminate_process_group
 from shared.verify_admission import nice_prefix
 
 from orchestrator.offline_lane_records import (
@@ -25,16 +32,26 @@ from orchestrator.offline_lane_records import (
     FailureRecord,
     LanePass,
     Phase,
+    ProbeKind,
+    ProbeResult,
     RunRecord,
     RunRecordStore,
     classify_exit,
 )
-from orchestrator.verify import parse_pytest_failures
+from orchestrator.verify import (
+    _extract_failing_test_ids_from_junit,
+    extract_test_outcomes_from_junit,
+    parse_pytest_failures,
+)
 from orchestrator.verify_cmd import parse_config_command, render, with_junitxml
 
 if TYPE_CHECKING:
     from orchestrator.config import LaneCommand
     from orchestrator.offline_lane import CommandRunner, SuiteRunner
+
+logger = logging.getLogger(__name__)
+
+ProbeSeam: TypeAlias = 'Callable[[LaneCommand, Path], Awaitable[ProbeResult]]'
 
 RUN_OFFLINE_DEEP_SCRIPT = 'scripts/run-offline-deep.sh'
 
@@ -43,10 +60,14 @@ RUN_OFFLINE_DEEP_SCRIPT = 'scripts/run-offline-deep.sh'
 RUN_ALL_INFRA_SCRIPT = 'tests/infra/run_all.sh'
 INFRA_SCOPE = 'host-infra'
 
-# One H9 per-test verdict line, e.g. '  RESULT: FAIL (test_x.sh)'.
-INFRA_RESULT_FAIL_RE = re.compile(r'^\s*RESULT:\s*FAIL\s*\((?P<name>.+?)\)\s*$')
+# One H9 per-test verdict line, e.g. '  RESULT: FAIL (test_x.sh)' or
+# '  RESULT: PASS (test_y.sh) [flaky: passed on serial retry]'.
+INFRA_RESULT_RE = re.compile(r'^\s*RESULT:\s*(?P<verdict>PASS|FAIL|SKIP)\s*\((?P<name>[^)]+)\)')
+
+_INFRA_OUTCOMES = {'PASS': 'passed', 'SKIP': 'skipped'}
 
 _TAIL_CHARS = 2000
+_PROBE_KILL_GRACE_SECS = 2.0
 
 _PYTEST_OUTCOME = r'\d+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun)'
 _PYTEST_FINAL_SUMMARY_RE = re.compile(
@@ -82,12 +103,28 @@ def _pytest_failures(text: str) -> tuple[FailureRecord, ...]:
     )
 
 
+def _infra_verdicts(text: str) -> list[tuple[str, str, str]]:
+    return [
+        (match.group('verdict'), match.group('name'), line.strip())
+        for line in text.splitlines()
+        if (match := INFRA_RESULT_RE.match(line))
+    ]
+
+
 def _infra_failures(text: str) -> tuple[FailureRecord, ...]:
     return tuple(
-        FailureRecord(match.group('name'), 'failed', line.strip()[:FIRST_LINE_MAX_CHARS])
-        for line in text.splitlines()
-        if (match := INFRA_RESULT_FAIL_RE.match(line))
+        FailureRecord(name, 'failed', line[:FIRST_LINE_MAX_CHARS])
+        for verdict, name, line in _infra_verdicts(text)
+        if verdict == 'FAIL'
     )
+
+
+def _infra_outcomes(text: str) -> dict[str, str]:
+    return {
+        name: _INFRA_OUTCOMES[verdict]
+        for verdict, name, _ in _infra_verdicts(text)
+        if verdict in _INFRA_OUTCOMES
+    }
 
 
 def _failures(text: str, output_format: OutputFormat) -> tuple[FailureRecord, ...]:
@@ -104,6 +141,85 @@ def _session_complete(text: str, output_format: OutputFormat, ended_by: EndedBy)
     if output_format is OutputFormat.PYTEST:
         return _PYTEST_FINAL_SUMMARY_RE.search(text) is not None
     return ended_by is EndedBy.EXIT
+
+
+def _node_prefix(classname: str, cwd: Path) -> str | None:
+    if '/' in classname:
+        return None
+    parts = classname.split('.')
+    for end in range(len(parts), 0, -1):
+        module = '/'.join(parts[:end]) + '.py'
+        if (cwd / module).is_file():
+            return '::'.join([module, *parts[end:]])
+    return None
+
+
+def _node_id_resolver(cwd: Path) -> Callable[[str], str | None]:
+    """Maps one report's junit ids to pytest node ids under *cwd*, caching each classname's resolution.
+
+    A junit id is ``<dotted classname>::<name>``; the classname's longest dotted
+    prefix naming a ``.py`` file under *cwd* is the module, the rest its class
+    nesting.  A bare id is a module that failed to collect.  ``None`` for an id
+    whose classname resolves to no file.
+    """
+    prefixes: dict[str, str | None] = {}
+
+    def node_id(junit_id: str) -> str | None:
+        classname, separator, name = junit_id.partition('::')
+        if classname not in prefixes:
+            prefixes[classname] = _node_prefix(classname, cwd)
+        prefix = prefixes[classname]
+        if prefix is None or not separator:
+            return prefix
+        return f'{prefix}::{name}'
+
+    return node_id
+
+
+def junit_node_outcomes(junit_path: Path, cwd: Path) -> dict[str, str] | None:
+    """The junit report's per-test outcomes keyed by pytest node id, resolved against *cwd*.
+
+    A test whose classname resolves to no file has no entry.  ``None`` when no report could be read.
+    """
+    outcomes = extract_test_outcomes_from_junit(junit_path)
+    if outcomes is None:
+        return None
+    resolve = _node_id_resolver(cwd)
+    node_outcomes: dict[str, str] = {}
+    for junit_id, verdict in outcomes.items():
+        node_id = resolve(junit_id)
+        if node_id is not None:
+            node_outcomes[node_id] = verdict
+    return node_outcomes
+
+
+def junit_failing_node_ids(junit_path: Path, cwd: Path) -> frozenset[str] | None:
+    """The pytest node ids the junit report names as failing, resolved against *cwd*.
+
+    ``None`` when no report could be read, or when any failing test's classname
+    resolves to no file: such a report cannot say which node ids failed.
+    """
+    failing = _extract_failing_test_ids_from_junit(junit_path)
+    if failing is None:
+        return None
+    resolve = _node_id_resolver(cwd)
+    node_ids: set[str] = set()
+    for junit_id in failing:
+        node_id = resolve(junit_id)
+        if node_id is None:
+            return None
+        node_ids.add(node_id)
+    return frozenset(node_ids)
+
+
+def _outcomes(
+    text: str, output_format: OutputFormat, junit_path: Path | None, cwd: Path,
+) -> dict[str, str] | None:
+    if junit_path is not None and junit_path.is_file():
+        return junit_node_outcomes(junit_path, cwd)
+    if output_format is OutputFormat.INFRA:
+        return _infra_outcomes(text)
+    return None
 
 
 def _read_text(path: Path) -> str:
@@ -124,7 +240,7 @@ async def launch(
     """Run *argv* with its output streamed to *lane_pass*'s *phase* log, then record it.
 
     Nothing of the output is held in memory while the child runs; the read,
-    the parse and the record write happen in one hop off the event loop.
+    the parse, the junit read and the record write happen in one hop off the event loop.
     The whole output comes back as ``text``; ``tail`` is its last ``_TAIL_CHARS`` characters.
     """
     output_path = lane_pass.output_path(phase)
@@ -154,7 +270,7 @@ async def launch(
             junit_path=None if junit_path is None else str(junit_path),
             failures=failures,
             ids_available=bool(failures),
-            outcomes=None,
+            outcomes=_outcomes(text, output_format, junit_path, cwd),
             session_complete=_session_complete(text, output_format, ended_by),
             probe=None,
         )
@@ -166,6 +282,128 @@ async def launch(
 
 def _lane_env() -> dict[str, str]:
     return {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+
+
+def command_cwd(worktree: Path, command: LaneCommand) -> Path:
+    """Where *command*'s sub-runs and its outage probe run: ``<worktree>/<cwd>``."""
+    return worktree / command.cwd
+
+
+def probe_result(returncode: int | None, stdout: str, duration: float) -> ProbeResult:
+    """D7's mapping of one probe's exit to up, outage or broken; pure.
+
+    Only stdout's first line counts: exit 0 is up, ``OUTAGE_EXIT_STATUS`` with a
+    non-empty first line is an outage naming that line, and anything else is broken.
+    """
+    lines = stdout.splitlines()
+    first_line = lines[0].strip()[:FIRST_LINE_MAX_CHARS] if lines else ''
+    if returncode == 0:
+        return ProbeResult(ProbeKind.UP, returncode, None, first_line, duration)
+    if returncode == OUTAGE_EXIT_STATUS and first_line:
+        return ProbeResult(ProbeKind.OUTAGE, returncode, first_line, first_line, duration)
+    return ProbeResult(ProbeKind.BROKEN, returncode, None, first_line, duration)
+
+
+def _no_exit(started: float) -> ProbeResult:
+    return ProbeResult(ProbeKind.BROKEN, None, None, '', time.monotonic() - started)
+
+
+async def _reap_probe_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
+    """Kill every process the probe left in its group, even after its shell has exited.
+
+    A background child can hold the probe's stdout open past its shell, so the shell's exit proves nothing
+    about the group; ``terminate_process_group`` returns at once in that case.
+    """
+    await asyncio.to_thread(reap_process_groups, [pgid], grace_secs=_PROBE_KILL_GRACE_SECS)
+    await proc.wait()
+
+
+async def run_probe(command: LaneCommand, worktree: Path) -> ProbeResult:
+    """Run *command*'s ``outage_probe`` once in its cwd, at normal priority, bounded by its timeout.
+
+    A probe that times out or cannot start is broken with no exit status; the log says which.
+    """
+    if command.outage_probe is None:
+        raise ValueError(f'{command.name}: declares no outage_probe')
+    started = time.monotonic()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'sh', '-c', command.outage_probe,
+            cwd=str(command_cwd(worktree, command)),
+            env=_lane_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError:
+        logger.exception('offline-lane: %s: outage probe could not start', command.name)
+        return _no_exit(started)
+    pgid = proc.pid
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=command.outage_probe_timeout_secs)
+    except TimeoutError:
+        await _reap_probe_group(proc, pgid)
+        logger.error(
+            'offline-lane: %s: outage probe timed out after %ss', command.name, command.outage_probe_timeout_secs,
+        )
+        return _no_exit(started)
+    finally:
+        if proc.returncode is None:
+            await terminate_process_group(proc, pgid)
+    result = probe_result(proc.returncode, stdout.decode(errors='replace'), time.monotonic() - started)
+    if result.result == ProbeKind.BROKEN:
+        logger.warning(
+            'offline-lane: %s: outage probe is broken (exit %s); stderr tail: %s',
+            command.name, proc.returncode, stderr.decode(errors='replace')[-_TAIL_CHARS:],
+        )
+    return result
+
+
+class ConfirmRunner(Protocol):
+    """Runs one confirm sub-run of a bound pass; a junit-producing confirm writes to ``junit_path``."""
+
+    @property
+    def junit_path(self) -> Path: ...
+
+    async def __call__(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        output_format: OutputFormat,
+        junit_path: Path | None,
+    ) -> Launched: ...
+
+
+@dataclass(frozen=True)
+class _PassConfirmRunner:
+    store: RunRecordStore
+    lane_pass: LanePass
+    junit_path: Path
+
+    async def __call__(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        output_format: OutputFormat,
+        junit_path: Path | None,
+    ) -> Launched:
+        return await launch(
+            argv,
+            cwd=cwd,
+            env=_lane_env(),
+            store=self.store,
+            lane_pass=self.lane_pass,
+            phase=Phase.CONFIRM,
+            output_format=output_format,
+            junit_path=junit_path,
+        )
+
+
+def confirm_runner(store: RunRecordStore, lane_pass: LanePass) -> ConfirmRunner:
+    """*lane_pass*'s confirm seam: ``launch`` in the confirm phase with the lane's environment."""
+    return _PassConfirmRunner(store, lane_pass, lane_pass.junit_path(Phase.CONFIRM))
 
 
 def require_current_pass(store: RunRecordStore, command: str) -> LanePass:
@@ -230,7 +468,7 @@ def command_runner(store: RunRecordStore) -> CommandRunner:
         command, junit_path = _with_junit(cmd.command, lane_pass.junit_path(Phase.DETECT))
         launched = await launch(
             [*nice_prefix('background'), 'sh', '-c', command],
-            cwd=wt_path / cmd.cwd,
+            cwd=command_cwd(wt_path, cmd),
             env=_lane_env(),
             store=store,
             lane_pass=lane_pass,

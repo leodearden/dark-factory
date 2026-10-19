@@ -79,7 +79,7 @@ from orchestrator.evals.task_sampler import (
     default_verify_commands,
     repo_of_project,
 )
-from orchestrator.landing_evidence import is_valid_sha_40
+from orchestrator.merge_lane.landing_evidence import is_valid_sha_40
 
 __all__ = [
     'ShadowShape',

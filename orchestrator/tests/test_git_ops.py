@@ -15183,3 +15183,39 @@ class TestAdvanceMainIndexLockStandoff:
             'a wait spanning several warn intervals must re-announce itself; '
             f'got {[r.message for r in caplog.records]!r}'
         )
+
+
+@pytest.mark.asyncio
+class TestIsAncestorChecked:
+    """The ancestry read tells a git error (None) from a plain no (False)."""
+
+    @staticmethod
+    async def _first_and_diverged(repo: Path) -> tuple[str, str, str]:
+        (repo / 'first.txt').write_text('first\n')
+        first = await _commit_all(repo, 'first')
+        (repo / 'second.txt').write_text('second\n')
+        second = await _commit_all(repo, 'second')
+        rc, _, err = await _run(['git', 'checkout', '-b', 'side', first], cwd=repo)
+        assert rc == 0, err
+        (repo / 'side.txt').write_text('side\n')
+        side = await _commit_all(repo, 'side')
+        return first, second, side
+
+    async def test_an_ancestor_is_true(self, git_ops: GitOps, git_repo: Path):
+        first, second, _ = await self._first_and_diverged(git_repo)
+        assert await git_ops.is_ancestor_checked(first, second) is True
+        assert await git_ops.is_ancestor(first, second) is True
+
+    async def test_a_non_ancestor_is_false(self, git_ops: GitOps, git_repo: Path):
+        _, second, side = await self._first_and_diverged(git_repo)
+        assert await git_ops.is_ancestor_checked(side, second) is False
+        assert await git_ops.is_ancestor(side, second) is False
+
+    async def test_an_unknown_sha_is_none_and_not_an_ancestor(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        first, _, _ = await self._first_and_diverged(git_repo)
+        unknown = '0123456789abcdef0123456789abcdef01234567'
+        assert await git_ops.is_ancestor_checked(unknown, first) is None
+        assert await git_ops.is_ancestor_checked(first, unknown) is None
+        assert await git_ops.is_ancestor(unknown, first) is False

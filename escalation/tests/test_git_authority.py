@@ -397,7 +397,7 @@ def _force_differential_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
         return True
 
     monkeypatch.setattr(
-        'orchestrator.landing_evidence._delivered_checks_differential', _confirm,
+        'orchestrator.merge_lane.landing_evidence._delivered_checks_differential', _confirm,
     )
 
 
@@ -533,7 +533,7 @@ class TestProbeLanding:
     # to catch.
     #
     # The differential is forced through the DEFINING module
-    # (``orchestrator.landing_evidence``), the same way
+    # (``orchestrator.merge_lane.landing_evidence``), the same way
     # ``test_merge_status_git_authority.py``'s
     # ``_record_validate_landing_evidence`` patches its own target, so the
     # REAL ``validate_landing_evidence`` decision logic stays in the loop.

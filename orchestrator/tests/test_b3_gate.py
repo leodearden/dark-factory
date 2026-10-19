@@ -2208,7 +2208,7 @@ class TestMergeCompletionConsumptionContract:
     These are CONTRACT/regression tests, not tests driving new b3_gate code:
     the (a)+(b)+(c) eligibility gate is enforced at GENERATION time by the
     dry_run_unblock.run_dry_run_unblock risk_label clamp (see
-    orchestrator.merge_completion.merge_completion_eligible and
+    orchestrator.merge_lane.completion.merge_completion_eligible and
     TestMergeCompletionRiskClamp in test_dry_run_unblock.py) —
     check_proposal itself is UNCHANGED by task 2633. This class pins that
     the EXISTING check_proposal behaviour already delivers the three

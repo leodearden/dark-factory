@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args
@@ -31,27 +31,32 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
+from shared import process_identity
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
+    DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
     StatusWriteAuthorityError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+from fused_memory.backends.task_backend_types import MetadataLookupResult
 from fused_memory.config.schema import CuratorConfig
-from fused_memory.middleware import recon_write_policy
+from fused_memory.middleware import deferral_gate, recon_write_policy
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
     build_duplicate_metadata,
     sweep_zot_duplicate,
 )
+from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.done_provenance_authz import (
     DETERMINISTIC_CALLER_ERROR_TYPE,
     DETERMINISTIC_PROVENANCE_KINDS,
@@ -506,8 +511,11 @@ class TaskInterceptor:
         scope_violation_escalator: ScopeViolationEscalator | None = None,
         path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
         curator: TaskCurator | None = None,
+        proc_root: Path = process_identity.PROC_ROOT,
     ):
         self.taskmaster = taskmaster
+        # Where the deferral gate reads a held_by_session holder's /proc entries.
+        self._proc_root = proc_root
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
         # WP-B: when an event queue is wired in, journalling is fire-and-forget
@@ -1209,6 +1217,10 @@ class TaskInterceptor:
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        deferral: dict | None = None,
+        expected_stamped_at: str | None = None,
+        restamp_only: bool = False,
+        scope: StatusWriteScope = StatusWriteScope.STATUS,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
 
@@ -1236,12 +1248,35 @@ class TaskInterceptor:
         (whole-call, covering both the CSV and single-id branches) and skips the
         transition. It is NOT threaded into ``_apply_status_transition`` — dedup
         is a public-method concern only. Absent a key behavior is unchanged.
+
+        ``deferral``, ``expected_stamped_at`` and ``restamp_only`` are the
+        metadata.deferral arguments of the MCP tool; ``scope`` is internal,
+        passed only by ``commit_planning``. ``deferral_gate`` decides them:
+        its row-independent checks run once here, before the write lock.
         """
         if (hit := await self._idempotency_replay(client_op_id)) is not None:
             return hit
         if err := await self._backlog_gate(project_root):
             return err
-        await self._ensure_taskmaster()
+        tm = await self._ensure_taskmaster()
+        deferral_call = await deferral_gate.corroborate(
+            task_id=task_id,
+            status=status,
+            raw_deferral=deferral,
+            expected_stamped_at=expected_stamped_at,
+            restamp_only=restamp_only,
+            scope=scope,
+            read_task=lambda carrier_id: tm.get_task(carrier_id, project_root, tag),
+            proc_root=self._proc_root,
+            now=datetime.now(UTC),
+        )
+        if isinstance(deferral_call, deferral_gate.DeferralInvalidRefusal):
+            return await self._journal_deferral_refusal(
+                deferral_call,
+                project_root,
+                {'task_id': task_id, 'status': status, 'tag': tag},
+                agent_id,
+            )
 
         if ',' in task_id:
             ids = [t.strip() for t in task_id.split(',') if t.strip()]
@@ -1272,6 +1307,7 @@ class TaskInterceptor:
                     heartbeat_at=heartbeat_at,
                     agent_id=agent_id,
                     pending_since_now=batch_pending_since,
+                    deferral_call=deferral_call,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -1292,9 +1328,28 @@ class TaskInterceptor:
             claimant_run_id=claimant_run_id,
             heartbeat_at=heartbeat_at,
             agent_id=agent_id,
+            deferral_call=deferral_call,
         )
         await self._idempotency_record(client_op_id, 'set_task_status', result)
         return result
+
+    async def _journal_deferral_refusal(
+        self,
+        refusal: deferral_gate.GateRefusal,
+        project_root: str,
+        params: dict[str, Any],
+        agent_id: str | None,
+    ) -> dict:
+        """Journal a deferral refusal as a ``success=False`` row and return its wire dict."""
+        await self._log_write_op_row(
+            'set_task_status',
+            project_root,
+            params,
+            agent_id=agent_id,
+            success=False,
+            error=refusal.journal_text(),
+        )
+        return refusal.to_error_dict()
 
     async def _apply_status_transition(
         self,
@@ -1309,6 +1364,7 @@ class TaskInterceptor:
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         pending_since_now: str | None = None,
+        deferral_call: deferral_gate.DeferralCall,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
@@ -1466,7 +1522,33 @@ class TaskInterceptor:
                 _journal_params['done_provenance_kind'] = _provenance_kind(done_provenance)
                 _journal_agent_id = agent_id
 
+            stored_metadata = before.get('metadata') if isinstance(before, dict) else None
+
             if status == old_status:
+                same_status = deferral_gate.plan_same_status(
+                    status=status,
+                    stored_metadata=stored_metadata,
+                    call=deferral_call,
+                    task_id=task_id,
+                    agent_id=agent_id,
+                )
+                match same_status:
+                    case deferral_gate.Restamp():
+                        return await self._apply_restamp(
+                            tm,
+                            task_id=task_id,
+                            project_root=project_root,
+                            tag=tag,
+                            restamp=same_status,
+                            journal_params=_journal_params,
+                            journal_agent_id=_journal_agent_id,
+                        )
+                    case deferral_gate.NoWrite():
+                        pass
+                    case refusal:
+                        return await self._journal_deferral_refusal(
+                            refusal, project_root, _journal_params, agent_id,
+                        )
                 if status == 'done' and done_provenance:
                     repair = await _repair_done_provenance_same_status(
                         tm,
@@ -1743,6 +1825,23 @@ class TaskInterceptor:
                     actor,
                 )
 
+            # 2f. The deferral gate runs last, so a refusal's self-correction
+            # hint never sends the caller into a gate above that refuses the
+            # retry (a terminal exit with no reopen_reason, an illegal edge).
+            deferral_write = deferral_gate.plan_status_change(
+                old_status=old_status,
+                status=status,
+                stored_metadata=stored_metadata,
+                call=deferral_call,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+            if isinstance(deferral_write, deferral_gate.GateRefusal):
+                return await self._journal_deferral_refusal(
+                    deferral_write, project_root, _journal_params, agent_id,
+                )
+            audit_fields.update(deferral_write.audit_fields)
+
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
             # Sits after the same-status no-op (C4-E5) and feeds both writers:
@@ -1763,25 +1862,16 @@ class TaskInterceptor:
             )
 
             async def _do_set_task_status_write() -> Any:
-                # Task 2649: an audit-carrying transition (reopen_* and/or
-                # done_provenance accumulated above) writes through the
-                # single atomic set_status_and_stamp_audit call instead of
-                # plain set_task_status, so the status column and the audit
-                # metadata commit together — both or neither.
-                if audit_fields:
-                    write_body = tm.set_status_and_stamp_audit(  # type: ignore[attr-defined]
-                        task_id, status, project_root, tag,
-                        audit_fields=audit_fields, **claimant_kwargs,
-                    )
-                else:
-                    write_body = tm.set_task_status(
-                        task_id, status, project_root, tag, **claimant_kwargs,
-                    )
                 return await self._journal_around(
                     'set_task_status',
                     project_root,
                     _journal_params,
-                    write_body,
+                    _status_write_body(
+                        tm, task_id, status, project_root, tag,
+                        audit_fields=audit_fields,
+                        clear_keys=deferral_write.clear_keys,
+                        claimant_kwargs=claimant_kwargs,
+                    ),
                     agent_id=_journal_agent_id,
                 )
 
@@ -1849,6 +1939,8 @@ class TaskInterceptor:
         if resolved_reopen_reason is not None:
             payload['reopen_reason'] = resolved_reopen_reason
             payload['reopen_from'] = old_status
+        payload.update(deferral_write.event_fields)
+        result.update(deferral_write.echo)
         event = self._make_event(
             EventType.task_status_changed,
             project_root,
@@ -1891,6 +1983,44 @@ class TaskInterceptor:
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
+
+    async def _apply_restamp(
+        self,
+        tm: TaskBackendProtocol,
+        *,
+        task_id: str,
+        project_root: str,
+        tag: str | None,
+        restamp: deferral_gate.Restamp,
+        journal_params: dict[str, Any],
+        journal_agent_id: str | None,
+    ) -> dict:
+        """Replace a deferred row's record: not a status change, so no status event,
+        transition gate or targeted reconciliation (PRD decision 3)."""
+        result = dict(
+            await self._journal_around(
+                'set_task_status',
+                project_root,
+                journal_params,
+                _status_write_body(
+                    tm, task_id, TaskStatus.DEFERRED.value, project_root, tag,
+                    audit_fields=restamp.audit_fields,
+                    clear_keys=frozenset(),
+                    claimant_kwargs={},
+                ),
+                agent_id=journal_agent_id,
+            )
+        )
+        if result.get('success') is False:
+            return result
+        await self._journal(
+            self._make_event(
+                EventType.deferral_restamped,
+                project_root,
+                {'task_id': task_id, 'old': restamp.old, 'new': restamp.new},
+            )
+        )
+        return {**result, **restamp.echo}
 
     async def _mint_recurrence_successor(
         self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
@@ -3827,6 +3957,8 @@ class TaskInterceptor:
             return err
 
         metadata = kwargs.pop('metadata', None)
+        if 'deferral' in (coerce_task_metadata(metadata) or {}):
+            return DeferralWriteAuthorityError(None).to_error_dict()
 
         # Inject the override reason into task metadata (both the normal ticket
         # path and the planning_mode path benefit from this placement).  When no
@@ -3915,7 +4047,8 @@ class TaskInterceptor:
         Skips the ticket store, the per-project curator queue, and the curator
         LLM round-trip entirely.  Persists ``human_decomposed=True`` in task
         metadata as a forensic marker so future curator hooks on status
-        transitions can defensively skip these tasks.
+        transitions can defensively skip these tasks, and the ``planning``
+        deferral record attributed to the submitter.
 
         Returns ``{'task_id', 'status', 'planning_mode'}`` synchronously.
         """
@@ -3944,6 +4077,9 @@ class TaskInterceptor:
                 'error_type': 'ValidationError',
             }
         normalized_metadata['human_decomposed'] = True
+        normalized_metadata['deferral'] = deferral_gate.planning_birth_record(
+            stamped_by=attribution.agent_id, now=datetime.now(UTC),
+        )
         try:
             metadata_json = json.dumps(normalized_metadata)
         except (TypeError, ValueError) as exc:
@@ -5664,6 +5800,8 @@ class TaskInterceptor:
            caught below and converted via ``.to_error_dict()`` into the canonical
            ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
            'task_id': …, …}`` shape defined in ``task_backend_errors.py`` (task C2).
+           Any add, alter or removal of ``metadata.deferral`` raises
+           ``DeferralWriteAuthorityError``, returned the same way.
         2. ``_reject_directory_locks_in_update_metadata`` — rejects ``metadata.files``
            entries that name a directory; returns ``lock_charter_error(...)``.
         3. ``_backlog_gate`` — rejects when the reconciliation backlog exceeds the
@@ -5826,7 +5964,11 @@ class TaskInterceptor:
                     )
                 else:
                     result = dict(await _do_update_task_write())
-            except (StatusWriteAuthorityError, DoneProvenanceWriteAuthorityError) as e:
+            except (
+                StatusWriteAuthorityError,
+                DoneProvenanceWriteAuthorityError,
+                DeferralWriteAuthorityError,
+            ) as e:
                 # SqliteTaskBackend write-authority floor (task C1): a status
                 # write is always rejected, and so is any add, change or
                 # removal of metadata.done_provenance (under replace, anything
@@ -6220,6 +6362,25 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)
 
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        tm = await self._ensure_taskmaster()
+        return await tm.find_tasks_by_metadata(
+            project_root, key, value,
+            statuses=statuses, limit=limit, offset=offset, tag=tag,
+            include_value=include_value,
+        )
+
     def _require_done_provenance(self) -> bool:
         """True when the provenance gate is enforcing (reject missing/invalid).
 
@@ -6259,6 +6420,35 @@ class TaskInterceptor:
             return 'warn'
         recon = getattr(cfg, 'reconciliation', None)
         return getattr(recon, 'reject_stale_done_evidence', 'warn')
+
+
+def _status_write_body(
+    tm: TaskBackendProtocol,
+    task_id: str,
+    status: str,
+    project_root: str,
+    tag: str | None,
+    *,
+    audit_fields: dict[str, Any],
+    clear_keys: frozenset[str],
+    claimant_kwargs: dict[str, Any],
+) -> Awaitable[Any]:
+    """The status write: atomic with its metadata changes when there are any.
+
+    Task 2649: an audit-carrying transition (reopen_*, done_provenance, a
+    deferral record) or one that clears a key writes through the single atomic
+    set_status_and_stamp_audit, so the status column and the metadata commit
+    together, both or neither. Every other write keeps plain set_task_status.
+    """
+    if audit_fields or clear_keys:
+        clear_kwargs = {'clear_keys': clear_keys} if clear_keys else {}
+        write_body = tm.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+            task_id, status, project_root, tag,
+            audit_fields=audit_fields, **clear_kwargs, **claimant_kwargs,
+        )
+    else:
+        write_body = tm.set_task_status(task_id, status, project_root, tag, **claimant_kwargs)
+    return write_body
 
 
 def _extract_status(task_data: dict) -> str:

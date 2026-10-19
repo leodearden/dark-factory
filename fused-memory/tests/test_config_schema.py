@@ -1193,6 +1193,11 @@ class TestConsolidationAutoConfig:
     def test_default_proposal_ttl_hours_is_one_week(self):
         assert ConsolidationAutoConfig().proposal_ttl_hours == 168
 
+    def test_default_canonical_absent_bonus_is_2(self):
+        """A cluster whose topic has no canonical yet ranks as if twice its
+        size (PRD C4 ranking formula; consolidation_flood_control.rank_and_cap)."""
+        assert ConsolidationAutoConfig().canonical_absent_bonus == 2.0
+
     def test_default_category_weights_are_the_three_mem0_primaries(self):
         """PRD §12 Q1 — the three Mem0-primary categories, with
         observations_and_summaries down-weighted because its corpus is
@@ -1298,6 +1303,16 @@ class TestConsolidationAutoConfig:
     def test_proposal_ttl_hours_negative_rejected(self):
         with pytest.raises(ValidationError):
             ConsolidationAutoConfig(proposal_ttl_hours=-1)
+
+    def test_canonical_absent_bonus_below_one_rejected(self):
+        """A bonus below 1 would PENALISE a canonical-absent cluster, inverting
+        the policy it exists to express."""
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(canonical_absent_bonus=0.9)
+
+    def test_canonical_absent_bonus_float_override_accepted(self):
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.5).canonical_absent_bonus == 1.5
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.0).canonical_absent_bonus == 1.0
 
     def test_backlog_multiplier_zero_rejected(self):
         with pytest.raises(ValidationError):
@@ -4164,9 +4179,10 @@ class TestWriteJournalConfig:
         assert section.read_retention_days == 30.0
         assert section.search_retention_days == 365.0
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
         assert section.prune_max_rows_per_run == 500_000
         assert section.prune_max_seconds == 30.0
+        assert section.prune_interval_seconds == 1800.0
 
     def test_search_rows_outlive_task_read_rows(self):
         section = FusedMemoryConfig().write_journal
@@ -4185,12 +4201,22 @@ class TestWriteJournalConfig:
             'RED: the rejection must name the field an operator has to fix'
         )
 
+    def test_a_zero_prune_interval_is_rejected(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(prune_interval_seconds=0)
+        assert 'prune_interval_seconds' in str(excinfo.value), (
+            'RED: a zero interval would spin the periodic prune loop'
+        )
+
     def test_values_load_from_yaml(self, tmp_path, monkeypatch):
         config_data = {
             'write_journal': {
                 'read_retention_days': 7.0,
                 'search_retention_days': 90.0,
                 'prune_max_seconds': 5.0,
+                'prune_interval_seconds': 600.0,
             },
         }
         config_file = tmp_path / 'config.yaml'
@@ -4202,9 +4228,10 @@ class TestWriteJournalConfig:
         assert section.read_retention_days == 7.0, 'RED: the section must be tunable'
         assert section.search_retention_days == 90.0
         assert section.prune_max_seconds == 5.0
+        assert section.prune_interval_seconds == 600.0
         # Unmentioned leaves keep their defaults rather than being clobbered.
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
 
 
 class TestWriteJournalGrowthAlarmConfig:

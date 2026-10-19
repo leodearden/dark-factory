@@ -35,7 +35,6 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.mcp.verdict_tools import (
     _envelope as _verdict_envelope,
 )
@@ -43,6 +42,7 @@ from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
 from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
     BlastRadiusResult,
@@ -523,7 +523,7 @@ class FakeBriefing:
 
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict, changed_files: list,
-        worktree=None, context: str | None = None,
+        worktree=None, context: str | None = None, *, text_drift=None,
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -970,6 +970,7 @@ class AgentStub:
         working_idle_secs: float | None = None,
         absolute_cap_secs: float | None = None,
         prices: dict[str, Any] | None = None,
+        strict_mcp_config: bool = False,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)

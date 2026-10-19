@@ -7,7 +7,7 @@ running orchestrator; a test injects its own implementation
 
 The verify and clock adapters are built from zero-argument RESOLVERS rather
 than from the collaborator functions themselves. A resolver is evaluated on
-every call, so the function used is whatever ``orchestrator.merge_queue``
+every call, so the function used is whatever ``orchestrator.merge_lane.worker``
 binds at that moment: the test suite still patches those module names (PRD
 phase γ migrates it onto injected fakes), and a function captured at
 construction would go inert under such a patch. γ retires the resolvers.

@@ -1167,6 +1167,75 @@ plus the script's membership in
 `TestSiblingLibsTravelledWithTheScripts`'s parametrize list — the negative and
 positive halves of the guard.
 
+### Delta 12 — six scripts stop piping a producer into `grep -q`
+
+**`provision-warm-lane-fs.sh`, `warm-lane-audit.sh`,
+`warm-lane-degenerate-ref-check.sh`, `warm-lane-disk-guard.sh`,
+`warm-lane-gc-sweep.sh` and `warm-lane-gc.sh` are no longer byte-identical to
+reify.** Added by **task 5940**. Sixteen sites in those six scripts, all of
+which set `-o pipefail`, decided a branch through `printf … | grep -q`.
+`thin-warm-lane.sh` was already clean.
+
+The construct has two defects:
+
+- **SIGPIPE.** Under `pipefail` the `if` reads the PRODUCER's status. `grep -q`
+  closes the pipe on its first match, so a producer that is still writing dies
+  of SIGPIPE and a present match reads as absent. The one site where this is
+  reachable is `_classify_img`'s permission-denied probe over captured `blkid`
+  stderr. Measured with a `blkid: Permission denied` line followed by 262144
+  filler bytes: it misread 40/40 in isolation. End to end (5/5), the sudo
+  re-probe was skipped, the image was classified `unformatted`, and P1 refused
+  to re-attach a healthy XFS image.
+- **Line-oriented anchoring.** The scalar validators had a second,
+  deterministic defect. grep anchors `^…$` per LINE, so a multi-line value
+  whose first line is valid passed. Measured on bash 5.2.21, none of the nine
+  flag/env validators exited 2 on one:
+  - disk-guard `--min-free-gib` and `--soft-free-gib`: exit 1
+  - disk-guard `--min-free-inodes` and `--soft-free-inodes`: exit 0 (admitted)
+  - gc-sweep `--critical-free-gib`: exit 1
+  - gc `--max-record-age-days`: exit 1, a raw arithmetic error
+  - audit `--stale-age-min` and `--safety`: exit 0
+  - degenerate-ref `--task`: exit 5
+
+The two kinds of site want opposite matching, so the fix uses two idioms:
+
+- **The stderr probe** wants grep's semantics: case-insensitive, any line of a
+  multi-line capture. It now reads `grep -qiE '…' <<<"$_IMG_STDERR"`, the way
+  `lib_task_citation.sh` feeds grep. The regex and `-i` are unchanged.
+- **Every scalar validator** wants the whole value anchored. It now reads
+  `[[ "$X" =~ ^…$ ]]`, the shape `provision-warm-lane-fs.sh` already used for
+  `SIZE_GIB`. disk-guard keeps `GIB_FLOOR_PATTERN` as the unquoted right-hand
+  side.
+
+Some sites take single-line values by construction: the df/du-derived checks
+(disk-guard avail bytes and inodes, gc-sweep avail bytes, audit's
+`_divergent_bytes` and free-GiB read) and gc's unreachable
+`MAX_RECORD_AGE_SECS` backstop. They are converted for uniformity, and the
+conversion preserves their behaviour.
+
+The converted scalar sites no longer fork `grep`, so they need nothing on
+`PATH` (the Delta 7 class). The provision probe still runs `grep`.
+
+The GiB-floor patterns on the disk-guard and gc-sweep validator lines are a
+separate divergence. They came from task 5534 (`cf7f58a056`, `9cee864912`),
+which recorded no delta.
+
+This is patched here, not upstream, for the reason Delta 7 gives under "Why
+patch here rather than upstream to reify". reify's copies still carry the
+pipelines.
+
+**Pinned by** these cases in the ported suites under `orchestrator/tests/warm-lane/`:
+
+- provision N4
+- disk-guard A10
+- gc-sweep G6g
+- gc A11m/A11n
+- audit A3/A4
+- degenerate-ref U8
+
+and by `tests/scripts/test_quiet_grep_sweep.py::test_never_pipes_a_producer_into_grep_q`,
+which sweeps all seven invocable scripts in this directory.
+
 ## Sibling-seed defaults, and who resolves them
 
 Two of the relocated scripts default their `--seed-script` to a **sibling**

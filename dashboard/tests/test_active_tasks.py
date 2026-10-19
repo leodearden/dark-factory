@@ -224,7 +224,7 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
     # keyword raises TypeError instead of shaping rows.
     async def _narrowed(
         client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None,
+        statuses=None, timeout=None,
     ):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):

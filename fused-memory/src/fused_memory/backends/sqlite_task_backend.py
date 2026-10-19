@@ -35,8 +35,13 @@ from shared.task_metadata import (
 )
 from shared.task_statuses import TERMINAL, TaskStatus
 
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    validate_metadata_lookup,
+)
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
+    DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     StatusWriteAuthorityError,
@@ -47,6 +52,8 @@ from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DependencyResult,
     GetTasksResult,
+    MetadataLookupResult,
+    MetadataLookupRow,
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
@@ -758,6 +765,8 @@ async def _migrate_v3_to_v4(
                     mode='merge',
                     project_root=project_root, tag=group['tag'], task_id=cancel_id,
                 )
+                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4).
+                new_metadata = _metadata_without_keys(new_metadata, _CLEARABLE_AUDIT_KEYS)
                 await conn.execute(
                     "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
                     "metadata = ? WHERE tag = ? AND id = ?",
@@ -1362,6 +1371,10 @@ def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
     )
 
 
+def _wire_priority(raw: str | None) -> str:
+    return raw or 'medium'
+
+
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
@@ -1411,7 +1424,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'testStrategy': row['test_strategy'] or '',
         'status': row['status'],
         'dependencies': dependencies,
-        'priority': row['priority'] or 'medium',
+        'priority': _wire_priority(row['priority']),
         'subtasks': [],
         'updatedAt': row['updated_at'],
         'metadata': metadata if metadata is not None else {},
@@ -1442,6 +1455,88 @@ def _updated_task_response(
             if refreshed is not None else None
         ),
     }
+
+
+# The quoted JSON path of the looked-up key, built in SQL from the bound
+# ``:key`` so the caller's key never becomes SQL text.
+_METADATA_KEY_PATH = """('$."' || :key || '"')"""
+
+
+def _metadata_lookup_sql(status_count: int | None) -> str:
+    """The one statement behind ``find_tasks_by_metadata``: counts and page, one snapshot.
+
+    ``status_count`` is the number of ``:s0, :s1, ...`` status parameters, or
+    ``None`` for every status. ``doc`` is the metadata only when it is a JSON
+    object, so no JSON function ever reads a malformed row.
+    """
+    status_clause = (
+        '' if status_count is None
+        else 'AND status IN (' + ', '.join(f':s{i}' for i in range(status_count)) + ')'
+    )
+    path = _METADATA_KEY_PATH
+    return f"""
+WITH scoped AS (
+    SELECT id, title, status, priority, updated_at,
+           COALESCE(metadata, '') <> '' AS has_metadata,
+           CASE WHEN json_valid(metadata) THEN
+               CASE WHEN json_type(metadata) = 'object' THEN metadata END
+           END AS doc
+    FROM tasks
+    WHERE tag = :tag {status_clause}
+),
+keyed AS MATERIALIZED (
+    SELECT id, title, status, priority, updated_at,
+           has_metadata AND doc IS NULL AS malformed,
+           json_type(doc, {path}) IS NOT NULL AS has_key,
+           CASE
+               WHEN json_type(doc, {path}) IS NULL THEN 0
+               WHEN :vtype IS NULL THEN 1
+               WHEN json_type(doc, {path}) = :vtype THEN doc ->> {path} = :value
+               WHEN json_type(doc, {path}) = 'array' THEN EXISTS (
+                   SELECT 1 FROM json_each(doc, {path}) WHERE type = :vtype AND value = :value
+               )
+               ELSE 0
+           END AS is_match
+    FROM scoped
+),
+stats AS (
+    SELECT COALESCE(SUM(is_match), 0) AS total,
+           COALESCE(SUM(has_key), 0) AS tasks_with_key,
+           (SELECT json_group_array(id) FROM keyed WHERE malformed) AS malformed_ids
+    FROM keyed
+),
+page AS (
+    SELECT id, title, status, priority, updated_at
+    FROM keyed WHERE is_match ORDER BY id LIMIT :limit OFFSET :offset
+)
+SELECT stats.total, stats.tasks_with_key, stats.malformed_ids,
+       page.id, page.title, page.status, page.priority, page.updated_at,
+       CASE WHEN :include_value THEN t.metadata -> {path} END AS value_json
+FROM stats
+LEFT JOIN page ON 1
+LEFT JOIN tasks AS t ON t.tag = :tag AND t.id = page.id
+ORDER BY page.id
+"""
+
+
+def _json_value_type(value: str | int | None) -> str | None:
+    """The ``json_type`` a stored value must have to equal *value*; ``None`` is presence."""
+    if value is None:
+        return None
+    return 'text' if isinstance(value, str) else 'integer'
+
+
+def _metadata_lookup_row(row: aiosqlite.Row, *, include_value: bool) -> MetadataLookupRow:
+    out: MetadataLookupRow = {
+        'task_id': int(row['id']),
+        'title': row['title'],
+        'status': row['status'],
+        'priority': _wire_priority(row['priority']),
+        'updated_at': row['updated_at'],
+    }
+    if include_value:
+        out['matched_value'] = json.loads(row['value_json'])
+    return out
 
 
 class SqliteTaskBackend:
@@ -2021,6 +2116,56 @@ class SqliteTaskBackend:
             out['id'] = int(out['id'])
         return out
 
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        """One page of the tasks whose top-level ``metadata[key]`` matches *value*.
+
+        ``value=None`` matches presence; a str or int matches a scalar by
+        equality or a list by membership. The page and its counts come from
+        one statement read through :meth:`_fresh_read_conn`, and a store
+        error raises rather than reading as no match. Semantics:
+        ``plans/task-metadata-lookup-prd.md`` decisions 5-7.
+        """
+        validate_metadata_lookup(
+            key=key, value=value, statuses=statuses, include_value=include_value,
+            limit=limit, offset=offset,
+        )
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        if statuses is not None and not statuses:
+            return {'results': [], 'total': 0, 'tasks_with_key': 0, 'malformed_metadata_ids': []}
+        params: dict[str, Any] = {
+            'tag': tag, 'key': key, 'value': value, 'vtype': _json_value_type(value),
+            'limit': limit, 'offset': offset, 'include_value': include_value,
+        }
+        params.update({f's{i}': status for i, status in enumerate(statuses or [])})
+        sql = _metadata_lookup_sql(None if statuses is None else len(statuses))
+        async with (
+            self._fresh_read_conn(project_root) as conn,
+            conn.execute(sql, params) as cursor,
+        ):
+            rows = list(await cursor.fetchall())
+        counts = rows[0]
+        return {
+            'results': [
+                _metadata_lookup_row(row, include_value=include_value)
+                for row in rows if row['id'] is not None
+            ],
+            'total': counts['total'],
+            'tasks_with_key': counts['tasks_with_key'],
+            'malformed_metadata_ids': sorted(json.loads(counts['malformed_ids'])),
+        }
+
     async def get_dependency_edges(
         self, project_root: str, tag: str | None = None,
     ) -> dict[int, list[int]]:
@@ -2596,11 +2741,16 @@ class SqliteTaskBackend:
         tag: str | None = None,
         *,
         audit_fields: dict,
+        clear_keys: frozenset[str] = frozenset(),
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
+
+        ``clear_keys`` (a subset of ``_CLEARABLE_AUDIT_KEYS``) are removed from
+        the resulting blob in the same transaction: leaving ``deferred`` drops
+        its record.
 
         The sole atomic status+audit writer (task 2649). Calling
         ``stamp_audit_metadata`` followed by ``set_task_status`` — the
@@ -2642,6 +2792,11 @@ class SqliteTaskBackend:
         :meth:`stamp_audit_metadata`, kept off the 12-method contract so
         other callers do not treat it as sanctioned public surface.
         """
+        if unclearable := clear_keys - _CLEARABLE_AUDIT_KEYS:
+            raise ValueError(
+                f'set_status_and_stamp_audit cannot clear {sorted(unclearable)}; '
+                f'clearable keys are {sorted(_CLEARABLE_AUDIT_KEYS)}'
+            )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
@@ -2700,6 +2855,7 @@ class SqliteTaskBackend:
                 )
                 if stamped is not None:
                     new_metadata = stamped
+                new_metadata = _metadata_without_keys(new_metadata, clear_keys)
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, task_timestamp_now()]
@@ -3212,6 +3368,8 @@ class SqliteTaskBackend:
         # checks it inside the transaction below. The gate reads the RAW
         # metadata_mode because _resolve_metadata_mode can itself raise, and
         # resolving first would change which error a bad call surfaces.
+        # metadata.deferral has its own floor, _assert_deferral_unchanged,
+        # judged in-transaction against the stored row in every mode.
         if status is not None:
             raise StatusWriteAuthorityError(task_id, status)
         parsed_metadata: dict | None = None
@@ -3436,7 +3594,12 @@ class SqliteTaskBackend:
                 # narrower "responsibility" to scope to here. Under replace, a
                 # done_provenance the passthrough check admitted is not this
                 # write's responsibility either: the caller had to send it
-                # back unchanged.
+                # back unchanged. The same holds for an admitted echo of
+                # metadata.deferral, which _assert_deferral_unchanged checks
+                # against the stored row in every mode.
+                deferral_echoed = _assert_deferral_unchanged(
+                    row['metadata'], parsed_metadata, new_metadata, task_id,
+                )
                 incoming_keys: set[str] | None = None
                 try:
                     _loaded_incoming = json.loads(metadata)
@@ -3447,6 +3610,8 @@ class SqliteTaskBackend:
                         incoming_keys = set(_loaded_incoming.keys())
                 if done_provenance_passed_through and incoming_keys is not None:
                     incoming_keys.discard('done_provenance')
+                if deferral_echoed and incoming_keys is not None:
+                    incoming_keys.discard('deferral')
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
                     incoming_keys=incoming_keys,
@@ -3645,6 +3810,7 @@ class SqliteTaskBackend:
         admits ``done_provenance`` only as a verbatim passthrough (the same
         :func:`_assert_done_provenance_passthrough` rule update_task applies),
         refuses any change to ``files`` (``candidate_key`` derives from them),
+        carries ``deferral`` through unchanged (:func:`_assert_deferral_unchanged`),
         and refuses a corrupt stored blob rather than repairing it.
 
         Deliberately NOT declared on :class:`TaskBackendProtocol`, like
@@ -3694,6 +3860,7 @@ class SqliteTaskBackend:
                 **{key: stored[key] for key in _MACHINE_AUTHORED_METADATA_KEYS if key in stored},
             }
             new_metadata = json.dumps(new_blob)
+            _assert_deferral_unchanged(row['metadata'], incoming, new_metadata, task_id)
             stored_files, new_files = _files_for_key(row['metadata']), _files_for_key(new_metadata)
             if stored_files != new_files:
                 raise ValueError(
@@ -4331,6 +4498,57 @@ def _assert_done_provenance_passthrough(
     if stored.get('done_provenance', absent) != incoming.get('done_provenance', absent):
         raise DoneProvenanceWriteAuthorityError(task_id)
     return 'done_provenance' in incoming
+
+
+_CLEARABLE_AUDIT_KEYS: frozenset[str] = frozenset({'deferral'})
+
+
+def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:
+    """*blob_json* with *keys* removed; returned unchanged when it is not a JSON object."""
+    if not keys:
+        return blob_json
+    try:
+        blob = json.loads(blob_json)
+    except (TypeError, ValueError):
+        return blob_json
+    if not isinstance(blob, dict) or not keys & blob.keys():
+        return blob_json
+    return json.dumps({k: v for k, v in blob.items() if k not in keys})
+
+
+def _deferral_slice(blob_json: str | None, absent: object) -> object:
+    try:
+        blob = json.loads(blob_json) if blob_json is not None else None
+    except (TypeError, ValueError):
+        blob = None
+    return blob.get('deferral', absent) if isinstance(blob, dict) else absent
+
+
+def _assert_deferral_unchanged(
+    stored_raw: str | None, incoming: dict | None, new_blob_json: str, task_id: str,
+) -> bool:
+    """Refuse a metadata write that would add, alter or remove ``metadata.deferral``.
+
+    The status choke point is the record's only writer
+    (plans/deferral-flip-condition-prd.md decision 3). Judged inside the
+    caller's transaction against the STORED row, in every metadata mode:
+    a ``deferral`` the payload carries must equal the stored value (additive's
+    OLD-wins merge would otherwise drop an alteration silently), and the blob
+    about to be written must carry exactly the stored record (a replace that
+    omits it would otherwise remove it). Identity is JSON value equality, as in
+    :func:`_assert_done_provenance_passthrough`; a corrupt or absent stored
+    blob holds no record.
+
+    Returns True when the payload carried the key as an admitted echo.
+    """
+    absent = object()
+    stored = _deferral_slice(stored_raw, absent)
+    carried = incoming.get('deferral', absent) if incoming is not None else absent
+    if carried is not absent and carried != stored:
+        raise DeferralWriteAuthorityError(task_id)
+    if _deferral_slice(new_blob_json, absent) != stored:
+        raise DeferralWriteAuthorityError(task_id)
+    return carried is not absent
 
 
 def _merge_metadata(

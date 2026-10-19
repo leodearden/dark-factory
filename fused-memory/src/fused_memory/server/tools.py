@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid as uuid_mod
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,12 +32,18 @@ from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     MEM0_MANAGED_METADATA_KEYS,
 )
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    InvalidMetadataLookupError,
+    validate_metadata_query,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
     inject_task_kind,
@@ -81,7 +88,12 @@ from fused_memory.middleware.task_interceptor import (
     _is_ticket_id,
     _looks_like_task_id,
 )
-from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
+from fused_memory.models.enums import (
+    MEM0_PRIMARY,
+    MemoryCategory,
+    SourceStore,
+    routes_to_graphiti,
+)
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.citation_verifier import (
     find_live_citation_occurrences,
@@ -508,6 +520,7 @@ Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
+- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -1197,14 +1210,16 @@ def _status_page(
     return {k: statuses[k] for k in page_keys}, len(ordered)
 
 
-def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
+def _validate_paging(
+    page_size: Any, offset: Any, *, size_arg: str = 'page_size',
+) -> dict[str, Any] | None:
     """Validate shared ``page_size``/``offset`` paging inputs.
 
     Returns a ValidationError payload dict when an input is malformed, or None
-    when both are acceptable.  Shared by ``get_tasks`` and ``get_statuses`` so
-    both tools reject identical inputs identically and a future fix to the
-    bool/int guard lands in ONE place (it was previously copy-pasted, so it
-    had to be fixed twice).
+    when both are acceptable.  Shared by ``get_tasks``, ``get_statuses`` and
+    ``find_tasks_by_metadata`` so they reject identical inputs identically and
+    a future fix to the bool/int guard lands in ONE place (it was previously
+    copy-pasted, so it had to be fixed twice).
 
     ``bool`` is rejected explicitly because it is an ``int`` subclass:
     ``page_size=True`` would otherwise silently mean a 1-entry page.
@@ -1212,21 +1227,69 @@ def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
     would spin a paging caller forever.
 
     Callers must invoke this BEFORE touching the interceptor, so a malformed
-    request costs no backend work.
+    request costs no backend work. ``size_arg`` is the page-size argument's
+    name in the calling tool, so the error names what the caller passed.
     """
     if page_size is not None and (
         not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0
     ):
         return {
-            'error': 'page_size must be a positive integer',
+            'error': f'{size_arg} must be a positive integer; got {page_size!r}',
             'error_type': 'ValidationError',
         }
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         return {
-            'error': 'offset must be a non-negative integer',
+            'error': f'offset must be a non-negative integer; got {offset!r}',
             'error_type': 'ValidationError',
         }
     return None
+
+
+def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
+    """Return a ValidationError payload unless ``statuses`` is None or a list of str.
+
+    ``[]`` is valid and matches nothing. Shared by ``get_tasks`` and
+    ``find_tasks_by_metadata``, so a bare string is rejected identically by both.
+    """
+    if statuses is None or (
+        isinstance(statuses, list) and all(isinstance(s, str) for s in statuses)
+    ):
+        return None
+    return {
+        'error': f'statuses must be a list of status strings; got {statuses!r}',
+        'error_type': 'ValidationError',
+    }
+
+
+# find_tasks_by_metadata's page-size cap, and its include_value page budget in
+# serialized bytes of ``results`` (plans/task-metadata-lookup-prd.md decision 6).
+METADATA_LOOKUP_LIMIT_CAP = 100
+RESULT_BYTE_BUDGET = 48_000
+
+
+def _json_bytes(obj: Any) -> int:
+    """Serialized size as the lookup contract measures it: stdlib ``json.dumps``, UTF-8 bytes."""
+    return len(json.dumps(obj).encode('utf-8'))
+
+
+def _elided_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    elided = {'_elided': True, 'bytes': _json_bytes(row['matched_value'])}
+    return {**row, 'matched_value': elided, 'truncated_value': True}
+
+
+def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The longest prefix of *rows* whose serialized list fits ``RESULT_BYTE_BUDGET``.
+
+    Sizes add up exactly as ``json.dumps`` of the list: ``[]`` plus each row
+    plus a ``', '`` between rows. A first row too big to fit alone comes back
+    as the only row, with its value elided.
+    """
+    size = len('[]')
+    for count, row in enumerate(rows):
+        size += _json_bytes(row) + (len(', ') if count else 0)
+        if size > RESULT_BYTE_BUDGET:
+            return list(rows[:count]) if count else [_elided_row(row)]
+    return list(rows)
 
 
 def _pagination_meta(
@@ -3199,9 +3262,12 @@ def create_mcp_server(
         declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the episode is not
         ingested — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -3238,13 +3304,14 @@ def create_mcp_server(
                 is NOT "all entities": extraction legitimately derives entities
                 no caller could predict, and this parameter names only the
                 referents the episode is ABOUT. A declaration the content
-                contradicts is REJECTED
+                contradicts — a near-miss typo of a declared task number, or
+                that number under another project — is REJECTED
                 (error_type=DeclaredReferentConflictRejected) and nothing is
-                ingested. ANY wrong shape — a bare string, a single un-wrapped
-                dict, a bad entry inside the list — is rejected as a
-                ValidationError whose message carries the accepted entry shape,
-                so you never have to guess the remedy. Absence is never
-                rejected, so omitting this always succeeds.
+                ingested; fix the id, or write `task NNN` in the content. ANY
+                wrong shape — a bare string, a single un-wrapped dict, a bad
+                entry inside the list — is rejected as a ValidationError whose
+                message carries the accepted entry shape, so you never have to
+                guess the remedy. Absence is never rejected.
                 One asymmetry against add_memory, and it is a tier below this
                 parameter: add_episode persists no metadata, so there is no
                 metadata['task_id'] fallback here — a declaration overrides
@@ -3528,23 +3595,21 @@ def create_mcp_server(
         all. A declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the write does not
         happen — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
-        Two halves of that, and they have DIFFERENT scopes — the rejection is
-        universal, the recording is not. Every add_memory call is checked for a
-        declared/prose conflict, whatever its category. But a declaration is
-        RECORDED only on a write that reaches Graphiti — an
+        A declaration is RECORDED only on a write that reaches Graphiti — an
         entities_and_relations, temporal_facts or decisions_and_rationale
-        category, or dual_write=True. On a Mem0-primary write
+        category, or dual_write=True. On an explicit Mem0-primary category
         (procedural_knowledge, preferences_and_norms,
-        observations_and_summaries) the referent set has nowhere to live: your
-        `entities` is validated against the content and then discarded, and
-        nothing downstream can tell it apart from a call that omitted the
-        parameter. So on those three categories `entities` buys you the
-        typo-catch and nothing else — which is still worth having, but do not
-        expect it to steer retrieval.
+        observations_and_summaries) without dual_write, the referent set has
+        nowhere to live: your `entities` is shape-checked, then discarded, and
+        never conflict-rejected. With category omitted it IS conflict-checked,
+        because the destination is not known until the write is classified.
 
         Content asserting that concrete, NAMED work is complete ("task N's fix
         has been applied", "re-filed as ticket tkt_...") is cross-checked
@@ -3605,17 +3670,19 @@ def create_mcp_server(
                       extraction pipeline legitimately derives entities no caller
                       could predict, and this parameter names only the referents
                       the memory is ABOUT. A declaration the content contradicts
-                      is REJECTED (error_type=DeclaredReferentConflictRejected)
-                      and nothing is written. ANY wrong shape — a bare string,
+                      — a near-miss typo of a declared task number, or that
+                      number under another project — is REJECTED
+                      (error_type=DeclaredReferentConflictRejected) and nothing
+                      is written; fix the id, or write `task NNN` in the
+                      content. ANY wrong shape — a bare string,
                       a single un-wrapped dict, a bad entry inside the list — is
                       rejected as a ValidationError whose message carries the
                       accepted entry shape, so you never have to guess the
-                      remedy. Absence is never rejected, so omitting this
-                      parameter always succeeds. RECORDED only on a write that
+                      remedy. Absence is never rejected. RECORDED only on a write that
                       reaches Graphiti (a GRAPHITI_PRIMARY category, or
-                      dual_write=True); on a Mem0-primary category it is
-                      checked for a conflict and then discarded — see the
-                      scope note above.
+                      dual_write=True); on an explicit Mem0-primary category
+                      without dual_write it is shape-checked, then discarded,
+                      and never conflict-rejected — see the scope note above.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3649,8 +3716,19 @@ def create_mcp_server(
         # through `canonicalize_project_id` — so the gate and `MemoryService`
         # classify local-vs-foreign referents identically. A raw id here would
         # let the two disagree about whether a qualifier names us.
+        #
+        # `category is None` counts as recorded: the classifier picks the
+        # destination below this boundary, and running it here too would be a
+        # second classification site (INV-5).
+        declaration_recorded = category is None or routes_to_graphiti(
+            MemoryCategory(category), dual_write=dual_write,
+        )
         if err := entities_gate(
-            entities, content=content, group_id=project_id, agent_id=agent_id,
+            entities,
+            content=content,
+            group_id=project_id,
+            agent_id=agent_id,
+            declaration_recorded=declaration_recorded,
         ):
             return err
         # MCP-markup rejection no longer happens here: task 4458 retired this
@@ -8463,16 +8541,9 @@ def create_mcp_server(
         _paging_error = _validate_paging(page_size, offset)
         if _paging_error is not None:
             return _paging_error
-        if statuses is not None and not isinstance(statuses, list):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
-        if statuses is not None and any(not isinstance(s, str) for s in statuses):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
+        _statuses_error = _validate_statuses(statuses)
+        if _statuses_error is not None:
+            return _statuses_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -8923,6 +8994,9 @@ def create_mcp_server(
         heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        deferral: dict | None = None,
+        expected_stamped_at: str | None = None,
+        restamp_only: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -8993,6 +9067,27 @@ def create_mcp_server(
             client_op_id: Optional client-supplied idempotency key (task 2712).
                 A retry with the same key applies once and returns the recorded
                 outcome. Omit for today's behavior.
+            deferral: What ends the hold. REQUIRED to enter ``deferred``, refused
+                with any other status. One of
+                ``{'kind': 'carried_by', 'carrier_task_id': <id>}``,
+                ``{'kind': 'until_condition', 'condition': <text>, 'expires_at': <ISO, optional>}``
+                or ``{'kind': 'held_by_session', 'holder_pid': <your $CLAUDE_PID>,
+                'grace_secs': <600..86400, optional>}``; each may add ``reason``.
+                On a row already ``deferred`` it re-stamps (replaces) the record
+                without a status change. Every successful write echoes the
+                stored record as ``deferral`` (entry, re-stamp) or the removed
+                one as ``deferral_cleared`` (any exit from ``deferred``); no echo
+                means the server predates the gate. Refusals: ``deferral_required``,
+                ``deferral_invalid`` (with ``reason_code``, ``field``, ``value``),
+                ``deferral_changed``. Recipe: docs/task-authoring.md §9
+                "Deferring a task".
+            expected_stamped_at: Compare-and-set, single id only: the write is
+                refused ``deferral_changed`` unless the row's current record has
+                this ``stamped_at``.
+            restamp_only: Guarded re-stamp, single id only, ``status='deferred'``
+                and a ``deferral`` required: refused ``deferral_changed`` unless
+                the row is ``deferred`` now with the record named by
+                ``expected_stamped_at`` (omitted = no record).
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -9021,6 +9116,9 @@ def create_mcp_server(
             reopen_reason=reopen_reason,
             agent_id=agent_id,
             client_op_id=client_op_id,
+            deferral=deferral,
+            expected_stamped_at=expected_stamped_at,
+            restamp_only=restamp_only,
             **claimant_kwargs,
         )
 
@@ -9632,6 +9730,92 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def find_tasks_by_metadata(
+        project_root: str,
+        key: str,
+        value: Any = None,
+        statuses: Any = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: Any = False,
+    ) -> dict[str, Any]:
+        """Exact lookup of the tasks whose top-level ``metadata[key]`` matches ``value``.
+
+        Searches every status, including ``deferred`` and ``cancelled``, which
+        ``search_tasks`` does not. Semantics: plans/task-metadata-lookup-prd.md.
+
+        Args:
+            project_root: Absolute path to project root.
+            key: One top-level metadata key matching ``[A-Za-z0-9_][A-Za-z0-9_-]*``.
+            value: Omit to match every task carrying ``key`` (even as JSON null).
+                A str or int matches a scalar by equality or a list by
+                membership, type-strictly: 40 does not match "40". bool, float,
+                dict and list values are rejected.
+            statuses: Optional list of task statuses to search within
+                (default: all); an unknown status is a ValidationError.
+            limit: Page size >= 1; values above 100 are clamped to 100 (default 50).
+            offset: Zero-based index into the matches, ordered by task id.
+            tag: Tag context (optional).
+            include_value: True adds ``matched_value``, the whole ``metadata[key]``.
+
+        Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
+        ``updated_at``), ``tasks_with_key`` (how many tasks in the searched
+        statuses carry ``key``), ``pagination`` (page on ``has_more`` with
+        ``offset += returned``), ``malformed_metadata_ids`` when some task's
+        metadata is not a JSON object, and the echoed arguments. An ``error``
+        payload means the lookup failed; it never means "no match".
+        """
+        paging_error = _validate_paging(limit, offset, size_arg='limit')
+        if paging_error is not None:
+            return paging_error
+        statuses_error = _validate_statuses(statuses)
+        if statuses_error is not None:
+            return statuses_error
+        page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
+        try:
+            validate_metadata_query(
+                key=key, value=value, statuses=statuses, include_value=include_value,
+            )
+        except InvalidMetadataLookupError as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        normalized = _normalize_project_root(project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        found = await task_interceptor.find_tasks_by_metadata(
+            normalized, key, value,
+            statuses=statuses, limit=page_size, offset=offset, tag=tag,
+            include_value=include_value,
+        )
+        results = _fit_rows_to_budget(found['results']) if include_value else found['results']
+        pid = resolve_project_id(normalized)
+        response: dict[str, Any] = {
+            'project_id': pid,
+            'project_root': normalized,
+            'key': key,
+            'value': value,
+            'statuses': statuses,
+            'results': results,
+            'tasks_with_key': found['tasks_with_key'],
+            'pagination': _pagination_meta(
+                total=found['total'], offset=offset, page_size=page_size,
+                returned=len(results),
+            ),
+        }
+        if found['malformed_metadata_ids']:
+            response['malformed_metadata_ids'] = found['malformed_metadata_ids']
+        await _log_read(
+            'find_tasks_by_metadata',
+            project_id=pid,
+            result_summary={
+                'project_id': pid, 'key': key,
+                'total': found['total'], 'returned': len(results),
+            },
+        )
+        return response
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
         """Cancel a pending curator ticket by its ticket_id.
 
@@ -9662,6 +9846,9 @@ def create_mcp_server(
         project_root: str,
         task_ids: str,
         target_status: str = 'pending',
+        deferral: dict | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
 
@@ -9683,6 +9870,19 @@ def create_mcp_server(
             target_status: ``pending`` to release for scheduling (default),
                 ``deferred`` to leave them parked, or ``cancelled`` to discard
                 the planned batch.  Other status values are rejected.
+            deferral: Required iff ``target_status='deferred'``: what ends the
+                hold, in the ``set_task_status`` ``deferral`` shape. Each id is
+                re-stamped with it (its ``deferred_at`` is kept) and the record
+                is echoed per id as ``deferral``.
+            agent_id: Which agent is committing (optional, auto-derived from
+                MCP context); a re-stamp records it as ``stamped_by``.
+
+        RELEASE RULE (``pending``/``cancelled``): only a ``planning`` hold, or a
+        row with no record, is released. Any other hold is refused per id with
+        ``deferral_invalid`` / ``reason_code='not_planning_hold'`` and stays
+        parked; a plain ``set_task_status(status='pending')`` still releases
+        it. Each released id echoes the record it removed as
+        ``deferral_cleared`` (``None`` when there was none).
 
         A ``pending`` commit stamps ONE shared ``metadata.pending_since``
         across the whole batch (task 3816, PRD
@@ -9865,10 +10065,14 @@ def create_mcp_server(
                 for f in findings
             )
 
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
             status=target_status,
             project_root=project_root,
+            agent_id=agent_id,
+            deferral=deferral,
+            scope=StatusWriteScope.COMMIT_PLANNING,
         )
         if target_status == 'pending':
             # Best-effort/never-raising (see index_committed_tasks docstring) —
@@ -9887,16 +10091,13 @@ def create_mcp_server(
             # already-fetched tasks_data (no extra reads). Only attaches the
             # report key when a sidecar actually exists on disk, so a batch
             # with no capability-manifest involvement gets a byte-identical
-            # legacy response. agent_id is intentionally omitted: unlike most
-            # write tools in this module, commit_planning takes no
-            # agent_id/ctx parameter of its own — the set_task_status call
-            # above this one is likewise un-attributed — so passing None
-            # here is parity with that call, not a missed wiring.
+            # legacy response.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
+                agent_id=agent_id,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
@@ -10661,15 +10862,15 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Snapshot dict with keys: skip_counts, parks, effective_priorities,
-            pin_queue, overrides, current_holders, snapshot_at.
-            Returns the empty skeleton when no snapshot file exists yet.
+            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        snapshot = await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        return snapshot.to_json()
 
     @mcp.tool()
     @mcp_tool_errors()

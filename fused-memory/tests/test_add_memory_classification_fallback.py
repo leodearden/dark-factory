@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from _fm_helpers import poll_until
-from _openai_stubs import completion_client, raising_client
+from _sdk_client_stubs import completion_client, raising_client
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory

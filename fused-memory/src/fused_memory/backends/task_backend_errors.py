@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.task_deferral import DeferralRefusalCode
+
 TASKMASTER_TOOL_ERROR: str = 'TASKMASTER_TOOL_ERROR'
 TASKMASTER_UNAVAILABLE: str = 'TASKMASTER_UNAVAILABLE'
 
@@ -242,6 +244,37 @@ class DoneProvenanceWriteAuthorityError(TaskmasterError):
         return done_provenance_via_update_task_error(self.task_id)
 
 
+_DEFERRAL_WRITE_AUTHORITY_HINT = (
+    "Only set_task_status(status='deferred', deferral={...}) writes metadata.deferral, "
+    'and only leaving deferred removes it; update_task and submit_task may not add, '
+    'alter or remove it (an unchanged echo of the stored record is accepted). '
+    "Recipe: docs/task-authoring.md §9 'Deferring a task'."
+)
+
+
+class DeferralWriteAuthorityError(TaskmasterError):
+    """Raised when a metadata writer would add, alter or remove ``metadata.deferral``.
+
+    The status choke point is the record's only writer (PRD
+    plans/deferral-flip-condition-prd.md decision 3). Call :meth:`to_error_dict`
+    for the wire shape.
+    """
+
+    def __init__(self, task_id: str | None, path: str = 'metadata.deferral') -> None:
+        self.task_id = task_id
+        self.path = path
+        super().__init__('TASKMASTER_TOOL_ERROR', _DEFERRAL_WRITE_AUTHORITY_HINT)
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': DeferralRefusalCode.WRITE_AUTHORITY.value,
+            'task_id': self.task_id,
+            'path': self.path,
+            'hint': _DEFERRAL_WRITE_AUTHORITY_HINT,
+        }
+
+
 class AppendUnsupportedFieldError(TaskmasterError):
     """Raised when ``update_task`` combines ``append=True`` with a REPLACE-ONLY column.
 
@@ -305,6 +338,7 @@ __all__ = [
     'TaskNotFoundError',
     'StatusWriteAuthorityError',
     'DoneProvenanceWriteAuthorityError',
+    'DeferralWriteAuthorityError',
     'AppendUnsupportedFieldError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',

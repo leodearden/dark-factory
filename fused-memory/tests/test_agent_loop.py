@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
 from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
 
@@ -162,7 +163,7 @@ async def test_openai_content_block_dispatch():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -649,7 +650,7 @@ async def test_openai_tool_schema_conversion():
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
 
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -747,7 +748,7 @@ async def test_openai_message_conversion():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -816,7 +817,7 @@ async def test_openai_tools_omitted_when_empty():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -928,7 +929,7 @@ async def test_openai_round_trip_two_turns():
     mock_completions.create = fake_create
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -952,6 +953,59 @@ async def test_openai_round_trip_two_turns():
     assert tool_result_msgs[0]['tool_call_id'] == 'call_tool_1'
     result_content = json.loads(tool_result_msgs[0]['content'])
     assert result_content['doubled'] == 14
+
+
+def _sdk_arm_agent(provider: str, model: str) -> AgentLoop:
+    return AgentLoop(
+        config=_make_config(agent_llm_provider=provider, agent_llm_model=model),
+        system_prompt='Release test agent.',
+        tools={},
+        terminal_tool='stage_complete',
+    )
+
+
+class TestAgentLoopReleasesSdkClient:
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released(self):
+        agent = _sdk_arm_agent('anthropic', 'claude-sonnet-4-20250514')
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(return_value=FakeResponse(
+            content=[FakeText(text='ok')], usage=FakeUsage(input_tokens=7, output_tokens=3),
+        ))
+
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await agent._call_llm([{'role': 'user', 'content': 'hi'}], [])
+
+        client.__aexit__.assert_awaited_once()
+        assert agent.llm_call_count == 1
+        assert agent.token_count == 10
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released(self):
+        agent = _sdk_arm_agent('openai', 'gpt-4o')
+        client = sdk_client_double()
+        client.chat.completions.create = AsyncMock(return_value=FakeOpenAIResponse(
+            choices=[FakeOpenAIChoice(message=FakeOpenAIMessage(content='ok'))],
+        ))
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await agent._call_openai([{'role': 'user', 'content': 'hi'}], [])
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released_when_the_call_fails(self):
+        agent = _sdk_arm_agent('openai', 'gpt-4o')
+        client = sdk_client_double()
+        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with (
+            patch('openai.AsyncOpenAI', return_value=client),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await agent._call_openai([{'role': 'user', 'content': 'hi'}], [])
+
+        client.__aexit__.assert_awaited_once()
 
 
 # --- Claude CLI provider tests ---

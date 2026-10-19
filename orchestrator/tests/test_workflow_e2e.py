@@ -359,7 +359,7 @@ class TestHappyPath:
         Fails until _submit_to_merge_queue stores merge_sha on self._merge_sha (step-15)
         and workflow.py:554 passes it as done_provenance.
         """
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         stub = AgentStub()
         scheduler = FakeScheduler()
@@ -3042,7 +3042,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3077,7 +3077,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3117,7 +3117,7 @@ class TestMarkBlockedFalseDoneGuard:
         from unittest.mock import AsyncMock, patch
 
         from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3147,7 +3147,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3184,7 +3184,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRANSIENT_INFRA_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3214,7 +3214,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -6067,16 +6067,18 @@ class TestStaleL1DoesNotSinkRun:
     ('info', 0, False),
     # info at level 1 — same
     ('info', 1, False),
-    # info at level 2 — gated by the level≥2 catch-all (D4: any L2+ is stop-the-line)
-    ('info', 2, True),
+    # info at level 2 — never gates: a level≥2 record gates only when
+    # escalation.pins classifies it a queue handoff (info-l0-router PRD D3)
+    ('info', 2, False),
 ])
 class TestIsGatingEscalation:
     """Unit test of ``_is_gating_escalation`` (truth table over severity×level).
 
     Pins full PRD C7/D4 semantics including B3 (plain blocking L1 → False)
     and disjunct isolation (critical at level 0 hits severity branch only;
-    blocking at level 2 hits level branch only; info at level 2 hits level≥2
-    catch-all regardless of severity).
+    blocking at level 2 hits level branch only).  A level≥2 record gates only
+    when escalation.pins classifies it a queue handoff, so info at level 2
+    never gates (PRD info-l0-router D3).
     """
 
     def test_predicate(self, severity, level, expected):
@@ -6315,10 +6317,10 @@ class TestBornAtL2GatesMergeEntry:
 class TestFormatReescalationDetail:
     """Unit test of ``_format_reescalation_detail`` (task 2553).
 
-    Pins the rendered detail text built from the ``Escalation`` objects an
-    ``_StewardReescalated`` exception carries, so ``_mark_blocked``'s
-    ``detail=`` stops duplicating ``reason`` when the steward re-escalates
-    to a human (workflow.py:2444's ``except _StewardReescalated`` clause).
+    Pins the rendered detail text built from the ``Escalation`` objects a
+    ``_HumanHandoff`` exception carries, so ``_mark_blocked``'s ``detail=``
+    stops duplicating ``reason`` when the task is handed to a human (the
+    ``except _HumanHandoff`` clause in ``run()``'s ESCALATED branch).
     """
 
     def test_single_escalation_contains_all_fields(self):
@@ -6398,8 +6400,8 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
     already-on-main branch-check (fresh worktree HEAD == main SHA → break),
     then reaches the MERGE gate which returns ESCALATED — so the outcome is
     ESCALATED rather than BLOCKED.  With the fix _wait_for_resolution raises
-    _StewardReescalated for level≥2/born-at-L2, causing run() to call
-    _mark_blocked and return BLOCKED.
+    _NoStewardApplicable for a non-info level≥2 or born-at-L2 record, causing run()
+    to call _mark_blocked and return BLOCKED.
 
     This tests the wait/gate handshake at the run() level, not just the
     inner-gate predicate covered by TestBornAtL2GatesPostImplementer et al.
@@ -6451,7 +6453,7 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 
         outcome = (await workflow.run()).outcome
 
-        # With the fix: _wait_for_resolution raises _StewardReescalated for the
+        # With the fix: _wait_for_resolution raises _NoStewardApplicable for the
         # pending level-2 escalation → _mark_blocked → BLOCKED.
         # Without the fix: _wait_for_resolution returns '' (no L0 pending) →
         # git ancestry check breaks (fresh branch at main HEAD) → MERGE gate
@@ -6472,22 +6474,29 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestReescalationDetailPropagatedToBlockReport:
-    """task 2553: the ``except _StewardReescalated`` clause in ``run()``
-    (workflow.py:2444) must thread the carried escalation payload into
-    ``_mark_blocked``'s ``detail=`` instead of discarding it.
+    """task 2553: the hand-off clause in ``run()``'s ESCALATED branch must
+    thread the carried escalation payload into ``_mark_blocked``'s
+    ``detail=`` instead of discarding it, so ``report.detail`` names the
+    record rather than copying ``report.reason``.
 
     Mirrors ``TestBornAtL2HaltsRunViaWaitForResolution`` but asserts on the
     returned ``TerminalReport.detail``/``.reason`` rather than only
-    ``.outcome``. RED today: the except clause has no ``as reesc`` binding
-    and calls ``_mark_blocked('Steward re-escalated to human',
-    skip_escalation=True)`` with no ``detail=``, so ``_mark_blocked``'s
-    ``detail = detail or reason`` fallback makes ``report.detail`` an exact
-    copy of ``report.reason`` — neither the escalation's detail text nor its
-    id appear anywhere in the report.
+    ``.outcome``.  The REASON names which of ``_wait_for_resolution``'s two
+    hand-offs fired (PRD info-l0-disposition-router D13, task 5222): an open
+    non-info L2 short-circuits before any steward work, so its reason is
+    ``Gated by open L2 <ids>; no steward applicable`` and its detail must not
+    claim a steward acted; an open L1 no steward filed during the wait reads
+    ``Gated by open L1 <ids>; no steward applicable`` for the same reason.
     """
 
+    @pytest.mark.parametrize(('severity', 'level', 'expected_reason'), [
+        ('critical', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
+        ('blocking', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
+        ('blocking', 1, 'Gated by open L1 {esc_id}; no steward applicable'),
+    ])
     async def test_detail_contains_escalation_payload(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        severity, level, expected_reason,
     ):
         from escalation.models import Escalation
 
@@ -6513,17 +6522,17 @@ class TestReescalationDetailPropagatedToBlockReport:
             call_count += 1
             if call_count == 1:
                 # Simulate a post-implementer/post-debugger gate firing:
-                # the inner loop submitted a critical/level-2 escalation and
-                # returned ESCALATED — which bubbles up to run().
+                # the inner loop submitted an escalation a human must decide
+                # and returned ESCALATED — which bubbles up to run().
                 queue.submit(Escalation(
                     id=esc_id,
                     task_id=task_assignment.task_id,
                     agent_role='implementer',
-                    severity='critical',
+                    severity=severity,
                     category='risk_identified',
-                    summary='Stop-the-line: critical risk needing human review',
-                    detail='Born at L2 — cannot be auto-resolved by steward',
-                    level=2,
+                    summary='Stop-the-line: risk needing human review',
+                    detail='Needs a human decision — no steward can resolve it',
+                    level=level,
                 ))
             return WorkflowOutcome.ESCALATED
 
@@ -6534,11 +6543,11 @@ class TestReescalationDetailPropagatedToBlockReport:
         assert report.outcome == WorkflowOutcome.BLOCKED
         # The escalation's own detail text and id must be recoverable from
         # the block report — not just a copy of the generic reason.
-        assert 'Born at L2 — cannot be auto-resolved by steward' in report.detail
+        assert 'Needs a human decision — no steward can resolve it' in report.detail
         assert esc_id in report.detail
-        # reason stays the stable generic summary; detail must differ from it.
-        assert report.reason == 'Steward re-escalated to human'
+        assert report.reason == expected_reason.format(esc_id=esc_id)
         assert report.detail != report.reason
+        assert 'Steward re-escalated' not in report.detail, report.detail
 
 
 @pytest.mark.asyncio

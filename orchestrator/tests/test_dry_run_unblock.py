@@ -23,7 +23,11 @@ from _orch_helpers import (
     skip_role_config_layer,
     stamp_stock_routing_config,
 )
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AllAccountsCappedException,
+    classify_agent_failure,
+)
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
@@ -429,6 +433,7 @@ class TestBudgetExhaustedFallback:
             output='',
             structured_output=None,
         )
+        assert classify_agent_failure(agent_result).kind is AgentFailureKind.BUDGET
 
         scheduler = MagicMock()
         scheduler.update_task = AsyncMock(return_value=True)
@@ -748,7 +753,7 @@ class TestBlockClassStamping:
         on an ordinary success entry.
         """
         from orchestrator.dry_run_unblock import run_dry_run_unblock
-        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane.gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 
         reason = POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX + ': type-check failed for orchestrator'
         structured = {
@@ -1978,7 +1983,7 @@ class TestMergeCompletionRiskClamp:
     for a MERGE_VERIFY_RED proposal when
     ``merge_completion_eligible(event_store, task_id)`` is False (task 2633,
     the (b)+(c) generation-time enforcement point — see
-    ``orchestrator.merge_completion``).
+    ``orchestrator.merge_lane.completion``).
 
     RED today (step-3): the clamp does not exist yet in ``run_dry_run_unblock``,
     so ``test_low_risk_clamped_when_eligibility_evidence_missing`` fails — the

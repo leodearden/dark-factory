@@ -48,7 +48,7 @@ _needs_escalation = pytest.mark.skipif(
 
 _ANCHOR = 'folded-escalation-test'
 _ROLE = 'fused-memory/folded-escalation-test'
-_CATEGORY = 'folded_escalation_test'
+_CATEGORY = 'risk_identified'
 
 logger = logging.getLogger('fused_memory.tests.folded_escalation')
 

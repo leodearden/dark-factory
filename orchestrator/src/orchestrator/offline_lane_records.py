@@ -32,7 +32,6 @@ LEGACY_INFRA_COMMAND = 'legacy_infra'
 LEGACY_COMMANDS: frozenset[str] = frozenset({LEGACY_NUMERIC_COMMAND, LEGACY_INFRA_COMMAND})
 
 _FAILURE_KINDS = frozenset({'failed', 'error'})
-_PROBE_RESULTS = frozenset({'up', 'outage', 'broken'})
 _PASS_ID_TIMESTAMP_FORMAT = '%Y%m%dT%H%M%S'
 _PASS_ID_TIMESTAMP_RE = re.compile(r'^\d{8}T\d{6}(?=-)')
 _SHELL_SIGNAL_RANGE = range(129, 193)
@@ -55,6 +54,17 @@ class Leg(StrEnum):
 class EndedBy(StrEnum):
     EXIT = 'exit'
     SIGNAL = 'signal'
+
+
+class ProbeKind(StrEnum):
+    """A ``ProbeResult.result``: D7's three readings of one outage probe's exit."""
+
+    UP = 'up'
+    OUTAGE = 'outage'
+    BROKEN = 'broken'
+
+
+_PROBE_RESULTS = frozenset(ProbeKind)
 
 
 def classify_exit(returncode: int) -> EndedBy:
@@ -361,6 +371,9 @@ class RunRecordStore:
     def now(self) -> datetime:
         return self._clock()
 
+    def pass_directory(self, command: str, pass_id: str) -> Path:
+        return self.root / command_key(command) / pass_id
+
     def allocate_pass(self, command: str, leg: Leg | str, head: str) -> LanePass:
         if Leg(leg) is Leg.GENERIC and command in LEGACY_COMMANDS:
             raise ValueError(f'{command!r} names a legacy leg, not a generic command')
@@ -372,7 +385,7 @@ class RunRecordStore:
             head=head,
             pass_id=pass_id,
             started_at=started_at,
-            directory=self.root / command_key(command) / pass_id,
+            directory=self.pass_directory(command, pass_id),
         )
         _write_payload(
             lane_pass.record_path,
@@ -422,7 +435,7 @@ class RunRecordStore:
         self.write_run(lane_pass, replace(RunRecord.from_json(detect), probe=probe))
 
     def load_pass(self, command: str, pass_id: str) -> PassRecord | None:
-        path = self.root / command_key(command) / pass_id / 'record.json'
+        path = self.pass_directory(command, pass_id) / 'record.json'
         if not path.is_file():
             return None
         try:

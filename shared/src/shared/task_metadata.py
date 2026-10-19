@@ -1266,8 +1266,9 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # writers `orchestrator/src/orchestrator/merge_queue.py::
         # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
         # main-health fix task, 'high'), `orchestrator/src/orchestrator/
-        # workflow.py::build_offline_lane_fix_task_arguments` (offline-lane fix
-        # task, 'normal') and `orchestrator/src/orchestrator/workflow.py::
+        # offline_lane_filing.py::build_lane_fix_task_arguments` and
+        # `::build_lane_command_task_arguments` (offline-lane fix tasks,
+        # 'normal') and `orchestrator/src/orchestrator/workflow.py::
         # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high');
         # reader `orchestrator/src/orchestrator/merge_queue.py::
         # lane_for_task_metadata` -> `_normalize_lane`, consumed at
@@ -1337,6 +1338,11 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # §10): written and read back only by
         # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
         'audit_trail_rotation',
+        # Plan task-text provenance mirror (task 4031): written by orchestrator
+        # TaskWorkflow._mirror_plan_text_fp at plan authoring; read by
+        # fused-memory's amendment advisory (task 4034).
+        'plan_text_fp',
+        'plan_authored_at',
     }
 )
 

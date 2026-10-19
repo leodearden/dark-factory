@@ -28,6 +28,7 @@ from legibility import (
     unlanded,
 )
 from legibility.session_ledger import CodedBy, LedgerRow, Outcome
+from legibility_task_store_fake import FakeTaskStore
 
 _NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 _DATE = "2026-10-06"
@@ -161,6 +162,7 @@ class _Census:
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
             synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
             submit_fn=_Recorder({"ticket": "tkt_1"}),
+            task_store=FakeTaskStore(),
             escalate_fn=_Recorder(),
             status_fetcher=lambda: {"statuses": {}},
             commit=_Recorder(_LANDED),

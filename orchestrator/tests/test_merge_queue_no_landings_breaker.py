@@ -10,7 +10,7 @@ Covers:
 """
 from __future__ import annotations
 
-from orchestrator.merge_queue import BreakerTrip, NoLandingsCircuitBreaker
+from orchestrator.merge_lane.worker import BreakerTrip, NoLandingsCircuitBreaker
 
 # ---------------------------------------------------------------------------
 # step-01: healthy / no-trip cases

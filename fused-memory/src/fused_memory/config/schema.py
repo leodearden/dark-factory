@@ -447,8 +447,9 @@ class QueueConfig(BaseModel):
 class WriteJournalConfig(BaseModel):
     """Retention horizons and prune budgets for the ``write_ops`` journal.
 
-    RESTART-ONLY BY CONSTRUCTION. The prune runs once at startup
-    (``server/main.py``), so no consumer re-reads these values afterwards.
+    RESTART-ONLY BY CONSTRUCTION. The prune runs at startup and every
+    ``prune_interval_seconds`` (``services/write_ops_retention.py``), and both
+    capture this section once at startup, so nothing re-reads it afterwards.
     ``config/reload.py::RELOADABLE_FIELDS`` is an opt-in allowlist and this
     section is deliberately absent from it, which makes a changed leaf report
     ``restart_required`` — honest, rather than a leaf advertised hot-reloadable
@@ -471,15 +472,21 @@ class WriteJournalConfig(BaseModel):
     #: volume, so a long horizon costs essentially nothing.
     write_retention_days: float = Field(default=730.0, gt=0)
     #: Rows deleted per transaction. Each batch commits separately so the
-    #: write lock is released between batches.
-    prune_batch_size: int = Field(default=5000, gt=0)
-    #: Ceiling on one startup sweep. A backlog drains over successive restarts
-    #: and each partial run says so at WARNING.
+    #: write lock is released between batches, which makes one batch the
+    #: longest a journalled tool call waits behind a periodic pass; sized for
+    #: that in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
+    prune_batch_size: int = Field(default=500, gt=0)
+    #: Ceiling on one sweep. A backlog drains over successive passes and each
+    #: partial run says so at WARNING.
     prune_max_rows_per_run: int = Field(default=500_000, gt=0)
     #: Wall-clock ceiling on one sweep, checked between batches. This is the
     #: bound that actually matters: the watchdog's startup grace is a TIME
     #: budget, and rows-per-second is not knowable in advance.
     prune_max_seconds: float = Field(default=30.0, gt=0)
+    #: Seconds between background prune passes, each bounded by the same
+    #: ``prune_max_seconds`` / ``prune_max_rows_per_run``. The sizing basis is
+    #: in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
+    prune_interval_seconds: float = Field(default=1800.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
@@ -3276,11 +3283,27 @@ class ConsolidationAutoConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'How many candidate clusters the ranking considers per cycle, as a '
-            'multiple of max_auto_per_cycle. Greater than 1 so the cycle picks '
-            'the best few of a wider field rather than the first few it saw; '
-            'bounded so ranking cost stays proportional to what can actually '
-            'be executed. Green-tier hot-reloadable.'
+            'Proposals above (max_auto_per_cycle + max_gate_filings_per_cycle) '
+            'x this trip the backlog regime: the cycle executes and files '
+            'nothing and emits ONE aggregate escalation, so a flooding proposer '
+            'costs one human-visible record per cycle rather than a gate per '
+            'cluster. Applied by '
+            'reconciliation/consolidation_flood_control.py::rank_and_cap. '
+            'Green-tier hot-reloadable.'
+        ),
+    )
+    canonical_absent_bonus: float = Field(
+        default=2.0,
+        ge=1.0,
+        description=(
+            'Ranking multiplier applied by '
+            'reconciliation/consolidation_flood_control.py::rank_and_cap to a '
+            'cluster whose topic has no canonical yet, so an unconsolidated '
+            'cluster outranks a regrowth of one already consolidated. Ordering '
+            'only: it can never raise how much a cycle executes, the per-cycle '
+            'caps do that. At least 1.0, because a value below 1 would penalise '
+            'exactly the clusters it exists to favour. Green-tier '
+            'hot-reloadable.'
         ),
     )
     refusal_streak_threshold: int = Field(

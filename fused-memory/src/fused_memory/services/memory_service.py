@@ -69,6 +69,8 @@ from fused_memory.models.enums import (
     ClassificationFallback,
     MemoryCategory,
     SourceStore,
+    routes_to_graphiti,
+    routes_to_mem0,
 )
 from fused_memory.models.memory import (
     AddEpisodeResponse,
@@ -83,7 +85,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
 )
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import Scope, build_known_projects_map
 from fused_memory.reconciliation.flag_record_contract import (
     enforce_flag_record_write_contract,
 )
@@ -177,8 +179,12 @@ _T = TypeVar('_T')
 # backend can consume the whole shutdown budget or starve the durable-flush
 # SQLite closes (_write_journal/_event_buffer) that run after it. The paired
 # outer step budget lives in server/main.py as _MEMORY_CLOSE_STEP_TIMEOUT and
-# must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
+# must dominate MemoryService.close_budget_secs() (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
+
+# SDK connection-pool releases (classifier, router) only close local idle sockets: httpx opens its TLS streams with standard_compatible=False, so no close waits on the peer.
+# They run after every durable-flush close and lose nothing if cut short.
+_POOL_RELEASE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes
 # from its Graphiti ones, whose group_id is the bare project_id
@@ -1725,6 +1731,15 @@ def _edge_to_dict(e: Any) -> dict:
     }
 
 
+def _edge_is_retired(edge: Any) -> bool:
+    """True when a graphiti-core ``EntityEdge``'s ``invalid_at`` is set — the
+    Python mirror of backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, which
+    explains why ``expired_at`` is deliberately not consulted (a restored edge
+    keeps it).
+    """
+    return getattr(edge, 'invalid_at', None) is not None
+
+
 # Defensive: resolve the embedding-provider's RateLimitError class at module
 # load. If the openai SDK is absent or its exception hierarchy is renamed,
 # _is_rate_limit_or_quota_error still works via its duck-typed fallback checks
@@ -1847,25 +1862,17 @@ def _store_failure_diagnostics(
     elapsed and was cancelled (there, *exc* is None — there is no exception object,
     only the fact of the timeout).
 
-    INNER vs OUTER TIMEOUT, and why ``reason`` is the only discriminator.  Since
-    task 5265 a mem0 BACKEND read timeout (``Mem0Backend.search`` exceeding
-    ``backend_read_timeout_seconds``) also arrives at the ``'exception'`` branch,
-    where it used to be swallowed into an empty response and never reach here at
-    all.  Both variants carry ``error_type='TimeoutError'``, so they are told
-    apart ONLY by ``reason``: inner backend read timeout → ``'exception'``;
-    outer fan-out deadline → ``'timeout'``.  The inner one additionally carries
-    a non-empty ``error`` naming the backend read timeout, because
-    ``Mem0Backend`` re-raises with that text rather than letting
-    ``asyncio.wait_for``'s empty-stringifying ``TimeoutError`` through.
-
-    GraphitiBackend still swallows its own inner ``TimeoutError`` (at
-    ``search`` and several sibling reads), so a Graphiti backend read timeout
-    does NOT reach this function and leaves the search reported as clean.  That
-    asymmetry is deliberate and temporary: it is entangled with a second,
-    independent degrade mechanism in this module
-    (``_graphiti_classify_or_degrade`` / ``_graphiti_degraded_entity_result`` /
-    ``get_entity``'s fallback arms), so reversing it is design work on the
-    degrade contract and was explicitly held out of task 5265's scope.
+    INNER vs OUTER TIMEOUT, and why ``reason`` is the only discriminator.  A
+    BACKEND read timeout from either store (``Mem0Backend.search`` or
+    ``GraphitiBackend.search`` exceeding ``backend_read_timeout_seconds``, tasks
+    5265 / 5699) arrives at the ``'exception'`` branch, where it used to be
+    swallowed into an empty response and never reach here at all.  Both
+    variants carry ``error_type='TimeoutError'``, so they are told apart ONLY by
+    ``reason``: inner backend read timeout → ``'exception'``; outer fan-out
+    deadline → ``'timeout'``.  The inner one additionally carries a non-empty
+    ``error`` naming the store, operation and budget, because both backends
+    raise through ``backends/timeout_budget.py::await_within`` rather than
+    letting ``asyncio.wait_for``'s empty-stringifying ``TimeoutError`` through.
 
     This is the diagnosability fix for task 2653: search()'s prior degraded-path
     WARNING carried only ``{'store': ..., 'error': str(e)}`` — no exception type, no
@@ -2325,11 +2332,11 @@ class MemoryService:
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
         self.recon_journal: ReconciliationJournal | None = None
-        # {project_id: project_root} registry snapshot (task 3088). Injected by
-        # set_known_projects at server startup — MemoryService is constructed
-        # before build_known_projects_map runs, so it cannot arrive by
-        # constructor. Used to resolve an escalation queue's filesystem root
-        # from the project_id update_memory carries.
+        # {project_id: project_root}, seeded below from DASHBOARD_KNOWN_PROJECT_ROOTS
+        # alone, never config.taskmaster.project_root (see the module docstring of
+        # middleware/mem0_update_storm_escalator.py); startup replaces it. The
+        # seed reaches EVERY `_known_projects` consumer, not only the storm
+        # alarm — see `set_known_projects`.
         self._known_projects: dict[str, str] = {}
         # INV-4 storm escape for update_memory's silent-rewrite primitive (task
         # 3088). Both are constructed UNCONDITIONALLY — never obtained from
@@ -2338,8 +2345,11 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
+        self._mem0_update_storm_counters: KeyedStormCounters[tuple[str, str]] = (
+            KeyedStormCounters()
+        )
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        self.set_known_projects(build_known_projects_map(primary_root=''))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
         # keyed per `agent_id` for the same attribution reason as the registry
         # above.
@@ -2483,13 +2493,13 @@ class MemoryService:
 
     @property
     def mem0_update_storm_tracked_agents(self) -> frozenset[str]:
-        """The ``agent_id`` labels holding an ``update_memory`` storm window.
+        """The ``agent_id`` labels holding an ``update_memory`` storm window in any project.
 
         ``agent_id`` is caller-supplied and unbounded, so evicting dormant
         agents is a real memory bound on a long-lived server and belongs in the
         interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
         """
-        return self._mem0_update_storm_counters.tracked_keys
+        return frozenset(agent for agent, _ in self._mem0_update_storm_counters.tracked_keys)
 
     @property
     def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
@@ -2529,13 +2539,24 @@ class MemoryService:
     def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
         """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
 
-        The same snapshot ``server/main.py`` builds with
-        ``build_known_projects_map`` and already hands to ``ReconciliationHarness``
-        and ``TicketJanitor``. Injected rather than derived so this stays pure
-        data with no lifetime coupling to any conditionally-constructed
-        component — the ``update_memory`` storm alarm must keep working with
-        reconciliation disabled, which is exactly the degraded configuration
-        where an unattended rewrite loop is least likely to be noticed.
+        The ONE injection point for the registry. ``__init__`` seeds it with
+        the ``DASHBOARD_KNOWN_PROJECT_ROOTS`` roots, and ``server/main.py``
+        replaces that seed with the full startup snapshot it builds with
+        ``build_known_projects_map`` and also hands to ``ReconciliationHarness``
+        and ``TicketJanitor``. Pure data with no lifetime coupling to any
+        conditionally-constructed component — the ``update_memory`` storm alarm
+        must keep working with reconciliation disabled, which is exactly the
+        degraded configuration where an unattended rewrite loop is least likely
+        to be noticed.
+
+        The seed deliberately widens EVERY ``_known_projects`` consumer, not
+        only the ``update_memory`` storm alarm. A never-wired service built with
+        ``DASHBOARD_KNOWN_PROJECT_ROOTS`` set already has active producer
+        referent narrowing, a resolvable dead-letter and entity-mint root and an
+        exact-match ``_project_id_from_queue_group_id`` arm. That holds for an
+        operator script that builds a ``MemoryService`` with no startup wiring
+        too, which therefore also pays the seed's path I/O and logs this
+        method's INFO line (and a WARNING per phantom root) at construction.
 
         Copied on entry so a later mutation of the caller's map cannot change
         resolution out from under an in-flight escalation.
@@ -2545,9 +2566,9 @@ class MemoryService:
         # project_root resolution actually happens.
         self._mem0_update_storm_escalator.set_known_projects(self._known_projects)
         # The PERMISSIVE arm is logged too, not only the populated one. An
-        # empty registry is a real window rather than a hypothetical: this
-        # service is constructed before `build_known_projects_map` runs (see
-        # `__init__`), and while it lasts every producer referent scan stays
+        # empty registry is a real window rather than a hypothetical: with
+        # DASHBOARD_KNOWN_PROJECT_ROOTS unset, the `__init__` seed is empty until
+        # startup wiring, and while it lasts every producer referent scan stays
         # permissive — junk qualifiers like 'localhost:6379' keep minting
         # referents — with nothing else in the log to say so. The remedy is the
         # same one the three existing `_known_projects`-miss messages already
@@ -2604,15 +2625,12 @@ class MemoryService:
 
         logger.info('MemoryService initialized')
 
-    async def _safe_close(
-        self, label: str, resource: Any, timeout: float | None = None
-    ) -> None:
+    async def _safe_close(self, label: str, resource: Any, timeout: float) -> None:
         """Close one resource, time-boxed and logging any failure without re-raising.
 
-        Each close is bounded by ``timeout`` (default: the module-level
-        ``_SUBCLOSE_TIMEOUT``, read at call time so it can be monkeypatched) so a
-        hung network-driver teardown can neither consume the whole shutdown budget
-        nor starve the durable-flush closes that run after it. The bound applies
+        Each close is bounded by ``timeout`` so a hung network-driver teardown
+        can neither consume the whole shutdown budget nor starve the
+        durable-flush closes that run after it. The bound applies
         UNIFORMLY to every resource, including the durable-flush SQLite closes
         (durable_queue/write_journal/event_buffer), not just the graphiti/mem0
         network drivers — see the cancel-branch comment below for why hard-bounding
@@ -2620,8 +2638,6 @@ class MemoryService:
         Both the timeout and the generic-failure paths swallow the error so close()
         continues through every resource.
         """
-        if timeout is None:
-            timeout = _SUBCLOSE_TIMEOUT
         start = time.monotonic()
         try:
             close_task = asyncio.ensure_future(resource.close())
@@ -2678,17 +2694,27 @@ class MemoryService:
                 time.monotonic() - start,
             )
 
+    def _bounded_closes(self) -> tuple[tuple[str, Any, float], ...]:
+        """Each sub-close close() runs, in order, with its time budget."""
+        return (
+            ('durable_queue', self.durable_queue, _SUBCLOSE_TIMEOUT),
+            ('graphiti', self.graphiti, _SUBCLOSE_TIMEOUT),
+            ('mem0', self.mem0, _SUBCLOSE_TIMEOUT),
+            ('write_journal', self._write_journal, _SUBCLOSE_TIMEOUT),
+            ('event_buffer', self._event_buffer, _SUBCLOSE_TIMEOUT),
+            ('planned_episode_registry', self.planned_episode_registry, _SUBCLOSE_TIMEOUT),
+            ('classifier', self.classifier, _POOL_RELEASE_TIMEOUT),
+            ('router', self.router, _POOL_RELEASE_TIMEOUT),
+        )
+
+    def close_budget_secs(self) -> float:
+        """Worst-case seconds close() can take: every sub-close's budget, summed."""
+        return sum(timeout for _, _, timeout in self._bounded_closes())
+
     async def close(self) -> None:
-        if self.durable_queue:
-            await self._safe_close('durable_queue', self.durable_queue)
-        await self._safe_close('graphiti', self.graphiti)
-        await self._safe_close('mem0', self.mem0)
-        if self._write_journal:
-            await self._safe_close('write_journal', self._write_journal)
-        if self._event_buffer:
-            await self._safe_close('event_buffer', self._event_buffer)
-        if self.planned_episode_registry:
-            await self._safe_close('planned_episode_registry', self.planned_episode_registry)
+        for label, resource, timeout in self._bounded_closes():
+            if resource is not None:
+                await self._safe_close(label, resource, timeout)
 
     # ------------------------------------------------------------------
     # Journal helper
@@ -2829,8 +2855,10 @@ class MemoryService:
         A BOUND METHOD for the same call-time-resolution reason
         ``_record_queue_terminal_outcome``'s docstring gives: ``server/main.py``
         calls ``initialize()`` (which constructs the queue) BEFORE
-        ``set_known_projects()``, so ``_known_projects`` is still empty when the
-        hook is wired and must be read at call time.
+        ``set_known_projects()``, so when the hook is wired ``_known_projects``
+        holds only the ``__init__`` seed (empty when
+        ``DASHBOARD_KNOWN_PROJECT_ROOTS`` is unset) and must be read at call
+        time to see the startup snapshot.
 
         PROJECT ROOT resolution has NO FALLBACK, exactly as in
         ``_record_entity_mint``. Falling back to
@@ -4188,13 +4216,14 @@ class MemoryService:
                         # is prerequisite to that narrowing.
                         #
                         # FAIL-CLOSED ON AN EMPTY REGISTRY, on purpose, matching
-                        # `ReferentFinding.resolvable` defaulting to False:
-                        # MemoryService is constructed before
-                        # `build_known_projects_map` runs, so `{}` is a real
+                        # `ReferentFinding.resolvable` defaulting to False: with
+                        # DASHBOARD_KNOWN_PROJECT_ROOTS unset, the `__init__`
+                        # seed is `{}` until startup wiring, so `{}` is a real
                         # window, and "permissive until populated" would leave
-                        # exactly that window open. The registry arrives via
-                        # `set_known_projects`, which is the injection point to
-                        # look at if this ever skips more than expected.
+                        # exactly that window open. Both the seed and the
+                        # startup snapshot arrive via `set_known_projects`,
+                        # which is the injection point to look at if this ever
+                        # skips more than expected.
                         #
                         # CONFINED TO THE MEMBERSHIP ARM. The pairing arm fires
                         # only when the endpoint IS declared, where the write
@@ -6735,16 +6764,14 @@ class MemoryService:
         make, and needs a second counting site — it is not a thing this method
         can fix by moving one call.
 
-        The tool-boundary ``entities_gate`` is category-INDEPENDENT and does
-        run on this path (pinned by
-        ``tests/server/test_entities_gate_ingestion.py::...
-        test_the_gate_is_category_independent``), so a CONFLICTING declaration
-        on a Mem0-primary write is still rejected even though an agreeing one
-        would have been inert. That asymmetry is intended: the gate polices
-        whether the caller's stated referents match its own prose, which is a
-        fact about the caller and not about routing. It costs nothing an
-        undeclaring caller pays — absence is never rejected, so an agent that
-        omits ``entities`` (``/reflect`` as shipped) cannot lose a write here.
+        The tool-boundary ``entities_gate`` shape-checks every declaration but
+        conflict-checks only one that will be RECORDED: an explicit
+        Mem0-primary category without ``dual_write`` discards the declaration
+        here, so a conflict verdict could only cost a false rejection (pinned
+        by
+        ``tests/server/test_entities_gate_ingestion.py::TestAddMemoryEntitiesGate::test_a_mem0_primary_write_is_never_conflict_rejected``).
+        Both sides read :func:`~fused_memory.models.enums.routes_to_graphiti`,
+        so they cannot disagree about which writes record it.
 
         Deliberately UNVALIDATED here: gamma's ``_declared_referents`` owns the
         TOTAL ``InputValidationError`` contract, and a direct service caller
@@ -6807,13 +6834,10 @@ class MemoryService:
         #   what makes this cover Graphiti-primary writes, which never reach
         #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
         #
-        # `write_mem0` is HOISTED above the call (task 3508) so ONE expression
+        # `write_mem0` is HOISTED above the call (task 3508) so ONE value
         # answers both "does this write go to Mem0" and the seam's
-        # `reaches_mem0`. Never restate it: a copy that forgot `dual_write`
-        # would refuse valid canonical writes that do land in Mem0.
-        write_mem0 = (
-            resolved_category in MEM0_PRIMARY or dual_write
-        )
+        # `reaches_mem0`.
+        write_mem0 = routes_to_mem0(resolved_category, dual_write=dual_write)
 
         await _apply_memory_metadata_validation(
             meta,
@@ -6831,9 +6855,7 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        write_graphiti = (
-            resolved_category in GRAPHITI_PRIMARY or dual_write
-        )
+        write_graphiti = routes_to_graphiti(resolved_category, dual_write=dual_write)
         # `write_mem0` is computed above, hoisted to feed the validation
         # seam's `reaches_mem0`. See the comment at that call site.
 
@@ -7968,17 +7990,18 @@ class MemoryService:
 
         results = []
         for edge in edges:
-            fact = getattr(edge, 'fact', str(edge))
-            valid_at = getattr(edge, 'valid_at', None)
-            invalid_at = getattr(edge, 'invalid_at', None)
-
             # Skip superseded edges (invalid_at set means the fact has been
             # replaced by a newer edge).  Check this before anything else to
-            # avoid unnecessary work on edges that will be discarded.
-            if invalid_at is not None:
+            # avoid unnecessary work on edges that will be discarded, and so a
+            # dropped edge consumes no rank.
+            if _edge_is_retired(edge):
                 continue
 
-            temporal = _serialize_temporal(valid_at, invalid_at)
+            fact = getattr(edge, 'fact', str(edge))
+            temporal = _serialize_temporal(
+                getattr(edge, 'valid_at', None),
+                getattr(edge, 'invalid_at', None),
+            )
 
             # Extract entity names from source/target nodes
             entities = []
@@ -8150,11 +8173,12 @@ class MemoryService:
         search() call. The exact-match branch does NOT use edge_limit: its
         get_valid_edges_for_node traversal returns every valid edge for the
         resolved node uuid(s), uncapped. Both branches exclude invalidated
-        edges (invalid_at set): the exact branch at the Cypher level (WHERE
-        e.invalid_at IS NULL), and the fuzzy branch via an explicit
-        invalid_at filter applied to the search() results, mirroring
-        search()'s own drop (task 312) — so neither branch surfaces
-        superseded facts (task 2726).
+        edges (invalid_at set): the exact branch at the Cypher level
+        (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE), and the fuzzy
+        branch via `_edge_is_retired` applied to the search() results,
+        mirroring search()'s own drop (task 312) — so neither branch surfaces
+        superseded facts (task 2726). Neither filters on `expired_at`: a
+        restored edge keeps it (task 4714).
 
         EXACT vs. FUZZY edge sets are fundamentally different — TOPOLOGICAL
         vs. SEMANTIC — and comparing them across branches will produce
@@ -8274,10 +8298,10 @@ class MemoryService:
         node_data = [_node_to_dict(n) for n in nodes]
         # Drop superseded edges (invalid_at set) so the fuzzy/semantic branch
         # presents the same valid-edge semantics as the exact/topological branch
-        # (get_valid_edges_for_node's Cypher WHERE invalid_at IS NULL) and as
-        # search() (task 312, ~line 2588) — otherwise an agent resolving via the
-        # fuzzy fallback could silently act on a stale fact (task 2726).
-        edge_data = [_edge_to_dict(e) for e in edges if getattr(e, 'invalid_at', None) is None]
+        # (get_valid_edges_for_node's Cypher _ACTIVE_EDGE_PREDICATE) and as
+        # search() (task 312) — otherwise an agent resolving via the fuzzy
+        # fallback could silently act on a stale fact (task 2726).
+        edge_data = [_edge_to_dict(e) for e in edges if not _edge_is_retired(e)]
 
         return {'nodes': node_data, 'edges': edge_data}
 
@@ -8432,8 +8456,9 @@ class MemoryService:
         (recent-N only) or search results (edge/fact text only), this is the
         by-UUID episode-body lookup needed by the reconciliation promotion-time
         batch-plan gate (task 2033) to run is_batch_plan_framing on the
-        episode's actual content. Returns None when the episode is not found
-        (or on a fail-safe timeout inside get_episode_by_uuid).
+        episode's actual content. Returns None when the episode is not found;
+        a Graphiti read timeout propagates as ``TimeoutError`` (see
+        ``GraphitiBackend.get_episode_by_uuid``).
         """
         node = await self.graphiti.get_episode_by_uuid(episode_uuid, group_id=project_id)
         return getattr(node, 'content', None) if node is not None else None
@@ -9505,10 +9530,15 @@ class MemoryService:
         cheap to correct; counting patches would drown the signal that a silent
         content-rewrite loop is running.
 
-        One counter per ``agent_id``, so two independently-busy agents cannot
-        sum into a false alarm. The threshold and window are read LIVE off the
-        shared config and passed into ``record()`` per call — captured once,
-        they would make both green-tier leaves restart-only in disguise.
+        One counter per ``(agent_id, project_id)``. Two independently-busy
+        agents cannot sum into a false alarm, and one agent's amendments in
+        another project cannot inflate the count filed into this project's
+        queue, so the number is reproducible from this project's own journal
+        rows. Recon stage ids (``recon-stage-<stage>``) are project-independent,
+        which is why the project is part of the key. The threshold and window
+        are read LIVE off the shared config and passed into ``record()`` per
+        call — captured once, they would make both green-tier leaves
+        restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
         cfg = getattr(self.config, 'mem0_update', None)
@@ -9520,7 +9550,7 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._mem0_update_storm_counters.record(
-            label,
+            (label, project_id),
             threshold=threshold,
             window_seconds=float(window_seconds),
             label=label,

@@ -213,16 +213,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'entity_mint.storm_threshold',
     'entity_mint.storm_window_seconds',
     # ---- Deterministic auto-consolidation (task 5237, PRD Section 7/11) ----
-    # HONEST STATUS, because a comment that overclaims is worse than none: NO
-    # consumer of consolidation_auto.* exists on this branch. The executor is
-    # task delta, the proposal tool task gamma, the provenance bar task
-    # epsilon. These leaves are registered NOW so the section ships green-tier
-    # from its first commit; the live-read half of this module's reload-safety
-    # rule -- read off the shared config object per call, never captured at
-    # construction -- is discharged by those tasks' own resolvers and their own
-    # tests, which is where a captured-at-construction regression would be
-    # caught. Registration is load-bearing either way: anything absent from
-    # this frozenset silently degrades to restart-only.
+    # The live-read consumers are
+    # reconciliation/consolidation_auto_executor.py::run_auto_consolidation
+    # (MemoryConsolidator.run reads memory.config.consolidation_auto once per
+    # cycle, never at construction) and server/tools.py::propose_consolidation.
+    # Registration is load-bearing: anything absent from this frozenset
+    # silently degrades to restart-only.
     #
     # Two of these MUST be green tier for the PRD Section 11 rollout to work at
     # all. `enabled` is the kill switch -- what an operator flips to stop a
@@ -253,6 +249,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # cycle actually produces (PRD Section 12 Q2), so they must move on a
     # running server or the calibration loop is a redeploy loop.
     'consolidation_auto.backlog_multiplier',
+    'consolidation_auto.canonical_absent_bonus',
     'consolidation_auto.refusal_streak_threshold',
     'consolidation_auto.slug_collision_jaccard',
     'consolidation_auto.proposal_ttl_hours',

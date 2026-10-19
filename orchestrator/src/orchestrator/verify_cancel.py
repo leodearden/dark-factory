@@ -198,7 +198,7 @@ def read_ppid_map() -> dict[int, int]:
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
-        fields = read_stat_fields(entry)
+        fields = read_stat_fields(entry, skip_malformed=True)
         if fields is None:
             continue
         ppid_map[int(entry.name)] = fields.ppid

@@ -1387,7 +1387,7 @@ def derive_verify_plan(
 # resolves module_configs from the TASK's own touched modules only, so an
 # orchestrator-only diff never considers escalation's ModuleConfig at all —
 # even though escalation/tests/test_server.py white-box-imports
-# orchestrator.merge_queue and can be broken by an orchestrator-source
+# orchestrator.merge_lane.worker and can be broken by an orchestrator-source
 # change. This recurred 3x as a RED-main fix-forward (1736->1761,
 # 2173->2038, 2435->2604) before being structurally closed here. Mirrors the
 # hooks/project-checks reverse-dependency precedent (task 2551,
@@ -1415,7 +1415,7 @@ def _imports_any(content: str | None, import_names: list[str]) -> bool:
 
     The regex is anchored per-line (``re.MULTILINE``) but tolerates leading
     whitespace, so a guarded/indented import — e.g. escalation/tests/
-    test_server.py's ``    try:\\n        from orchestrator.merge_queue
+    test_server.py's ``    try:\\n        from orchestrator.merge_lane.worker
     import ...`` — still matches. *content* of ``None`` (unreadable/missing
     file) never matches, same as ``classify_file``'s STRUCTURAL detection
     treats missing content as "simply not detected" rather than an error.

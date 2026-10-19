@@ -6,17 +6,29 @@ matching (haiku), then computes recall, precision, F1, and blocking recall.
 
 from __future__ import annotations
 
-import json
+import functools
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from shared.cli_invoke import no_mcp_servers_config
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.evals.measurement import (
+    MeasurementStage,
+    Scored,
+    Unmeasured,
+    json_answer,
+    measured_call,
+)
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
+
+if TYPE_CHECKING:
+    from shared.cli_invoke import AgentResult
+    from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +41,14 @@ class IssueMatch:
     ground_truth_id: str
     match_confidence: float
     match_reasoning: str
+
+
+@dataclass(frozen=True)
+class MatchedIssues:
+    """What the matcher measured for one panel: its matches and its false positives."""
+
+    matches: list[IssueMatch]
+    false_positives: list[dict]
 
 
 @dataclass
@@ -46,6 +66,13 @@ class ScoringResult:
 
     Use the ``total_cost_usd`` property when you need the combined figure,
     so callers cannot accidentally read only ``cost_usd`` and undercount.
+
+    - ``unmeasured``     — set when the matcher did not measure. The metric
+                           fields then carry no measurement, matches /
+                           false_positives / unmatched_gt are empty, and every
+                           reducer excludes the record and counts it
+                           (``campaign.summarize_arm``,
+                           ``report.build_trial_report``).
     """
 
     variant_name: str
@@ -60,6 +87,7 @@ class ScoringResult:
     cost_usd: float = 0.0       # panel cost only — see class docstring
     match_cost_usd: float = 0.0  # haiku matcher cost — see class docstring
     wall_clock_ms: int = 0
+    unmeasured: Unmeasured | None = None
 
     @property
     def total_cost_usd(self) -> float:
@@ -134,16 +162,21 @@ async def match_issues(
     ground_truth: list[GroundTruthIssue],
     diff_text: str,
     confidence_threshold: float = 0.5,
-) -> tuple[list[IssueMatch], list[dict], float]:
+    *,
+    usage_gate: UsageGate | None = None,
+    label: str = 'issue matcher',
+) -> Scored[MatchedIssues] | Unmeasured:
     """Use haiku to match reviewer findings to ground truth.
 
-    Returns (matches, unmatched_reviewer_issues, match_cost_usd).
-    The third element is the USD cost of the haiku matcher call, or 0.0 if
-    no LLM call was made (empty inputs).  The cost is still reported even
-    when the output is unparseable — the tokens were billed regardless.
+    With no findings or no ground truth there is nothing to match: that is a
+    measurement made without an LLM call, at ``cost_usd=0.0``. Otherwise the
+    call goes through ``measured_call`` (through *usage_gate* when given), so
+    a refused call or an answer without a ``matches`` list is ``Unmeasured``
+    with its real spend, never an empty match.
     """
     if not reviewer_issues or not ground_truth:
-        return [], reviewer_issues, 0.0
+        nothing_matched = MatchedIssues(matches=[], false_positives=list(reviewer_issues))
+        return Scored(nothing_matched, cost_usd=0.0)
 
     # Format issues for the matcher prompt
     ri_lines = []
@@ -203,7 +236,18 @@ Output your matches as JSON.
         'Output ONLY valid JSON.'
     )
 
-    result = await invoke_agent(
+    return await measured_call(
+        invoke_agent,
+        functools.partial(
+            _parse_matches,
+            reviewer_issues=reviewer_issues,
+            ground_truth=ground_truth,
+            confidence_threshold=confidence_threshold,
+        ),
+        stage=MeasurementStage.MATCHER,
+        backend='claude',
+        usage_gate=usage_gate,
+        label=label,
         prompt=prompt,
         system_prompt=system_prompt,
         cwd=Path('/home/leo/src/dark-factory'),
@@ -220,26 +264,34 @@ Output your matches as JSON.
         strict_mcp_config=True,
     )
 
-    match_cost = result.cost_usd
 
-    # Parse matches
+def _parse_matches(
+    result: AgentResult,
+    *,
+    reviewer_issues: list[dict],
+    ground_truth: list[GroundTruthIssue],
+    confidence_threshold: float,
+) -> MatchedIssues:
+    """The matcher's answer as matches and false positives.
+
+    Raises ``KeyError`` / ``ValueError`` when the answer carries no ``matches``
+    list of objects. An entry below the threshold, out of range, naming an
+    unknown ground-truth id or breaking one-to-one is a match the matcher did
+    not make, so it is skipped and its finding stays a false positive.
+    """
+    entries = json_answer(result)['matches']
+    if not isinstance(entries, list):
+        raise ValueError(f'matches is not a list but {type(entries).__name__}')
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(f'a matches entry is not an object but {type(entry).__name__}')
+
     matches: list[IssueMatch] = []
     matched_indices: set[int] = set()
-
-    match_data = None
-    if result.structured_output:
-        match_data = result.structured_output
-    else:
-        try:
-            match_data = json.loads(result.output)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning('Issue matcher produced unparseable output: %s', result.output[:200])
-            return [], reviewer_issues, match_cost
-
     gt_ids = {gt.id for gt in ground_truth}
     matched_gt_ids: set[str] = set()
 
-    for m in match_data.get('matches', []):
+    for m in entries:
         idx = m.get('reviewer_issue_index', -1)
         gt_id = m.get('ground_truth_id', '')
         confidence = m.get('confidence', 0.0)
@@ -268,19 +320,22 @@ Output your matches as JSON.
         issue for i, issue in enumerate(reviewer_issues)
         if i not in matched_indices
     ]
-
-    return matches, unmatched, match_cost
+    return MatchedIssues(matches=matches, false_positives=unmatched)
 
 
 async def score_panel_run(
     run: PanelRunResult,
     corpus_diff: CorpusDiff,
+    *,
+    usage_gate: UsageGate | None = None,
 ) -> ScoringResult:
     """Score one (variant, diff) pair.
 
     1. Collect all issues from all reviewers in the panel
     2. Deduplicate by (normalized_location, category)
-    3. Match against ground truth via match_issues()
+    3. Match against ground truth via match_issues() (through *usage_gate*
+       when given); an unmeasured match makes the whole result unmeasured,
+       with no metric computed
     4. Compute recall, precision, F1, blocking_recall
     """
     # Filter out ERROR reviews
@@ -293,11 +348,23 @@ async def score_panel_run(
     deduped = _deduplicate_issues(clean_reviews)
 
     # Match against ground truth
-    matches, false_positives, match_cost_usd = await match_issues(
+    outcome = await match_issues(
         reviewer_issues=deduped,
         ground_truth=corpus_diff.ground_truth,
         diff_text=corpus_diff.diff_text,
+        usage_gate=usage_gate,
+        label=f'matcher {run.variant_name}__{run.diff_id}',
     )
+    if isinstance(outcome, Unmeasured):
+        return ScoringResult(
+            variant_name=run.variant_name,
+            diff_id=run.diff_id,
+            cost_usd=run.total_cost_usd,
+            match_cost_usd=round(outcome.cost_usd, 4),
+            wall_clock_ms=run.wall_clock_ms,
+            unmeasured=outcome,
+        )
+    matches = outcome.value.matches
 
     # Compute metrics
     gt_total = len(corpus_diff.ground_truth)
@@ -323,12 +390,12 @@ async def score_panel_run(
         diff_id=run.diff_id,
         matches=matches,
         unmatched_gt=unmatched_gt,
-        false_positives=false_positives,
+        false_positives=outcome.value.false_positives,
         recall=round(recall, 4),
         precision=round(precision, 4),
         f1=round(f1, 4),
         blocking_recall=round(blocking_recall, 4),
         cost_usd=run.total_cost_usd,
-        match_cost_usd=round(match_cost_usd, 4),
+        match_cost_usd=round(outcome.cost_usd, 4),
         wall_clock_ms=run.wall_clock_ms,
     )

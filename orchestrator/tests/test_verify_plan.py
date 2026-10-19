@@ -2038,14 +2038,14 @@ class TestPlanFlags:
 # test_verify_plan.py idiom: hand-built dict/lambda fakes).
 
 # escalation/tests/test_server.py's real shape: a guarded, indented import of
-# orchestrator.merge_queue (escalation/tests/test_server.py:31-34).
+# orchestrator.merge_lane.worker (escalation/tests/test_server.py:31-34).
 _ESCALATION_TEST_SERVER_CONTENT = (
     'from __future__ import annotations\n'
     '\n'
     'import pytest\n'
     '\n'
     'try:\n'
-    '    from orchestrator.merge_queue import SpeculativeMergeWorker\n'
+    '    from orchestrator.merge_lane.worker import SpeculativeMergeWorker\n'
     'except ImportError:\n'
     '    SpeculativeMergeWorker = None\n'
 )
