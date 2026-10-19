@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import textwrap
+from collections.abc import MutableMapping
+from pathlib import Path
 
 import pytest
 
@@ -13,9 +15,12 @@ from shared.defect_enumerator import (
     FileEnumeration,
     GapReason,
     NonStaticMark,
+    TreeEnumeration,
     enumerate_source,
+    enumerate_tree,
+    is_test_file,
 )
-from shared.defects import NodeId, mint_explore_ref
+from shared.defects import MalformedDefectRef, NodeId, mint_explore_ref
 
 REF_A = mint_explore_ref('run1', 1)
 REF_B = mint_explore_ref('run1', 2)
@@ -498,3 +503,171 @@ def test_a_skip_on_a_sibling_test_does_not_leak():
             pass
     ''')
     assert result.carriers == {REF_A: (_runnable('test_a'),)}
+
+
+_MARKED = f'''
+    import pytest
+
+    @pytest.mark.defect({REF_A!r})
+    def test_a():
+        pass
+'''
+
+
+def _file(path: str, source: str) -> FileEnumeration:
+    return enumerate_source(path, textwrap.dedent(source), module_root='.')
+
+
+def _at(path: str, name: str) -> NodeId:
+    return NodeId(module_root='.', path=path, name=name)
+
+
+def test_tree_carriers_merge_per_ref_sorted_with_carriers_in_path_then_source_order():
+    later = _file('b/test_two.py', f'''
+        @pytest.mark.defect({REF_A!r})
+        def test_z():
+            pass
+    ''')
+    earlier = _file('a/test_one.py', f'''
+        @pytest.mark.defect({REF_B!r})
+        def test_y():
+            pass
+
+        @pytest.mark.defect({REF_A!r})
+        def test_x():
+            pass
+
+        @pytest.mark.defect({REF_A!r})
+        def test_w():
+            pass
+    ''')
+    tree = TreeEnumeration((later, earlier))
+    assert list(tree.carriers) == [REF_A, REF_B]
+    assert [carrier.node_id for carrier in tree.carriers[REF_A]] == [
+        _at('a/test_one.py', 'test_x'),
+        _at('a/test_one.py', 'test_w'),
+        _at('b/test_two.py', 'test_z'),
+    ]
+
+
+def test_runnable_refs_need_one_runnable_carrier_anywhere_in_the_tree():
+    only_disabled = _file('a/test_one.py', f'''
+        @pytest.mark.skip
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+
+        @pytest.mark.xfail
+        @pytest.mark.defect({REF_B!r})
+        def test_b():
+            pass
+    ''')
+    runnable_elsewhere = _file('b/test_two.py', f'''
+        @pytest.mark.defect({REF_B!r})
+        def test_b():
+            pass
+    ''')
+    tree = TreeEnumeration((only_disabled, runnable_elsewhere))
+    assert tree.runnable_refs == frozenset({REF_B})
+
+
+def test_tree_non_static_refs_hold_the_pytest_param_ref():
+    tree = TreeEnumeration((_file('a/test_one.py', f'''
+        @pytest.mark.parametrize('x', [pytest.param(1, marks=pytest.mark.defect({REF_A!r}))])
+        def test_p(x):
+            pass
+    '''),))
+    assert tree.non_static_refs == frozenset({REF_A})
+    assert tree.carriers == {}
+
+
+def test_tree_incomplete_files_name_every_incomplete_file():
+    complete = _file('a/test_ok.py', _MARKED)
+    broken = _file('b/test_broken.py', 'def test_a(:\n')
+    assert TreeEnumeration((complete, broken)).incomplete_files == ('b/test_broken.py',)
+    assert TreeEnumeration((complete, broken)).complete is False
+    assert TreeEnumeration((complete,)).incomplete_files == ()
+    assert TreeEnumeration((complete,)).complete is True
+
+
+def test_a_tree_refuses_two_enumerations_of_one_path():
+    with pytest.raises(ValueError, match='a/test_one.py'):
+        TreeEnumeration((_file('a/test_one.py', _MARKED), _file('a/test_one.py', _MARKED)))
+
+
+def test_a_file_enumeration_refuses_a_key_outside_the_ref_grammar():
+    with pytest.raises(MalformedDefectRef):
+        FileEnumeration('a/test_one.py', {'not-a-ref': ()})
+
+
+def test_a_file_enumerations_carriers_are_read_only_and_detached_from_the_callers_dict():
+    given = dict(_file('a/test_one.py', _MARKED).carriers)
+    enumeration = FileEnumeration('a/test_one.py', given)
+    given[REF_B] = ()
+    assert not isinstance(enumeration.carriers, MutableMapping)
+    assert REF_B not in enumeration.carriers
+
+
+@pytest.mark.parametrize(('path', 'expected'), [
+    ('a/test_x.py', True),
+    ('a/x_test.py', True),
+    ('a/conftest.py', False),
+    ('a/helper.py', False),
+    ('a/test_x.txt', False),
+])
+def test_is_test_file_follows_pytests_default_python_files(path, expected):
+    assert is_test_file(path) is expected
+
+
+def _write(root: Path, relative: str, source: str = _MARKED) -> None:
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(textwrap.dedent(source))
+
+
+def _dot_root(path: str) -> str:
+    return '.'
+
+
+def test_enumerate_tree_scans_only_test_files(tmp_path):
+    for relative in ('pkg/tests/test_x.py', 'pkg/tests/helper.py', 'pkg/conftest.py'):
+        _write(tmp_path, relative)
+    tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    assert [file.path for file in tree.files] == ['pkg/tests/test_x.py']
+
+
+@pytest.mark.parametrize('directory', ['.venv', '.git', 'node_modules', 'build', 'dist', 'venv', 'x.egg'])
+def test_enumerate_tree_prunes_pytests_default_norecursedirs_at_any_depth(tmp_path, directory):
+    _write(tmp_path, 'pkg/tests/test_x.py')
+    _write(tmp_path, f'{directory}/test_in.py')
+    _write(tmp_path, f'pkg/{directory}/test_in.py')
+    tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    assert [file.path for file in tree.files] == ['pkg/tests/test_x.py']
+
+
+def test_enumerate_tree_returns_files_sorted_by_tree_relative_path(tmp_path):
+    for relative in ('b/test_b.py', 'a/test_a.py', 'a/z/test_c.py', 'a/test_d.py'):
+        _write(tmp_path, relative)
+    tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    assert [file.path for file in tree.files] == ['a/test_a.py', 'a/test_d.py', 'a/z/test_c.py', 'b/test_b.py']
+
+
+def test_enumerate_tree_qualifies_each_file_by_its_module_root(tmp_path):
+    _write(tmp_path, 'pkg/tests/test_x.py')
+    _write(tmp_path, 'top/test_y.py')
+    tree = enumerate_tree(tmp_path, module_root_of=lambda path: 'pkg' if path.startswith('pkg/') else '.')
+    assert [carrier.node_id for carrier in tree.carriers[REF_A]] == [
+        NodeId(module_root='pkg', path='tests/test_x.py', name='test_a'),
+        NodeId(module_root='.', path='top/test_y.py', name='test_a'),
+    ]
+
+
+def test_an_unreadable_test_file_is_an_unreadable_file_gap_and_the_walk_continues(tmp_path):
+    _write(tmp_path, 'a/test_ok.py')
+    (tmp_path / 'a' / 'test_gone.py').symlink_to(tmp_path / 'nowhere.py')
+    tree = enumerate_tree(tmp_path, module_root_of=_dot_root)
+    assert tree.files == (
+        FileEnumeration('a/test_gone.py', {}, gaps=(EnumerationGap(GapReason.UNREADABLE_FILE, None),)),
+        _file('a/test_ok.py', _MARKED),
+    )
+    assert tree.incomplete_files == ('a/test_gone.py',)
