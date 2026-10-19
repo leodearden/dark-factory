@@ -775,7 +775,7 @@ async def _status_rows(journal: Any) -> list[tuple[Any, ...]]:
     """(agent_id, success, done_provenance_kind) of each journaled set_task_status."""
     return [
         (row['agent_id'], row['success'], json.loads(row['params'])['done_provenance_kind'])
-        for row in await journal.get_ops_since('1970-01-01')
+        for row in await journal.get_stored_ops_since('1970-01-01')
         if row['operation'] == 'set_task_status'
     ]
 
