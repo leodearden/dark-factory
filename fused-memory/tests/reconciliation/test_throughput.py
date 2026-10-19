@@ -21,6 +21,10 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.coalescing import (
+    COALESCED_COUNT_KEY,
+    COALESCED_LAST_TIMESTAMP_KEY,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.throughput import (
@@ -595,9 +599,82 @@ async def test_inflow_concentration_is_empty_on_an_empty_database(recon_db):
         'window_start': None,
         'window_end': None,
         'live_events': 0,
+        'live_rows': 0,
         'unattributed_events': 0,
         'top_tasks': [],
     }
+
+
+# Task 4278 folds a looping task's events into one row.  Counting rows would
+# hide exactly the task-7076 shape, so each row weighs its fold count.
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_weighs_a_folded_row_by_its_events(recon_db):
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 6)
+    await _push_task_events(recon_db, '636', EventType.task_modified, 3)
+    for _ in range(2):
+        await recon_db.push(_make_event(timestamp=_H13, event_type=EventType.memory_added))
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section['live_events'] == 11
+    assert section['live_rows'] == 6
+    assert section['top_tasks'][0] == {
+        'task_id': '644',
+        'events': 6,
+        'share': pytest.approx(6 / 11),
+        'composition': {'task_status_changed': 6},
+    }
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_window_reaches_the_newest_folded_event(recon_db):
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 1)
+    await _push_task_events(
+        recon_db, '644', EventType.task_status_changed, 1, timestamp=_H14)
+    assert await recon_db.count_buffered('reify') == 1
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert datetime.fromisoformat(section['window_start']) == _H13
+    assert datetime.fromisoformat(section['window_end']) == _H14
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bogus_count', [0, -3, True, '5'])
+async def test_inflow_concentration_weighs_a_bogus_fold_count_as_one(recon_db, bogus_count):
+    await recon_db.push(_make_event(
+        timestamp=_H13, payload={'task_id': '644', COALESCED_COUNT_KEY: bogus_count}))
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section['live_events'] == 1
+    assert section['top_tasks'][0]['events'] == 1
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_ignores_an_unparseable_fold_timestamp(recon_db):
+    await recon_db.push(_make_event(timestamp=_H13, payload={
+        'task_id': '644',
+        COALESCED_COUNT_KEY: 2,
+        COALESCED_LAST_TIMESTAMP_KEY: 'not-a-timestamp',
+    }))
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section['live_events'] == 2
+    assert section['window_start'] == section['window_end'] == _H13.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_inflow_concentration_counts_an_empty_task_id_as_unattributed(recon_db):
+    await recon_db.push(_make_event(timestamp=_H13, payload={'task_id': ''}))
+
+    section = inflow_concentration(recon_db._db_path, 'reify')
+
+    assert section['unattributed_events'] == 1
+    assert section['top_tasks'] == []
 
 
 # ── drain_stats ────────────────────────────────────────────────────────
@@ -1455,6 +1532,10 @@ async def test_main_without_json_names_the_dominant_task(recon_db, capsys):
     assert any('644' in line and '54.5%' in line for line in lines), out
     assert any(
         line.startswith('by task:') and 'live event_buffer row' in line
+        for line in lines
+    ), out
+    assert any(
+        line.startswith('by task: 11 event(s) on 6 live event_buffer row(s)')
         for line in lines
     ), out
 
