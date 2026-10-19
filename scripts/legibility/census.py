@@ -2661,7 +2661,9 @@ def run_census(
     re-mined by the next run. The outcome's ``deferred_stage``/``unverified_clusters`` tell the two
     apart. Otherwise falls through to the
     happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
-    split records into duplicates vs novel clusters -> ``verify_fn``
+    split records into duplicates vs novel clusters -> the pre-screen
+    (``prescreen.screen``: a title or session already catalogued is not
+    verified) -> ``verify_fn``
     (Sonnet, ``census_verify``, asserts observations vs current main, never
     diagnoses -- lesson guards-assert-unverified-diagnoses) ->
     ``synthesize_fn`` (Fable, ``census_synthesis`` -- clustering/prose ONLY
@@ -2761,13 +2763,13 @@ def run_census(
     cap.
 
     *max_verify_clusters* bounds the per-cluster verification spend
-    (``--max-verify-clusters``) to the first N novel clusters in mining
-    order. Selection is a plain ``[:N]`` slice of ``_novel_clusters``'s
+    (``--max-verify-clusters``) to the first N novel clusters the pre-screen
+    leaves, in mining order. Selection is a plain ``[:N]`` slice of ``_novel_clusters``'s
     own first-occurrence-wins ordering -- deterministic given the run,
     with no invented "most important first" heuristic (any such ranking
     would need a signal the census does not have pre-verification). The
     deferred remainder is NOT dropped: the codebook merge below consumes
-    the raw ``mining_result.records``, not the verified clusters, so a
+    every mining record (``prescreen.routed_records``), not the verified clusters, so a
     deferred cluster still lands as a ``pending`` candidate that
     ``_find_pending_candidate_id`` can resolve later. That later pickup is
     CONDITIONAL (see ``VerifyCoverage``): its sessions are ledgered as coded,
@@ -2904,7 +2906,15 @@ def run_census(
     )
     selection = selection_of()
 
-    novel_clusters = _novel_clusters(mining_result.records)
+    # The pre-screen (plans/census-incremental-prd.md L6): a cluster already
+    # catalogued by title, or from a session already sighted, costs no verify
+    # call, and the merge attaches each title-screened sighting through its
+    # existing routing. The cap, the stage gate and verify see what is left.
+    catalogue = prescreen.Catalogue.of(codebook_dict)
+    screen = prescreen.screen(_novel_clusters(mining_result.records), catalogue)
+    routed_records = prescreen.routed_records(mining_result.records, catalogue, run_id=run_id)
+    session_screened = sum(1 for item in screen.screened if item.rule is prescreen.Rule.SESSION)
+    novel_clusters = list(screen.to_verify)
     if max_verify_clusters is None:
         clusters_to_verify = novel_clusters
         verify_coverage = None
@@ -3048,7 +3058,7 @@ def run_census(
     matrix_md = render_matrix(compute_matrix(verified_sightings))
 
     merge = codebook.apply_coding_records(
-        codebook_dict, mining_result.records, invariant_slugs=invariant_slugs,
+        codebook_dict, routed_records, invariant_slugs=invariant_slugs,
     )
     updated_codebook = merge.codebook
     logger.info("census: merge: %s", merge.summary())
@@ -3305,9 +3315,7 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
-    screen_report = prescreen.ScreenReport(
-        prescreen.Screen((), (), ()), (), (), prescreen.InstrumentFindings((), None, ()),
-    )
+    screen_report = prescreen.ScreenReport(screen, (), (), prescreen.InstrumentFindings((), None, ()))
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
@@ -3316,7 +3324,7 @@ def run_census(
         mined=len(mining_result.records),
         confirmed=len(verified),
         refuted=len(rejected),
-        unverified=len(novel_clusters) - len(clusters_to_verify),
+        unverified=len(novel_clusters) - len(clusters_to_verify) + session_screened,
         miner_calls=sum(s.total for s in mining_result.batch_stats),
         verify_calls=verify_calls,
         synthesis_calls=1,

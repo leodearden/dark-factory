@@ -3420,9 +3420,44 @@ def _codebook_with_adjudicated_candidate(disposition, *, promoted_to=None, extra
     return cb
 
 
+_SPURIOUS_CLUSTER = {
+    "title": _REJECTED_TITLE,
+    "summary": _REJECTED_TITLE,
+    "cause": None,
+    "area": None,
+    "origin_phase": "review",
+    "manifested_phase": "merge",
+    "evidence": [],
+    "sightings": [{"session": "novel-rejected", "origin_phase": "review", "manifested_phase": "merge"}],
+}
+"""The cluster the "novel-rejected" digest mines, as the census offers it to
+its verifier."""
+
+
+def _answering_the_mined_spurious_cluster(**fake_kwargs):
+    """`_make_fake_verify_fn(**fake_kwargs)` that also answers
+    `_SPURIOUS_CLUSTER` when the run's first verify call did not offer it.
+
+    Over a codebook already carrying `_REJECTED_TITLE`, the pre-screen
+    (plans/census-incremental-prd.md L6) attaches the re-mined cluster with no
+    verify call. Answering it anyway is what still drives a verdict onto the
+    standing record in the runs that pin that path; a run that offers the
+    cluster gets exactly the plain fake's answer."""
+    fake = _make_fake_verify_fn(**fake_kwargs)
+
+    def verify_fn(clusters, *, model):
+        offered = {cluster.get("title") for cluster in clusters}
+        unoffered = [] if fake.calls or _REJECTED_TITLE in offered else [copy.deepcopy(_SPURIOUS_CLUSTER)]
+        return fake([*clusters, *unoffered], model=model)
+
+    verify_fn.calls = fake.calls
+    return verify_fn
+
+
 def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
     """`run_census` kwargs for a single-cluster run over the `_REJECTED_TITLE`
-    cluster, whose DEFAULT `verify_fn` rejects it.
+    cluster, whose DEFAULT `verify_fn` rejects it, offered or not
+    (`_answering_the_mined_spurious_cluster`).
 
     The verdict is chosen by `verify_fn` alone, not by this builder --
     *overrides* win, so `_verified_run_kwargs` below is this same run with the
@@ -3430,7 +3465,7 @@ def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
     defaults = dict(
         invoke=_make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-rejected", "a spurious one-off")]],
-        verify_fn=_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}),
+        verify_fn=_answering_the_mined_spurious_cluster(rejected_titles={_REJECTED_TITLE}),
         synthesize_fn=_make_fake_synthesize_fn(),
         submit_fn=_make_fake_submit_fn(),
         commit=_make_fake_commit(),
@@ -3446,7 +3481,7 @@ def _verified_run_kwargs(tmp_path, codebook_dict, **overrides):
     defaults would drift."""
     return _rejected_run_kwargs(
         tmp_path, codebook_dict,
-        **{"verify_fn": _make_fake_verify_fn(verified_titles={_REJECTED_TITLE}), **overrides},
+        **{"verify_fn": _answering_the_mined_spurious_cluster(verified_titles={_REJECTED_TITLE}), **overrides},
     )
 
 
@@ -8247,33 +8282,25 @@ def _rejected_twin_kwargs(tmp_path, **overrides):
     return _run_census_kwargs(tmp_path, **kwargs)
 
 
-def test_run_census_warns_when_a_verified_clusters_verdict_finds_no_pending_candidate(
+def test_run_census_screens_a_title_with_a_standing_rejection_instead_of_dropping_its_verdict(
     tmp_path, caplog,
 ):
+    """Re-premised by task 6405 (PRD L6): the title with a standing rejection
+    is screened before verify, so no verdict is paid for and dropped; its
+    sighting attaches to the standing candidate."""
     kwargs = _rejected_twin_kwargs(tmp_path)
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done", "a dropped verdict must not fail the run"
+    assert outcome.status == "done"
     assert kwargs["census_state_path"].exists(), "state is still persisted"
-    assert outcome.unresolved_verdicts == 1
+    assert outcome.unresolved_verdicts == 0
+    assert [cluster["title"] for cluster in kwargs["verify_fn"].calls[0]["clusters"]] == list(_THREE_NOVEL_TITLES[1:])
+    assert _run_record(kwargs)["method"]["extra"]["screened"]["title"] == 1
 
-    per_cluster = [
-        r for r in _census_warnings(caplog)
-        if _THREE_NOVEL_TITLES[0] in r.getMessage()
-    ]
-    assert len(per_cluster) == 1, (
-        f"exactly one per-cluster warning naming the title; got "
-        f"{[r.getMessage() for r in _census_warnings(caplog)]}"
-    )
-    message = per_cluster[0].getMessage()
-    assert _STANDING_CANDIDATE_ID in message, "the standing candidate's id"
-    assert "rejected" in message, "its disposition"
-    assert _STANDING_FIRST_SEEN in message, "and when it was first seen"
-
-    # The other two titles were promoted normally — the drop is scoped to the
-    # one title with a standing verdict, not a whole-run failure.
+    # The other two titles were promoted normally — the screen is scoped to the
+    # one title with a standing verdict.
     written = codebook.load(kwargs["codebook_path"])
     promoted = [
         c for c in written["candidates"] if c.get("disposition") == "promoted"
@@ -8283,6 +8310,7 @@ def test_run_census_warns_when_a_verified_clusters_verdict_finds_no_pending_cand
         c for c in written["candidates"] if c["id"] == _STANDING_CANDIDATE_ID
     )
     assert standing["disposition"] == "rejected", "the prior verdict still stands"
+    assert [sighting["attached_by"]["method"] for sighting in standing["sightings"]] == ["title"]
 
 
 def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, caplog):
@@ -8314,12 +8342,15 @@ def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, capl
 def test_run_census_run_summary_names_unresolved_verdicts_and_disposition_conflicts(
     tmp_path, caplog,
 ):
+    """Re-premised by task 6405 (PRD L6): the standing title is screened, so
+    no verdict is dropped, while the merger still counts its attached
+    sighting as a disposition conflict, which the summary line names."""
     kwargs = _rejected_twin_kwargs(tmp_path)
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    assert outcome.unresolved_verdicts == 1, "step-13's signal still holds"
+    assert outcome.unresolved_verdicts == 0
 
     summaries = [
         r for r in _census_warnings(caplog)
@@ -8331,7 +8362,8 @@ def test_run_census_run_summary_names_unresolved_verdicts_and_disposition_confli
         f"{[r.getMessage() for r in _census_warnings(caplog)]}"
     )
     message = summaries[0].getMessage()
-    assert "1" in message, "the unresolved-verdict count"
+    assert "0 unresolved verdict(s)" in message, "the unresolved-verdict count"
+    assert "1 candidate disposition conflict(s)" in message
     assert "conflict" in message.lower(), (
         "and the candidate_disposition_conflicts count accumulated across the "
         f"merge loop; got {message!r}"
@@ -9207,9 +9239,10 @@ def _rejected_first_run(tmp_path):
 
 
 def _reverified_kwargs(tmp_path, first, *, session):
-    """A later census that re-mines *first*'s rejected title in *session* and
-    now verifies it, unremediated. The merger routes the sighting onto the
-    rejected candidate, so the verdict resolves to no pending candidate."""
+    """A later census that re-mines *first*'s rejected title in *session*,
+    with a verifier that would verify it, unremediated. The pre-screen
+    (plans/census-incremental-prd.md L6) attaches the re-mined title to the
+    rejected candidate instead, so it is never offered."""
     return {
         **_gate_kwargs(tmp_path, sessions=(session,)),
         "codebook_dict": codebook.load(first["codebook_path"]),
@@ -9224,21 +9257,32 @@ def test_run_census_does_not_report_an_unpromoted_cluster_as_withheld(tmp_path):
 
     outcome = mod.run_census(**second)
 
-    assert [dropped.title for dropped in outcome.dropped_verdicts] == [_GATED_TITLE]
+    assert outcome.dropped_verdicts == (), "re-premised by task 6405: the title is screened, not verified"
+    assert _run_record(second)["method"]["extra"]["screened"]["title"] == 1
     assert second["submit_fn"].calls == []
     assert outcome.withheld == (), "no entry was promoted, so none carries the withheld marker"
     assert not any(e["title"] == _GATED_TITLE for e in codebook.load(second["codebook_path"])["entries"])
 
 
-def test_run_census_counts_a_rejected_candidates_sightings_as_recurrence(tmp_path):
+def test_run_census_attaches_a_rejected_titles_recurrence_without_verifying_or_filing_it(tmp_path):
+    """Re-premised by task 6405 (PRD L6): the recurrence of a rejected title
+    used to be re-verified and filed on the strength of the rejected
+    candidate's sightings. It is now screened: no verify call, nothing filed,
+    and the new sighting lands on the rejected candidate."""
     first = _rejected_first_run(tmp_path)
     second = _reverified_kwargs(tmp_path, first, session="s2")
 
     outcome = mod.run_census(**second)
 
-    [filed] = second["submit_fn"].calls
-    assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
+    assert [call["clusters"] for call in second["verify_fn"].calls] == [[]]
+    assert second["submit_fn"].calls == []
     assert outcome.withheld == ()
+    [candidate] = [
+        c for c in codebook.load(second["codebook_path"])["candidates"] if c["title"] == _GATED_TITLE
+    ]
+    assert candidate["disposition"] == "rejected"
+    [attached] = [s for s in candidate["sightings"] if s["session"] == "s2-novel-verified"]
+    assert attached["attached_by"] == {"method": "title", "run_id": second["run_id"]}
 
 
 # ---------------------------------------------------------------------------
@@ -10793,10 +10837,6 @@ def _earlier_sighting(session: str = "sess-earlier") -> dict:
     }
 
 
-def _l6_record(kwargs) -> dict:
-    return json.loads(kwargs["report_path"].with_suffix(".json").read_text(encoding="utf-8"))
-
-
 def _l6_codebook(kwargs) -> dict:
     return codebook.load(kwargs["codebook_path"])
 
@@ -10824,7 +10864,7 @@ def test_row_11_a_re_mined_adjudicated_title_is_attached_with_no_verify_call(tmp
 
     assert outcome.status == "done"
     assert _offered_titles(verify_fn) in ([], [[]])
-    record = _l6_record(kwargs)
+    record = _run_record(kwargs)
     assert record["method"]["cost"]["verify_calls"] == 0
     assert record["method"]["cost"]["probe_calls"] == 1
     assert record["method"]["extra"]["screened"] == {"title": 1, "session": 0, "key": 0, "cross_instrument": 0}
@@ -10875,7 +10915,7 @@ def test_a_novel_title_from_an_already_sighted_session_waits_as_pending_unverifi
 
     assert outcome.status == "done"
     assert _offered_titles(verify_fn) in ([], [[]])
-    record = _l6_record(kwargs)
+    record = _run_record(kwargs)
     assert record["method"]["extra"]["screened"]["session"] == 1
     assert record["method"]["verification"]["unverified"] == 1
     persisted = _l6_codebook(kwargs)
@@ -10911,7 +10951,7 @@ def test_a_title_re_observing_a_fixed_entry_is_surfaced_and_verified(tmp_path):
     assert _offered_titles(verify_fn)[0] == [_L6_NOVEL_TITLE]
     screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
     assert [line for line in screened.splitlines() if "surfaced" in line and "entry-fixed" in line]
-    assert _l6_record(kwargs)["method"]["extra"]["screened"]["title"] == 0
+    assert _run_record(kwargs)["method"]["extra"]["screened"]["title"] == 0
 
 
 def test_the_verify_cap_counts_only_the_clusters_the_screen_leaves(tmp_path):
@@ -10934,4 +10974,4 @@ def test_the_verify_cap_counts_only_the_clusters_the_screen_leaves(tmp_path):
 
     assert outcome.status == "done"
     assert _offered_titles(verify_fn)[0] == [_L6_NOVEL_TITLE]
-    assert _l6_record(kwargs)["verify_coverage"] == {"novel": 1, "offered": 1, "cap": 1}
+    assert _run_record(kwargs)["verify_coverage"] == {"novel": 1, "offered": 1, "cap": 1}
