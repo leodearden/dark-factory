@@ -30,8 +30,9 @@ Usage
 Exit codes
 ----------
   0  the run completed.
-  2  the run could not start: bad arguments, an unreadable tasks.db, or the
-     canonical-slug list was unavailable.
+  2  the run could not start: bad arguments, an unreadable tasks.db, a store
+     this process may not mutate (--execute), the consolidation_auto kill
+     switch (--execute), or an unavailable canonical-slug list.
 """
 
 from __future__ import annotations
@@ -79,6 +80,10 @@ from fused_memory.server.consolidation import (
     proposal_shape_codes,
 )
 from fused_memory.topic_slug import is_valid_topic_slug
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 from fused_memory.utils.validation import is_full_uuid
 from shared.project_id import project_id_for_root
 from shared.project_layout import CheckoutRootError, default_project_root
@@ -89,6 +94,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger('migrate_open_consolidation_gates')
 
+_EXECUTE_OPERATION = 'migrate_open_consolidation_gates --execute'
 _RATIONALE = 'Migrated from consolidation gate {task_id} by scripts/migrate_open_consolidation_gates.py'
 
 
@@ -511,6 +517,30 @@ def parse_claims(values: Sequence[str]) -> dict[str, str]:
     return claims
 
 
+@dataclass(frozen=True)
+class Invocation:
+    """The command line, resolved and validated."""
+
+    mode: Mode
+    claims: Mapping[str, str]
+    project_root: str
+    project_id: str
+    tag: str
+    as_json: bool
+
+
+def parse_invocation(args: argparse.Namespace) -> Invocation:
+    project_root = _project_root(args)
+    return Invocation(
+        mode=Mode.EXECUTE if args.execute else Mode.DRY_RUN,
+        claims=parse_claims(args.claim),
+        project_root=project_root,
+        project_id=_project_id(args, project_root),
+        tag=args.tag,
+        as_json=args.as_json,
+    )
+
+
 def _project_root(args: argparse.Namespace) -> str:
     if args.project_root is not None:
         return str(Path(args.project_root).resolve())
@@ -529,42 +559,82 @@ def _project_id(args: argparse.Namespace, project_root: str) -> str:
         raise UsageError(f'{exc}, or pass --project-id') from exc
 
 
+def kill_switch_refusal(invocation: Invocation, config: ConsolidationAutoConfig) -> str | None:
+    """Why ``--execute`` may not write here, naming the config leaf; ``None`` when it may."""
+    if invocation.mode is not Mode.EXECUTE:
+        return None
+    if not config.enabled:
+        return 'consolidation_auto.enabled is false, so no unattended consolidation may be written'
+    if invocation.project_id not in config.enabled_projects:
+        return (
+            f'{invocation.project_id!r} is not in consolidation_auto.enabled_projects, '
+            'so no unattended consolidation may be written there'
+        )
+    return None
+
+
 def new_run_id(now: datetime) -> str:
     return f'migrate-gates-{now:%Y%m%dT%H%M%SZ}-{secrets.token_hex(4)}'
 
 
+def _could_not_run(cause: object) -> int:
+    logger.error('could not run: %s', cause)
+    return ExitCode.COULD_NOT_RUN
+
+
 async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
-    mode = Mode.EXECUTE if args.execute else Mode.DRY_RUN
+    """The whole run. *memory* is injected by tests; otherwise the live service is built here.
+
+    ``--execute`` probes the store-mutation capability FIRST, before tasks.db,
+    any scroll, or building the service, and then honours the kill switch.
+    Only a self-built service in execute mode is initialized (and closed).
+    """
     try:
-        claims = parse_claims(args.claim)
-        project_root = _project_root(args)
-        project_id = _project_id(args, project_root)
-        gates = open_consolidation_gates(project_root, args.tag)
+        invocation = parse_invocation(args)
+        if invocation.mode is Mode.EXECUTE:
+            assert_store_mutation_allowed(operation=_EXECUTE_OPERATION)
+    except (UsageError, StoreMutationUnavailable) as exc:
+        return _could_not_run(exc)
+    owned = memory is None
+    service = closure_cli.build_memory_service() if owned else memory
+    switched_off = kill_switch_refusal(invocation, service.config.consolidation_auto)
+    if switched_off is not None:
+        return _could_not_run(switched_off)
+    try:
+        gates = open_consolidation_gates(invocation.project_root, invocation.tag)
     except UsageError as exc:
-        logger.error('could not run: %s', exc)
-        return ExitCode.COULD_NOT_RUN
-    if memory is None:
-        memory = closure_cli.build_memory_service()
-    slugs = await read_canonical_slugs(memory, project_id)
+        return _could_not_run(exc)
+    live = owned and invocation.mode is Mode.EXECUTE
+    if live:
+        await service.initialize()
+    try:
+        return await _migrate_and_emit(invocation, service, gates)
+    finally:
+        if live:
+            await service.close()
+
+
+async def _migrate_and_emit(
+    invocation: Invocation, memory: Any, gates: Sequence[OpenGate],
+) -> int:
+    slugs = await read_canonical_slugs(memory, invocation.project_id)
     if slugs is None:
-        logger.error(
-            'could not run: the canonical-slug list for %s is unavailable or may be partial',
-            project_id,
+        return _could_not_run(
+            f'the canonical-slug list for {invocation.project_id!r} is unavailable or may be partial',
         )
-        return ExitCode.COULD_NOT_RUN
     ctx = RunContext(
         memory=memory,
         config=memory.config.consolidation_auto,
-        project_id=project_id,
+        project_id=invocation.project_id,
         run_id=new_run_id(datetime.now(UTC)),
-        mode=mode,
-        claims=claims,
+        mode=invocation.mode,
+        claims=invocation.claims,
         canonical_slugs=slugs,
     )
     report = MigrationReport(
-        project_id=project_id, mode=mode, run_id=ctx.run_id, gates=await migrate(ctx, gates),
+        project_id=ctx.project_id, mode=ctx.mode, run_id=ctx.run_id, gates=await migrate(ctx, gates),
     )
-    print(json.dumps(report_payload(report), indent=2) if args.as_json else render_text(report))
+    print(json.dumps(report_payload(report), indent=2) if invocation.as_json else render_text(report))
     return ExitCode.COMPLETED
 
 
