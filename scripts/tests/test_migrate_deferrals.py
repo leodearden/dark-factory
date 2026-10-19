@@ -9,6 +9,9 @@ CLI section (boundary row 23) drives ``main(argv)`` over ``FakeFusedMemory``.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -533,3 +536,22 @@ class TestMigrationRun:
         assert result.code == migrate_deferrals.MigrationExit.OK
         assert 'sweep: orchestrator-a.service' in result.block(root_a)[0]
         assert result.classes(root_a) == CLASSES_A
+
+
+class TestMigrationStarts:
+    def test_from_a_bare_interpreter_whose_environment_resolves_another_dashboard(self, tmp_path: Path) -> None:
+        decoy = tmp_path / 'decoy'
+        (decoy / 'dashboard').mkdir(parents=True)
+        (decoy / 'dashboard' / '__init__.py').write_text('', encoding='utf-8')
+        env = {key: value for key, value in os.environ.items() if key != 'PYTHONSAFEPATH'}
+
+        proc = subprocess.run(
+            [sys.executable, '-s', migrate_deferrals.__file__, '--help'],
+            env={**env, 'PYTHONPATH': str(decoy)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert proc.returncode == 0, proc.stderr

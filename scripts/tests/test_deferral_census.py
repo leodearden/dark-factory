@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -578,3 +580,22 @@ class TestCensusProjects:
         assert fake.calls
         assert all(Path(arguments['project_root']).is_absolute() for _, arguments in fake.calls)
         assert {arguments['project_root'] for _, arguments in fake.calls} == {str(root_a)}
+
+
+class TestCensusStarts:
+    def test_from_a_bare_interpreter_whose_environment_resolves_another_dashboard(self, tmp_path: Path) -> None:
+        decoy = tmp_path / 'decoy'
+        (decoy / 'dashboard').mkdir(parents=True)
+        (decoy / 'dashboard' / '__init__.py').write_text('', encoding='utf-8')
+        env = {key: value for key, value in os.environ.items() if key != 'PYTHONSAFEPATH'}
+
+        proc = subprocess.run(
+            [sys.executable, '-s', deferral_census.__file__, '--help'],
+            env={**env, 'PYTHONPATH': str(decoy)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert proc.returncode == 0, proc.stderr

@@ -17,6 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final, TextIO
 
+import _checkout as _checkout
 import deferral_store
 import orchestrator_projects
 from deferral_store import DeferralStore, RecordHit, StoreUnreachable, TaskRow

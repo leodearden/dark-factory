@@ -18,6 +18,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, NamedTuple, TextIO
 
+import _checkout as _checkout
 import deferral_store
 import orchestrator_projects
 from deferral_store import (
