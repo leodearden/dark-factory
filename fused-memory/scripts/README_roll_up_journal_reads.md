@@ -428,8 +428,9 @@ help: the maximum stayed at 3.3-4.8 s and throughput collapsed. 7026 is paused.
   were measured and are minor. Copy baseline at 2000: lock hold mean 0.533 s,
   p99 2.116 s, max 2.650 s.
 
-**Fix.** `migrate_chunk` runs `PREWARM_PRIMARY_KEY_SQL`
-(`fused_memory/services/read_rollup.py`) immediately BEFORE `BEGIN IMMEDIATE`.
+**Fix.** `migrate_chunk` runs
+`fused-memory/src/fused_memory/services/read_rollup.py::PREWARM_PRIMARY_KEY_SQL`
+immediately BEFORE `BEGIN IMMEDIATE`.
 It is a read-only walk of the primary-key index for exactly the ids the chunk
 will then delete, over the same rowid window, so the cold reads happen with no
 lock held and the `DELETE` finds its leaf pages cached. Measured on the copy:
@@ -442,5 +443,8 @@ and `TestPrewarmOutsideTheWriteLock` pins its position before `BEGIN`.
 
 `migrate`'s report now carries `mean_lock_seconds` and `max_lock_seconds`,
 timed from `BEGIN IMMEDIATE` returning to `COMMIT` returning, next to
-`mean_chunk_seconds` and `max_chunk_seconds`. Re-measure on the live file with
+`mean_chunk_seconds` and `max_chunk_seconds`. The migration connection sets
+`wal_autocheckpoint=0` and runs `PRAGMA wal_checkpoint(PASSIVE)` after each
+`COMMIT` returns, outside the lock: SQLite's own auto-checkpoint runs inside
+the `COMMIT` call, so left on it would be counted in the lock hold. Re-measure on the live file with
 the pilot of step 3 and record the result here.

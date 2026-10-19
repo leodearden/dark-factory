@@ -214,6 +214,8 @@ def connect_for_migration(journal: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(journal, isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
     conn.execute(f'PRAGMA busy_timeout={BUSY_TIMEOUT_MS}')
     conn.execute('PRAGMA synchronous=FULL')
+    # Checkpoints are explicit (see migrate_chunk): SQLite would otherwise run one inside COMMIT.
+    conn.execute('PRAGMA wal_autocheckpoint=0')
     return conn
 
 
@@ -404,10 +406,9 @@ def migrate_chunk(conn: sqlite3.Connection, lo: int, hi: int) -> ChunkResult:
         conn.execute('ROLLBACK')
         raise
     conn.execute('COMMIT')
-    return ChunkResult(
-        lo=lo, hi=hi, keys=len(keys), rows_moved=deleted,
-        lock_seconds=time.monotonic() - lock_acquired,
-    )
+    lock_seconds = time.monotonic() - lock_acquired
+    conn.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchall()
+    return ChunkResult(lo=lo, hi=hi, keys=len(keys), rows_moved=deleted, lock_seconds=lock_seconds)
 
 
 def preview_first_chunk(conn: sqlite3.Connection, chunk_rowids: int) -> MigrationReport:
