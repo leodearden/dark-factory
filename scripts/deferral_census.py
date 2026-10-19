@@ -15,13 +15,15 @@ from datetime import UTC, datetime
 from enum import IntEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, TextIO
+from typing import Final
 
 import _checkout as _checkout
 import deferral_store
 import orchestrator_projects
+import project_report
 from deferral_store import DeferralStore, RecordHit, StoreUnreachable, TaskRow
 from orchestrator_projects import ProjectTarget
+from project_report import UnreadableProject
 from shared.process_identity import (
     PROC_ROOT,
     Liveness,
@@ -29,7 +31,6 @@ from shared.process_identity import (
     ProcessIdentityUnreadable,
     liveness,
 )
-from shared.project_layout import tasks_db
 from shared.task_deferral import (
     CarriedByDeferral,
     Deferral,
@@ -172,16 +173,9 @@ class ProjectCensus:
         return bool(self.verdicts) and self.record_count == 0
 
 
-@dataclass(frozen=True)
-class UnreadableProject:
-    target: ProjectTarget
-    reason: str
-    unknown: bool = False
-
-
 def census_project(store: DeferralStore, target: ProjectTarget, *, now: datetime) -> ProjectCensus | UnreadableProject:
-    if not deferral_store.known_project(target.root):
-        return UnreadableProject(target, f'no task store at {tasks_db(target.root)}', unknown=True)
+    if (unknown := project_report.unknown_project(target)) is not None:
+        return unknown
     try:
         rows = store.deferred_rows(target.root)
         hits = store.rows_with_record(target.root)
@@ -203,10 +197,6 @@ def _one_line(text: str) -> str:
     return flat if len(flat) <= _DETAIL_CHARS else f'{flat[:_DETAIL_CHARS]}…'
 
 
-def _ids(task_ids: Iterable[int]) -> str:
-    return ', '.join(str(task_id) for task_id in sorted(task_ids))
-
-
 def _failing_line(verdict: RowVerdict) -> str:
     reason = verdict.needs_human.value if verdict.needs_human else ''
     detail = f' — {_one_line(verdict.invalid_detail)}' if verdict.invalid_detail else ''
@@ -220,10 +210,10 @@ def _listed_lines(verdicts: Sequence[RowVerdict]) -> list[str]:
         if reason is NeedsHumanReason.LEGACY_UNKNOWN:
             owners = [verdict.task_id for verdict in matching if verdict.deflake_owner]
             others = [verdict.task_id for verdict in matching if not verdict.deflake_owner]
-            lines += [f'{reason.value}: {_ids(others)}'] if others else []
-            lines += [f'{reason.value} (de-flake owner): {_ids(owners)}'] if owners else []
+            lines += [f'{reason.value}: {project_report.ids(others)}'] if others else []
+            lines += [f'{reason.value} (de-flake owner): {project_report.ids(owners)}'] if owners else []
         elif matching:
-            lines.append(f'{reason.value}: {_ids(verdict.task_id for verdict in matching)}')
+            lines.append(f'{reason.value}: {project_report.ids(verdict.task_id for verdict in matching)}')
     return lines
 
 
@@ -247,19 +237,6 @@ def _census_lines(census: ProjectCensus) -> list[str]:
         *_listed_lines(census.verdicts),
         *_closing_line(census),
     ]
-
-
-def _body(result: ProjectCensus | UnreadableProject) -> list[str]:
-    if isinstance(result, ProjectCensus):
-        return _census_lines(result)
-    return [f'{"UNKNOWN PROJECT" if result.unknown else "UNREADABLE"}: {result.reason}']
-
-
-def render(results: Iterable[ProjectCensus | UnreadableProject], *, out: TextIO) -> None:
-    for result in results:
-        print(f'{result.target.root} — {result.target.sweep_label}', file=out)
-        for line in _body(result):
-            print(f'  {line}', file=out)
 
 
 def exit_code(results: Sequence[ProjectCensus | UnreadableProject], *, check: bool) -> CensusExit:
@@ -291,19 +268,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    targets, scan = orchestrator_projects.targets_from_args(args)
-    for problem in scan.problems:
-        print(f'{_TOOL}: {problem}', file=sys.stderr)
+    targets = project_report.targets_with_problems_reported(args, tool=_TOOL, verb='census')
     if not targets:
-        print(
-            f'{_TOOL}: no project to census: no --project-root, and no unit under {args.units_dir} names one',
-            file=sys.stderr,
-        )
         return CensusExit.UNREADABLE
     store = deferral_store.store_from_args(args)
     now = datetime.now(UTC)
     results = [census_project(store, target, now=now) for target in targets]
-    render(results, out=sys.stdout)
+    project_report.render(results, _census_lines, out=sys.stdout)
     return exit_code(results, check=args.check)
 
 

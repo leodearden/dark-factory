@@ -16,11 +16,12 @@ from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, NamedTuple, TextIO
+from typing import Any, Final, NamedTuple
 
 import _checkout as _checkout
 import deferral_store
 import orchestrator_projects
+import project_report
 from deferral_store import (
     Changed,
     DeferralStore,
@@ -31,7 +32,7 @@ from deferral_store import (
     Unechoed,
 )
 from orchestrator_projects import ProjectTarget
-from shared.project_layout import tasks_db
+from project_report import UnreadableProject
 from shared.task_deferral import (
     REASON_MAX_CHARS,
     CarriedByDeferral,
@@ -240,13 +241,6 @@ class ProjectReport:
         return any(outcome.outcome is Outcome.FAILED for outcome in self.outcomes)
 
 
-@dataclass(frozen=True)
-class UnreadableProject:
-    target: ProjectTarget
-    reason: str
-    unknown: bool = False
-
-
 def _carrier_ids(plans: Iterable[RowPlan], now: datetime) -> set[int]:
     requests = (parse_request(plan.request, now=now) for plan in plans)
     return {request.carrier_task_id for request in requests if isinstance(request, CarriedByRequest)}
@@ -287,8 +281,8 @@ def migrate_project(
     store: DeferralStore, target: ProjectTarget, *, now: datetime, apply: bool
 ) -> ProjectReport | UnreadableProject:
     """Plan every deferred row of *target*; under *apply*, re-stamp each planned row in task-id order."""
-    if not deferral_store.known_project(target.root):
-        return UnreadableProject(target, f'no task store at {tasks_db(target.root)}', unknown=True)
+    if (unknown := project_report.unknown_project(target)) is not None:
+        return unknown
     try:
         rows = sorted(store.deferred_rows(target.root), key=lambda row: row.task_id)
         planned = [plan_row(row, now=now) for row in rows]
@@ -307,10 +301,6 @@ def migrate_project(
     )
 
 
-def _ids(task_ids: Iterable[int]) -> str:
-    return ', '.join(str(task_id) for task_id in sorted(task_ids))
-
-
 def _class_lines(report: ProjectReport) -> list[str]:
     classes: dict[str, list[int]] = {}
     for plan in report.plans:
@@ -318,14 +308,14 @@ def _class_lines(report: ProjectReport) -> list[str]:
     if report.recorded:
         classes[ALREADY_RECORDED] = [recorded.task_id for recorded in report.recorded]
     labels = (*(kind.value for kind in DeferralKind), ALREADY_RECORDED)
-    return [f'{label} ({len(classes[label])}): {_ids(classes[label])}' for label in labels if label in classes]
+    return [f'{label} ({len(classes[label])}): {project_report.ids(classes[label])}' for label in labels if label in classes]
 
 
 def _carrier_lines(report: ProjectReport) -> list[str]:
     lines = []
     for reason in NeedsHumanReason:
         ids = [task_id for task_id, found in report.carrier_reasons.items() if found is reason]
-        lines += [f'{reason.value} carried_by: {_ids(ids)}'] if ids else []
+        lines += [f'{reason.value} carried_by: {project_report.ids(ids)}'] if ids else []
     return lines
 
 
@@ -347,17 +337,8 @@ def _outcome_lines(report: ProjectReport) -> list[str]:
     ]
 
 
-def _body(result: ProjectReport | UnreadableProject) -> list[str]:
-    if isinstance(result, ProjectReport):
-        return [*_class_lines(result), *_carrier_lines(result), *_outcome_lines(result)]
-    return [f'{"UNKNOWN PROJECT" if result.unknown else "UNREADABLE"}: {result.reason}']
-
-
-def render(results: Iterable[ProjectReport | UnreadableProject], *, out: TextIO) -> None:
-    for result in results:
-        print(f'{result.target.root} — {result.target.sweep_label}', file=out)
-        for line in _body(result):
-            print(f'  {line}', file=out)
+def _report_lines(report: ProjectReport) -> list[str]:
+    return [*_class_lines(report), *_carrier_lines(report), *_outcome_lines(report)]
 
 
 def exit_code(results: Sequence[ProjectReport | UnreadableProject]) -> MigrationExit:
@@ -382,11 +363,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    targets, scan = orchestrator_projects.targets_from_args(args)
-    for problem in scan.problems:
-        print(f'{_TOOL}: {problem}', file=sys.stderr)
+    targets = project_report.targets_with_problems_reported(args, tool=_TOOL, verb='migrate')
     if not targets:
-        print(f'{_TOOL}: no project to migrate: no --project-root, and no unit under {args.units_dir} names one', file=sys.stderr)
         return MigrationExit.FAILED
     store = deferral_store.store_from_args(args)
     now = datetime.now(UTC)
@@ -399,7 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return MigrationExit.PREDATES_GATE
-    render(results, out=sys.stdout)
+    project_report.render(results, _report_lines, out=sys.stdout)
     return exit_code(results)
 
 
