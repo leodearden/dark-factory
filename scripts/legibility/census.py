@@ -119,6 +119,7 @@ from legibility import (  # noqa: E402
     filing_policy,
     finding_area,
     invariants,
+    prescreen,
     session_ledger,
     session_runner,
     task_store,
@@ -1155,6 +1156,7 @@ SECTION_HEADER = "header"
 SECTION_FORCE_MARKER = "force-marker"
 SECTION_METHOD = "method"
 SECTION_SATURATION = "saturation"
+SECTION_SCREENED = "screened"
 SECTION_VERIFICATION = "verification"
 SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
 SECTION_MATRIX = "matrix"
@@ -1221,12 +1223,6 @@ class ReportSection:
 
 CENSUS_RECORD_VERSION = 1
 
-_INPUTS_CONSUMED_NOTE = (
-    "this census reads no other instrument's report yet; matching sightings "
-    "against /review, /hotspot-survey and /review-all findings arrives with "
-    "the pre-screen (plans/census-incremental-prd.md leaf L6)"
-)
-
 
 def _selection_evidence(
     selection: census_window.SessionSelection | None, *, mined: int,
@@ -1284,13 +1280,19 @@ def build_method(
     wall_clock_secs: float,
     verify_normalisations: Mapping[str, int],
     reverify: Mapping[str, int],
+    screened: Mapping[str, int],
+    inputs_consumed: Sequence[str],
+    inputs_consumed_note: str | None,
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
     (plans/census-incremental-prd.md §4.3), which carries
-    *verify_normalisations*: the verdict repairs per kind (§4.4), and the
+    *verify_normalisations*: the verdict repairs per kind (§4.4), the
     *reverify* counts of the outcome feedback (L5, D8), whose offered
-    re-verifies *verify_calls* includes. *selection* is ``None`` for a
+    re-verifies *verify_calls* includes, and the pre-screen's per-rule
+    *screened* counts (L6). *inputs_consumed* are the run ids of the other
+    instruments' records the pre-screen read, and *inputs_consumed_note*
+    says why any gave it none. *selection* is ``None`` for a
     run with no mining window, which nulls the evidence and ledger fields it
     would have supplied; an unreadable ledger counts ``ledger_rows`` and
     ``ledger_pruned`` as ``None``, never 0."""
@@ -1310,9 +1312,10 @@ def build_method(
             "embedding_calls": 0,
             "wall_clock_secs": wall_clock_secs,
         },
-        "inputs_consumed": [],
+        "inputs_consumed": list(inputs_consumed),
         "extra": {
-            "inputs_consumed_note": _INPUTS_CONSUMED_NOTE,
+            "inputs_consumed_note": inputs_consumed_note,
+            "screened": dict(screened),
             **_ledger_extra(selection),
             "verify_normalisations": dict(verify_normalisations),
             "reverify": dict(reverify),
@@ -1336,6 +1339,7 @@ def build_census_record(
     project_root: str,
     filing: Mapping[str, Any],
     dispositions: Mapping[str, Any],
+    screened: Mapping[str, Any],
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
@@ -1351,7 +1355,8 @@ def build_census_record(
     contract §1 rows (``census_findings.FindingRow.to_record``) and
     *area_map* the ``finding_area.AreaMap.to_record`` that keyed them.
     *filing* is ``disposition.FilingReport.to_record``, *dispositions*
-    ``disposition.OutcomeReport.to_record``, and *project_root* the observed
+    ``disposition.OutcomeReport.to_record``, *screened*
+    ``prescreen.ScreenReport.to_record``, and *project_root* the observed
     project their decisions and outcomes are reported against."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
@@ -1373,6 +1378,7 @@ def build_census_record(
         "synthesis_md": synthesis_md,
         "filing": dict(filing),
         "dispositions": dict(dispositions),
+        "screened": dict(screened),
         "dry_run": _optional_asdict(dry_run),
         "withheld": [asdict(cluster) for cluster in withheld],
         "findings": [dict(row) for row in findings],
@@ -1491,6 +1497,7 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
             f"saturated={stats.saturated})"
         )
     emit(SECTION_SATURATION, saturation)
+    emit(SECTION_SCREENED, prescreen.report_lines(record["screened"]))
 
     if verify_coverage is not None or mass_rejection is not None:
         verification = ["", "## Verification", ""]
@@ -3298,6 +3305,9 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
+    screen_report = prescreen.ScreenReport(
+        prescreen.Screen((), (), ()), (), (), prescreen.InstrumentFindings((), None, ()),
+    )
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
@@ -3314,6 +3324,9 @@ def run_census(
         wall_clock_secs=round(time.monotonic() - started, 3),
         verify_normalisations=verify_normalisations,
         reverify=dispositions_record["reverify"],
+        screened=screen_report.counts(),
+        inputs_consumed=screen_report.inputs.consumed,
+        inputs_consumed_note=screen_report.inputs.note,
     )
     record = build_census_record(
         method=method,
@@ -3326,6 +3339,7 @@ def run_census(
         project_root=project_root,
         filing=filing_report.to_record(),
         dispositions=dispositions_record,
+        screened=screen_report.to_record(),
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
