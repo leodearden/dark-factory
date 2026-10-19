@@ -21,6 +21,7 @@ fails the suite.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -63,6 +64,8 @@ from fused_memory.server.tools import create_mcp_server
 
 TOPIC = 'e2e-topic-alpha'
 RATIONALE = 'These records state the same rule in different words.'
+#: The curator sitting, one of the reversal's two callers (PRD C4).
+REVERT_AGENT = 'curator-auto-consolidation-revert'
 
 #: The Mem0 methods the executor, the closure scroll and the revert call.
 _MEM0_SURFACE = (
@@ -182,6 +185,26 @@ class World:
         rows = await self.ledger.list_by_kind(self.project_id, 'cycle_summary', 'active')
         row = _only([r for r in rows if r.run_id == run_id], 'cycle summary row')
         return json.loads(row.payload_json)['stats']
+
+    def mem0_writes(self) -> tuple[int, int, int]:
+        """Update, add and delete awaits on the corpus.
+
+        ``add_system_record`` is left out: every full cycle's cycle-summary
+        mirror writes one, so a cycle that wrote nothing still awaits it.
+        """
+        return (
+            self.fake.update_memory.await_count,
+            self.fake.add_memory.await_count,
+            self.fake.delete_memory.await_count,
+        )
+
+    def corpus_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Every record except the stage's own cycle-summary mirrors, deep-copied."""
+        return {
+            memory_id: copy.deepcopy(record)
+            for memory_id, record in self.fake.records.items()
+            if record['metadata'].get('kind') != 'cycle_summary'
+        }
 
 
 def _parse_tool_result(result: Any) -> dict[str, Any]:
