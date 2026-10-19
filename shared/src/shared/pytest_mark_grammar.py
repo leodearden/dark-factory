@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
 
-__all__ = ['mark_elements', 'marker_name', 'pytestmark_value']
+__all__ = ['mark_elements', 'marker_name', 'pytestmark_elements', 'pytestmark_value']
 
 
 def _is_pytestmark_target(node: ast.expr) -> bool:
@@ -53,3 +54,18 @@ def mark_elements(value: ast.expr) -> list[ast.expr]:
     if isinstance(value, ast.List | ast.Tuple):
         return list(value.elts)
     return [value]
+
+
+def pytestmark_elements(body: Sequence[ast.stmt]) -> list[ast.expr]:
+    """The mark elements of the ``pytestmark`` binding that wins in a scope *body*.
+
+    Only DIRECT children of *body* bind the scope's ``pytestmark`` — one bound
+    inside an ``if`` does not — and the LAST binding wins, as in Python itself.
+    No binding yields an empty list.
+    """
+    value: ast.expr | None = None
+    for statement in body:
+        bound = pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    return mark_elements(value) if value is not None else []
