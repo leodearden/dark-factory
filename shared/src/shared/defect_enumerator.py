@@ -1,0 +1,178 @@
+"""Static enumeration of ``pytest.mark.defect`` refs: which collected test node carries which ref.
+
+plans/defect-tests-prd.md decision 8 makes this static scan the authoritative binding of a defect
+ref to its node ids, and decision 14 makes completeness part of every answer: a file whose refs
+cannot all be read statically is incomplete, never clean. Collection mirrors pytest's DEFAULT
+rules only, so a project that overrides them is a known, fail-safe limit.
+"""
+
+from __future__ import annotations
+
+import ast
+import posixpath
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+from types import MappingProxyType
+
+from shared.defects import MalformedDefectRef, NodeId, parse_ref
+from shared.pytest_mark_grammar import marker_name
+
+__all__ = [
+    'Carrier',
+    'DisablingMark',
+    'EnumerationGap',
+    'FileEnumeration',
+    'GapReason',
+    'NonStaticMark',
+    'enumerate_source',
+]
+
+_DEFECT_MARKER = 'defect'
+_TEST_FUNCTION_PREFIX = 'test'
+
+
+class DisablingMark(StrEnum):
+    """A pytest mark that statically keeps a carrier from running as a guard; values are pytest's names."""
+
+    SKIP = 'skip'
+    SKIPIF = 'skipif'
+    XFAIL = 'xfail'
+
+
+class GapReason(StrEnum):
+    SYNTAX_ERROR = 'syntax_error'
+    UNREADABLE_REF = 'unreadable_ref'
+    MALFORMED_REF = 'malformed_ref'
+    UNREADABLE_FILE = 'unreadable_file'
+
+
+@dataclass(frozen=True)
+class EnumerationGap:
+    """Why a file's refs cannot all be seen, at the source line that hides them when one is known."""
+
+    reason: GapReason
+    line: int | None
+
+
+@dataclass(frozen=True)
+class Carrier:
+    node_id: NodeId
+    disabled_by: frozenset[DisablingMark]
+
+    @property
+    def runnable(self) -> bool:
+        return not self.disabled_by
+
+
+@dataclass(frozen=True)
+class NonStaticMark:
+    """A readable defect mark that reaches no statically collected item, so it carries nothing."""
+
+    ref: str
+    line: int
+
+
+@dataclass(frozen=True)
+class FileEnumeration:
+    """One file's carriers by ref, its non-static marks, and the gaps that make it incomplete."""
+
+    path: str
+    carriers: Mapping[str, tuple[Carrier, ...]]
+    non_static: tuple[NonStaticMark, ...] = ()
+    gaps: tuple[EnumerationGap, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not _is_tree_relative(self.path):
+            raise ValueError(f'FileEnumeration path {self.path!r} is not a normalised tree-relative POSIX path')
+        carriers = dict(self.carriers)
+        for ref in carriers:
+            parse_ref(ref)
+        object.__setattr__(self, 'carriers', MappingProxyType(carriers))
+
+    @property
+    def complete(self) -> bool:
+        return not self.gaps
+
+
+def _is_tree_relative(path: str) -> bool:
+    return (
+        bool(path)
+        and path != '.'
+        and not path.startswith('/')
+        and posixpath.normpath(path) == path
+        and path.split('/', 1)[0] != '..'
+    )
+
+
+def _module_relative(path: str, module_root: str) -> str:
+    """*path* made relative to *module_root*, which is '.' or a directory prefix of it."""
+    if not _is_tree_relative(path) or not (module_root == '.' or _is_tree_relative(module_root)):
+        raise ValueError(
+            f'path {path!r} and module_root {module_root!r} must be normalised tree-relative '
+            "POSIX paths; module_root may also be '.'"
+        )
+    if module_root == '.':
+        return path
+    prefix = f'{module_root}/'
+    if not path.startswith(prefix):
+        raise ValueError(f'path {path!r} is not inside module_root {module_root!r}')
+    return path[len(prefix):]
+
+
+def _read_ref(mark: ast.expr) -> str | EnumerationGap:
+    """The ref one defect mark names: exactly one positional str literal, no keywords, in the grammar."""
+    if not (isinstance(mark, ast.Call) and len(mark.args) == 1 and not mark.keywords):
+        return EnumerationGap(GapReason.UNREADABLE_REF, mark.lineno)
+    argument = mark.args[0]
+    if not (isinstance(argument, ast.Constant) and isinstance(argument.value, str)):
+        return EnumerationGap(GapReason.UNREADABLE_REF, mark.lineno)
+    try:
+        return parse_ref(argument.value).ref
+    except MalformedDefectRef:
+        return EnumerationGap(GapReason.MALFORMED_REF, mark.lineno)
+
+
+def _test_items(body: Sequence[ast.stmt]) -> Iterator[tuple[str, list[ast.expr]]]:
+    for statement in body:
+        is_function = isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
+        if is_function and statement.name.startswith(_TEST_FUNCTION_PREFIX):
+            yield statement.name, statement.decorator_list
+
+
+def _enumerate_module(path: str, node_of: Callable[[str], NodeId], tree: ast.Module) -> FileEnumeration:
+    carriers: dict[str, dict[Carrier, None]] = {}
+    gaps: list[EnumerationGap] = []
+    for name, marks in _test_items(tree.body):
+        for mark in marks:
+            if marker_name(mark) != _DEFECT_MARKER:
+                continue
+            reading = _read_ref(mark)
+            if isinstance(reading, EnumerationGap):
+                gaps.append(reading)
+            else:
+                carriers.setdefault(reading, {})[Carrier(node_of(name), frozenset())] = None
+    return FileEnumeration(
+        path,
+        {ref: tuple(item_carriers) for ref, item_carriers in carriers.items()},
+        gaps=tuple(gaps),
+    )
+
+
+def enumerate_source(path: str, source: str | bytes, *, module_root: str) -> FileEnumeration:
+    """Enumerate the defect refs in one file's *source*, at tree-relative POSIX *path*.
+
+    *module_root* is '.' or a directory prefix of *path*; each carrier's NodeId is qualified by it,
+    with *path* made relative to it. A source that does not parse is one SYNTAX_ERROR gap.
+    """
+    relative_path = _module_relative(path, module_root)
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError) as error:
+        gap = EnumerationGap(GapReason.SYNTAX_ERROR, getattr(error, 'lineno', None))
+        return FileEnumeration(path, {}, gaps=(gap,))
+
+    def node_of(name: str) -> NodeId:
+        return NodeId(module_root=module_root, path=relative_path, name=name)
+
+    return _enumerate_module(path, node_of, tree)
