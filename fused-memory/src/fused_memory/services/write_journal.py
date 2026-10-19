@@ -34,6 +34,11 @@ from shared.async_sqlite_base import (
 )
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
+from fused_memory.services.read_rollup import (
+    COUNT_READ_SQL,
+    READ_OP_COUNTS_SCHEMA_SQL,
+    keeps_read_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,7 @@ logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
 
 SCHEMA_SQL = """
+-- The read rollup table read_op_counts (task 5405) is created beside these; its DDL lives in services/read_rollup.py.
 CREATE TABLE IF NOT EXISTS write_ops (
     id TEXT PRIMARY KEY,
     causation_id TEXT,
@@ -151,8 +157,8 @@ CREATE TABLE IF NOT EXISTS write_ops (
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
--- idx_wo_created (task 3304): the dashboard filters a BARE `WHERE created_at >= ?`
--- in get_memory_timeseries / get_operations_breakdown / get_agent_breakdown
+-- idx_wo_created (task 3304): the dashboard range-filters `created_at` alone
+-- in get_memory_ops
 -- (dashboard/src/dashboard/data/write_journal.py — cited by function name, not
 -- line number, so the reference survives edits to that file). Every other
 -- write_ops index has created_at in SECOND position, so none of them can
@@ -367,6 +373,27 @@ class JournalGrowthSample:
     since: datetime
 
 
+_UPSERT_WRITE_OP_SQL = """INSERT INTO write_ops
+   (id, causation_id, source, provenance, operation,
+    project_id, agent_id, session_id, kind,
+    params, result_summary, success, error, created_at)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(id) DO UPDATE SET
+       causation_id = excluded.causation_id,
+       source = excluded.source,
+       provenance = excluded.provenance,
+       operation = excluded.operation,
+       project_id = excluded.project_id,
+       agent_id = excluded.agent_id,
+       session_id = excluded.session_id,
+       kind = excluded.kind,
+       params = excluded.params,
+       result_summary = excluded.result_summary,
+       success = excluded.success,
+       error = excluded.error,
+       created_at = excluded.created_at"""
+
+
 async def _read_int(access: AtomicConnection, sql: str) -> int:
     """The single integer *sql* selects, or a RuntimeError naming *sql*."""
     row = await access.read_one(sql)
@@ -397,6 +424,7 @@ class WriteJournal:
         self._access = AtomicConnection(conn)
         async with self._access.write() as db:
             await db.executescript(SCHEMA_SQL)
+            await db.executescript(READ_OP_COUNTS_SCHEMA_SQL)
         await self._migrate()
         logger.info(f'Write journal initialized at {db_path}')
 
@@ -533,6 +561,11 @@ class WriteJournal:
     ) -> None:
         """Log a Layer 1 operation. Fire-and-forget — never raises.
 
+        A successful read with no per-row consumer (``read_rollup.keeps_read_row``
+        is False) is COUNTED into ``read_op_counts`` and never stored (task 5405).
+        Each read therefore lands in exactly one of the two tables, which is what
+        lets the dashboard add them.
+
         An UPSERT rather than a plain INSERT (task 3582): the durable queue's
         terminal write-back can legitimately reach this ``write_op_id`` before
         its producer gets here — ``add_memory`` enqueues the Graphiti leg and
@@ -565,45 +598,34 @@ class WriteJournal:
                 write_op_id, kind,
             )
             kind = 'read'
+        created_at = datetime.now(UTC).isoformat()
+        counted = kind == 'read' and not keeps_read_row(operation=operation, success=success)
         try:
             async with self._require_access().write() as db:
-                await db.execute(
-                    """INSERT INTO write_ops
-                       (id, causation_id, source, provenance, operation,
-                        project_id, agent_id, session_id, kind,
-                        params, result_summary, success, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(id) DO UPDATE SET
-                           causation_id = excluded.causation_id,
-                           source = excluded.source,
-                           provenance = excluded.provenance,
-                           operation = excluded.operation,
-                           project_id = excluded.project_id,
-                           agent_id = excluded.agent_id,
-                           session_id = excluded.session_id,
-                           kind = excluded.kind,
-                           params = excluded.params,
-                           result_summary = excluded.result_summary,
-                           success = excluded.success,
-                           error = excluded.error,
-                           created_at = excluded.created_at""",
-                    (
-                        write_op_id,
-                        causation_id,
-                        source,
-                        provenance,
-                        operation,
-                        project_id,
-                        agent_id,
-                        session_id,
-                        kind,
-                        json.dumps(params) if params else '{}',
-                        json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
-                        1 if success else 0,
-                        error,
-                        datetime.now(UTC).isoformat(),
-                    ),
-                )
+                if counted:
+                    await db.execute(
+                        COUNT_READ_SQL, (created_at, project_id, agent_id, operation, 1)
+                    )
+                else:
+                    await db.execute(
+                        _UPSERT_WRITE_OP_SQL,
+                        (
+                            write_op_id,
+                            causation_id,
+                            source,
+                            provenance,
+                            operation,
+                            project_id,
+                            agent_id,
+                            session_id,
+                            kind,
+                            json.dumps(params) if params else '{}',
+                            json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
+                            1 if success else 0,
+                            error,
+                            created_at,
+                        ),
+                    )
         except Exception as e:
             self._dropped[operation] += 1
             logger.warning(f'Failed to log write_op: {e}')
@@ -810,10 +832,15 @@ class WriteJournal:
         results.sort(key=lambda r: r.get('created_at', ''))
         return results
 
-    async def get_ops_since(
+    async def get_stored_ops_since(
         self, since: str, limit: int = 100, kind: str | None = None
     ) -> list[dict]:
-        """Return write_ops since a timestamp, optionally filtered by kind."""
+        """Return the ``write_ops`` rows STORED since a timestamp, optionally by kind.
+
+        Successful reads without a per-row consumer are counted into
+        ``read_op_counts`` and never stored (``read_rollup.py``), so this is not
+        an activity count: ``kind='read'`` yields searches and failed reads only.
+        """
         if kind:
             sql = 'SELECT * FROM write_ops WHERE created_at >= ? AND kind = ? ORDER BY created_at LIMIT ?'
             params = (since, kind, limit)
@@ -1197,7 +1224,9 @@ class WriteJournal:
         short horizon would silently starve the metric, and a long one is nearly
         free (365 days is ~1.1M rows). WRITES are the durable audit trail joined
         by ``causation_id`` in ``reconciliation/stats_verifier.py`` and are 0.73%
-        of volume, so 730 days costs essentially nothing.
+        of volume, so 730 days costs essentially nothing. Since task 5405 the
+        'read' horizon governs less than it did: see the ``write_journal`` block
+        of ``fused-memory/config/config.yaml``.
 
         BATCHED AND DOUBLY BOUNDED, unlike this file's two sibling prunes, whose
         tables are small enough for a single unbounded DELETE. This one runs
@@ -1328,65 +1357,3 @@ class WriteJournal:
         except Exception as e:
             logger.error(f'Failed to prune write_ops: {e}')
             return 0
-
-    async def get_usage_stats(
-        self, since: str, project_id: str | None = None
-    ) -> dict:
-        """Aggregate read/write stats since a timestamp.
-
-        Returns {reads, writes, by_operation, by_agent}.
-        """
-        access = self._require_access()
-        where = 'WHERE created_at >= ?'
-        params: list = [since]
-        if project_id:
-            where += ' AND project_id = ?'
-            params.append(project_id)
-
-        kind_counts = {
-            row[0]: row[1]
-            for row in await access.read_all(
-                f'SELECT kind, COUNT(*) FROM write_ops {where} GROUP BY kind', params
-            )
-        }
-        by_operation = {
-            row[0]: row[1]
-            for row in await access.read_all(
-                f'SELECT operation, COUNT(*) FROM write_ops {where} GROUP BY operation',
-                params,
-            )
-        }
-        by_agent: dict[str, dict[str, int]] = {}
-        for row in await access.read_all(
-            f'SELECT agent_id, kind, COUNT(*) FROM write_ops {where} GROUP BY agent_id, kind',
-            params,
-        ):
-            aid = row[0] or '_unknown'
-            if aid not in by_agent:
-                by_agent[aid] = {'read': 0, 'write': 0}
-            by_agent[aid][row[1]] = row[2]
-
-        return {
-            'reads': kind_counts.get('read', 0),
-            'writes': kind_counts.get('write', 0),
-            'by_operation': by_operation,
-            'by_agent': by_agent,
-        }
-
-    async def get_session_ops(
-        self, agent_id: str, since: str | None = None, limit: int = 100
-    ) -> list[dict]:
-        """Return ops for a specific agent, most recent first."""
-        if since:
-            sql = (
-                'SELECT * FROM write_ops WHERE agent_id = ? AND created_at >= ? '
-                'ORDER BY created_at DESC LIMIT ?'
-            )
-            params = (agent_id, since, limit)
-        else:
-            sql = (
-                'SELECT * FROM write_ops WHERE agent_id = ? '
-                'ORDER BY created_at DESC LIMIT ?'
-            )
-            params = (agent_id, limit)
-        return [dict(row) for row in await self._require_access().read_all(sql, params)]

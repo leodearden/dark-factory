@@ -28,6 +28,7 @@ from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
+    MetadataNotAnObjectError,
     StatusWriteAuthorityError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -5901,6 +5902,11 @@ class TaskInterceptor:
            'task_id': …, …}`` shape defined in ``task_backend_errors.py`` (task C2).
            Any add, alter or removal of ``metadata.deferral`` raises
            ``DeferralWriteAuthorityError``, returned the same way.
+           The backend also rejects a metadata payload that is not a JSON object,
+           in every mode, with
+           :class:`~fused_memory.backends.task_backend_errors.MetadataNotAnObjectError`,
+           converted the same way to the canonical
+           ``{'success': False, 'error': 'metadata_not_an_object', …}`` shape (task 6130).
         2. ``_reject_directory_locks_in_update_metadata`` — rejects ``metadata.files``
            entries that name a directory; returns ``lock_charter_error(...)``.
         3. ``_backlog_gate`` — rejects when the reconciliation backlog exceeds the
@@ -6067,11 +6073,13 @@ class TaskInterceptor:
                 StatusWriteAuthorityError,
                 DoneProvenanceWriteAuthorityError,
                 DeferralWriteAuthorityError,
+                MetadataNotAnObjectError,
             ) as e:
                 # SqliteTaskBackend write-authority floor (task C1): a status
                 # write is always rejected, and so is any add, change or
                 # removal of metadata.done_provenance (under replace, anything
-                # but a verbatim passthrough of the stored value).
+                # but a verbatim passthrough of the stored value), and a
+                # metadata payload that is not a JSON object, in every mode.
                 # _journal_around already logged the failing backend_op row and
                 # re-raised; convert to the canonical rejection dict here so
                 # this surface's long-standing contract — return a dict, never

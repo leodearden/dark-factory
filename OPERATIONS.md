@@ -3190,6 +3190,12 @@ a defect. It closes when you complete the sequence above. Validation for the
 migration itself was done at full scale: a dry run over all 4,574 live files
 decompressed and decoded every one of them with zero failures.
 
+### Also one-off: the write-journal read-rollup migration and reclaim
+
+Moving `write_journal.db`'s per-read history into `read_op_counts`, then
+VACUUMing the space back (task 5405), has its own runbook:
+`fused-memory/scripts/README_roll_up_journal_reads.md`.
+
 ---
 
 ## 14. Transcript preservation & the archival guard

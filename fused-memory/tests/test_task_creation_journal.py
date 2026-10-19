@@ -433,7 +433,7 @@ async def _poll_outcomes(journal, run_id: str, predicate) -> CreationOutcomes:
 
 
 async def _creation_rows(journal) -> list[dict]:
-    rows = await journal.get_ops_since('', limit=1000)
+    rows = await journal.get_stored_ops_since('', limit=1000)
     return [row for row in rows if row['operation'] in _CREATION_OPERATIONS]
 
 
