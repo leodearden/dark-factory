@@ -101,13 +101,25 @@ window's count-only rows, upserts them through the live path's own
 `COUNT_READ_SQL`, deletes them, then re-reads every key. It commits only if
 the rows deleted equal the counts added, key by key; otherwise it rolls back
 and exits naming the window, the key and both values. Compare the pilot's
-`rows_per_second` with the measured figure below before running the bulk, and
-check `max_chunk_seconds`. Each chunk holds SQLite's write lock for about its
-transaction time, and fused-memory's `busy_timeout` is 5000 ms: a write that
-waits longer is DROPPED (`log_write_op` swallows the error). Keep the maximum
-well under ~2 s (the full-scale pilot measured mean ~0.45 s, max ~0.6 s at the
-default 2,000 rowids). If it is higher, lower `--chunk-rowids` or raise
-`--pause-seconds`.
+`rows_per_second` with the measured figures below before running the bulk, and
+check `max_lock_seconds`. That is the time each chunk holds SQLite's write
+lock, from `BEGIN IMMEDIATE` returning to `COMMIT` returning. fused-memory's
+`busy_timeout` is 5000 ms, and a write that waits longer is DROPPED
+(`log_write_op` swallows the error). `*_chunk_seconds` also count the prewarm,
+the wait for the lock and the post-COMMIT checkpoint, so they overstate the
+hold. **Pilot stop rule:** stop and do not start the bulk if `max_lock_seconds`
+exceeds 1.5 s, or if fused-memory logged ANY new `database is locked` or
+`Failed to log write_op` line during the pilot:
+
+```bash
+journalctl --user -u fused-memory.service --since "-15min" \
+  | grep -E 'database is locked|Failed to log write_op'
+```
+
+A smaller `--chunk-rowids` is not the remedy for a long maximum (see (d)
+below): the lock hold is paced by cold index reads, which the prewarm moves
+out of the lock. Keep the defaults, `--chunk-rowids 2000` and
+`--pause-seconds 0.5`.
 
 `verify` exits 1 and prints every `(window, hour, kind, operation)` whose
 count changed.
@@ -148,7 +160,7 @@ behind both, about 2.5 s at the measured maxima. That is still inside
 fused-memory's 5000 ms `busy_timeout`. A prune batch caught behind a chunk
 longer than 5 s fails its pass with `Failed to prune write_ops: database is
 locked` at ERROR, and the next pass retries. Treat that line the way the
-pilot treats `max_chunk_seconds` above 2 s: lower `--chunk-rowids`.
+pilot treats a `max_lock_seconds` above 1.5 s: stop and read (d) below.
 Measured 2026-10-19 on a 400,000-row scratch with 40 days of history, a
 prune pass every 0.2 s and live journal writes during `migrate --apply`:
 for every key, rollup plus pruned equalled the original count exactly.
@@ -358,18 +370,20 @@ build did not have yet:
   not 5,000: the transaction alone then measured p95 0.58 s and max 1.94 s
   against fused-memory's 5000 ms `busy_timeout` (see the next bullet). A
   maximum is not guaranteed: the sustained run's 5.69 s chunk includes the
-  checkpoint after COMMIT, so its lock hold is unknown. The pilot rule (step 3 and
-  the Variance bullet) applies, with `--chunk-rowids 1000` (max 0.52 s over 25 chunks) as the
-  fallback.
+  checkpoint after COMMIT, so its lock hold was unknown. The pilot rule
+  (step 3) now reads the lock hold directly, as `max_lock_seconds`. These
+  per-chunk figures were taken WITHOUT the prewarm of (d), on a quieter host
+  than the live pilot of (d), and do not transfer to a loaded host. (d) also
+  corrects the cause: the per-row cost is the cold random reads of the
+  UUID primary-key index, and a smaller chunk does not shorten the maximum.
 - **Lock hold vs. the reported time.** `*_chunk_seconds` include the
   auto-checkpoint that runs after COMMIT, outside the write lock. A separate run
   with checkpoints taken apart (129 chunks of 2,000 rowids) measured the
   transaction alone at mean 0.37 s, p95 0.58 s, max 1.94 s; 87 chunks of 5,000
   measured 0.78 / 1.36 / 2.71 s.
 - **Variance:** the 600 s run had one 5.69 s chunk in 593, on a workstation that
-  is ~97% CPU-busy. A maximum above 5 s is a dropped write in the live service,
-  so watch `max_chunk_seconds` in the pilot; if the 25-chunk pilot shows more
-  than ~2 s, lower `--chunk-rowids` or raise `--pause-seconds`.
+  is ~97% CPU-busy. A lock hold above 5 s is a dropped write in the live
+  service, so the pilot watches `max_lock_seconds` (step 3).
 - **Projection:** the backlog was ~35.1M count-only rows on 2026-10-16, plus
   ~1M a day until fused-memory restarts onto 5405. At the sustained
   1,960 rows/s that is about **5 h** of online migration (extrapolated from a
@@ -378,3 +392,59 @@ build did not have yet:
   than `read_retention_days` before `migrate` reaches them, so once it has
   drained, the backlog is at most ~30 days of reads, ~30M rows and ~4 h.
   `status`'s `count_only_span` shows what is actually left.
+
+**(d) Live pilot and the lock-hold diagnosis (2026-10-19, task 7167).** The
+2026-10-18 figures above did not hold on the live host. The task 7026 pilot ran
+`migrate --apply` against the live journal at host load ~130 and IO pressure
+40-60%. Chunk times are the old `*_chunk_seconds`, which include the wait for
+the lock and the post-COMMIT checkpoint:
+
+| `--chunk-rowids` | rows/s | chunk mean / max (s) |
+|---|---|---|
+| 2000 | 1,349 | 0.961 / 1.956, plus 1 dropped journal write in the bulk |
+| 1000 | 387 | 2.047 / 4.821 |
+| 500 | 236 | 1.594 / 3.318 |
+
+At 2000 one chunk held the write lock past fused-memory's 5000 ms
+`busy_timeout` and fused-memory logged `Failed to log write_op: database is
+locked` (12:53:48Z), so one journal write was dropped. Smaller chunks did NOT
+help: the maximum stayed at 3.3-4.8 s and throughput collapsed. 7026 is paused.
+
+**Diagnosis**, on a full-size copy of the live journal under live host load:
+
+- About 91% of the lock hold is the chunk's `DELETE`. Each deleted row must
+  remove its entry from `sqlite_autoindex_write_ops_1`, the index on
+  `write_ops.id TEXT PRIMARY KEY`, and those ids are random UUIDs. A
+  2,000-row chunk therefore makes ~2,000-2,500 random leaf reads inside
+  `BEGIN IMMEDIATE` (~7 MiB).
+- That index was ~95% of the cold pages. The 20 GB file is only 1-3% resident
+  in the page cache, so lock hold = reads x per-read latency, and per-read
+  latency swings with the host's IO bursts. That is why a smaller chunk only
+  fell in rate and not in maximum.
+- Per statement inside the lock at 2000 rowids: `BEGIN` wait 0.002 s mean;
+  preview `SELECT` 0.015 s; upsert 0.0001 s; `DELETE` 0.483 s mean / 2.604 s
+  max; `_verify_chunk` ~0; `COMMIT` 0.035 s. The checkpoint (~0.05 s) runs
+  outside the lock. `synchronous=NORMAL`, `wal_autocheckpoint` and chunk size
+  were measured and are minor. Copy baseline at 2000: lock hold mean 0.533 s,
+  p99 2.116 s, max 2.650 s.
+
+**Fix.** `migrate_chunk` runs
+`fused-memory/src/fused_memory/services/read_rollup.py::PREWARM_PRIMARY_KEY_SQL`
+immediately BEFORE `BEGIN IMMEDIATE`.
+It is a read-only walk of the primary-key index for exactly the ids the chunk
+will then delete, over the same rowid window, so the cold reads happen with no
+lock held and the `DELETE` finds its leaf pages cached. Measured on the copy:
+lock hold max 0.18-0.40 s, writer max wait 0.435 s, 0 busy, ~1,900-2,570 rows/s,
+in-lock reads 7.15 MiB -> 0.06-0.3 MiB. Everything inside the transaction is
+unchanged and durability stays `synchronous=FULL`. A row changing between
+prewarm and lock costs only time. `TestMigrationQueryPlans` pins the prewarm's
+plan (including the index's SQLite-generated name, so a rename fails loudly)
+and `fused-memory/tests/test_roll_up_journal_reads_script.py::TestTheWriteLockHold` pins its position before `BEGIN` and the checkpoint after `COMMIT`.
+
+`migrate`'s report now carries `mean_lock_seconds` and `max_lock_seconds`,
+timed from `BEGIN IMMEDIATE` returning to `COMMIT` returning, next to
+`mean_chunk_seconds` and `max_chunk_seconds`. The migration connection sets
+`wal_autocheckpoint=0` and runs `PRAGMA wal_checkpoint(PASSIVE)` after each
+`COMMIT` returns, outside the lock: SQLite's own auto-checkpoint runs inside
+the `COMMIT` call, so left on it would be counted in the lock hold. Re-measure on the live file with
+the pilot of step 3 and record the result here.

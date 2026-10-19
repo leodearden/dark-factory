@@ -70,6 +70,15 @@ DELETE_COUNT_ONLY_READS_SQL = (
     f'WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE}'
 )
 
+# Run just before the chunk's write transaction: the DELETE must drop each row's
+# random-UUID entry from the primary-key autoindex, and those cold leaf reads, not
+# the deletes, are what hold the write lock past fused-memory's busy_timeout.
+PREWARM_PRIMARY_KEY_SQL = (
+    'SELECT count(*) FROM write_ops INDEXED BY sqlite_autoindex_write_ops_1 '
+    'WHERE id IN (SELECT id FROM write_ops NOT INDEXED '
+    f'WHERE rowid >= ? AND rowid < ? AND {COUNT_ONLY_READ_PREDICATE})'
+)
+
 # The migration's work queue starts at the first count-only rowid; NOT INDEXED
 # keeps ORDER BY rowid a rowid-order scan that stops at its first match.
 FIRST_COUNT_ONLY_ROWID_SQL = (
