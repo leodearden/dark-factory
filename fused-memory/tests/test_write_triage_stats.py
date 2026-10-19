@@ -89,8 +89,8 @@ class TestStratifiedRatio:
 
 class TestStratifiedBootstrap95:
     _UNITS = (
-        [('a', 1), ('a', 1), ('a', 0), ('a', 1)]
-        + [('b', 0), ('b', 0), ('b', 1), ('b', 0)]
+        [('a', 1)] * 15 + [('a', 0)] * 5
+        + [('b', 1)] * 5 + [('b', 0)] * 15
     )
 
     def _units(self) -> list[object]:
