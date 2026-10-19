@@ -10975,3 +10975,118 @@ def test_the_verify_cap_counts_only_the_clusters_the_screen_leaves(tmp_path):
     assert outcome.status == "done"
     assert _offered_titles(verify_fn)[0] == [_L6_NOVEL_TITLE]
     assert _run_record(kwargs)["verify_coverage"] == {"novel": 1, "offered": 1, "cap": 1}
+
+
+# ---------------------------------------------------------------------------
+# task 6405 (PRD L6) key rule, end to end: a verdict at a keyed entry's
+# (area, anchor) attaches to that entry instead of promoting a duplicate, and
+# the run files under the entry's standing key (the 10-03 shape minus
+# similarity, part 2).
+# ---------------------------------------------------------------------------
+
+_STANDING_ENTRY_ID = "entry-cand-20260701-1"
+_H11_KEY = finding_key("orchestrator", _ROW5_ANCHOR, "h11")
+
+
+def _keyed_standing_codebook() -> dict:
+    cb = _minimal_v2_codebook()
+    title = "An earlier titled shape"
+    cb["entries"].append({
+        "id": _STANDING_ENTRY_ID,
+        "title": title,
+        "severity": "high",
+        "status": "open",
+        "origin_phase": "implement",
+        "manifested_phase": "verify",
+        "sightings": [_earlier_sighting("sess-a")],
+        **copy.deepcopy(_ROW5_FIELDS),
+        "first_seen_run": "census-dark_factory-20260701",
+        "last_seen_runs": ["census-dark_factory-20260701"],
+        "supersedes": [],
+    })
+    cb["candidates"].append({
+        "id": "cand-20260701-1",
+        "title": title,
+        "first_seen": "2026-07-01",
+        "disposition": "promoted",
+        "promoted_to": _STANDING_ENTRY_ID,
+        "sightings": [_earlier_sighting("sess-a")],
+        **copy.deepcopy(_ROW5_FIELDS),
+    })
+    return cb
+
+
+def _verifying_at_the_row5_anchor(*, tags=("h13", verdict.KIND_TAG)):
+    def verify_fn(clusters, *, model):
+        verified = [{**cluster, "verdict": _keyed_verdict(tags=tags)} for cluster in clusters]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    return verify_fn
+
+
+def test_a_verdict_at_a_keyed_entrys_anchor_attaches_to_it_under_the_standing_key(tmp_path):
+    _write_briefing(tmp_path)
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_verifying_at_the_row5_anchor(tags=("h11", verdict.KIND_TAG)))
+    kwargs["codebook_dict"] = _keyed_standing_codebook()
+    run_id = kwargs["run_id"]
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    assert [entry["id"] for entry in persisted["entries"]] == ["entry-a", _STANDING_ENTRY_ID], "no new entry"
+    [twin] = [c for c in persisted["candidates"] if c["title"] == _PROMOTED_TITLE]
+    assert (twin["disposition"], twin["promoted_to"]) == ("promoted", _STANDING_ENTRY_ID)
+    assert twin["attached_by"] == {"method": "key", "run_id": run_id}
+    standing = next(e for e in persisted["entries"] if e["id"] == _STANDING_ENTRY_ID)
+    assert {field: standing[field] for field in _ROW5_FIELDS} == _ROW5_FIELDS
+    [sighting] = [s for s in standing["sightings"] if s["session"] == "novel-verified"]
+    assert sighting["verifier_tags"] == ["h11", verdict.KIND_TAG]
+    assert sighting["attached_by"] == {"method": "key", "run_id": run_id}
+    assert run_id in standing["last_seen_runs"]
+
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["screened"]["key"] == 1
+    screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
+    assert [line for line in screened.splitlines() if _PROMOTED_TITLE in line and "h13" in line and "h11" in line]
+    confirmed = [row for row in record["findings"] if row["verdict"] == "confirmed"]
+    assert [(row["id"], row["key"]) for row in confirmed] == [(_STANDING_ENTRY_ID, _ROW5_KEY)]
+
+    filed_keys = [call["metadata"]["x_finding_key"] for call in kwargs["submit_fn"].calls]
+    linked_keys = [row["finding_key"] for row in standing.get("filed_tickets") or []]
+    assert filed_keys + linked_keys, "the attached cluster was filed or linked"
+    assert set(filed_keys + linked_keys) == {_ROW5_KEY}
+    assert _H11_KEY not in json.dumps(record)
+
+
+def test_within_run_twins_at_one_anchor_promote_one_entry(tmp_path):
+    _write_briefing(tmp_path)
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+            _hand_digest("novel-rejected", "a spurious one-off"),
+        ]],
+        verify_fn=_verifying_at_the_row5_anchor(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    [entry] = [e for e in persisted["entries"] if e["id"] != "entry-a"]
+    assert entry["finding_key"] == _ROW5_KEY
+    candidates = {c["title"]: c for c in persisted["candidates"]}
+    assert candidates[_PROMOTED_TITLE]["promoted_to"] == entry["id"]
+    assert candidates[_REJECTED_TITLE]["promoted_to"] == entry["id"]
+    assert candidates[_REJECTED_TITLE]["attached_by"] == {"method": "key", "run_id": kwargs["run_id"]}
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["screened"]["key"] == 1
+    assert [row["id"] for row in record["findings"] if row["verdict"] == "confirmed"] == [entry["id"]]
+    assert len(kwargs["submit_fn"].calls) == 1
