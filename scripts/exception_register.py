@@ -770,12 +770,46 @@ _COLUMN_ZERO_ASSIGNMENT = re.compile(rb'(?m)^([A-Za-z_]\w*)\s*[:=]')
 _COLLECTION_DISPLAYS = (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.ListComp, ast.SetComp, ast.DictComp)
 _COLLECTION_FACTORIES = frozenset({'frozenset', 'set', 'tuple', 'list', 'dict', 'MappingProxyType'})
 
-NOT_EXCEPTION_LISTS: Mapping[ListRef, str] = MappingProxyType({})
+NOT_EXCEPTION_LISTS: Mapping[ListRef, str] = MappingProxyType({
+    ListRef('escalation/src/escalation/authority.py', 'ROLE_LEVEL_ALLOWLIST'):
+        'Grants each identity the escalation levels it may resolve or park.',
+    ListRef('escalation/src/escalation/authority.py', 'L2_AUTO_CLOSE_ALLOWLIST'):
+        'Grants which L2 escalations may be closed automatically.',
+    ListRef('escalation/src/escalation/authority.py', 'PROMOTE_ALLOWED'):
+        'Grants which identities may mint an L2 via promote_to_l2.',
+    ListRef('escalation/src/escalation/models.py', 'BORN_AT_L2_SEVERITIES'):
+        'Defines which severities are filed directly at L2, routed to a human.',
+    ListRef('orchestrator/src/orchestrator/merge_lane/worker.py', 'AUTO_HEAL_MECHANICAL_CATEGORIES'):
+        'Grants which merge failure categories the lane may auto-heal.',
+    ListRef('orchestrator/src/orchestrator/recovery_pins.py', 'MERGE_REMEDIABLE_ESC_CATEGORIES'):
+        'Grants which escalation categories a landed merge remediates.',
+    ListRef('orchestrator/src/orchestrator/verify_categories.py', 'ARCHIVE_DENY_LIST'):
+        'A projection of CATEGORY_POLICY, the verify failure-category policy table.',
+    ListRef('orchestrator/src/orchestrator/verify_categories.py', 'PREEXISTING_BREAK_SKIP_CATEGORIES'):
+        'A projection of CATEGORY_POLICY, the verify failure-category policy table.',
+    ListRef('orchestrator/src/orchestrator/verify_categories.py', 'INFRA_TRANSIENT_CATEGORIES'):
+        'A projection of CATEGORY_POLICY, the verify failure-category policy table.',
+    ListRef('orchestrator/src/orchestrator/verify_categories.py', 'INDETERMINATE_VERDICT_CATEGORIES'):
+        'A projection of CATEGORY_POLICY, the verify failure-category policy table.',
+    ListRef('fused-memory/src/fused_memory/config/reload.py', 'RELOADABLE_FIELDS'):
+        'Grants which fused-memory config fields hot-reload.',
+    ListRef('orchestrator/src/orchestrator/config.py', 'RELOADABLE_FIELDS'):
+        'Grants which orchestrator config fields hot-reload.',
+    ListRef('fused-memory/src/fused_memory/server/entity_mint_authz.py', '_DEFAULT_ALLOWED_PREFIXES'):
+        'Fail-closed default grant of which agent_id prefixes may mint entities.',
+    ListRef('fused-memory/src/fused_memory/server/mem0_update_authz.py', '_DEFAULT_ALLOWED_PREFIXES'):
+        'Fail-closed default grant of which agent_id prefixes may update Mem0 records.',
+    ListRef('fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py', '_BRIEFING_REFRESH_PROJECT_ALLOWLIST'):
+        'Grants which projects may use the briefing-refresh hook.',
+    ListRef('scripts/systemd_unit_parity.py', 'ENV_POLICY'):
+        'The unit environment policy table; grants which names are host-local and preserved by the renderer.',
+})
 """Containers whose names match the census but which are not exception lists.
 
 A classification, not a tolerated violation: each row carries a reason, never
-a ratification (D14).  Shipped empty; the day-one rulings seed it.  A row that
-matches no candidate is inert.
+a ratification (D14).  The rows are the design rows of
+``docs/legibility/inv12-day-one-rulings.md`` Part 2, each reason copied from
+that table's last column.  A row that matches no candidate is inert.
 """
 
 
