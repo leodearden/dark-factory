@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from shared.briefing_queries import BriefingScope
+from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
@@ -65,6 +66,23 @@ EVERY architect/simple_task dispatch of that task. As with
 ``COMMIT_BULLET_LIMIT``, the truncation is rendered VISIBLY so the agent knows
 the list is partial and can read the rest from the task record itself.
 """
+
+_TEXT_DRIFT_NOTICES = {
+    TaskTextDrift.CURRENT: '',
+    TaskTextDrift.AMENDED: (
+        '## The Task Text Has Changed\n\n'
+        'The description or details under # Task have been amended since this '
+        'plan was authored. Re-read them and change the plan to cover the '
+        'amended scope; call confirm_plan() only if it already does.'
+    ),
+    TaskTextDrift.UNSTAMPED: (
+        '## The Task Text May Have Changed\n\n'
+        'This plan carries no record of the task text it was authored against, '
+        'so the description or details under # Task may have been amended '
+        'since. Re-read them and change the plan if its scope has moved; call '
+        'confirm_plan() only if it already covers it.'
+    ),
+}
 
 _DELIVERED_CHECK_FIELDS_BY_KIND = {
     'grep': ('pattern', 'expect', 'paths'),
@@ -413,6 +431,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         changed_files: list[str],
         worktree: Path | None = None,
         context: str | None = None,
+        *,
+        text_drift: TaskTextDrift | None = None,
     ) -> str:
         """Build prompt for the architect to revalidate a plan after blast-radius requeue.
 
@@ -451,6 +471,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
             files_section = f'{overlap_section}\n\n{other_section}'.strip()
 
         plan_json = json.dumps(existing_plan, indent=2)
+        notice = _TEXT_DRIFT_NOTICES[text_drift] if text_drift is not None else ''
+        text_drift_section = f'{notice}\n\n' if notice else ''
 
         return f"""\
 {preamble}
@@ -465,7 +487,7 @@ to main, so the files it touched may have changed.
 Your job: review your previous plan against the current state of the codebase
 and either confirm it, update it, or recreate it from scratch.
 
-## Your Previous Plan
+{text_drift_section}## Your Previous Plan
 
 ```json
 {plan_json}

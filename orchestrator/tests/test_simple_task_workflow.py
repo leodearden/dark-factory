@@ -11,6 +11,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from shared.cli_invoke import AgentResult
+from shared.task_text_fingerprint import task_text_fingerprint
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -194,6 +195,7 @@ async def test_simple_task_success_returns_planned(tmp_path: Path):
     assert f.invocation_count == [1]
     plan = f.artifacts.read_plan()
     assert plan['_session_id'] == f.wf.session_id
+    assert plan['_task_text_fp'] == task_text_fingerprint('Add a docstring to foo.', None)
 
     skip_calls = [
         c for c in f.event_emit.call_args_list

@@ -20,6 +20,7 @@ from orchestrator.config import TASK_META_DIRNAME
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
+PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
 
 
 class ArtifactWriteError(OSError):
@@ -1081,10 +1082,14 @@ class TaskArtifacts:
         if base_commit is not None:
             self.update_base_commit(base_commit)
 
-    def stamp_plan_provenance(self, session_id: str) -> None:
+    def stamp_plan_provenance(
+        self, session_id: str, *, task_text_fp: str | None = None,
+    ) -> None:
         """Stamp _session_id and _created_at into plan.json.
 
         Reads current plan.json, adds provenance fields, writes back.
+        ``task_text_fp=None`` leaves an existing fingerprint untouched (the
+        per-iteration and recovered-plan stamps rely on this).
 
         Raises:
             ValueError: if plan.json is missing or does not contain a 'steps' list.
@@ -1106,6 +1111,8 @@ class TaskArtifacts:
         # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
         # plan is not mistaken for an interrupted partial on a later requeue.
         plan.setdefault('_finalized_at', plan['_created_at'])
+        if task_text_fp is not None:
+            plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
         self._write_json(self.root / 'plan.json', plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:
