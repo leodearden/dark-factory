@@ -521,10 +521,19 @@ const DEFAULT_TIMEOUT_MS = 30000; // 10x the poll interval
 // the full 30s deadline is about half that budget held continuously, which
 // is why the HEALTHY tabs also felt sluggish and slow to answer chip changes
 // during the 2026-08-27 incident. Once an endpoint has failed
-// STALE_FAILURE_THRESHOLD times in a row there is nothing left to wait 30s
-// for: it is already reported stale in the UI, and a shorter deadline gets
-// the socket back for the tabs that are still working.
+// STALE_FAILURE_THRESHOLD times in a row, most attempts gain nothing by
+// waiting 30s (STALE_PROBE_EVERY is the exception): it is already reported
+// stale in the UI, and a shorter deadline gets the socket back for the tabs
+// that are still working.
 const STALE_TIMEOUT_MS = 5000;
+
+// A reduced-deadline abort shows only that the endpoint did not answer within
+// STALE_TIMEOUT_MS, so past the threshold every STALE_PROBE_EVERY-th attempt
+// still arms DEFAULT_TIMEOUT_MS; otherwise an endpoint answering in 5-30s could
+// never succeed again. 4 is the smallest N that keeps a wedged endpoint at the
+// 60s backoff plateau holding its socket under half as long as it did with no
+// reduced deadline. Pinned by dashboard/tests/js/data_attempt_deadline.test.mjs.
+const STALE_PROBE_EVERY = 4;
 
 // Fallback for endpoint_staleness.js's threshold, read LAZILY with this
 // literal as a fallback — deliberately unlike the DF_DATUM destructure at the
@@ -548,6 +557,13 @@ function staleFailureThreshold() {
     if (Number.isFinite(n) && n > 0) return n;
   }
   return STALE_FAILURE_THRESHOLD_FALLBACK;
+}
+
+// The abort deadline for an endpoint's next attempt, given its failure streak.
+function attemptDeadlineMs(failures) {
+  const pastThreshold = failures - staleFailureThreshold();
+  if (pastThreshold < 0) return DEFAULT_TIMEOUT_MS;
+  return pastThreshold % STALE_PROBE_EVERY === STALE_PROBE_EVERY - 1 ? DEFAULT_TIMEOUT_MS : STALE_TIMEOUT_MS;
 }
 
 // Republish this endpoint's staleness record onto DF_DATA. Called from
@@ -662,8 +678,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     }
     // An explicitly injected deps.timeoutMs still wins over both defaults;
     // the reduced deadline is a DEFAULT selection, not an override.
-    const timeoutMs = deps.timeoutMs
-      ?? (st.failures >= staleFailureThreshold() ? STALE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
+    const timeoutMs = deps.timeoutMs ?? attemptDeadlineMs(st.failures);
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     // Races the fetch against a deadline instead of relying on the fetch
     // implementation to honour AbortSignal itself (test stubs generally
@@ -757,17 +772,17 @@ function pollSetFor(tab, win) {
 // timer pair. Do NOT add a policy value, and `timeoutMs` in particular. It was
 // pinned here once and that silently disabled the reduced deadline entirely:
 // refreshDFData merges these FIRST, so `deps.timeoutMs` was never undefined,
-// so refreshOne's `deps.timeoutMs ?? (failures >= threshold ? STALE_TIMEOUT_MS
-// : DEFAULT_TIMEOUT_MS)` could not fall through and STALE_TIMEOUT_MS was dead
-// code in every browser. The node suite stayed green throughout, because its
-// tests hand refreshOne a partial deps object with no timeoutMs and so take a
-// path production never takes. Chrome 151 is what caught it (task 4884 step-19,
+// so refreshOne's deadline selection (`deps.timeoutMs ?? attemptDeadlineMs(...)`
+// today) could not fall through and STALE_TIMEOUT_MS was dead code in every
+// browser. The node suite stayed green throughout, because its tests hand
+// refreshOne a partial deps object with no timeoutMs and so take a path
+// production never takes. Chrome 151 is what caught it (task 4884 step-19,
 // #4791 acceptance 3): four consecutive ~30000ms aborts on a wedged endpoint
 // whose banner already read "4 consecutive attempts failed".
 //
-// Now pinned from both ends by data_poll.test.mjs's "PRODUCTION deps merge"
-// test — behaviourally through refreshDFData, and structurally against this
-// literal.
+// Now pinned from both ends by data_attempt_deadline.test.mjs's "PRODUCTION
+// deps merge" test — behaviourally through refreshDFData, and structurally
+// against this literal.
 const DEFAULT_POLL_DEPS = {
   now: () => Date.now(),
   random: () => Math.random(),

@@ -44,7 +44,8 @@ test('staleness: past the threshold the per-attempt deadline drops to STALE_TIME
   // the full 30s deadline consumed about half the page's ~6-concurrent-
   // connections-per-origin budget continuously, which is why the HEALTHY tabs
   // also felt sluggish during the incident. Once an endpoint has demonstrated
-  // it is failing, there is nothing left to wait 30s for.
+  // it is failing, most attempts gain nothing by waiting 30s; the periodic
+  // full-deadline probe below is the exception.
   const armed = [];
   const fetchImpl = () => Promise.reject(new Error('simulated failure'));
   const { api } = loadDataJs({ fetchStub: fetchImpl });
