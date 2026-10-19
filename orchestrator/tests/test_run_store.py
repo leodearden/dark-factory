@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from datetime import UTC, datetime
 
 import pytest
 
 from orchestrator.harness import HarnessReport, TaskReport
-from orchestrator.run_store import RunStore
+from orchestrator.run_store import RunStore, TaskResultRecord
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -1024,3 +1025,112 @@ class TestRunsCodeSha:
         assert self._code_sha(legacy, 'run-legacy') is None
         store.start_run('run-new', 'proj-a', '2026-10-20T00:00:00+00:00', code_sha='e' * 40)
         assert self._code_sha(legacy, 'run-new') == 'e' * 40
+
+
+class TestGetTaskOutcome:
+    """Production's latest recorded outcome for a task, across runs (live-shadow PRD S1)."""
+
+    @staticmethod
+    def _report(**overrides) -> TaskReport:
+        fields = {
+            'task_id': '777',
+            'title': 'Ship the widget',
+            'outcome': WorkflowOutcome.DONE,
+            'cost_usd': 1.25,
+            'duration_ms': 42_000,
+            'agent_invocations': 6,
+            'execute_iterations': 2,
+            'verify_attempts': 3,
+            'review_cycles': 1,
+            'steward_cost_usd': 0.4,
+            'completed_at': '2026-10-18T09:00:00+00:00',
+            'block_reason': '',
+            'block_phase': '',
+        }
+        fields.update(overrides)
+        return TaskReport(**fields)
+
+    @staticmethod
+    def _save(store: RunStore, run_id: str, report: TaskReport, project_id='dark_factory'):
+        store.start_run(run_id, project_id, '2026-10-18T00:00:00+00:00')
+        store.save_task_result(run_id, report, project_id)
+
+    def test_no_row_reads_none(self, tmp_path):
+        assert RunStore(tmp_path / 'runs.db').get_task_outcome('dark_factory', '777') is None
+
+    def test_a_saved_row_reads_back_typed(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        report = self._report(block_reason='verify failed', block_phase='verify')
+        self._save(store, 'run-a', report)
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record == TaskResultRecord(
+            run_id='run-a',
+            project_id='dark_factory',
+            task_id='777',
+            title='Ship the widget',
+            outcome=WorkflowOutcome.DONE,
+            cost_usd=1.25,
+            steward_cost_usd=0.4,
+            duration_ms=42_000,
+            agent_invocations=6,
+            execute_iterations=2,
+            verify_attempts=3,
+            review_cycles=1,
+            completed_at=datetime(2026, 10, 18, 9, 0, tzinfo=UTC),
+            block_reason='verify failed',
+            block_phase='verify',
+        )
+        assert record is not None
+        assert record.outcome is WorkflowOutcome.DONE
+        assert record.completed_at is not None
+        assert record.completed_at.utcoffset() is not None
+
+    def test_the_latest_row_across_runs_wins(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report(
+            outcome=WorkflowOutcome.REQUEUED, completed_at='2026-10-17T09:00:00+00:00',
+        ))
+        self._save(store, 'run-b', self._report(
+            outcome=WorkflowOutcome.DONE, completed_at='2026-10-18T09:00:00+00:00',
+        ))
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record is not None
+        assert (record.run_id, record.outcome) == ('run-b', WorkflowOutcome.DONE)
+
+    def test_another_projects_row_is_never_returned(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-x', self._report(), project_id='reify')
+
+        assert store.get_task_outcome('dark_factory', '777') is None
+        record = store.get_task_outcome('reify', '777')
+        assert record is not None
+        assert record.project_id == 'reify'
+
+    def test_an_untimestamped_row_reads_none_and_sorts_last(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report(completed_at='2026-10-17T09:00:00+00:00'))
+        self._save(store, 'run-b', self._report(
+            outcome=WorkflowOutcome.BLOCKED, completed_at='',
+        ))
+
+        latest = store.get_task_outcome('dark_factory', '777')
+        assert latest is not None
+        assert latest.run_id == 'run-a'
+
+        only_blank = RunStore(tmp_path / 'other.db')
+        self._save(only_blank, 'run-b', self._report(completed_at=''))
+        record = only_blank.get_task_outcome('dark_factory', '777')
+        assert record is not None
+        assert record.completed_at is None
+
+    @pytest.mark.parametrize('field_name', ['outcome', 'run_id', 'completed_at'])
+    def test_the_record_is_frozen(self, tmp_path, field_name):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report())
+        record = store.get_task_outcome('dark_factory', '777')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(record, field_name, None)
