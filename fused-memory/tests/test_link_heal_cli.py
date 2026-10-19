@@ -56,6 +56,7 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
+from fused_memory.memory_metadata import ORCHESTRATOR_COMPLETION_SOURCE
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
@@ -658,6 +659,10 @@ class TestPlanFromAdjudicator:
         'source_args',
         [
             pytest.param(['--from-corpus', 'corpus.jsonl', '--from-adjudicator'], id='both'),
+            pytest.param(
+                ['--deterministic', '--from-corpus', 'corpus.jsonl'], id='deterministic_and_corpus',
+            ),
+            pytest.param(['--deterministic', '--from-adjudicator'], id='deterministic_and_adjudicator'),
             pytest.param([], id='neither'),
         ],
     )
@@ -678,8 +683,11 @@ class TestPlanFromAdjudicator:
             'plan', '--from-corpus', str(corpus), '--project', DF,
         )
 
+        err = capsys.readouterr().err
         assert code == 2
-        assert '--project' in capsys.readouterr().err
+        assert '--project' in err
+        assert '--from-adjudicator' in err
+        assert '--deterministic' in err
         assert workspace.runs() == []
 
     @pytest.mark.asyncio
@@ -788,6 +796,116 @@ class TestApplyFromAdjudicator:
         assert applied['counts']['stopped_by'] == SHARE_STOP
         assert applied['counts']['applied'] == 0
         assert harness.mem0.write_count == 0
+
+
+COMPLETION_META = {'source': ORCHESTRATOR_COMPLETION_SOURCE, 'task_id': '4242'}
+
+
+def seed_completion_children(
+    harness: LinkHealHarness, *projects: str, first: int = 400,
+) -> None:
+    """One orchestrator completion record per project, each filed as an amendment of its own parent."""
+    for index, project in enumerate(projects, start=first):
+        child, parent = _sighting_ids(index)
+        harness.seed_link(
+            child=child, parent=parent, project=project,
+            child_text=f'cli completion {index}', parent_text=f'cli parent {index}',
+            meta={**COMPLETION_META, 'task_id': str(index)},
+        )
+
+
+async def plan_deterministic(
+    env: Any, workspace: Workspace, capsys, *argv: str,
+) -> tuple[int, dict[str, Any]]:
+    code = await run_cli(env, workspace, 'plan', '--deterministic', *argv)
+    return code, printed_report(capsys)
+
+
+def plan_document_actions(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return json.loads(Path(report['plan_path']).read_text())['actions']
+
+
+class TestPlanDeterministic:
+    @pytest.mark.asyncio
+    async def test_plans_the_completion_detaches_of_every_project_without_a_verdict(
+        self, harness, workspace, capsys,
+    ):
+        seed_completion_children(harness, DF, REIFY)
+        seed_unrated_sightings(harness, 1)
+
+        code, report = await plan_deterministic(
+            env_for(harness, workspace), workspace, capsys, '--project', DF, '--project', REIFY,
+        )
+
+        assert code == 0
+        assert report['counts']['planned_by_action'] == {'detach': 2}
+        assert report['counts']['unexamined'] == 1
+        (run,) = workspace.runs()
+        assert (run.run_id, run.source, run.writes) == (
+            report['run_id'], RunSource.DETERMINISTIC, False,
+        )
+        actions = plan_document_actions(report)
+        assert {action['basis_source'] for action in actions} == {'completion_record'}
+        assert sorted(action['project_id'] for action in actions) == sorted([DF, REIFY])
+        assert harness.mem0.write_count == 0
+
+    @pytest.mark.asyncio
+    async def test_project_defaults_to_the_home_project(self, harness, workspace, capsys):
+        home = resolve_project_id(str(workspace.home_root))
+        seed_completion_children(harness, home, DF)
+
+        code, report = await plan_deterministic(env_for(harness, workspace), workspace, capsys)
+
+        assert code == 0
+        assert [action['project_id'] for action in plan_document_actions(report)] == [home]
+
+    @pytest.mark.asyncio
+    async def test_status_names_the_latest_deterministic_plan_as_pending_now(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        seed_completion_children(harness, DF)
+        _code, planned = await plan_deterministic(env, workspace, capsys, '--project', DF)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        line = latest_plan_line(status_lines(capsys), RunSource.DETERMINISTIC)
+        assert planned['run_id'][:8] in line
+        assert planned['plan_path'] in line
+        assert planned['plan_sha256'] in line
+        assert PENDING_NOW in line
+
+
+class TestApplyDeterministic:
+    @pytest.mark.asyncio
+    async def test_an_approved_deterministic_apply_drains_only_its_own_heals(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+        seed_completion_children(harness, DF)
+        _code, planned = await plan_deterministic(env, workspace, capsys, '--project', DF)
+
+        code, applied = await apply(
+            env, workspace, capsys, '--deterministic', '--approved-plan-sha', planned['plan_sha256'],
+        )
+
+        assert code == 0
+        assert applied['counts']['applied'] == 1
+        assert applied['counts']['approved_plan_sha256'] == planned['plan_sha256']
+        assert workspace.pending(RunSource.DETERMINISTIC) == 0
+        assert workspace.pending(RunSource.CORPUS) == 1
+
+    @pytest.mark.asyncio
+    async def test_deterministic_and_adjudicator_together_is_a_usage_error(self, harness, workspace):
+        with pytest.raises(SystemExit) as exited:
+            await run_cli(
+                env_for(harness, workspace), workspace,
+                'apply', '--deterministic', '--from-adjudicator',
+            )
+
+        assert exited.value.code == 2
+        assert workspace.runs() == []
 
 
 class TestStatusShowsWhatAPlanCameTo:
