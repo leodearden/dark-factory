@@ -957,7 +957,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
-    from fused_memory.middleware.curator_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.curator_escalator import (
         _ANCHOR_TASK_ID as CURATOR_ANCHOR,
     )
     from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
