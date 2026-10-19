@@ -21,6 +21,7 @@ from orchestrator.shadow_types import (
     ShadowCellState,
     ShadowShape,
 )
+from orchestrator.workflow_types import WorkflowOutcome
 
 if TYPE_CHECKING:
     from orchestrator.harness import HarnessReport, TaskReport
@@ -234,6 +235,45 @@ def _require_valid_parent(conn: sqlite3.Connection, cell: ShadowCell) -> None:
                 f'{column}={getattr(cell, column)!r}; a child cell shares its '
                 f"parent's project, task and base"
             )
+
+
+@dataclass(frozen=True)
+class TaskResultRecord:
+    """One typed ``task_results`` row; NULL block fields mean the row predates task 3068."""
+
+    run_id: str
+    project_id: str
+    task_id: str
+    title: str | None
+    outcome: WorkflowOutcome
+    cost_usd: float
+    steward_cost_usd: float
+    duration_ms: int
+    agent_invocations: int
+    execute_iterations: int
+    verify_attempts: int
+    review_cycles: int
+    completed_at: datetime | None
+    block_reason: str | None
+    block_phase: str | None
+
+
+_TASK_RESULT_COLUMNS = tuple(field.name for field in fields(TaskResultRecord))
+
+
+def _task_result_from_row(row: sqlite3.Row) -> TaskResultRecord:
+    values: dict[str, Any] = {name: row[name] for name in _TASK_RESULT_COLUMNS}
+    try:
+        values['outcome'] = WorkflowOutcome(values['outcome'])
+    except ValueError:
+        raise ValueError(
+            f'task_results row for task {values["task_id"]!r} (run {values["run_id"]!r}): '
+            f'unknown outcome {values["outcome"]!r}'
+        ) from None
+    values['completed_at'] = (
+        datetime.fromisoformat(values['completed_at']) if values['completed_at'] else None
+    )
+    return TaskResultRecord(**values)
 
 
 _SCHEMA = """\
@@ -520,6 +560,21 @@ class RunStore:
             return 0.0
         cost_usd, steward_cost_usd = row
         return float(cost_usd or 0.0) + float(steward_cost_usd or 0.0)
+
+    def get_task_outcome(self, project_id: str, task_id: str) -> TaskResultRecord | None:
+        """Production's latest recorded outcome for *task_id*, across every run."""
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                f'SELECT {", ".join(_TASK_RESULT_COLUMNS)} FROM task_results '
+                'WHERE project_id = ? AND task_id = ? '
+                'ORDER BY completed_at DESC, rowid DESC LIMIT 1',
+                (project_id, task_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else _task_result_from_row(row)
 
     def finish_run(
         self,

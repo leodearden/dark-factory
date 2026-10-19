@@ -1127,6 +1127,21 @@ class TestGetTaskOutcome:
         assert record is not None
         assert record.completed_at is None
 
+    def test_an_unknown_stored_outcome_is_refused(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report())
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        try:
+            conn.execute("UPDATE task_results SET outcome = 'garbage'")
+            conn.commit()
+        finally:
+            conn.close()
+
+        with pytest.raises(ValueError) as excinfo:
+            store.get_task_outcome('dark_factory', '777')
+        assert '777' in str(excinfo.value)
+        assert 'garbage' in str(excinfo.value)
+
     @pytest.mark.parametrize('field_name', ['outcome', 'run_id', 'completed_at'])
     def test_the_record_is_frozen(self, tmp_path, field_name):
         store = RunStore(tmp_path / 'runs.db')
