@@ -16,14 +16,16 @@ queue are real, on ``tmp_path``.
 INV-10: every row that depends on the executor runs twice. Its ``reverted``
 twin replaces the stage's ``run_auto_consolidation`` with a no-op and must fail
 on an assertion (strict xfail), so a row that would pass without the executor
-fails the suite.
+fails the suite. B6, B11 and B12 run once: their seams (the emit validator, the
+provenance caller bar, the stage deny lists) never reach the executor.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -52,11 +54,16 @@ from _tool_surface_classification import assert_tool_surface_classified
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from mcp.server.fastmcp import FastMCP
-from reconciliation.consolidator_fixtures import make_consolidator
+from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
 
-from fused_memory.config.schema import ConsolidationAutoConfig
+from fused_memory.config.schema import (
+    ConsolidationAutoConfig,
+    FusedMemoryConfig,
+    ReconciliationConfig,
+)
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
+from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.consolidation_auto import AutoOutcome, build_auto_canonical
 from fused_memory.reconciliation.consolidation_auto_executor import (
@@ -71,12 +78,18 @@ from fused_memory.reconciliation.consolidation_proposal import (
     ProposalOutcome,
     outcome_from_record,
 )
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.stages import memory_consolidator as memory_consolidator_module
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    IntegrityCheck,
+    TaskKnowledgeSync,
+)
 from fused_memory.reconciliation.task_filter import filter_task_tree
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.write_journal import WriteJournal
 
 TOPIC = 'e2e-topic-alpha'
 #: A second topic whose token-Jaccard against TOPIC stays under slug_collision_jaccard.
@@ -85,7 +98,7 @@ RATIONALE = 'These records state the same rule in different words.'
 #: The curator sitting, one of the reversal's two callers (PRD C4).
 REVERT_AGENT = 'curator-auto-consolidation-revert'
 
-#: The Mem0 methods the executor, the closure scroll and the revert call.
+#: The Mem0 methods the stateful fake serves in place of the stage's mock.
 _MEM0_SURFACE = (
     'get_memory_by_id',
     'update_memory',
@@ -334,6 +347,50 @@ async def aged_proposal(
         project_id=world.project_id,
         now=datetime.now(UTC) - timedelta(minutes=1),
     )
+
+
+@contextlib.asynccontextmanager
+async def provenance_interceptor(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[TaskInterceptor, AsyncMock, WriteJournal]]:
+    """The real TaskInterceptor over a mock task backend, journaling to a real WriteJournal."""
+    backend = AsyncMock()
+    backend.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'Consolidation gate'},
+    )
+    backend.set_task_status = AsyncMock(return_value={'success': True})
+    backend.set_status_and_stamp_audit = AsyncMock(return_value={'success': True})
+    reconciler = AsyncMock()
+    reconciler.reconcile_task = AsyncMock(return_value={'actions': []})
+    buffer = EventBuffer(db_path=tmp_path / 'eb.db', buffer_size_threshold=100)
+    await buffer.initialize()
+    journal = WriteJournal(tmp_path / 'wj')
+    try:
+        await journal.initialize()
+        interceptor = TaskInterceptor(backend, reconciler, buffer, config=FusedMemoryConfig())
+        interceptor.set_write_journal(journal)
+        yield interceptor, backend, journal
+    finally:
+        await journal.close()
+        await buffer.close()
+
+
+def stage_disallowed_tools() -> dict[StageId, list[str]]:
+    """Each recon stage's ``get_disallowed_tools()``, the list ``BaseStage.run`` hands the CLI."""
+    scope = make_scope(PROJECT_ID, '/tmp/e2e-stage-surface')
+    stages = [
+        make_consolidator(),
+        *(
+            stage_class(
+                stage_id, AsyncMock(), AsyncMock(), AsyncMock(), ReconciliationConfig(), scope=scope,
+            )
+            for stage_class, stage_id in (
+                (TaskKnowledgeSync, StageId.task_knowledge_sync),
+                (IntegrityCheck, StageId.integrity_check),
+            )
+        ),
+    ]
+    return {stage.stage_id: stage.get_disallowed_tools() for stage in stages}
 
 
 def _only(items: Sequence[Any], what: str = 'item') -> Any:
