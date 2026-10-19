@@ -451,6 +451,22 @@ class TestSameBasenameRoots:
         assert config.project_labels.of(b.resolve()) == 'b/proj'
         assert config.project_labels.roots == config.all_project_roots
 
+    def test_the_label_table_is_built_once_per_config(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+
+        assert config.project_labels is config.project_labels
+
+    def test_a_replaced_roster_is_labelled_afresh(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+        assert config.project_labels.of(a.resolve()) == 'a/proj'
+
+        narrowed = dataclasses.replace(config, known_project_roots=[])
+
+        assert narrowed.project_labels.roots == (a.resolve(),)
+        assert narrowed.project_labels.of(a.resolve()) == 'proj'
+
     def test_each_root_keeps_its_own_escalation_url(self, tmp_path):
         a, b = self._roots(tmp_path)
         expected = {
