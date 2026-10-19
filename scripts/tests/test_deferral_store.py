@@ -27,6 +27,7 @@ from deferral_store import (
 from legibility import census_trigger
 from shared.task_deferral import (
     CarriedByDeferral,
+    CarriedByRequest,
     DeferralInvalidReason,
     DeferralRefusalCode,
     record_to_json,
@@ -196,7 +197,7 @@ class TestKnownProject:
 
 class TestRestamp:
     AGENT = 'migrate-deferrals'
-    CARRIED_BY = {'kind': 'carried_by', 'carrier_task_id': 2, 'reason': 'migrated'}
+    CARRIED_BY = CarriedByRequest(carrier_task_id=2, reason='migrated')
 
     def test_the_write_is_a_guarded_restamp_and_an_echo_is_stamped(
         self, root: Path, store: DeferralStore, serve: Any
@@ -210,7 +211,7 @@ class TestRestamp:
                 'project_root': str(root),
                 'id': '1',
                 'status': 'deferred',
-                'deferral': self.CARRIED_BY,
+                'deferral': {'kind': 'carried_by', 'carrier_task_id': 2, 'reason': 'migrated'},
                 'restamp_only': True,
                 'agent_id': self.AGENT,
             }
@@ -224,7 +225,7 @@ class TestRestamp:
     def test_deferral_invalid_is_refused_with_its_reason(self, root: Path, store: DeferralStore, serve: Any) -> None:
         serve(FakeFusedMemory({str(root): [_row(1)]}))
 
-        outcome = store.restamp(root, 1, {**self.CARRIED_BY, 'carrier_task_id': 77}, agent_id=self.AGENT)
+        outcome = store.restamp(root, 1, CarriedByRequest(carrier_task_id=77), agent_id=self.AGENT)
 
         assert outcome == Refused(
             code=DeferralRefusalCode.INVALID,

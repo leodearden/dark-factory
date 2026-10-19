@@ -22,6 +22,7 @@ from shared.task_deferral import (
     Deferral,
     DeferralInvalidReason,
     DeferralRefusalCode,
+    DeferralRequest,
     InvalidRecord,
     parse_record,
 )
@@ -301,13 +302,13 @@ class DeferralStore:
         return self._call('get_statuses', arguments, _parse_statuses)
 
 
-    def restamp(self, root: Path, task_id: int, request: Mapping[str, Any], *, agent_id: str) -> RestampOutcome:
+    def restamp(self, root: Path, task_id: int, request: DeferralRequest, *, agent_id: str) -> RestampOutcome:
         """A guarded re-stamp of an unrecorded deferred row: ``restamp_only``, expecting no record."""
         arguments = {
             'project_root': _root_argument(root),
             'id': str(task_id),
             'status': TaskStatus.DEFERRED.value,
-            'deferral': dict(request),
+            'deferral': request.model_dump(mode='json', exclude_none=True),
             'restamp_only': True,
             'agent_id': agent_id,
         }

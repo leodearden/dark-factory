@@ -35,12 +35,12 @@ from orchestrator_projects import ProjectTarget
 from project_report import UnreadableProject
 from shared.task_deferral import (
     REASON_MAX_CHARS,
-    CarriedByDeferral,
     CarriedByRequest,
     DeferralInvalid,
     DeferralInvalidReason,
     DeferralKind,
     DeferralRefusalCode,
+    DeferralRequest,
     InvalidRecord,
     LegacyUnknownRequest,
     NeedsHumanReason,
@@ -105,12 +105,12 @@ class Fallback:
 
 @dataclass(frozen=True)
 class RowPlan:
-    """The request one row will be re-stamped with; *request* is the wire ``deferral`` argument."""
+    """The request one row will be re-stamped with, already validated by the shared parser."""
 
     task_id: int
     title: str
     source: Source | None
-    request: dict[str, Any]
+    request: DeferralRequest
     fallback: Fallback | None
     mapped_kind: DeferralKind = DeferralKind.LEGACY_UNKNOWN
     source_value: object = None
@@ -137,9 +137,8 @@ def _legacy_reason(fallback: Fallback | None, human_decomposed: bool) -> str:
     return f'{head}{value}{note}'
 
 
-def _legacy_request(fallback: Fallback | None, human_decomposed: bool) -> dict[str, Any]:
-    request = LegacyUnknownRequest(reason=_legacy_reason(fallback, human_decomposed))
-    return request.model_dump(mode='json', exclude_none=True)
+def _legacy_request(fallback: Fallback | None, human_decomposed: bool) -> LegacyUnknownRequest:
+    return LegacyUnknownRequest(reason=_legacy_reason(fallback, human_decomposed))
 
 
 def fallback_plan(plan: RowPlan, reason_code: DeferralInvalidReason) -> RowPlan:
@@ -151,21 +150,22 @@ def fallback_plan(plan: RowPlan, reason_code: DeferralInvalidReason) -> RowPlan:
 
 
 def _mapped_plan(row: TaskRow, source: Source, mapped: _Mapped, human_decomposed: bool, now: datetime) -> RowPlan:
-    plan = RowPlan(
+    fallback: Fallback | None = None
+    try:
+        request: DeferralRequest = parse_request({**mapped.raw, 'reason': f'migrated from metadata.{source}'}, now=now)
+    except DeferralInvalid as exc:
+        fallback = Fallback(source=source, value=mapped.value, reason_code=exc.reason)
+        request = _legacy_request(fallback, human_decomposed)
+    return RowPlan(
         task_id=row.task_id,
         title=row.title,
         source=source,
-        request={**mapped.raw, 'reason': f'migrated from metadata.{source}'},
-        fallback=None,
+        request=request,
+        fallback=fallback,
         mapped_kind=mapped.raw['kind'],
         source_value=mapped.value,
         human_decomposed=human_decomposed,
     )
-    try:
-        request = parse_request(plan.request, now=now)
-    except DeferralInvalid as exc:
-        return fallback_plan(plan, exc.reason)
-    return replace(plan, request=request.model_dump(mode='json', exclude_none=True))
 
 
 def plan_row(row: TaskRow, *, now: datetime) -> RowPlan | AlreadyRecorded:
@@ -191,10 +191,11 @@ def plan_row(row: TaskRow, *, now: datetime) -> RowPlan | AlreadyRecorded:
 
 def carrier_reason(plan: RowPlan, carrier_statuses: Mapping[int, TaskStatus], *, now: datetime) -> NeedsHumanReason | None:
     """Why the carried_by record *plan* would stamp needs a human (closable, orphaned, missing), else None."""
-    record = stamp(parse_request(plan.request, now=now), stamped_at=now, stamped_by=MIGRATION_AGENT_ID, deferred_at=None)
-    if not isinstance(record, CarriedByDeferral):
+    request = plan.request
+    if not isinstance(request, CarriedByRequest):
         return None
-    return needs_human(record, now, carrier_statuses.get(record.carrier_task_id), None)
+    record = stamp(request, stamped_at=now, stamped_by=MIGRATION_AGENT_ID, deferred_at=None)
+    return needs_human(record, now, carrier_statuses.get(request.carrier_task_id), None)
 
 
 class MigrationExit(IntEnum):
@@ -241,8 +242,8 @@ class ProjectReport:
         return any(outcome.outcome is Outcome.FAILED for outcome in self.outcomes)
 
 
-def _carrier_ids(plans: Iterable[RowPlan], now: datetime) -> set[int]:
-    requests = (parse_request(plan.request, now=now) for plan in plans)
+def _carrier_ids(plans: Iterable[RowPlan]) -> set[int]:
+    requests = (plan.request for plan in plans)
     return {request.carrier_task_id for request in requests if isinstance(request, CarriedByRequest)}
 
 
@@ -287,7 +288,7 @@ def migrate_project(
         rows = sorted(store.deferred_rows(target.root), key=lambda row: row.task_id)
         planned = [plan_row(row, now=now) for row in rows]
         plans = tuple(plan for plan in planned if isinstance(plan, RowPlan))
-        carrier_statuses = store.statuses(target.root, _carrier_ids(plans, now))
+        carrier_statuses = store.statuses(target.root, _carrier_ids(plans))
     except StoreUnreachable as exc:
         return UnreadableProject(target, str(exc))
     reasons = {plan.task_id: carrier_reason(plan, carrier_statuses, now=now) for plan in plans}
