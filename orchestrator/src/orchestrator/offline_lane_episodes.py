@@ -43,6 +43,9 @@ Rules the engine and its pure rules keep beyond the PRD's text:
   nodes, or a pre-cutover task's ``failing_tests``), committed and named in
   ``prior_task_ids``.  Only the rest are submitted.  A failed lookup or read files
   nothing and keeps the filing due with that reason.
+- R14 a command record that has observed no pass takes its last pass and last green
+  head from the command's run records before the pass, so a cutover or a lost store
+  keeps a green pass on record.
 """
 
 from __future__ import annotations
@@ -77,6 +80,7 @@ from orchestrator.offline_lane_episode_state import (
     reproduced_nodes,
     unconfirmable_node,
     with_probe,
+    with_recorded_history,
 )
 from orchestrator.offline_lane_escalations import (
     PENDING_ESCALATION,
@@ -105,6 +109,7 @@ from orchestrator.offline_lane_filing import (
     covering_lane_task,
 )
 from orchestrator.offline_lane_records import (
+    RECORD_RETENTION,
     PassRecord,
     ProbeKind,
     ProbeResult,
@@ -411,6 +416,7 @@ class LaneEngine:
         policy = lane_policy(self._config)
         record = await asyncio.to_thread(self._store.load, observation.command)
         record, filed = await self._retry_due_filings(record)
+        record = await self._with_recorded_history(record, observation)
         reads, statuses = await self._pass_reads(record, observation)
         applied = apply_pass(record, observation, reads, policy, self._now())
         record = applied.record
@@ -693,6 +699,21 @@ class LaneEngine:
             logger.exception('offline-lane: state of escalation %s unreadable', escalation_id)
             return False
         return state in CLOSED_ESCALATION_STATES
+
+    async def _with_recorded_history(self, record: CommandRecord, observation: PassObservation) -> CommandRecord:
+        """R14; the run records are evidence, never a gate, so an unreadable listing seeds nothing."""
+        if record.last_pass_id is not None:
+            return record
+        try:
+            recorded = await asyncio.to_thread(self._recorded_before, observation)
+        except (OSError, ValueError):
+            logger.exception('offline-lane: %s: run records unreadable, no history seeded', record.command)
+            return record
+        return with_recorded_history(record, recorded)
+
+    def _recorded_before(self, observation: PassObservation) -> list[PassRecord]:
+        recorded = self._records.passes_since(observation.command, observation.started_at - RECORD_RETENTION)
+        return [earlier for earlier in recorded if earlier.started_at < observation.started_at]
 
     async def _previous_detect(self, record: CommandRecord) -> RunRecord | None:
         if record.last_pass_id is None:
