@@ -30,6 +30,7 @@ Usage
 Exit codes
 ----------
   0  the run completed.
+  1  a gate this run wrote to is still not closed afterwards.
   2  the run could not start: bad arguments, an unreadable tasks.db, a store
      this process may not mutate (--execute), the consolidation_auto kill
      switch (--execute), or an unavailable canonical-slug list.
@@ -109,6 +110,7 @@ _RATIONALE = 'Migrated from consolidation gate {task_id} by scripts/migrate_open
 
 class ExitCode(IntEnum):
     COMPLETED = 0
+    GATE_LEFT_OPEN = 1
     COULD_NOT_RUN = 2
 
 
@@ -202,6 +204,15 @@ class GateReport:
     @property
     def codes(self) -> tuple[str, ...]:
         return tuple(reason.code for reason in self.reasons)
+
+    @property
+    def attempted_execution(self) -> bool:
+        return self.execution is not None or RefusalCode.EXECUTION_REFUSED in self.codes
+
+    @property
+    def left_open(self) -> bool:
+        """This run wrote to the gate's topic and the gate is still not closed."""
+        return self.disposition is Disposition.EXECUTED and not (self.closure and self.closure.closed)
 
 
 @dataclass(frozen=True)
@@ -307,29 +318,38 @@ def _id_order(task_id: str) -> tuple[int, str]:
 
 
 async def migrate(ctx: RunContext, gates: Iterable[OpenGate]) -> tuple[GateReport, ...]:
-    return tuple([await migrate_gate(ctx, gate) for gate in gates])
+    """Every gate in order, executing at most ``max_auto_per_cycle`` of them per run."""
+    reports: list[GateReport] = []
+    for gate in gates:
+        attempts = sum(report.attempted_execution for report in reports)
+        reports.append(
+            await migrate_gate(ctx, gate, may_execute=attempts < ctx.config.max_auto_per_cycle),
+        )
+    return tuple(reports)
 
 
-async def migrate_gate(ctx: RunContext, gate: OpenGate) -> GateReport:
+async def migrate_gate(ctx: RunContext, gate: OpenGate, *, may_execute: bool) -> GateReport:
     """One gate, isolated: a store failure is reported on this gate and never ends the run."""
     topic = declared_gate_topic(gate.metadata)
     if topic is None:
         return _refused(gate, None, MigrationCode.GATE_TOPIC_UNUSABLE)
-    report = await _rule(ctx, gate, topic)
+    report = await _rule(ctx, gate, topic, may_execute=may_execute)
     if ctx.mode is Mode.DRY_RUN:
         return report
     return await _settle(ctx, gate, topic, report)
 
 
-async def _rule(ctx: RunContext, gate: OpenGate, topic: str) -> GateReport:
+async def _rule(ctx: RunContext, gate: OpenGate, topic: str, *, may_execute: bool) -> GateReport:
     scroll_ids = await _scroll_topic(ctx, topic)
     if isinstance(scroll_ids, MigrationCode):
         return _refused(gate, topic, scroll_ids)
     assessment = await assess(ctx, gate, topic, scroll_ids)
     report = _dispose(ctx, assessment)
-    if ctx.mode is Mode.EXECUTE and report.disposition is Disposition.WOULD_EXECUTE:
-        return await _execute(ctx, assessment)
-    return report
+    if ctx.mode is not Mode.EXECUTE or report.disposition is not Disposition.WOULD_EXECUTE:
+        return report
+    if not may_execute:
+        return assessment.report(Disposition.DEFERRED, [Reason(MigrationCode.CYCLE_CAP_REACHED)])
+    return await _execute(ctx, assessment)
 
 
 def _refused(gate: OpenGate, topic: str | None, code: MigrationCode) -> GateReport:
@@ -847,6 +867,13 @@ async def _migrate_and_emit(
         project_id=ctx.project_id, mode=ctx.mode, run_id=ctx.run_id, gates=await migrate(ctx, gates),
     )
     print(json.dumps(report_payload(report), indent=2) if invocation.as_json else render_text(report))
+    return exit_code(report)
+
+
+def exit_code(report: MigrationReport) -> ExitCode:
+    """1 when a gate this run wrote to is still not closed: a partial write always shows as one."""
+    if any(gate.left_open for gate in report.gates):
+        return ExitCode.GATE_LEFT_OPEN
     return ExitCode.COMPLETED
 
 
