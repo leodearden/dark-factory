@@ -53,6 +53,7 @@ from shared.task_statuses import TaskStatus
 MIGRATION_AGENT_ID: Final = 'migrate-deferrals'
 HUMAN_DECOMPOSED_NOTE: Final = 'human_decomposed: possibly an uncommitted planning birth'
 ALREADY_RECORDED: Final = 'already recorded'
+DEFERRED_WATCH: Final = 'deferred_watch'
 _VALUE_HEAD_CHARS: Final = 60
 _TOOL: Final = 'migrate_deferrals.py'
 
@@ -77,7 +78,7 @@ def _coalesced_into(metadata: Mapping[str, Any]) -> _Mapped | None:
 
 def _watch_trigger(metadata: Mapping[str, Any]) -> _Mapped | None:
     value = metadata.get(Source.TRIGGER)
-    if metadata.get('deferred_watch') is None or value is None:
+    if metadata.get(DEFERRED_WATCH) is None or value is None:
         return None
     return _Mapped(value, {'kind': DeferralKind.UNTIL_CONDITION, 'condition': value})
 
@@ -87,11 +88,21 @@ def _armed_by(metadata: Mapping[str, Any]) -> _Mapped | None:
     return None if value is None else _Mapped(value, {'kind': DeferralKind.UNTIL_CONDITION, 'condition': value})
 
 
-_MAPPINGS: Final[tuple[tuple[Source, Callable[[Mapping[str, Any]], _Mapped | None]], ...]] = (
-    (Source.X_COALESCED_INTO, _coalesced_into),
-    (Source.TRIGGER, _watch_trigger),
-    (Source.X_ARMED_BY, _armed_by),
+@dataclass(frozen=True)
+class _LegacyMapping:
+    """One legacy shape: the key a request is read from, what the metadata must carry, and the reader."""
+
+    source: Source
+    needs: str
+    extract: Callable[[Mapping[str, Any]], _Mapped | None]
+
+
+_MAPPINGS: Final = (
+    _LegacyMapping(Source.X_COALESCED_INTO, Source.X_COALESCED_INTO, _coalesced_into),
+    _LegacyMapping(Source.TRIGGER, f'{DEFERRED_WATCH} with {Source.TRIGGER}', _watch_trigger),
+    _LegacyMapping(Source.X_ARMED_BY, Source.X_ARMED_BY, _armed_by),
 )
+_NO_MAPPING_REASON: Final = f'migrated: no mapped legacy key ({", ".join(mapping.needs for mapping in _MAPPINGS)})'
 
 
 @dataclass(frozen=True)
@@ -131,7 +142,7 @@ def _truncated(text: str, budget: int) -> str:
 def _legacy_reason(fallback: Fallback | None, human_decomposed: bool) -> str:
     note = f'; {HUMAN_DECOMPOSED_NOTE}' if human_decomposed else ''
     if fallback is None:
-        return f'migrated: metadata names no {", ".join(Source)}{note}'
+        return f'{_NO_MAPPING_REASON}{note}'
     head = f'migration fallback: metadata.{fallback.source} refused {fallback.reason_code}: '
     value = _truncated(json.dumps(fallback.value), REASON_MAX_CHARS - len(head) - len(note))
     return f'{head}{value}{note}'
@@ -175,10 +186,10 @@ def plan_row(row: TaskRow, *, now: datetime) -> RowPlan | AlreadyRecorded:
         return AlreadyRecorded(task_id=row.task_id, title=row.title, kind=record.kind)
     metadata = row.metadata or {}
     human_decomposed = bool(metadata.get('human_decomposed'))
-    for source, extract in _MAPPINGS:
-        mapped = extract(metadata)
+    for mapping in _MAPPINGS:
+        mapped = mapping.extract(metadata)
         if mapped is not None:
-            return _mapped_plan(row, source, mapped, human_decomposed, now)
+            return _mapped_plan(row, mapping.source, mapped, human_decomposed, now)
     return RowPlan(
         task_id=row.task_id,
         title=row.title,

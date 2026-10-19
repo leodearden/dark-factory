@@ -133,6 +133,12 @@ class TestPlanRow:
         assert plan.source is None
         assert plan.fallback is None
 
+    @pytest.mark.parametrize('metadata', [{'trigger': 't'}, {}], ids=['trigger-without-watch', 'bare'])
+    def test_the_legacy_reason_names_what_each_mapping_needs(self, metadata: dict[str, Any]) -> None:
+        reason = reason_of(planned(row(**metadata)))
+
+        assert reason == 'migrated: no mapped legacy key (x_coalesced_into, deferred_watch with trigger, x_armed_by)'
+
     @pytest.mark.parametrize(('flag', 'noted'), [(True, True), ('yes', True), (False, False), (None, False)])
     def test_legacy_unknown_notes_a_human_decomposed_row(self, flag: object, noted: bool) -> None:
         plan = planned(row(human_decomposed=flag))
