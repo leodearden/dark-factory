@@ -10,6 +10,7 @@ no IO. Every refusal is a :class:`DefectWriteRefused` whose
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -25,8 +26,6 @@ from shared.defects import (
     DeclareEvent,
     DeclareRetirement,
     DefectDeclaration,
-    DefectOrigin,
-    DefectStatus,
     DuplicateDefectRef,
     IllegalDefectTransition,
     OutcomeEvent,
@@ -151,11 +150,14 @@ class DefectRefsNotUnique(DefectWriteRefused):
 
 
 class StoredDefectRecordsMalformed(DefectWriteRefused):
+    """The stored records cannot be read; ``key`` is None when the whole blob is not an object."""
+
     refusal = DefectWriteRefusalCode.STORED_RECORDS_MALFORMED
 
-    def __init__(self, key: str, index: int | None, detail: str) -> None:
+    def __init__(self, key: str | None, index: int | None, detail: str) -> None:
+        stored = 'metadata' if key is None else f'metadata.{key}'
         super().__init__(
-            f'the stored metadata.{key} cannot be read as defect records, so no event '
+            f'the stored {stored} cannot be read as defect records, so no event '
             f'can be applied to it: {detail}',
             key=key,
             index=index,
@@ -187,16 +189,15 @@ class DefectRefNotLive(DefectWriteRefused):
 
 
 class DefectCreationRefused(DefectWriteRefused):
+    """``detail`` carries the ``shared.defects`` validator's own words, which name the allowed values."""
+
     refusal = DefectWriteRefusalCode.CREATION_REFUSED
 
-    def __init__(
-        self, key: str, index: int | None, detail: str, allowed: Mapping[str, list[str | None]]
-    ) -> None:
+    def __init__(self, key: str, index: int | None, detail: str) -> None:
         super().__init__(
             f'a creating write may carry metadata.{key} only as fresh records: {detail}',
             key=key,
             index=index,
-            allowed={field: list(values) for field, values in allowed.items()},
         )
 
 
@@ -277,6 +278,25 @@ class DefectRecords:
             retirements=_stored_records(metadata, DEFECT_TEST_RETIREMENTS_METADATA_KEY, Retirement),
         )
 
+    @classmethod
+    def from_stored_blob(cls, stored_raw: str | None) -> DefectRecords:
+        """:meth:`from_metadata` over a task row's stored metadata text; an absent blob is no records.
+
+        Raises:
+            StoredDefectRecordsMalformed: with ``key`` None when the blob is
+                not a JSON object, else as :meth:`from_metadata`.
+            DefectRefsNotUnique: as :meth:`from_metadata`.
+        """
+        try:
+            stored = json.loads(stored_raw) if stored_raw else {}
+        except ValueError:
+            stored = None
+        if not isinstance(stored, dict):
+            raise StoredDefectRecordsMalformed(
+                None, None, f'it is not a JSON object (stored {(stored_raw or "")[:80]!r})'
+            )
+        return cls.from_metadata(stored)
+
     def apply(self, events: Iterable[_AnyEvent]) -> DefectRecordsChange:
         """The records after *events*, in order, each folded into the record its ref names.
 
@@ -351,21 +371,6 @@ def refs_required_live(events: Iterable[_AnyEvent]) -> tuple[LiveRefRequirement,
 
 # --- The creation floor --------------------------------------------------------
 
-_ALLOWED_AT_CREATION: Mapping[str, Mapping[str, list[str | None]]] = MappingProxyType(
-    {
-        DEFECTS_METADATA_KEY: MappingProxyType(
-            {
-                'status': [DefectStatus.OPEN.value],
-                'origin': [origin.value for origin in DefectOrigin],
-            }
-        ),
-        DEFECT_TEST_RETIREMENTS_METADATA_KEY: MappingProxyType(
-            {'reason': [code.value for code in RetirementCode], 'ruling': [None]}
-        ),
-    }
-)
-
-
 def _creation_event(key: str, entry: object) -> Declare | DeclareRetirement:
     if key == DEFECTS_METADATA_KEY:
         return Declare.model_validate({'declaration': entry})
@@ -373,20 +378,19 @@ def _creation_event(key: str, entry: object) -> Declare | DeclareRetirement:
 
 
 def _require_fresh_list(key: str, raw: object) -> None:
-    allowed = _ALLOWED_AT_CREATION[key]
     if not isinstance(raw, list):
-        raise DefectCreationRefused(key, None, f'a {type(raw).__name__}, not a list', allowed)
+        raise DefectCreationRefused(key, None, f'a {type(raw).__name__}, not a list')
     records: list[DefectDeclaration | Retirement] = []
     for index, entry in enumerate(raw):
         try:
             event = _creation_event(key, entry)
         except ValidationError as exc:
-            raise DefectCreationRefused(key, index, str(exc), allowed) from exc
+            raise DefectCreationRefused(key, index, str(exc)) from exc
         records.append(event.declaration if isinstance(event, Declare) else event.retirement)
     try:
         require_unique_refs(records)
     except DuplicateDefectRef as exc:
-        raise DefectCreationRefused(key, None, str(exc), allowed) from exc
+        raise DefectCreationRefused(key, None, str(exc)) from exc
 
 
 def require_creation_floor(metadata: Mapping[str, object] | None) -> None:
@@ -398,8 +402,9 @@ def require_creation_floor(metadata: Mapping[str, object] | None) -> None:
     at most once.
 
     Raises:
-        DefectCreationRefused: naming the key, the offending index (None for
-            a non-list or a repeated ref) and the allowed values.
+        DefectCreationRefused: naming the key and the offending index (None
+            for a non-list or a repeated ref); its detail names the allowed
+            values.
     """
     if metadata is None:
         return

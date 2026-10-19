@@ -3761,7 +3761,11 @@ class SqliteTaskBackend:
         """See :meth:`TaskBackendProtocol.apply_defect_events`; the rules live in defect_records.py.
 
         The liveness lookup reads before the write unit opens, because a read
-        must never nest inside :meth:`_write_unit` (see :meth:`_fresh_read_conn`).
+        must never nest inside :meth:`_write_unit` (see :meth:`_fresh_read_conn`),
+        so the two are not atomic. That is sound: only removing a ref's last
+        carrier un-lives it, and a removal landing between the read and the
+        write leaves the state a removal just after the write leaves, which
+        ``remove_task`` permits since it checks no referrer.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -3776,8 +3780,7 @@ class SqliteTaskBackend:
                 raise TaskNotFoundError(task_id, tag=tag)
             if row['status'] in TERMINAL:
                 raise DefectTaskTerminal(task_id, row['status'])
-            stored = _stored_metadata_object(row['metadata'], task_id)
-            change = DefectRecords.from_metadata(stored).apply(events)
+            change = DefectRecords.from_stored_blob(row['metadata']).apply(events)
             changed = change.changed_metadata()
             new_metadata = _merge_metadata(
                 row['metadata'], json.dumps(changed), mode='merge',
@@ -4522,21 +4525,6 @@ _JSON_TYPE_NAMES: dict[type, str] = {
     float: 'number',
     type(None): 'null',
 }
-
-
-def _stored_metadata_object(stored_raw: str | None, task_id: str) -> dict[str, Any]:
-    """The row's stored metadata as an object (an absent blob is ``{}``); refuses any other shape."""
-    try:
-        stored = json.loads(stored_raw) if stored_raw else {}
-    except ValueError:
-        stored = None
-    if not isinstance(stored, dict):
-        raise TaskmasterError(
-            'TASKMASTER_TOOL_ERROR',
-            f'Task {task_id} metadata is not a JSON object, so its defect records cannot be '
-            f'read; nothing was written (stored {(stored_raw or "")[:80]!r})',
-        )
-    return stored
 
 
 def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict:

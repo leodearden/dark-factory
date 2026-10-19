@@ -161,7 +161,7 @@ async def test_the_ticket_path_refuses_a_proven_entry_before_persisting(
     wire = await stack.submit({DEFECTS_METADATA_KEY: [_PROVEN]})
 
     _assert_refused(wire, DEFECTS_METADATA_KEY, 0)
-    assert wire['allowed']['status'] == [DefectStatus.OPEN.value]
+    assert f'status {DefectStatus.OPEN.value}' in wire['detail']
     assert await stack.tickets() == []
     assert await stack.task_ids() == []
 
@@ -184,7 +184,8 @@ async def test_an_unknown_origin_is_refused_naming_every_origin(stack: CreationS
     )
 
     _assert_refused(wire, DEFECTS_METADATA_KEY, 0)
-    assert wire['allowed']['origin'] == [origin.value for origin in DefectOrigin]
+    for origin in DefectOrigin:
+        assert f"'{origin.value}'" in wire['detail']
 
 
 @pytest.mark.asyncio
@@ -194,7 +195,7 @@ async def test_a_ruled_retirement_is_refused(stack: CreationStack) -> None:
     )
 
     _assert_refused(wire, DEFECT_TEST_RETIREMENTS_METADATA_KEY, 0)
-    assert wire['allowed']['ruling'] == [None]
+    assert 'unruled' in wire['detail']
 
 
 @pytest.mark.asyncio

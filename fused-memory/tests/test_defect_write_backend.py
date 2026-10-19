@@ -50,14 +50,14 @@ from fused_memory.backends.defect_records import (
     DefectRefNotLive,
     DefectTaskTerminal,
     DefectTransitionRefused,
+    StoredDefectRecordsMalformed,
 )
 from fused_memory.backends.defect_ref_lookup import (
     DefectRefCarrier,
     lookup_defect_ref,
 )
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
-from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
-from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.config.schema import TaskmasterConfig
 
 _REF = mint_human_ref(datetime(2026, 10, 18, 12, 34, 56, tzinfo=UTC), 'Some summary')
@@ -374,14 +374,10 @@ async def test_a_non_object_stored_blob_is_refused_and_preserved(
     task_id = await stack.seed()
     stack.corrupt(task_id, raw)
 
-    with pytest.raises(TaskmasterError):
+    with pytest.raises(StoredDefectRecordsMalformed) as excinfo:
         await stack.apply(task_id, Declare(declaration=_declaration()))
 
+    wire = excinfo.value.to_error_dict(task_id=task_id)
+    assert wire['error'] == 'stored_defect_records_malformed'
+    assert wire['key'] is None
     assert stack.stored_bytes(task_id)[0] == raw
-
-
-# --- (i) the protocol ----------------------------------------------------------------
-
-
-def test_the_backend_protocol_declares_apply_defect_events() -> None:
-    assert hasattr(TaskBackendProtocol, 'apply_defect_events')

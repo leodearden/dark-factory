@@ -9,8 +9,10 @@ MCP server.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -51,6 +53,7 @@ from shared.defects import (
     parse_ref,
 )
 from shared.governed_exceptions import Debt, TaskRef
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -276,6 +279,22 @@ async def test_a_duplicate_of_an_undeclared_ref_is_refused(stack: ToolStack) -> 
     assert reply['error'] == 'defect_ref_not_live'
     assert reply['ref'] == _OTHER_REF
     assert reply['relation'] == 'duplicate_of'
+
+
+@pytest.mark.asyncio
+async def test_a_stored_blob_that_is_not_an_object_is_a_structured_refusal(
+    stack: ToolStack,
+) -> None:
+    task_id = await stack.seed()
+    with contextlib.closing(sqlite3.connect(tasks_db(stack.root))) as conn, conn:
+        conn.execute('UPDATE tasks SET metadata = ? WHERE id = ?', ('[1, 2]', int(task_id)))
+
+    reply = await stack.call('declare_defect', task_id=task_id, event=_DECLARE)
+
+    assert reply['success'] is False
+    assert reply['error'] == 'stored_defect_records_malformed'
+    assert reply['key'] is None
+    assert reply['task_id'] == task_id
 
 
 # --- (f) the lookup ------------------------------------------------------------------

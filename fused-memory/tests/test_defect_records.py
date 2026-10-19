@@ -9,6 +9,7 @@ refusals as structured data, and floors what a creating write may carry.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, get_args
 
@@ -349,6 +350,27 @@ def test_a_stored_list_repeating_a_ref_is_refused_naming_the_ref() -> None:
     assert wire['refs'] == [_REF]
 
 
+@pytest.mark.parametrize('raw', [None, ''])
+def test_an_absent_stored_blob_holds_no_records(raw: str | None) -> None:
+    assert DefectRecords.from_stored_blob(raw) == DefectRecords()
+
+
+def test_a_stored_blob_reads_as_its_metadata_object() -> None:
+    stored = _stored(_declaration(), files=['a.py'])
+
+    assert DefectRecords.from_stored_blob(json.dumps(stored)) == DefectRecords.from_metadata(stored)
+
+
+@pytest.mark.parametrize('raw', ['[1, 2]', 'not json', '"text"'])
+def test_a_stored_blob_that_is_not_an_object_is_refused_as_a_whole(raw: str) -> None:
+    with pytest.raises(StoredDefectRecordsMalformed) as excinfo:
+        DefectRecords.from_stored_blob(raw)
+    wire = excinfo.value.to_error_dict()
+    assert wire['error'] == 'stored_defect_records_malformed'
+    assert wire['key'] is None
+    assert wire['index'] is None
+
+
 # --- (h) refs another task must already declare ---------------------------------
 
 
@@ -381,20 +403,6 @@ def test_refs_required_live(event: Any, expected: tuple[tuple[str, str], ...]) -
 
 
 # --- (i) the creation floor ---------------------------------------------------
-
-
-_ALLOWED_DEFECTS = {
-    'status': [DefectStatus.OPEN.value],
-    'origin': [origin.value for origin in DefectOrigin],
-}
-_ALLOWED_RETIREMENTS = {
-    'reason': [code.value for code in RetirementCode],
-    'ruling': [None],
-}
-_ALLOWED = {
-    DEFECTS_METADATA_KEY: _ALLOWED_DEFECTS,
-    DEFECT_TEST_RETIREMENTS_METADATA_KEY: _ALLOWED_RETIREMENTS,
-}
 
 
 @pytest.mark.parametrize(
@@ -473,7 +481,7 @@ _CREATION_REFUSALS = [
 
 
 @pytest.mark.parametrize(('key', 'value', 'index'), _CREATION_REFUSALS)
-def test_the_creation_floor_refuses_naming_key_index_and_allowed_values(
+def test_the_creation_floor_refuses_naming_key_and_index(
     key: str, value: Any, index: int | None
 ) -> None:
     with pytest.raises(DefectCreationRefused) as excinfo:
@@ -484,7 +492,6 @@ def test_the_creation_floor_refuses_naming_key_index_and_allowed_values(
     assert wire['key'] == key
     assert wire['index'] == index
     assert isinstance(wire['detail'], str) and wire['detail']
-    assert wire['allowed'] == _ALLOWED[key]
 
 
 def test_a_repeated_ref_at_creation_is_named() -> None:
