@@ -1556,6 +1556,15 @@ dashboard.
 
 ## 8. Fleet redeploy & watchdog
 
+**Cadence: 72 hours (Leo, 2026-10-19).** The fleet-deploy clock's window
+is 72h (`orchestrator_restart_min_interval_secs: 259200`), not the 8h it
+was: at 8h every boundary's drained restart cancelled all in-flight
+workflows. When landed code must go live sooner, file an explicit deploy
+task (`task_kind='deterministic'`, `before_done`
+`scripts/restart-all-orchestrators.sh --drain`, as tasks 2776/5049/7175 do)
+rather than waiting for the window. Where the text below says 8h, read the
+current window.
+
 Three restart mechanisms act on the orchestrator fleet. They're
 deliberately kept orthogonal — don't conflate them when debugging a
 restart:
@@ -1581,8 +1590,8 @@ restart:
   rate-capped liveness pass since task 3764 — see
   [fused-memory liveness revive](#fused-memory-liveness-revive) below.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
-  is the backstop: *intended* to cap the fleet at one redeploy per 8 hours
-  (`orchestrator_restart_min_interval_secs`, default 28800) via a shared
+  is the backstop: *intended* to cap the fleet at one redeploy per 72 hours
+  (`orchestrator_restart_min_interval_secs`, default 259200) via a shared
   clock file (`data/orchestrator/last_redeploy_orchestrator.json`) — see
   the correction below for why that cap does not currently hold,
   delegating the actual restart to

@@ -189,8 +189,8 @@ except (KeyError, ValueError):
 # with the event-driven restart coordinator
 # (orchestrator.service_restart.StaleServiceRestartCoordinator's
 # min_interval_secs, sourced from
-# OrchestratorConfig.orchestrator_restart_min_interval_secs, default 28800.0
-# = 8h). The watchdog is a stdlib-only systemd oneshot that cannot import the
+# OrchestratorConfig.orchestrator_restart_min_interval_secs, default 259200.0
+# = 72h). The watchdog is a stdlib-only systemd oneshot that cannot import the
 # orchestrator package, so this is a hardcoded env-mirror of the config
 # default (drift-tested in tests/scripts/test_orchestrator_watchdog.py
 # against a live OrchestratorConfig, task 2396 Open-Q1) rather than a live
@@ -204,7 +204,7 @@ except (KeyError, ValueError):
 try:
     ORCH_RESTART_MIN_INTERVAL_SECS = int(os.environ["ORCH_RESTART_MIN_INTERVAL_SECS"])
 except (KeyError, ValueError):
-    ORCH_RESTART_MIN_INTERVAL_SECS = 28800
+    ORCH_RESTART_MIN_INTERVAL_SECS = 259200
 
 # Provenance recorded in every clock this script stamps (task 4823). These
 # MIRROR df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
@@ -261,7 +261,7 @@ FLEET_LEASE_PATH = os.environ.get(
 # 13290s ~= 3.7h; each unit left on the legacy merge-idle gate (pre-5371 code,
 # or a refused request) can add its 600s busy grace on top, so it is not a
 # worst case. 14400 clears the common case with ~8% headroom while staying far below
-# the 8h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
+# the 72h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
 # point: a leaked lease can therefore delay at most ONE redeploy window and can
 # never wedge the fleet indefinitely — the same reasoning that makes the pid
 # test alone insufficient. A sweep that overruns the bound loses the lease
@@ -282,8 +282,8 @@ except (KeyError, ValueError):
 # (orchestrator-watchdog.timer's OnUnitActiveSec=60) is a FRESH process (see
 # module docstring), so there is no cross-tick memory to log the fleet-deploy
 # min-interval skip line only once per window. Logging on EVERY tick would
-# write ~480 near-identical lines to the journal over one full
-# ORCH_RESTART_MIN_INTERVAL_SECS (8h default) window, burying genuinely
+# write ~4,320 near-identical lines to the journal over one full
+# ORCH_RESTART_MIN_INTERVAL_SECS (72h default) window, burying genuinely
 # actionable watchdog output. Re-emit the skip line at most once per this many
 # wall-clock seconds instead, bucketed purely off time.time() (no persisted
 # state needed) — deliberately much coarser than the ~60s tick cadence so most
@@ -351,7 +351,7 @@ FM_DEPLOY_CLOCK_PATH = os.environ.get(
 )
 
 # Minimum wall-clock seconds between successive fm redeploys — fm's own
-# independent cap, mirroring ORCH_RESTART_MIN_INTERVAL_SECS's 8h default and its
+# independent cap with its own 8h default, mirroring ORCH_RESTART_MIN_INTERVAL_SECS's
 # env-with-try/except-fallback pattern (a typo'd env var must not crash the
 # oneshot watchdog). 0 disables the cap entirely — and, as for the fleet cap,
 # since task 4754 that leaves fm's head start (_within_fm_staleness_head_start)

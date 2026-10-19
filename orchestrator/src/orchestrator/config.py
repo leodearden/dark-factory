@@ -4125,17 +4125,18 @@ class OrchestratorConfig(BaseSettings):
     orchestrator_restart_on_active_secs: int = Field(default=10)
     # Rate-cap on the orchestrator's own deploy-on-commit self-redeploy: the
     # minimum wall-clock interval (seconds) enforced between successive fires.
-    # Unlike the debounce (which coalesces a *single* merge burst), this cap is
+    # 72h since Leo's 2026-10-19 ruling (it was 8h); an explicit deterministic
+    # deploy task is the way to go live sooner. Unlike the debounce (which coalesces a *single* merge burst), this cap is
     # restart-safe — persisted to disk — so a stream of orchestrator/src merges
     # over hours can't churn the daemon through repeated redeploys. 0 disables
     # the cap (restoring pure debounce behaviour). Deliberately NOT in
     # RELOADABLE_FIELDS: red-tier / restart-only, matching its sibling
     # orchestrator_restart_* fields.
     orchestrator_restart_min_interval_secs: float = Field(
-        default=28800.0,
+        default=259200.0,
         description=(
             'Minimum wall-clock seconds between successive orchestrator '
-            'self-redeploys; 8h default caps deploy-on-commit churn. '
+            'self-redeploys; 72h default caps deploy-on-commit churn. '
             '0 disables.'
         ),
     )
@@ -4146,7 +4147,7 @@ class OrchestratorConfig(BaseSettings):
     # rarely true, so the polite path can starve indefinitely. Once a pending
     # restart has been owed for this many seconds, maybe_restart bypasses
     # agents_idle, the debounce, and the merge-drain preference — but NEVER
-    # the min_interval 8h clock above, which is still enforced unchanged.
+    # the min_interval 72h clock above, which is still enforced unchanged.
     # 0 disables force-fire (byte-identical behaviour); 75-min default.
     # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only,
     # matching its sibling orchestrator_restart_min_interval_secs.
@@ -4155,7 +4156,7 @@ class OrchestratorConfig(BaseSettings):
         description=(
             'Max seconds a pending orchestrator self-redeploy stays owed '
             'before force-firing (bypassing agents_idle + debounce + the '
-            'merge-drain preference, but NOT the min_interval 8h clock); '
+            'merge-drain preference, but NOT the min_interval 72h clock); '
             '75-min default.'
         ),
     )
@@ -4190,7 +4191,7 @@ class OrchestratorConfig(BaseSettings):
     # (task 5371) is the whole 11400s ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait
     # cap, plus 7 x (verify 30 + grace 120) restart verification, plus 7 x 120s
     # stale/absent grace = ~13,300s ~= 3.7h, so 14400 (4h) clears it with
-    # headroom while staying far below the 8h
+    # headroom while staying far below the 72h
     # orchestrator_restart_min_interval_secs — a leaked lease therefore delays at
     # most ONE redeploy window. NOT a worst case: each unit left on the legacy
     # merge-idle gate (pre-5371 code, or a refused request) can add its 600s
@@ -4210,7 +4211,7 @@ class OrchestratorConfig(BaseSettings):
             'Derived from the common long --drain sweep (~13,300s: the '
             '11400s verify-wait cap plus per-unit restart verification and '
             'stale-heartbeat grace; legacy-gate units can add 600s each) and '
-            'kept far below the 8h min-interval, so a lease stranded by a '
+            'kept far below the 72h min-interval, so a lease stranded by a '
             'SIGKILLed sweep delays at most one window. 4h default.'
         ),
     )

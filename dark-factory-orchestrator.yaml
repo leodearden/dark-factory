@@ -1336,6 +1336,24 @@ orchestrator_restart_watch_prefixes:
   - "orchestrator/uv.lock"
   - "escalation/pyproject.toml"
 
+# Merge-landed redeploy cadence: at most one coordinator-fired fleet restart
+# per 72h, not the 8h it was (Leo, 2026-10-19). Measured at 8h: DF's own
+# coordinator force-fired a drained fleet restart at every boundary (10-17
+# 14:46, 22:49; 10-18 07:10, 15:35, 23:45; 10-19 08:01, 16:24 local), each
+# cancelling all 24 in-flight workflows, and runs.db showed 415 cancelled vs
+# 111 done task completions over the 7 days to 10-19.
+#
+# To put landed code live sooner, file an explicit deploy task:
+# task_kind='deterministic' with before_done
+# scripts/restart-all-orchestrators.sh --drain (the pattern of tasks
+# 2776/5049; task 7175 is the first under this ruling).
+#
+# Red tier like its siblings: inert until the next orchestrator restart.
+# The code default (OrchestratorConfig) and the watchdog's
+# ORCH_RESTART_MIN_INTERVAL_SECS fallback carry the same value; the installed
+# watchdog unit sets the staleness tier's value through its own env.
+orchestrator_restart_min_interval_secs: 259200
+
 # Recovery-veto-streak alarm: silence the ESCALATION arm only (Leo, 2026-09-12,
 # authorizing the standing request in cockpit decision veto-streak-alarm-retune-df,
 # filed 2026-08-22 and unactioned since).

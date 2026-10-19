@@ -1772,10 +1772,10 @@ def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.Monke
 
 
 def test_orch_restart_min_interval_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 28800 (8h) with no env override."""
+    """ORCH_RESTART_MIN_INTERVAL_SECS defaults to 259200 (72h) with no env override."""
     monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 259200
 
 
 def test_orch_restart_min_interval_secs_matches_config_default(
@@ -1786,20 +1786,29 @@ def test_orch_restart_min_interval_secs_matches_config_default(
     The watchdog is a stdlib-only systemd oneshot that cannot import the
     orchestrator package at runtime, so ORCH_RESTART_MIN_INTERVAL_SECS's
     default is a hardcoded mirror of
-    OrchestratorConfig.orchestrator_restart_min_interval_secs (28800.0, task
-    2371). This drift test — mirroring
-    tests/scripts/test_orchestrator_restart_config_drift.py — pins the two
-    together so a future config.py change doesn't silently diverge from the
-    watchdog's copy (Open-Q1).
+    OrchestratorConfig.orchestrator_restart_min_interval_secs (259200.0 since
+    Leo's 2026-10-19 72h ruling; task 2371 introduced it). This drift test —
+    mirroring tests/scripts/test_orchestrator_restart_config_drift.py — pins
+    the two together so a future config.py change doesn't silently diverge
+    from the watchdog's copy (Open-Q1).
+
+    Two readings, both pinned: the field's CODE default, which the mirror
+    claims to copy, and the value this repo's committed
+    dark-factory-orchestrator.yaml resolves to, which is what the
+    merge-landed coordinator sharing the watchdog's fleet clock actually runs
+    with. The yaml sets the key explicitly, so the second reading alone no
+    longer sees the code default.
     """
     from orchestrator.config import OrchestratorConfig
 
+    field_default = OrchestratorConfig.model_fields["orchestrator_restart_min_interval_secs"].default
     monkeypatch.delenv("ORCH_RESTART_MIN_INTERVAL_SECS", raising=False)
     # Anchor ORCH_CONFIG_PATH to this worktree's own committed config so the
     # comparison is deterministic regardless of the ambient shell env (which
     # may point ORCH_CONFIG_PATH at a different checkout).
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     wdog = _load_watchdog()
+    assert pytest.approx(field_default) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
     assert pytest.approx(
         OrchestratorConfig().orchestrator_restart_min_interval_secs
     ) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
@@ -2045,14 +2054,14 @@ def test_restart_orchestrator_unit_default_matches_across_tiers() -> None:
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 28800.
+    """A malformed ORCH_RESTART_MIN_INTERVAL_SECS env value falls back to 259200.
 
     A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
     mirroring STALENESS_GRACE_SECS's malformed-env test above.
     """
     monkeypatch.setenv("ORCH_RESTART_MIN_INTERVAL_SECS", "not-an-int")
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 28800
+    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == 259200
 
 
 def test_read_last_fleet_deploy_epoch_happy_path(
@@ -4301,7 +4310,7 @@ def test_boundary1_staleness_inside_window_real_clock_file(
     wdog = _load_watchdog()
 
     now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
-    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 28800s default window
+    clock_ts = now - 2 * 3600  # ~2h ago -- well inside the 259200s default window
     clock_file = tmp_path / "clock.json"
     clock_file.write_text(json.dumps({"ts": clock_ts, "iso": "2026-07-16T00:00:00+00:00"}))
     monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
