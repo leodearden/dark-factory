@@ -8,9 +8,11 @@ rules only, so a project that overrides them is a known, fail-safe limit.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import os
 import posixpath
+import sys
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -19,6 +21,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from types import MappingProxyType
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.defects import MalformedDefectRef, NodeId, parse_ref
 from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 
@@ -33,6 +36,7 @@ __all__ = [
     'enumerate_source',
     'enumerate_tree',
     'is_test_file',
+    'main',
 ]
 
 _DEFECT_MARKER = 'defect'
@@ -349,3 +353,70 @@ def enumerate_tree(root: Path, *, module_root_of: Callable[[str], str]) -> TreeE
     return TreeEnumeration(tuple(
         _enumerate_file(root, path, module_root_of(path)) for path in _test_file_paths(root)
     ))
+
+
+def _directory(value: str) -> Path:
+    path = Path(value)
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(f'{value!r} is not a directory')
+    return path
+
+
+def _build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
+        prog='python -m shared.defect_enumerator',
+        description=(
+            'List the pytest.mark.defect refs each test file under TREE carries, and whether every '
+            'file could be read completely. Exits 1 when any file is incomplete.'
+        ),
+    )
+    parser.add_argument('tree', type=_directory, help='the directory to walk')
+    return parser
+
+
+def _tree_root_module(path: str) -> str:
+    return '.'
+
+
+def _gap_text(gap: EnumerationGap) -> str:
+    return f'{gap.reason}' if gap.line is None else f'{gap.reason} at line {gap.line}'
+
+
+def _file_header(file: FileEnumeration) -> str:
+    if file.complete:
+        return f'{file.path}: complete'
+    return f'{file.path}: incomplete ({"; ".join(_gap_text(gap) for gap in file.gaps)})'
+
+
+def _carrier_text(ref: str, carrier: Carrier) -> str:
+    node_id = carrier.node_id
+    text = f'  {ref}  {node_id.module_root}/{node_id.path}::{node_id.name}'
+    if carrier.disabled_by:
+        text += f' [disabled: {", ".join(sorted(carrier.disabled_by))}]'
+    return text
+
+
+def _render(tree: TreeEnumeration) -> Iterator[str]:
+    for file in tree.files:
+        yield _file_header(file)
+        for ref, carriers in file.carriers.items():
+            for carrier in carriers:
+                yield _carrier_text(ref, carrier)
+        for mark in file.non_static:
+            yield f'  {mark.ref}  not static (line {mark.line})'
+    yield (
+        f'{len(tree.files)} files, {len(tree.incomplete_files)} incomplete, '
+        f'{len(tree.carriers)} refs carried, {len(tree.non_static_refs)} refs not static'
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _build_parser().parse_args(argv)
+    tree = enumerate_tree(arguments.tree, module_root_of=_tree_root_module)
+    for line in _render(tree):
+        print(line)
+    return 0 if tree.complete else 1
+
+
+if __name__ == '__main__':
+    sys.exit(run_cli(main))
