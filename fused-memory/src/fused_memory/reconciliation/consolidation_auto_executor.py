@@ -153,7 +153,14 @@ class _Cycle:
 
 
 @dataclass(frozen=True)
-class _Facts:
+class ClusterFacts:
+    """One cluster's deterministic read: each member's record and the topic's canonical count.
+
+    A member maps to its record, ``None`` for a genuine miss, or
+    :data:`UNREADABLE` when the read did not answer; ``canonical_count`` is
+    ``None`` when the count did not answer.
+    """
+
     members: dict[str, Any]
     canonical_count: int | None
 
@@ -219,7 +226,7 @@ async def _run(
     if active_tasks is None:
         stats['auto_consolidation_skipped_unavailable'] = 'task_tree'
         return
-    slugs = await _canonical_slugs(memory_service, project_id)
+    slugs = await read_canonical_slugs(memory_service, project_id)
     if slugs is None:
         stats['auto_consolidation_skipped_unavailable'] = 'canonical_slugs'
         return
@@ -295,7 +302,7 @@ async def _run(
             )
 
 
-async def _canonical_slugs(memory_service: Any, project_id: str) -> tuple[str, ...] | None:
+async def read_canonical_slugs(memory_service: Any, project_id: str) -> tuple[str, ...] | None:
     """Every canonical's topic slug, or ``None`` when the list may be partial."""
     try:
         rows = await memory_service.get_memories_by_metadata(
@@ -385,7 +392,12 @@ def _expired(row: ReconLedgerRecord, now: datetime) -> bool:
 async def _evaluate(
     cycle: _Cycle, record: ReconLedgerRecord, proposal: ConsolidationProposal,
 ) -> None:
-    facts = await _read_facts(cycle, proposal)
+    facts = await read_cluster_facts(
+        cycle.memory_service,
+        project_id=cycle.project_id,
+        topic=proposal.topic,
+        member_ids=proposal.member_ids,
+    )
     verdict = evaluate_auto_predicate(
         AutoProposal(
             topic=proposal.topic,
@@ -406,23 +418,30 @@ async def _evaluate(
         await _execute(cycle, record, proposal, verdict, facts)
 
 
-async def _read_facts(cycle: _Cycle, proposal: ConsolidationProposal) -> _Facts:
+async def read_cluster_facts(
+    memory_service: Any,
+    *,
+    project_id: str,
+    topic: str,
+    member_ids: Sequence[str],
+) -> ClusterFacts:
+    """Re-read every member by id, and count the topic's canonicals."""
     members: dict[str, Any] = {}
-    for member_id in proposal.member_ids:
+    for member_id in member_ids:
         try:
-            members[member_id] = await cycle.memory_service.get_memory_by_id(
-                project_id=cycle.project_id, memory_id=member_id,
+            members[member_id] = await memory_service.get_memory_by_id(
+                project_id=project_id, memory_id=member_id,
             )
         except Exception:
             members[member_id] = UNREADABLE
     try:
-        canonical_count = await cycle.memory_service.count_memories_by_metadata(
-            project_id=cycle.project_id,
-            filters={'topic': proposal.topic, 'canonical': True},
+        canonical_count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={'topic': topic, 'canonical': True},
         )
     except Exception:
         canonical_count = None
-    return _Facts(members=members, canonical_count=canonical_count)
+    return ClusterFacts(members=members, canonical_count=canonical_count)
 
 
 def _verdict_fields(verdict: AutoVerdict) -> dict[str, Any]:
@@ -461,7 +480,7 @@ async def _execute(
     record: ReconLedgerRecord,
     proposal: ConsolidationProposal,
     verdict: AutoVerdict,
-    facts: _Facts,
+    facts: ClusterFacts,
 ) -> None:
     if cycle.executions >= cycle.config.max_auto_per_cycle:
         cycle.stats['auto_consolidation_unexecuted'] += 1
@@ -477,7 +496,19 @@ async def _execute(
         return
 
     try:
-        arm = await _apply_arm(cycle, proposal, verdict, facts)
+        arm = await apply_auto_verdict(
+            cycle.memory_service,
+            project_id=cycle.project_id,
+            run_id=cycle.run_id,
+            now=cycle.now,
+            topic=proposal.topic,
+            claim=proposal.claim,
+            category=proposal.category,
+            verdict=verdict,
+            members=facts.members,
+            agent_id=_EXECUTOR_AGENT_ID,
+            source=_SOURCE,
+        )
     except Exception as exc:
         # The arm raises only from the canonical write, before any peer patch.
         logger.warning(
@@ -810,45 +841,67 @@ def _escalate(
         )
 
 
-async def _apply_arm(
-    cycle: _Cycle, proposal: ConsolidationProposal, verdict: AutoVerdict, facts: _Facts,
+async def apply_auto_verdict(
+    memory_service: Any,
+    *,
+    project_id: str,
+    run_id: str,
+    now: datetime,
+    topic: str,
+    claim: str | None,
+    category: str,
+    verdict: AutoVerdict,
+    members: Mapping[str, Any],
+    agent_id: str,
+    source: str,
 ) -> RetainArmApplied | RetainArmRefused:
-    """Mint (PASS) or resolve (PASS_TAG_ONLY) the canonical; tag only unstamped members."""
+    """Mint (PASS) or resolve (PASS_TAG_ONLY) the canonical; tag only unstamped members.
+
+    *members* is the :class:`ClusterFacts` read the verdict was ruled over.
+    Raises ``ValueError`` before any read or write for a verdict that is not
+    actionable, or for a PASS with no *claim* to mint from.
+    """
+    if verdict.outcome not in (AutoOutcome.PASS, AutoOutcome.PASS_TAG_ONLY):
+        raise ValueError(
+            f'topic {topic!r}: a {verdict.outcome.value} verdict is not actionable; '
+            'only pass and pass_tag_only write',
+        )
+    canonical_content: str | None = None
+    if verdict.outcome is AutoOutcome.PASS:
+        if claim is None:
+            raise ValueError(
+                f'topic {topic!r}: a pass verdict mints a canonical and needs a claim',
+            )
+        canonical_content = build_auto_canonical(claim, topic, len(verdict.retain_ids), run_id)
+    mint = canonical_content is not None
     to_tag = [
         member_id
         for member_id in verdict.retain_ids
-        if _metadata(facts.members.get(member_id)).get('topic') != proposal.topic
+        if _metadata(members.get(member_id)).get('topic') != topic
     ]
-    mint = verdict.outcome is AutoOutcome.PASS
     return await apply_retain_arm(
-        cycle.memory_service,
-        project_id=cycle.project_id,
-        topic=proposal.topic,
-        canonical_content=(
-            build_auto_canonical(
-                proposal.claim, proposal.topic, len(verdict.retain_ids), cycle.run_id,
-            )
-            if mint
-            else None
-        ),
+        memory_service,
+        project_id=project_id,
+        topic=topic,
+        canonical_content=canonical_content,
         retain_ids=to_tag,
-        category=proposal.category,
-        agent_id=_EXECUTOR_AGENT_ID,
-        run_id=cycle.run_id,
+        category=category,
+        agent_id=agent_id,
+        run_id=run_id,
         extra_canonical_meta=(
             {
                 _CANONICAL_STAMP_KEY: {
-                    'run_id': cycle.run_id,
+                    'run_id': run_id,
                     'predicate_version': verdict.predicate_version,
                     'members_count': len(verdict.retain_ids),
-                    'at': cycle.now.isoformat(),
+                    'at': now.isoformat(),
                 },
             }
             if mint
             else None
         ),
-        extra_peer_meta={_RUN_STAMP_KEY: cycle.run_id},
-        source=_SOURCE,
+        extra_peer_meta={_RUN_STAMP_KEY: run_id},
+        source=source,
     )
 
 
