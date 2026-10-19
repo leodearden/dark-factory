@@ -120,6 +120,10 @@ def _prompt_ids(create: AsyncMock) -> list[list[str]]:
     return [_ID_LINE.findall(call.kwargs['input']) for call in create.await_args_list]
 
 
+def _seeded_plan():
+    return _cases_mod().seeded_plan(list(_CORPUS), distractors=2)
+
+
 def _resolved(plan, index: int) -> list:
     return list(plan.candidate_records[index])
 
@@ -127,14 +131,10 @@ def _resolved(plan, index: int) -> list:
 class TestTheSeededLiveEdge:
     """`build_judge_fn`: one shipped-judge call per case, on the slate built for it."""
 
-    @staticmethod
-    def _plan():
-        return _cases_mod().seeded_plan(list(_CORPUS), distractors=2)
-
     def test_every_case_is_one_completion_naming_its_slate_in_order(
         self, tmp_path: Path,
     ) -> None:
-        plan = self._plan()
+        plan = _seeded_plan()
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
             _mod().run_judge_eval(
@@ -146,7 +146,7 @@ class TestTheSeededLiveEdge:
         assert _prompt_ids(create) == [case['candidates'] for case in plan.cases]
 
     def test_the_answer_is_the_parsed_verdict(self) -> None:
-        plan = self._plan()
+        plan = _seeded_plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('amends')):
             answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
@@ -154,7 +154,7 @@ class TestTheSeededLiveEdge:
         assert answer.candidate_id == case['candidates'][0]
 
     def test_a_recorded_run_reports_what_the_provider_billed(self) -> None:
-        plan = self._plan()
+        plan = _seeded_plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('restates')):
             answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
@@ -162,7 +162,7 @@ class TestTheSeededLiveEdge:
 
     def test_a_run_with_no_reported_usage_is_unpriced(self) -> None:
         """The artifact says 'unpriced', never zeros."""
-        plan = self._plan()
+        plan = _seeded_plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('restates', billed=None)):
             answer = _live_judge().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
@@ -174,7 +174,7 @@ class TestTheRecordedElisionFollowsTheWidth:
 
     @staticmethod
     def _first_case() -> tuple[dict, list]:
-        plan = TestTheSeededLiveEdge._plan()
+        plan = _seeded_plan()
         return plan.cases[0], _resolved(plan, 0)
 
     @staticmethod
