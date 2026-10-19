@@ -16,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Literal, overload
@@ -1380,6 +1381,10 @@ class TestCurationDrain:
         assert (reparked['status'], reparked['attempts']) == (AWAITING_CURATION, 1)
 
 
+# scripts/sitting/inventory.py::ESC_ID_RE
+_ESC_ID_RE = re.compile(r'\besc-(?:[A-Za-z0-9_]+-)+\d+\b')
+
+
 class TestCurationBacklogEscalation:
     """One folded ``infra_issue`` per project and defer reason once a parked
     ticket has survived a retry; its severity comes from the reason."""
@@ -1475,6 +1480,18 @@ class TestCurationBacklogEscalation:
         assert self._all_records(tmp_path) == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('reason', list(DeferReason))
+    async def test_the_minted_escalation_id_is_one_the_sitting_inventory_can_cite(
+        self, store, tmp_path, pid, reason,
+    ):
+        await _park(store, pid, reason=reason, deferrals=2)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [record] = self._pending(tmp_path, reason)
+        assert _ESC_ID_RE.fullmatch(record.id)
+
+    @pytest.mark.asyncio
     async def test_capped_files_info_and_auth_failed_files_blocking_side_by_side(
         self, store, tmp_path, pid,
     ):
@@ -1489,7 +1506,7 @@ class TestCurationBacklogEscalation:
         [auth_record] = self._pending(tmp_path, DeferReason.ACCOUNTS_AUTH_FAILED)
         assert (capped_record.severity, auth_record.severity) == ('info', 'blocking')
         assert curation_backlog_anchor(DeferReason.ACCOUNTS_AUTH_FAILED) == (
-            f'{CURATION_BACKLOG_ANCHOR}:accounts-auth-failed'
+            f'{CURATION_BACKLOG_ANCHOR}-accounts-auth-failed'
         )
         auth_detail = json.loads(auth_record.detail)
         assert (auth_detail['defer_reason'], auth_detail['severity'], auth_detail['count']) == (

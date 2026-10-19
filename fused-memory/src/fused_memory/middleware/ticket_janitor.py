@@ -113,7 +113,7 @@ _CURATION_BACKLOG_DETAIL_TICKETS: Final = 20
 
 
 def curation_backlog_anchor(reason: DeferReason) -> str:
-    return f'{CURATION_BACKLOG_ANCHOR}:{reason}'
+    return f'{CURATION_BACKLOG_ANCHOR}-{reason}'
 
 
 def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool:
