@@ -4126,7 +4126,8 @@ class OrchestratorConfig(BaseSettings):
     # Rate-cap on the orchestrator's own deploy-on-commit self-redeploy: the
     # minimum wall-clock interval (seconds) enforced between successive fires.
     # 72h since Leo's 2026-10-19 ruling (it was 8h); an explicit deterministic
-    # deploy task is the way to go live sooner. Unlike the debounce (which coalesces a *single* merge burst), this cap is
+    # deploy task is the way to go live sooner. Unlike the debounce (which
+    # coalesces a *single* merge burst), this cap is
     # restart-safe — persisted to disk — so a stream of orchestrator/src merges
     # over hours can't churn the daemon through repeated redeploys. 0 disables
     # the cap (restoring pure debounce behaviour). Deliberately NOT in

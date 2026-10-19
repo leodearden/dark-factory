@@ -1556,14 +1556,17 @@ dashboard.
 
 ## 8. Fleet redeploy & watchdog
 
-**Cadence: 72 hours (Leo, 2026-10-19).** The fleet-deploy clock's window
-is 72h (`orchestrator_restart_min_interval_secs: 259200`), not the 8h it
-was: at 8h every boundary's drained restart cancelled all in-flight
-workflows. When landed code must go live sooner, file an explicit deploy
-task (`task_kind='deterministic'`, `before_done`
+**Cadence: 72 hours (Leo, 2026-10-19).** The merge-landed coordinator's
+window is 72h (`orchestrator_restart_min_interval_secs: 259200`), not the
+8h it was: at 8h every boundary's drained restart cancelled all in-flight
+workflows. On this host the watchdog's staleness tier is also 72h, through
+the drop-in `orchestrator-watchdog.service.d/72h-restart-cadence.conf`
+(the committed unit still says 24h). When landed code must go live sooner,
+file an explicit deploy task (`task_kind='deterministic'`, `before_done`
 `scripts/restart-all-orchestrators.sh --drain`, as tasks 2776/5049/7175 do)
-rather than waiting for the window. Where the text below says 8h, read the
-current window.
+rather than waiting for the window. Where the text below gives the
+orchestrator fleet's window as 8h, read 72h; fused-memory's own window is
+still 8h.
 
 Three restart mechanisms act on the orchestrator fleet. They're
 deliberately kept orthogonal — don't conflate them when debugging a
