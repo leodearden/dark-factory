@@ -51,7 +51,11 @@ from fused_memory.config.schema import ConsolidationAutoConfig
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.consolidation_auto import AutoOutcome, build_auto_canonical
-from fused_memory.reconciliation.consolidation_auto_executor import revert_auto_consolidation
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    BACKLOG_CATEGORY,
+    REFUSED_CATEGORY,
+    revert_auto_consolidation,
+)
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.consolidation_proposal import (
     PROPOSER_AGENT_ID,
@@ -576,3 +580,93 @@ async def test_b8_supervised_cycle_records_dry_runs_and_still_gates_hazards(tmp_
     gate = _only(world.filed_gates(), 'gate')
     assert gate.metadata[GATE_METADATA_KEY]['topic'] == HAZARD_TOPIC
     assert (await world.row(HAZARD_TOPIC, 'run-b8')).state == 'gated'
+
+
+@pytest.mark.asyncio
+async def test_b6_a_label_claim_is_refused_at_emit(world):
+    members = world.fake.seed_many(3)
+    corpus = world.corpus_snapshot()
+
+    cycle = await world.cycle('run-b6', emit=[Emission(TOPIC, members, claim='INDEX — foo')])
+
+    result = _only(cycle.emissions, 'emission')
+    assert result['error_type'] == 'ValidationError'
+    assert result['hint']
+    assert await world.ledger.list_by_kind(
+        PROJECT_ID, RECORD_KIND_CONSOLIDATION_PROPOSAL, 'proposed',
+    ) == []
+    assert cycle.report.stats['auto_consolidation_proposals_listed'] == 0
+    assert world.corpus_snapshot() == corpus
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b7_an_aged_oversized_row_is_refused_in_stage_and_the_streak_escalates(
+    tmp_path, ledger,
+):
+    world = build_world(tmp_path, ledger, config=enabled_config(refusal_streak_threshold=2))
+    oversized = [new_id() for _ in range(21)]
+
+    await aged_proposal(world, topic=TOPIC, member_ids=oversized, run_id='run-b7-p0')
+    first = await world.cycle('run-b7-0')
+
+    record = _only(world.pending(REFUSED_CATEGORY), 'refusal record')
+    assert record.level == 1
+    assert record.severity == 'info'
+    assert record.summary == f'{TOPIC}: member_count_out_of_range'
+    assert record.project_id == PROJECT_ID
+    row = await world.row(TOPIC, 'run-b7-p0')
+    assert row.state == 'refused'
+    assert outcome(row).reason_codes == ('member_count_out_of_range',)
+    assert first.report.stats['auto_consolidation_refusals'] == {'member_count_out_of_range': 1}
+    assert world.predicate_reads() == []
+
+    await aged_proposal(world, topic=TOPIC, member_ids=oversized, run_id='run-b7-p1')
+    await world.cycle('run-b7-1')
+
+    assert _only(world.pending(REFUSED_CATEGORY), 'refusal record').dedupe_count == 1
+
+    await aged_proposal(world, topic=TOPIC, member_ids=oversized, run_id='run-b7-p2')
+    await world.cycle('run-b7-2')
+
+    assert sorted(esc.severity for esc in world.pending(REFUSED_CATEGORY)) == ['blocking', 'info']
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b9_a_backlog_trip_executes_nothing_and_escalates_once(tmp_path, ledger):
+    config = enabled_config(max_auto_per_cycle=1, max_gate_filings_per_cycle=0, backlog_multiplier=2)
+    world = build_world(tmp_path, ledger, config=config)
+    topics = ['e2e-backlog-one', 'e2e-backlog-two', 'e2e-backlog-three']
+    emissions = [Emission(topic, world.fake.seed_many(3)) for topic in topics]
+    corpus = world.corpus_snapshot()
+    writes = world.mem0_writes()
+
+    result = await world.cycle('run-b9', emit=emissions)
+
+    assert [emitted.get('ok') for emitted in result.emissions] == [True, True, True]
+    assert _only(world.pending(BACKLOG_CATEGORY), 'backlog record').severity == 'info'
+    for topic in topics:
+        assert (await world.row(topic, 'run-b9')).state == 'proposed'
+    assert world.predicate_reads() == []
+    assert world.mem0_writes() == writes
+    assert world.corpus_snapshot() == corpus
+    assert world.tasks.calls == []
+    assert result.report.stats['auto_consolidation_backlog_tripped'] is True
+    assert result.report.stats['auto_consolidation_unexecuted'] == 3
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b13_a_project_outside_enabled_projects_is_skipped_unread(tmp_path, ledger):
+    world = build_world(tmp_path, ledger, project_id='reify')
+    members = world.fake.seed_many(4)
+    writes = world.mem0_writes()
+
+    result = await world.cycle('run-b13', emit=[Emission(TOPIC, members)])
+
+    assert _only(result.emissions, 'emission')['ok'] is True
+    assert result.report.stats['auto_consolidations_skipped_project'] == 1
+    assert world.predicate_reads() == []
+    assert (await world.row(TOPIC, 'run-b13')).state == 'proposed'
+    assert world.mem0_writes() == writes
