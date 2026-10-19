@@ -9,6 +9,7 @@ curator injected through the interceptor's ``curator=`` constructor argument.
 import asyncio
 import json
 from collections import deque
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import pytest
@@ -69,7 +70,7 @@ class _ScriptedCurator:
     ``curate_batch_prepared`` call raise instead of answering.
     """
 
-    def __init__(self, script: dict[str, list[Verdict]]) -> None:
+    def __init__(self, script: Mapping[str, Sequence[Verdict]]) -> None:
         self._script = {title: deque(verdicts) for title, verdicts in script.items()}
         self.batch_raises: deque[BaseException] = deque()
         self.hold_prepare: dict[str, asyncio.Event] = {}
@@ -430,3 +431,78 @@ class TestParking:
 
         assert cancelled == {'status': 'cancelled', 'ticket_id': ticket_id}
         assert await _resolve(interceptor, ticket_id) == {'status': 'cancelled', 'reason': 'user_cancelled'}
+
+
+def _combine_into_existing(taskmaster: _RecordingTaskmaster) -> CuratorDecision:
+    taskmaster.tasks['7'] = {'id': '7', 'title': 'Existing task', 'status': 'pending', 'metadata': {}}
+    return CuratorDecision(
+        action='combine', target_id='7', target_fingerprint=normalize_title('Existing task'),
+        rewritten_task=_REWRITE, justification='overlaps 7',
+    )
+
+
+class TestRequeue:
+    @pytest.mark.asyncio
+    async def test_requeue_hands_back_a_parked_ticket_for_a_real_combine_verdict(
+        self, make_interceptor, store, taskmaster,
+    ):
+        curator = _ScriptedCurator({'Overlapping work': [CAPPED, _combine_into_existing(taskmaster)]})
+        interceptor = make_interceptor(curator)
+        ticket_id = await _park(interceptor, 'Overlapping work')
+
+        requeued = await interceptor.requeue_awaiting_curation_ticket('project', ticket_id)
+
+        assert requeued is True
+        assert await _resolve(interceptor, ticket_id) == {
+            'status': 'combined', 'task_id': '7', 'reason': 'combine: overlaps 7',
+        }
+        row = await store.get(ticket_id)
+        assert row is not None and row['attempts'] == 1
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_requeue_refuses_anything_but_a_parked_ticket(self, make_interceptor, store, taskmaster):
+        curator = _ScriptedCurator({
+            'New work': [CuratorDecision(action='create', justification='novel')],
+            'Capped work': [CAPPED, CuratorDecision(action='create', justification='novel later')],
+        })
+        interceptor = make_interceptor(curator)
+        created = await _submit(interceptor, 'New work')
+        await _resolve(interceptor, created)
+        parked = await _park(interceptor, 'Capped work')
+
+        assert await interceptor.requeue_awaiting_curation_ticket('project', created) is False
+        assert await interceptor.requeue_awaiting_curation_ticket('project', 'tkt_unknown') is False
+        assert await interceptor.requeue_awaiting_curation_ticket('project', parked) is True
+        assert await interceptor.requeue_awaiting_curation_ticket('project', parked) is False
+        assert (await _resolve(interceptor, parked))['status'] == 'created'
+        assert len(taskmaster.add_task_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_requeue_after_close_leaves_the_row_parked(self, make_interceptor, tmp_path):
+        interceptor = make_interceptor(_ScriptedCurator({'Capped work': [CAPPED]}))
+        ticket_id = await _park(interceptor, 'Capped work')
+        await interceptor.close()
+
+        requeued = await interceptor.requeue_awaiting_curation_ticket('project', ticket_id)
+
+        reopened = TicketStore(tmp_path / 'tickets.db')
+        await reopened.initialize()
+        try:
+            assert requeued is False
+            assert await _parked_row(reopened, ticket_id) == _parked(DeferReason.ALL_ACCOUNTS_CAPPED)
+        finally:
+            await reopened.close()
+
+    @pytest.mark.asyncio
+    async def test_requeue_marks_the_worker_alive_before_enqueue(self, make_interceptor, taskmaster):
+        script = {'Overlapping work': [CAPPED, _combine_into_existing(taskmaster)]}
+        ticket_id = await _park(make_interceptor(_ScriptedCurator(script)), 'Overlapping work')
+        restarted = make_interceptor(_ScriptedCurator({'Overlapping work': script['Overlapping work'][1:]}))
+        assert restarted.is_worker_alive('project') is False
+
+        requeued = await restarted.requeue_awaiting_curation_ticket('project', ticket_id)
+        alive_on_return = restarted.is_worker_alive('project')
+
+        assert (requeued, alive_on_return) == (True, True)
+        assert (await _resolve(restarted, ticket_id))['status'] == 'combined'

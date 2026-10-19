@@ -3893,14 +3893,7 @@ class TaskInterceptor:
             project_id=project_id,
             candidate_json=blob,
         )
-        queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
-        # Mark intent BEFORE the queue.put so a janitor tick that lands
-        # between the row insert and _start_worker_if_needed sees the
-        # project as "alive" (worker about to spawn) rather than reaping
-        # the freshly-pending row as worker_dead.
-        self._worker_intent.add(project_id)
-        await queue.put(ticket_id)
-        self._start_worker_if_needed(project_id)
+        self._enqueue_ticket(project_id, ticket_id)
         return {'ticket': ticket_id}
 
     async def _submit_task_planning_mode(
@@ -4289,6 +4282,30 @@ class TaskInterceptor:
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
         logger.info('cancel_ticket: cancelled %s ticket %s', row['status'], ticket_id)
         return {'status': 'cancelled', 'ticket_id': ticket_id}
+
+    async def requeue_awaiting_curation_ticket(self, project_id: str, ticket_id: str) -> bool:
+        """Hand a parked ticket back to *project_id*'s curator worker for another attempt.
+
+        The ticket janitor's drain target. Returns ``True`` only when this call
+        flipped the row ``awaiting_curation`` → ``pending`` and enqueued it;
+        anything else (not parked, unknown, already requeued, interceptor
+        closed) returns ``False`` and changes nothing.
+        """
+        if self._closed or self._ticket_store is None:
+            return False
+        if not await self._ticket_store.requeue_awaiting_curation(ticket_id):
+            return False
+        self._enqueue_ticket(project_id, ticket_id)
+        return True
+
+    def _enqueue_ticket(self, project_id: str, ticket_id: str) -> None:
+        queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
+        # Mark intent BEFORE the put so a janitor tick that lands between the
+        # row write and _start_worker_if_needed sees the project as "alive"
+        # (worker about to spawn) rather than reaping the pending row.
+        self._worker_intent.add(project_id)
+        queue.put_nowait(ticket_id)
+        self._start_worker_if_needed(project_id)
 
     def _start_worker_if_needed(self, project_id: str) -> None:
         """Lazily start the per-project curator worker asyncio.Task if not running.
