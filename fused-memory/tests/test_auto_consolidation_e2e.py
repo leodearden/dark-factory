@@ -42,6 +42,13 @@ from _auto_consolidation_fakes import (
     new_id,
     propose,
 )
+from _fused_memory_tool_surface import (
+    FUSED_MEMORY_TOOL_PREFIX,
+    REVIEWED_FUSED_MEMORY_STAGE_SAFE,
+    fused_memory_names,
+    registered_fused_memory_tools,
+)
+from _tool_surface_classification import assert_tool_surface_classified
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from mcp.server.fastmcp import FastMCP
@@ -697,3 +704,85 @@ async def test_b13_a_project_outside_enabled_projects_is_skipped_unread(tmp_path
     assert world.predicate_reads() == []
     assert (await world.row(TOPIC, 'run-b13')).state == 'proposed'
     assert world.mem0_writes() == writes
+
+
+#: A valid deterministic-gate close, as the deterministic runner stamps one.
+GATE_CLOSE = {
+    'kind': 'deterministic-gate',
+    'note': 'pure gate resolved',
+    'escalation_id': 'esc-5243-1',
+}
+
+
+async def _status_rows(journal: Any) -> list[tuple[Any, ...]]:
+    """(agent_id, success, done_provenance_kind) of each journaled set_task_status."""
+    return [
+        (row['agent_id'], row['success'], json.loads(row['params'])['done_provenance_kind'])
+        for row in await journal.get_ops_since('1970-01-01')
+        if row['operation'] == 'set_task_status'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_b11_a_recon_stage_gate_close_is_refused_and_the_orchestrator_is_accepted(
+    tmp_path,
+):
+    async with provenance_interceptor(tmp_path) as (interceptor, backend, journal):
+        refused = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=GATE_CLOSE,
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        assert refused.get('error') == 'done_provenance_invalid'
+        assert refused.get('error_type') == 'DeterministicProvenanceCallerNotPermitted'
+        backend.set_status_and_stamp_audit.assert_not_awaited()
+        backend.set_task_status.assert_not_awaited()
+        assert await _status_rows(journal) == [
+            ('recon-stage-task_knowledge_sync', 0, 'deterministic-gate'),
+        ]
+
+        accepted = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=GATE_CLOSE,
+            agent_id='orchestrator',
+        )
+
+        assert 'error' not in accepted, accepted
+        backend.set_status_and_stamp_audit.assert_awaited_once()
+        persisted = backend.set_status_and_stamp_audit.await_args.kwargs['audit_fields'][
+            'done_provenance'
+        ]
+        assert (persisted['kind'], persisted['escalation_id']) == (
+            'deterministic-gate', 'esc-5243-1',
+        )
+        assert await _status_rows(journal) == [
+            ('recon-stage-task_knowledge_sync', 0, 'deterministic-gate'),
+            ('orchestrator', 1, 'deterministic-gate'),
+        ]
+
+
+def test_b12_stage_surfaces_hold_exactly_the_sanctioned_consolidation_tools():
+    disallowed = stage_disallowed_tools()
+    registered = registered_fused_memory_tools()
+    propose_tool = f'{FUSED_MEMORY_TOOL_PREFIX}propose_consolidation'
+    consolidate_tool = f'{FUSED_MEMORY_TOOL_PREFIX}consolidate_memories'
+
+    assert propose_tool in registered
+    assert propose_tool not in disallowed[StageId.memory_consolidator]
+    assert propose_tool in disallowed[StageId.task_knowledge_sync]
+    assert propose_tool in disallowed[StageId.integrity_check]
+    assert consolidate_tool in disallowed[StageId.memory_consolidator]
+    assert consolidate_tool in disallowed[StageId.task_knowledge_sync]
+    assert_tool_surface_classified(
+        registered.keys(),
+        {
+            'Stage 3 disallowed': fused_memory_names(disallowed[StageId.integrity_check]),
+            'REVIEWED_FUSED_MEMORY_STAGE_SAFE': REVIEWED_FUSED_MEMORY_STAGE_SAFE,
+        },
+        remedy=(
+            'Put each mutating fused-memory tool in exactly one deny bucket in '
+            'reconciliation/cli_stage_runner.py, or a read-only one in '
+            'REVIEWED_FUSED_MEMORY_STAGE_SAFE in tests/_fused_memory_tool_surface.py.'
+        ),
+    )
