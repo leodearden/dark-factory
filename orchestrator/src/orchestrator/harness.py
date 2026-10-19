@@ -51,7 +51,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import digest as digest_mod
-from orchestrator import recovery_pins
+from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -9418,6 +9418,103 @@ class Harness:
             task_id,
         )
 
+    async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
+        """Execute or refuse a task's re-cut ruling before dispatch (task 3154).
+
+        Fails closed: an exception is a refusal. A refusal blocks the task and
+        files one design_concern L1.
+        """
+        task_id = assignment.task_id
+        try:
+            result = await recut_ruling.enforce_recut_ruling(
+                assignment.task,
+                ops=self.git_ops,
+                persist=functools.partial(self.scheduler.update_task, task_id),
+                now=datetime.now(UTC),
+            )
+        except Exception as exc:
+            logger.warning(
+                'recut_ruling: gate raised for task %s: %s', task_id, exc, exc_info=True,
+            )
+            result = recut_ruling.RecutGateResult(
+                recut_ruling.GateVerdict.REFUSED, reason=f'the re-cut gate raised: {exc}',
+            )
+        logger.info(
+            'recut_ruling: task %s verdict=%s reason=%r',
+            task_id, result.verdict.value, result.reason,
+        )
+        if result.executed:
+            self._log_recut_executed(task_id, result)
+        elif result.refused:
+            ruling_id = result.ruling.ruling_id if result.ruling else 'unreadable'
+            await self._block_and_file_dispatch_gate_l1(
+                task_id,
+                category='design_concern',
+                summary=f'RECUT_RULING_REFUSED: task {task_id} ruling {ruling_id} cannot be honoured',
+                detail=(
+                    f'{result.reason}\n'
+                    'Remedy: if metadata.recut_ruling is malformed, correct it to '
+                    '{"ruling_id": <str>, "ruled_at": <ISO-8601>}; otherwise resolve the '
+                    'cause above and unblock the task. A re-dispatch is safe: nothing '
+                    'fresh is cut until the execution record is durable.'
+                ),
+            )
+        return result
+
+    @staticmethod
+    def _log_recut_executed(task_id: str, result: recut_ruling.RecutGateResult) -> None:
+        parked = result.parked
+        logger.warning(
+            'RECUT: task %s ruling %s executed — parked %s @ %s; dispatching fresh off main',
+            task_id,
+            result.ruling.ruling_id if result.ruling else '?',
+            parked.parked_branch if parked and parked.parked_branch else 'nothing',
+            parked.parked_tip if parked and parked.parked_tip else '-',
+        )
+
+    async def _block_and_file_dispatch_gate_l1(
+        self, task_id: str, *, category: str, summary: str, detail: str,
+    ) -> None:
+        """Block *task_id* and file one category-scoped L1 for a dispatch gate."""
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Dispatch-gate block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id, exc_info=True,
+            )
+        if not self._escalation_queue:
+            logger.warning(
+                'Dispatch-gate block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+        if self._escalation_queue.has_open_l1(task_id, category=category):
+            logger.warning(
+                'Dispatch-gate block for task %s — open %s L1 already exists, '
+                'suppressing duplicate',
+                task_id, category,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category=category,
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning('Filed L1 %s escalation %s for task %s', category, esc.id, task_id)
+
     async def _run_cross_repo_gate(self, assignment) -> bool:
         """Run the dispatch-time cross-repo admission gate (task 3121).
 
@@ -10015,6 +10112,22 @@ class Harness:
             )
             # Drop any preserved-worktree marker once the slot picks the task up.
             self._preserved_worktrees.discard(assignment.task_id)
+
+            # ── Re-cut ruling gate (task 3154) ───────────────────────────────
+            # Runs before the session-resume guard so a pre-ruling plan or
+            # session is never resumed. See orchestrator/recut_ruling.py.
+            if recut_ruling.carries_recut_ruling(assignment.task):
+                recut = await self._run_recut_ruling_gate(assignment)
+                if recut.refused:
+                    arm_requeue_cooldown = True
+                    return TaskReport(
+                        task_id=assignment.task_id,
+                        title=assignment.task.get('title', ''),
+                        outcome=WorkflowOutcome.BLOCKED,
+                        block_reason='recut_ruling_refused',
+                    )
+                if recut.executed:
+                    recovered_plan = recovered_session = recovered_config_dir = None
 
             # ── γ session-resume eligibility guard (task 2774) ────────────────
             # A recovered session is injected as --resume below ONLY when it is
