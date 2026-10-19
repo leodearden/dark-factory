@@ -68,21 +68,6 @@ from fused_memory.services.consolidation_ops import (
     read_topic_closure,
 )
 
-try:
-    # One combined block, as in stage1_stall_detector.py: the four names bind
-    # or fail together.
-    from escalation.dedupe import (  # type: ignore[import-untyped]
-        DedupeConfig,
-        compute_content_fingerprint,
-        submit_or_dedupe,
-    )
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-except ImportError:
-    Escalation = None  # type: ignore[assignment,misc]
-    DedupeConfig = None  # type: ignore[assignment,misc]
-    compute_content_fingerprint = None  # type: ignore[assignment]
-    submit_or_dedupe = None  # type: ignore[assignment]
-
 if TYPE_CHECKING:
     from fused_memory.config.schema import ConsolidationAutoConfig
 
@@ -789,13 +774,16 @@ def _escalate(
 
     Records fold on ``(category, finding, affected)``.
     """
-    if (
-        cycle.escalation_queue is None
-        or Escalation is None
-        or DedupeConfig is None
-        or compute_content_fingerprint is None
-        or submit_or_dedupe is None
-    ):
+    if cycle.escalation_queue is None:
+        return
+    try:
+        from escalation.dedupe import (
+            DedupeConfig,
+            compute_content_fingerprint,
+            submit_or_dedupe,
+        )
+        from escalation.models import Escalation
+    except ImportError:
         return
     queue = cycle.escalation_queue
     try:

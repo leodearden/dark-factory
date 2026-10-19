@@ -290,5 +290,6 @@ class TestNewestPerTopic:
 
 def test_outcome_is_frozen():
     outcome = _outcome(ProposalState.REFUSED)
+    attribute = 'state'
     with pytest.raises(dataclasses.FrozenInstanceError):
-        outcome.state = ProposalState.ADDRESSED  # type: ignore[misc]
+        setattr(outcome, attribute, ProposalState.ADDRESSED)

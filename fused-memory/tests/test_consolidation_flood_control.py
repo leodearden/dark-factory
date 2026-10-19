@@ -171,8 +171,9 @@ class TestValidation:
 class TestFloodCandidateShape:
     def test_candidate_is_frozen(self):
         cand = _cand('a', 2)
+        attribute = 'size'
         with pytest.raises(AttributeError):
-            cand.size = 3  # type: ignore[misc]
+            setattr(cand, attribute, 3)
 
     def test_key_may_be_any_hashable(self):
         cands = [_cand(('project', 'topic-a'), 3), _cand(('project', 'topic-b'), 4)]
