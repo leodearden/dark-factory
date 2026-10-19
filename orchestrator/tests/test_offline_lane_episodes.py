@@ -9,6 +9,7 @@ read, an injected clock and a real escalation queue.  The pure rules are
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -63,6 +64,7 @@ from orchestrator.offline_lane_records import (
     LEGACY_NUMERIC_COMMAND,
     RunRecord,
     RunRecordStore,
+    command_key,
 )
 
 # --- the engine: observe and tick over fakes ----------------------------------------
@@ -1210,3 +1212,35 @@ async def test_r14_with_no_run_records_before_the_pass_the_green_head_stays_unkn
     await lane.red(head=HEAD2)
 
     assert (lane.episode(A).last_green_head, lane.stored().last_green_head) == (None, None)
+
+
+def _listable(directory: Path) -> bool:
+    try:
+        os.listdir(directory)
+    except PermissionError:
+        return False
+    return True
+
+
+@pytest.mark.asyncio
+async def test_r14_an_unlistable_run_record_directory_seeds_nothing_and_the_pass_still_applies(tmp_path, caplog):
+    lane = Lane(tmp_path)
+    lane.unobserved(HEAD0)
+    lane.clock.advance(minutes=30)
+    command_dir = lane.records.root / command_key(COMMAND)
+    command_dir.chmod(0o300)
+    try:
+        if _listable(command_dir):
+            pytest.skip('this user lists a directory whose mode forbids it')
+        with caplog.at_level(logging.ERROR):
+            effect = await lane.red(head=HEAD2)
+    finally:
+        command_dir.chmod(0o700)
+
+    assert effect.episodes_started == (A,)
+    assert (lane.episode(A).last_green_head, lane.stored().last_green_head) == (None, None)
+    assert lane.stored().last_pass_id is not None
+    assert any(
+        r.levelno == logging.ERROR and 'run records unreadable, no history seeded' in r.getMessage()
+        for r in caplog.records
+    )
