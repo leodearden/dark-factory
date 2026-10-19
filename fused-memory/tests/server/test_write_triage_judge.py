@@ -925,8 +925,6 @@ class TestJudgePromptElisions:
             field_chars=10,
         )
         assert report == JudgePromptElisions(entry=False, candidates={'a': True, 'b': False})
-        assert report.entry is False
-        assert report.candidates == {'a': True, 'b': False}
 
     def test_every_candidate_given_is_reported(self) -> None:
         """No selection, no trim, no reorder: it describes the slate it was handed."""
