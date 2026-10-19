@@ -9,8 +9,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadDataJs } from './_data_loader.mjs';
-import { CURATOR_PATH, STALE_FAILURE_THRESHOLD } from './_data_fixtures.mjs';
+// The UI's own reader of DF_DATA.__stale, so the recovery tests assert what an
+// operator sees. A static import is safe: unlike data.js, this module touches
+// no browser global at load.
+import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+
+import { loadDataJs, drain, quietly } from './_data_loader.mjs';
+import { CURATOR_PATH, STALE_FAILURE_THRESHOLD, TASKS_PATH } from './_data_fixtures.mjs';
+
+const { staleNoticesForTab } = staleness;
 
 // ---------------------------------------------------------------------------
 // Per-attempt deadline (task 4884, #4791)
@@ -231,4 +238,150 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
       'unreachable in the browser and turns STALE_TIMEOUT_MS into dead code (measured: ' +
       '4 consecutive ~30000ms aborts in Chrome 151 with the banner already rendered)',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Periodic full-deadline probe (task 5831)
+//
+// A reduced-deadline abort shows only that the endpoint did not answer within
+// STALE_TIMEOUT_MS. If every attempt past the threshold armed it, an endpoint
+// now answering in 5-30s could never succeed again, so it stayed stale until
+// it got faster than 5s. These tests run the deadlines for real on a virtual
+// clock; the no-op timers of data_poll.test.mjs::makeVirtualServer never fire.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_TIMEOUT_MS = 30000;
+const EXPECTED_STALE_PROBE_EVERY = 4;
+
+// The /tasks service times task 5823's ticket measured under degraded conditions.
+const SPIKE_SERVICE_MS = 33000;
+const DEGRADED_SERVICE_MS = 16000;
+
+// One endpoint on a virtual clock whose timers fire. `answer` is mutable: set
+// serviceMs to Infinity for an endpoint that never answers, and ok to false for
+// one that answers with an error status. An aborted request's answer is
+// cancelled, as a real fetch cancels its request, so it cannot land during a
+// later attempt.
+function makeVirtualEndpoint() {
+  const answer = { serviceMs: Infinity, ok: true };
+  const armed = [];
+  const timers = new Map();
+  let clock = 0;
+  let nextTimerId = 1;
+
+  const schedule = (fn, ms) => {
+    const id = nextTimerId;
+    nextTimerId += 1;
+    timers.set(id, { fn, at: clock + ms });
+    return id;
+  };
+  const earliestTimer = () => {
+    let earliest = null;
+    for (const [id, timer] of timers) {
+      if (earliest === null || timer.at < earliest.at) earliest = { id, ...timer };
+    }
+    return earliest;
+  };
+
+  const deps = {
+    now: () => clock,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    fetchImpl: (url, init) => new Promise(resolve => {
+      if (answer.serviceMs === Infinity) return;
+      const { ok } = answer;
+      const id = schedule(() => resolve({ ok, json: async () => ({}) }), answer.serviceMs);
+      init.signal.addEventListener('abort', () => timers.delete(id));
+    }),
+    setTimeoutImpl: (fn, ms) => {
+      armed.push(ms);
+      return schedule(fn, ms);
+    },
+    clearTimeoutImpl: id => {
+      timers.delete(id);
+    },
+  };
+
+  // One refreshOne attempt, run to its outcome. It first waits out any backoff
+  // the way the poll loop's wall clock does, then fires timers in time order
+  // until the attempt settles. The clock never moves backwards.
+  async function attempt(api, state, path) {
+    clock = Math.max(clock, state.get(path)?.nextAllowedAt ?? 0);
+    let outcome = null;
+    api.refreshOne(path, {}, state, deps).then(result => { outcome = result; });
+    await drain();
+    while (outcome === null) {
+      const timer = earliestTimer();
+      assert.ok(timer, `refreshOne(${path}) is still pending with no timer left to fire`);
+      timers.delete(timer.id);
+      clock = Math.max(clock, timer.at);
+      timer.fn();
+      await drain();
+    }
+    return outcome;
+  }
+
+  return { answer, armed, attempt, now: () => clock };
+}
+
+// Runs `count` attempts on TASKS_PATH and returns their outcomes. Quietly,
+// because every failed attempt console.warns by design.
+function attemptsQuietly(endpoint, api, state, count) {
+  return quietly(async () => {
+    const outcomes = [];
+    for (let i = 0; i < count; i += 1) outcomes.push(await endpoint.attempt(api, state, TASKS_PATH));
+    return outcomes;
+  });
+}
+
+// Makes TASKS_PATH stale with `staleAnswer`, then has it answer in
+// DEGRADED_SERVICE_MS, between the two deadlines. It must recover within one
+// probe cycle, both in the poll state and in what the operator sees.
+async function assertRecoversAfter(staleAnswer) {
+  const endpoint = makeVirtualEndpoint();
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const failures = () => win.DF_DATA.__stale[TASKS_PATH].failures;
+  const notices = () => staleNoticesForTab({ tab: 'tasks', stale: win.DF_DATA.__stale, now: endpoint.now() });
+
+  Object.assign(endpoint.answer, staleAnswer);
+  await attemptsQuietly(endpoint, api, state, STALE_FAILURE_THRESHOLD);
+  assert.equal(failures(), STALE_FAILURE_THRESHOLD, 'precondition: the endpoint must reach the threshold');
+  assert.equal(notices().length, 1, 'precondition: the tasks tab must show a stale notice at the threshold');
+
+  Object.assign(endpoint.answer, { ok: true, serviceMs: DEGRADED_SERVICE_MS });
+  const outcomes = await attemptsQuietly(endpoint, api, state, EXPECTED_STALE_PROBE_EVERY);
+  assert.ok(
+    outcomes.includes(api.REFRESH_OUTCOMES.applied),
+    `an endpoint answering in ${DEGRADED_SERVICE_MS}ms must recover within ` +
+      `${EXPECTED_STALE_PROBE_EVERY} attempts past the threshold; outcomes ` +
+      `[${outcomes.join(', ')}], armed deadlines [${endpoint.armed.join(', ')}]`,
+  );
+  assert.equal(failures(), 0, 'a recovered endpoint must have its failure streak reset');
+  assert.deepEqual(notices(), [], 'a recovered endpoint must no longer show a stale notice');
+}
+
+test('deadline: an endpoint stale after a timeout spike, now answering between the two deadlines, recovers on a full-deadline probe', () =>
+  assertRecoversAfter({ serviceMs: SPIKE_SERVICE_MS }));
+
+test('deadline: an endpoint stale after a run of 503s, now answering between the two deadlines, recovers on a full-deadline probe', () =>
+  assertRecoversAfter({ ok: false, serviceMs: 0 }));
+
+test('deadline: a wedged endpoint past the threshold arms the full deadline on one attempt in four, never two in a row', async () => {
+  // Pins both sides of the trade-off: the probe lets a slow-but-working
+  // endpoint recover, and its rarity keeps the connection-budget rationale
+  // above data.js::STALE_TIMEOUT_MS.
+  const endpoint = makeVirtualEndpoint();
+  const { api } = loadDataJs();
+  const state = api.createPollState();
+
+  await attemptsQuietly(endpoint, api, state, STALE_FAILURE_THRESHOLD + 3 * EXPECTED_STALE_PROBE_EVERY);
+
+  const probeCycle = [...Array(EXPECTED_STALE_PROBE_EVERY - 1).fill(STALE_TIMEOUT_MS), DEFAULT_TIMEOUT_MS];
+  assert.deepEqual(endpoint.armed, [
+    ...Array(STALE_FAILURE_THRESHOLD).fill(DEFAULT_TIMEOUT_MS),
+    ...probeCycle,
+    ...probeCycle,
+    ...probeCycle,
+  ]);
 });
