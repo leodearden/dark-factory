@@ -1855,6 +1855,43 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestStripXdistGroupSuffix:
+    """``strip_xdist_group_suffix`` removes the ``@<group>`` xdist adds under ``--dist loadgroup``."""
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            pytest.param('x.py::t@grp', 'x.py::t', id='plain-test'),
+            pytest.param('x.py::t[p]@grp', 'x.py::t[p]', id='parametrised'),
+            pytest.param('x.py::C::t[p]@grp', 'x.py::C::t[p]', id='class-qualified'),
+            pytest.param('x.py::t@g1_g2', 'x.py::t', id='several-groups-joined'),
+            pytest.param('x.py::t[a@b]@grp', 'x.py::t[a@b]', id='at-inside-params-kept'),
+            pytest.param('x.py::t[a::b]@grp', 'x.py::t[a::b]', id='double-colon-inside-params'),
+            pytest.param(
+                'pkg.tests.test_probe.TestBox::test_inner@probe_group',
+                'pkg.tests.test_probe.TestBox::test_inner',
+                id='junit-classname-spelling',
+            ),
+        ],
+    )
+    def test_group_suffix_is_stripped(self, raw: str, expected: str):
+        assert verify.strip_xdist_group_suffix(raw) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param('x.py::t', id='no-suffix'),
+            pytest.param('x.py::t[a@b]', id='at-only-inside-params'),
+            pytest.param('x.py', id='bare-file-of-collection-error'),
+            pytest.param('dir@v2/x.py::t', id='at-in-path'),
+            pytest.param('x.py::t[a@b', id='unclosed-params-truncated-id'),
+            pytest.param('tests.t', id='bare-junit-module-id'),
+        ],
+    )
+    def test_id_without_a_group_suffix_is_unchanged(self, raw: str):
+        assert verify.strip_xdist_group_suffix(raw) == raw
+
+
 class TestParsePytestFailures:
     """``parse_pytest_failures`` types each failing test by kind and first failure line."""
 
@@ -2081,6 +2118,48 @@ class TestParsePytestFailures:
 
     def test_empty_input_parses_to_empty_tuple(self):
         assert verify.parse_pytest_failures('') == ()
+
+    def test_xdist_loadgroup_summary_lines_yield_plain_node_ids(self):
+        output = (
+            'FAILED pkg/tests/test_probe.py::test_ok[a@b]@probe_group - AssertionError: as...\n'
+            'FAILED pkg/tests/test_probe.py::test_ok[1]@probe_group - AssertionError: asse...\n'
+            'FAILED pkg/tests/test_probe.py::TestBox::test_inner@probe_group - AssertionEr...\n'
+        )
+        assert self._parse(output) == [
+            ('pkg/tests/test_probe.py::test_ok[a@b]', 'failed', 'AssertionError: as...'),
+            ('pkg/tests/test_probe.py::test_ok[1]', 'failed', 'AssertionError: asse...'),
+            ('pkg/tests/test_probe.py::TestBox::test_inner', 'failed', 'AssertionEr...'),
+        ]
+
+    def test_xdist_loadgroup_error_line_yields_plain_node_id(self):
+        assert self._parse('ERROR tests/a.py::test_x@grp - RuntimeError: setup') == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: setup'),
+        ]
+
+    def test_xdist_loadgroup_crash_notice_yields_plain_node_id(self):
+        output = "worker 'gw1' crashed while running 'tests/a.py::test_x[1]@grp'"
+        assert self._parse(output) == [('tests/a.py::test_x[1]', 'failed', '')]
+
+    def test_xdist_loadgroup_node_down_preceding_line_yields_plain_node_id(self):
+        output = 'tests/a.py::test_x@grp\n[gw0] node down: Not properly terminated\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_loadgroup_id_finds_its_unsuffixed_section(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ test_x[1] ___\n'
+            'E   AssertionError: grouped\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x[1]@grp\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x[1]', 'failed', 'AssertionError: grouped')]
+
+    def test_xdist_loadgroup_id_dedups_across_summary_and_crash_surfaces(self):
+        output = (
+            'FAILED tests/a.py::t@g\n'
+            "worker 'gw0' crashed while running 'tests/a.py::t@g'\n"
+        )
+        assert verify.node_ids_of(verify.parse_pytest_failures(output)) == ['tests/a.py::t']
 
     def test_extract_failing_test_ids_is_the_node_ids_of_the_parse(self):
         output = (
@@ -2489,6 +2568,12 @@ class TestExtractTestOutcomesFromJunit:
             'tests/test_b.py::test_nofile': 'passed',
             'test_bare': 'passed',
         }
+
+    def test_an_xdist_loadgroup_name_is_keyed_without_its_group_suffix(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path, self._suite('<testcase classname="tests.test_sample" name="test_g[1]@grp" />'),
+        )
+        assert outcomes == {'tests.test_sample::test_g[1]': 'passed'}
 
 
 # ---------------------------------------------------------------------------

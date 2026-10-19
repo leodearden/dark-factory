@@ -929,6 +929,7 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
 # one exception: the crash notice is not line-anchored (it can appear
 # mid-line), so it instead relies on its distinctive literal "crashed while
 # running" prefix to avoid false matches.
+# Every extracted id passes through ``strip_xdist_group_suffix``.
 _FAILED_LINE_NODEID_RE = re.compile(r'^FAILED\s+(\S+\.py::\S+)', re.MULTILINE)
 _ERROR_LINE_NODEID_RE = re.compile(r'^ERROR\s+(\S+\.py::\S+)', re.MULTILINE)
 _ERROR_LINE_FILE_RE = re.compile(r'^ERROR\s+(\S+\.py)(?:\s|$)', re.MULTILINE)
@@ -939,6 +940,23 @@ _XDIST_NODE_DOWN_PRECEDING_NODEID_RE = re.compile(
     r'^(\S+\.py::\S+?)\s*\n\[gw\d+\] node down: Not properly terminated',
     re.MULTILINE,
 )
+
+
+def strip_xdist_group_suffix(node_id: str) -> str:
+    """*node_id* without the ``@<groups>`` suffix xdist appends under ``--dist loadgroup``.
+
+    The suffix comes from ``xdist/remote.py::WorkerInteractor.pytest_collection_modifyitems``
+    and is not an id plain pytest accepts.  An id with no ``::`` or with an unclosed
+    ``[`` in its final segment is returned unchanged.
+    """
+    head, sep, name = node_id.rpartition('::')
+    if not sep:
+        return node_id
+    params_end = name.rfind(']')
+    if name.rfind('[') > params_end:
+        return node_id
+    at = name.find('@', params_end + 1)
+    return node_id if at < 0 else f'{head}{sep}{name[:at]}'
 
 
 class FailureKind(StrEnum):
@@ -985,12 +1003,14 @@ def _summary_reason(test_output: str, match: re.Match[str]) -> str:
 
 def _failure_matches(test_output: str) -> list[_FailureMatch]:
     matches = [
-        _FailureMatch(m.start(1), m.group(1), kind, _summary_reason(test_output, m))
+        _FailureMatch(
+            m.start(1), strip_xdist_group_suffix(m.group(1)), kind, _summary_reason(test_output, m),
+        )
         for pattern, kind in _SUMMARY_LINE_SURFACES
         for m in pattern.finditer(test_output)
     ]
     matches += [
-        _FailureMatch(m.start(1), m.group(1), kind, None)
+        _FailureMatch(m.start(1), strip_xdist_group_suffix(m.group(1)), kind, None)
         for pattern, kind in _XDIST_CRASH_SURFACES
         for m in pattern.finditer(test_output)
     ]
@@ -1139,11 +1159,8 @@ def _junit_testcase_id(testcase: ET.Element) -> str:
     spellings would make every such comparison silently miss.
     """
     name = testcase.get('name', '')
-    classname = testcase.get('classname')
-    if classname:
-        return f'{classname}::{name}'
-    file_attr = testcase.get('file')
-    return f'{file_attr}::{name}' if file_attr else name
+    owner = testcase.get('classname') or testcase.get('file')
+    return strip_xdist_group_suffix(f'{owner}::{name}' if owner else name)
 
 
 def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
@@ -11103,12 +11120,13 @@ async def confirm_isolated_rerun_verdict(
     *module_configs* or files-not-on-disk naturally map nothing, which is an
     honest ``unconfirmable`` rather than a guess.
 
-    ``test_ids`` carries the RAW extracted node-ids, never the
-    prefix-qualified group ids — the qualified id is a re-run implementation
-    detail (which subproject to invoke pytest from), whereas the raw node-id is
-    the test's IDENTITY and is what α's ``flake_debt.test_id`` primary key and
-    §8.3's idempotency key are built on. Recording a prefix-qualified variant
-    would split one test's debt across two rows.
+    ``test_ids`` carries the extracted node-ids (xdist group suffix already
+    stripped at extraction), never the prefix-qualified group ids — the
+    qualified id is a re-run implementation detail (which subproject to invoke
+    pytest from), whereas the raw node-id is the test's IDENTITY and is what
+    α's ``flake_debt.test_id`` primary key and §8.3's idempotency key are built
+    on. Recording a prefix-qualified variant would split one test's debt across
+    two rows.
 
     Args:
         worktree: The tree to re-run in. Judged as given (INV-3).

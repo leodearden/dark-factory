@@ -35,6 +35,11 @@ def _first_run(name):
 LANE_TESTS = {
     'test_steady_fail': 'def test_steady_fail():\n    assert 1 == 2\n',
     'test_flaky': "def test_flaky():\n    assert not _first_run('flaky')\n",
+    'test_grouped_flaky': (
+        "@pytest.mark.xdist_group('lane_group')\n"
+        'def test_grouped_flaky():\n'
+        "    assert not _first_run('grouped_flaky')\n"
+    ),
     'test_red_on_rerun': "def test_red_on_rerun():\n    assert _first_run('red_on_rerun')\n",
     'test_skips_on_rerun': (
         'def test_skips_on_rerun():\n'
