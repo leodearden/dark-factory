@@ -17,14 +17,16 @@ from pathlib import Path
 import pytest
 import yaml
 from _fm_helpers import load_script_module
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.memory_eval_limits import LimitsConfig, limits_artifact_path, load_limits_artifact
-from shared.memory_eval_metrics import load_metric_series
+from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, load_metric_series
 from shared.memory_eval_verdicts import (
     RunnerFailureRecord,
     StormEscape,
     VerdictsArtifact,
     build_verdicts_artifact,
+    load_verdicts_artifact,
 )
 
 _FM_ROOT = Path(__file__).parent.parent
@@ -249,10 +251,14 @@ def _seed(root: Path, *stamps: str, eval_id: str = _E1) -> None:
         shutil.copy(_alpha_series(stamp), root / eval_id / f'metrics-{stamp}.json')
 
 
-def _failing(stamp: str) -> list[str]:
+def _failing_items(stamp: str) -> list[str]:
     series = load_metric_series(_alpha_series(stamp))
     tripwire = next(m for m in series.metrics if m.metric_id == _TRIPWIRE)
-    return sorted(f'{_TRIPWIRE}::{i.item_key}' for i in tripwire.items or [] if not i.passed)
+    return [i.item_key for i in tripwire.items or [] if not i.passed]
+
+
+def _failing(stamp: str) -> list[str]:
+    return sorted(f'{_TRIPWIRE}::{item}' for item in _failing_items(stamp))
 
 
 def _tripwire_status(run) -> str:
@@ -539,3 +545,142 @@ class TestTheRunnerNeverResolves:
         _, first = _file(queue, run, root)
         _file(queue, run, root, failures=[_failure('e4-staleness-sweep')])
         assert {queue.get(esc_id).status for esc_id in first.filed} == {'pending'}
+
+
+def _config(**changes):
+    return _mod().load_runner_config(COMMITTED_CONFIG).model_copy(update=changes)
+
+
+def _seed_first_run(root: Path) -> None:
+    """Baseline runs 0701-0703 on disk, with the 0701 grandfather snapshot persisted."""
+    _seed(root, *_ALL_STAMPS[:3])
+    _mod().evaluate_eval(root, _E1, _FIRST, _config().limits_config())
+
+
+def _producing(fake_script: Path, stamp: str):
+    return _fake(fake_script, source=_alpha_series(stamp))
+
+
+def _failing_producer(fake_script: Path, eval_id: str = 'e4-staleness-sweep'):
+    return _fake(fake_script, eval_id, extra=['--exit', '3', '--stderr', 'store unreachable'])
+
+
+def _seeded_queue_dir(tmp_path: Path) -> Path:
+    queue_dir = tmp_path / 'escalations'
+    queue = EscalationQueue(queue_dir)
+    queue.submit(Escalation(
+        id=queue.make_id('unrelated'), task_id='unrelated', agent_role='test',
+        severity='info', category='merge_error', summary='unrelated record',
+    ))
+    return queue_dir
+
+
+def _main(root: Path, queue_dir: Path, producers) -> int:
+    return _mod().main(
+        ['--config', str(COMMITTED_CONFIG), '--artifact-root', str(root), '--queue-dir', str(queue_dir)],
+        producers=producers,
+    )
+
+
+class TestRunProgram:
+    def _regression(self, tmp_path, fake_script, **config_changes):
+        root, queue = tmp_path / 'root', EscalationQueue(tmp_path / 'escalations')
+        _seed_first_run(root)
+        outcome = _mod().run_program(
+            _config(**config_changes), [_producing(fake_script, _REGRESSION)], root, queue, _REGRESSION,
+        )
+        return root, queue, outcome
+
+    def test_the_verdicts_are_persisted_stamped_and_current(self, tmp_path, fake_script):
+        root, _, _ = self._regression(tmp_path, fake_script)
+        stamped = root / f'verdicts-{_REGRESSION}.json'
+        current = root / 'verdicts-current.json'
+        assert stamped.read_bytes() == current.read_bytes()
+        assert load_verdicts_artifact(current).run_stamp == _REGRESSION
+
+    def test_filed_escalations_match_the_alarm_entries(self, tmp_path, fake_script):
+        root, queue, _ = self._regression(tmp_path, fake_script)
+        artifact = load_verdicts_artifact(root / 'verdicts-current.json')
+        alarms = {e.fingerprint for e in artifact.entries if e.verdict == 'alarm'}
+        assert alarms
+        assert {e.dedupe_fingerprint for e in _pending(queue)} == alarms
+
+    def test_a_storm_files_the_aggregate_the_artifact_names(self, tmp_path, fake_script):
+        root, queue, _ = self._regression(tmp_path, fake_script, storm_alarm_limit=2)
+        artifact = load_verdicts_artifact(root / 'verdicts-current.json')
+        (only,) = _pending(queue)
+        assert only.dedupe_fingerprint == artifact.storm_escape.aggregate_fingerprint
+
+    def test_the_run_report_is_written_and_cited(self, tmp_path, fake_script):
+        root, queue, _ = self._regression(tmp_path, fake_script)
+        report = root / f'run-report-{_REGRESSION}.txt'
+        assert report.is_file()
+        assert all(str(report) in esc.detail for esc in _pending(queue))
+
+    def test_a_first_run_reports_the_known_bad_baseline_and_files_nothing(
+        self, tmp_path, fake_script,
+    ):
+        root, queue = tmp_path / 'root', EscalationQueue(tmp_path / 'escalations')
+        _mod().run_program(_config(), [_producing(fake_script, _FIRST)], root, queue, _FIRST)
+        report = (root / f'run-report-{_FIRST}.txt').read_text(encoding='utf-8')
+        assert 'Initial-state baseline (known-bad, not alarmed)' in report
+        for item in _failing_items(_FIRST):
+            assert item in report
+        assert _pending(queue) == []
+
+
+
+class TestMain:
+    def test_one_failing_producer_does_not_stop_the_others(
+        self, tmp_path, fake_script, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        root, queue_dir = tmp_path / 'root', _seeded_queue_dir(tmp_path)
+        code = _main(root, queue_dir, [_failing_producer(fake_script), _producing(fake_script, _FIRST)])
+        assert code == 1
+        artifact = load_verdicts_artifact(root / 'verdicts-current.json')
+        assert {e.eval_id for e in artifact.entries} == {_E1}
+        assert [(f.scope, f.phase) for f in artifact.runner_failures] == [
+            ('e4-staleness-sweep', 'produce'),
+        ]
+        (only,) = _pending(EscalationQueue(queue_dir))
+        assert only.task_id == _PROGRAM_TASK
+        summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert summary['failures'] == 1
+
+    def test_a_run_with_alarms_but_no_failures_exits_0(self, tmp_path, fake_script, monkeypatch):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _REGRESSION)
+        root, queue_dir = tmp_path / 'root', _seeded_queue_dir(tmp_path)
+        _seed_first_run(root)
+        assert _main(root, queue_dir, [_producing(fake_script, _REGRESSION)]) == 0
+        assert len(_pending(EscalationQueue(queue_dir))) == 3
+
+    def test_an_unexpected_error_files_one_runner_failure_and_exits_1(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        root = tmp_path / 'root-is-a-file'
+        root.write_text('not a directory', encoding='utf-8')
+        queue_dir = _seeded_queue_dir(tmp_path)
+        assert _main(root, queue_dir, []) == 1
+        (only,) = _pending(EscalationQueue(queue_dir))
+        assert only.task_id == _PROGRAM_TASK
+        assert 'runner' in only.evidence[0]['observation']
+
+    def test_a_rerun_at_the_pinned_stamp_files_nothing_and_rewrites_identical_verdicts(
+        self, tmp_path, fake_script, monkeypatch,
+    ):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _REGRESSION)
+        root, queue_dir = tmp_path / 'root', _seeded_queue_dir(tmp_path)
+        _seed_first_run(root)
+        producers = [_producing(fake_script, _REGRESSION)]
+        _main(root, queue_dir, producers)
+        first_bytes = (root / 'verdicts-current.json').read_bytes()
+        first_pending = {e.id for e in _pending(EscalationQueue(queue_dir))}
+        _main(root, queue_dir, producers)
+        assert (root / 'verdicts-current.json').read_bytes() == first_bytes
+        assert {e.id for e in _pending(EscalationQueue(queue_dir))} == first_pending
+
+    def test_only_producer_eval_dirs_appear_under_the_root(self, tmp_path, fake_script, monkeypatch):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        root, queue_dir = tmp_path / 'root', _seeded_queue_dir(tmp_path)
+        _main(root, queue_dir, [_failing_producer(fake_script), _producing(fake_script, _FIRST)])
+        assert sorted(p.name for p in root.iterdir() if p.is_dir()) == [_E1]
