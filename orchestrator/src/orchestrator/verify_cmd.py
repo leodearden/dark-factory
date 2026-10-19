@@ -1919,7 +1919,10 @@ def serial_pytest(cmd: VerifyCmd, ini_addopts: Sequence[str] = ()) -> VerifyCmd:
     invocation recovers independently. No-ops unless ``cmd.tool is
     ToolKind.PYTEST`` (covers OPAQUE and every other tool — P1). This is the
     recovery task 2045 proved for a shared-venv-mutation transient, where
-    xdist has vanished from the venv.
+    xdist has vanished from the venv. ``-p no:xdist`` also unregisters xdist's
+    fixtures (``worker_id``, ``testrun_uid``), so a test requesting one ERRORs
+    at setup; ``verify.py::reproduced_failures`` says what such an ERROR
+    confirms.
 
     *ini_addopts* is the RAW ``addopts`` of the config pytest will read for
     this command, supplied by the caller
