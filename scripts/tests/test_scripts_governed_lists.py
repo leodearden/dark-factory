@@ -11,6 +11,7 @@ import check_dashboard_unit_parity
 import governed_list_agreement
 import inline_suppressions
 import merge_lane_metrics
+import sweep_toolcall_markup
 import test_design_invariants_consistency as design_invariants_consistency
 import test_merge_state_vocabulary_consistency as merge_state_vocabulary_consistency
 from shared.governed_exceptions import Debt, Policy, TaskRef, governed_exceptions
@@ -62,6 +63,15 @@ INLINE_SUPPRESSION_BASELINE = governed_exceptions(
     [inline_suppressions.BASELINE_PATH],
     default=Policy('inv12-shrink-only-baselines'),
     default_covers=1,
+)
+
+NEVER_TOUCH_LIST = governed_exceptions(
+    'scripts.sweep_toolcall_markup.NEVER_TOUCH',
+    'A file the tool-call markup sweep never rewrites, because it is a verbatim record '
+    'of an earlier leak.',
+    sorted(sweep_toolcall_markup.NEVER_TOUCH),
+    default=Policy('inv12-toolcall-markup-never-touch'),
+    default_covers=2,
 )
 
 
