@@ -5,18 +5,21 @@ import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from orchestrator.recut_ruling import (
     RECUT_EXECUTED_KEY,
     RECUT_RULING_KEY,
+    GateVerdict,
     ParkedIncarnation,
     RecutRuling,
     RecutRulingUnreadable,
     RecutRulingViolation,
     RecutState,
     carries_recut_ruling,
+    enforce_recut_ruling,
     execution_record,
     read_recut_ruling,
     ruling_to_enforce,
@@ -194,3 +197,148 @@ class TestRecutRulingViolation:
         assert RULING.ruled_at.isoformat() in text
         for item in evidence:
             assert item in text
+
+
+class _RecordingOps:
+    """A PriorIncarnationOps that records each call into a shared list."""
+
+    def __init__(
+        self,
+        calls: list[tuple[Any, ...]],
+        *,
+        parked: ParkedIncarnation | None = PARKED,
+        park_error: Exception | None = None,
+        evidence: tuple[str, ...] = (),
+    ) -> None:
+        self.calls = calls
+        self.parked = parked
+        self.park_error = park_error
+        self.evidence = evidence
+
+    async def park_prior_incarnation(
+        self, branch_name: str, *, reason: str,
+    ) -> ParkedIncarnation | None:
+        self.calls.append(('park', branch_name, reason))
+        if self.park_error is not None:
+            raise self.park_error
+        return self.parked
+
+    async def prior_incarnation_evidence(self, branch_name: str) -> tuple[str, ...]:
+        self.calls.append(('evidence', branch_name))
+        return self.evidence
+
+
+def _persist(
+    calls: list[tuple[Any, ...]], *, result: bool = True, error: Exception | None = None,
+) -> AsyncMock:
+    async def _record(patch: dict[str, Any]) -> bool:
+        calls.append(('persist', patch))
+        if error is not None:
+            raise error
+        return result
+
+    return AsyncMock(side_effect=_record)
+
+
+class TestEnforceRecutRuling:
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(None, id='absent'),
+        pytest.param('not json', id='skip'),
+        pytest.param(_ruled(**{RECUT_EXECUTED_KEY: {'ruling_id': RULING_ID}}),
+                     id='satisfied'),
+    ])
+    async def test_nothing_to_execute_proceeds(self, metadata: object):
+        calls: list[tuple[Any, ...]] = []
+        result = await enforce_recut_ruling(
+            _task(metadata), ops=_RecordingOps(calls), persist=_persist(calls),
+            now=EXECUTED_AT,
+        )
+        assert result.verdict is GateVerdict.PROCEED
+        assert calls == []
+
+    async def test_malformed_refuses_without_touching_anything(self):
+        calls: list[tuple[Any, ...]] = []
+        result = await enforce_recut_ruling(
+            _task({RECUT_RULING_KEY: {'ruling_id': RULING_ID}}),
+            ops=_RecordingOps(calls), persist=_persist(calls), now=EXECUTED_AT,
+        )
+        assert result.verdict is GateVerdict.REFUSED and result.refused
+        assert 'ruled_at' in result.reason
+        assert calls == []
+
+    async def test_pending_parks_then_verifies_then_persists(self):
+        calls: list[tuple[Any, ...]] = []
+        result = await enforce_recut_ruling(
+            _task(_ruled()), ops=_RecordingOps(calls), persist=_persist(calls),
+            now=EXECUTED_AT,
+        )
+        record = execution_record(RULING, PARKED, EXECUTED_AT)
+        assert [call[0] for call in calls] == ['park', 'evidence', 'persist']
+        assert calls[0][1] == '2896' and RULING_ID in calls[0][2]
+        assert calls[1] == ('evidence', '2896')
+        assert calls[2] == ('persist', {RECUT_EXECUTED_KEY: record})
+        merged = _task({**_ruled(), **calls[2][1]})
+        assert read_recut_ruling(merged).state is RecutState.SATISFIED
+        assert result.verdict is GateVerdict.EXECUTED and result.executed
+        assert result.parked == PARKED
+        assert result.ruling == RULING
+
+    async def test_integer_task_id_is_the_bare_branch_name(self):
+        calls: list[tuple[Any, ...]] = []
+        await enforce_recut_ruling(
+            {'id': 2896, 'metadata': _ruled()}, ops=_RecordingOps(calls),
+            persist=_persist(calls), now=EXECUTED_AT,
+        )
+        assert calls[0][1] == '2896'
+
+    async def test_nothing_parked_still_records_execution(self):
+        calls: list[tuple[Any, ...]] = []
+        result = await enforce_recut_ruling(
+            _task(_ruled()), ops=_RecordingOps(calls, parked=None),
+            persist=_persist(calls), now=EXECUTED_AT,
+        )
+        assert calls[-1] == (
+            'persist', {RECUT_EXECUTED_KEY: execution_record(RULING, None, EXECUTED_AT)},
+        )
+        assert result.verdict is GateVerdict.EXECUTED
+        assert result.parked is None
+
+    async def test_park_failure_refuses_and_records_nothing(self):
+        calls: list[tuple[Any, ...]] = []
+        result = await enforce_recut_ruling(
+            _task(_ruled()),
+            ops=_RecordingOps(calls, park_error=RuntimeError('worktree move failed')),
+            persist=_persist(calls), now=EXECUTED_AT,
+        )
+        assert result.verdict is GateVerdict.REFUSED
+        assert RULING_ID in result.reason and 'worktree move failed' in result.reason
+        assert [call[0] for call in calls] == ['park']
+
+    async def test_surviving_evidence_refuses_and_records_nothing(self):
+        calls: list[tuple[Any, ...]] = []
+        evidence = ('branch task/2896 exists at abc', 'lane /pool/_lane-1 is assigned to 2896')
+        result = await enforce_recut_ruling(
+            _task(_ruled()), ops=_RecordingOps(calls, evidence=evidence),
+            persist=_persist(calls), now=EXECUTED_AT,
+        )
+        assert result.verdict is GateVerdict.REFUSED
+        for item in evidence:
+            assert item in result.reason
+        assert [call[0] for call in calls] == ['park', 'evidence']
+
+    @pytest.mark.parametrize(('result', 'error'), [
+        pytest.param(False, None, id='returns-false'),
+        pytest.param(True, RuntimeError('store down'), id='raises'),
+    ])
+    async def test_persist_failure_refuses_naming_the_parked_ref(
+        self, result: bool, error: Exception | None,
+    ):
+        calls: list[tuple[Any, ...]] = []
+        gate = await enforce_recut_ruling(
+            _task(_ruled()), ops=_RecordingOps(calls),
+            persist=_persist(calls, result=result, error=error), now=EXECUTED_AT,
+        )
+        assert gate.verdict is GateVerdict.REFUSED
+        assert PARKED.parked_branch is not None
+        assert PARKED.parked_branch in gate.reason
+        assert 're-dispatch is safe' in gate.reason

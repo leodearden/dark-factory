@@ -24,12 +24,27 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 from orchestrator.lane_lifecycle import AcquireRoute
-from orchestrator.recut_ruling import RecutRuling, RecutRulingViolation
+from orchestrator.recut_ruling import (
+    RECUT_EXECUTED_KEY,
+    RECUT_RULING_KEY,
+    GateVerdict,
+    RecutRuling,
+    RecutRulingViolation,
+    enforce_recut_ruling,
+    ruling_to_enforce,
+)
 from orchestrator.warm_lane_pool import LaneState
 
 PRE_RULING_DATE = '2026-07-22T12:00:00Z'
 PARKED_NAME = re.compile(r'^task/(?P<id>[^/]+)-\d{8}T\d{6}Z$')
 RULING = RecutRuling('esc-2896-3/D11-A', datetime(2026, 8, 30, tzinfo=UTC))
+EXECUTED_AT = datetime(2026, 9, 1, 12, 30, tzinfo=UTC)
+SPECIMEN_TASK = {
+    'id': '2896',
+    'metadata': {
+        RECUT_RULING_KEY: {'ruling_id': 'esc-2896-3/D11-A', 'ruled_at': '2026-08-30T00:00:00Z'},
+    },
+}
 REUSE_ROUTES = (
     AcquireRoute.REUSE,
     AcquireRoute.DISK_BACKSTOP_REUSE,
@@ -396,3 +411,115 @@ class TestProvisioningDoorsRefuseUnderPendingRuling:
         assert info.path == worktree
         assert _resolve(git_repo, 'task/7') == tip
         assert _git(git_repo, 'rev-list', '--count', 'main..task/7') == '2'
+
+
+class _RecordingPersist:
+    def __init__(self) -> None:
+        self.patches: list[dict] = []
+
+    async def __call__(self, patch: dict) -> bool:
+        self.patches.append(patch)
+        return True
+
+
+def _parked_refs(repo: Path, task_id: str) -> list[str]:
+    listing = _git(repo, 'for-each-ref', '--format=%(refname:short)', f'refs/heads/task/{task_id}-*')
+    return [line for line in listing.splitlines() if line]
+
+
+async def _seed_pre_ruling_work(repo: Path, worktree: Path) -> str:
+    """Three pre-ruling commits + an uncommitted edit, then main moves on by two."""
+    _commit_files(worktree, 3, 'pre-ruling')
+    (worktree / 'README.md').write_text('# uncommitted pre-ruling edit\n')
+    tip = _resolve(repo, 'task/2896')
+    assert tip is not None
+    _commit_files(repo, 2, 'main-advance')
+    return tip
+
+
+def _assert_parked_intact(repo: Path, parked_branch: str, early_main: str, original_tip: str) -> None:
+    assert _resolve(repo, parked_branch) is not None
+    assert _git(repo, 'rev-list', '--count', f'{early_main}..{parked_branch}') == '4'
+    assert _git(repo, 'merge-base', parked_branch, 'main') == early_main
+    _git(repo, 'merge-base', '--is-ancestor', original_tip, parked_branch)
+
+
+@pytest.mark.asyncio
+class TestSpecimenRecut:
+    """Task 2896's shape: work from before ruling D11-A must never be resumed."""
+
+    async def test_cold_specimen_recut_then_redispatch(self, git_repo: Path):
+        git_ops = GitOps(_config(warm_lane_pool=False), git_repo)
+        early_main = await _get_head(git_repo)
+        worktree = (await git_ops.create_worktree('2896')).path
+        original_tip = await _seed_pre_ruling_work(git_repo, worktree)
+        main_head = await _get_head(git_repo)
+        persist = _RecordingPersist()
+
+        result = await enforce_recut_ruling(
+            SPECIMEN_TASK, ops=git_ops, persist=persist, now=EXECUTED_AT,
+        )
+        info = await git_ops.create_worktree('2896', recut_ruling=ruling_to_enforce(SPECIMEN_TASK))
+
+        assert result.verdict is GateVerdict.EXECUTED
+        assert result.parked is not None and result.parked.parked_branch is not None
+        parked_branch = result.parked.parked_branch
+        _assert_parked_intact(git_repo, parked_branch, early_main, original_tip)
+        assert _git(git_repo, 'rev-list', '--count', 'main..task/2896') == '0'
+        assert info.base_commit == main_head
+        assert _resolve(git_repo, 'task/2896') == main_head
+        record = persist.patches[0][RECUT_EXECUTED_KEY]
+        assert record['parked_branch'] == parked_branch
+        assert record['parked_tip'] == _resolve(git_repo, parked_branch)
+
+        redispatch = {
+            'id': '2896',
+            'metadata': {**SPECIMEN_TASK['metadata'], **persist.patches[0]},
+        }
+        assert ruling_to_enforce(redispatch) is None
+        again = await enforce_recut_ruling(
+            redispatch, ops=git_ops, persist=persist, now=EXECUTED_AT,
+        )
+        info_again = await git_ops.create_worktree('2896', recut_ruling=ruling_to_enforce(redispatch))
+
+        assert again.verdict is GateVerdict.PROCEED
+        assert info_again.path == info.path
+        assert _resolve(git_repo, 'task/2896') == main_head
+        assert _parked_refs(git_repo, '2896') == [parked_branch]
+
+    async def test_pooled_specimen_recut_takes_a_fresh_route(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_config(warm_lane_pool=True), git_repo, warm_lane_pool_size=1)
+        early_main = await _get_head(git_repo)
+        acquired = await git_ops.acquire_warm_lane('2896', early_main)
+        assert isinstance(acquired, WorktreeInfo), f'Expected WorktreeInfo; got {acquired!r}'
+        _write_lane_metadata(git_ops, acquired.path.name, '2896')
+        original_tip = await _seed_pre_ruling_work(git_repo, acquired.path)
+        main_head = await _get_head(git_repo)
+        persist = _RecordingPersist()
+
+        result = await enforce_recut_ruling(
+            SPECIMEN_TASK, ops=git_ops, persist=persist, now=EXECUTED_AT,
+        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            info = await git_ops.create_worktree(
+                '2896', recut_ruling=ruling_to_enforce(SPECIMEN_TASK),
+            )
+
+        assert result.verdict is GateVerdict.EXECUTED
+        assert result.parked is not None and result.parked.parked_branch is not None
+        _assert_parked_intact(git_repo, result.parked.parked_branch, early_main, original_tip)
+        assert any(
+            _route_logged(caplog, route)
+            for route in (AcquireRoute.CREATE_ONCE_FRESH, AcquireRoute.RECYCLE)
+        ), caplog.text
+        for route in REUSE_ROUTES:
+            assert not _route_logged(caplog, route), caplog.text
+        assert _git(git_repo, 'rev-list', '--count', 'main..task/2896') == '0'
+        assert info.base_commit == main_head
+        record = persist.patches[0][RECUT_EXECUTED_KEY]
+        assert record['parked_branch'] == result.parked.parked_branch
+        assert record['relocated_meta_roots'] == list(result.parked.relocated_meta_roots)
