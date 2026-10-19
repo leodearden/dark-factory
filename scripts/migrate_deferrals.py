@@ -14,9 +14,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
-from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, NamedTuple
+from typing import Any, Final, NamedTuple, TypeGuard
 
 import _checkout as _checkout
 import deferral_store
@@ -215,19 +214,14 @@ class MigrationExit(IntEnum):
     PREDATES_GATE = 2
 
 
-class PredatesGate(Exception):
-    """A write succeeded without echoing its record, so the server predates the deferral gate."""
-
-    def __init__(self, root: Path, task_id: int) -> None:
-        super().__init__(f'{root} task {task_id}')
-        self.root = root
-        self.task_id = task_id
-
-
 class Outcome(StrEnum):
     STAMPED = 'stamped'
     MOVED = 'moved since read'
     FAILED = 'failed'
+    UNECHOED = 'unechoed'
+
+
+_COUNTED: Final = (Outcome.STAMPED, Outcome.MOVED, Outcome.FAILED)
 
 
 @dataclass(frozen=True)
@@ -252,6 +246,11 @@ class ProjectReport:
     def failed(self) -> bool:
         return any(outcome.outcome is Outcome.FAILED for outcome in self.outcomes)
 
+    @property
+    def unechoed(self) -> int | None:
+        """The task whose write succeeded without echoing its record; nothing after it was written."""
+        return next((row.plan.task_id for row in self.outcomes if row.outcome is Outcome.UNECHOED), None)
+
 
 def _carrier_ids(plans: Iterable[RowPlan]) -> set[int]:
     requests = (plan.request for plan in plans)
@@ -275,7 +274,7 @@ def _written(store: DeferralStore, target: ProjectTarget, plan: RowPlan) -> RowO
         case Changed(current_status=status):
             return RowOutcome(plan, Outcome.MOVED, f'now {status}')
         case Unechoed():
-            raise PredatesGate(target.root, plan.task_id)
+            return RowOutcome(plan, Outcome.UNECHOED)
         case Refused(reason_code=DeferralInvalidReason() as reason_code) as refused if _falls_back(plan, refused):
             return _written(store, target, fallback_plan(plan, reason_code))
         case Refused() as refused:
@@ -289,10 +288,22 @@ def _apply(store: DeferralStore, target: ProjectTarget, plan: RowPlan) -> RowOut
         return RowOutcome(plan, Outcome.FAILED, str(exc))
 
 
+def _applied(store: DeferralStore, target: ProjectTarget, plans: Iterable[RowPlan]) -> tuple[RowOutcome, ...]:
+    """Each plan written in turn, stopping after a write the server did not echo."""
+    outcomes: list[RowOutcome] = []
+    for plan in plans:
+        outcome = _apply(store, target, plan)
+        outcomes.append(outcome)
+        if outcome.outcome is Outcome.UNECHOED:
+            break
+    return tuple(outcomes)
+
+
 def migrate_project(
     store: DeferralStore, target: ProjectTarget, *, now: datetime, apply: bool
 ) -> ProjectReport | UnreadableProject:
-    """Plan every deferred row of *target*; under *apply*, re-stamp each planned row in task-id order."""
+    """Plan every deferred row of *target*; under *apply*, re-stamp each planned row in task-id order
+    until a write is not echoed."""
     if (unknown := project_report.unknown_project(target)) is not None:
         return unknown
     try:
@@ -309,7 +320,7 @@ def migrate_project(
         plans=plans,
         recorded=tuple(plan for plan in planned if isinstance(plan, AlreadyRecorded)),
         carrier_reasons=MappingProxyType({task_id: reason for task_id, reason in reasons.items() if reason}),
-        outcomes=tuple(_apply(store, target, plan) for plan in plans) if apply else (),
+        outcomes=_applied(store, target, plans) if apply else (),
     )
 
 
@@ -342,10 +353,12 @@ def _outcome_lines(report: ProjectReport) -> list[str]:
         return [f'would stamp: {len(report.plans)}', *fallbacks, 'dry-run: nothing written']
     counts = Counter(outcome.outcome for outcome in report.outcomes)
     return [
-        *(f'{outcome.value}: {counts[outcome]}' for outcome in Outcome),
+        *(f'{outcome.value}: {counts[outcome]}' for outcome in _COUNTED),
         *(_fallback_line(row.plan, row.plan.fallback) for row in report.outcomes if row.plan.fallback),
         *(f'moved since read #{row.plan.task_id} ({row.detail})' for row in report.outcomes if row.outcome is Outcome.MOVED),
         *(f'FAILED #{row.plan.task_id}: {row.detail}' for row in report.outcomes if row.outcome is Outcome.FAILED),
+        *([f'ABORTED #{report.unechoed}: the write succeeded without echoing its record; nothing after it '
+            'was written'] if report.unechoed is not None else []),
     ]
 
 
@@ -353,7 +366,31 @@ def _report_lines(report: ProjectReport) -> list[str]:
     return [*_class_lines(report), *_carrier_lines(report), *_outcome_lines(report)]
 
 
+def _stopped_at(result: ProjectReport | UnreadableProject) -> TypeGuard[ProjectReport]:
+    """Whether the run stopped at *result*: one of its writes succeeded without echoing its record."""
+    return isinstance(result, ProjectReport) and result.unechoed is not None
+
+
+def _aborted(results: Iterable[ProjectReport | UnreadableProject]) -> ProjectReport | None:
+    return next((result for result in results if _stopped_at(result)), None)
+
+
+def _migrated(
+    store: DeferralStore, targets: Iterable[ProjectTarget], *, now: datetime, apply: bool
+) -> tuple[ProjectReport | UnreadableProject, ...]:
+    """Each project in turn, stopping after the one whose write the server did not echo."""
+    results: list[ProjectReport | UnreadableProject] = []
+    for target in targets:
+        result = migrate_project(store, target, now=now, apply=apply)
+        results.append(result)
+        if _stopped_at(result):
+            break
+    return tuple(results)
+
+
 def exit_code(results: Sequence[ProjectReport | UnreadableProject]) -> MigrationExit:
+    if _aborted(results) is not None:
+        return MigrationExit.PREDATES_GATE
     failed = any(isinstance(result, UnreadableProject) or result.failed for result in results)
     return MigrationExit.FAILED if failed else MigrationExit.OK
 
@@ -364,7 +401,7 @@ def _parser() -> argparse.ArgumentParser:
         epilog=(
             'Exit 0: every project was read and every write landed or moved since read. Exit 1: a project '
             'could not be read or a write failed. Exit 2: the server predates the deferral gate; the run '
-            'stopped before its next write.'
+            'stopped before its next write, and reports the writes made before it.'
         ),
     )
     orchestrator_projects.add_arguments(parser)
@@ -379,17 +416,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not targets:
         return MigrationExit.FAILED
     store = deferral_store.store_from_args(args)
-    now = datetime.now(UTC)
-    try:
-        results = [migrate_project(store, target, now=now, apply=args.apply) for target in targets]
-    except PredatesGate as exc:
+    results = _migrated(store, targets, now=datetime.now(UTC), apply=args.apply)
+    project_report.render(results, _report_lines, out=sys.stdout)
+    aborted = _aborted(results)
+    if aborted is not None:
         print(
-            f'{_TOOL}: server predates the deferral gate: the write to {exc.root} task {exc.task_id} succeeded '
-            'without echoing its record; stopped before any further write',
+            f'{_TOOL}: server predates the deferral gate: the write to {aborted.target.root} task '
+            f'{aborted.unechoed} succeeded without echoing its record; stopped before any further write',
             file=sys.stderr,
         )
-        return MigrationExit.PREDATES_GATE
-    project_report.render(results, _report_lines, out=sys.stdout)
     return exit_code(results)
 
 

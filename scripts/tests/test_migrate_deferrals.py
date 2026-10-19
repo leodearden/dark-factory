@@ -451,7 +451,25 @@ class TestMigrationRun:
         assert 'server predates the deferral gate' in result.err
         assert str(root_a) in result.err and '301' in result.err
         assert len(fake.calls_to('set_task_status')) == 1
-        assert 'stamped' not in result.out
+        assert result.count(root_a, 'stamped') == 0
+        assert any('#301' in line for line in result.lines_with(root_a, 'ABORTED #'))
+        assert str(root_b) not in result.out
+
+    def test_an_abort_still_reports_the_writes_that_landed_before_it(
+        self, migrate: Any, serve: Any, make_root: Any
+    ) -> None:
+        root_a, root_b = make_root('A'), make_root('B')
+        fake = serve({str(root_a): project_a(), str(root_b): project_b()})
+        fake.unechoing.add(str(root_b))
+
+        result = migrate(*_roots(root_a, root_b), '--apply')
+
+        assert result.code == migrate_deferrals.MigrationExit.PREDATES_GATE
+        assert result.count(root_a, 'stamped') == 7
+        assert result.count(root_b, 'stamped') == 0
+        assert any('#501' in line for line in result.lines_with(root_b, 'ABORTED #'))
+        assert [call['id'] for call in fake.calls_to('set_task_status') if call['project_root'] == str(root_b)] == ['501']
+        assert str(root_b) in result.err and '501' in result.err
 
     def test_a_refused_carrier_falls_back_to_legacy_unknown(self, migrate: Any, serve: Any, make_root: Any) -> None:
         root = make_root('A')

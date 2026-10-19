@@ -59,8 +59,8 @@ def _int_id(row: Mapping[str, Any]) -> int:
 class FakeFusedMemory:
     """*projects* maps a project root string to its get_tasks-wire row dicts.
     A root not in *projects*, or in ``unreadable``, answers an error payload.
-    With *echo* False a successful re-stamp omits ``deferral``, as a server
-    that predates the deferral gate would."""
+    With *echo* False, or for a root in ``unechoing``, a successful re-stamp
+    omits ``deferral``, as a server that predates the deferral gate would."""
 
     def __init__(self, projects: Mapping[str, Sequence[Mapping[str, Any]]], *, echo: bool = True) -> None:
         self.projects: dict[str, list[dict[str, Any]]] = {
@@ -68,6 +68,7 @@ class FakeFusedMemory:
         }
         self.echo = echo
         self.unreadable: set[str] = set()
+        self.unechoing: set[str] = set()
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._moves: dict[tuple[str, int], str] = {}
         self._kind_refusals: dict[tuple[str, int, str], DeferralInvalidReason] = {}
@@ -179,7 +180,7 @@ class FakeFusedMemory:
         metadata = row['metadata'] if isinstance(row.get('metadata'), dict) else {}
         row['metadata'] = {**metadata, 'deferral': record}
         reply: dict[str, Any] = {'success': True, 'task_id': str(task_id), 'status': 'deferred'}
-        return {**reply, 'deferral': record} if self.echo else reply
+        return {**reply, 'deferral': record} if self.echo and root not in self.unechoing else reply
 
     @staticmethod
     def _corroborate(rows: list[dict[str, Any]], request: object) -> None:
