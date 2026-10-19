@@ -1101,9 +1101,11 @@ verify_env:
 # consulted alongside the verify_runners pool, which is itself restart-only.
 #
 # THE PROBE SEAM IS THE VERIFY SEAM, ON BOTH SIDES.
-#   - REMOTE: RemoteRunner.env_probe_run issues `ssh <host> <cmd>` — the same
-#     NON-LOGIN, non-interactive shell RemoteRunner.run_merge_verify dispatches
-#     `orchestrator verify-merge` through.
+#   - REMOTE: RemoteRunner.env_probe_run issues `ssh <host> <prelude> <cmd>` —
+#     the same NON-LOGIN, non-interactive shell RemoteRunner.run_merge_verify
+#     dispatches `orchestrator verify-merge` through, with
+#     verify_runner.py::REMOTE_TOOL_PATH_PRELUDE putting ~/.local/bin on PATH
+#     exactly as RemoteRunner's remote `uv sync` does (task 7097).
 #   - LOCAL: verify_runner.env_probe_local_run spawns via execve (no shell)
 #     under verify._target_subprocess_env(None) — VIRTUAL_ENV dropped, the venv
 #     bin dir off PATH — which is exactly how every local verify command is
@@ -1157,14 +1159,12 @@ verify_env:
 # row, so npm cannot write _cacache/_logs and aborts with EACCES before it
 # ever execs pyright (task 3162 owns the fix; the `sudo chown -R` the npm
 # error text suggests is a confirmed no-op — the tree is already leo:leo).
-# The unsandboxed daemon that runs the real probe is unaffected. Under the
-# seam above, the first live drift check is expected to report TWO diverging
-# probes:
-#   - uv: present on the workstation, absent from the laptop's non-login ssh
-#     PATH. `ssh leo-laptop bash -lc "uv --version"` DOES find uv 0.10.6, so
-#     this is a PATH-scope difference, not a missing install — and it is the
-#     scope the remote verify actually runs in. Fix by putting uv on the
-#     non-login PATH (and then the 0.11.6/0.10.6 version skew surfaces).
+# The unsandboxed daemon that runs the real probe is unaffected. The table's
+# rc=127 for uv predates the remote prelude (task 7097): it was a PATH-scope
+# artefact of the bare non-login shell, not a missing install (`ssh leo-laptop
+# bash -lc "uv --version"` finds uv 0.10.6). Under the seam above, the first
+# live drift check is expected to report TWO genuine diverging probes:
+#   - uv: 0.11.6 on the workstation vs 0.10.6 on the laptop.
 #   - node: a genuine patch-level skew.
 # pyright is EQUAL today only by coincidence: type_check_command chains bare
 # `npx pyright` with no package.json, so each host resolves whatever its npx

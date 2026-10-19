@@ -6315,8 +6315,9 @@ def _make_ssh_seam(rc_by_probe=None, *, default=None):
     ``(rc, stdout, stderr)`` for every outcome including transport failure and
     raises nothing, so a test double that raises cannot reach the code path a
     down host actually takes.  Keys of *rc_by_probe* are matched against the
-    trailing remote command string of the ssh argv.
+    probe command the ssh argv carries after REMOTE_TOOL_PATH_PRELUDE.
     """
+    from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
     if default is None:
         default = (
             _SSH_UNREACHABLE_RC,
@@ -6327,7 +6328,7 @@ def _make_ssh_seam(rc_by_probe=None, *, default=None):
 
     async def run(argv, *, cwd=None):
         issued.append(list(argv))
-        remote_cmd = argv[-1]
+        remote_cmd = argv[-1].removeprefix(f'{REMOTE_TOOL_PATH_PRELUDE} ')
         if rc_by_probe is not None and remote_cmd in rc_by_probe:
             return rc_by_probe[remote_cmd]
         return default
@@ -7316,7 +7317,9 @@ class TestRemoteRunnerCancelVerify:
 @pytest.mark.asyncio
 class TestRemoteRunnerEnvProbeRun:
     """env_probe_run() returns a capture_env_fingerprint-compatible adapter
-    that dispatches each probe argv over ssh through the plain self._run seam."""
+    that dispatches each probe argv over ssh through the plain self._run seam,
+    behind REMOTE_TOOL_PATH_PRELUDE (task 7097) so the non-login ssh shell
+    finds ~/.local/bin tools the way RemoteRunner's own `uv sync` does."""
 
     def _make_runner(self, *, responses=None):
         calls = []
@@ -7339,15 +7342,33 @@ class TestRemoteRunnerEnvProbeRun:
 
     async def test_issues_exact_ssh_argv_with_shared_base_opts(self):
         """The adapter reuses _SSH_BASE_OPTS verbatim rather than re-spelling flags."""
-        from orchestrator.verify_runner import _SSH_BASE_OPTS
+        from orchestrator.verify_runner import _SSH_BASE_OPTS, REMOTE_TOOL_PATH_PRELUDE
 
         runner, calls = self._make_runner()
         adapter = runner.env_probe_run()
         await adapter(['uv', '--version'])
 
         assert calls == [[
-            'ssh', *_SSH_BASE_OPTS, 'laptop.local', 'uv --version',
+            'ssh', *_SSH_BASE_OPTS, 'laptop.local',
+            f'{REMOTE_TOOL_PATH_PRELUDE} uv --version',
         ]]
+
+    async def test_remote_command_leads_with_the_unquoted_path_prelude(self):
+        """Task 7097: a non-login ssh shell lacks ~/.local/bin, so a bare
+        `uv --version` exits 127 on a host where uv IS installed — a false
+        divergence that, deduped, would suppress the real skew alarm. The
+        prelude goes first and unquoted ($HOME must expand remotely); the
+        probe argv follows, still shlex-quoted."""
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+
+        runner, calls = self._make_runner()
+        adapter = runner.env_probe_run()
+        await adapter(['sh', '-c', 'echo a b'])
+
+        remote_cmd = calls[0][-1]
+        assert remote_cmd.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} ')
+        assert '$HOME/.local/bin' in remote_cmd
+        assert remote_cmd.removeprefix(f'{REMOTE_TOOL_PATH_PRELUDE} ') == "sh -c 'echo a b'"
 
     async def test_returns_run_result_tuple_unchanged(self):
         """(rc, stdout, stderr) passes through — satisfies capture's run contract."""
@@ -7361,8 +7382,10 @@ class TestRemoteRunnerEnvProbeRun:
         adapter = runner.env_probe_run()
         await adapter(['sh', '-c', 'echo a b'])
 
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+
         remote_cmd = calls[0][-1]
-        assert remote_cmd == "sh -c 'echo a b'"
+        assert remote_cmd == f"{REMOTE_TOOL_PATH_PRELUDE} sh -c 'echo a b'"
 
     async def test_capture_env_fingerprint_drives_probes_over_ssh(self):
         """End-to-end: capture_env_fingerprint(adapter) populates extra_probes."""
@@ -7384,8 +7407,9 @@ class TestRemoteRunnerEnvProbeRun:
         assert dict(fp.extra_probes) == {'pyright': '1.1.377', 'uv': 'uv 0.10.6'}
         # every probe went over ssh to the configured host
         assert all(c[0] == 'ssh' and 'laptop.local' in c for c in calls)
-        assert calls[-2][-1] == 'npx pyright --version'
-        assert calls[-1][-1] == 'uv --version'
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+        assert calls[-2][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} npx pyright --version'
+        assert calls[-1][-1] == f'{REMOTE_TOOL_PATH_PRELUDE} uv --version'
 
 
 # ---------------------------------------------------------------------------

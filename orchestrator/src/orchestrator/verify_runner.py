@@ -2174,11 +2174,13 @@ class RemoteRunner:
         The returned async callable has capture's ``(argv, *, cwd=None) ->
         (rc, stdout, stderr)`` shape, and dispatches each probe as::
 
-            ssh <_SSH_BASE_OPTS> <host> <shlex-joined argv>
+            ssh <_SSH_BASE_OPTS> <host> <REMOTE_TOOL_PATH_PRELUDE> <shlex-joined argv>
 
         so a remote fingerprint can be captured through exactly the same
         function that captures the local one.  The rc/stdout/stderr triple is
-        returned unchanged.
+        returned unchanged.  The prelude (task 7097) puts ``~/.local/bin`` on
+        the non-login shell's PATH, as for RemoteRunner's own remote ``uv
+        sync``; without it a host with uv installed reports rc=127.
 
         Routed through ``self._run`` (the plain seam shared with health /
         cancel_verify / probe_clean) rather than ``self._ssh_run``: probes are
@@ -2225,9 +2227,10 @@ class RemoteRunner:
             remote_cmd = ' '.join(shlex.quote(a) for a in argv)
             try:
                 async with asyncio.timeout(_SSH_PROBE_TIMEOUT_SECS):
-                    rc, stdout, stderr = await self._run(
-                        ['ssh', *_SSH_BASE_OPTS, self._ssh_host, remote_cmd]
-                    )
+                    rc, stdout, stderr = await self._run([
+                        'ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                        f'{REMOTE_TOOL_PATH_PRELUDE} {remote_cmd}',
+                    ])
             except TimeoutError as exc:
                 # BEFORE the OSError clause: TimeoutError subclasses OSError.
                 # A reached-then-wedged connection is a transport failure, not
