@@ -11,6 +11,7 @@ from shared.defect_enumerator import (
     EnumerationGap,
     FileEnumeration,
     GapReason,
+    NonStaticMark,
     enumerate_source,
 )
 from shared.defects import NodeId, mint_explore_ref
@@ -22,7 +23,7 @@ PATH = 'pkg/tests/test_x.py'
 
 
 def _enumerate(source: str, *, path: str = PATH, module_root: str = 'pkg') -> FileEnumeration:
-    return enumerate_source(path, textwrap.dedent(source), module_root=module_root)
+    return enumerate_source(path, textwrap.dedent(source).removeprefix('\n'), module_root=module_root)
 
 
 def _node(name: str) -> NodeId:
@@ -93,6 +94,7 @@ def test_a_mark_on_a_function_pytest_does_not_collect_is_not_a_carrier():
             pass
     ''')
     assert REF_A not in result.carriers
+    assert result.non_static == (NonStaticMark(REF_A, 1),)
 
 
 def test_bytes_source_is_read_including_a_pep_263_coding_cookie():
@@ -146,3 +148,116 @@ def test_a_path_outside_its_module_root_or_not_normalised_is_refused(path, modul
     message = str(excinfo.value)
     assert repr(path) in message
     assert repr(module_root) in message
+
+
+@pytest.mark.parametrize('mark', [
+    'pytest.mark.defect',
+    'pytest.mark.defect()',
+    f'pytest.mark.defect({REF_A!r}, {REF_B!r})',
+    f'pytest.mark.defect(ref={REF_A!r})',
+    'pytest.mark.defect(SOME_NAME)',
+    "pytest.mark.defect(f'explore:run1:{N}')",
+    'pytest.mark.defect(*refs)',
+])
+def test_a_defect_mark_whose_ref_is_not_one_positional_literal_is_an_unreadable_ref_gap(mark):
+    result = _enumerate(f'''
+        import pytest
+
+        @{mark}
+        def test_a():
+            pass
+    ''')
+    assert result.complete is False
+    assert result.gaps == (EnumerationGap(GapReason.UNREADABLE_REF, 3),)
+
+
+def test_a_literal_outside_the_ref_grammar_is_a_malformed_ref_gap():
+    result = _enumerate('''
+        import pytest
+
+        @pytest.mark.defect('not-a-ref')
+        def test_a():
+            pass
+    ''')
+    assert result.complete is False
+    assert result.gaps == (EnumerationGap(GapReason.MALFORMED_REF, 3),)
+
+
+def test_readable_carriers_survive_beside_an_unreadable_mark():
+    result = _enumerate(f'''
+        @pytest.mark.defect(SOME_NAME)
+        def test_a():
+            pass
+
+        @pytest.mark.defect({REF_A!r})
+        def test_b():
+            pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_b'),)}
+    assert result.complete is False
+
+
+def test_a_mark_inside_pytest_param_is_not_static():
+    result = _enumerate(f'''
+        import pytest
+
+        @pytest.mark.parametrize('x', [pytest.param(1, marks=pytest.mark.defect({REF_A!r}))])
+        def test_p(x):
+            pass
+    ''')
+    assert REF_A not in result.carriers
+    assert result.non_static == (NonStaticMark(REF_A, 3),)
+    assert result.complete is True
+
+
+def test_a_mark_added_at_runtime_is_not_static():
+    result = _enumerate(f'''
+        def test_a(request):
+            request.node.add_marker(pytest.mark.defect({REF_B!r}))
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == (NonStaticMark(REF_B, 2),)
+
+
+def test_a_mark_applied_as_a_call_is_not_static():
+    result = _enumerate(f'''
+        def check():
+            pass
+
+        test_applied = pytest.mark.defect({REF_A!r})(check)
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == (NonStaticMark(REF_A, 4),)
+
+
+@pytest.mark.parametrize('source', [
+    '''
+        def test_a(request):
+            request.node.add_marker(pytest.mark.defect(SOME_NAME))
+    ''',
+    '''
+        x = 1
+        MARK = pytest.mark.defect
+    ''',
+], ids=['add-marker', 'bare-attribute'])
+def test_an_unreadable_mark_in_a_non_static_position_still_makes_the_file_incomplete(source):
+    result = _enumerate(source)
+    assert result.complete is False
+    assert result.gaps == (EnumerationGap(GapReason.UNREADABLE_REF, 2),)
+    assert result.non_static == ()
+
+
+def test_non_static_marks_and_gaps_are_ordered_by_line():
+    result = _enumerate(f'''
+        def helper(request):
+            request.node.add_marker(pytest.mark.defect({REF_B!r}))
+            request.node.add_marker(pytest.mark.defect(LATER))
+
+        MARK = pytest.mark.defect({REF_A!r})
+        OTHER = pytest.mark.defect(EARLIER)
+    ''')
+    assert result.non_static == (NonStaticMark(REF_B, 2), NonStaticMark(REF_A, 5))
+    assert result.gaps == (
+        EnumerationGap(GapReason.UNREADABLE_REF, 3),
+        EnumerationGap(GapReason.UNREADABLE_REF, 6),
+    )
