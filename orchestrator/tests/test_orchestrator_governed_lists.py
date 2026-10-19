@@ -10,7 +10,7 @@ with no disposition fails this suite before any test runs.
 import sys
 from pathlib import Path
 
-from shared.governed_exceptions import Debt, TaskRef, governed_exceptions
+from shared.governed_exceptions import Policy, governed_exceptions
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
@@ -23,7 +23,7 @@ MERGE_LANE_RATCHET_BASELINE = governed_exceptions(
     'none may rise without an authorized raise, and a path or function absent from '
     'the baseline must meet the file-size and new-function complexity ceilings.',
     [merge_lane_metrics.BASELINE_RELPATH],
-    default=Debt(TaskRef(5603)),
+    default=Policy('inv12-shrink-only-baselines'),
     default_covers=1,
 )
 

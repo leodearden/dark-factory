@@ -131,7 +131,7 @@ SILENT_FALLTHROUGH_ALLOWLIST = governed_exceptions(
     'A pre-existing site that swallows an error into an empty value or a discarded '
     'error slot, tolerated by the silent-fallthrough gate until it is fixed.',
     _occurrence_keys(entry[:3] for entry in silent_fallthrough_allowlist.ALLOWLIST_ENTRIES),
-    default=Debt(TaskRef(5603)),
+    default=Debt(TaskRef(7139)),
     default_covers=12,
 )
 
@@ -158,7 +158,7 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     'A task-metadata key outside the typed TaskMetadata schema that the metadata census '
     'accepts without an unknown-key warning.',
     sorted(_BLESSED_METADATA_KEYS),
-    default=Debt(TaskRef(5603)),
+    default=Policy('inv12-task-metadata-blessed-keys'),
     default_covers=56,
 )
 
@@ -167,7 +167,7 @@ LEGACY_RETRY_LEDGER_COUNTER_KEYS = governed_exceptions(
     'A RetryLedger counter that legacy metadata blobs still carry as a top-level key '
     'instead of nested under retry_ledger, tolerated rather than reported.',
     list(_LEGACY_RETRY_LEDGER_COUNTER_KEYS),
-    default=Debt(TaskRef(5603)),
+    default=Debt(TaskRef(7135)),
     default_covers=2,
 )
 
@@ -176,8 +176,10 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     'A ruff rule turned off in a workspace pyproject.toml, globally or for a file glob, '
     'instead of being fixed at its sites or disposed inline.',
     ruff_suppression_keys(REPO_ROOT),
-    default=Debt(TaskRef(5603)),
-    default_covers=2,
+    dispositions={
+        'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
+        'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
+    },
 )
 
 
@@ -187,7 +189,7 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
     'event loop thread, tolerated by the INV-8 loop-blocking gate with a recorded '
     'justification until it is offloaded.',
     _occurrence_keys(row[:3] for row in loop_blocking_allowlist.AUDITED_SITES),
-    default=Debt(TaskRef(5603)),
+    default=Debt(TaskRef(5270)),
     default_covers=28,
     dispositions={
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy.on_judge_unhalt::8f53c74a5d76': Debt(TaskRef(5270)),
