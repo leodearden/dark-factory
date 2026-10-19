@@ -2,7 +2,7 @@
 
 - acquire_warm_lane / release_warm_lane durable ASSIGNED/RELEASED writes
 - the .pool-root sentinel fold (GitOps delegates to LaneLifecycle)
-- the .task -> .task-meta relocations (disk-backstop plan.json,
+- the .task -> .task-meta relocations (disk-backstop metadata.json,
   interactive.json stamp)
 
 Self-contained, mirroring test_warm_lane_abort_teardown.py: conftest.py
@@ -369,8 +369,8 @@ class TestAcquireRouteClassification:
         _assert_route_logged(caplog, AcquireRoute.CREATE_ONCE_REATTACH)
 
     async def test_disk_backstop_reuse(self, git_repo: Path, caplog: pytest.LogCaptureFixture):
-        """A registered FREE lane whose .task/plan.json still names THIS
-        task (e.g. after a process restart cleared the in-memory map)."""
+        """A registered FREE lane whose meta-root metadata.json still names
+        THIS task (e.g. after a process restart cleared the in-memory map)."""
         await _add_warm_lane_scripts(git_repo)
         git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
         start_ref = await _get_head(git_repo)
@@ -378,12 +378,13 @@ class TestAcquireRouteClassification:
         first = await git_ops.acquire_warm_lane('D', start_ref)
         assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
         lane = first.path
-        (lane / '.task').mkdir(exist_ok=True)
-        (lane / '.task' / 'plan.json').write_text('{"task_id": "D"}')
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "D"}')
         assert git_ops.warm_lane_pool is not None
         # Bare pool release: drops the in-memory assignment (and frees the
-        # pool slot) without touching git or the .task/ scratch on disk —
-        # only the on-disk plan.json scan can now discover the match.
+        # pool slot) without touching git or the meta root on disk — only
+        # the on-disk metadata.json read can now discover the match.
         await git_ops.warm_lane_pool.release(lane)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
@@ -395,6 +396,84 @@ class TestAcquireRouteClassification:
         assert record is not None and record.state is LaneState.ASSIGNED
         assert record.task_id == 'D'
         _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
+
+    async def test_disk_backstop_reuse_via_metadata_when_no_plan_exists(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """A same-lane re-dispatch whose architect never wrote a plan: only
+        metadata.json names the task, and task/D carries a commit beyond main.
+        It must reuse the lane and keep the meta root, not reset-and-reattach.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('D', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            json.dumps({'task_id': 'D', 'title': 'Task D'})
+        )
+        assert not (meta_root / 'plan.json').exists()
+        assert not (lane / '.task' / 'plan.json').exists()
+
+        (lane / 'wip.txt').write_text('wip\n')
+        await _run(['git', 'add', 'wip.txt'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=lane)
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('D', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        assert record.task_id == 'D'
+        _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
+        reattach_needle = f'route={AcquireRoute.RESET_IN_PLACE_REATTACH.value} edge='
+        assert reattach_needle not in caplog.text, caplog.text
+        assert (meta_root / 'metadata.json').exists()
+
+    async def test_disk_backstop_identity_guard_fires_on_metadata_only_lane(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """The recycled-id identity guard gates a metadata.json-only match."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane(
+            '321', start_ref, expected_title='Old Title',
+        )
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane)
+
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            json.dumps({'task_id': '321', 'title': 'Old Title'})
+        )
+        assert not (meta_root / 'plan.json').exists()
+        assert not (lane / '.task' / 'plan.json').exists()
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane(
+                '321', start_ref, expected_title='Totally Different Title',
+            )
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert 'disk backstop identity MISMATCH' in caplog.text, caplog.text
+        for reuse_route in (AcquireRoute.REUSE, AcquireRoute.DISK_BACKSTOP_REUSE):
+            needle = f'route={reuse_route.value} edge='
+            assert needle not in caplog.text, caplog.text
 
     async def test_reset_in_place_reattach(
         self, git_repo: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
@@ -433,8 +512,8 @@ class TestAcquireRouteClassification:
         _assert_route_logged(caplog, AcquireRoute.RESET_IN_PLACE_REATTACH)
 
     async def test_recycle(self, git_repo: Path, caplog: pytest.LogCaptureFixture):
-        """A registered FREE lane with no matching on-disk plan.json and no
-        orphan-with-commits branch for the new task: fresh reset+reseed via
+        """A registered FREE lane with no matching on-disk metadata.json and
+        no orphan-with-commits branch for the new task: fresh reset+reseed via
         `_reset_and_seed_recycled_lane`."""
         await _add_warm_lane_scripts(git_repo)
         git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
@@ -445,8 +524,8 @@ class TestAcquireRouteClassification:
         lane = first.path
         assert git_ops.warm_lane_pool is not None
         # Bare pool release: FREE + registered, no git/file cleanup — 'OLD'
-        # left checked out and no .task/plan.json ever written, so the next
-        # acquire's disk-backstop scan (task_id 'OLD' != 'NEW') and orphan
+        # left checked out and no metadata.json in the lane's meta root (git_ops
+        # never writes one), so the next acquire's disk-backstop read and orphan
         # probe (task/NEW never existed) both miss, landing on recycle.
         await git_ops.warm_lane_pool.release(lane)
 
@@ -773,7 +852,7 @@ class TestAcquireIdentityGuardReadsRelocatedTaskMeta:
         lane = first.path
         assert git_ops.warm_lane_pool is not None
         # Bare pool release: FREE + registered, no git/file cleanup — only
-        # the on-disk plan.json scan (disk-backstop) can discover the match.
+        # the on-disk metadata.json read (disk-backstop) can discover the match.
         await git_ops.warm_lane_pool.release(lane)
 
         # Seed the relocated sibling .task-meta/<name> with a title that
@@ -795,10 +874,8 @@ class TestAcquireIdentityGuardReadsRelocatedTaskMeta:
 
         assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
 
-        # (1) An identity-MISMATCH warning must have fired.
-        assert 'identity' in caplog.text and 'MISMATCH' in caplog.text, (
-            f'expected an identity-MISMATCH warning in caplog:\n{caplog.text}'
-        )
+        # (1) The DISK-BACKSTOP identity-MISMATCH warning must have fired.
+        assert 'disk backstop identity MISMATCH' in caplog.text, caplog.text
 
         # (2) The route taken must be a FRESH-RESET route, NOT a reuse route
         # — the guard must not have failed open on the (previously) empty

@@ -2927,26 +2927,27 @@ class TestAcquireWarmLaneReuse:
 
 
 # ===========================================================================
-# Step-23: RED — on-disk backstop: same-task plan.json survives restart
+# Step-23: on-disk backstop — same-task artifacts survive a restart
 #
-# Acquire 'A' fresh, write .task/plan.json with task_id 'A' + tracked WIP.
-# Construct a BRAND-NEW GitOps (simulating a process restart — empty
-# _assignments).  acquire_warm_lane('A', sha_main) should detect that
-# _lane-0's plan.json has task_id == 'A' and route to _reuse_warm_lane
-# (preserving .task/plan.json + rebasing).
+# Acquire 'A' fresh, seed the lane's meta root + tracked WIP.  Construct a
+# BRAND-NEW GitOps (simulating a process restart — empty _assignments).
+# acquire_warm_lane('A', sha_main) should detect that _lane-0's meta-root
+# metadata.json has task_id == 'A' and route to _reuse_warm_lane (preserving
+# the meta root's plan.json payload + rebasing).
 #
 # Contrast (fresh, different task): a new GitOps with the SAME registered
-# _lane-0 whose plan.json has task_id 'A' but we acquire for 'Z' → treated
-# FRESH → .task/plan.json is gone (git clean removed it) and target/ retained.
+# _lane-0 whose metadata.json has task_id 'A' but we acquire for 'Z' →
+# treated FRESH → plan.json is gone and target/ retained.
 #
-# Today the fresh-but-registered branch always calls _reset_warm_lane →
-# git clean -xfd -e target deletes .task/ even for the same task → RED.
+# The routing key is metadata.json (task 3154), NOT plan.json: plan.json is
+# kept here only as the PAYLOAD whose survival across the reuse route is
+# asserted.
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 class TestAcquireWarmLaneOnDiskBackstop:
-    """On-disk backstop: plan.json task_id match restores REUSE across restart."""
+    """On-disk backstop: metadata.json task_id match restores REUSE across restart."""
 
     async def test_same_task_plan_preserved_after_restart(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
@@ -2960,12 +2961,14 @@ class TestAcquireWarmLaneOnDiskBackstop:
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
 
-        # Simulate agent writing plan.json + tracked WIP
-        plan_file = (
-            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
-            / 'plan.json'
+        # Simulate dispatch (metadata.json — the routing key) + an agent
+        # writing plan.json (the payload) + tracked WIP.
+        meta_root = TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            '{"task_id": "task-A", "title": "task A work"}'
         )
-        plan_file.parent.mkdir(parents=True, exist_ok=True)
+        plan_file = meta_root / 'plan.json'
         plan_file.write_text('{"task_id": "task-A", "title": "task A work"}')
         (info1.path / 'task_work.txt').write_text('WIP after restart\n')
 
@@ -2978,12 +2981,12 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Reacquire same task on fresh GitOps — disk backstop should detect REUSE
         info2 = await git_ops2.acquire_warm_lane('task-A', sha_main)
 
-        # TODAY: fresh-but-registered → _reset_warm_lane → git clean → .task/ gone
-        # After step-24: reads plan.json, detects task_id match → _reuse_warm_lane
+        # Disk backstop reads metadata.json, detects the task_id match →
+        # _reuse_warm_lane, which preserves the meta root's plan.json payload.
         assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path  # same _lane-0
 
-        assert plan_file.exists(), '.task/plan.json must be preserved by disk backstop'
+        assert plan_file.exists(), 'plan.json must be preserved by disk backstop'
         data = json.loads(plan_file.read_text())
         assert data['task_id'] == 'task-A', (
             f'plan.json was overwritten; got {data}'
@@ -2998,12 +3001,10 @@ class TestAcquireWarmLaneOnDiskBackstop:
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
-        plan_file = (
-            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
-            / 'plan.json'
-        )
-        plan_file.parent.mkdir(parents=True, exist_ok=True)
-        plan_file.write_text('{"task_id": "task-A"}')
+        meta_root = TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "task-A"}')
+        (meta_root / 'plan.json').write_text('{"task_id": "task-A"}')
         (info1.path / 'task_work.txt').write_text('WIP work\n')
 
         # Restart
