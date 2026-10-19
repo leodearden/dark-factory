@@ -22,7 +22,9 @@ import pytest_asyncio
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.flag_dedup import (
+    acknowledge_resolved_flags,
     compute_content_fingerprint_signature,
+    compute_marker_signature,
     dedup_flags,
 )
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
@@ -166,20 +168,14 @@ async def test_local_task_going_terminal_reaps_only_the_local_row(memory_service
 
 
 def test_foreign_citation_is_project_qualified():
-    from fused_memory.reconciliation.flag_dedup import compute_marker_signature
-
     assert compute_marker_signature(FOREIGN, project_id=RUNNING) == ('reify:650', FT)
 
 
 def test_local_citation_collapses_to_the_bare_top_level_id():
-    from fused_memory.reconciliation.flag_dedup import compute_marker_signature
-
     assert compute_marker_signature(LOCAL_CITING_ITSELF, project_id=RUNNING) == ('650', FT)
 
 
 def test_project_less_citations_stay_bare():
-    from fused_memory.reconciliation.flag_dedup import compute_marker_signature
-
     flag = {
         'task_id': None,
         'flag_type': FT,
@@ -190,8 +186,6 @@ def test_project_less_citations_stay_bare():
 
 
 def test_mixed_union_qualifies_only_foreign_components():
-    from fused_memory.reconciliation.flag_dedup import compute_marker_signature
-
     sig = compute_marker_signature(MIXED_UNION, project_id=RUNNING)
 
     assert sig is not None
@@ -201,8 +195,6 @@ def test_mixed_union_qualifies_only_foreign_components():
 
 @pytest.mark.asyncio
 async def test_mixed_union_key_round_trips_through_the_ledger(memory_service):
-    from fused_memory.reconciliation.flag_dedup import compute_marker_signature
-
     sig = compute_marker_signature(MIXED_UNION, project_id=RUNNING)
     assert sig is not None
 
@@ -213,11 +205,6 @@ async def test_mixed_union_key_round_trips_through_the_ledger(memory_service):
 
 @pytest.mark.asyncio
 async def test_acknowledging_the_foreign_subject_addresses_only_its_row(memory_service):
-    from fused_memory.reconciliation.flag_dedup import (
-        acknowledge_resolved_flags,
-        compute_marker_signature,
-    )
-
     ledger = memory_service.recon_ledger
     await dedup_flags(memory_service, RUNNING, 'r1', [LOCAL, FOREIGN])
     foreign_sig = compute_marker_signature(FOREIGN, project_id=RUNNING)
@@ -233,13 +220,71 @@ async def test_acknowledging_the_foreign_subject_addresses_only_its_row(memory_s
 
 
 def test_anchorless_flag_falls_back_to_content_fingerprint():
-    from fused_memory.reconciliation.flag_dedup import compute_marker_signature
-
     flag = {'task_id': None, 'flag_type': FT, 'description': 'no anchor at all'}
 
     assert compute_marker_signature(flag, project_id=RUNNING) == (
         compute_content_fingerprint_signature(flag)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'flag',
+    [
+        {
+            'task_id': None,
+            'flag_type': FT,
+            'description': 'project id outside the safe-identifier allowlist',
+            'cited_tasks': [{'project_id': 'Reify Project', 'task_id': '650'}],
+        },
+        {
+            'task_id': '12',
+            'flag_type': FT,
+            'description': 'padded foreign task id',
+            'cited_tasks': [{'project_id': 'reify', 'task_id': ' 650'}],
+        },
+        {
+            'task_id': None,
+            'flag_type': FT,
+            'description': 'padded foreign project id',
+            'cited_tasks': [{'project_id': ' reify ', 'task_id': '650'}],
+        },
+    ],
+    ids=['invalid-project', 'padded-task-id', 'padded-project'],
+)
+async def test_malformed_foreign_citation_is_still_deduplicated(memory_service, flag):
+    """Qualification must never turn a key the bare form would have deduplicated
+    into a key the ledger refuses, because that re-flags every cycle."""
+    (first,) = await dedup_flags(memory_service, RUNNING, 'r1', [flag])
+    sig = compute_marker_signature(flag, project_id=RUNNING)
+    assert sig is not None
+
+    assert 'persisted_from_run' not in first
+    assert await memory_service.recon_ledger.get_by_identity(RUNNING, MARKER, *sig, '') is not None
+
+    (second,) = await dedup_flags(memory_service, RUNNING, 'r2', [flag])
+
+    assert second['persisted_from_run'] == 'r1'
+
+
+def test_padded_foreign_citation_keeps_its_qualification():
+    flag = {
+        'task_id': None,
+        'flag_type': FT,
+        'cited_tasks': [{'project_id': ' reify ', 'task_id': ' 650'}],
+    }
+
+    assert compute_marker_signature(flag, project_id=RUNNING) == ('reify:650', FT)
+
+
+def test_padded_home_project_citation_is_local():
+    flag = {
+        'task_id': None,
+        'flag_type': FT,
+        'cited_tasks': [{'project_id': ' dark_factory', 'task_id': '650'}],
+    }
+
+    assert compute_marker_signature(flag, project_id=RUNNING) == ('650', FT)
 
 
 class TestConsolidatorAcknowledgesByMarkerIdentity:
@@ -271,8 +316,6 @@ class TestConsolidatorAcknowledgesByMarkerIdentity:
     async def test_moot_local_drop_is_reclaimed_while_foreign_suppression_is_kept(
         self, memory_service
     ):
-        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
-
         ledger = memory_service.recon_ledger
         suppressed_sig = compute_marker_signature(self.SUPPRESSED, project_id=self.PROJECT_ID)
         assert suppressed_sig is not None
