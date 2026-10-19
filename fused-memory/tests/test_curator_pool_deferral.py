@@ -227,9 +227,11 @@ class TestBatchDefersOnUnavailablePool:
         curator = TaskCurator(config=make_config(), taskmaster=None)
         batch = [_prepared('A'), _prepared('B'), _prepared('A')]
 
-        with patch(INVOKE, new=AsyncMock(side_effect=_capped('task-curator-batch[p]'))):
+        invoke = AsyncMock(side_effect=_capped('task-curator-batch[p]'))
+        with patch(INVOKE, new=invoke):
             decisions = await _curate_batch(curator, batch)
 
+        invoke.assert_awaited_once()
         assert [d.action for d in decisions] == ['defer', 'defer', 'drop']
         assert decisions[2].batch_target_index == 0
         assert decisions[2].justification == 'pre-batch-dedup: identical payload_hash'
