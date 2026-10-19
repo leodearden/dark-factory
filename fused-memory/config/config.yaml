@@ -244,8 +244,8 @@ taskmaster:
 # non-search reads are COUNTED into read_op_counts, never stored, so
 # read_retention_days governs only failed reads and history not yet moved by
 # fused-memory/scripts/roll_up_journal_reads.py. Per-row inserts fall from
-# ~985k/day to the 19,001/day 7-day mean (peak 38,759) measured 2026-10-16 in
-# the growth-alarm block below, and nearly all of those are writes and searches
+# ~985k/day to the per-row figure in the write_journal_growth_alarm block's
+# MEASURED BASIS below, and nearly all of those are writes and searches
 # on the 730/365-day horizons, so the read horizon accrues almost nothing and
 # the capacity above is spent only on pre-5405 history. No value here changes:
 # - prune_batch_size: a counted read still takes the journal's connection lock

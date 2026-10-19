@@ -136,8 +136,12 @@ that still exist, and the prune never touches `read_op_counts`. So every
 count-only read ends up either counted by `migrate` or deleted by the prune,
 once. The prune takes only reads older than `read_retention_days`, the
 horizon it applied before task 5405, so the `snapshot` windows never see it.
-Such reads are dropped uncounted, as they always were, and `read_op_counts`
-history starts roughly one retention horizon before the migration.
+Such reads are dropped uncounted, as they always were. If the prune has drained
+the pre-horizon backlog first, `read_op_counts` history starts roughly one
+retention horizon before the migration. If it has not (live: oldest non-search
+read 2026-08-23 at 08:58Z on 10-19), the bulk is ~35M rows / ~5 h, history
+starts wherever the prune-vs-migrate race lands, and `status`'s
+`count_only_span` is the real figure.
 The two take the write lock in turn. A prune batch (500 rows, measured
 0.17-0.55 s) can wait behind one chunk, and a journalled tool call can wait
 behind both, about 2.5 s at the measured maxima. That is still inside

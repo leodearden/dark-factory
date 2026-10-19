@@ -463,8 +463,8 @@ class WriteJournalConfig(BaseModel):
     #: Non-search reads (``get_task``/``get_tasks``/``get_statuses``/
     #: ``get_external_statuses``) — 97.9% of the table with no downstream
     #: consumer, so this is incident-forensics headroom and nothing more.
-    #: Since task 5405 a successful one is counted into ``read_op_counts``, never
-    #: stored, so this governs only failed reads and not-yet-migrated history.
+    #: Since task 5405 this governs less than it did: see the ``write_journal``
+    #: block of ``fused-memory/config/config.yaml``.
     read_retention_days: float = Field(default=30.0, gt=0)
     #: ``search`` reads — 1.36% of the table and the SOLE data source for leaf
     #: eta's write-after-miss metric (task 3213) and leaf theta's retro corpus
