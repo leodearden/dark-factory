@@ -24,12 +24,16 @@ from typing import Any
 
 import migrate_open_consolidation_gates as mod
 import pytest
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from fused_memory.config.schema import ConsolidationAutoConfig, Mem0UpdateConfig
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     build_consolidation_gate_task,
 )
+from shared.project_layout import escalation_queue_dir
 
 PROJECT_ID = 'dark_factory'
 CATEGORY = 'procedural_knowledge'
@@ -560,3 +564,153 @@ class TestExecuteGating:
         assert code == 0
         assert payload['mode'] == 'execute'
         assert payload['gates'] == []
+
+
+def seed_gate_escalation(root: Path, task_id: int) -> str:
+    queue = EscalationQueue(escalation_queue_dir(root))
+    escalation_id = queue.make_id(str(task_id))
+    queue.submit(Escalation(
+        id=escalation_id,
+        task_id=str(task_id),
+        agent_role='orchestrator-deterministic',
+        severity='critical',
+        category='milestone_gate',
+        summary='gate',
+        level=2,
+    ))
+    return escalation_id
+
+
+def tools_of(gate: dict) -> list[str]:
+    return [call['tool'] for call in gate['next']]
+
+
+class TestExecuteWrites:
+    def test_a_pass_mints_stamps_closes_and_lists_the_resume(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        members = fake.seed_many(3)
+        seed_tasks([gate_row(81, TOPIC, observed=members)])
+        escalation_id = seed_gate_escalation(root, 81)
+
+        code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 0
+        gate = gate_of(payload, 81)
+        assert gate['disposition'] == 'executed'
+        (canonical,) = fake.canonicals_of(TOPIC)
+        assert canonical['content'] == build_auto_canonical(CLAIM, TOPIC, 3, payload['run_id'])
+        for member in members:
+            assert fake.metadata_of(member)['topic'] == TOPIC
+            assert fake.metadata_of(member)['x_auto_consolidated_run'] == payload['run_id']
+        assert gate['execution']['canonical_id'] == canonical['id']
+        assert gate['execution']['minted'] is True
+        assert sorted(gate['execution']['tagged']) == sorted(members)
+        assert gate['closure']['closed'] is True
+        (resume,) = gate['next']
+        assert resume['tool'] == 'resolve_issue'
+        assert resume['arguments']['escalation_id'] == escalation_id
+        assert resume['arguments']['action'] == 'resume'
+        assert payload['run_id'] in resume['arguments']['resolution']
+
+    def test_tag_only_stamps_the_observed_members_and_leaves_the_canonical(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        canonical = fake.seed(topic=TOPIC, canonical=True)
+        fake.seed_many(2, topic=TOPIC)
+        fresh = fake.seed_many(2)
+        before = fake.snapshot(canonical)
+        seed_tasks([gate_row(82, TOPIC, observed=fresh)])
+        escalation_id = seed_gate_escalation(root, 82)
+
+        code, payload = drive(root, fake, capsys, '--execute')
+
+        assert code == 0
+        gate = gate_of(payload, 82)
+        assert gate['verdict'] == 'pass_tag_only'
+        assert gate['disposition'] == 'executed'
+        for member in fresh:
+            assert fake.metadata_of(member)['topic'] == TOPIC
+        assert fake.snapshot(canonical) == before
+        assert fake.adds == 0
+        assert gate['execution']['minted'] is False
+        assert gate['closure']['closed'] is True
+        assert [c['arguments']['escalation_id'] for c in gate['next']] == [escalation_id]
+
+    def test_a_cleared_hazard_gate_is_stamped_before_it_is_resumed(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        members = fake.seed_many(3)
+        seed_tasks([gate_row(
+            83,
+            TOPIC,
+            observed=members,
+            report_run='run-hazard',
+            reason_codes={'member_carries_correction_banner': [members[0]]},
+            auto_predicate_version='1',
+            category=CATEGORY,
+        )])
+        seed_gate_escalation(root, 83)
+
+        code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 0
+        gate = gate_of(payload, 83)
+        assert gate['disposition'] == 'executed'
+        assert tools_of(gate) == ['update_task', 'resolve_issue']
+        stamp = gate['next'][0]['arguments']
+        assert stamp['id'] == '83'
+        assert stamp['project_root'] == str(root)
+        assert set(stamp['metadata']) == {'human_curator_adjudicated_at'}
+        assert stamp['metadata_mode'] == 'merge'
+
+    def test_a_closed_gate_with_no_pending_escalation_says_so(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        seed_tasks([gate_row(84, TOPIC, observed=fake.seed_many(3))])
+
+        _, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 84)
+        assert gate['closure']['closed'] is True
+        assert 'resolve_issue' not in tools_of(gate)
+        assert 'no pending milestone_gate escalation' in gate['note']
+
+    def test_a_hazard_gate_never_lists_a_resume(self, root, fake, seed_tasks, capsys):
+        fake.seed(
+            topic=TOPIC, canonical=True, content='[CORRECTION 2026-01-01] the rule was reversed',
+        )
+        stamped = fake.seed_many(2, topic=TOPIC)
+        seed_tasks([gate_row(85, TOPIC, observed=stamped)])
+        seed_gate_escalation(root, 85)
+
+        _, payload = drive(root, fake, capsys, '--execute')
+
+        gate = gate_of(payload, 85)
+        assert gate['disposition'] == 'left_to_sitting'
+        assert gate['next'] == []
+
+    def test_execute_leaves_tasks_db_byte_identical(self, root, fake, seed_tasks, capsys):
+        db_path = seed_tasks([
+            gate_row(86, TOPIC, observed=fake.seed_many(3)),
+            gate_row(87, OTHER_TOPIC, observed=fake.seed_many(3)),
+        ])
+        before = task_rows(db_path)
+
+        code, payload = drive(
+            root, fake, capsys, '--execute',
+            '--claim', f'{TOPIC}={CLAIM}', '--claim', f'{OTHER_TOPIC}={CLAIM}',
+        )
+
+        assert code == 0
+        assert {g['disposition'] for g in payload['gates']} == {'executed'}
+        assert task_rows(db_path) == before
+
+    def test_the_text_report_carries_the_resume_call(self, root, fake, seed_tasks, capsys):
+        seed_tasks([gate_row(88, TOPIC, observed=fake.seed_many(3))])
+        escalation_id = seed_gate_escalation(root, 88)
+
+        code = run_code(root, fake, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 0
+        assert f"resolve_issue(escalation_id='{escalation_id}'" in capsys.readouterr().out
