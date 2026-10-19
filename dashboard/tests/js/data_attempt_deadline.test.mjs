@@ -27,8 +27,9 @@ const { staleNoticesForTab } = staleness;
 // one. The __stale publication half of that task is data_freshness.test.mjs.
 // ---------------------------------------------------------------------------
 
-// The reduced per-attempt deadline, stated as a literal rather than read back
-// out of the module under test.
+// The full and the reduced per-attempt deadlines, stated as literals rather
+// than read back out of the module under test.
+const DEFAULT_TIMEOUT_MS = 30000;
 const STALE_TIMEOUT_MS = 5000;
 
 const DATA_JS_SOURCE = fs.readFileSync(
@@ -66,7 +67,7 @@ test('staleness: past the threshold the per-attempt deadline drops to STALE_TIME
     t = state.get(CURATOR_PATH).nextAllowedAt;
   }
 
-  assert.equal(armed[0], 30000, 'the FIRST attempt must still use the full 30s deadline');
+  assert.equal(armed[0], DEFAULT_TIMEOUT_MS, 'the FIRST attempt must still use the full 30s deadline');
   assert.equal(state.get(CURATOR_PATH).failures, STALE_FAILURE_THRESHOLD);
 
   const before = armed.length;
