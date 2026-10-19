@@ -57,6 +57,7 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -91,6 +92,7 @@ __all__ = [
     'EXPERIMENTAL_KEY_PREFIX',
     'MemoryMetadataValidationError',
     'MetadataViolation',
+    'ORCHESTRATOR_COMPLETION_SOURCE',
     'PARENT_ID_DEAD_CODE',
     'PARENT_ID_UNAVAILABLE_CODE',
     'ParentHasChildrenError',
@@ -100,6 +102,7 @@ __all__ = [
     'TOPIC_SLUG_RE',
     'check_canonical_routing',
     'classify_unknown_keys',
+    'is_orchestrator_completion_record',
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
@@ -657,6 +660,15 @@ BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
     'stage2_suppress',       #  1,588
     'echo_used_provenance',  #  1,284
 })
+
+#: The ``source`` the orchestrator stamps on its task completion record
+#: (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._write_completion_to_memory``).
+ORCHESTRATOR_COMPLETION_SOURCE = 'orchestrator_completion'
+
+
+def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
+    return meta.get('source') == ORCHESTRATOR_COMPLETION_SOURCE
+
 
 #: Union of every known layer, precomputed for the unknown-key scan.
 _KNOWN_METADATA_KEYS: frozenset[str] = (
