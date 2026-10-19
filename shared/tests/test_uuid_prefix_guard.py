@@ -43,6 +43,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, get_args
 
 import pytest
+from _schema_outage import install_schema_outage
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -1683,6 +1684,36 @@ class TestTheOverrideFlagTravelsByTheToolsOwnSchema:
                 'delete_memory',
                 {**DELETE_CALL, 'metadata': {**OVERRIDE, 'keep': 'this'}},
             )
+
+
+class TestAnUnresolvableSchemaTakesTheDropBranch:
+    """The tool catalogue cannot be read: the override still bypasses the guard."""
+
+    async def _override_call_during_an_outage(self) -> Harness:
+        h = override_harness()
+        install_schema_outage(h.mcp)
+        await h.call(
+            'add_memory',
+            {'content': f'see {BFF}', 'project_id': PROJECT, 'metadata': dict(OVERRIDE)},
+        )
+        return h
+
+    async def test_the_flag_is_dropped_and_the_token_survives(self) -> None:
+        h = await self._override_call_during_an_outage()
+
+        assert h.recorder.args['metadata'] is None
+        assert h.recorder.args['content'] == f'see {BFF}'
+        assert h.resolver.calls == []
+
+    async def test_the_failure_is_reported_once_by_the_shared_reader(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING):
+            await self._override_call_during_an_outage()
+
+        shared_records = [r for r in caplog.records if r.name.startswith('shared.')]
+        assert [(r.name, r.levelno) for r in shared_records if r.exc_info] == [
+            ('shared.mcp_tool_schema', logging.WARNING)
+        ]
+        assert [r for r in shared_records if r.levelno >= logging.ERROR] == []
 
 
 class TestTheOverrideIsFailClosed:
