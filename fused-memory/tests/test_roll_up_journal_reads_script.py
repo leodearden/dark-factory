@@ -20,7 +20,7 @@ import pytest
 from _fm_helpers import load_script_module
 
 from fused_memory.config.schema import WriteJournalConfig
-from fused_memory.services.read_rollup import keeps_read_row
+from fused_memory.services.read_rollup import PREWARM_PRIMARY_KEY_SQL, keeps_read_row
 from fused_memory.services.write_journal import SCHEMA_SQL, WriteJournal
 from fused_memory.services.write_ops_retention import prune_write_ops_pass
 
@@ -190,6 +190,8 @@ class TestMigrateApply:
         assert report['rows_moved'] == sum(1 for row in history if _is_count_only(row))
         assert report['chunks'] > 1
         assert report['max_chunk_seconds'] >= report['mean_chunk_seconds'] > 0
+        assert 0 <= report['mean_lock_seconds'] <= report['max_lock_seconds']
+        assert report['max_lock_seconds'] <= report['max_chunk_seconds']
         assert _rollup_counts(journal) == expected
         after_rows = _write_ops_by_id(journal)
         kept_ids = {row['id'] for row in history if not _is_count_only(row)}
@@ -225,6 +227,37 @@ class TestMigrateApply:
         assert report is not None
         assert report['setup_seconds'] >= 0.4
         assert report['seconds'] < 0.4
+
+
+class TestPrewarmOutsideTheWriteLock:
+    def test_every_prewarm_runs_before_its_begin_and_never_inside_a_transaction(
+        self, journal, capsys, monkeypatch,
+    ):
+        statements: list[str] = []
+        connect = _script.connect_for_migration
+
+        def tracing_connect(path):
+            conn = connect(path)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(_script, 'connect_for_migration', tracing_connect)
+
+        code, report, err = _migrate(journal, capsys)
+
+        assert code == 0, err
+        assert report is not None and report['chunks'] > 1
+        prewarm_text = PREWARM_PRIMARY_KEY_SQL.split('?')[0]
+        kinds = []
+        for statement in statements:
+            if statement.startswith(prewarm_text):
+                kinds.append('prewarm')
+            elif statement == 'BEGIN IMMEDIATE':
+                kinds.append('begin')
+            elif statement == 'COMMIT':
+                kinds.append('commit')
+        chunk = ['prewarm', 'begin', 'commit']
+        assert kinds == chunk * report['chunks']
 
 
 def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:
