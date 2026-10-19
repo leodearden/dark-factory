@@ -1474,3 +1474,29 @@ def test_the_live_register_document_reads_the_real_tree(tmp_path: Path, capsys):
         {'id': row.id, 'date': row.date.isoformat(), 'source': row.source, 'covers': row.covers}
         for row in sorted(rows, key=lambda row: row.id)
     ]
+
+
+_CLOSED_RULINGS_TASK = TaskRef(5603)
+
+
+def test_no_live_declaration_cites_the_closed_rulings_task():
+    """No declaration's default or override is a Debt owned by task 5603.
+
+    5603 is δ, the operator decision gate whose sitting produced the day-one
+    rulings and closed on ``resume``. A closed gate can own no debt, and the
+    owner sweep (κ2) activates only once nothing cites it, so a copy of the old
+    placeholder literal must fail here rather than wait for the sweep.
+    """
+    discovery = exception_register.discover_declarations(REPO_ROOT)
+    placeholder = Debt(_CLOSED_RULINGS_TASK)
+    citing = sorted(
+        f'{d.path}:{d.line} {d.list_id}'
+        for d in discovery.declarations
+        if placeholder in (d.default, *d.overrides.values())
+    )
+
+    assert not citing, (
+        f'These declarations still cite {placeholder!r}, the closed rulings task. Give each '
+        'list the disposition docs/legibility/inv12-day-one-rulings.md rules for it:\n  '
+        + '\n  '.join(citing)
+    )
