@@ -23,6 +23,7 @@ import silent_fallthrough_allowlist
 from shared.governed_exceptions import (
     Debt,
     MalformedDeclaration,
+    Policy,
     TaskRef,
     TicketRef,
     governed_exceptions,
@@ -260,6 +261,22 @@ def _loop_blocking_mismatch(row: tuple[str, str, str, str, str], key: str) -> st
     return f'{key}: ledger disposition {disposition!r}, override found {override!r}'
 
 
+_OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION = {
+    config_dir_archival_allowlist.UNARCHIVED_BY_DESIGN: None,
+    config_dir_archival_allowlist.UNARCHIVED_GAP: Debt,
+}
+
+
+def _config_dir_mismatch(disposition: str, key: str) -> str | None:
+    override = CONFIG_DIR_ARCHIVAL_EXCEPTIONS.overrides.get(key)
+    override_type = _OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION[disposition]
+    if override_type is None and override is None:
+        return None
+    if override_type is not None and isinstance(override, override_type):
+        return None
+    return f'{key}: allowlist disposition {disposition!r}, override found {override!r}'
+
+
 def test_repeated_sites_keep_distinct_keys() -> None:
     assert _occurrence_keys([('a.py', 'f', 'h'), ('a.py', 'f', 'h'), ('b.py', 'g', 'h')]) == [
         'a.py::f::h',
@@ -355,4 +372,31 @@ def test_loop_blocking_overrides_follow_the_ledger_vocabulary() -> None:
         'Debt(TaskRef(<task>)) for filed, Debt(TicketRef(<ticket>)) for to_file, and the '
         "owner id must appear in the row's justification. Correct the override in this "
         'module, or the ledger row in loop_blocking_allowlist.py:\n  ' + '\n  '.join(mismatches)
+    )
+
+
+def test_config_dir_overrides_follow_the_allowlist_vocabulary() -> None:
+    unarchived = config_dir_archival_allowlist.DISPOSITIONS - {config_dir_archival_allowlist.ARCHIVED}
+    assert set(_OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION) == unarchived, (
+        'config_dir_archival_allowlist.DISPOSITIONS changed: decide which INV-12 disposition '
+        'each unarchived disposition maps to in _OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION.'
+    )
+    assert isinstance(CONFIG_DIR_ARCHIVAL_EXCEPTIONS.default, Policy), (
+        'The UNARCHIVED_BY_DESIGN sites are ratified, so CONFIG_DIR_ARCHIVAL_EXCEPTIONS '
+        f'must borrow a Policy default, not {CONFIG_DIR_ARCHIVAL_EXCEPTIONS.default!r}.'
+    )
+    dispositions = [
+        site['disposition']
+        for site in config_dir_archival_allowlist.AUDITED_SITES
+        if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
+    ]
+    pairs = zip(dispositions, CONFIG_DIR_ARCHIVAL_EXCEPTIONS.keys, strict=True)
+    mismatches = [
+        mismatch for disposition, key in pairs if (mismatch := _config_dir_mismatch(disposition, key))
+    ]
+    assert not mismatches, (
+        'Each config-dir override must match its allowlist row: none for UNARCHIVED_BY_DESIGN, '
+        'which borrows the Policy default, and a Debt for UNARCHIVED_GAP. Correct the override '
+        'in this module, or the row in config_dir_archival_allowlist.py:\n  '
+        + '\n  '.join(mismatches)
     )
