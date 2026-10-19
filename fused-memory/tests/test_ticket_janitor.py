@@ -27,7 +27,11 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import ticket_janitor
 from fused_memory.middleware.curation_deferral import DeferralPolicy, DeferReason
-from fused_memory.middleware.ticket_janitor import TicketJanitor
+from fused_memory.middleware.ticket_janitor import (
+    CURATION_BACKLOG_ANCHOR,
+    TicketJanitor,
+    curation_backlog_anchor,
+)
 from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
 
 
@@ -1374,3 +1378,132 @@ class TestCurationDrain:
         failed, reparked = await store.get(never_deferred), await store.get(deferred_in_flight)
         assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
         assert (reparked['status'], reparked['attempts']) == (AWAITING_CURATION, 1)
+
+
+class TestCurationBacklogEscalation:
+    """One folded ``infra_issue`` per project and defer reason once a parked
+    ticket has survived a retry; its severity comes from the reason."""
+
+    @pytest.fixture
+    def pid(self, tmp_path):
+        return _project_id_for(tmp_path)
+
+    @staticmethod
+    def _janitor(store, tmp_path, pid, **kwargs):
+        return TicketJanitor(store, known_projects={pid: str(tmp_path)}, **kwargs)
+
+    @staticmethod
+    def _pending(root: Path, reason: DeferReason) -> list:
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(escalation_queue_dir(str(root)))
+        return queue.get_by_task(curation_backlog_anchor(reason), status='pending')
+
+    @staticmethod
+    def _all_records(root: Path) -> list[Path]:
+        return sorted(escalation_queue_dir(str(root)).glob('esc-*.json'))
+
+    @pytest.mark.asyncio
+    async def test_one_record_once_a_parked_row_survives_a_retry(self, store, tmp_path, pid):
+        oldest = await _park(store, pid, title='first', deferrals=2)
+        await _park(store, pid, title='second')
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [record] = self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)
+        assert (record.category, record.severity, record.level) == ('infra_issue', 'info', 1)
+        assert pid in record.summary
+        detail = json.loads(record.detail)
+        assert {k: v for k, v in detail.items() if k != 'tickets'} == {
+            'project_id': pid,
+            'defer_reason': 'all-accounts-capped',
+            'severity': 'info',
+            'count': 2,
+            'oldest_created_at': (await store.get(oldest))['created_at'],
+            'max_attempts': 2,
+        }
+        assert {t['ticket_id'] for t in detail['tickets']} == {
+            r['ticket_id'] for r in await store.list_tickets(pid, status=AWAITING_CURATION)
+        }
+
+    @pytest.mark.asyncio
+    async def test_later_ticks_fold_into_the_open_record(self, store, tmp_path, pid):
+        await _park(store, pid, deferrals=2)
+        janitor = self._janitor(store, tmp_path, pid, cooldown_secs=0.0)
+
+        for _ in range(3):
+            await janitor.tick()
+
+        assert len(self._all_records(tmp_path)) == 1
+        assert len(self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('deferrals', 'min_attempts', 'files'),
+        [(1, 2, False), (2, 2, True), (1, 1, True)],
+        ids=['one-deferral', 'survived-a-retry', 'threshold-lowered'],
+    )
+    async def test_below_threshold_files_nothing(
+        self, store, tmp_path, pid, deferrals, min_attempts, files,
+    ):
+        await _park(store, pid, deferrals=deferrals)
+
+        await self._janitor(store, tmp_path, pid, curation_backlog_min_attempts=min_attempts).tick()
+
+        assert bool(self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)) is files
+
+    @pytest.mark.asyncio
+    async def test_cooldown_suppresses_a_refile_after_resolution(self, store, tmp_path, pid):
+        from escalation.queue import EscalationQueue
+
+        await _park(store, pid, deferrals=2)
+        janitor = self._janitor(store, tmp_path, pid, cooldown_secs=3600.0)
+        await janitor.tick()
+        [record] = self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)
+        EscalationQueue(escalation_queue_dir(str(tmp_path))).resolve(record.id, 'credentials fixed')
+
+        await janitor.tick()
+
+        assert self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED) == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_project_files_nothing(self, store, tmp_path, pid):
+        await _park(store, pid, deferrals=2)
+
+        await TicketJanitor(store, known_projects={}).tick()
+
+        assert self._all_records(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_capped_files_info_and_auth_failed_files_blocking_side_by_side(
+        self, store, tmp_path, pid,
+    ):
+        await _park(store, pid, title='capped', deferrals=2)
+        auth_failed = await _park(
+            store, pid, title='auth', reason=DeferReason.ACCOUNTS_AUTH_FAILED, deferrals=2,
+        )
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [capped_record] = self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)
+        [auth_record] = self._pending(tmp_path, DeferReason.ACCOUNTS_AUTH_FAILED)
+        assert (capped_record.severity, auth_record.severity) == ('info', 'blocking')
+        assert curation_backlog_anchor(DeferReason.ACCOUNTS_AUTH_FAILED) == (
+            f'{CURATION_BACKLOG_ANCHOR}:accounts-auth-failed'
+        )
+        auth_detail = json.loads(auth_record.detail)
+        assert (auth_detail['defer_reason'], auth_detail['severity'], auth_detail['count']) == (
+            'accounts-auth-failed', 'blocking', 1,
+        )
+        assert [t['ticket_id'] for t in auth_detail['tickets']] == [auth_failed]
+
+    @pytest.mark.asyncio
+    async def test_the_detail_lists_at_most_twenty_tickets(self, store, tmp_path, pid):
+        for n in range(21):
+            await _park(store, pid, title=f't{n}', deferrals=2)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        [record] = self._pending(tmp_path, DeferReason.ALL_ACCOUNTS_CAPPED)
+        detail = json.loads(record.detail)
+        assert (detail['count'], len(detail['tickets'])) == (21, 20)
