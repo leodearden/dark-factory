@@ -2550,6 +2550,41 @@ class TestOpenDebtFilesTheDeflakeTask:
         assert client.commit_calls == [['task-901']]
         assert _owner(db_path, self.TEST_ID) == 'task-901'
 
+    async def test_a_context_shapes_the_filed_block(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        from orchestrator.flake_ledger import build_deflake_task_arguments, open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns=_task('task-901'))
+        ctx = _lane_context()
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW, context=ctx,
+        )
+
+        assert row is not None
+        assert client.submit_calls == [
+            build_deflake_task_arguments(dataclasses.replace(row, owner_task_id=None), ctx)
+        ]
+
+    async def test_a_context_never_decides_whether_a_task_is_filed(self, tmp_path: Path) -> None:
+        """A live, open owner is kept whatever the context says: the context changes the
+        text of a filing, never whether one happens."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(statuses={'task-901': 'pending'})
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=client, now=self.NOW + timedelta(minutes=1), context=_lane_context(),
+        )
+
+        assert row is not None and row.owner_task_id == 'task-901'
+        assert client.submit_calls == []
+
     async def test_returned_row_carries_the_owner_not_a_pre_filing_snapshot(
         self, tmp_path: Path
     ) -> None:
@@ -5609,6 +5644,29 @@ class TestOneConnectionPerCall:
         )
         assert row is not None and row.owner_task_id == 'task-901'
         assert _owner(db_path, self.TEST_ID) == 'task-901'
+
+    async def test_open_debt_with_a_context_still_opens_three_connections(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The context arrives whole, evidence included, so the builder reads nothing:
+        the owned path's bound is unchanged (offline-lane PRD open question 6)."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns=_task('task-901'))
+        opened = _count_connections(monkeypatch)
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=client, now=self.NOW, context=_lane_context(),
+        )
+
+        assert len(opened) == 3, f'expected 3 connections, got {len(opened)}'
+        (block,) = client.submit_calls
+        assert block['metadata']['flake_debt_call_site'] == 'offline_lane'
+        assert block['title'] == (
+            f'Flake debt: {self.TEST_ID} — cleared on the offline lane (qdrant-integration), '
+            f'cycle 1'
+        )
 
     async def test_resolve_debt_that_stamps_nothing_opens_one_connection(
         self, tmp_path: Path, monkeypatch
