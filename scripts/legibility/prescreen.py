@@ -477,3 +477,111 @@ def load_instrument_findings(project_root: str | Path, project_id: str) -> Instr
         note="; ".join(notes) if notes else None,
         findings=tuple(found for read in reads for found in read.findings),
     )
+
+
+# ---------------------------------------------------------------------------
+# The run's ## Screened section
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReObserved:
+    """A cluster promoted under another instrument's finding key."""
+
+    title: str
+    entry_id: str
+    adoption: Adoption
+
+
+@dataclass(frozen=True)
+class ScreenReport:
+    screen: Screen
+    attached: tuple[KeyAttach, ...]
+    re_observed: tuple[ReObserved, ...]
+    inputs: InstrumentFindings
+
+    def counts(self) -> dict[str, int]:
+        screened = [item.rule for item in self.screen.screened]
+        return {
+            Rule.TITLE.value: screened.count(Rule.TITLE),
+            Rule.SESSION.value: screened.count(Rule.SESSION),
+            Rule.KEY.value: len(self.attached),
+            Rule.CROSS_INSTRUMENT.value: len(self.re_observed),
+        }
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "counts": self.counts(),
+            "inputs": {"consumed": list(self.inputs.consumed), "note": self.inputs.note},
+            "screened": [
+                {"rule": item.rule.value, "title": item.title, "session": item.session, "matched": list(item.matched)}
+                for item in self.screen.screened
+            ],
+            "surfaced": [
+                {"title": item.title, "fixed_entry_ids": list(item.fixed_entry_ids)} for item in self.screen.surfaced
+            ],
+            "attached": [
+                {
+                    "title": item.title,
+                    "candidate_id": item.candidate_id,
+                    "entry_id": item.entry_id,
+                    "key": item.identity.key,
+                    "verifier_tags": list(item.verifier_tags),
+                    "tag_disagreement": None if item.tag_disagreement is None else list(item.tag_disagreement),
+                }
+                for item in self.attached
+            ],
+            "re_observed": [
+                {
+                    "title": item.title,
+                    "entry_id": item.entry_id,
+                    "key": item.adoption.identity.key,
+                    "run_id": item.adoption.external.run_id,
+                    "matched_by": item.adoption.matched_by.value,
+                    "supersedes": list(item.adoption.supersedes),
+                    "first_seen": item.adoption.first_seen,
+                }
+                for item in self.re_observed
+            ],
+        }
+
+
+def _title(title: str) -> str:
+    return '"' + " ".join(title.split()) + '"'
+
+
+def _attached_line(item: Mapping[str, Any]) -> str:
+    line = f"- attached by key: {_title(item['title'])} ({item['candidate_id']}) → {item['entry_id']} under {item['key']}"
+    if item["tag_disagreement"] is None:
+        return line
+    standing, offered = item["tag_disagreement"]
+    return f"{line}; primary tag disagreement: standing {standing}, verifier {offered}"
+
+
+def report_lines(record: Mapping[str, Any]) -> list[str]:
+    """The report's ``## Screened`` section, rendered from the run record's
+    ``screened`` value (:meth:`ScreenReport.to_record`)."""
+    counts = ", ".join(f"{rule} {count}" for rule, count in record["counts"].items())
+    inputs = record["inputs"]
+    consumed = ", ".join(inputs["consumed"]) or "none"
+    return [
+        "",
+        "## Screened",
+        "",
+        f"- per rule: {counts}",
+        f"- inputs consumed: {consumed}",
+        *([f"- inputs note: {inputs['note']}"] if inputs["note"] else []),
+        *(
+            f"- screened by {item['rule']}: {_title(item['title'])} → {', '.join(item['matched'])}"
+            for item in record["screened"]
+        ),
+        *(
+            f"- surfaced, verified (re-observes fixed {', '.join(item['fixed_entry_ids'])}): {_title(item['title'])}"
+            for item in record["surfaced"]
+        ),
+        *(_attached_line(item) for item in record["attached"]),
+        *(
+            f"- re-observed from {item['run_id']} by {item['matched_by']}: {_title(item['title'])} → "
+            f"{item['entry_id']} under {item['key']}"
+            for item in record["re_observed"]
+        ),
+    ]
