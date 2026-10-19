@@ -9,50 +9,19 @@ hand-launched ones — SessionStart is how a hand-launched session first gets
 captured into the session registry.
 
 This module imports ``orchestrator.session_registry`` read-only (PRD §6 G5:
-consumers import the shared record contract, they never re-derive it). All
-three hook handlers key their registry record on ``CLAUDE_SPAWN_SESSION_ID``
-(env) when present — spawn-claude.sh's own ``launching``-record slug for a
-spawned session — falling back to the Claude Code ``session_id`` delivered
-on each hook's stdin JSON for a hand-launched session (see
-``hook_session_slug``).
+consumers import the shared record contract, they never re-derive it).
 
-RESOLVED (task 2511): spawned sessions used to get TWO registry records —
-this trio's session_id-keyed one and spawn-claude.sh's pid-keyed
-``launching``/``exited`` one — because ``session_id`` and ``launcher_pid``
-are different uniqueness tokens that can never converge (see
-``run_session_start``'s docstring). Now that spawn-claude.sh exports
-``CLAUDE_SPAWN_SESSION_ID`` (its own launching record's slug) into the
-spawned session's environment, ``hook_session_slug`` adopts it directly, so
-all three hooks — plus spawn-claude.sh's own ``launching``/``exit`` writes —
-target the SAME record: one record advances
-launching -> running -> idle/awaiting-input -> exited (exited is still
-written by spawn-claude.sh's ``finish()``). Hand-launched sessions (no
-CLAUDE_SPAWN_SESSION_ID) still key on session_id, exactly as before.
+A spawned session's hooks key its record on ``CLAUDE_SPAWN_SESSION_ID``, the
+slug of the record spawn-claude.sh created; a hand-launched session keys on
+its stdin ``session_id``. See ``docs/session-hook-ownership.md`` §Record keying.
 
-REFINED (task 4193): ``CLAUDE_SPAWN_SESSION_ID`` is inherited by anything
-the spawned session starts, so a nested ``claude`` (a Bash-tool ``claude
--p``, an agent shelling out) used to collapse onto the spawning session's
-record and flip its status mid-turn. The first hook event to adopt a slug
-now binds its own stdin ``session_id`` into ``record.claude_session_id``,
-and a later hook arriving with a DIFFERENT one is recognised as an
-inheritor-not-owner: it falls through to the hand-launched keying and gets
-its own record, leaving the spawned session's untouched.
-
-IMPORT CONTRACT (documented env: ``PYTHONPATH=<repo>/orchestrator/src``).
-This module is executed BY ABSOLUTE PATH from a plain shell with no venv and
-no install — ``skills/spawn/hooks/{session-start,stop,notification,
-install-hooks}.sh`` export that one PYTHONPATH entry (line 25) and then run
-this file (line 29). So ``from orchestrator import ...`` is fine (that is how
-``session_registry`` above is reached), but a module-scope ``from shared
-import ...`` or any third-party import makes this file unimportable in its own
-production entrypoint — and the failure is quiet, since a hook that dies just
-leaves the session unretitled and its record unrefreshed. Pinned as the
-``session_hooks.py (tier-2: bare shell + PYTHONPATH)`` row of
-``_BARE_SHELL_ENTRYPOINTS`` in
-``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``,
-and mutation-tested there rather than merely asserted green. Note
-``session_registry`` itself holds the STRICTER tier-1 contract (no PYTHONPATH
-at all) — see its module docstring.
+IMPORT CONTRACT. ``skills/spawn/hooks/*.sh`` run this file by absolute path
+from a plain shell with only ``PYTHONPATH=<repo>/orchestrator/src``: no venv,
+no install. ``from orchestrator import ...`` works; a module-scope ``shared``
+or third-party import makes every hook die quietly. Pinned and mutation-tested
+by the ``session_hooks.py`` row of
+``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``.
+``session_ownership_probes`` carries the same contract under its own row.
 """
 
 from __future__ import annotations
@@ -111,26 +80,13 @@ def resolve_hook_identity(
 ) -> session_registry.SpawnIdentity:
     """Resolve role/project/task_id/escalation_id for one hook event.
 
-    Delegates to ``session_registry.parse_spawn_identity``: ``CLAUDE_SPAWN_*``
-    env wins when present; otherwise falls back to its documented defaults
-    (``role='session'``, ``project`` derived from the enclosing checkout of
-    *cwd* -- see ``session_registry.py::parse_spawn_identity``) since hook
-    stdin carries no title to parse. *cwd* comes from the hook's stdin JSON, falling back
-    to ``os.getcwd()`` when absent.
-
-    SCOPE of the fork-path strip, stated once (tasks 4663, 5421): the strip
-    covers every caller that DESCRIBES the event's own session. Those are
-    ``run_session_start`` (the persisted record body) and
-    ``_run_status_refresh_and_retitle`` (the OSC retitle, which goes to the
-    hook process's own controlling terminal and so describes the session
-    whose hook fired). Both obtain their *env* from ``_own_identity_env``,
-    which strips the SPAWNER-describing identity keys whenever the inherited
-    env slug was rejected (see ``_HookSlugResolution.rejected_env_slug``),
-    so a forked session describes itself rather than its spawner.
-
-    The ONE raw-env caller is the slug derivation in ``_resolve_hook_slug``:
-    an opaque key whose spawner-derived segments nothing parses back, and
-    which must be identical across all three hook events.
+    Delegates to ``session_registry.py::parse_spawn_identity``: ``CLAUDE_SPAWN_*``
+    env wins when present, else its defaults (``role='session'``, ``project``
+    from the checkout enclosing *cwd*). *cwd* is the stdin ``cwd``, else
+    ``os.getcwd()``. Callers describing the event's own session (record body,
+    OSC retitle) pass the env from ``_own_identity_env``; only the slug
+    derivation in ``_resolve_hook_slug`` passes the raw env. See
+    ``docs/session-hook-ownership.md`` §Forked-inheritor identity.
     """
     cwd = str(hook_input.get('cwd') or os.getcwd())
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
@@ -146,22 +102,14 @@ _SPAWNER_IDENTITY_ENV_KEYS = frozenset({
     'CLAUDE_SPAWN_TITLE',
     'CLAUDE_SPAWN_PROMPT',
 })
-"""``CLAUDE_SPAWN_*`` keys that ``parse_spawn_identity``/``hook_display_title``
-read to build role/project/task_id/escalation_id/title.
+"""``CLAUDE_SPAWN_*`` keys ``parse_spawn_identity``/``hook_display_title`` read.
 
-Named separately from the handful of ``CLAUDE_SPAWN_*`` keys
-``run_session_start`` already knows describe the SPAWNER on the fork path
-(``CLAUDE_SPAWN_PARENT_ID``, ``CLAUDE_SPAWN_LAUNCHER_PID``,
-``CLAUDE_SPAWN_WM_TITLE``) because those are consulted directly by name at
-their own call sites, not funneled through identity resolution -- this set
-exists purely to drive ``_own_identity_env``.
-
-``CLAUDE_SPAWN_PROMPT`` is the one member no assertion can pin: it is
-forwarded to ``parse_spawn_identity`` but documented there as taking no part
-in the resolution, so stripping it is inert today and listed only so the
-funnel stays complete if that ever changes. Every OTHER member is
-load-bearing and mutation-detectable -- see
-``test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title``.
+``_own_identity_env`` strips them on the fork path, where they describe the
+spawner. The other spawner-describing keys (``CLAUDE_SPAWN_PARENT_ID``,
+``CLAUDE_SPAWN_LAUNCHER_PID``, ``CLAUDE_SPAWN_WM_TITLE``) are read by name at
+their own call sites in ``run_session_start``. ``CLAUDE_SPAWN_PROMPT`` takes
+no part in identity resolution today and is listed so the set stays complete.
+See ``docs/session-hook-ownership.md`` §Forked-inheritor identity.
 """
 
 
@@ -179,44 +127,13 @@ def _hook_session_id(hook_input: Mapping[str, Any]) -> str:
 
 
 _OWNER_ONLY_SESSION_START_SOURCES = frozenset({'clear', 'compact'})
-"""SessionStart ``source`` values only the session's OWN process can emit.
+"""SessionStart ``source`` values only a process already holding a session can emit.
 
-The stdin ``session_id`` is NOT constant for the life of one Claude Code
-process: ``/clear`` (and compaction) re-mints it in place. So an owning
-spawned session's later hooks legitimately arrive carrying an id that
-mismatches the binding its first SessionStart stamped -- and reading that as
-"an inheritor" would fork the real session onto a second record and freeze
-spawn-claude.sh's converged one at ``running``, re-introducing the exact
-task-2511 split for any spawned session the user ``/clear``s.
-
-These two have no command-line spelling, so the emitter is always a process
-that already holds a session. That is NECESSARY but NOT SUFFICIENT: it
-proves the emitter holds *a* session, not *this* one. A nested ``claude``
-holds a session too, and automatic compaction fires ``source='compact'``
-with no user action at all, so any nested ``claude -p`` that runs long
-enough emits one (task 4193 review). Membership here is therefore only the
-FIRST of two conditions -- ``_env_slug_is_owned`` additionally requires the
-event's owning process pid to equal the ``claude_owner_pid`` bound on the
-record. Both together mean the re-mint really did happen inside the owning
-process, and ``run_session_start`` RE-binds the fresh id so the record keeps
-tracking the session it belongs to.
-
-``'resume'`` is deliberately EXCLUDED even though it is also a re-mint:
-Claude Code emits it for ``--resume``/``--continue`` as well as an
-in-session ``/resume``, so a brand-new nested process (``claude -c -p
-'...'`` shelled out from inside a spawned session) reports it too. It is
-therefore no evidence of ownership at all, and honouring it would let any
-inheritor RE-bind its spawner's record to itself -- inverting ownership
-without any hook fault. A spawned session ``/resume``d in place forks onto
-its own record and recovers on its next ``/clear``/compact -- the fail-safe
-direction, and strictly better than the inversion.
-
-Note ``'compact'`` is NOT dropped for the same reason, because it is
-automatic: dropping it would fork the OWNER's own record on every routine
-auto-compaction, re-introducing the task-2511 split for a far more common
-event than the inversion it would prevent. Measured both ways before
-choosing (task 4193 review) -- the pid condition fixes both directions
-instead of trading one for the other.
+``/clear`` and compaction re-mint ``session_id`` in place. Membership is
+necessary but not sufficient to forgive a re-mint: ``_env_slug_ownership``
+also requires the event's owning claude pid to equal the record's
+``claude_owner_pid``. ``'resume'`` is excluded because a new nested process
+reports it too. See ``docs/session-hook-ownership.md`` §Session-id re-mints.
 """
 
 
@@ -225,7 +142,7 @@ def _is_owner_only_session_start(hook_input: Mapping[str, Any]) -> bool:
 
     ``source`` is a SessionStart-only stdin field, so this is only ever
     consulted from the SessionStart handler's own call path -- the
-    ``allow_remint`` seam on ``_env_slug_is_owned``/``_resolve_hook_slug``.
+    ``allow_remint`` seam on ``_env_slug_ownership``/``_resolve_hook_slug``.
     Notification and Stop stay under the strict bind-once rule rather than
     trusting a field their event shape has no business carrying.
     """
@@ -237,36 +154,18 @@ def _is_owner_only_session_start(hook_input: Mapping[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class _RecordSnapshot:
-    """One TRI-STATE read of ``<root>/sessions/<slug>/record.json``.
-
-    The three states, and why two of them are not one:
+    """One tri-state read of ``<root>/sessions/<slug>/record.json``.
 
     * PRESENT -- ``record`` is the body, ``unreadable`` False.
-    * ABSENT -- ``record`` None, ``unreadable`` False. No record exists at
-      this key yet. This state MAY be synthesized over: it is the ordinary
-      fresh-spawn / hand-launched first sight.
-    * UNREADABLE -- ``record`` None, ``unreadable`` True. A record EXISTS but
-      could not be parsed or read. This state may NOT be synthesized over.
+    * ABSENT -- ``record`` None, ``unreadable`` False. No record exists yet;
+      a refresh may create one.
+    * UNREADABLE -- ``record`` None, ``unreadable`` True. A record exists but
+      could not be read; a refresh must not overwrite it.
 
-    Collapsing the last two into a bare ``record | None`` is the bug this
-    type exists to make unrepresentable. One read serves two consumers that
-    want opposite things from a fault: the ownership probe must fail soft to
-    "adopt" (see ``_env_slug_ownership``: "every failure mode resolves to
-    adopt (True), never to fork"), so it treats ABSENT and UNREADABLE alike;
-    the refresh must not, because
-    ``session_registry.py::refresh_record`` guarantees "a *corrupt* existing
-    body is NOT treated as absent -- it continues to raise
-    ``CorruptSessionRecord`` rather than silently overwriting data". A hook
-    that synthesized a fresh record over a corrupt body would destroy the
-    record carrying role/prompt/result_file -- the one spawn-claude.sh's
-    ``finish()`` writes ``exited`` to.
-
-    Frozen: a snapshot is ONE observation of the registry at one instant,
-    and the whole point of passing it around is that every decision derived
-    from it was derived from the same bytes.
-
-    ``slug`` travels with the body so a snapshot can never be applied to a
-    record it was not read from -- see ``_resolve_hook_slug``'s invariant.
+    Frozen: one observation, so every decision derived from it saw the same
+    bytes. ``slug`` travels with the body so a snapshot is never applied to a
+    record it was not read from. See ``docs/session-hook-ownership.md``
+    §One read, one decision, one write.
     """
 
     slug: str
@@ -315,124 +214,48 @@ def _env_slug_ownership(
     allow_remint: bool = False,
     probes: EventProbes,
 ) -> tuple[bool, bool, _RecordSnapshot | None]:
-    """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
+    """Is the inherited ``CLAUDE_SPAWN_SESSION_ID`` *slug* this session's own?
 
-    Returns ``(owned, may_bind, snapshot)``. ``snapshot`` is the record read
-    performed to answer, so an adopting caller can reuse it instead of
-    reading the same record again -- None only on the early return that
-    reads nothing at all. ``owned`` is the adopt/fork answer
-    documented below. ``may_bind`` is the SEPARATE question of whether this
-    event may stamp its ``session_id`` onto the adopted record, and the two
-    are deliberately not the same bit: adopting is fail-soft (it degrades to
-    the pre-task-4193 collapse-onto-one-record behaviour), but BINDING is
-    not -- a binding is permanent, so an event that adopts merely because
-    ownership could not be DISPROVED must not also claim the record. Doing
-    both is what let a nested ``claude`` capture an unbound spawn record and
-    exile its true owner one event later (task 4193 review, esc-4193-10).
+    Returns ``(owned, may_bind, snapshot)``:
 
-    So ``may_bind`` is False on exactly one shape: an inherited env slug
-    whose record carries NO binding yet AND whose ownership is merely
-    unproven (``session_ownership_probes.py::EventProbes.owner_ppid_verdict`` returns None -- a session spawned by a
-    pre-task-4193 spawn-claude.sh, every record already live on deploy day,
-    or a platform with no ``/proc`` such as macOS). There the record is left
-    OPEN for its true owner, which is precisely the "leave them unbound and
-    let the fork rule apply only to newly-spawned sessions" disposition the
-    L2 ruling (item 8) sanctions for the in-flight fleet. It is True
-    everywhere else, including every hand-launched and forked-inheritor
-    slug: those embed the stdin ``session_id`` in the slug itself, so a
-    binding there is tautological and can never mismatch.
+    * ``owned`` -- adopt the env slug (True) or fork onto the hand-launched
+      keying (False). False only when ownership is positively disproved: a
+      bound ``claude_session_id`` that mismatches, or, on an unbound record,
+      an ``owner_ppid_verdict`` of False.
+    * ``may_bind`` -- whether this event may stamp its ``session_id`` onto the
+      record. False when ownership was adopted but not proven, which leaves
+      the record open for its real owner.
+    * ``snapshot`` -- the record read made to answer, so an adopting caller
+      need not read again. None only when nothing was read.
 
-    The hook stdin ``session_id`` is the only discriminator: a nested claude
-    is also a descendant of the original launcher, so PID lineage cannot
-    tell an owner from an inheritor (task 4193). Answers True -- adopt --
-    whenever ownership is not positively disproved: no stdin session_id (no
-    discriminator at all), no record yet (this hook IS the first sight), or
-    a record carrying no binding (spawn-claude.sh's ``launching`` write, or
-    a pre-task-4193 record; the first matching hook binds it in
-    ``_bind_claude_session_id``). Only a binding that positively MISMATCHES
-    returns False, sending the caller to the hand-launched keying.
-
-    With *allow_remint* a mismatch is ALSO forgiven when the event's
-    SessionStart ``source`` says only the owning process could have fired it
-    (``/clear`` and compaction re-mint ``session_id`` in place -- see
-    ``_OWNER_ONLY_SESSION_START_SOURCES``); ``run_session_start`` re-binds
-    the record to the new id on that path. Only SessionStart passes it: a
-    Notification/Stop carrying a ``source`` at all is malformed, and
-    honouring one there would hand any inheritor a one-word bypass. The
-    owning session needs no such bypass on those events -- its SessionStart
-    has already re-bound the record to the fresh id by then.
-
-    An UNBOUND record has no ``claude_session_id`` discriminator yet -- the
-    spawn-created ``launching`` snapshot, a sibling-mode record already
-    flipped to ``running`` by ``resolve_sibling``, or any pre-task-4193
-    record. That window is wide (median ~27s over the live fleet, p90 ~141s)
-    and unbounded, and the FIRST event to arrive in it binds, owner or
-    inheritor. So the stateless ``CLAUDE_SPAWN_OWNER_PPID`` probe decides
-    there instead (``session_ownership_probes.py::EventProbes.owner_ppid_verdict``): a positive MISMATCH forks; a
-    match, or no verdict at all, adopts. Deliberately keyed on
-    unbound-ness rather than ``status is LAUNCHING``, so sibling-mode spawns
-    -- never LAUNCHING by the time a hook sees them -- are covered too
-    (task 4193 L2 ruling items 4-i and 8).
-
-    FAIL-SOFT: every failure mode resolves to adopt (True), never to fork.
-    A probe that cannot answer degrades to the pre-task-4193 behaviour
-    rather than inventing a record split, honouring the hook trio's hard
-    rule that a registry fault never breaks a session. That includes the
-    pid arm below: an owner pid missing on EITHER side is "cannot prove",
-    not "disproved" -- forking there would split the owner's own record on
-    every routine automatic compaction wherever ``/proc`` is unavailable.
-
-    *probes* is this event's ``EventProbes`` memo, so the ownership walk it
-    performs here is the SAME observation ``_withhold_from_launching`` and
-    ``_bind_claude_session_id`` later consult -- see that class's docstring.
-
-    The returned snapshot is the probe's own record read. On the adopt path
-    it is the event's ONLY read of the record it goes on to write: the
-    handlers take it forward through ``_HookSlugResolution.snapshot``
-    instead of reading again (task 4662).
+    Fail-soft: every unresolvable probe adopts, never forks. *allow_remint*
+    (SessionStart only) forgives a mismatch from an owner-only ``source`` when
+    the owning claude pid matches the record's ``claude_owner_pid``. *probes*
+    is this event's ``EventProbes``. See ``docs/session-hook-ownership.md``
+    §Owner or inheritor and §Fail-soft direction.
     """
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
-        # No discriminator at all, and nothing to bind either: the 'unknown'
-        # slug fallback is deliberately not a valid binding. Nothing is read
-        # here, so there is no snapshot to hand forward.
+        # No discriminator, and the 'unknown' slug fallback is not a valid binding.
         return True, True, None
     snapshot = _read_record_snapshot(slug, root)
     if snapshot.unreadable:
-        # A corrupt body, an unreadable fleet root, anything: an ownership
-        # probe that cannot answer must degrade to the pre-task-4193
-        # behaviour (adopt) rather than fork a spurious record or raise --
-        # the hook trio's hard rule is that a registry fault never breaks a
-        # session. Logged (in _read_record_snapshot), never silent.
+        # Cannot answer: adopt without binding (logged in _read_record_snapshot).
         return True, False, snapshot
     record = snapshot.record
     if record is None:
-        # No record yet: this hook event IS the slug's first sight. Its own
-        # arm, above the broad one, so an ordinary fresh spawn logs nothing.
-        # Binding still needs positive proof: an unbound slug with no record
-        # is the same open-for-its-owner shape as an unbound record.
+        # First sight of this slug: adopt, and bind only on positive proof.
         return True, probes.owner_ppid_verdict() is True, snapshot
     bound = (record.claude_session_id or '').strip()
     if not bound:
-        # No binding yet, so the stdin session_id proves nothing: whoever
-        # arrives first would otherwise capture the spawn-created record,
-        # inverting ownership permanently. Fall back to the stateless
-        # owner-provenance probe, which needs no persisted field. Note the
-        # asymmetry between the two bits: a merely-unproven event (verdict
-        # None) ADOPTS -- the fail-soft direction -- but does NOT bind, so
-        # the record stays open for its true owner instead of being
-        # captured by whoever happened to arrive first.
+        # Unbound: the OWNER_PPID verdict decides. An unproven event (None)
+        # adopts but does not bind.
         verdict = probes.owner_ppid_verdict()
         return verdict is not False, verdict is True, snapshot
     if bound == hook_session_id:
         return True, True, snapshot
-    # A re-mint is forgiven only when the OWNING PROCESS is the one
-    # presenting it. The `source` string alone proves the emitter holds *a*
-    # session, not *this* one -- and automatic compaction fires
-    # source='compact' with no user action, so any nested `claude -p` that
-    # runs long enough reaches this branch (task 4193 review). The pid bound
-    # at stamp time is the discriminator: /clear and compaction happen
-    # inside the owning process and keep its pid; a nested claude cannot.
+    # A re-mint is forgiven only for an owner-only SessionStart source
+    # presented by the owning process, i.e. the same claude pid.
     if not (allow_remint and _is_owner_only_session_start(hook_input)):
         # Forked onto the hand-launched keying, whose slug embeds this very
         # session_id: binding there is tautological, never a capture.
@@ -440,14 +263,7 @@ def _env_slug_ownership(
     owner_pid = record.claude_owner_pid
     current_pid = probes.owning_claude_pid()
     if owner_pid is None or current_pid is None:
-        # Legacy record bound before the pid existed, a bind where it could
-        # not be resolved, or a platform with no /proc (macOS -- a
-        # first-class lane, cf. task 4058). Ownership is UNPROVABLE, not
-        # DISPROVED, so take the fail-soft direction this docstring
-        # promises: adopt. Forking here would split the OWNER's own record
-        # on every routine automatic compaction, a universal regression
-        # strictly worse than the rare inversion it would prevent
-        # (task 4193 L2 ruling item 4-ii).
+        # Unprovable, not disproved: adopt.
         return True, True, snapshot
     return owner_pid == current_pid, True, snapshot
 
@@ -473,13 +289,10 @@ def _env_slug_is_owned(
 class _HookSlugResolution:
     """One hook event's resolved registry identity -- see ``_resolve_hook_slug``.
 
-    A frozen dataclass rather than a 4-tuple deliberately: this is the
-    surface task 4193 spent seven review cycles stabilizing, and named
-    fields make a mis-ordered unpack a type error rather than a silent
-    ownership inversion.
+    Named fields rather than a tuple, so a mis-ordered unpack is a type error
+    rather than a silent ownership inversion.
 
-    INVARIANT: ``snapshot is None or snapshot.slug == slug``. See
-    ``_resolve_hook_slug``'s docstring for why that is load-bearing.
+    INVARIANT: ``snapshot is None or snapshot.slug == slug``.
     """
 
     slug: str
@@ -496,55 +309,28 @@ def _resolve_hook_slug(
     allow_remint: bool = False,
     probes: EventProbes,
 ) -> _HookSlugResolution:
-    """Resolve this hook event's registry identity -- see ``_HookSlugResolution``.
+    """Resolve this hook event's registry identity.
 
-    ``slug`` is exactly what ``hook_session_slug`` returns -- see its
-    docstring for the adoption / fall-through contract.
+    * ``slug`` -- exactly what ``hook_session_slug`` returns.
+    * ``rejected_env_slug`` -- the sanitized ``CLAUDE_SPAWN_SESSION_ID`` when
+      one was present but disowned: this event belongs to a nested ``claude``
+      being forked onto its own record, and the value names its spawner.
+      None on every other path.
+    * ``may_bind`` -- ``_env_slug_ownership``'s second bit. Callers that bind
+      must honour it.
+    * ``snapshot`` -- the ownership probe's own record read, attached ONLY on
+      the adopt branch, where the slug read is the slug returned. On the fork
+      branch it would describe the spawner's record, not the one returned.
 
-    ``rejected_env_slug`` is the sanitized ``CLAUDE_SPAWN_SESSION_ID`` when
-    one was present but disowned by ``_env_slug_is_owned``: this event
-    belongs to a nested ``claude`` that merely INHERITED the variable and is
-    being forked onto its own record. It is None on every other path
-    (adopted, or no env slug at all).
-
-    That one bit is worth returning because the fork path is the only place
-    where the true spawner IS known -- it is precisely the slug just
-    rejected -- and equally the only place where every OTHER inherited
-    ``CLAUDE_SPAWN_*`` value in scope describes the SPAWNER rather than this
-    session, so it must not be copied onto the new record wholesale --
-    ``run_session_start`` uses this bit to tell the two apart.
-
-    ``may_bind`` is ``_env_slug_ownership``'s second bit: whether this event
-    is allowed to stamp its ``session_id`` onto the record the slug resolves
-    to. It is False only for an adopted-but-unproven inherited env slug --
-    adoption is fail-soft, a permanent binding is not (see that function's
-    docstring). Callers that would bind must honour it; callers that only
-    need an identity can ignore it.
-
-    ``snapshot`` is the record read the ownership probe already performed,
-    handed forward so the caller need not read the same record again -- the
-    single-read collapse this whole path exists to enable. It is attached
-    ONLY on the adopt branch, where the slug READ is the slug RETURNED.
-
-    That restriction is load-bearing, not tidiness. On the FORK branch the
-    slug returned is the hand-launched one -- a DIFFERENT record.json --
-    and handing the rejected spawner's snapshot forward would apply a
-    nested ``claude``'s status/question/binding decision to the SPAWNING
-    session's record: exactly the ownership inversion tasks 4193 and 2511
-    exist to prevent, re-introduced through a plumbing shortcut. Every
-    other branch (fork, no env slug, and the blank-stdin-session_id early
-    return that reads nothing) carries ``snapshot=None``.
-
-    *allow_remint* is forwarded to ``_env_slug_ownership``; SessionStart is
-    the only caller that sets it. *probes* is likewise forwarded, so the
-    resolution's ownership walk is shared with the rest of the event.
+    *allow_remint* (SessionStart only) and *probes* are forwarded to
+    ``_env_slug_ownership``. See ``docs/session-hook-ownership.md``
+    §One read, one decision, one write.
     """
     spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
     rejected: str | None = None
     if spawn_session_id is not None:
-        # Sanitize BEFORE probing: it keeps the all-dots containment contract
-        # (task 4112) intact, and means an adversarial env token can no more
-        # escape sessions_dir when READ than when written.
+        # Sanitize BEFORE probing, so an adversarial token can no more escape
+        # sessions_dir when read than when written.
         candidate = session_registry.sanitize_slug(spawn_session_id)
         owned, may_bind, snapshot = _env_slug_ownership(
             candidate,
@@ -559,31 +345,13 @@ def _resolve_hook_slug(
             return _HookSlugResolution(candidate, None, may_bind, snapshot)
         rejected = candidate
 
-    # RAW env, deliberately, on the fork branch too (task 4663): the
-    # role/project/task segments below stay SPAWNER-derived even though the
-    # record BODY `run_session_start` writes at this slug does not, so on
-    # that one path slug and body legitimately disagree. Two reasons to
-    # leave it. First, the slug is an opaque KEY, not a description: every
-    # consumer either keys on it or prints it verbatim (measured over
-    # cockpit's registry_reader/session_table/spawn_tree, workflow.py,
-    # scripts/legibility, spawn-claude.sh -- none splits a slug back into an
-    # identity), so a spawner-flavoured segment misleads nothing but a human
-    # reading the sessions dir, whose authoritative answer is the body.
-    # Second, this exact shape is a landed task-4193 contract, pinned by
-    # test_hook_session_slug_forks_when_binding_mismatches -- re-deriving it
-    # is a deliberate contract change, not a consistency tidy-up.
-    # CONSTRAINT on any such change: SessionStart, Notification and Stop each
-    # re-derive this slug independently, so whatever identity it is built
-    # from must be identical across all three or one forked session splits
-    # across two records. The forked session's OWN identity is carried by its
-    # record body AND its retitle instead -- see `resolve_hook_identity` for
-    # that strip's scope.
+    # Raw env on the fork branch too: the slug is an opaque key that all three
+    # hook events must derive identically. See docs/session-hook-ownership.md
+    # §Forked-inheritor identity.
     identity = resolve_hook_identity(hook_input, env)
     session_id = _hook_session_id(hook_input) or 'unknown'
-    # session_id (str) deliberately fills the launcher_pid slot as the
-    # uniqueness token (see module docstring); build_session_slug only ever
-    # str()s this argument, so the int annotation is not a real runtime
-    # constraint here.
+    # session_id fills the launcher_pid slot as the uniqueness token; the int
+    # annotation does not bind, since build_session_slug only str()s it.
     slug = session_registry.build_session_slug(
         identity.role,
         identity.project,
@@ -605,52 +373,21 @@ def hook_session_slug(
 ) -> str:
     """Build the record-identity slug for one hook event.
 
-    Prefers ``CLAUDE_SPAWN_SESSION_ID`` (env) when present AND owned by this
-    session: that value is already spawn-claude.sh's own ``launching``-record
-    slug, so it is returned DIRECTLY (sanitized via
-    ``session_registry.sanitize_slug``), NOT fed back through
-    ``build_session_slug`` -- doing so would double-prefix it (e.g.
-    ``'session-cockpit-session-cockpit-3215033'``) and miss the pre-existing
-    launching record. This is what lets all three hook events converge on the
-    SAME pid-keyed record spawn-claude.sh created (module docstring). A
-    missing, empty, or whitespace-only value is treated as absent (mirrors
-    ``_resolve_parent_session_id``'s ``env.get(...) or None`` idiom, extended
-    with a ``.strip()`` so a blank-but-non-empty token also falls through).
+    Returns the sanitized ``CLAUDE_SPAWN_SESSION_ID`` as-is when it is present
+    (blank counts as absent) and owned by this session: it is already
+    spawn-claude.sh's record slug, and feeding it back through
+    ``build_session_slug`` would prefix it twice. Otherwise, including on a
+    proven mismatch, returns ``session_registry.build_session_slug`` keyed on
+    the stdin ``session_id`` (``'unknown'`` when blank), which is the same for
+    SessionStart, Notification and Stop. See ``docs/session-hook-ownership.md``
+    §Record keying and §Owner or inheritor.
 
-    Adoption is conditional on ownership (task 4193): the variable is
-    inherited by any process the spawned session starts, so a nested
-    ``claude`` carries it too. ``_env_slug_is_owned`` compares the record's
-    bound Claude Code ``session_id`` against this hook's stdin one and
-    returns False only on a proven mismatch, in which case this falls through
-    to the hand-launched keying below and the inheritor gets its OWN record
-    instead of collapsing onto the spawned session's. Pass ``root`` so the
-    probe reads the same registry the caller writes; with ``root=None`` it
-    resolves the default fleet root.
+    Pass *root* so the ownership probe reads the registry the caller writes.
+    *allow_remint* is SessionStart-only (see ``_env_slug_ownership``).
+    *process_tree* is the tree the probes read; None reads the live one.
 
-    Otherwise (or on a proven mismatch) reuses
-    ``session_registry.build_session_slug`` with the hook's ``session_id``
-    (via ``_hook_session_id``, so a blank token falls back to ``'unknown'``
-    exactly as an absent one does) as the uniqueness token in place of
-    ``launcher_pid``. ``session_id`` is stable across the
-    SessionStart/Notification/Stop events of one turn, so all three
-    deterministically resolve to the same ``record.json`` (the hand-launched
-    fallback). It is NOT stable across a ``/clear``, which re-mints it in
-    place -- a hand-launched session simply gets a new record from there on,
-    while a spawned one is kept whole by
-    ``_OWNER_ONLY_SESSION_START_SOURCES``.
-
-    *allow_remint* (SessionStart only) lets a ``/clear``-style re-mint keep
-    the record instead of forking -- see ``_env_slug_is_owned``.
-    *process_tree* is the tree this event's ownership probes read; None reads
-    the live one (see ``ProcessTree``).
-
-    Thin wrapper over ``_resolve_hook_slug``, which additionally reports
-    WHETHER an inherited env slug was rejected, whether this event may BIND
-    the record it resolved to, and the record SNAPSHOT the ownership probe
-    read; callers that enrich, bind or refresh a record need those bits,
-    callers that only need an identity do not. This wrapper discards them,
-    so calling it re-reads what the probe already read -- the handlers go
-    through ``_resolve_hook_slug`` directly for exactly that reason.
+    A thin wrapper over ``_resolve_hook_slug`` that discards its rejection,
+    binding and snapshot bits, so the handlers call that directly instead.
     """
     probes = EventProbes(env, process_tree)
     return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint, probes=probes).slug
@@ -660,22 +397,13 @@ def _own_identity_env(
     env: Mapping[str, str],
     resolution: _HookSlugResolution,
 ) -> Mapping[str, str]:
-    """The env this event's OWN session identity (record body, OSC retitle) resolves from.
+    """The env this event's own identity (record body, OSC retitle) resolves from.
 
-    The raw hook env, unless ``_resolve_hook_slug`` REJECTED an inherited
-    ``CLAUDE_SPAWN_SESSION_ID`` (tasks 4663, 4193 review): this event then
-    belongs to a nested ``claude`` that merely inherited the variable, so
-    every remaining ``CLAUDE_SPAWN_*`` identity value in scope describes the
-    SPAWNER -- the same principle ``run_session_start`` already applies to
-    ``parent_session_id``/display/``launcher_pid``. Those
-    ``_SPAWNER_IDENTITY_ENV_KEYS`` are stripped, so ``resolve_hook_identity``
-    and ``hook_display_title`` fall through to their own non-spawn defaults
-    (``role='session'``, ``project`` from the enclosing checkout -- see
-    ``session_registry.py::parse_spawn_identity`` -- ``task_id=None``,
-    ``escalation_id=None``) instead of parroting the spawner's identity.
-
-    The slug itself is deliberately NOT derived from this (see
-    ``_resolve_hook_slug``).
+    The raw hook env, unless ``_resolve_hook_slug`` rejected an inherited
+    ``CLAUDE_SPAWN_SESSION_ID``. Then the ``_SPAWNER_IDENTITY_ENV_KEYS`` values
+    describe the spawner and are stripped, so identity falls through to this
+    session's own defaults. The slug is not derived from this env. See
+    ``docs/session-hook-ownership.md`` §Forked-inheritor identity.
     """
     if resolution.rejected_env_slug is None:
         return env
@@ -689,26 +417,15 @@ def _bind_claude_session_id(
     allow_rebind: bool = False,
     probes: EventProbes,
 ) -> bool:
-    """Stamp this hook's Claude Code session_id onto an unbound *record*.
+    """Stamp this hook's ``session_id`` and owning claude pid onto an unbound *record*.
 
-    BIND-ONCE: an already-bound record is left untouched, and a hook whose
-    stdin carries no (or a blank) ``session_id`` binds nothing -- the
-    ``'unknown'`` fallback ``hook_session_slug`` uses for slug-building is
-    deliberately NOT a valid binding, since every discriminator-less session
-    would otherwise claim ownership under the same bogus token. Returns
-    whether *record* was mutated, so the caller can fold the stamp into a
-    write it was already making instead of adding one.
-
-    *allow_rebind* is the one sanctioned exception: Claude Code re-mints
-    ``session_id`` in place on ``/clear``, so the OWNING process itself can
-    arrive with a new id. ``run_session_start`` passes it only when
-    ``_is_owner_only_session_start`` says no nested ``claude`` could have
-    produced this event -- never on the Notification/Stop refresh path,
-    where no such ``source`` field exists to vouch for the caller.
-
-    *probes* supplies the owning pid from this event's memo, so the stamp
-    reads the SAME process-tree observation the adopt/fork decision was made
-    from rather than walking ``/proc`` a third time.
+    Bind-once: an already-bound record is left alone, and a blank stdin
+    ``session_id`` binds nothing (``'unknown'`` is never a valid binding).
+    *allow_rebind* lets SessionStart re-bind when ``_is_owner_only_session_start``
+    holds, because ``/clear`` re-mints the id inside the owning process; never on
+    Notification/Stop. ``claude_owner_pid`` comes from *probes* and is None when
+    unresolvable. Returns whether *record* was mutated. See
+    ``docs/session-hook-ownership.md`` §Owner or inheritor.
     """
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
@@ -719,11 +436,8 @@ def _bind_claude_session_id(
     if bound and not allow_rebind:
         return False
     record.claude_session_id = hook_session_id
-    # Stamp the owning process alongside the id, in the same mutation: the
-    # pid is what lets a later re-mint (/clear, automatic compaction) be
-    # told apart from a nested claude presenting a different id. None when
-    # it cannot be resolved -- recorded honestly rather than guessed, and
-    # read back as "cannot prove ownership".
+    # The pid later tells a re-mint inside the owner from a nested claude;
+    # None, when unresolvable, reads back as "cannot prove ownership".
     record.claude_owner_pid = probes.owning_claude_pid()
     return True
 
@@ -1001,83 +715,29 @@ def run_session_start(
 ) -> session_registry.SessionRecord:
     """SessionStart hook handler: capture or refresh this session's record.
 
-    When no record exists yet at this session's slug, this IS the session's
-    first sight (PRD hand-launched-capture signal -- true for every hand-
-    launched session), so a RICH record is built:
-    role/project/task_id/escalation_id/title/cwd/transcript_path all
-    populated from the resolved identity, status=RUNNING. When a record
-    already exists under this slug, it is refreshed to RUNNING in place --
-    every other already-populated field survives untouched. Both paths then
-    receive the same best-effort enrichment (parent_session_id from
-    ``CLAUDE_SPAWN_PARENT_ID``, see ``_resolve_parent_session_id``; display
-    from ``TMUX``/``WINDOWID``, see ``_resolve_display``) before a single
-    ``write_record`` call, which bumps the record's mtime heartbeat.
+    With no record at the slug yet, this is the session's first sight: a rich
+    record is built from the resolved identity with status RUNNING. An
+    existing record is refreshed to RUNNING in place, its other fields kept.
+    Both then get best-effort enrichment (``parent_session_id`` from
+    ``CLAUDE_SPAWN_PARENT_ID``, display from ``_resolve_display``), a binding
+    when ``may_bind`` allows (``_bind_claude_session_id``, re-binding on an
+    owner-only ``source``), one ``write_record`` and the pid pointer.
 
-    The record is read exactly ONCE per event (task 4662): on the adopt path
-    the ownership probe already read it, and that snapshot travels forward
-    on ``_HookSlugResolution.snapshot`` rather than being re-read here, so
-    the ownership/remint decision and the body written derive from the same
-    observation. An UNREADABLE body is the one exception -- it is re-read so
-    the fault propagates rather than being synthesized over; see
-    ``_RecordSnapshot``.
+    The record is read once per event: on the adopt path the ownership
+    probe's snapshot is reused. An UNREADABLE body is re-read so the fault
+    propagates instead of being overwritten (see ``_RecordSnapshot``).
 
-    RESOLVED dual-record split for SPAWNED sessions (task 2511): this slug
-    used to be keyed on the Claude Code ``session_id`` (module docstring),
-    while spawn-claude.sh's own ``launching`` write keys ITS record on the
-    integer ``launcher_pid`` -- a different uniqueness token that
-    ``session_id`` could never converge with, since spawn-claude.sh cannot
-    know the session_id Claude Code will assign at launch time. A spawned
-    session used to get TWO registry records: spawn-claude.sh's pid-keyed
-    LAUNCHING/RUNNING/EXITED record, and this hook trio's session_id-keyed
-    RUNNING/AWAITING_INPUT/IDLE record -- they did not merge into one,
-    regardless of hook-vs-spawn-claude.sh timing. Per the PRD addendum, this
-    is now fixed: spawn-claude.sh exports ``CLAUDE_SPAWN_SESSION_ID`` (its
-    own launching record's slug) into the spawned session's own
-    environment, and ``hook_session_slug`` adopts that token directly (see
-    its docstring) -- so this handler's read/refresh/write all target
-    spawn-claude.sh's pre-existing record, converging launching -> running
-    -> idle/awaiting-input -> exited onto ONE record. Hand-launched sessions
-    (no CLAUDE_SPAWN_SESSION_ID) are unaffected -- they still key on
-    session_id exactly as before.
+    On the fork path, where an inherited env slug was rejected:
 
-    Ownership binding (task 4193): the first hook event to adopt a slug AND
-    positively prove its ownership (``_env_slug_ownership``'s ``may_bind``
-    bit -- an adopted-but-unproven event refreshes the record without
-    claiming it, leaving it open for its true owner) also stamps its own
-    Claude Code ``session_id`` into
-    ``record.claude_session_id`` (see ``_bind_claude_session_id``), folded
-    into the single ``write_record`` below. The binding is never overwritten
-    afterwards -- bind-once is what makes it a stable discriminator between
-    the session spawn-claude.sh launched and a nested ``claude`` that merely
-    inherited ``CLAUDE_SPAWN_SESSION_ID`` from it. The single exception is a
-    SessionStart whose ``source`` only the owning process could have
-    produced (``/clear`` re-mints ``session_id`` in place): there the record
-    is RE-bound to the new id, so the owner keeps its own record rather than
-    being mistaken for an inheritor (see
-    ``_OWNER_ONLY_SESSION_START_SOURCES``).
+    * ``parent_session_id`` is the rejected slug, i.e. the spawner;
+    * ``CLAUDE_SPAWN_WM_TITLE`` is not resolved for display;
+    * ``launcher_pid`` is ``EventProbes.nested_claude_liveness_pid``, never an
+      inherited ``CLAUDE_SPAWN_LAUNCHER_PID``;
+    * identity and title resolve from ``_own_identity_env``.
 
-    Forked-inheritor enrichment (task 4193 review): when the inherited env
-    slug is REJECTED, every remaining ``CLAUDE_SPAWN_*`` value in scope
-    still describes the SPAWNER, not this session, so it is not copied over
-    wholesale. ``parent_session_id`` is taken from the rejected slug itself
-    -- the one path where the true spawner is known exactly, and strictly
-    better than ``CLAUDE_SPAWN_PARENT_ID``, which names the spawner's OWN
-    parent and would render this session as its spawner's sibling. The
-    ``CLAUDE_SPAWN_WM_TITLE`` display resolution is skipped (see
-    ``_resolve_display``) and ``launcher_pid`` comes from
-    ``session_ownership_probes.py::EventProbes.nested_claude_liveness_pid`` so the forked record stays reapable.
-
-    RESIDUAL sibling fixed (task 4663): the three overrides above left
-    ``resolve_hook_identity``/``hook_display_title`` still reading
-    role/task_id/escalation_id/title straight out of the inherited env, so a
-    forked record got the SPAWNER's role, task_id, escalation_id and display
-    title -- two cockpit rows identical except for slug. ``identity_env``
-    comes from ``_own_identity_env`` (stripped on the fork path, raw on
-    every other), so identity resolution falls through to this session's own
-    defaults instead of the spawner's.
-
-    *process_tree* is the tree this event's ownership probes read; None reads
-    the live one (see ``ProcessTree``).
+    *process_tree* is the tree the probes read; None reads the live one. See
+    ``docs/session-hook-ownership.md`` §Forked-inheritor identity and
+    §One read, one decision, one write.
     """
     probes = EventProbes(env, process_tree)
     resolution = _resolve_hook_slug(
@@ -1090,20 +750,12 @@ def run_session_start(
     )
     identity_env = _own_identity_env(env, resolution)
     identity = resolve_hook_identity(hook_input, identity_env)
-    # THE event's only read of the slug it writes: on the adopt path the
-    # ownership probe already read this very record, so its snapshot is
-    # handed forward rather than re-read (task 4662).
+    # The event's only read of its slug: the probe's snapshot on the adopt path.
     snapshot = resolution.snapshot or _read_record_snapshot(slug, root)
     record = snapshot.record
     if record is None and snapshot.unreadable:
-        # UNREADABLE, not ABSENT: a record EXISTS but could not be parsed or
-        # read, and synthesizing over it would destroy the body holding
-        # role/prompt/result_file. Re-read so a CorruptSessionRecord/OSError
-        # propagates to main()'s blanket except exactly as it does today --
-        # deliberately neither swallowed here nor written past. A
-        # FileNotFoundError here instead means the fault was transient over
-        # a record that is simply absent, which falls through to the capture
-        # below, again exactly as today.
+        # Unreadable, not absent: re-read so a corrupt body propagates to
+        # main() instead of being overwritten. FileNotFoundError means absent.
         with contextlib.suppress(FileNotFoundError):
             record = session_registry.read_record(slug, root=root)
     if record is None:
@@ -1143,13 +795,8 @@ def run_session_start(
     display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
     if display is not None:
         record.display = display
-    # This path always writes, so the return value is deliberately ignored.
-    # `may_bind` is the guard, not `forked_from`: an adopted-but-UNPROVEN
-    # inherited slug must refresh the record it adopted without CLAIMING it
-    # (see `_env_slug_ownership`), or a nested claude captures the
-    # spawn-created record permanently and exiles the owner on its next
-    # event -- the inversion task 2511 fixed, re-introduced from the other
-    # side (esc-4193-10).
+    # may_bind, not forked_from, guards the bind: an adopted-but-unproven
+    # event refreshes the record without claiming it. The result is unused.
     if may_bind:
         _bind_claude_session_id(
             record,
@@ -1182,26 +829,11 @@ def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Questio
 
 
 _LAUNCH_WINDOW_WITHHOLD_MAX_SECS = 600.0
-"""How long an event of UNKNOWN provenance may be withheld from a still-
-LAUNCHING, still-unbound record before the rail prefers a possibly-wrong
-status to a permanently blind one.
+"""How long an event of unknown provenance is withheld from a LAUNCHING, unbound record.
 
-Nothing else bounds that window: there is no LAUNCHING reaper or expiry, and
-``reap_stale_records`` needs both NON_TERMINAL_HEARTBEAT_TTL (1h) and a DEAD
-``launcher_pid`` -- which is spawn-claude.sh's own ``$$``, alive for the whole
-session. So without this bound, a session whose SessionStart never landed (it
-can be killed by ``_HOOK_TIMEOUT_SECS`` while ``_resolve_wm_window_id``
-retries) is invisible to the attention rail FOR ITS ENTIRE LIFE, and its
-pending question is silently dropped -- a regression in the rail's core
-function (task 4193 L2 ruling item 4-iii).
-
-600s is comfortably past the measured launch window (n=51 live-fleet records:
-median 27.2s, p90 141.2s, max 172.3s; max 575s under a looser match), so a
-merely-slow-but-healthy spawn is still withheld and only a genuinely stuck one
-falls through. This is the FALLBACK path: an event whose
-``CLAUDE_SPAWN_OWNER_PPID`` positively identifies it as the owner's is never
-withheld at all, and one that positively identifies an inheritor has already
-been forked onto its own slug by ``_env_slug_is_owned``."""
+Nothing else bounds that window. 600s is well past the observed launch-window
+p90 and maximum, so only a stuck spawn falls through. See
+``docs/session-hook-ownership.md`` §The launch window."""
 
 
 def _launch_window_withholding_expired(
@@ -1209,14 +841,9 @@ def _launch_window_withholding_expired(
 ) -> bool:
     """Has *prior* sat in the unbound launch window past the withhold bound?
 
-    Fail-soft in the direction of EXPIRED, not withholding: a missing or
-    unparseable ``start_ts`` returns True. ``start_ts`` defaults to ``''``
-    on ``SessionRecord``, so treating an unreadable clock as "still within
-    the window" would let a record with no clock at all withhold FOREVER --
-    exactly the permanently-blind failure ``_LAUNCH_WINDOW_WITHHOLD_MAX_SECS``
-    exists to bound (L2 ruling esc-4193-8 item 4-iii: "a permanently-withheld
-    record is worse than a stale status"). An unclocked LAUNCHING record
-    cannot be SHOWN to be within the window, so it is treated as past it.
+    A missing or unparseable ``start_ts`` counts as expired: a record with no
+    clock cannot be shown to be inside the window, and treating it as inside
+    would withhold forever.
     """
     raw = (prior.start_ts or '').strip()
     if not raw:
@@ -1233,24 +860,12 @@ def _launch_window_withholding_expired(
 def _in_unbound_launch_window(
     prior: session_registry.SessionRecord | None,
 ) -> bool:
-    """Is *prior* a spawn-created record whose owner has not been sighted yet?
+    """Is *prior* a spawn-created record still LAUNCHING and unbound?
 
-    True only for the LAUNCHING-and-still-unbound snapshot spawn-claude.sh
-    writes before the session it launched runs its own SessionStart. In that
-    window the record carries NO ``claude_session_id``, so there is no
-    discriminator (task 4193's whole premise: the stdin ``session_id`` is
-    the only one, and PID lineage cannot substitute). An event arriving here
-    is therefore of UNKNOWN provenance -- it may be the owner's, or a nested
-    ``claude`` that merely inherited ``CLAUDE_SPAWN_SESSION_ID``.
-
-    A LAUNCHING record that IS already bound is not in the window: a bound
-    record has a discriminator, so ``_env_slug_is_owned`` has already proved
-    this event's ownership and the caller may write normally.
-
-    This answers only the RECORD-SHAPE question. Whether the caller actually
-    withholds is decided in ``_run_status_refresh_and_retitle``, which also
-    consults ``session_ownership_probes.py::EventProbes.owner_ppid_verdict`` (a positively-identified owner is never
-    withheld) and ``_launch_window_withholding_expired``.
+    In that window the record has no ``claude_session_id`` discriminator, so an
+    event's provenance is unknown. A bound LAUNCHING record is not in the
+    window. This answers only the record-shape question; whether to withhold
+    is ``_withhold_from_launching``'s decision.
     """
     if prior is None or prior.status is not session_registry.Status.LAUNCHING:
         return False
@@ -1264,24 +879,11 @@ def _withhold_from_launching(
 ) -> bool:
     """Given a record in the unbound launch window, withhold this event?
 
-    False -- write normally -- in exactly two cases:
-
-    * ``CLAUDE_SPAWN_OWNER_PPID`` positively identifies this event as the
-      OWNER's (``session_ownership_probes.py::EventProbes.owner_ppid_verdict`` is True). Its own status and pending
-      question belong on this record whether or not its SessionStart has
-      landed yet, and withholding them was the regression this repairs.
-    * The record has been stuck in the window past
-      ``_LAUNCH_WINDOW_WITHHOLD_MAX_SECS`` -- i.e. the owner's SessionStart
-      is not merely slow, it is never coming -- or it carries no readable
-      ``start_ts`` at all, which cannot be shown to be inside the window and
-      so is treated the same way (see ``_launch_window_withholding_expired``).
-
-    Otherwise the event's provenance is genuinely unknowable and nothing it
-    carries may land on the spawn-created record.
-
-    *probes* shares the event's single ownership observation with the
-    adopt/fork decision, so the two can never disagree because the process
-    tree changed between two walks.
+    No when ``owner_ppid_verdict`` positively identifies the owner, or when the
+    window has expired (``_launch_window_withholding_expired``); otherwise the
+    event's provenance is unknowable, so yes. *probes* is the same observation
+    the adopt/fork decision used. See ``docs/session-hook-ownership.md``
+    §The launch window.
     """
     if probes.owner_ppid_verdict() is True:
         return False
@@ -1297,108 +899,40 @@ def _run_status_refresh_and_retitle(
     question: session_registry.Question | None = None,
     process_tree: ProcessTree | None,
 ) -> str:
-    """Shared refresh-then-retitle body for run_notification/run_stop.
+    """Shared refresh-then-retitle body for ``run_notification``/``run_stop``.
 
-    Resolves the record through the ownership check (task 4193), so a
-    nested ``claude`` that merely inherited ``CLAUDE_SPAWN_SESSION_ID``
-    refreshes its OWN record rather than flipping the spawning session's
-    status mid-turn.
+    Resolves the record through the ownership check, so a nested inheritor
+    refreshes its own record, not its spawner's. One read, one decision, one
+    write: the event reads its slug once (the probe's snapshot on the adopt
+    path), decides the launch-window withhold from that same snapshot, and
+    issues one ``write_record`` carrying status, question and binding.
 
-    ONE READ, ONE DECISION, ONE WRITE (task 4662). The event reads the slug
-    it writes exactly once -- on the adopt path that read is the ownership
-    probe's own, handed forward on ``_HookSlugResolution.snapshot`` -- and
-    issues exactly ONE ``write_record`` carrying status, question and
-    binding together. That last part used to be a claim the shape did not
-    deliver: the status came from ``refresh_record``'s write and the
-    question/binding from a conditional second one.
+    An event that ``_withhold_from_launching`` holds back from a record in the
+    unbound launch window writes only the mtime heartbeat: no status, question
+    or binding. Every lane, the UNREADABLE fault included, goes through the one
+    shared withhold/refresh/bind/question/write block; do not give a lane its
+    own copy. The pid pointer is stamped on every event. Returns the OSC
+    retitle for *status*.
 
-    ONE BLOCK, ALL LANES. Every lane -- adopt, fork, hand-launched, and the
-    UNREADABLE fault -- shares the single withhold / refresh / bind /
-    question / write block below. The unreadable case differs ONLY in where
-    its snapshot came from: it spends one extra ``read_record`` and then
-    falls through, exactly as ``run_session_start``'s unreadable arm does,
-    so the two handlers are structurally symmetric.
-
-    Do NOT re-fork that lane. A second copy of this policy is precisely how
-    the task-4193 withhold guard went missing: the fault lane reproduced
-    this block's WRITE policy (refresh, bind, stamp the question) while
-    silently omitting its DECISION policy, and a lane that writes without
-    evaluating ``_in_unbound_launch_window`` inverts ownership on a nested
-    ``claude``'s event. Measured before the lanes were merged, same scenario
-    both sides: the two-read shape withheld (``launching``, no question),
-    the duplicated lane did not (``awaiting-input``, the nested session's
-    prompt landed on the SPAWNING session's record). The pre-task-4662
-    shape was only accidentally robust here -- it made TWO independent
-    reads, so a transient fault on the probe's read left the second free to
-    succeed and the guard still ran.
-
-    It also closes a TOCTOU gap. The withhold decision used to be computed
-    from a snapshot taken BEFORE ``refresh_record``'s own internal re-read,
-    so the body written was not the body decided on and two racing events
-    could decide against stale state while writing against fresh state. Both
-    now derive from one snapshot.
-
-    NON-GOAL, deliberate: registry writes remain last-writer-wins.
-    ``session_registry.py::write_record`` is an atomic whole-body replace
-    with no compare-and-swap, so folding two writes into one strictly
-    NARROWS the clobber surface without eliminating it. A CAS/mtime protocol
-    would change the write contract for every registry caller
-    (spawn-claude.sh's launching/exit/refresh/set-display verbs, the reaper,
-    the cockpit) and belongs in its own change.
-
-    While the record is still LAUNCHING AND unbound, this event's provenance
-    is UNKNOWABLE (``_in_unbound_launch_window``), so NOTHING it carries is
-    allowed to land on the spawn-created record: not the binding, not the
-    status, not the pending question. Only the mtime heartbeat is bumped.
-    That record holds role/project/prompt/result_file and is the one
-    spawn-claude.sh's finish() writes ``exited`` to; letting a nested
-    inheritor rewrite it would invert ownership (the failure task 2511
-    fixed) or advertise a still-launching spawn as idle/awaiting-input in
-    the cockpit -- the very lie task 4193 exists to stop. Withholding costs
-    only a deferral: the owner's own SessionStart binds the record and every
-    later event writes normally.
-
-    TRADE-OFF (deliberate): if the owner's SessionStart never lands at all,
-    its own later Stop/Notification is withheld too, so the record stays
-    LAUNCHING until the reaper collects it. That is preferred over the
-    alternative of forking every pre-SessionStart event onto a new slug,
-    which would misroute the OWNER's session whenever its SessionStart is
-    merely slow -- trading a rare stale status for a routine wrong one.
-
-    The refresh path stamps the pid pointer too (``_stamp_session_pointer``),
-    so a session already running when the pointer shipped -- a long-lived
-    watcher -- is linked by its next Notification/Stop, not its next restart.
+    See ``docs/session-hook-ownership.md`` §One read, one decision, one write
+    and §The launch window.
     """
     probes = EventProbes(env, process_tree)
     resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
     slug, may_bind = resolution.slug, resolution.may_bind
-    # THE event's only read of the slug it writes: the ownership probe
-    # already read this record on the adopt path, so reuse its snapshot;
-    # every other path (fork, hand-launched) reads here for the first time.
+    # The event's only read of its slug: the probe's snapshot on the adopt
+    # path, a first read on every other.
     snapshot = resolution.snapshot or _read_record_snapshot(slug, root)
 
     prior = snapshot.record
     if prior is None and snapshot.unreadable:
-        # UNREADABLE, not ABSENT: a record EXISTS but could not be read, and
-        # deciding from NO observation is what silently disarmed the
-        # task-4193 launch-window withhold. Re-read, then fall through to the
-        # one shared block below. A transient fault on the probe's read must
-        # not cost this event its withhold decision; a genuinely corrupt body
-        # must still not be synthesized over, so CorruptSessionRecord/OSError
-        # propagates to main()'s blanket except exactly as refresh_record's
-        # contract requires. FileNotFoundError means the fault was transient
-        # over an absent record, which is ABSENT -- suppressed, and
-        # synthesized below.
+        # Unreadable, not absent: re-read, then fall through to the shared
+        # block so the withhold is still decided. A corrupt body propagates to
+        # main(); FileNotFoundError means absent.
         with contextlib.suppress(FileNotFoundError):
             prior = session_registry.read_record(slug, root=root)
-    # Decide the launch window BEFORE applying the status: the decision and
-    # the body written below both derive from THIS one snapshot, so they can
-    # never disagree. status=None makes the refresh a pure heartbeat bump,
-    # leaving the spawn-created record's status untouched.
-    # The `prior is not None` leg is redundant at runtime --
-    # _in_unbound_launch_window already answers False for None -- but it is
-    # what narrows the Optional for the type checker before
-    # _withhold_from_launching, which takes a record, not a maybe-record.
+    # Decided from the same snapshot as the body written; status=None makes
+    # the refresh a heartbeat-only bump. `prior is not None` narrows the type.
     in_launch_window = (
         prior is not None
         and _in_unbound_launch_window(prior)
@@ -1407,19 +941,13 @@ def _run_status_refresh_and_retitle(
     record = session_registry.apply_refresh(
         slug, prior, status=None if in_launch_window else status
     )
-    # Bind on the post-status-flip record and write after every mutation, so
-    # status, question and binding land in ONE body -- atomically in fact,
-    # not merely in intent. The guards are unchanged: a withheld event never
-    # binds, and an adopted-but-UNPROVEN one (may_bind False) never claims
-    # the record. Only the return value is now unused -- the single write
-    # below is unconditional, so nothing has to ask whether it bound.
+    # Status, question and binding land in one body. A withheld event never
+    # binds, nor does an adopted-but-unproven one (may_bind False).
     if not in_launch_window and may_bind:
         _bind_claude_session_id(record, hook_input, probes=probes)
     if question is not None and not in_launch_window:
         record.question = question
-    # Unconditional: apply_refresh no longer writes the mtime heartbeat
-    # itself, and that bump is owed on EVERY event, a withheld one included
-    # -- it is the whole point of withholding rather than skipping.
+    # Unconditional: the heartbeat is owed on every event, a withheld one too.
     session_registry.write_record(record, root=root)
     _stamp_session_pointer(record, probes, root)
     identity_env = _own_identity_env(env, resolution)
@@ -1524,8 +1052,7 @@ def _hooks_script_dir() -> Path:
     ``.worktrees/<id>/``). Otherwise the ephemeral worktree's path gets
     baked into the absolute hook commands written into
     ``~/.claude/settings.json``, and every hook breaks the moment that
-    worktree is reaped (observed live 2026-07-08: worktree 2288 was reaped
-    after authoring this trio, orphaning all three hook commands).
+    worktree is reaped.
 
     Runs ``git -C <this file's dir> rev-parse --path-format=absolute
     --git-common-dir``: the *common* git dir always points at the primary
