@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import textwrap
 from collections.abc import MutableMapping
 from pathlib import Path
@@ -19,6 +22,7 @@ from shared.defect_enumerator import (
     enumerate_source,
     enumerate_tree,
     is_test_file,
+    main,
 )
 from shared.defects import MalformedDefectRef, NodeId, mint_explore_ref
 
@@ -676,3 +680,86 @@ def test_an_unreadable_test_file_is_an_unreadable_file_gap_and_the_walk_continue
 def test_enumerate_tree_refuses_a_root_it_cannot_list(tmp_path):
     with pytest.raises(FileNotFoundError):
         enumerate_tree(tmp_path / 'missing', module_root_of=_dot_root)
+
+
+_SHARED_SRC = Path(__file__).resolve().parents[1] / 'src'
+
+_CLI_OK = f'''
+    import pytest
+
+    @pytest.mark.defect({REF_A!r})
+    def test_a():
+        pass
+
+    @pytest.mark.skip
+    @pytest.mark.defect({REF_B!r})
+    def test_b():
+        pass
+
+    @pytest.mark.parametrize('x', [pytest.param(1, marks=pytest.mark.defect({REF_A!r}))])
+    def test_p(x):
+        pass
+'''
+_CLI_OK_NON_STATIC_LINE = 12
+_CLI_BROKEN = 'import pytest\n\ndef test_a(:\n    pass\n'
+_CLI_BROKEN_LINE = 3
+
+
+def _cli_tree(root: Path, *, broken: bool) -> Path:
+    _write(root, 'pkg/tests/test_ok.py', _CLI_OK.removeprefix('\n'))
+    if broken:
+        _write(root, 'pkg/tests/test_broken.py', _CLI_BROKEN)
+    return root
+
+
+def _block_under(lines: list[str], header_prefix: str) -> list[str]:
+    start = next(index for index, line in enumerate(lines) if line.startswith(header_prefix))
+    block = []
+    for line in lines[start + 1:]:
+        if not line.startswith(' '):
+            break
+        block.append(line)
+    return block
+
+
+def test_the_cli_lists_each_file_its_carriers_and_non_static_marks(tmp_path, capsys):
+    rc = main([str(_cli_tree(tmp_path, broken=True))])
+    lines = capsys.readouterr().out.splitlines()
+    file_lines = [line for line in lines if line.startswith('pkg/')]
+    assert len(file_lines) == 2
+    assert 'pkg/tests/test_ok.py: complete' in file_lines
+    (broken_line,) = [line for line in file_lines if line.startswith('pkg/tests/test_broken.py: incomplete')]
+    assert 'syntax_error' in broken_line
+    assert str(_CLI_BROKEN_LINE) in broken_line
+    block = _block_under(lines, 'pkg/tests/test_ok.py:')
+    assert any(REF_A in line and './pkg/tests/test_ok.py::test_a' in line for line in block)
+    assert any(REF_B in line and './pkg/tests/test_ok.py::test_b' in line and 'skip' in line for line in block)
+    assert any(
+        REF_A in line and 'not static' in line and str(_CLI_OK_NON_STATIC_LINE) in line for line in block
+    )
+    assert '2 files' in lines[-1]
+    assert '1 incomplete' in lines[-1]
+    assert rc == 1
+
+
+def test_the_cli_exits_zero_when_every_file_is_complete(tmp_path, capsys):
+    assert main([str(_cli_tree(tmp_path, broken=False))]) == 0
+
+
+def test_the_cli_refuses_a_tree_that_is_not_a_directory(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main([str(tmp_path / 'missing')])
+    assert excinfo.value.code == 2
+
+
+def test_the_cli_runs_as_python_dash_m(tmp_path):
+    tree = _cli_tree(tmp_path, broken=False)
+    result = subprocess.run(
+        [sys.executable, '-m', 'shared.defect_enumerator', str(tree)],
+        env={**os.environ, 'PYTHONPATH': str(_SHARED_SRC)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert REF_A in result.stdout
