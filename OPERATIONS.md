@@ -1084,10 +1084,8 @@ default 900s). It has no config knob of its own.
 these owners:
 
 - a train the merge worker still holds lists it;
-- a live single merge request was submitted under its id: any request
-  `get_merge_queue` lists (queued, merging, awaiting_verify, verifying,
-  gate_reverify, finalizing), from the `merge_request` call until it
-  resolves (task 7022);
+- a live `merge_request` or workflow submit under the member's own task id
+  holds it, from the submit until the request resolves (task 7022);
 - a live workflow holds it;
 - a live claimant holds it (`claimant_run_id` with a heartbeat inside
   `claimant_liveness_ttl_secs`);

@@ -442,7 +442,7 @@ class InFlightMergeRegistry:
         return branch in self._slots
 
     def task_ids_in_flight(self) -> frozenset[str]:
-        """The task id each in-flight slot was submitted under."""
+        """Each branch slot's first submitter's task id; a later id on a branch is not listed."""
         return frozenset(entry.task_id for entry in self._slots.values())
 
     def entry(self, branch: str) -> _InFlightEntry | None:

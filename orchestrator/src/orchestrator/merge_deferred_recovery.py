@@ -3,7 +3,8 @@
 A member parks merge-deferred to wait for a train.  It stays owned while a
 train the merge lane holds lists it, a live single merge request was submitted
 under its id (task 7022), a live workflow holds it, a live claimant or a
-pinning escalation holds it, or a peer of its declared train is still active.  A member with none of these owners is abandoned.  The operator's view
+pinning escalation holds it, or a peer of its declared train is still active.
+A member with none of these owners is abandoned.  The operator's view
 of the sweep, including how to hold a member by hand, is OPERATIONS.md
 § "Abandoned merge-deferred members (task 4737)".
 """
