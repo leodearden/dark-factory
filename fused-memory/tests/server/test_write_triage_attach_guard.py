@@ -12,10 +12,11 @@ main checkout (``data/write-triage-soak-2026-10-19/``).
 from __future__ import annotations
 
 import itertools
+import logging
 import types
 from enum import StrEnum
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 import yaml
@@ -26,22 +27,30 @@ from fused_memory.config.reload import RELOADABLE_FIELDS, apply_reload
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageConfig
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server import write_triage
+from fused_memory.server import tools, write_triage
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY, SIGHTING_KIND
+from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
+    CANONICAL_ID_KEY,
     OUTCOME_AMENDED,
+    OUTCOME_CONTESTED,
     OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
+    ROUTED_KEY,
     AttachGuard,
     AttachRefusal,
     BandDecision,
+    TriageFailOpenCounter,
+    TriageJudgeVerdict,
     decide_band,
     resolve_attach_guard,
     resolve_hoist_max_cosine_gap,
     resolve_min_parent_cosine,
+    triage_write,
 )
-from fused_memory.services.memory_service import RRF_K
+from fused_memory.services.memory_service import RRF_K, SearchResults
+from server.write_triage_harness import configure_triage_config, search_candidate
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _SHIPPED_CONFIG = _PACKAGE_ROOT / 'config' / 'config.yaml'
@@ -50,6 +59,9 @@ _CALIBRATION_SCRIPT = _PACKAGE_ROOT / 'scripts' / 'calibrate_write_triage.py'
 _GUARD_KNOBS = ('min_parent_cosine', 'hoist_max_cosine_gap')
 
 _PARENT = 'parent-P'
+_WRITE = 'the write under test'
+_PROJECT = 'proj-7158'
+_TRIAGE_LOGGER = 'fused_memory.server.write_triage'
 _EVERY_BAND_AND_HOIST = list(itertools.product([True, False], repeat=2))
 
 
@@ -79,6 +91,70 @@ def _result(id_: str, cosine: float, *, extra_metadata: dict | None = None) -> M
 
 def _child_of(parent_id: str, kind: str = SIGHTING_KIND) -> dict:
     return {'kind': kind, PARENT_ID_KEY: parent_id}
+
+
+def _child(id_: str, cosine: float, *, kind: str = SIGHTING_KIND) -> MemoryResult:
+    return _result(id_, cosine, extra_metadata=_child_of(_PARENT, kind))
+
+
+def _svc(
+    results: list[MemoryResult],
+    *,
+    min_parent_cosine: float | None = 0.60,
+    hoist_max_cosine_gap: float | None = 0.05,
+    t_high: float = 0.90,
+    t_low: float = 0.50,
+    parent_cosines: dict[str, float] | None = None,
+) -> types.SimpleNamespace:
+    """A memory service whose search returns *results* and whose by-id lookup returns *parent_cosines*."""
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            write_triage=types.SimpleNamespace(
+                enabled=True,
+                candidate_k=20,
+                t_high=t_high,
+                t_low=t_low,
+                min_parent_cosine=min_parent_cosine,
+                hoist_max_cosine_gap=hoist_max_cosine_gap,
+            ),
+        ),
+        search=AsyncMock(return_value=SearchResults(results)),
+        cosine_to_memories=AsyncMock(return_value=parent_cosines or {}),
+    )
+
+
+def _counter() -> TriageFailOpenCounter:
+    return TriageFailOpenCounter(time_provider=lambda: 1000.0)
+
+
+def _judge(outcome: str, candidate_id: str | None = None) -> AsyncMock:
+    return AsyncMock(return_value=TriageJudgeVerdict(outcome, candidate_id))
+
+
+async def _triage(service, counter=None, judge=None) -> BandDecision:
+    return await triage_write(
+        service,
+        content=_WRITE,
+        project_id=_PROJECT,
+        counter=counter or _counter(),
+        judge=judge or _judge(OUTCOME_STORED),
+    )
+
+
+def _refusal_lines(caplog) -> list[logging.LogRecord]:
+    return [
+        record for record in caplog.records
+        if record.name == _TRIAGE_LOGGER
+        and record.getMessage().startswith('write_triage attach refused')
+    ]
+
+
+def _fail_open_lines(caplog) -> list[logging.LogRecord]:
+    return [
+        record for record in caplog.records
+        if record.name == _TRIAGE_LOGGER
+        and record.getMessage().startswith('write_triage fail-open')
+    ]
 
 
 class TestTheGuardKnobs:
@@ -338,3 +414,197 @@ class TestTheDecisionNamesItsSource:
         decision = BandDecision(OUTCOME_STORED, None, None, 0.9, 0.5)
 
         assert decision.attach_refusals == frozenset()
+
+
+class TestTheHoistGuardInTheJudgeBand:
+    @pytest.mark.asyncio
+    async def test_a_parent_far_below_the_named_child_is_refused(self):
+        service = _svc([_child('c', 0.80), _result(_PARENT, 0.70)])
+        counter = _counter()
+
+        decision = await _triage(service, counter, _judge(OUTCOME_AMENDED, 'c'))
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_STORED, None)
+        assert decision.attach_refusals == {AttachRefusal.HOIST_COSINE_GAP}
+        assert counter.live_count() == 0
+        service.cosine_to_memories.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_parent_within_the_gap_is_attached(self):
+        service = _svc([_child('c', 0.80), _result(_PARENT, 0.78)])
+
+        decision = await _triage(service, judge=_judge(OUTCOME_AMENDED, 'c'))
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_AMENDED, _PARENT)
+        assert decision.attach_refusals == frozenset()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('parent_cosine', 'outcome', 'canonical_id', 'refusals'),
+        [
+            (0.70, OUTCOME_STORED, None, {AttachRefusal.HOIST_COSINE_GAP}),
+            (0.79, OUTCOME_AMENDED, _PARENT, frozenset()),
+        ],
+    )
+    async def test_an_unretrieved_parent_is_scored_by_one_lookup(
+        self, parent_cosine, outcome, canonical_id, refusals,
+    ):
+        service = _svc([_child('c', 0.80)], parent_cosines={_PARENT: parent_cosine})
+
+        decision = await _triage(service, judge=_judge(OUTCOME_AMENDED, 'c'))
+
+        service.cosine_to_memories.assert_awaited_once_with(
+            query=_WRITE, memory_ids=[_PARENT], project_id=_PROJECT,
+        )
+        assert (decision.outcome, decision.canonical_id) == (outcome, canonical_id)
+        assert decision.attach_refusals == refusals
+
+    @pytest.mark.asyncio
+    async def test_a_bare_word_verdict_measures_the_gap_from_the_band_winner(self):
+        service = _svc([_child('c', 0.80), _result(_PARENT, 0.70)])
+
+        decision = await _triage(service, judge=AsyncMock(return_value=OUTCOME_AMENDED))
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_STORED, None)
+        assert decision.attach_refusals == {AttachRefusal.HOIST_COSINE_GAP}
+
+    @pytest.mark.asyncio
+    async def test_a_named_record_that_is_not_a_child_needs_no_lookup(self):
+        service = _svc([_result('w', 0.80), _result('x', 0.65)])
+
+        decision = await _triage(service, judge=_judge(OUTCOME_CONTESTED, 'x'))
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_CONTESTED, 'x')
+        service.cosine_to_memories.assert_not_awaited()
+
+
+class TestTheFloorOnEveryAttach:
+    @pytest.mark.asyncio
+    async def test_a_restated_parent_below_the_floor_is_refused(self):
+        service = _svc([_child('c', 0.95), _result(_PARENT, 0.55)])
+        judge = _judge(OUTCOME_AMENDED, 'c')
+
+        decision = await _triage(service, judge=judge)
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_STORED, None)
+        assert decision.attach_refusals == {AttachRefusal.BELOW_MIN_PARENT_COSINE}
+        judge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_gap_does_not_apply_to_a_restated_hoist(self):
+        service = _svc([_child('c', 0.95), _result(_PARENT, 0.70)])
+
+        decision = await _triage(service)
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_RESTATED, _PARENT)
+        assert decision.attach_refusals == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_a_judged_record_below_the_floor_is_refused(self):
+        service = _svc([_result('w', 0.55)])
+
+        decision = await _triage(service, judge=_judge(OUTCOME_AMENDED, 'w'))
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_STORED, None)
+        assert decision.attach_refusals == {AttachRefusal.BELOW_MIN_PARENT_COSINE}
+
+    @pytest.mark.asyncio
+    async def test_a_hoist_tripping_both_rules_records_both(self):
+        service = _svc([_child('c', 0.80), _result(_PARENT, 0.55)])
+
+        decision = await _triage(service, judge=_judge(OUTCOME_AMENDED, 'c'))
+
+        assert decision.attach_refusals == {
+            AttachRefusal.BELOW_MIN_PARENT_COSINE, AttachRefusal.HOIST_COSINE_GAP,
+        }
+
+
+class TestRefusalsArePlainStoredNotFailOpens:
+    @pytest.mark.asyncio
+    async def test_a_parent_missing_from_the_store_is_refused_uncounted(self):
+        service = _svc([_child('c', 0.95)], parent_cosines={})
+        counter = _counter()
+
+        decision = await _triage(service, counter)
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_STORED, None)
+        assert decision.attach_refusals == {AttachRefusal.TARGET_COSINE_UNAVAILABLE}
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_one_info_line_and_no_fail_open_line(self, caplog):
+        service = _svc([_child('c', 0.80), _result(_PARENT, 0.55)])
+        caplog.set_level(logging.INFO, logger=_TRIAGE_LOGGER)
+
+        await _triage(service, judge=_judge(OUTCOME_AMENDED, 'c'))
+
+        [line] = _refusal_lines(caplog)
+        assert line.levelno == logging.INFO
+        message = line.getMessage()
+        for fragment in (
+            AttachRefusal.BELOW_MIN_PARENT_COSINE.value,
+            AttachRefusal.HOIST_COSINE_GAP.value,
+            _PARENT,
+            '0.55',
+            '0.8',
+        ):
+            assert fragment in message, (fragment, message)
+        assert _fail_open_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_that_raises_is_a_counted_fail_open(self, caplog):
+        service = _svc([_child('c', 0.95)])
+        service.cosine_to_memories.side_effect = TimeoutError('Mem0 cosine_to_points blew 5s')
+        counter = _counter()
+        caplog.set_level(logging.INFO, logger=_TRIAGE_LOGGER)
+
+        decision = await _triage(service, counter)
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_STORED, None)
+        assert decision.attach_refusals == frozenset()
+        assert counter.live_count() == 1
+        [line] = _fail_open_lines(caplog)
+        assert line.levelno == logging.WARNING
+        assert 'stage=attach_guard' in line.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_with_both_rules_off_a_hoist_attaches_as_before(self):
+        service = _svc([_child('c', 0.95)], min_parent_cosine=None, hoist_max_cosine_gap=None)
+
+        decision = await _triage(service)
+
+        assert (decision.outcome, decision.canonical_id) == (OUTCOME_RESTATED, _PARENT)
+        service.cosine_to_memories.assert_not_awaited()
+
+
+class TestTheToolAcksARefusalAsStored:
+    @pytest.mark.asyncio
+    async def test_a_refused_restatement_is_acked_and_persisted_as_a_plain_store(self, monkeypatch):
+        counter = TriageFailOpenCounter(time_provider=lambda: 1000.0)
+        monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
+        mock_service = AsyncMock()
+        configure_triage_config(mock_service, min_parent_cosine=0.60, hoist_max_cosine_gap=0.05)
+        stored = MagicMock()
+        stored.model_dump.return_value = {
+            'id': 'new-id', 'category': 'procedural_knowledge', 'stored_in': ['mem0'],
+        }
+        mock_service.add_memory.return_value = stored
+        mock_service.search.return_value = [
+            search_candidate('m1', 0.55, store_rank=2),
+            search_candidate('m2', 0.97, extra_metadata={PARENT_ID_KEY: 'm1', 'kind': SIGHTING_KIND}),
+        ]
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool('add_memory', {
+            'content': _WRITE,
+            'category': 'procedural_knowledge',
+            'agent_id': 'claude-interactive',
+            'project_id': _PROJECT,
+        })
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, result
+        assert CANONICAL_ID_KEY not in result, result
+        assert mock_service.add_memory.await_count == 1
+        metadata = mock_service.add_memory.await_args.kwargs.get('metadata') or {}
+        assert PARENT_ID_KEY not in metadata and 'kind' not in metadata, metadata
+        assert counter.live_count() == 0
