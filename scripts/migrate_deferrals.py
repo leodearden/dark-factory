@@ -6,20 +6,39 @@ Run it as ``uv run --project shared python scripts/migrate_deferrals.py``.
 
 from __future__ import annotations
 
+import argparse
 import json
-from collections.abc import Callable, Mapping
+import sys
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
-from enum import StrEnum
-from typing import Any, Final, NamedTuple
+from datetime import UTC, datetime
+from enum import IntEnum, StrEnum
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Final, NamedTuple, TextIO
 
-from deferral_store import TaskRow
+import deferral_store
+import orchestrator_projects
+from deferral_store import (
+    Changed,
+    DeferralStore,
+    Refused,
+    Stamped,
+    StoreUnreachable,
+    TaskRow,
+    Unechoed,
+)
+from orchestrator_projects import ProjectTarget
+from shared.project_layout import tasks_db
 from shared.task_deferral import (
     REASON_MAX_CHARS,
     CarriedByDeferral,
+    CarriedByRequest,
     DeferralInvalid,
     DeferralInvalidReason,
     DeferralKind,
+    DeferralRefusalCode,
     InvalidRecord,
     LegacyUnknownRequest,
     NeedsHumanReason,
@@ -31,6 +50,9 @@ from shared.task_statuses import TaskStatus
 
 MIGRATION_AGENT_ID: Final = 'migrate-deferrals'
 HUMAN_DECOMPOSED_NOTE: Final = 'human_decomposed: possibly an uncommitted planning birth'
+ALREADY_RECORDED: Final = 'already recorded'
+_VALUE_HEAD_CHARS: Final = 60
+_TOOL: Final = 'migrate_deferrals.py'
 
 
 class Source(StrEnum):
@@ -88,6 +110,7 @@ class RowPlan:
     source: Source | None
     request: dict[str, Any]
     fallback: Fallback | None
+    mapped_kind: DeferralKind = DeferralKind.LEGACY_UNKNOWN
     source_value: object = None
     human_decomposed: bool = False
 
@@ -132,6 +155,7 @@ def _mapped_plan(row: TaskRow, source: Source, mapped: _Mapped, human_decomposed
         source=source,
         request={**mapped.raw, 'reason': f'migrated from metadata.{source}'},
         fallback=None,
+        mapped_kind=mapped.raw['kind'],
         source_value=mapped.value,
         human_decomposed=human_decomposed,
     )
@@ -169,3 +193,214 @@ def carrier_reason(plan: RowPlan, carrier_statuses: Mapping[int, TaskStatus], *,
     if not isinstance(record, CarriedByDeferral):
         return None
     return needs_human(record, now, carrier_statuses.get(record.carrier_task_id), None)
+
+
+class MigrationExit(IntEnum):
+    OK = 0
+    FAILED = 1
+    PREDATES_GATE = 2
+
+
+class PredatesGate(Exception):
+    """A write succeeded without echoing its record, so the server predates the deferral gate."""
+
+    def __init__(self, root: Path, task_id: int) -> None:
+        super().__init__(f'{root} task {task_id}')
+        self.root = root
+        self.task_id = task_id
+
+
+class Outcome(StrEnum):
+    STAMPED = 'stamped'
+    MOVED = 'moved since read'
+    FAILED = 'failed'
+
+
+@dataclass(frozen=True)
+class RowOutcome:
+    """What one row's write did; *plan* is the plan last written, a fallback when it fell back."""
+
+    plan: RowPlan
+    outcome: Outcome
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectReport:
+    target: ProjectTarget
+    applied: bool
+    plans: tuple[RowPlan, ...]
+    recorded: tuple[AlreadyRecorded, ...]
+    carrier_reasons: Mapping[int, NeedsHumanReason]
+    outcomes: tuple[RowOutcome, ...]
+
+    @property
+    def failed(self) -> bool:
+        return any(outcome.outcome is Outcome.FAILED for outcome in self.outcomes)
+
+
+@dataclass(frozen=True)
+class UnreadableProject:
+    target: ProjectTarget
+    reason: str
+    unknown: bool = False
+
+
+def _carrier_ids(plans: Iterable[RowPlan], now: datetime) -> set[int]:
+    requests = (parse_request(plan.request, now=now) for plan in plans)
+    return {request.carrier_task_id for request in requests if isinstance(request, CarriedByRequest)}
+
+
+def _refused_text(refused: Refused) -> str:
+    parts = [refused.code, refused.reason_code, None if refused.field is None else f'{refused.field}={refused.value!r}']
+    return _truncated(' '.join(part for part in parts if part), REASON_MAX_CHARS)
+
+
+def _falls_back(plan: RowPlan, refused: Refused) -> bool:
+    """A mapped request refused deferral_invalid falls back once; a legacy_unknown request never does."""
+    return plan.source is not None and plan.fallback is None and refused.code == DeferralRefusalCode.INVALID
+
+
+def _written(store: DeferralStore, target: ProjectTarget, plan: RowPlan) -> RowOutcome:
+    match store.restamp(target.root, plan.task_id, plan.request, agent_id=MIGRATION_AGENT_ID):
+        case Stamped():
+            return RowOutcome(plan, Outcome.STAMPED)
+        case Changed(current_status=status):
+            return RowOutcome(plan, Outcome.MOVED, f'now {status}')
+        case Unechoed():
+            raise PredatesGate(target.root, plan.task_id)
+        case Refused(reason_code=DeferralInvalidReason() as reason_code) as refused if _falls_back(plan, refused):
+            return _written(store, target, fallback_plan(plan, reason_code))
+        case Refused() as refused:
+            return RowOutcome(plan, Outcome.FAILED, _refused_text(refused))
+
+
+def _apply(store: DeferralStore, target: ProjectTarget, plan: RowPlan) -> RowOutcome:
+    try:
+        return _written(store, target, plan)
+    except StoreUnreachable as exc:
+        return RowOutcome(plan, Outcome.FAILED, str(exc))
+
+
+def migrate_project(
+    store: DeferralStore, target: ProjectTarget, *, now: datetime, apply: bool
+) -> ProjectReport | UnreadableProject:
+    """Plan every deferred row of *target*; under *apply*, re-stamp each planned row in task-id order."""
+    if not deferral_store.known_project(target.root):
+        return UnreadableProject(target, f'no task store at {tasks_db(target.root)}', unknown=True)
+    try:
+        rows = sorted(store.deferred_rows(target.root), key=lambda row: row.task_id)
+        planned = [plan_row(row, now=now) for row in rows]
+        plans = tuple(plan for plan in planned if isinstance(plan, RowPlan))
+        carrier_statuses = store.statuses(target.root, _carrier_ids(plans, now))
+    except StoreUnreachable as exc:
+        return UnreadableProject(target, str(exc))
+    reasons = {plan.task_id: carrier_reason(plan, carrier_statuses, now=now) for plan in plans}
+    return ProjectReport(
+        target=target,
+        applied=apply,
+        plans=plans,
+        recorded=tuple(plan for plan in planned if isinstance(plan, AlreadyRecorded)),
+        carrier_reasons=MappingProxyType({task_id: reason for task_id, reason in reasons.items() if reason}),
+        outcomes=tuple(_apply(store, target, plan) for plan in plans) if apply else (),
+    )
+
+
+def _ids(task_ids: Iterable[int]) -> str:
+    return ', '.join(str(task_id) for task_id in sorted(task_ids))
+
+
+def _class_lines(report: ProjectReport) -> list[str]:
+    classes: dict[str, list[int]] = {}
+    for plan in report.plans:
+        classes.setdefault(plan.mapped_kind.value, []).append(plan.task_id)
+    if report.recorded:
+        classes[ALREADY_RECORDED] = [recorded.task_id for recorded in report.recorded]
+    labels = (*(kind.value for kind in DeferralKind), ALREADY_RECORDED)
+    return [f'{label} ({len(classes[label])}): {_ids(classes[label])}' for label in labels if label in classes]
+
+
+def _carrier_lines(report: ProjectReport) -> list[str]:
+    lines = []
+    for reason in NeedsHumanReason:
+        ids = [task_id for task_id, found in report.carrier_reasons.items() if found is reason]
+        lines += [f'{reason.value} carried_by: {_ids(ids)}'] if ids else []
+    return lines
+
+
+def _fallback_line(plan: RowPlan, fallback: Fallback) -> str:
+    value = _truncated(json.dumps(fallback.value), _VALUE_HEAD_CHARS)
+    return f'fallback #{plan.task_id} {fallback.source}={value} {fallback.reason_code} → {DeferralKind.LEGACY_UNKNOWN}'
+
+
+def _outcome_lines(report: ProjectReport) -> list[str]:
+    if not report.applied:
+        fallbacks = [_fallback_line(plan, plan.fallback) for plan in report.plans if plan.fallback]
+        return [f'would stamp: {len(report.plans)}', *fallbacks, 'dry-run: nothing written']
+    counts = Counter(outcome.outcome for outcome in report.outcomes)
+    return [
+        *(f'{outcome.value}: {counts[outcome]}' for outcome in Outcome),
+        *(_fallback_line(row.plan, row.plan.fallback) for row in report.outcomes if row.plan.fallback),
+        *(f'moved since read #{row.plan.task_id} ({row.detail})' for row in report.outcomes if row.outcome is Outcome.MOVED),
+        *(f'FAILED #{row.plan.task_id}: {row.detail}' for row in report.outcomes if row.outcome is Outcome.FAILED),
+    ]
+
+
+def _body(result: ProjectReport | UnreadableProject) -> list[str]:
+    if isinstance(result, ProjectReport):
+        return [*_class_lines(result), *_carrier_lines(result), *_outcome_lines(result)]
+    return [f'{"UNKNOWN PROJECT" if result.unknown else "UNREADABLE"}: {result.reason}']
+
+
+def render(results: Iterable[ProjectReport | UnreadableProject], *, out: TextIO) -> None:
+    for result in results:
+        print(f'{result.target.root} — {result.target.sweep_label}', file=out)
+        for line in _body(result):
+            print(f'  {line}', file=out)
+
+
+def exit_code(results: Sequence[ProjectReport | UnreadableProject]) -> MigrationExit:
+    failed = any(isinstance(result, UnreadableProject) or result.failed for result in results)
+    return MigrationExit.FAILED if failed else MigrationExit.OK
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Re-stamp every unrecorded deferred task with the deferral its legacy metadata names.',
+        epilog=(
+            'Exit 0: every project was read and every write landed or moved since read. Exit 1: a project '
+            'could not be read or a write failed. Exit 2: the server predates the deferral gate; the run '
+            'stopped before its next write.'
+        ),
+    )
+    orchestrator_projects.add_arguments(parser)
+    deferral_store.add_store_argument(parser)
+    parser.add_argument('--apply', action='store_true', help='write the re-stamps (default: a dry-run that writes nothing)')
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    targets, scan = orchestrator_projects.targets_from_args(args)
+    for problem in scan.problems:
+        print(f'{_TOOL}: {problem}', file=sys.stderr)
+    if not targets:
+        print(f'{_TOOL}: no project to migrate: no --project-root, and no unit under {args.units_dir} names one', file=sys.stderr)
+        return MigrationExit.FAILED
+    store = deferral_store.store_from_args(args)
+    now = datetime.now(UTC)
+    try:
+        results = [migrate_project(store, target, now=now, apply=args.apply) for target in targets]
+    except PredatesGate as exc:
+        print(
+            f'{_TOOL}: server predates the deferral gate: the write to {exc.root} task {exc.task_id} succeeded '
+            'without echoing its record; stopped before any further write',
+            file=sys.stderr,
+        )
+        return MigrationExit.PREDATES_GATE
+    render(results, out=sys.stdout)
+    return exit_code(results)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
