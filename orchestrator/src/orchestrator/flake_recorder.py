@@ -1,4 +1,4 @@
-"""Dispatcher-side RECORDER for merge-gate flake observations (PRD task ε).
+"""One recorder for every flake call site (PRD task ε; offline-lane PRD D6).
 
 `plans/flake-ledger-prd.md` §5.8 — the topology rule this module exists
 to encode:
@@ -29,6 +29,11 @@ an item on the ledger's due list in the same transaction as its occurrence row
 files the owner afterwards (PRD §5.9) and raises any ``regressed_after_resolution``
 escalation, so no network call is left on the observation path.
 
+Since ε1 (task 6864) :func:`record_call_site_observations` is the one body every call
+site records through, and :data:`_CALL_SITE_EFFECTS` says what each call site's
+observations do beyond the rows and the due items.  The merge-gate entry unwraps its
+``VerifyResult`` and delegates.
+
 Import discipline: this module imports ``flake_ledger`` (which depends on ``shared``
 alone) at runtime and NOTHING else from ``orchestrator``.
 ``VerifyResult`` is a ``TYPE_CHECKING``-only annotation and ``EventType`` /
@@ -40,16 +45,21 @@ import cycle with either.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from escalation.categories import EscalationCategory
 
 from orchestrator.flake_ledger import (
+    DebtContext,
     DueItem,
+    FlakeCallSite,
+    FlakeSuppression,
     FlakeVerdict,
+    debt_context_to_json,
     enqueue_debt,
     ledger_db_path,
     named_tests,
@@ -60,6 +70,34 @@ if TYPE_CHECKING:
     from orchestrator.verify import VerifyResult
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CallSiteEffects:
+    """What one call site's observations do beyond the ledger rows and the due items.
+
+    *live_signals*: a suppression emits ``merge_flake_suppressed`` and bumps the INV-4
+    storm streak.  The merge gate's alone: the offline lane gates no merge, so a lane
+    clear masks nothing (offline-lane PRD D6, call 1).
+    """
+
+    live_signals: bool
+
+
+_CALL_SITE_EFFECTS: Final[Mapping[FlakeCallSite, CallSiteEffects]] = {
+    FlakeCallSite.merge_gate: CallSiteEffects(live_signals=True),
+    FlakeCallSite.offline_lane: CallSiteEffects(live_signals=False),
+}
+_NO_ROW: Final = CallSiteEffects(live_signals=False)
+
+
+def call_site_effects(call_site: str) -> CallSiteEffects:
+    """*call_site*'s row of the table; the neutral row for a member with none or an
+    off-vocabulary spelling (the ``verify.py::_CALL_SITE_POLICY`` idiom)."""
+    try:
+        return _CALL_SITE_EFFECTS.get(FlakeCallSite(call_site), _NO_ROW)
+    except ValueError:
+        return _NO_ROW
 
 
 def _emit_merge_flake_suppressed(
@@ -206,6 +244,222 @@ def _bump_suppression_streak_and_maybe_escalate(
     escalation_queue.submit(esc)
 
 
+@dataclass(frozen=True)
+class _Guard:
+    """Runs one side-effect under its OWN catch-all, so a failure costs exactly that
+    signal, and names the observation in the one line that reports the loss."""
+
+    call_site: str
+    head_sha: str
+    observing_task_id: str | None
+
+    def __call__(self, what: str, fn: Callable[[], object]) -> None:
+        try:
+            fn()
+        except Exception:
+            self.lost(what)
+
+    def lost(self, what: str) -> None:
+        """The one place a lost signal is reported; call it from an ``except`` block."""
+        logger.warning(
+            'flake_recorder: failed to record a flake observation [%s] (call_site=%s, '
+            'head_sha=%s, task_id=%s); the merge/verify is unaffected',
+            what,
+            self.call_site,
+            self.head_sha,
+            self.observing_task_id,
+            exc_info=True,
+        )
+
+
+@dataclass(frozen=True)
+class _DueItems:
+    """The due items one call owes: those riding each suppression's own write, in
+    suppression order, and those of eligible tests no suppression names."""
+
+    per_suppression: tuple[tuple[DueItem, ...], ...]
+    unnamed: tuple[DueItem, ...]
+
+    @classmethod
+    def none(cls, suppressions: int) -> _DueItems:
+        return cls(per_suppression=((),) * suppressions, unnamed=())
+
+
+def _context_text(test_id: str, ctx: DebtContext | None) -> str:
+    """*ctx* as due-list text; ``'{}'`` (logged) for one that will not encode: the owner
+    is still owed, only its wording is lost."""
+    if ctx is None:
+        return '{}'
+    try:
+        return debt_context_to_json(ctx)
+    except Exception:
+        logger.warning(
+            'flake_recorder: could not encode the debt context for %s; enqueuing it '
+            'without one',
+            test_id,
+            exc_info=True,
+        )
+        return '{}'
+
+
+def _due_items(
+    suppressions: Sequence[FlakeSuppression],
+    debt_eligible: Mapping[str, DebtContext | None],
+    *,
+    call_site: FlakeCallSite,
+    head: str | None,
+    observed_at: str | None,
+    observing_task_id: str | None,
+) -> _DueItems:
+    """One item per debt-eligible test.  A test a suppression names takes that
+    suppression's instant and call site, so its key is its row's; an unnamed one takes
+    the call's, and is skipped (logged) when the call has no instant."""
+    named = [named_tests(s) for s in suppressions]
+    per_suppression: list[list[DueItem]] = [[] for _ in suppressions]
+    unnamed: list[DueItem] = []
+    for test_id, ctx in debt_eligible.items():
+        context = _context_text(test_id, ctx)
+        index = next((i for i, tests in enumerate(named) if test_id in tests), None)
+        if index is not None:
+            s = suppressions[index]
+            per_suppression[index].append(
+                DueItem(test_id, s.observed_at, s.call_site, head, observing_task_id, context),
+            )
+        elif observed_at is None:
+            logger.warning(
+                'flake_recorder: %s is debt-eligible at call_site=%s but no suppression names '
+                'it and the call has no observed_at; skipping it rather than stamping the '
+                'wall clock',
+                test_id,
+                call_site,
+            )
+        else:
+            unnamed.append(
+                DueItem(test_id, observed_at, call_site, head, observing_task_id, context),
+            )
+    return _DueItems(tuple(tuple(items) for items in per_suppression), tuple(unnamed))
+
+
+def _write_ledger(
+    db_path: Path,
+    project_id: str,
+    suppressions: Sequence[FlakeSuppression],
+    due: _DueItems,
+    *,
+    head: str | None,
+    observing_task_id: str | None,
+    guard: _Guard,
+) -> None:
+    """Each suppression's rows with its own items, in one transaction and under one guard
+    each; then the unnamed items."""
+    for s, items in zip(suppressions, due.per_suppression, strict=True):
+        guard(
+            'ledger',
+            lambda s=s, items=items: enqueue_debt(
+                db_path, project_id, items,
+                occurrence=s, merge_sha=head, task_id=observing_task_id,
+            ),
+        )
+    if due.unnamed:
+        guard('ledger', lambda: enqueue_debt(db_path, project_id, due.unnamed))
+
+
+def _is_suppression(s: FlakeSuppression, guard: _Guard) -> bool:
+    """Whether *s* is ``passes_in_isolation``, by ``==``; ``False`` (logged) for a verdict
+    that cannot be read, since a bogus live signal is worse than a missing one."""
+    try:
+        return s.verdict == FlakeVerdict.passes_in_isolation
+    except Exception:
+        guard.lost('verdict')
+        return False
+
+
+def _fire_live_signals(
+    suppressions: Sequence[FlakeSuppression],
+    *,
+    head_sha: str,
+    observing_task_id: str | None,
+    event_store: EventStore | None,
+    escalation_queue: Any,
+    guard: _Guard,
+) -> None:
+    """The ``merge_flake_suppressed`` fact and the storm-streak bump, per suppression."""
+    for s in suppressions:
+        if not _is_suppression(s, guard):
+            continue
+        guard(
+            'event',
+            lambda s=s: _emit_merge_flake_suppressed(
+                event_store, observing_task_id, head_sha, list(s.test_ids),
+            ),
+        )
+        # Its OWN guard, after the emit: the storm detector must survive a broken event
+        # store rather than being taken down with it.
+        guard(
+            'streak',
+            lambda: _bump_suppression_streak_and_maybe_escalate(
+                escalation_queue, observing_task_id, head_sha,
+            ),
+        )
+
+
+async def record_call_site_observations(
+    suppressions: Sequence[FlakeSuppression],
+    *,
+    call_site: FlakeCallSite,
+    project_root: Path,
+    project_id: str,
+    head_sha: str,
+    observed_at: str | None = None,
+    observing_task_id: str | None = None,
+    debt_eligible: Mapping[str, DebtContext | None],
+    event_store: EventStore | None = None,
+    escalation_queue: Any = None,
+) -> None:
+    """Record what one call site observed at *head_sha* (offline-lane PRD §5.8).
+
+    Every suppression's ``flake_occurrence`` rows are written, whatever its verdict
+    (§5.5: the observation, not the remedy).  Every test in *debt_eligible* gets one item
+    on the ledger's due list carrying its context, in the same transaction as the rows
+    of the suppression that names it; which tests are eligible is the caller's call,
+    never derived from a verdict here.  Then, for a call site whose row in
+    :data:`_CALL_SITE_EFFECTS` has live signals, each ``passes_in_isolation`` suppression
+    emits its fact and bumps the storm streak.
+
+    ORDER IS THE CONTRACT: the durable rows and items first, the in-process signals
+    second, so a crash mid-call loses the recoverable half.  ``==``, never ``is``, on the
+    verdict, which may be a wire-rebuilt string.  Each effect has its own guard, so one
+    failure costs that signal alone, and the function NEVER RAISES (B12): a lost
+    measurement must not fail a verify or stall the merge queue.
+    """
+    guard = _Guard(call_site, head_sha, observing_task_id)
+    head = head_sha or None
+    due = _DueItems.none(len(suppressions))
+    try:
+        due = _due_items(
+            suppressions, debt_eligible,
+            call_site=call_site, head=head, observed_at=observed_at,
+            observing_task_id=observing_task_id,
+        )
+    except Exception:
+        logger.warning(
+            'flake_recorder: could not derive the due items at call_site=%s; writing the '
+            'rows without them',
+            call_site,
+            exc_info=True,
+        )
+    _write_ledger(
+        ledger_db_path(project_root), project_id, suppressions, due,
+        head=head, observing_task_id=observing_task_id, guard=guard,
+    )
+    if call_site_effects(call_site).live_signals:
+        _fire_live_signals(
+            suppressions,
+            head_sha=head_sha, observing_task_id=observing_task_id,
+            event_store=event_store, escalation_queue=escalation_queue, guard=guard,
+        )
+
+
 async def record_merge_flake_suppression(
     result: VerifyResult,
     *,
@@ -216,51 +470,15 @@ async def record_merge_flake_suppression(
     event_store: EventStore | None = None,
     escalation_queue: Any = None,
 ) -> None:
-    """Record the flake observation *result* carries.
+    """Record the merge gate's flake observation *result* carries, through
+    :func:`record_call_site_observations`.
 
-    Four side-effects, on two triggers:
-
-    * the durable ``flake_occurrence`` ledger row(s) — on EVERY carried verdict,
-      including ``fails_in_isolation`` and ``unconfirmable``.  §5.5: record the
-      OBSERVATION, not the remedy.  The non-suppressing verdicts are what make θ's
-      health checks computable at all — an unconfirmable RATE needs its numerator,
-      and a suppression RATE needs the confirmed-red denominator — which is why the
-      ledger counts an unconfirmable observation under its ``UNKNOWN_TEST_ID`` sentinel
-      rather than dropping it;
-    * one due-list item per suppressed test, the ``merge_flake_suppressed`` fact and the
-      INV-4 storm-streak bump — on ``passes_in_isolation`` ONLY.  The fact and the bump
-      are byte-identical to the trigger condition they had inline before ε; nothing
-      about WHEN they fire changes here, only WHERE.  The items join them on the same
-      trigger because §5.9's invariant is about tests that are IN the ledger, and only a
-      suppression puts one there: a confirmed red is a bug, not a flake, and an
-      unconfirmable observation names no test to own.  The items ride the rows' own
-      transaction (``flake_ledger.enqueue_debt``); the drain files their owners.
-
-    ORDER IS THE CONTRACT, not an incidental sequence — local/durable first (the rows
-    and the items), then the in-process live signals (the event, the streak): the rows
-    outlive this process and are the evidence θ reads, so if anything is lost to a crash
-    mid-call, lose the recoverable half.
-
-    ``==``, never ``is``, on the verdict.  The observation may have been rebuilt from
-    JSON by ``flake_ledger.flake_suppression_from_wire``, and an unrecognised
-    vocabulary string is deliberately PRESERVED there rather than coerced — so an
-    identity test would skip the emit and the bump for exactly the remote
-    suppressions ε exists to make visible.  (``StrEnum`` makes ``==`` correct for
-    both the member and its wire spelling.)
-
-    NEVER RAISES (B12).  A ledger write, an event emit or an escalation submit failing
-    is a lost measurement; letting it propagate would fail a VERIFY, or stall the merge
-    queue, over bookkeeping.
-
-    The side-effects are INDEPENDENTLY guarded — one ``try`` each — so losing one
-    really does not cost the others.  A single shared ``try`` made that claim false by
-    ordering alone: an ``event_store.emit`` that raised (a locked or closed sqlite
-    store) would skip straight to the catch-all and the streak bump would never run, so
-    a broken event store silently disarmed the INV-4 storm detector — the one signal
-    whose whole job is to fire when something is going wrong.
-
-    None-safe on both collaborators: the CLI and any storeless caller still contribute
-    the durable rows and items.
+    It unwraps the ``VerifyResult`` carrier and supplies the merge gate's half of the
+    contract: the merge sha as the head, the task being merged as the observing task,
+    and, on a ``passes_in_isolation`` observation only, every test it names as
+    debt-eligible with no context.  A suppression is the only merge-gate observation
+    that puts a test in the ledger: a confirmed red is a bug, not a flake, and an
+    unconfirmable observation names no test to own.
     """
     s = getattr(result, 'flake_suppression', None)
     if s is None:
@@ -270,29 +488,9 @@ async def record_merge_flake_suppression(
         # sentinel row for it would put fiction in the evidence trail.
         return
 
-    def _lost(what: str) -> None:
-        """The one place a lost signal is reported."""
-        logger.warning(
-            'flake_recorder: failed to record merge flake suppression [%s] '
-            '(merge_sha=%s, task_id=%s); the merge/verify is unaffected',
-            what,
-            merge_sha,
-            task_id,
-            exc_info=True,
-        )
-
-    def _guarded(what: str, fn: Callable[[], None]) -> None:
-        """Run one side-effect under its OWN catch-all, so a failure costs exactly
-        that signal."""
-        try:
-            fn()
-        except Exception:
-            _lost(what)
-
     # Read the verdict once, under its own guard, so a malformed observation cannot
-    # decide the debt and the two live signals by raising.  Defaults to False = "not a
-    # suppression", which is the fail-safe reading: a bogus item, event or streak bump
-    # would be worse than a missing one.  A pure read, so the rows still come first.
+    # decide the debt by raising.  Defaults to False = "not a suppression", the
+    # fail-safe reading: a bogus item would be worse than a missing one.
     suppressed = False
     try:
         suppressed = s.verdict == FlakeVerdict.passes_in_isolation
@@ -305,39 +503,17 @@ async def record_merge_flake_suppression(
             exc_info=True,
         )
 
-    items: tuple[DueItem, ...] = (
-        tuple(
-            DueItem(test_id, s.observed_at, s.call_site, merge_sha or None, task_id)
-            for test_id in named_tests(s)
-        )
-        if suppressed
-        else ()
+    debt_eligible: dict[str, DebtContext | None] = (
+        {test_id: None for test_id in named_tests(s)} if suppressed else {}
     )
-    _guarded(
-        'ledger',
-        lambda: enqueue_debt(
-            ledger_db_path(project_root),
-            project_id,
-            items,
-            occurrence=s,
-            merge_sha=merge_sha or None,
-            task_id=task_id,
-        ),
+    await record_call_site_observations(
+        (s,),
+        call_site=FlakeCallSite.merge_gate,
+        project_root=project_root,
+        project_id=project_id,
+        head_sha=merge_sha,
+        observing_task_id=task_id,
+        debt_eligible=debt_eligible,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
     )
-
-    if suppressed:
-        _guarded(
-            'event',
-            lambda: _emit_merge_flake_suppressed(
-                event_store, task_id, merge_sha, list(s.test_ids),
-            ),
-        )
-        # Its OWN guard, and deliberately AFTER the emit rather than inside it: the
-        # storm detector is the escape hatch for "α is masking too much", so it must
-        # survive a broken event store rather than being taken down with it.
-        _guarded(
-            'streak',
-            lambda: _bump_suppression_streak_and_maybe_escalate(
-                escalation_queue, task_id, merge_sha,
-            ),
-        )
