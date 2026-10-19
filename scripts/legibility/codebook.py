@@ -96,6 +96,21 @@ class NeverDeleteError(Exception):
 # them here — additionalProperties defaults to permissive (open-world).
 # ---------------------------------------------------------------------------
 
+_RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
+
+# How an attach put a sighting or a candidate where it is
+# (plans/census-incremental-prd.md C1, L6). Checked at write by
+# validate_coding_record and at rest by validate.
+_ATTACHED_BY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "method": {"enum": ["session", "title", "key", "similarity"]},
+        "score": {"type": "number"},
+        "run_id": _RUN_ID_SCHEMA,
+    },
+    "required": ["method", "run_id"],
+}
+
 _SIGHTING_SCHEMA = {
     "type": "object",
     "properties": {
@@ -110,6 +125,8 @@ _SIGHTING_SCHEMA = {
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
         "evidence_quote": {"type": "string"},
+        "attached_by": _ATTACHED_BY_SCHEMA,
+        "verifier_tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
     },
     "required": ["date", "project", "session", "origin_phase", "manifested_phase"],
 }
@@ -118,8 +135,6 @@ _SIGHTING_SCHEMA = {
 # docs/quality-findings-contract.md §1, §2, §8). The finding identity fields
 # are checked by finding_identity_errors, not by these schemas.
 _FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
-
-_RUN_ID_SCHEMA = {"type": "string", "minLength": 1}
 
 FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "existing")
 
@@ -177,15 +192,7 @@ _CANDIDATE_SCHEMA = {
         "first_seen": {"type": "string"},
         "disposition": {"enum": DISPOSITIONS},
         "sightings": {"type": "array", "items": _SIGHTING_SCHEMA},
-        "attached_by": {
-            "type": "object",
-            "properties": {
-                "method": {"enum": ["session", "title", "key", "similarity"]},
-                "score": {"type": "number"},
-                "run_id": _RUN_ID_SCHEMA,
-            },
-            "required": ["method", "run_id"],
-        },
+        "attached_by": _ATTACHED_BY_SCHEMA,
         "adjudicated_with": {"type": "string", "pattern": _CANDIDATE_ID_RE.pattern},
     },
     "required": ["id", "title", "first_seen", "disposition", "sightings"],
@@ -229,6 +236,7 @@ _MATCH_SCHEMA = {
         "manifested_phase": {"enum": PHASES},
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
+        "attached_by": _ATTACHED_BY_SCHEMA,
     },
     "required": ["entry_id"],
 }
@@ -265,6 +273,7 @@ _CANDIDATE_RECORD_SCHEMA = {
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
         "evidence_quote": {"type": "string"},
+        "attached_by": _ATTACHED_BY_SCHEMA,
     },
     "required": ["title"],
 }
@@ -506,8 +515,8 @@ def validate(codebook: dict) -> list[str]:
 
 def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> dict:
     """Build a sighting dict from a match/candidate payload + record header
-    fields. invariant_violated/note/evidence_quote are included only when
-    truthy (never emitted as an explicit null/empty key)."""
+    fields. invariant_violated/note/evidence_quote/attached_by are included
+    only when truthy (never emitted as an explicit null/empty key)."""
     sighting = {
         "date": date,
         "project": project,
@@ -524,6 +533,9 @@ def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> 
     evidence_quote = payload.get("evidence_quote")
     if evidence_quote:
         sighting["evidence_quote"] = evidence_quote
+    attached_by = payload.get("attached_by")
+    if attached_by:
+        sighting["attached_by"] = copy.deepcopy(attached_by)
     return sighting
 
 
