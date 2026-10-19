@@ -1939,7 +1939,7 @@ free-text `reason` (≤ 2,000 chars) that nothing parses.
 | Kind | `deferral` | Ends when |
 |---|---|---|
 | `carried_by` | `{'kind': 'carried_by', 'carrier_task_id': 4711}` | a human closes or re-pends the row once the carrier is terminal |
-| `until_condition` | `{'kind': 'until_condition', 'condition': 'reify 812 lands', 'expires_at': '2026-11-01T00:00:00Z'}` | a human judges the condition (≤ 500 chars); an optional future `expires_at` releases it to `pending` |
+| `until_condition` | `{'kind': 'until_condition', 'condition': 'reify 812 lands', 'expires_at': '2026-11-01T00:00:00Z'}` | a human judges the condition (≤ 500 chars); an optional future `expires_at` bounds it (the sweep below) |
 | `held_by_session` | `{'kind': 'held_by_session', 'holder_pid': <your $CLAUDE_PID>, 'grace_secs': 7200}` | the holding session lands or releases it (the lease rule below) |
 
 The server checks that a `carried_by` carrier exists and is not the task
@@ -1948,11 +1948,13 @@ itself, and that `holder_pid` is a live `claude` process on its own host.
 `legacy_unknown` is written only by the migration, as a guarded re-stamp of
 an unrecorded row. Either from a caller is refused `server_only_kind`.
 
-**Echo check.** Every successful write echoes the stored record as
-`deferral` (entry, re-stamp) or the removed one as `deferral_cleared` (any
-exit). Confirm it, or confirm `get_task` shows `metadata.deferral`. No echo
-means the fused-memory server predates the gate and dropped the argument:
-treat the hold as unrecorded and re-stamp it once fused-memory restarts.
+**Echo check.** Every successful `set_task_status` or `commit_planning`
+write echoes the stored record as `deferral` (entry, re-stamp) or the
+removed one as `deferral_cleared` (any exit). Confirm it, or confirm
+`get_task` shows `metadata.deferral`. No echo means the fused-memory server
+predates the gate and dropped the argument: treat the hold as unrecorded and
+re-stamp it once fused-memory restarts. A `planning_mode` birth echoes no
+record; read its `planning` record with `get_task`.
 
 **Refusals** carry what is needed to self-correct: `deferral_required`
 (no record), `deferral_invalid` (`reason_code`, `field`, `value`),
@@ -1984,10 +1986,17 @@ deferral={…})` re-stamps a batch held out of the commit.
 separate carrier task, re-stamp the task `carried_by(<carrier>)`.
 
 **The lease rule.** A live holder is never released or notified, however
-long it waits. Once the holder dies, the sweep files one informational
-notice, and after `grace_secs` (600 to 86,400, default 7,200) of observed
-death it releases the row to `pending`. A `/resume`d session is a new
-process: re-stamp the hold with its new pid within the grace window.
+long it waits. Once the holder dies, the deferral sweep files one
+informational notice, and after `grace_secs` (600 to 86,400, default 7,200)
+of observed death it releases the row to `pending`. It releases an
+`until_condition` row the same way once its `expires_at` passes. A
+`/resume`d session is a new process: re-stamp the hold with its new pid
+within the grace window.
+
+**Until the sweep lands** (task 6526), nothing releases a hold on its own:
+a dead holder's row and a lapsed `expires_at` stay `deferred` until someone
+releases them. A session that ends without landing its hold releases it
+first.
 
 ## 10. Rotating a long-running audit-trail task
 
