@@ -109,7 +109,7 @@ def test_plan_source_values():
     assert [p.value for p in PlanSource] == ['production', 'candidate']
 
 
-_ALL_MEMBERS = [
+_ALL_MEMBERS: list[StrEnum] = [
     member
     for enum_cls in (ShadowShape, CostBasis, ShadowCellState, ReferenceKind, PlanSource)
     for member in enum_cls
@@ -117,7 +117,7 @@ _ALL_MEMBERS = [
 
 
 @pytest.mark.parametrize('member', _ALL_MEMBERS, ids=lambda m: f'{type(m).__name__}.{m.name}')
-def test_every_member_is_a_bare_str_that_round_trips(member):
+def test_every_member_is_a_bare_str_that_round_trips(member: StrEnum):
     assert isinstance(member, str)
     assert json.dumps(member) == json.dumps(member.value)
     assert type(member)(member.value) is member

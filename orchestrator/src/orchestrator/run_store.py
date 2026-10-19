@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,10 +13,109 @@ from typing import TYPE_CHECKING
 from shared.sqlite_column_migration import add_column_if_missing_sync
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
+from orchestrator.shadow_types import (
+    CostBasis,
+    PlanSource,
+    ReferenceKind,
+    ShadowCellState,
+    ShadowShape,
+)
+
 if TYPE_CHECKING:
     from orchestrator.harness import HarnessReport, TaskReport
 
 logger = logging.getLogger(__name__)
+
+# One blank-character set for every "non-empty text" rule, in the record and in the DDL.
+_BLANK_CHARS = ' \t\n\r'
+_STRATUM_SEPARATOR = '×'
+_SHADOW_CELL_DEFAULT_OWNER = 'shadow_coordinator'
+
+
+def _is_blank(text: str | None) -> bool:
+    return text is None or not text.strip(_BLANK_CHARS)
+
+
+@dataclass(frozen=True)
+class ShadowCell:
+    """One ``shadow_cells`` row (plans/live-shadow-eval-prd.md C1); field names are its columns."""
+
+    cell_id: str
+    project_id: str
+    task_id: str
+    shape: ShadowShape
+    candidate: str
+    incumbent: str
+    stratum: tuple[str, str, str]
+    base_sha: str
+    state: ShadowCellState
+    cost_basis: CostBasis
+    opened_at: datetime
+    settle_deadline: datetime
+    parent_cell_id: str | None = None
+    worktree_path: Path | None = None
+    plan_source: PlanSource | None = None
+    reason: str | None = None
+    reference_kind: ReferenceKind | None = None
+    reference_sha: str | None = None
+    result_path: Path | None = None
+    cost_usd: float = 0.0
+    cost_credits: float = 0.0
+    run_id: str | None = None
+    running_at: datetime | None = None
+    settled_at: datetime | None = None
+    owner: str = _SHADOW_CELL_DEFAULT_OWNER
+
+    def __post_init__(self) -> None:
+        self._check_identity()
+        self._check_timestamps()
+        self._check_costs()
+        self._check_stratum()
+        if self.state.requires_reason and _is_blank(self.reason):
+            self._refuse(f'state {self.state.value!r} requires a non-blank reason (got {self.reason!r})')
+
+    def _refuse(self, invariant: str) -> None:
+        raise ValueError(f'ShadowCell {self.cell_id!r}: {invariant}')
+
+    def _check_identity(self) -> None:
+        for name in ('cell_id', 'project_id', 'task_id', 'candidate', 'incumbent', 'base_sha', 'owner'):
+            value = getattr(self, name)
+            if _is_blank(value):
+                self._refuse(f'{name} must be non-blank (got {value!r})')
+        if self.parent_cell_id == self.cell_id:
+            self._refuse(f'parent_cell_id must differ from cell_id (got {self.parent_cell_id!r})')
+
+    def _check_timestamps(self) -> None:
+        for name in ('opened_at', 'settle_deadline', 'running_at', 'settled_at'):
+            value = getattr(self, name)
+            if value is not None and value.utcoffset() is None:
+                self._refuse(f'{name} must be timezone-aware (got naive {value!r})')
+        if self.settle_deadline <= self.opened_at:
+            self._refuse(
+                f'settle_deadline must lie after opened_at '
+                f'(got {self.settle_deadline.isoformat()} <= {self.opened_at.isoformat()})'
+            )
+
+    def _check_costs(self) -> None:
+        for name in ('cost_usd', 'cost_credits'):
+            value = getattr(self, name)
+            if not value >= 0:
+                self._refuse(f'{name} must be >= 0 (got {value!r})')
+        if self.cost_basis is CostBasis.METERED and self.cost_credits != 0:
+            self._refuse(
+                f'a {CostBasis.METERED.value} arm meters dollars, never credits '
+                f'(got cost_credits={self.cost_credits!r})'
+            )
+
+    def _check_stratum(self) -> None:
+        parts = self.stratum
+        if len(parts) != 3 or any(
+            _is_blank(part) or _STRATUM_SEPARATOR in part for part in parts
+        ):
+            self._refuse(
+                f'stratum must be three non-blank parts free of {_STRATUM_SEPARATOR!r} '
+                f'(got {parts!r})'
+            )
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS runs (
