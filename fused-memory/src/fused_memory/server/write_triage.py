@@ -1063,8 +1063,7 @@ async def _guard_attach(
     hoisted = target_id != source_id
     if not guard.needs_target_cosine(hoisted=hoisted, judged=judged):
         return decision
-    source = next((result for result in results if result.id == source_id), None)
-    source_cosine = cosine_of(source) if source is not None else None
+    source_cosine = _slate_cosine(results, source_id)
     target_cosine = (
         await _parent_cosine(
             memory_service, target_id, results, content=content, project_id=project_id,
@@ -1097,13 +1096,18 @@ async def _parent_cosine(
 
     ``None`` when the parent is not in the store. A lookup error propagates.
     """
-    retrieved = next((result for result in results if result.id == parent_id), None)
-    if retrieved is not None and (cosine := cosine_of(retrieved)) is not None:
+    cosine = _slate_cosine(results, parent_id)
+    if cosine is not None:
         return cosine
     scores = await memory_service.cosine_to_memories(
         query=content, memory_ids=[parent_id], project_id=project_id,
     )
     return _number_or_none(scores.get(parent_id))
+
+
+def _slate_cosine(results: Sequence[MemoryResult], memory_id: str | None) -> float | None:
+    """The retrieved cosine of *memory_id*, or ``None`` when it was not retrieved with one."""
+    return next((cosine_of(result) for result in results if result.id == memory_id), None)
 
 
 def _log_attach_refusal(
