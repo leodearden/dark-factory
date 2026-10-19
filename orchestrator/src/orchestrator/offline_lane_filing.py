@@ -11,6 +11,7 @@ from typing import Any
 MAX_TESTS_SHOWN = 10
 FAILURE_LINE_MAX_CHARS = 300
 HEAD_PREFIX_CHARS = 12
+SPAWN_CONTEXT_KEY = 'spawn_context'
 SPAWN_CONTEXT = 'offline_lane_red'
 LANE_METADATA_KEY = 'x_offline_lane'
 LEGACY_NODES_KEY = 'failing_tests'
@@ -149,7 +150,7 @@ def _lane_metadata(
     prior_task_ids: Sequence[str],
 ) -> dict[str, Any]:
     return {
-        'spawn_context': SPAWN_CONTEXT,
+        SPAWN_CONTEXT_KEY: SPAWN_CONTEXT,
         'merge_lane': MERGE_LANE,
         LANE_METADATA_KEY: {
             'command': command,
@@ -302,7 +303,7 @@ def covering_lane_task(
     """
     for task_id, task in tasks.items():
         metadata = task.get('metadata')
-        if not isinstance(metadata, Mapping) or metadata.get('spawn_context') != SPAWN_CONTEXT:
+        if not isinstance(metadata, Mapping) or metadata.get(SPAWN_CONTEXT_KEY) != SPAWN_CONTEXT:
             continue
         if node in _covered_nodes(metadata, command):
             return task_id

@@ -37,6 +37,12 @@ Rules the engine and its pure rules keep beyond the PRD's text:
   of the answer's kind is filed, or amended when the answer changed; the other is
   released with the level-2s that hold it.  A record resolved by hand is replaced only
   by a pass.
+- R13 before submitting for a group with no covering task, the engine looks up the
+  project's open lane fix tasks (``spawn_context`` ``offline_lane_red``, each read live)
+  and binds each test to the first that covers it (its ``x_offline_lane`` command and
+  nodes, or a pre-cutover task's ``failing_tests``), committed and named in
+  ``prior_task_ids``.  Only the rest are submitted.  A failed lookup or read files
+  nothing and keeps the filing due with that reason.
 """
 
 from __future__ import annotations
@@ -50,10 +56,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from shared.task_statuses import OwnerLiveness, owner_liveness
+from shared.task_statuses import OwnerLiveness, TaskStatus, owner_liveness
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
-from orchestrator.flake_ledger import fix_contained, resolving_commit
+from orchestrator.flake_ledger import FlakeLedgerTaskClient, fix_contained, resolving_commit
 from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, outcome_from_json
 from orchestrator.offline_lane_episode_state import (
     CommandRecord,
@@ -89,11 +95,14 @@ from orchestrator.offline_lane_escalations import (
     resolve_stuck_filing,
 )
 from orchestrator.offline_lane_filing import (
+    SPAWN_CONTEXT,
+    SPAWN_CONTEXT_KEY,
     UNKNOWN,
     CountedPassEvidence,
     TestEvidence,
     build_lane_command_task_arguments,
     build_lane_fix_task_arguments,
+    covering_lane_task,
 )
 from orchestrator.offline_lane_records import (
     PassRecord,
@@ -108,7 +117,6 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
     from orchestrator.config import LaneCommand, OrchestratorConfig
-    from orchestrator.flake_ledger import FlakeLedgerTaskClient
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +124,7 @@ UNKNOWN_MODE = 'unknown'
 UNKNOWN_STATUS = 'unknown'
 CLOSED_ESCALATION_STATES = frozenset({'resolved', 'dismissed'})
 DEFERRED_STATUS = 'deferred'
+_OPEN_STATUSES = tuple(sorted(s.value for s in TaskStatus if owner_liveness(s) is OwnerLiveness.OPEN))
 
 
 def _utc_now() -> datetime:
@@ -138,6 +147,14 @@ class LaneGit(Protocol):
 
     @property
     def persistent_offline_deep_worktree_path(self) -> Path: ...
+
+
+class LaneTaskClient(FlakeLedgerTaskClient, Protocol):
+    """The lane's task seam: the flake ledger's, and the metadata lookup R13 adopts open fix tasks through."""
+
+    async def find_tasks_by_metadata(
+        self, key: str, value: str, statuses: Sequence[str],
+    ) -> tuple[list[dict], Exception | None]: ...
 
 
 @dataclass(frozen=True)
@@ -213,6 +230,20 @@ def _after_submit(
         case SubmitFailed(reason=reason):
             failure = reason
     return _with_episodes(record, nodes, filing_failure=failure)
+
+
+def _adopted(record: CommandRecord, adopted: Mapping[str, str], now: datetime) -> CommandRecord:
+    """R13: each node of *adopted* bound to its open task, as a submission combined into an open task binds."""
+    episodes = dict(record.episodes)
+    for node, task_id in adopted.items():
+        episode = episodes[node]
+        prior = episode.prior_task_ids
+        episodes[node] = replace(
+            episode, covering_task_id=task_id, planning_committed=True, filed_at=now, filing_due=False,
+            filing_due_since=None, reproduce=None, filing_failure=None, binding_swallowed=False,
+            prior_task_ids=prior if task_id in prior else (*prior, task_id),
+        )
+    return replace(record, episodes=episodes)
 
 
 def _after_commit(record: CommandRecord, nodes: Sequence[str], task_id: str, read: _TaskRead) -> CommandRecord:
@@ -360,7 +391,7 @@ class LaneEngine:
         config: OrchestratorConfig,
         git: LaneGit,
         *,
-        task_client: FlakeLedgerTaskClient | None,
+        task_client: LaneTaskClient | None,
         escalation_queue: EscalationQueue | None,
         now: Callable[[], datetime] | None = None,
         probe_runner: ProbeSeam = run_probe,
@@ -698,7 +729,7 @@ class LaneEngine:
 
     async def _file(
         self,
-        client: FlakeLedgerTaskClient,
+        client: LaneTaskClient,
         record: CommandRecord,
         nodes: tuple[str, ...],
         *,
@@ -713,6 +744,9 @@ class LaneEngine:
         filed = None
         record = await self._saved(record, _marked_due(record, nodes, reproduce, self._now()))
         if _covering(record, nodes) is None:
+            record, nodes = await self._adopt_open_tasks(client, record, nodes)
+            if not nodes:
+                return record, None
             outcome = await self._submit(client, await self._fix_task_arguments(record, nodes, reproduce, opening))
             record = await self._saved(record, _after_submit(record, nodes, outcome, self._now()))
             filed = self._submitted(record, nodes)
@@ -724,6 +758,42 @@ class LaneEngine:
         record = await self._saved(record, _after_commit(record, nodes, task_id, read))
         record = await self._saved(record, _cleared(record, nodes))
         return record, filed
+
+    async def _adopt_open_tasks(
+        self, client: LaneTaskClient, record: CommandRecord, nodes: tuple[str, ...],
+    ) -> tuple[CommandRecord, tuple[str, ...]]:
+        """R13: the saved record with every node an open lane fix task covers bound to it; the nodes left to submit."""
+        open_tasks, failure = await self._open_lane_tasks(client)
+        if failure is not None:
+            logger.warning('offline-lane: %s: filing for %s not attempted, still due: %s',
+                           record.command, list(nodes), failure)
+            return await self._saved(record, _with_episodes(record, nodes, filing_failure=failure)), ()
+        adopted = {
+            node: task_id for node in nodes
+            if (task_id := covering_lane_task(open_tasks, record.command, node)) is not None
+        }
+        if adopted:
+            logger.warning('offline-lane: %s: adopted the open lane fix tasks covering %s, not filing for them',
+                           record.command, adopted)
+        record = await self._saved(record, _adopted(record, adopted, self._now()))
+        return record, tuple(node for node in nodes if node not in adopted)
+
+    async def _open_lane_tasks(self, client: LaneTaskClient) -> tuple[dict[str, Mapping[str, Any]], str | None]:
+        """The project's open lane fix tasks, read live, in lookup order; or why they could not be read."""
+        try:
+            rows, error = await client.find_tasks_by_metadata(SPAWN_CONTEXT_KEY, SPAWN_CONTEXT, _OPEN_STATUSES)
+        except Exception as exc:
+            rows, error = [], exc
+        if error is not None:
+            return {}, f'open lane task lookup failed: {error}'
+        open_tasks: dict[str, Mapping[str, Any]] = {}
+        for task_id in (str(row['task_id']) for row in rows):
+            read = await self._read_task(task_id)
+            if read.error is not None:
+                return {}, f'open lane task {task_id} unreadable: {read.error}'
+            if read.task is not None and owner_liveness(read.status) is OwnerLiveness.OPEN:
+                open_tasks[task_id] = read.task
+        return open_tasks, None
 
     def _submitted(self, record: CommandRecord, nodes: Sequence[str]) -> str | None:
         episode = record.episodes[nodes[0]]
