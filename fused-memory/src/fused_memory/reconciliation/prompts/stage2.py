@@ -99,6 +99,7 @@ Interpreting the status:
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
+- `status="awaiting_curation"` — NON-terminal: the curator's account pool could not serve, so the ticket is durably parked and retried automatically. NO `task_id` is returned yet. Do not re-submit it, do not count it, and do not flag it as a discrepancy.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
 {render_finding_provenance_section(can_file_tasks=True)}
@@ -454,11 +455,12 @@ After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
 `tasks_created` for `created` and `tasks_combined` for `combined` (never \
 `tasks_created`: a combined candidate mints no new task id). If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
+If `status="awaiting_curation"`, the ticket is parked, not lost: no `task_id` is present yet, and this is CORRECT — never count it toward `tasks_created`, never re-submit it, and never flag it as a discrepancy. \
 Otherwise, if `task_id` is missing from the `resolve_ticket` response, \
 skip the `tasks_created` increment and flag the discrepancy in your structured report. \
 `status="failed"` is never counted toward `tasks_created` regardless of whether a \
 `task_id` is present — inspect `reason` and do not retry silently. \
-If the status is anything other than `created`/`combined`/`failed`/`refused` but a `task_id` \
+If the status is anything other than `created`/`combined`/`failed`/`refused`/`awaiting_curation` but a `task_id` \
 is present, call \
 `mcp__fused-memory__get_task` with that id to verify — only count if it returns a \
 valid record, otherwise flag the discrepancy.

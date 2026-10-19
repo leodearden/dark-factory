@@ -1521,6 +1521,8 @@ apart: `curator_action` / `curator_justification` / `combined_at` are
 written by the **automated task curator**'s combine flow (fused-memory
 `task_interceptor`), while the `human_curator_*` keys below belong to a
 **human content curator** adjudicating a deterministic gate.
+`dedupe_skipped` `{reason, at}` marks a create no curator verdict judged; it is
+the re-dedupe sweep key.
 
 #### The human-curator-gate contract
 
