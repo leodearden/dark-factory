@@ -13,7 +13,6 @@ from __future__ import annotations
 import pytest
 import yaml
 from pydantic import ValidationError
-from shared import psi
 from shared.psi import PsiSample
 
 from orchestrator.config import (
@@ -74,11 +73,22 @@ class TestPsiAdmissionArmVocabulary:
             _THRESHOLD_FIELDS
         )
 
-    def test_every_arm_reads_a_config_field(self):
-        # Reads the private truth table on purpose (precedent:
-        # sampler/tests/test_load_metrics.py): it is the only place an arm
-        # with no config counterpart is visible.
-        assert {arm.field for arm in psi._ARMS} <= set(PsiAdmissionConfig.model_fields)
+    def test_saturation_reads_exactly_the_threshold_fields(self):
+        """``saturated()`` reads its duck-typed cfg only by arm field name, so
+        the names it asks for are the arm vocabulary."""
+        asked: set[str] = set()
+
+        class _EveryArmOff:
+            def __getattr__(self, name: str) -> None:
+                asked.add(name)
+                return None
+
+        readable = PsiSample(
+            cpu_some10=0.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True,
+        )
+
+        assert not readable.saturated(_EveryArmOff())
+        assert asked == set(_THRESHOLD_FIELDS)
 
     @pytest.mark.parametrize('field', _THRESHOLD_FIELDS)
     def test_threshold_accepts_none(self, field):
