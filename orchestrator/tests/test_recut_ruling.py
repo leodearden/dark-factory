@@ -240,6 +240,7 @@ def _persist(
     return AsyncMock(side_effect=_record)
 
 
+@pytest.mark.asyncio
 class TestEnforceRecutRuling:
     @pytest.mark.parametrize('metadata', [
         pytest.param(None, id='absent'),

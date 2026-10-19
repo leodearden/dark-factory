@@ -16,10 +16,11 @@ the reverse.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 from shared.task_metadata_wire import coerce_task_metadata
 
@@ -84,6 +85,38 @@ class RecutRulingViolation(RuntimeError):
         )
 
 
+class PriorIncarnationOps(Protocol):
+    """What the gate needs from ``GitOps``, satisfied structurally."""
+
+    async def park_prior_incarnation(
+        self, branch_name: str, *, reason: str,
+    ) -> ParkedIncarnation | None: ...
+
+    async def prior_incarnation_evidence(self, branch_name: str) -> tuple[str, ...]: ...
+
+
+class GateVerdict(Enum):
+    PROCEED = 'proceed'
+    EXECUTED = 'executed'
+    REFUSED = 'refused'
+
+
+@dataclass(frozen=True)
+class RecutGateResult:
+    verdict: GateVerdict
+    ruling: RecutRuling | None = None
+    parked: ParkedIncarnation | None = None
+    reason: str = ''
+
+    @property
+    def refused(self) -> bool:
+        return self.verdict is GateVerdict.REFUSED
+
+    @property
+    def executed(self) -> bool:
+        return self.verdict is GateVerdict.EXECUTED
+
+
 def carries_recut_ruling(task: dict[str, Any]) -> bool:
     """Key presence, not validity: a malformed or unreadable marker must
     enter the gate and fail loudly there, not skip it."""
@@ -137,6 +170,82 @@ def execution_record(
         'quarantined_worktree': parked.quarantined_worktree,
         'relocated_meta_roots': list(parked.relocated_meta_roots),
     }
+
+
+async def enforce_recut_ruling(
+    task: dict[str, Any],
+    *,
+    ops: PriorIncarnationOps,
+    persist: Callable[[dict[str, Any]], Awaitable[bool]],
+    now: datetime,
+) -> RecutGateResult:
+    """Execute a pending ruling: park, prove nothing survives, then record it.
+
+    Nothing fresh is cut until the record is durable, so re-dispatching
+    after any refusal is safe: the park finds nothing left to move.
+    """
+    reading = read_recut_ruling(task)
+    if reading.state is RecutState.MALFORMED:
+        return RecutGateResult(
+            GateVerdict.REFUSED, reason=f'unreadable re-cut ruling: {reading.problem}',
+        )
+    if reading.state is not RecutState.PENDING or reading.ruling is None:
+        return RecutGateResult(GateVerdict.PROCEED, reading.ruling)
+    return await _execute(str(task['id']), reading.ruling, ops, persist, now)
+
+
+async def _execute(
+    task_id: str,
+    ruling: RecutRuling,
+    ops: PriorIncarnationOps,
+    persist: Callable[[dict[str, Any]], Awaitable[bool]],
+    now: datetime,
+) -> RecutGateResult:
+    try:
+        parked = await ops.park_prior_incarnation(
+            task_id, reason=f'recut-ruling {ruling.ruling_id}',
+        )
+    except Exception as exc:
+        return _refused(ruling, None, f'parking task {task_id} failed: {exc}')
+    evidence = await _surviving_evidence(ops, task_id)
+    if evidence:
+        return _refused(ruling, parked, f'still present after parking: {"; ".join(evidence)}')
+    failure = await _persist_failure(
+        persist, {RECUT_EXECUTED_KEY: execution_record(ruling, parked, now)},
+    )
+    if failure is not None:
+        where = parked.parked_branch if parked and parked.parked_branch else 'nothing'
+        return _refused(
+            ruling, parked,
+            f'parked {where} but recording the execution failed ({failure}); '
+            'a re-dispatch is safe because no fresh branch was cut',
+        )
+    return RecutGateResult(GateVerdict.EXECUTED, ruling, parked)
+
+
+async def _surviving_evidence(ops: PriorIncarnationOps, task_id: str) -> tuple[str, ...]:
+    try:
+        return await ops.prior_incarnation_evidence(task_id)
+    except Exception as exc:
+        return (f'the evidence check itself failed: {exc}',)
+
+
+async def _persist_failure(
+    persist: Callable[[dict[str, Any]], Awaitable[bool]], patch: dict[str, Any],
+) -> str | None:
+    try:
+        stored = await persist(patch)
+    except Exception as exc:
+        return f'the task store raised {exc!r}'
+    return None if stored else 'the task store reported failure'
+
+
+def _refused(
+    ruling: RecutRuling, parked: ParkedIncarnation | None, why: str,
+) -> RecutGateResult:
+    return RecutGateResult(
+        GateVerdict.REFUSED, ruling, parked, f're-cut ruling {ruling.ruling_id}: {why}',
+    )
 
 
 def _parse_ruling(value: object) -> RecutRuling | str:
