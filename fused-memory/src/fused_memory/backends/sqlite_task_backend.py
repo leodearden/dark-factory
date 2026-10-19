@@ -41,12 +41,14 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
 )
+from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
 
 from fused_memory.backends.defect_records import (
     DEFECT_RECORD_KEYS,
     DefectRecords,
     DefectTaskTerminal,
+    require_creation_floor,
 )
 from fused_memory.backends.defect_ref_lookup import require_refs_live
 from fused_memory.backends.metadata_lookup import (
@@ -3166,6 +3168,9 @@ class SqliteTaskBackend:
             description=description, details=details, dependencies=dependencies,
             priority=priority, metadata=metadata, tag=tag, status=status,
         )
+        # The backstop for creators that bypass TaskInterceptor.submit_task;
+        # an unreadable blob is left to _validate_metadata_on_write.
+        require_creation_floor(coerce_task_metadata(metadata))
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         if status not in _VALID_STATUSES:

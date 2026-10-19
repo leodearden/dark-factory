@@ -21,6 +21,7 @@ from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.defect_records import DefectCreationRefused, require_creation_floor
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
@@ -4023,8 +4024,15 @@ class TaskInterceptor:
             return err
 
         metadata = kwargs.pop('metadata', None)
-        if 'deferral' in (coerce_task_metadata(metadata) or {}):
+        incoming_metadata = coerce_task_metadata(metadata)
+        if 'deferral' in (incoming_metadata or {}):
             return DeferralWriteAuthorityError(None).to_error_dict()
+        # Before the planning_mode split, so both creation paths refuse
+        # synchronously, before a ticket or a row is written.
+        try:
+            require_creation_floor(incoming_metadata)
+        except DefectCreationRefused as exc:
+            return exc.to_error_dict()
 
         # Inject the override reason into task metadata (both the normal ticket
         # path and the planning_mode path benefit from this placement).  When no

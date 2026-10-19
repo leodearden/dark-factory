@@ -9,6 +9,7 @@ backend directly. Driven over a real backend, ticket store and interceptor.
 from __future__ import annotations
 
 import json
+import subprocess
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -116,9 +117,15 @@ class CreationStack:
         return await self.store.list_tickets(resolve_project_id(self.root))
 
 
+def _git_init_root(path: Path) -> str:
+    path.mkdir(parents=True)
+    subprocess.run(['git', 'init', '-q', str(path)], check=True, capture_output=True)
+    return str(path.resolve())
+
+
 @pytest_asyncio.fixture
 async def stack(tmp_path: Path) -> AsyncIterator[CreationStack]:
-    root = str(tmp_path)
+    root = _git_init_root(tmp_path / 'project')
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=root))
     await backend.start()
     unique = uuid.uuid4().hex[:8]
