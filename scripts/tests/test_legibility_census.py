@@ -17,6 +17,7 @@ state.
 from __future__ import annotations
 
 import contextlib
+import copy
 import functools
 import json
 import logging
@@ -10768,3 +10769,169 @@ def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tm
     assert "re-verify not yet run" not in filed["disposition"]
     [row] = _run_record(kwargs)["dispositions"]["rows"]
     assert row["outcome"] == "present"
+
+
+# ---------------------------------------------------------------------------
+# task 6405 (census PRD leaf L6): the pre-screen runs between _novel_clusters
+# and verify. A title already catalogued (PRD §4.8 row 11) or a session
+# already sighted costs no verify call; a fixed entry re-observed is surfaced
+# and verified; the verify cap counts only what the screen leaves.
+# ---------------------------------------------------------------------------
+
+_L6_RUN = "census-dark_factory-20260714"
+_L6_TITLE_ATTACH = {"method": "title", "run_id": _L6_RUN}
+_L6_NOVEL_TITLE = "Silent no-op subagent contract"
+
+
+def _earlier_sighting(session: str = "sess-earlier") -> dict:
+    return {
+        "date": "2026-07-01",
+        "project": "dark_factory",
+        "session": session,
+        "origin_phase": "review",
+        "manifested_phase": "merge",
+    }
+
+
+def _l6_record(kwargs) -> dict:
+    return json.loads(kwargs["report_path"].with_suffix(".json").read_text(encoding="utf-8"))
+
+
+def _l6_codebook(kwargs) -> dict:
+    return codebook.load(kwargs["codebook_path"])
+
+
+def _offered_titles(verify_fn) -> list[list[str]]:
+    return [[cluster["title"] for cluster in call["clusters"]] for call in verify_fn.calls]
+
+
+def _row11_codebook(case: str) -> dict:
+    standing = "promoted" if case == "promoted" else "rejected"
+    cb = _codebook_with_standing(standing)
+    candidate = cb["candidates"][-1]
+    candidate["sightings"] = [_earlier_sighting()]
+    if case == "renamed":
+        candidate["title"] = "spurious   PATTERN"
+    return cb
+
+
+@pytest.mark.parametrize("case", ["rejected", "promoted", "renamed"])
+def test_row_11_a_re_mined_adjudicated_title_is_attached_with_no_verify_call(tmp_path, case):
+    verify_fn = _make_fake_verify_fn(verified_titles={_REJECTED_TITLE})
+    kwargs = _rejected_run_kwargs(tmp_path, _row11_codebook(case), verify_fn=verify_fn)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _offered_titles(verify_fn) in ([], [[]])
+    record = _l6_record(kwargs)
+    assert record["method"]["cost"]["verify_calls"] == 0
+    assert record["method"]["cost"]["probe_calls"] == 1
+    assert record["method"]["extra"]["screened"] == {"title": 1, "session": 0, "key": 0, "cross_instrument": 0}
+    assert record["dropped_verdicts"] == []
+    assert outcome.unresolved_verdicts == 0
+
+    persisted = _l6_codebook(kwargs)
+    assert [c["id"] for c in persisted["candidates"]] == ["cand-20260701-7"], "no pending twin minted"
+    holder = (
+        next(e for e in persisted["entries"] if e["id"] == "entry-spurious")
+        if case == "promoted"
+        else persisted["candidates"][0]
+    )
+    (attached,) = [s for s in holder["sightings"] if s["session"] == "novel-rejected"]
+    assert attached["attached_by"] == _L6_TITLE_ATTACH
+    if case == "promoted":
+        assert _L6_RUN in holder["last_seen_runs"]
+    assert codebook.validate(persisted) == []
+
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    titles = check_census_report.level2_titles(report)
+    assert "Screened" in titles
+    assert "Unresolved Verdicts" not in titles
+
+
+def test_a_novel_title_from_an_already_sighted_session_waits_as_pending_unverified(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["candidates"].append({
+        "id": "cand-20260701-1",
+        "title": "An earlier pending shape",
+        "first_seen": "2026-07-01",
+        "disposition": "pending",
+        "sightings": [_earlier_sighting("novel-verified")],
+    })
+    before = copy.deepcopy(cb["candidates"][0])
+    verify_fn = _make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=cb,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _offered_titles(verify_fn) in ([], [[]])
+    record = _l6_record(kwargs)
+    assert record["method"]["extra"]["screened"]["session"] == 1
+    assert record["method"]["verification"]["unverified"] == 1
+    persisted = _l6_codebook(kwargs)
+    assert persisted["candidates"][0] == before
+    assert [(c["title"], c["disposition"]) for c in persisted["candidates"][1:]] == [(_L6_NOVEL_TITLE, "pending")]
+
+
+def test_a_title_re_observing_a_fixed_entry_is_surfaced_and_verified(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append({
+        "id": "entry-fixed",
+        "title": _L6_NOVEL_TITLE,
+        "severity": "medium",
+        "status": "fixed",
+        "origin_phase": "implement",
+        "manifested_phase": "verify",
+        "sightings": [_earlier_sighting()],
+    })
+    verify_fn = _make_fake_verify_fn(rejected_titles={_L6_NOVEL_TITLE})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=cb,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _offered_titles(verify_fn)[0] == [_L6_NOVEL_TITLE]
+    screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
+    assert [line for line in screened.splitlines() if "surfaced" in line and "entry-fixed" in line]
+    assert _l6_record(kwargs)["method"]["extra"]["screened"]["title"] == 0
+
+
+def test_the_verify_cap_counts_only_the_clusters_the_screen_leaves(tmp_path):
+    verify_fn = _make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[
+            _hand_digest("novel-rejected", "a spurious one-off"),
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+        ]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=_row11_codebook("rejected"),
+        max_verify_clusters=1,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _offered_titles(verify_fn)[0] == [_L6_NOVEL_TITLE]
+    assert _l6_record(kwargs)["verify_coverage"] == {"novel": 1, "offered": 1, "cap": 1}
