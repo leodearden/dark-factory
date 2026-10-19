@@ -157,3 +157,196 @@ class TestPerBinaryResolution:
                 _row(basis='attach_time', home='NO')]
         assert _resolved(rows, 'home') == _mod().Resolved.YES
         assert _resolved(rows, 'home', basis='attach_time') == _mod().Resolved.NO
+
+
+def _judged(target: str, *votes: dict[str, str]) -> object:
+    """The Judgement of write 'w' read against *target*, one rater per vote; None if no votes."""
+    if not votes:
+        return None
+    rubric = _mod()
+    rows = [_row('w', target, rater=f'r{index}', **vote) for index, vote in enumerate(votes)]
+    return rubric.resolve_judgements(rows)[rubric.PairKey('w', target, rubric.Basis.CURRENT)]
+
+
+def _derive(outcome: str, *votes: dict[str, str], **options: Any) -> object:
+    return _mod().derive(outcome, {'p': _judged('p', *votes)}, **options)
+
+
+def _decided(result: object) -> object:
+    assert isinstance(result, _mod().Decided), result
+    return result
+
+
+_HOME_FLAT = {'home': 'YES', 'loss': 'NO', 'conflict': 'NO'}
+_HOME_MORE = {'home': 'YES', 'loss': 'YES', 'conflict': 'NO'}
+
+
+class TestTheDerivationTable:
+    @pytest.mark.parametrize(('outcome', 'vote', 'triage', 'status_quo'), [
+        ('restated', _HOME_FLAT, set(), {'duplicate_clutter'}),
+        ('restated', _HOME_MORE, {'hidden_detail'}, set()),
+        ('restated', {'home': 'YES', 'conflict': 'YES'}, {'hidden_conflict'}, {'orphaned_conflict'}),
+        ('restated', {'home': 'NO', 'conflict': 'YES'},
+         {'hidden_conflict', 'wrong_home'}, {'orphaned_conflict'}),
+        ('restated', {'home': 'NO', 'conflict': 'NO'}, {'wrong_home'}, set()),
+        ('amended', _HOME_MORE, set(), set()),
+        ('amended', _HOME_FLAT, set(), {'duplicate_clutter'}),
+        ('amended', {'home': 'YES', 'conflict': 'YES'}, {'digest_conflict'}, {'orphaned_conflict'}),
+        ('amended', {'home': 'NO', 'conflict': 'YES'},
+         {'digest_conflict', 'wrong_home'}, {'orphaned_conflict'}),
+        ('amended', {'home': 'NO', 'conflict': 'NO'}, {'wrong_home'}, set()),
+        ('contested', {'conflict': 'YES'}, set(), {'orphaned_conflict'}),
+        ('contested', {'home': 'NO', 'conflict': 'YES', 'scope': 'SECONDARY'},
+         set(), {'orphaned_conflict'}),
+        ('contested', {'home': 'NO', 'conflict': 'NO'}, {'false_conflict', 'wrong_home'}, set()),
+        ('contested', _HOME_FLAT, {'false_conflict'}, {'duplicate_clutter'}),
+        ('contested', _HOME_MORE, {'false_conflict'}, set()),
+    ])
+    def test_an_attach_outcome_derives_its_cells_in_both_regimes(
+        self, outcome: str, vote: dict[str, str], triage: set[str], status_quo: set[str],
+    ) -> None:
+        result = _decided(_derive(outcome, vote))
+        assert result.triage_cells == triage
+        assert result.status_quo_cells == status_quo
+        assert result.m1_hidden is None
+
+    @pytest.mark.parametrize(('outcome', 'vote', 'conflict'), [
+        ('restated', {'home': 'NO', 'conflict': 'YES'}, True),
+        ('amended', _HOME_FLAT, False),
+        ('contested', {'conflict': 'YES'}, True),
+        ('contested', _HOME_FLAT, False),
+    ])
+    def test_a_decided_attach_says_whether_the_write_conflicts(
+        self, outcome: str, vote: dict[str, str], conflict: bool,
+    ) -> None:
+        assert _decided(_derive(outcome, vote)).conflict is conflict
+
+    def test_a_supersession_filed_as_an_attach_is_always_wrong(self) -> None:
+        for outcome, vote in (('restated', _HOME_FLAT), ('contested', {'conflict': 'YES'})):
+            result = _decided(_derive(outcome, vote, supersedes_target=True))
+            assert result.triage_cells == {'attached_supersession'}
+
+    def test_cell_rules_state_one_rule_per_cell(self) -> None:
+        rubric = _mod()
+        assert set(rubric.CELL_RULES) == set(rubric.Cell)
+        assert len(rubric.Cell) == 8
+        assert all(isinstance(rule, str) and rule.strip() for rule in rubric.CELL_RULES.values())
+
+
+class TestTheStoredRule:
+    def _derive(self, by_target: dict[str, list[dict[str, str]]], **options: Any) -> object:
+        rubric = _mod()
+        return rubric.derive(
+            'stored', {target: _judged(target, *votes) for target, votes in by_target.items()},
+            **options,
+        )
+
+    @pytest.mark.parametrize(('by_target', 'marks', 'cells', 'conflict'), [
+        ({}, frozenset(), set(), False),
+        ({'e1': [{'conflict': 'YES'}]}, frozenset(), {'orphaned_conflict'}, True),
+        ({'e1': [{'conflict': 'YES'}]}, frozenset({'e1'}), set(), True),
+        ({'e1': [_HOME_FLAT]}, frozenset(), {'duplicate_clutter'}, False),
+        ({'e1': [_HOME_MORE]}, frozenset(), set(), False),
+        ({'e1': [{'home': 'NO', 'conflict': 'NO'}]}, frozenset(), set(), False),
+        ({'e1': [{'conflict': 'YES'}], 'e2': [_HOME_FLAT]}, frozenset({'e1'}),
+         {'duplicate_clutter'}, True),
+        ({'e1': [{'conflict': 'YES'}], 'e2': [{'conflict': 'YES'}]}, frozenset({'e1'}),
+         {'orphaned_conflict'}, True),
+    ])
+    def test_a_stored_write_is_judged_against_every_earlier_record(
+        self, by_target: dict[str, list[dict[str, str]]], marks: frozenset[str],
+        cells: set[str], conflict: bool,
+    ) -> None:
+        result = _decided(self._derive(by_target, superseded_marks=marks))
+        assert result.triage_cells == cells
+        assert result.status_quo_cells == cells
+        assert result.conflict is conflict
+
+    def test_a_refusal_names_every_earlier_records_gap_at_once(self) -> None:
+        result = self._derive({'e1': [{'conflict': 'NO'}], 'e2': []})
+        assert isinstance(result, _mod().Incomplete)
+        assert [(gap.target_id, gap.binary, gap.kind) for gap in result.missing] == [
+            ('e1', 'home', 'unrated'), ('e2', 'conflict', 'unrated'),
+        ]
+
+    def test_a_stored_write_has_no_target_to_supersede(self) -> None:
+        with pytest.raises(ValueError, match='supersedes_target'):
+            self._derive({}, supersedes_target=True)
+
+
+class TestDecisiveness:
+    def _gaps(self, result: object) -> list[tuple[str, str, str]]:
+        assert isinstance(result, _mod().Incomplete), result
+        return [(gap.target_id, gap.binary, gap.kind) for gap in result.missing]
+
+    def test_a_decisive_unrated_binary_is_incomplete(self) -> None:
+        assert self._gaps(_derive('restated', {'home': 'YES', 'conflict': 'NO'})) == [
+            ('p', 'loss', 'unrated'),
+        ]
+
+    def test_a_decisive_tie_is_incomplete(self) -> None:
+        result = _derive('restated', {'home': 'YES', 'conflict': 'YES'},
+                         {'home': 'YES', 'conflict': 'NO'})
+        assert self._gaps(result) == [('p', 'conflict', 'tied')]
+
+    def test_an_unrated_pair_names_its_first_decisive_binary(self) -> None:
+        assert self._gaps(_derive('contested')) == [('p', 'conflict', 'unrated')]
+
+    def test_the_status_quo_regime_can_be_the_decisive_one(self) -> None:
+        assert self._gaps(_derive('amended', {'home': 'YES', 'conflict': 'NO'})) == [
+            ('p', 'loss', 'unrated'),
+        ]
+
+    def test_a_decisive_unclear_binary_makes_the_item_unclear(self) -> None:
+        result = _derive('restated', {'home': 'YES', 'conflict': 'NO', 'loss': 'UNCLEAR',
+                                      'unclear_reason': 'cut at the threshold'})
+        assert isinstance(result, _mod().Unclear)
+        assert result.binaries == (('p', 'loss'),)
+
+    def test_a_non_decisive_tie_never_blocks(self) -> None:
+        result = _derive('contested', {'home': 'YES', 'conflict': 'YES'},
+                         {'home': 'NO', 'conflict': 'YES'})
+        assert _decided(result).triage_cells == set()
+
+    def test_a_non_decisive_absent_binary_never_blocks(self) -> None:
+        assert _decided(_derive('restated', {'home': 'NO', 'conflict': 'NO'})).triage_cells == {
+            'wrong_home',
+        }
+
+    def test_an_attach_outcome_needs_exactly_one_target(self) -> None:
+        with pytest.raises(ValueError, match='restated.*one target'):
+            _mod().derive('restated', {})
+
+    def test_an_unknown_outcome_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="'filed'"):
+            _mod().derive('filed', {})
+
+
+class TestM1Hiddenness:
+    @pytest.mark.parametrize(('outcome', 'vote', 'hidden'), [
+        ('restated', {'conflict': 'YES', 'home': 'YES'}, True),
+        ('restated', _HOME_MORE, True),
+        ('restated', _HOME_FLAT, False),
+        ('restated', {'home': 'NO', 'conflict': 'NO'}, False),
+        ('amended', {**_HOME_MORE, 'digest': 'NO'}, True),
+        ('amended', {**_HOME_MORE, 'digest': 'YES'}, False),
+        ('amended', {'home': 'YES', 'conflict': 'YES'}, True),
+        ('amended', _HOME_FLAT, False),
+        ('contested', {'conflict': 'NO', 'home': 'NO'}, False),
+    ])
+    def test_hiddenness_in_the_band(
+        self, outcome: str, vote: dict[str, str], hidden: bool,
+    ) -> None:
+        assert _decided(_derive(outcome, vote, in_m1_band=True)).m1_hidden is hidden
+
+    def test_a_stored_write_in_the_band_is_never_hidden(self) -> None:
+        result = _mod().derive('stored', {}, in_m1_band=True)
+        assert _decided(result).m1_hidden is False
+
+    def test_digest_is_decisive_only_in_the_band(self) -> None:
+        in_band = _derive('amended', _HOME_MORE, in_m1_band=True)
+        assert isinstance(in_band, _mod().Incomplete)
+        assert [(g.target_id, g.binary, g.kind) for g in in_band.missing] == [
+            ('p', 'digest', 'unrated'),
+        ]
+        assert _decided(_derive('amended', _HOME_MORE)).m1_hidden is None
