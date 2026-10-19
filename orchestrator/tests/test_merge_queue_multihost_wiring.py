@@ -36,10 +36,22 @@ from orchestrator.verify_runner import HostAllocator, HostLease, RemoteRunner
 
 
 def _make_config(*, verify_runners=None, main_branch='main', drift_every_n=20):
-    """Build an OrchestratorConfig with optional verify_runners."""
+    """Build an OrchestratorConfig with optional verify_runners.
+
+    ``verify_env_probes`` is pinned EMPTY (Lever C off, task 4537).
+    conftest.py::_isolate_orch_config is autouse and points ORCH_CONFIG_PATH at
+    this repo's own dark-factory-orchestrator.yaml, which declares probes — so
+    without this a config built here inherits them, and
+    merge_drift.py::_run_drift_check would capture the LOCAL fingerprint
+    through verify_runner.py::env_probe_local_run: real, untimed
+    subprocesses (npx/uv/node/python3 plus rustc/cargo/sccache) spawned by
+    tests that are about runner-pool wiring, not about env probing.  Any test
+    here that wants Lever C on should say so explicitly.
+    """
     kwargs = {
         'git': GitConfig(main_branch=main_branch),
         'verify_drift_check_every_n_lands': drift_every_n,
+        'verify_env_probes': [],
     }
     if verify_runners is not None:
         kwargs['verify_runners'] = verify_runners

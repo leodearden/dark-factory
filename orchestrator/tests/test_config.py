@@ -5,6 +5,7 @@ import os
 import warnings
 from importlib import resources as pkg_resources
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -1508,6 +1509,259 @@ class TestLoadConfigSccacheFold:
 # ---------------------------------------------------------------------------
 
 
+class TestEnvProbeConfig:
+    """Task 4537: EnvProbeConfig + OrchestratorConfig.verify_env_probes.
+
+    The operator-declared OS-level probes the Lever C env-divergence detector
+    compares across hosts at the drift cadence.
+    """
+
+    def test_env_probe_config_required_fields(self):
+        """EnvProbeConfig parses from key + argv."""
+        from orchestrator.config import EnvProbeConfig
+
+        cfg = EnvProbeConfig(key='uv', argv=['uv', '--version'])
+        assert cfg.key == 'uv'
+        assert cfg.argv == ['uv', '--version']
+
+    def test_env_probe_config_rejects_missing_key(self):
+        """key is required — a probe with no extra_probes key is a config error."""
+        from orchestrator.config import EnvProbeConfig
+
+        with pytest.raises(ValidationError):
+            EnvProbeConfig.model_validate({'argv': ['uv', '--version']})
+
+    def test_env_probe_config_rejects_missing_argv(self):
+        """argv is required."""
+        from orchestrator.config import EnvProbeConfig
+
+        with pytest.raises(ValidationError):
+            EnvProbeConfig.model_validate({'key': 'uv'})
+
+    def test_env_probe_config_rejects_empty_argv(self):
+        """An empty argv is rejected (min_length=1), not a silent no-op probe."""
+        from orchestrator.config import EnvProbeConfig
+
+        with pytest.raises(ValidationError):
+            EnvProbeConfig(key='uv', argv=[])
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_orchestrator_config_verify_env_probes_defaults_empty(self):
+        """The CODE default is [] — the env detector ships OFF.
+
+        Needs ``code_default_config``: a bare ``OrchestratorConfig()`` loads
+        the ambient dark-factory-orchestrator.yaml, which now DECLARES probes
+        (see TestCommittedEnvProbesDeployed).  Without the fixture this would
+        read the deployed block and assert nothing about the shipped default —
+        which is what it was doing while the key happened to be absent.
+        """
+        config = OrchestratorConfig()
+        assert config.verify_env_probes == []
+
+    def test_orchestrator_config_verify_env_probes_parses_dict_list(self):
+        """A list of plain dicts coerces to typed EnvProbeConfig entries."""
+        from orchestrator.config import EnvProbeConfig
+
+        config = OrchestratorConfig(verify_env_probes=cast(Any, [
+            {'key': 'pyright', 'argv': ['npx', 'pyright', '--version']},
+            {'key': 'uv', 'argv': ['uv', '--version']},
+        ]))
+        assert len(config.verify_env_probes) == 2
+        assert all(isinstance(p, EnvProbeConfig) for p in config.verify_env_probes)
+        assert config.verify_env_probes[0].key == 'pyright'
+        assert config.verify_env_probes[0].argv == ['npx', 'pyright', '--version']
+
+    def test_verify_env_probes_argv_preserved_as_list_of_str(self):
+        """argv stays a list[str] so it can be handed straight to the probe seam."""
+        config = OrchestratorConfig(verify_env_probes=cast(Any, [
+            {'key': 'node', 'argv': ['node', '--version']},
+        ]))
+        argv = config.verify_env_probes[0].argv
+        assert isinstance(argv, list)
+        assert all(isinstance(a, str) for a in argv)
+
+    def test_env_probe_config_rejects_empty_key(self):
+        """An empty key is the same class of error as an empty argv.
+
+        It is not merely cosmetic: an empty key lands in ``extra_probes['']``
+        and renders the divergence L1 summary as "Host env divergence in
+        extra_probes: " with nothing after the colon — the unreadable-summary
+        failure verify_runner's ``offenders`` fallback exists to prevent.
+        """
+        from orchestrator.config import EnvProbeConfig
+
+        with pytest.raises(ValidationError):
+            EnvProbeConfig(key='', argv=['uv', '--version'])
+
+    def test_verify_env_probes_rejects_duplicate_keys(self):
+        """A collision silently DROPS a probe the operator believes is watched.
+
+        capture_env_fingerprint writes ``extra_probes[key]`` last-write-wins,
+        so a duplicate key removes one declared probe from the comparison on
+        both hosts while still paying its ssh round trip — and nothing in the
+        emitted events reveals it.  Fail at construction instead.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            OrchestratorConfig(verify_env_probes=cast(Any, [
+                {'key': 'uv', 'argv': ['uv', '--version']},
+                {'key': 'uv', 'argv': ['uv', 'tool', '--version']},
+            ]))
+        assert 'uv' in str(excinfo.value)
+
+    def test_verify_env_probes_duplicate_message_names_the_collision(self):
+        """The error has to say WHICH key collided, not just that one did."""
+        with pytest.raises(ValidationError) as excinfo:
+            OrchestratorConfig(verify_env_probes=cast(Any, [
+                {'key': 'node', 'argv': ['node', '--version']},
+                {'key': 'pyright', 'argv': ['npx', 'pyright', '--version']},
+                {'key': 'node', 'argv': ['nodejs', '--version']},
+            ]))
+        message = str(excinfo.value)
+        assert "'node'" in message
+        assert 'pyright' not in message
+
+    def test_distinct_keys_are_accepted(self):
+        """The duplicate guard must not reject a legitimate multi-probe list."""
+        config = OrchestratorConfig(verify_env_probes=cast(Any, [
+            {'key': 'uv', 'argv': ['uv', '--version']},
+            {'key': 'node', 'argv': ['node', '--version']},
+        ]))
+        assert [p.key for p in config.verify_env_probes] == ['uv', 'node']
+
+    def test_verify_env_probes_is_restart_only(self):
+        """Pinned here too, beside the field's own tests, not only in the
+        RELOADABLE_FIELDS suite (see test_restart_only_members_absent).
+
+        The probe list is consulted only alongside the verify_runners pool,
+        which is itself restart-only, so a hot-reloaded probe list could not
+        take effect without the runners it accompanies — an operator would get
+        a `reloaded: true` disposition for a knob that did nothing.
+        """
+        assert 'verify_env_probes' not in RELOADABLE_FIELDS, (
+            "verify_env_probes is consulted only alongside the restart-only "
+            "verify_runners pool, so it must NOT be hot-reloadable"
+        )
+
+
+#: Resolved from this test file so the guard works in a task worktree as well
+#: as the main checkout — the point is the config committed on THIS branch.
+_DF_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DF_CONFIG_PATH = _DF_REPO_ROOT / 'dark-factory-orchestrator.yaml'
+
+
+class TestCommittedEnvProbesDeployed:
+    """Standing guard: dark_factory's own verify_env_probes block is DEPLOYED.
+
+    verify_env_probes is inert unless an operator declares probes (the shipped
+    code default is []), so nothing in the config or wiring suites can notice
+    the deployed block going missing — exactly the gap
+    test_verify_pytest_n_operator_cap covers for verify_admission_pytest_n,
+    and this mirrors its ORCH_CONFIG_PATH load idiom rather than hand-parsing
+    the YAML text: the LOADED attribute, not the file text, is what the daemon
+    acts on, so a value that fails validation must fail here.
+
+    RETUNE IS TWO EDITS IN ONE COMMIT: the yaml block and
+    ``_EXPECTED_PROBE_KEYS`` below.  The rationale for WHICH tools are probed
+    lives in the yaml comment block, not restated here.
+    """
+
+    #: The tools dark_factory's two hosts were measured to skew on (2026-08-20),
+    #: plus python3 as a tripwire for a future skew.
+    _EXPECTED_PROBE_KEYS = {'pyright', 'uv', 'node', 'python3'}
+
+    def _committed(self, monkeypatch) -> OrchestratorConfig:
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(_DF_CONFIG_PATH))
+        return OrchestratorConfig()
+
+    def test_committed_config_declares_env_probes(self, monkeypatch):
+        from orchestrator.config import EnvProbeConfig
+
+        probes = self._committed(monkeypatch).verify_env_probes
+        assert probes, (
+            f'{_DF_CONFIG_PATH} declares no verify_env_probes, so the Lever C '
+            f'env-divergence detector is off for dark_factory itself'
+        )
+        assert all(isinstance(p, EnvProbeConfig) for p in probes)
+
+    def test_committed_probe_keys_cover_the_measured_skew(self, monkeypatch):
+        probes = self._committed(monkeypatch).verify_env_probes
+        assert {p.key for p in probes} == self._EXPECTED_PROBE_KEYS
+
+    def test_every_committed_probe_argv_is_non_empty(self, monkeypatch):
+        probes = self._committed(monkeypatch).verify_env_probes
+        for probe in probes:
+            assert probe.argv, f'probe {probe.key!r} has an empty argv'
+            assert all(isinstance(a, str) for a in probe.argv)
+
+    def test_pyright_probe_matches_how_type_check_command_resolves_pyright(
+        self, monkeypatch,
+    ):
+        """The probe has to measure the SAME binary the gate runs.
+
+        type_check_command chains bare ``npx pyright``: unpinned, no
+        package.json, so each host resolves whatever its npx cache holds.  A
+        probe spelling it any other way (a global ``pyright``, a pinned
+        version) would report parity on a tool the verify gate never uses.
+
+        DERIVED FROM THE LOADED CONFIG, not from a literal.  Asserting
+        ``== ['npx','pyright','--version']`` would restate what
+        _EXPECTED_PROBE_KEYS-style pinning already covers while staying GREEN
+        through the one change it exists to catch: re-pinning the gate (to
+        ``npx pyright@1.1.413``, or to a globally-installed ``pyright``) would
+        leave the probe measuring a binary the gate no longer runs.  So the
+        expected invocation is read off type_check_command itself.
+        """
+        config = self._committed(monkeypatch)
+        probes = {p.key: p.argv for p in config.verify_env_probes}
+        probe_argv = probes['pyright']
+        assert probe_argv[-1] == '--version', (
+            f'the pyright probe must be a --version query; got {probe_argv!r}'
+        )
+        invocation = probe_argv[:-1]  # how the PROBE spells pyright
+
+        tokens = config.type_check_command.split()
+        gate_sites = [i for i, tok in enumerate(tokens) if 'pyright' in tok]
+        assert gate_sites, (
+            'type_check_command no longer runs pyright at all, so probing it '
+            'measures a tool the verify gate does not use'
+        )
+        for i in gate_sites:
+            start = i - len(invocation) + 1
+            as_run = tokens[max(0, start):i + 1]
+            assert start >= 0 and as_run == invocation, (
+                f'type_check_command runs pyright as {as_run!r} but the probe '
+                f'measures {invocation!r} — the probe would report parity on a '
+                f'binary the gate never invokes.  Move both in one commit.'
+            )
+
+    def test_no_rust_probe_is_declared(self, monkeypatch):
+        """dark_factory is a Python project — probing rustc would manufacture drift.
+
+        This workstation carries a stray ~/.cargo/bin/rustc that leo-laptop
+        plausibly does not.  Only extra_probes is compared, so declaring a Rust
+        probe here is the one way to reintroduce the false-drift class the
+        dimension scoping exists to prevent.
+        """
+        probes = {p.key: p.argv for p in self._committed(monkeypatch).verify_env_probes}
+        for key, argv in probes.items():
+            assert 'rustc' not in argv[0], f'probe {key!r} probes rustc'
+            assert 'cargo' not in argv[0], f'probe {key!r} probes cargo'
+        assert 'rustc' not in probes
+        assert 'cargo' not in probes
+
+    def test_committed_probes_are_inert_until_verify_runners_is_populated(
+        self, monkeypatch,
+    ):
+        """Landing the block is safe NOW: no runners means no drift check runs.
+
+        _maybe_run_drift_check returns early on empty enabled_verify_runners,
+        so these probes cost nothing until Lever C is turned on.  If this ever
+        goes red, the probe block became live and needs a deliberate look.
+        """
+        config = self._committed(monkeypatch)
+        assert config.enabled_verify_runners == []
+
+
 class TestVerifyRunnerConfig:
     """Tests for VerifyRunnerConfig and OrchestratorConfig.verify_runners fields."""
 
@@ -2612,6 +2866,9 @@ class TestConfigReload:
     @pytest.mark.parametrize('path', [
         'max_concurrent_tasks',
         'verify_runners',
+        # task 4537: restart-only for the same reason as verify_runners — the
+        # probe list is only consulted alongside the runner pool it accompanies.
+        'verify_env_probes',
         'sandbox.backend',
         'escalation.port',
         'project_root',

@@ -3003,6 +3003,48 @@ class VerifyRunnerConfig(BaseModel):
     )
 
 
+class EnvProbeConfig(BaseModel):
+    """One operator-declared OS-level environment probe (Lever C, task 4537).
+
+    Each entry in OrchestratorConfig.verify_env_probes names a command whose
+    output is captured on BOTH the local dispatcher and the remote verify
+    runner at the drift-check cadence, and compared.  A difference means the
+    two hosts are not running the same tool, so their verify verdicts are not
+    interchangeable even when they happen to agree today.
+
+    Probes are declared per project rather than hardcoded: the hardcoded
+    rustc/cargo/sccache dimensions of EnvFingerprint are meaningless for a
+    Python project and would manufacture false drift (see
+    verify_runner.compare_env_fingerprints' `dimensions` parameter).  A Rust
+    project that wants them simply declares them here explicitly.
+    """
+
+    key: str = Field(
+        min_length=1,
+        description=(
+            'Key this probe\'s trimmed stdout is recorded under in the '
+            'EnvFingerprint.extra_probes mapping, and the name an env-divergence '
+            'escalation reports.  Choose something an operator will recognise '
+            '(e.g. "pyright", "uv").  Must be non-empty (min_length=1) for the '
+            'same reason argv must be: an empty key renders the divergence '
+            'escalation summary as a dangling "Host env divergence in '
+            'extra_probes:" with nothing after the colon — the unreadable-L1 '
+            'failure the summary fallback exists to prevent.'
+        ),
+    )
+    argv: list[str] = Field(
+        min_length=1,
+        description=(
+            'Command to execute, in argv form (e.g. ["uv", "--version"]).  '
+            'argv rather than a shell string so the local path needs no quoting '
+            'and the ssh path can shlex-join explicitly.  Must be non-empty — a '
+            'probe with no command is a config error, not a silent no-op.  Keep '
+            'it short, read-only and fast: it runs on both hosts on every drift '
+            'check.'
+        ),
+    )
+
+
 # --- Per-module overrides ---
 
 _OVERRIDABLE_FIELDS = frozenset({
@@ -5176,6 +5218,34 @@ class OrchestratorConfig(BaseSettings):
             'warm_verify_shadow_compare_every_n_merges cadence knob pattern.'
         ),
     )
+
+    # Lever C, task 4537: the HOST-ENVIRONMENT divergence detector's probe set.
+    # The existing drift check compares VERDICTS; these probes compare the two
+    # hosts' actual tooling at the same cadence, so a version skew is named
+    # before it silently produces divergent verdicts.
+    #
+    # [] (the default) means the env detector is OFF and touches no host — the
+    # check returns INCONCLUSIVE before probing.  Rust probes are deliberately
+    # NOT hardcoded here: only `extra_probes` is compared, so a Rust project
+    # declares rustc/cargo in this list explicitly and a Python project is not
+    # false-alarmed by a stray ~/.cargo/bin/rustc on one host.
+    #
+    # Deliberately NOT in RELOADABLE_FIELDS (restart-only): the probe list is
+    # only consulted alongside the verify_runners pool, which is itself
+    # restart-only, so a hot-reloaded probe list could not take effect anyway
+    # without the runners it accompanies.
+    verify_env_probes: list[EnvProbeConfig] = Field(
+        default_factory=list,
+        description=(
+            'Operator-declared OS-level probes (key + argv) captured on both the '
+            'local dispatcher and the remote verify runner at the drift-check '
+            'cadence and compared.  A difference emits a verify_env_divergence '
+            'event and files one deduped L1.  Default [] means the env detector '
+            'is off (no host is probed).  Only these probes are compared — the '
+            'hardcoded rustc/cargo/sccache dimensions are skipped, so a non-Rust '
+            'project is never false-alarmed; a Rust project declares them here.'
+        ),
+    )
     verify_host_unreachable_escalate_after_n: int = Field(
         default=3,
         ge=1,
@@ -5290,6 +5360,37 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
+
+    @field_validator('verify_env_probes', mode='after')
+    @classmethod
+    def _reject_duplicate_env_probe_keys(
+        cls, v: list[EnvProbeConfig],
+    ) -> list[EnvProbeConfig]:
+        """Reject colliding probe keys at load time (task 4537).
+
+        capture_env_fingerprint writes each probe into ``extra_probes[key]``,
+        which is LAST-WRITE-WINS.  A duplicated key therefore drops one of the
+        operator's probes from the comparison on BOTH hosts while still paying
+        its ssh round trip — a tool the operator believes is watched but is
+        not.  That is the same silent-no-op class the ``argv`` min_length and
+        the empty-``dimensions`` guard reject, and it is invisible from the
+        emitted events (they report the surviving value under the shared key),
+        so it has to fail at construction/reload instead.
+        """
+        seen: set[str] = set()
+        dupes: list[str] = []
+        for probe in v:
+            if probe.key in seen and probe.key not in dupes:
+                dupes.append(probe.key)
+            seen.add(probe.key)
+        if dupes:
+            raise ValueError(
+                f'verify_env_probes has duplicate key(s): {dupes!r}.  '
+                f'extra_probes[key] is last-write-wins, so each collision '
+                f'silently drops a declared probe from the comparison.  Give '
+                f'each probe a distinct key.'
+            )
+        return v
 
     @field_validator('verify_admission_pytest_n', mode='before')
     @classmethod
