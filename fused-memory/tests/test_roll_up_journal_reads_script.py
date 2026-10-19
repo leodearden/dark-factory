@@ -229,35 +229,80 @@ class TestMigrateApply:
         assert report['seconds'] < 0.4
 
 
-class TestPrewarmOutsideTheWriteLock:
-    def test_every_prewarm_runs_before_its_begin_and_never_inside_a_transaction(
-        self, journal, capsys, monkeypatch,
-    ):
+class TestTheWriteLockHold:
+    """What happens before BEGIN, inside the lock, and after COMMIT, seen through
+    the public connect_for_migration seam with SQLite's own statement trace."""
+
+    @pytest.fixture
+    def traced(self, journal, capsys, monkeypatch):
         statements: list[str] = []
+        callbacks: list = []
         connect = _script.connect_for_migration
 
         def tracing_connect(path):
             conn = connect(path)
-            conn.set_trace_callback(statements.append)
+            conn.set_trace_callback(lambda text: (statements.append(text), *(cb(text) for cb in callbacks)))
             return conn
 
         monkeypatch.setattr(_script, 'connect_for_migration', tracing_connect)
+        return statements, callbacks
+
+    def test_each_chunk_prewarms_then_locks_then_commits_then_checkpoints(
+        self, journal, capsys, traced,
+    ):
+        statements, _ = traced
+        prewarm_text = PREWARM_PRIMARY_KEY_SQL.split('?')[0]
 
         code, report, err = _migrate(journal, capsys)
 
         assert code == 0, err
         assert report is not None and report['chunks'] > 1
+        phases = {
+            'BEGIN IMMEDIATE': 'begin',
+            'COMMIT': 'commit',
+            'PRAGMA wal_checkpoint(PASSIVE)': 'checkpoint',
+        }
+        kinds = [
+            'prewarm' if statement.startswith(prewarm_text) else phases[statement]
+            for statement in statements
+            if statement.startswith(prewarm_text) or statement in phases
+        ]
+        assert kinds == ['prewarm', 'begin', 'commit', 'checkpoint'] * report['chunks']
+
+    def test_the_migration_connection_never_checkpoints_inside_a_commit(self, journal):
+        conn = _script.connect_for_migration(journal)
+        try:
+            assert conn.execute('PRAGMA wal_autocheckpoint').fetchone() == (0,)
+        finally:
+            conn.close()
+
+    def test_the_reported_lock_hold_spans_only_the_transaction(
+        self, journal, capsys, traced,
+    ):
+        _, callbacks = traced
         prewarm_text = PREWARM_PRIMARY_KEY_SQL.split('?')[0]
-        kinds = []
-        for statement in statements:
-            if statement.startswith(prewarm_text):
-                kinds.append('prewarm')
-            elif statement == 'BEGIN IMMEDIATE':
-                kinds.append('begin')
-            elif statement == 'COMMIT':
-                kinds.append('commit')
-        chunk = ['prewarm', 'begin', 'commit']
-        assert kinds == chunk * report['chunks']
+        delayed_delete = []
+
+        def slow_outside_then_once_inside(text: str) -> None:
+            if text.startswith(prewarm_text):
+                time.sleep(0.2)
+            elif text.startswith('DELETE FROM write_ops') and not delayed_delete:
+                delayed_delete.append(text)
+                time.sleep(0.1)
+
+        callbacks.append(slow_outside_then_once_inside)
+
+        code, report, err = _migrate(journal, capsys)
+
+        assert code == 0, err
+        assert report is not None and report['chunks'] > 1
+        assert (
+            report['max_chunk_seconds']
+            >= 0.2
+            > report['max_lock_seconds']
+            >= 0.1
+            > report['mean_lock_seconds']
+        )
 
 
 def _snapshot(journal: Path, capsys, out: Path, *extra: str) -> int:

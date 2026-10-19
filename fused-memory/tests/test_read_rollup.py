@@ -364,6 +364,10 @@ class TestMigrationQueryPlans:
 
         assert plan == 'SCAN write_ops', plan
 
+    def test_the_prewarm_selects_exactly_the_rows_the_delete_removes(self):
+        assert COUNT_ONLY_READ_PREDICATE in PREWARM_PRIMARY_KEY_SQL
+        assert COUNT_ONLY_READ_PREDICATE in DELETE_COUNT_ONLY_READS_SQL
+
     def test_the_prewarm_walks_the_primary_key_index_for_the_rowid_range_only(self, live_shaped_db):
         plan = self._plan(live_shaped_db, PREWARM_PRIMARY_KEY_SQL, (1, 5001))
 
