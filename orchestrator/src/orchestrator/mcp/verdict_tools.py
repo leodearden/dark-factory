@@ -404,8 +404,6 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             resolve_root=lambda worktree: _markup_project_root(worktree),
         ),
     ))
-    # Any tool call missing a required argument gets a structured refusal
-    # instead of pydantic's raw text (shared/src/shared/mcp_missing_arguments.py).
     mcp.add_middleware(MissingArgumentMiddleware())
 
     if role == 'judge':

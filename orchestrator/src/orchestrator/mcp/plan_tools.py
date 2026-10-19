@@ -2281,8 +2281,6 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             fact_sink=_markup_fact_sink(artifacts),
         )
     )
-    # Any tool call missing a required argument gets a structured refusal
-    # instead of pydantic's raw text (shared/src/shared/mcp_missing_arguments.py).
     mcp.add_middleware(MissingArgumentMiddleware())
 
     @mcp.tool()
