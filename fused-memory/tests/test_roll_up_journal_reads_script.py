@@ -284,7 +284,7 @@ class TestTheWriteLockHold:
         delayed_delete = []
 
         def slow_outside_then_once_inside(text: str) -> None:
-            if text.startswith(prewarm_text):
+            if text.startswith(prewarm_text) or text == 'PRAGMA wal_checkpoint(PASSIVE)':
                 time.sleep(0.2)
             elif text.startswith('DELETE FROM write_ops') and not delayed_delete:
                 delayed_delete.append(text)

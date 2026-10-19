@@ -439,7 +439,7 @@ in-lock reads 7.15 MiB -> 0.06-0.3 MiB. Everything inside the transaction is
 unchanged and durability stays `synchronous=FULL`. A row changing between
 prewarm and lock costs only time. `TestMigrationQueryPlans` pins the prewarm's
 plan (including the index's SQLite-generated name, so a rename fails loudly)
-and `TestPrewarmOutsideTheWriteLock` pins its position before `BEGIN`.
+and `fused-memory/tests/test_roll_up_journal_reads_script.py::TestTheWriteLockHold` pins its position before `BEGIN` and the checkpoint after `COMMIT`.
 
 `migrate`'s report now carries `mean_lock_seconds` and `max_lock_seconds`,
 timed from `BEGIN IMMEDIATE` returning to `COMMIT` returning, next to
