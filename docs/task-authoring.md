@@ -1904,20 +1904,35 @@ either key must also pass the whole list through
 - **`defects`**: a list of `DefectDeclaration` records, one per declared
   defect, each keyed by its ref.
   - *Who writes it:* at creation, `submit_task` accepts only fresh `open`
-    entries. After creation only `declare_defect` and
-    `record_defect_outcome` write it, never `update_task`; the PRD's α2 leaf
-    builds those two tools and the `update_task` refusal. A defect leaves
-    `open` only through a recorded I2 transition
+    entries and refuses anything else synchronously with
+    `error == 'defect_creation_refused'`, naming the allowed values. After
+    creation `declare_defect` (`Declare`, `DeclareClosure`, `Sighting`) and
+    `record_defect_outcome` (`Proof`, `Rule`) are its only writers. A
+    defect leaves `open` only through a recorded I2 transition
     (`shared/src/shared/defects.py::apply_event`).
   - *PRD:* `plans/defect-tests-prd.md` decisions 7, 13 and 15; Contract I1
     and I2.
 - **`defect_test_retirements`**: a list of `Retirement` records, carried on
   the task whose diff removes a proven defect's test, not on the defect's
   own task.
-  - *Who writes it:* declared through `declare_defect` (a
+  - *Who writes it:* at creation, `submit_task` accepts only unruled
+    entries. After creation it is declared through `declare_defect` (a
     `DeclareRetirement` event) and ruled through `record_defect_outcome` (a
     `Rule` event).
   - *PRD:* `plans/defect-tests-prd.md` decisions 13 and 14.
+
+**The write path** for both keys is
+`fused-memory/src/fused_memory/backends/defect_records.py`, which holds the
+creation floor, the per-ref event fold and the typed refusals; read the
+rules there rather than here. `record_defect_outcome` is called only by the
+orchestrator workflow and `scripts/prove_defect.py`; no dispatched role's
+`allowed_tools` grants it (pinned by
+`orchestrator/tests/test_role_defect_outcome_authority.py`). A
+`duplicate_of` or `superseded_by` ref must already be declared on some task,
+which `lookup_defect_ref` answers. `update_task` never writes either key: it
+refuses one with `error == 'defect_records_via_update_task'`, except under
+`metadata_mode='replace'` when the payload carries the stored value through
+verbatim, the same rule as `done_provenance` above.
 
 **Census corollary:** like `delivered_checks` above, both registrations are
 an import side effect of `shared.defects`, so a census script must import
