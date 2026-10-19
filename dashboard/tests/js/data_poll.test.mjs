@@ -894,7 +894,7 @@ test("preserved behaviour: refreshDFData(win) updates the ?window= param on the 
 // Slowness pacing (task 5823)
 //
 // A slow-but-successful endpoint is paced by its own measured service time.
-// The rule and its threshold live beside data.js::recordSuccess.
+// The rule and its threshold live beside data.js::slownessPacingHoldMs.
 // ---------------------------------------------------------------------------
 
 const SCHEDULER_PATH = '/api/v2/dashboard/scheduler';

@@ -751,7 +751,7 @@ test('plainDatum: the BASE bound is four poll intervals — an unpaced endpoint,
   // data.js polls every POLL_INTERVAL_MS=3000 with JITTER_MAX_MS=1500, so an
   // UNPACED endpoint's receipt is at most ~4.5s old; 12s leaves 7.5s of
   // headroom and no twitch. A paced receipt adds its pacingHoldMs on top,
-  // keeping that same headroom; data.js::recordSuccess paces.
+  // keeping that same headroom; data.js::slownessPacingHoldMs sets it.
   // endpoint_staleness.js calls an endpoint stale at 3 consecutive failures
   // (~21s of backoff), so the tile badge is the first per-VALUE signal and the
   // banner the later per-ENDPOINT explanation — deliberately ordered
