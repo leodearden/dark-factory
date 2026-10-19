@@ -28,10 +28,29 @@ not tied. Otherwise :func:`score_reader` raises
 incomplete corpus must not read as a result. A binary the derivation never
 asks for needs no rating, and a missing ``attach_time`` judgement never
 refuses (M6 is report-only).
+
+Usage
+-----
+Run from ``fused-memory/``. This scores the committed soak baseline::
+
+    uv run python scripts/score_write_triage_reader.py \
+        --items calibration/write_triage_v2_soak_items.jsonl \
+        --verdicts calibration/write_triage_v2_soak_verdicts.jsonl \
+        --strata calibration/write_triage_v2_soak_strata.json \
+        --out calibration/write_triage_v2_soak_baseline.json \
+        --markdown calibration/write_triage_v2_soak_baseline.md
+
+``--items`` and ``--verdicts`` each take one or more JSONL files.
+``--harm-weights`` takes a JSON ``{cell: weight}`` map in place of the
+provisional weights. The report is printed to stdout, and also written to
+``--out`` and, rendered, to ``--markdown`` when given. A refusal exits 1,
+prints one stderr line per gap, and writes nothing.
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
+import json
 import math
 import sys
 import types
@@ -634,3 +653,217 @@ def _harm_figures(
         delta_per_write=_stats.stratified_ratio(delta, weights),
         delta_interval95=_bootstrap(delta, weights),
     )
+
+
+_METRIC_KEYS = (
+    'n', 'hits', 'rate', 'wilson95', 'population_rate', 'population_interval95', 'unclear',
+)
+_ROUTE_LABELS = {'direct': 'direct', 'via_sibling': 'via_sibling', 'unknown': 'unknown route'}
+_CATEGORY_LABELS = {'same': 'same category', 'cross': 'cross category', 'unknown': 'unknown category'}
+
+
+def render_markdown(report: Mapping[str, Any]) -> str:
+    """*report* as Markdown tables; the same report always renders to the same text."""
+    sections = [
+        _summary_markdown(report),
+        _metrics_markdown(report['metrics']),
+        _cells_markdown(report),
+        _harm_markdown(report),
+        _kappa_markdown(report['kappa']),
+    ]
+    return '\n\n'.join(sections) + '\n'
+
+
+def _shown(value: Any) -> str:
+    if value is None:
+        return '—'
+    if isinstance(value, bool):
+        return 'yes' if value else 'no'
+    return str(value)
+
+
+def _table(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> str:
+    lines = [f'| {" | ".join(header)} |', f'|{"---|" * len(header)}']
+    lines += [f'| {" | ".join(_shown(cell) for cell in row)} |' for row in rows]
+    return '\n'.join(lines)
+
+
+def _listed(counts: Mapping[str, Any]) -> str:
+    return ', '.join(f'{key} {value}' for key, value in counts.items())
+
+
+def _summary_markdown(report: Mapping[str, Any]) -> str:
+    population = report['population']
+    strata = population['strata']
+    return '\n'.join([
+        f'# Write-triage reader report (rubric {report["rubric"]})',
+        '',
+        f'Items: {population["n_items"]} (decided {population["decided"]},'
+        f' unclear {population["unclear"]}). By outcome: {_listed(population["by_outcome"])}.',
+        f'Sampled per stratum: {_listed(population["by_stratum"])}.',
+        f'Stratum populations: {_listed(strata)}.' if strata is not None
+        else 'Stratum populations: none given, so every population figure is empty.',
+        f'Bootstrap: {report["bootstrap"]["resamples"]} resamples, seed {report["bootstrap"]["seed"]}.',
+    ])
+
+
+def _metrics_markdown(metrics: Mapping[str, Any]) -> str:
+    blocks: list[tuple[str, Mapping[str, Any]]] = [('M1', metrics['m1'])]
+    blocks += [(f'M2 {outcome}', block) for outcome, block in metrics['m2'].items()]
+    blocks += [('M3', metrics['m3']), ('M4', metrics['m4'])]
+    blocks += [(f'M4 {_ROUTE_LABELS[key]}', block) for key, block in metrics['m4']['by_route'].items()]
+    blocks += [
+        (f'M4 {_CATEGORY_LABELS[key]}', block) for key, block in metrics['m4']['by_category'].items()
+    ]
+    blocks.append(('M5', metrics['m5']))
+    m6 = metrics['m6']
+    rows = [[label, *(block[key] for key in _METRIC_KEYS)] for label, block in blocks]
+    rows.append(['M6', m6['attach_time_rated'], m6['drifted'], None, None, None, None,
+                 m6['attach_time_undecided']])
+    header = ['metric', 'n', 'hits', 'rate', 'Wilson 95%', 'population rate', 'population 95%',
+              'unclear']
+    return '\n'.join([
+        '## Metrics',
+        '',
+        _table(header, rows),
+        '',
+        f'- M1: items of unknown band (outside M1): {metrics["m1"]["band_unknown"]}.',
+        f'- M3 by ending: {_listed(metrics["m3"]["by_ending"])}.',
+        f'- M5 by scope: {_listed(metrics["m5"]["by_scope"])}.',
+        f'- M6: n is attach-time-rated items, hits the drifted ones'
+        f' ({", ".join(m6["drifted_entry_ids"]) or "none"}); parent edited after attach'
+        f' {m6["parent_edited"]}, of which unrated at attach time {m6["attach_time_unrated"]}.',
+    ])
+
+
+def _cells_markdown(report: Mapping[str, Any]) -> str:
+    cells = report['cells']
+    rows = [
+        [cell, count, cells['status_quo'][cell], report['harm_weights'].get(cell),
+         report['cell_rules'][cell]]
+        for cell, count in cells['triage'].items()
+    ]
+    return '\n'.join([
+        '## Cells',
+        '',
+        _table(['cell', 'triage', 'status quo', 'weight', 'rule'], rows),
+    ])
+
+
+def _harm_markdown(report: Mapping[str, Any]) -> str:
+    harm = report['harm']
+
+    def regimes(per_write: Mapping[str, Any] | None) -> list[Any]:
+        return [None, None] if per_write is None else [per_write['triage'], per_write['status_quo']]
+
+    return '\n'.join([
+        f'## Harm per write (weights: {report["harm_weights_status"]})',
+        '',
+        _table(['figure', 'triage', 'status quo', 'delta', 'delta 95%'], [
+            ['per write (sample)', *regimes(harm['per_write']),
+             harm['delta_per_write'], harm['delta_interval95']],
+            ['per write (population)', *regimes(harm['population_per_write']),
+             harm['population_delta_per_write'], harm['population_delta_interval95']],
+        ]),
+        '',
+        f'Over {harm["n"]} decided writes; unclear writes left out: {harm["unclear"]}.',
+    ])
+
+
+def _kappa_markdown(kappa: Mapping[str, Any]) -> str:
+    rows = [
+        [binary, block['n_overlap'], block['kappa'], block['floor_met']]
+        for binary, block in kappa['by_binary'].items()
+    ]
+    return '\n'.join([
+        '## Rater agreement (primary vs second)',
+        '',
+        f'Floor: kappa >= {kappa["floor"]} on at least {kappa["min_overlap"]} doubly rated pairs.',
+        '',
+        _table(['binary', 'n overlap', 'kappa', 'floor met'], rows),
+    ])
+
+
+def _read_jsonl(paths: Sequence[Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        with path.open() as lines:
+            for number, line in enumerate(lines, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f'{path}:{number}: not a JSON object line ({exc.msg})') from exc
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f'{path}:{number}: not a JSON object line (got {type(row).__name__})'
+                    )
+                rows.append(row)
+    return rows
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f'{path}: not a JSON object (got {type(value).__name__})')
+    return value
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Score write-triage outcomes by what a reader meets (rubric v2): metrics M1-M6,'
+            ' rater agreement and harm per write against storing every write flat.'
+            ' Definitions: fused-memory/calibration/write_triage_reader_metrics.md.'
+        ),
+    )
+    parser.add_argument(
+        '--items', type=Path, nargs='+', required=True, metavar='PATH',
+        help='JSONL item rows, one per write, in one or more files',
+    )
+    parser.add_argument(
+        '--verdicts', type=Path, nargs='+', required=True, metavar='PATH',
+        help='JSONL verdict files, read together as one corpus',
+    )
+    parser.add_argument(
+        '--strata', type=Path, metavar='PATH',
+        help='JSON {stratum: population}; adds population-weighted figures',
+    )
+    parser.add_argument(
+        '--harm-weights', type=Path, metavar='PATH',
+        help='JSON {cell: weight} in place of the provisional weights',
+    )
+    parser.add_argument('--out', type=Path, metavar='PATH', help='also write the report here')
+    parser.add_argument(
+        '--markdown', type=Path, metavar='PATH', help='also write the rendered report here',
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        report = score_reader(
+            _read_jsonl(args.items),
+            _read_jsonl(args.verdicts),
+            strata=None if args.strata is None else _read_json_object(args.strata),
+            harm_weights=(
+                PROVISIONAL_HARM_WEIGHTS if args.harm_weights is None
+                else _read_json_object(args.harm_weights)
+            ),
+        )
+    except IncompleteJudgementError as refusal:
+        print(refusal, file=sys.stderr)
+        return 1
+    text = json.dumps(report, indent=2)
+    print(text)
+    for path, content in ((args.out, text + '\n'), (args.markdown, render_markdown(report))):
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
