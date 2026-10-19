@@ -1,7 +1,8 @@
 """Dispatch wiring for re-cut rulings (task 3154).
 
 Harness._run_slot executes a pending ruling before any workflow exists, or
-blocks the task with a design_concern L1.
+blocks the task with a design_concern L1; the workflow hands the same
+dispatch-time ruling to create_worktree as the redundant second check.
 
 Scaffolding (_make_slot_harness/_make_mock_workflow) is copied from
 test_cross_repo_gate.py, matching this repo's per-test-file helper convention.
@@ -10,11 +11,13 @@ test_cross_repo_gate.py, matching this repo's per-test-file helper convention.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _workflow_helpers import _make_warmlane_workflow
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -22,6 +25,7 @@ from orchestrator.recut_ruling import (
     RECUT_EXECUTED_KEY,
     RECUT_RULING_KEY,
     ParkedIncarnation,
+    RecutRuling,
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
@@ -247,3 +251,59 @@ class TestRunSlotRecutGate:
         assert 'no ruling was read' in caplog.text
         h.git_ops.park_prior_incarnation.assert_not_awaited()
         assert build.called
+
+
+class _ProvisioningStopped(RuntimeError):
+    """Raised by the fake create_worktree so a run stops right after provisioning."""
+
+
+async def _run_to_provisioning(tmp_path: Path, metadata: Any) -> tuple[AsyncMock, Any]:
+    """Drive TaskWorkflow.run() up to create_worktree; return (create_worktree, report)."""
+    wf = _make_warmlane_workflow(tmp_path=tmp_path, task_id=TID)
+    if metadata is not None:
+        wf.task['metadata'] = metadata
+    create_worktree = AsyncMock(side_effect=_ProvisioningStopped('stop after provisioning'))
+    wf.git_ops.create_worktree = create_worktree
+    statuses = {TID: 'pending'}
+
+    async def _set_status(task_id: str, status: str, **_kwargs: Any) -> None:
+        statuses[task_id] = status
+
+    async def _get_status(task_id: str) -> str | None:
+        return statuses.get(task_id)
+
+    async def _mark_blocked(*_args: Any, **_kwargs: Any) -> WorkflowOutcome:
+        await _set_status(TID, 'blocked')
+        return WorkflowOutcome.BLOCKED
+
+    wf.scheduler.set_task_status = AsyncMock(side_effect=_set_status)
+    wf.scheduler.get_status = AsyncMock(side_effect=_get_status)
+    wf._mark_blocked = AsyncMock(side_effect=_mark_blocked)  # type: ignore[method-assign]
+    return create_worktree, await wf.run()
+
+
+@pytest.mark.asyncio
+class TestWorkflowPassesRulingToProvisioning:
+    async def test_pending_ruling_reaches_create_worktree(self, tmp_path: Path):
+        create_worktree, _ = await _run_to_provisioning(tmp_path, PENDING)
+
+        assert create_worktree.await_args.kwargs['recut_ruling'] == RecutRuling(
+            RULING_ID, datetime(2026, 8, 30, tzinfo=UTC),
+        )
+
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(None, id='no-marker'),
+        pytest.param({**PENDING, RECUT_EXECUTED_KEY: {'ruling_id': RULING_ID}}, id='satisfied'),
+    ])
+    async def test_nothing_pending_passes_none(self, tmp_path: Path, metadata: Any):
+        create_worktree, _ = await _run_to_provisioning(tmp_path, metadata)
+
+        assert create_worktree.await_args.kwargs['recut_ruling'] is None
+
+    async def test_malformed_ruling_blocks_before_provisioning(self, tmp_path: Path):
+        create_worktree, report = await _run_to_provisioning(
+            tmp_path, {RECUT_RULING_KEY: {'ruling_id': RULING_ID}},
+        )
+
+        create_worktree.assert_not_awaited()
+        assert report.outcome == WorkflowOutcome.BLOCKED
