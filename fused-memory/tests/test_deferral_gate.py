@@ -90,7 +90,7 @@ class Stack:
 
     async def journal_rows(self, operation: str) -> list[dict]:
         return [
-            row for row in await self.journal.get_ops_since('1970-01-01', limit=10_000)
+            row for row in await self.journal.get_stored_ops_since('1970-01-01', limit=10_000)
             if row['operation'] == operation
         ]
 
