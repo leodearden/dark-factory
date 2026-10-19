@@ -297,6 +297,108 @@ async def test_inflow_daily_composition_survives_the_rollup_boundary(recon_db):
     }
 
 
+# ── inflow across the lever-3 boundary ─────────────────────────────────
+#
+# Task 4278 folds repeat task events into one buffered row at push time and
+# counts each folded event in event_coalesced_hourly.  Inflow keeps meaning
+# "every event producers emitted"; the 'coalesced' sub-map says how many of
+# them never became a row, so total - coalesced is the drain demand.
+
+
+@pytest.mark.asyncio
+async def test_inflow_counts_folded_events_as_arrivals(recon_db):
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 4)
+    assert await recon_db.count_buffered('reify') == 1
+
+    assert inflow_hourly(db, 'reify') == {'2026-07-25T13': 4}
+    assert inflow_daily(db, 'reify')['total_events'] == 4
+
+
+_THREE_FOLDS_AT_H13 = {
+    'daily': {'2026-07-25': 3},
+    'composition': {'task_status_changed': 3},
+    'total_events': 3,
+}
+
+
+@pytest.mark.asyncio
+async def test_inflow_daily_reports_the_folded_share(recon_db):
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 4)
+
+    daily = inflow_daily(recon_db._db_path, 'reify')
+    assert daily['coalesced'] == _THREE_FOLDS_AT_H13
+    assert daily['total_events'] - daily['coalesced']['total_events'] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_folded_share_survives_the_rollup_boundary(recon_db):
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 4)
+    await recon_db.drain('reify', run_id='r')
+    assert await recon_db.cleanup_drained(max_age_seconds=0) == 1
+
+    daily = inflow_daily(db, 'reify')
+    assert daily['total_events'] == 4
+    assert daily['coalesced'] == _THREE_FOLDS_AT_H13
+
+
+@pytest.mark.asyncio
+async def test_since_floors_the_folded_share_like_every_other_key(recon_db):
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 2)
+    await _push_task_events(
+        recon_db, '644', EventType.task_status_changed, 2, timestamp=_H14)
+
+    floored = inflow_daily(db, 'reify', since='2026-07-25T14')
+    assert floored['total_events'] == 2
+    assert floored['coalesced'] == {
+        'daily': {'2026-07-25': 2},
+        'composition': {'task_status_changed': 2},
+        'total_events': 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_database_without_the_fold_table_reports_no_folds(recon_db):
+    db = recon_db._db_path
+    await _seed_inflow(recon_db)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute('DROP TABLE event_coalesced_hourly')
+        conn.commit()
+    finally:
+        conn.close()
+
+    daily = inflow_daily(db, 'reify')
+    assert daily['total_events'] == 7
+    assert daily['coalesced'] == {'daily': {}, 'composition': {}, 'total_events': 0}
+
+
+@pytest.mark.asyncio
+async def test_build_report_carries_the_folded_share(recon_db):
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 4)
+
+    report = build_report(db, 'reify')
+    assert report['inflow']['coalesced'] == inflow_daily(db, 'reify')['coalesced']
+    assert report['inflow']['coalesced']['total_events'] == 3
+
+
+@pytest.mark.asyncio
+async def test_main_without_json_states_the_folded_share(recon_db, capsys):
+    db = recon_db._db_path
+    await _push_task_events(recon_db, '644', EventType.task_status_changed, 4)
+
+    assert main(['--db', str(db), '--project', 'reify']) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert any(
+        'coalesced at push: 3' in line and 'rows reaching the buffer: 1' in line
+        for line in lines
+    ), lines
+
+
 # ── inflow_concentration ───────────────────────────────────────────────
 #
 # Per-event_type composition cannot tell organic growth from one task looping
