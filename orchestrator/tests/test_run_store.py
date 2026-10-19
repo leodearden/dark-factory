@@ -1043,6 +1043,7 @@ class TestGetTaskOutcome:
             'verify_attempts': 3,
             'review_cycles': 1,
             'steward_cost_usd': 0.4,
+            'steward_invocations': 2,
             'completed_at': '2026-10-18T09:00:00+00:00',
             'block_reason': '',
             'block_phase': '',
@@ -1073,6 +1074,7 @@ class TestGetTaskOutcome:
             outcome=WorkflowOutcome.DONE,
             cost_usd=1.25,
             steward_cost_usd=0.4,
+            steward_invocations=2,
             duration_ms=42_000,
             agent_invocations=6,
             execute_iterations=2,
@@ -1141,6 +1143,33 @@ class TestGetTaskOutcome:
             store.get_task_outcome('dark_factory', '777')
         assert '777' in str(excinfo.value)
         assert 'garbage' in str(excinfo.value)
+
+    def test_null_costs_and_counters_read_as_zero(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-a', 'dark_factory', '2026-10-18T00:00:00+00:00')
+        numeric = (
+            'cost_usd', 'steward_cost_usd', 'steward_invocations', 'duration_ms',
+            'agent_invocations', 'execute_iterations', 'verify_attempts', 'review_cycles',
+        )
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                'INSERT INTO task_results (run_id, task_id, project_id, outcome, '
+                f'{", ".join(numeric)}) VALUES (?, ?, ?, ?, {", ".join("NULL" for _ in numeric)})',
+                ('run-a', '777', 'dark_factory', 'done'),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record is not None
+        assert {name: getattr(record, name) for name in numeric} == dict.fromkeys(numeric, 0)
+        assert isinstance(record.cost_usd, float)
+        assert isinstance(record.steward_cost_usd, float)
+        assert isinstance(record.steward_invocations, int)
 
     @pytest.mark.parametrize('field_name', ['outcome', 'run_id', 'completed_at'])
     def test_the_record_is_frozen(self, tmp_path, field_name):

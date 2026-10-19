@@ -9,7 +9,7 @@ from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_type_hints
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
@@ -239,7 +239,11 @@ def _require_valid_parent(conn: sqlite3.Connection, cell: ShadowCell) -> None:
 
 @dataclass(frozen=True)
 class TaskResultRecord:
-    """One typed ``task_results`` row; NULL block fields mean the row predates task 3068."""
+    """One typed ``task_results`` row.
+
+    A NULL cost or counter reads 0, as in ``RunStore.get_task_cost``; NULL block
+    fields mean the row predates task 3068.
+    """
 
     run_id: str
     project_id: str
@@ -248,6 +252,7 @@ class TaskResultRecord:
     outcome: WorkflowOutcome
     cost_usd: float
     steward_cost_usd: float
+    steward_invocations: int
     duration_ms: int
     agent_invocations: int
     execute_iterations: int
@@ -259,6 +264,9 @@ class TaskResultRecord:
 
 
 _TASK_RESULT_COLUMNS = tuple(field.name for field in fields(TaskResultRecord))
+_TASK_RESULT_NUMERIC_TYPES = {
+    name: hint for name, hint in get_type_hints(TaskResultRecord).items() if hint in (int, float)
+}
 
 
 def _task_result_from_row(row: sqlite3.Row) -> TaskResultRecord:
@@ -270,6 +278,8 @@ def _task_result_from_row(row: sqlite3.Row) -> TaskResultRecord:
             f'task_results row for task {values["task_id"]!r} (run {values["run_id"]!r}): '
             f'unknown outcome {values["outcome"]!r}'
         ) from None
+    for name, numeric_type in _TASK_RESULT_NUMERIC_TYPES.items():
+        values[name] = numeric_type(values[name] or 0)
     values['completed_at'] = (
         datetime.fromisoformat(values['completed_at']) if values['completed_at'] else None
     )
