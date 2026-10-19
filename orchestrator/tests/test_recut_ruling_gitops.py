@@ -4,11 +4,11 @@ park_prior_incarnation renames a task's prior incarnation aside and never
 resets or deletes; prior_incarnation_evidence lists what survives; the two
 provisioning doors refuse a pending ruling while any of it survives.
 
-Self-contained, mirroring test_lane_lifecycle_gitops.py's fixtures.
+Fixtures mirror test_lane_lifecycle_gitops.py's; the repo comes from
+_git_fixtures.seed_repo.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -53,21 +54,10 @@ REUSE_ROUTES = (
 )
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """A repo with an initial commit, a resolvable warm base and `.pool-root`."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     default_base = repo / '.worktrees' / '_merge-verify' / 'target'
     default_base.mkdir(parents=True, exist_ok=True)
     (default_base / '.keep').write_text('warm base sentinel\n')

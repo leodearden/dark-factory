@@ -11,6 +11,7 @@ test_cross_repo_gate.py, matching this repo's per-test-file helper convention.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,21 @@ RECOVERED_PLAN = {'task_id': TID, 'steps': [{'id': 'step-1', 'status': 'done'}]}
 RECOVERED_SESSION = {'session_id': 'sess-pre-ruling', 'role': 'implementer'}
 
 
-def _make_slot_harness(tmp_path: Path):
+@dataclass
+class _Slot:
+    """A slot-ready Harness plus typed handles on the doubles it was given."""
+
+    harness: Any
+    park: AsyncMock
+    evidence: AsyncMock
+    update_task: AsyncMock
+    set_task_status: AsyncMock
+    release: MagicMock
+    session_reasons: MagicMock
+    queue: EscalationQueue
+
+
+def _make_slot_harness(tmp_path: Path) -> _Slot:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.harness import Harness
 
@@ -55,28 +70,52 @@ def _make_slot_harness(tmp_path: Path):
     ):
         h = Harness(config)
 
-    h.scheduler = MagicMock()
-    h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.is_deterministic = MagicMock(return_value=False)
-    h.scheduler.update_task = AsyncMock(return_value=True)
-    h.scheduler.release = MagicMock()
-    h.scheduler._dispatched = set()
+    slot = _Slot(
+        harness=h,
+        park=AsyncMock(return_value=PARKED),
+        evidence=AsyncMock(return_value=()),
+        update_task=AsyncMock(return_value=True),
+        set_task_status=AsyncMock(),
+        release=MagicMock(),
+        session_reasons=MagicMock(return_value=frozenset()),
+        queue=EscalationQueue(tmp_path / 'esc'),
+    )
+    scheduler = MagicMock()
+    scheduler.set_task_status = slot.set_task_status
+    scheduler.is_deterministic = MagicMock(return_value=False)
+    scheduler.update_task = slot.update_task
+    scheduler.release = slot.release
+    scheduler._dispatched = set()
+    h.scheduler = scheduler
 
-    h.git_ops = MagicMock()
-    h.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' * 5)
-    h.git_ops.worktree_base = tmp_path / '.worktrees'
-    h.git_ops.project_root = tmp_path
-    h.git_ops.prune_worktrees = AsyncMock(return_value=None)
-    h.git_ops.park_prior_incarnation = AsyncMock(return_value=PARKED)
-    h.git_ops.prior_incarnation_evidence = AsyncMock(return_value=())
+    git_ops = MagicMock()
+    git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' * 5)
+    git_ops.worktree_base = tmp_path / '.worktrees'
+    git_ops.project_root = tmp_path
+    git_ops.prune_worktrees = AsyncMock(return_value=None)
+    git_ops.park_prior_incarnation = slot.park
+    git_ops.prior_incarnation_evidence = slot.evidence
+    h.git_ops = git_ops
 
-    h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    h._escalation_queue = slot.queue
     h._run_id = None
     h.event_store = None
     h._recovered_plans[TID] = RECOVERED_PLAN
     h._recovered_sessions[TID] = RECOVERED_SESSION
-    h._session_resume_reasons = MagicMock(return_value=frozenset())
-    return h
+    h._session_resume_reasons = slot.session_reasons
+    return slot
+
+
+def _rewire(slot: _Slot, *, park: AsyncMock | None = None,
+            evidence: AsyncMock | None = None,
+            update_task: AsyncMock | None = None) -> None:
+    """Swap the gate's collaborators on both the slot and its harness."""
+    if park is not None:
+        slot.park = slot.harness.git_ops.park_prior_incarnation = park
+    if evidence is not None:
+        slot.evidence = slot.harness.git_ops.prior_incarnation_evidence = evidence
+    if update_task is not None:
+        slot.update_task = slot.harness.scheduler.update_task = update_task
 
 
 def _make_mock_workflow():
@@ -105,7 +144,7 @@ def _assignment(metadata: Any) -> TaskAssignment:
     )
 
 
-async def _run(h, metadata: Any, calls: list[str] | None = None):
+async def _run(slot: _Slot, metadata: Any, calls: list[str] | None = None):
     """Run one slot; return (report, build_workflow mock)."""
     sem = MagicMock()
     sem.release = MagicMock()
@@ -116,7 +155,7 @@ async def _run(h, metadata: Any, calls: list[str] | None = None):
             return _make_mock_workflow()
 
         build.side_effect = _build
-        report = await h._run_slot(_assignment(metadata), sem)
+        report = await slot.harness._run_slot(_assignment(metadata), sem)
     return report, build
 
 
@@ -128,18 +167,18 @@ def _record(calls: list[str], name: str, result: object) -> AsyncMock:
     return AsyncMock(side_effect=_call)
 
 
-def _pending_l1s(h) -> list[Escalation]:
-    return [e for e in h._escalation_queue.get_pending() if e.task_id == TID and e.level == 1]
+def _pending_l1s(slot: _Slot) -> list[Escalation]:
+    return [e for e in slot.queue.get_pending() if e.task_id == TID and e.level == 1]
 
 
-def _assert_refused(h, report, build) -> Escalation:
+def _assert_refused(slot: _Slot, report, build) -> Escalation:
     assert not build.called
     assert report is not None
     assert report.outcome == WorkflowOutcome.BLOCKED
     assert report.block_reason == 'recut_ruling_refused'
-    h.scheduler.set_task_status.assert_any_await(TID, 'blocked')
-    assert h.scheduler.release.call_args.kwargs.get('requeued') is True
-    l1s = _pending_l1s(h)
+    slot.set_task_status.assert_any_await(TID, 'blocked')
+    assert slot.release.call_args.kwargs.get('requeued') is True
+    l1s = _pending_l1s(slot)
     assert len(l1s) == 1, l1s
     assert l1s[0].category == 'design_concern'
     assert l1s[0].summary.startswith('RECUT_RULING_REFUSED')
@@ -149,11 +188,11 @@ def _assert_refused(h, report, build) -> Escalation:
 @pytest.mark.asyncio
 class TestRunSlotRecutGate:
     async def test_no_marker_never_enters_the_gate(self, tmp_path: Path):
-        h = _make_slot_harness(tmp_path)
+        slot = _make_slot_harness(tmp_path)
 
-        _, build = await _run(h, {'files': ['a.py']})
+        _, build = await _run(slot, {'files': ['a.py']})
 
-        h.git_ops.park_prior_incarnation.assert_not_awaited()
+        slot.park.assert_not_awaited()
         kwargs = build.call_args.kwargs
         assert kwargs['initial_plan'] == RECOVERED_PLAN
         assert kwargs['resume_session_id'] == RECOVERED_SESSION
@@ -161,68 +200,72 @@ class TestRunSlotRecutGate:
     async def test_pending_ruling_executes_before_the_workflow_exists(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
-        h = _make_slot_harness(tmp_path)
+        slot = _make_slot_harness(tmp_path)
         calls: list[str] = []
-        h.git_ops.park_prior_incarnation = _record(calls, 'park', PARKED)
-        h.git_ops.prior_incarnation_evidence = _record(calls, 'evidence', ())
-        h.scheduler.update_task = _record(calls, 'update_task', True)
+        _rewire(
+            slot,
+            park=_record(calls, 'park', PARKED),
+            evidence=_record(calls, 'evidence', ()),
+            update_task=_record(calls, 'update_task', True),
+        )
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            _, build = await _run(h, PENDING, calls)
+            _, build = await _run(slot, PENDING, calls)
 
         assert calls == ['park', 'evidence', 'update_task', 'build_workflow']
-        update_args = h.scheduler.update_task.await_args.args
-        assert update_args[0] == TID
-        assert update_args[1][RECUT_EXECUTED_KEY]['ruling_id'] == RULING_ID
+        update_call = slot.update_task.await_args
+        assert update_call is not None
+        assert update_call.args[0] == TID
+        assert update_call.args[1][RECUT_EXECUTED_KEY]['ruling_id'] == RULING_ID
         kwargs = build.call_args.kwargs
         assert kwargs['initial_plan'] is None
         assert kwargs['resume_session_id'] is None
-        h._session_resume_reasons.assert_not_called()
+        slot.session_reasons.assert_not_called()
         assert RULING_ID in caplog.text
         assert PARKED.parked_branch is not None
         assert PARKED.parked_branch in caplog.text
 
     async def test_satisfied_ruling_dispatches_without_parking(self, tmp_path: Path):
-        h = _make_slot_harness(tmp_path)
+        slot = _make_slot_harness(tmp_path)
         satisfied = {**PENDING, RECUT_EXECUTED_KEY: {'ruling_id': RULING_ID}}
 
-        _, build = await _run(h, satisfied)
+        _, build = await _run(slot, satisfied)
 
-        h.git_ops.park_prior_incarnation.assert_not_awaited()
+        slot.park.assert_not_awaited()
         assert build.called
 
     async def test_malformed_marker_blocks_and_files_l1(self, tmp_path: Path):
-        h = _make_slot_harness(tmp_path)
+        slot = _make_slot_harness(tmp_path)
 
-        report, build = await _run(h, {RECUT_RULING_KEY: {'ruling_id': RULING_ID}})
+        report, build = await _run(slot, {RECUT_RULING_KEY: {'ruling_id': RULING_ID}})
 
-        _assert_refused(h, report, build)
-        h.git_ops.park_prior_incarnation.assert_not_awaited()
+        _assert_refused(slot, report, build)
+        slot.park.assert_not_awaited()
 
     async def test_park_failure_blocks_naming_the_ruling(self, tmp_path: Path):
-        h = _make_slot_harness(tmp_path)
-        h.git_ops.park_prior_incarnation = AsyncMock(side_effect=RuntimeError('move failed'))
+        slot = _make_slot_harness(tmp_path)
+        _rewire(slot, park=AsyncMock(side_effect=RuntimeError('move failed')))
 
-        report, build = await _run(h, PENDING)
+        report, build = await _run(slot, PENDING)
 
-        l1 = _assert_refused(h, report, build)
+        l1 = _assert_refused(slot, report, build)
         assert RULING_ID in l1.summary + l1.detail
-        h.scheduler.update_task.assert_not_awaited()
+        slot.update_task.assert_not_awaited()
 
     async def test_failed_record_blocks_naming_the_parked_ref(self, tmp_path: Path):
-        h = _make_slot_harness(tmp_path)
-        h.scheduler.update_task = AsyncMock(return_value=False)
+        slot = _make_slot_harness(tmp_path)
+        _rewire(slot, update_task=AsyncMock(return_value=False))
 
-        report, build = await _run(h, PENDING)
+        report, build = await _run(slot, PENDING)
 
-        l1 = _assert_refused(h, report, build)
+        l1 = _assert_refused(slot, report, build)
         assert PARKED.parked_branch is not None
         assert PARKED.parked_branch in l1.detail
 
     async def test_open_design_concern_l1_is_not_duplicated(self, tmp_path: Path):
-        h = _make_slot_harness(tmp_path)
-        h._escalation_queue.submit(Escalation(
-            id=h._escalation_queue.make_id(TID),
+        slot = _make_slot_harness(tmp_path)
+        slot.queue.submit(Escalation(
+            id=slot.queue.make_id(TID),
             task_id=TID,
             agent_role='orchestrator-scheduler',
             severity='blocking',
@@ -233,23 +276,23 @@ class TestRunSlotRecutGate:
             level=1,
         ))
 
-        report, build = await _run(h, {RECUT_RULING_KEY: 'garbage'})
+        report, build = await _run(slot, {RECUT_RULING_KEY: 'garbage'})
 
         assert not build.called
         assert report is not None and report.block_reason == 'recut_ruling_refused'
-        h.scheduler.set_task_status.assert_any_await(TID, 'blocked')
-        assert len(_pending_l1s(h)) == 1
+        slot.set_task_status.assert_any_await(TID, 'blocked')
+        assert len(_pending_l1s(slot)) == 1
 
     async def test_unreadable_metadata_skips_loudly_and_dispatches(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
-        h = _make_slot_harness(tmp_path)
+        slot = _make_slot_harness(tmp_path)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.recut_ruling'):
-            _, build = await _run(h, 'not json')
+            _, build = await _run(slot, 'not json')
 
         assert 'no ruling was read' in caplog.text
-        h.git_ops.park_prior_incarnation.assert_not_awaited()
+        slot.park.assert_not_awaited()
         assert build.called
 
 
@@ -287,7 +330,9 @@ class TestWorkflowPassesRulingToProvisioning:
     async def test_pending_ruling_reaches_create_worktree(self, tmp_path: Path):
         create_worktree, _ = await _run_to_provisioning(tmp_path, PENDING)
 
-        assert create_worktree.await_args.kwargs['recut_ruling'] == RecutRuling(
+        provisioned = create_worktree.await_args
+        assert provisioned is not None
+        assert provisioned.kwargs['recut_ruling'] == RecutRuling(
             RULING_ID, datetime(2026, 8, 30, tzinfo=UTC),
         )
 
@@ -298,7 +343,9 @@ class TestWorkflowPassesRulingToProvisioning:
     async def test_nothing_pending_passes_none(self, tmp_path: Path, metadata: Any):
         create_worktree, _ = await _run_to_provisioning(tmp_path, metadata)
 
-        assert create_worktree.await_args.kwargs['recut_ruling'] is None
+        provisioned = create_worktree.await_args
+        assert provisioned is not None
+        assert provisioned.kwargs['recut_ruling'] is None
 
     async def test_malformed_ruling_blocks_before_provisioning(self, tmp_path: Path):
         create_worktree, report = await _run_to_provisioning(
