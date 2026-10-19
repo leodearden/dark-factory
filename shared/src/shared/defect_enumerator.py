@@ -133,6 +133,17 @@ def _read_ref(mark: ast.expr) -> str | EnumerationGap:
         return EnumerationGap(GapReason.MALFORMED_REF, mark.lineno)
 
 
+def _defect_marks(tree: ast.Module) -> list[ast.expr]:
+    """Every defect-mark expression in *tree*, by position: each ``defect(...)`` call and each bare mark."""
+    found = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call | ast.Attribute) and marker_name(node) == _DEFECT_MARKER
+    ]
+    called = {id(node.func) for node in found if isinstance(node, ast.Call)}
+    marks = [node for node in found if id(node) not in called]
+    return sorted(marks, key=lambda mark: (mark.lineno, mark.col_offset))
+
+
 def _test_items(body: Sequence[ast.stmt]) -> Iterator[tuple[str, list[ast.expr]]]:
     for statement in body:
         is_function = isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
@@ -140,23 +151,44 @@ def _test_items(body: Sequence[ast.stmt]) -> Iterator[tuple[str, list[ast.expr]]
             yield statement.name, statement.decorator_list
 
 
-def _enumerate_module(path: str, node_of: Callable[[str], NodeId], tree: ast.Module) -> FileEnumeration:
+_Reading = str | EnumerationGap
+
+
+def _carriers(
+    items: Iterator[tuple[str, list[ast.expr]]],
+    readings: Mapping[int, _Reading],
+    node_of: Callable[[str], NodeId],
+) -> tuple[dict[str, tuple[Carrier, ...]], frozenset[int]]:
+    """The carriers by ref the static *items* yield, and the ids of the census marks they reach."""
     carriers: dict[str, dict[Carrier, None]] = {}
-    gaps: list[EnumerationGap] = []
-    for name, marks in _test_items(tree.body):
+    reached: set[int] = set()
+    for name, marks in items:
         for mark in marks:
-            if marker_name(mark) != _DEFECT_MARKER:
+            reading = readings.get(id(mark))
+            if reading is None:
                 continue
-            reading = _read_ref(mark)
-            if isinstance(reading, EnumerationGap):
-                gaps.append(reading)
-            else:
+            reached.add(id(mark))
+            if isinstance(reading, str):
                 carriers.setdefault(reading, {})[Carrier(node_of(name), frozenset())] = None
-    return FileEnumeration(
-        path,
-        {ref: tuple(item_carriers) for ref, item_carriers in carriers.items()},
-        gaps=tuple(gaps),
+    return {ref: tuple(item_carriers) for ref, item_carriers in carriers.items()}, frozenset(reached)
+
+
+def _non_static(
+    marks: Sequence[ast.expr], readings: Mapping[int, _Reading], reached: frozenset[int]
+) -> tuple[NonStaticMark, ...]:
+    return tuple(
+        NonStaticMark(reading, mark.lineno)
+        for mark in marks
+        if id(mark) not in reached and isinstance(reading := readings[id(mark)], str)
     )
+
+
+def _enumerate_module(path: str, node_of: Callable[[str], NodeId], tree: ast.Module) -> FileEnumeration:
+    marks = _defect_marks(tree)
+    readings = {id(mark): _read_ref(mark) for mark in marks}
+    carriers, reached = _carriers(_test_items(tree.body), readings, node_of)
+    gaps = tuple(reading for reading in readings.values() if isinstance(reading, EnumerationGap))
+    return FileEnumeration(path, carriers, non_static=_non_static(marks, readings, reached), gaps=gaps)
 
 
 def enumerate_source(path: str, source: str | bytes, *, module_root: str) -> FileEnumeration:
