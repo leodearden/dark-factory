@@ -25,7 +25,7 @@ import copy
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -40,6 +40,7 @@ from _auto_consolidation_fakes import (
     FakeTaskBackend,
     enabled_config,
     new_id,
+    propose,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -229,6 +230,18 @@ class World:
             if record['metadata'].get('kind') != 'cycle_summary'
         }
 
+    def predicate_reads(self) -> list[Any]:
+        """The executor's per-proposal reads: member fetches and canonical counts.
+
+        The cycle-summary pool trim's own count (filtered on ``recon_pool``) is
+        left out: every full cycle awaits it.
+        """
+        counts = self.fake.count_memories_by_metadata.await_args_list
+        return [
+            *self.fake.get_memory_by_id.await_args_list,
+            *(c for c in counts if 'recon_pool' not in c.kwargs.get('filters', {})),
+        ]
+
     def filed_gates(self) -> list[FiledGate]:
         """Every task the raw backend accepted, metadata parsed from the JSON it received."""
         return [
@@ -299,6 +312,20 @@ def build_world(
         project_id=project_id,
         project_root=stage.project_root,
         accepted_tasks=accepted,
+    )
+
+
+async def aged_proposal(
+    world: World, *, topic: str, member_ids: Sequence[str], run_id: str,
+) -> None:
+    """A proposal row written past the tool, as an older row the emit validator never saw."""
+    await propose(
+        world.ledger,
+        topic=topic,
+        member_ids=list(member_ids),
+        run_id=run_id,
+        project_id=world.project_id,
+        now=datetime.now(UTC) - timedelta(minutes=1),
     )
 
 
