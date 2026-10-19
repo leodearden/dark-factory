@@ -144,8 +144,13 @@ CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
         for site in config_dir_archival_allowlist.AUDITED_SITES
         if site['disposition'] != config_dir_archival_allowlist.ARCHIVED
     ),
-    default=Debt(TaskRef(5603)),
-    default_covers=6,
+    default=Policy('inv12-config-dir-unarchived-by-design'),
+    default_covers=3,
+    dispositions={
+        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._resume_guard_reason': Debt(TaskRef(3972)),
+        'fused-memory/src/fused_memory/reconciliation/stages/base.py::BaseStage.run': Debt(TaskRef(3972)),
+        'fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator._transcript_config_dir': Debt(TaskRef(6008)),
+    },
 )
 
 BLESSED_TASK_METADATA_KEYS = governed_exceptions(
