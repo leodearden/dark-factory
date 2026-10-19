@@ -36,7 +36,7 @@ from shared.async_sqlite_base import (
     connect_daemon,
 )
 
-from fused_memory.middleware.curation_deferral import DeferReason
+from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
 
 if TYPE_CHECKING:
     from fused_memory.middleware.curation_deferral import DeferralPolicy
@@ -375,7 +375,7 @@ class TicketStore:
                 """,
                 (
                     AWAITING_CURATION, attempts, _utc_iso(next_attempt_at),
-                    defer_reason.value, f'curation-deferred: {defer_reason}', ticket_id,
+                    defer_reason.value, deferral_justification(defer_reason), ticket_id,
                 ),
             )
         return attempts

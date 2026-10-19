@@ -38,6 +38,10 @@ def backlog_severity(reason: DeferReason) -> Literal['info', 'blocking']:
             assert_never(reason)
 
 
+def deferral_justification(reason: DeferReason) -> str:
+    return f'curation-deferred: {reason}'
+
+
 POOL_UNAVAILABLE_ERRORS: Final = (
     AllAccountsCappedException,
     PoolFrozen,

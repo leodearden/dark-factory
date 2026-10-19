@@ -78,6 +78,7 @@ from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     DeferReason,
+    deferral_justification,
     pool_defer_reason,
 )
 from fused_memory.reconciliation.context_assembler import estimate_tokens
@@ -478,7 +479,7 @@ class CuratorDecision:
         return cls(
             action='defer',
             defer_reason=reason,
-            justification=f'curation-deferred: {reason}',
+            justification=deferral_justification(reason),
             pool_sizes=dict(pool_sizes or {}),
             latency_ms=latency_ms,
         )
