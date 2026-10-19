@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -394,6 +394,36 @@ class CostStore(AsyncSqliteBase):
             'WHERE model = ? AND completed_at BETWEEN ? AND ?',
             (model, start_iso, end_iso),
         ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return 0.0
+        return float(row[0])
+
+    async def task_invocation_cost(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        since: datetime | None = None,
+    ) -> float:
+        """Per-task production spend: the single reader of per-task invocation cost.
+
+        *since*, when given, is an inclusive aware lower bound on ``completed_at``
+        (live-shadow PRD S1). Raises ``ValueError`` on a naive *since* and
+        ``RuntimeError`` when the store is not open.
+        """
+        if since is not None and since.utcoffset() is None:
+            raise ValueError(f'task_invocation_cost: since must be timezone-aware (got {since!r})')
+        sql = (
+            'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+            'WHERE project_id = ? AND task_id = ?'
+        )
+        params: tuple[Any, ...] = (project_id, task_id)
+        if since is not None:
+            sql += ' AND completed_at >= ?'
+            params += (since.astimezone(UTC).isoformat(),)
+        conn = self._require_conn()
+        async with conn.execute(sql, params) as cur:
             row = await cur.fetchone()
         if row is None:
             return 0.0
