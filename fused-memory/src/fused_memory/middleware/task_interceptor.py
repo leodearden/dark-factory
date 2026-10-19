@@ -49,6 +49,11 @@ from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import MetadataLookupResult
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import recon_write_policy
+from fused_memory.middleware.curation_deferral import (
+    POOL_UNAVAILABLE_ERRORS,
+    DeferralPolicy,
+    pool_defer_reason,
+)
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
     build_duplicate_metadata,
@@ -117,6 +122,7 @@ from fused_memory.middleware.task_curator import (
     is_combine_eligible_status,
     normalize_title,
 )
+from fused_memory.middleware.ticket_store import AWAITING_CURATION
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
@@ -422,6 +428,9 @@ class _TicketLifecycle:
     status: str | None = None
     task_id: str | None = None
     dispatched: bool = False
+
+
+_CANCELLABLE_STATUSES: tuple[str, ...] = ('pending', AWAITING_CURATION)
 
 
 def _format_ticket_result(row: dict) -> dict:
@@ -4258,10 +4267,11 @@ class TaskInterceptor:
         row = await self._ticket_store.get(ticket_id)
         if row is None:
             return {'error': 'not_found', 'ticket_id': ticket_id}
-        if row['status'] != 'pending':
+        if row['status'] not in _CANCELLABLE_STATUSES:
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
         did_cancel = await self._ticket_store.mark_resolved(
-            ticket_id, status='cancelled', reason='user_cancelled'
+            ticket_id, status='cancelled', reason='user_cancelled',
+            from_statuses=_CANCELLABLE_STATUSES,
         )
         self._signal_ticket_event(ticket_id)
         if not did_cancel:
@@ -4277,7 +4287,7 @@ class TaskInterceptor:
                 row['status'],
             )
             return {'status': row['status'], 'ticket_id': ticket_id, 'no_op': True}
-        logger.info('cancel_ticket: cancelled pending ticket %s', ticket_id)
+        logger.info('cancel_ticket: cancelled %s ticket %s', row['status'], ticket_id)
         return {'status': 'cancelled', 'ticket_id': ticket_id}
 
     def _start_worker_if_needed(self, project_id: str) -> None:
@@ -4634,6 +4644,10 @@ class TaskInterceptor:
                 None,
             )
 
+        if decision is not None and decision.action == 'defer':
+            logger.info('ticket %s: curation deferred, parking it: %s', ticket_id, decision.justification)
+            return (AWAITING_CURATION, None, decision.justification, None, None)
+
         if decision is not None and decision.action == 'drop' and decision.target_id:
             # Drop: fold candidate into the existing target task (status='combined').
             # Preserves legacy result shape for the add_task facade.
@@ -4923,6 +4937,40 @@ class TaskInterceptor:
                 {'stage': 'zot_duplicate_escalation', 'error': str(exc)}
             )
 
+    def _deferral_policy(self) -> DeferralPolicy:
+        return DeferralPolicy.from_config(
+            self._config.curator if self._config is not None else CuratorConfig(),
+        )
+
+    async def _persist_worker_outcome(
+        self,
+        ticket_id: str,
+        *,
+        decision: CuratorDecision | None,
+        status: str,
+        task_id: str | None,
+        reason: str | None,
+        result_dict: dict | None,
+        caller: str,
+        project_root: str | None,
+        attribution: CreationAttribution,
+    ) -> bool:
+        """Persist what the dispatch decided: park a deferral, otherwise write the terminal."""
+        if status != AWAITING_CURATION:
+            return await self._persist_worker_terminal(
+                ticket_id, status=status, task_id=task_id, reason=reason,
+                result_dict=result_dict, caller=caller, project_root=project_root,
+                attribution=attribution,
+            )
+        assert self._ticket_store is not None
+        assert decision is not None and decision.defer_reason is not None, (
+            f'ticket {ticket_id}: only a defer decision parks, got {decision!r}'
+        )
+        attempts = await asyncio.shield(self._ticket_store.mark_awaiting_curation(
+            ticket_id, reason=decision.defer_reason, policy=self._deferral_policy(),
+        ))
+        return attempts is not None
+
     async def _persist_worker_terminal(
         self,
         ticket_id: str,
@@ -5052,6 +5100,7 @@ class TaskInterceptor:
         reason: str | None = None
         result_dict: dict | None = None
         curator_degrade_reason: str | None = None
+        decision: CuratorDecision | None = None
 
         try:
             # ── R3 invariant: serialise curator+write within this project ─
@@ -5092,7 +5141,6 @@ class TaskInterceptor:
 
                 # ── Curator gate ─────────────────────────────────────────────
                 curator = await self._get_curator()
-                decision: CuratorDecision | None = None
                 if curator is not None and candidate is not None:
                     try:
                         decision = await curator.curate(candidate, project_id, project_root)
@@ -5136,8 +5184,9 @@ class TaskInterceptor:
                 status,
             )
             try:
-                await self._persist_worker_terminal(
+                await self._persist_worker_outcome(
                     ticket_id,
+                    decision=decision,
                     status=status,
                     task_id=task_id,
                     reason=reason
@@ -5187,8 +5236,9 @@ class TaskInterceptor:
         # Shield from cancellation so that a close()-triggered CancelledError
         # that arrives here (after the try/except block) does not prevent the
         # ticket from reaching a terminal state.
-        await self._persist_worker_terminal(
+        await self._persist_worker_outcome(
             ticket_id,
+            decision=decision,
             status=status,
             task_id=task_id,
             reason=reason,
@@ -5401,13 +5451,15 @@ class TaskInterceptor:
                         else:
                             rec.decision = bd
                             rec.target = None
-                except AllAccountsCappedException:
-                    # Cap exhaustion bubbles to the worker, which defers the
-                    # whole batch and waits for cap reset.  Re-raising here
-                    # avoids the wasteful N×size-1 fallback that the legacy
-                    # path used to take on cap exhaustion (each fallback call
-                    # would repeat the ~10-min cap-retry storm).
-                    raise
+                except POOL_UNAVAILABLE_ERRORS as exc:
+                    logger.warning(
+                        '_process_add_tickets_batch_prepared: curator pool unavailable '
+                        'for project %s; deferring %d candidates: %s',
+                        project_id, len(curatable_records), exc,
+                    )
+                    for rec in curatable_records:
+                        rec.decision = CuratorDecision.deferred(pool_defer_reason(exc))
+                        rec.target = None
                 except CuratorFailureError as exc:
                     # The bisecting fallback in curate_batch_prepared no
                     # longer surfaces CuratorFailureError to the caller for
@@ -5508,7 +5560,12 @@ class TaskInterceptor:
                     effective_decision = dec
                     if dec is not None and dec.action == 'drop' and target is not None:
                         sibling_task_id = target.task_id
-                        if sibling_task_id:
+                        sibling_deferral = (
+                            target.decision.defer_reason if target.decision is not None else None
+                        )
+                        if sibling_deferral is not None:
+                            effective_decision = CuratorDecision.deferred(sibling_deferral)
+                        elif sibling_task_id:
                             # Sibling created or combined — use its task_id.
                             effective_decision = CuratorDecision(
                                 action='drop',
@@ -5569,9 +5626,9 @@ class TaskInterceptor:
                         task_id = None
                         result_dict = None
 
-                    # Persist terminal state.
-                    await self._persist_worker_terminal(
+                    await self._persist_worker_outcome(
                         t.ticket_id,
+                        decision=effective_decision,
                         status=status,
                         task_id=task_id,
                         reason=reason,
@@ -5593,6 +5650,7 @@ class TaskInterceptor:
                     self._signal_ticket_event(t.ticket_id)
 
                     # Record this ticket's result for downstream sibling drops.
+                    rec.decision = effective_decision
                     rec.status = status
                     rec.task_id = task_id
                     rec.dispatched = True

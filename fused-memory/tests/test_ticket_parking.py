@@ -13,7 +13,10 @@ from typing import Any, cast
 
 import pytest
 import pytest_asyncio
+from shared.cli_invoke import AllAccountsCappedException
+from shared.usage_gate import PoolFrozen
 
+from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -23,7 +26,7 @@ from fused_memory.middleware.task_curator import (
     normalize_title,
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
-from fused_memory.middleware.ticket_store import TicketStore
+from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 PROJECT_ROOT = '/project'
@@ -305,3 +308,125 @@ class TestUncappedCurationUnchanged:
         assert taskmaster.added_metadata() == [{
             **_CALLER_METADATA, 'task_kind': 'deterministic', 'always_escalates': True,
         }]
+
+
+CAPPED = CuratorDecision.deferred(DeferReason.ALL_ACCOUNTS_CAPPED)
+AUTH_FAILED = CuratorDecision.deferred(DeferReason.ACCOUNTS_AUTH_FAILED)
+PARKED_CAPPED_ANSWER = {
+    'status': AWAITING_CURATION, 'reason': 'curation-deferred: all-accounts-capped',
+}
+
+
+async def _park(interceptor: TaskInterceptor, title: str) -> str:
+    ticket_id = await _submit(interceptor, title)
+    assert await _resolve(interceptor, ticket_id) == PARKED_CAPPED_ANSWER
+    return ticket_id
+
+
+async def _parked_row(store: TicketStore, ticket_id: str) -> dict:
+    row = await store.get(ticket_id)
+    assert row is not None
+    return {
+        key: row[key]
+        for key in ('status', 'task_id', 'reason', 'result_json', 'resolved_at', 'attempts', 'defer_reason')
+    }
+
+
+def _parked(reason: DeferReason, *, attempts: int = 1) -> dict:
+    return {
+        'status': AWAITING_CURATION, 'task_id': None, 'reason': f'curation-deferred: {reason}',
+        'result_json': None, 'resolved_at': None, 'attempts': attempts, 'defer_reason': reason.value,
+    }
+
+
+def _frozen_pool() -> PoolFrozen:
+    return PoolFrozen(account_count=1, capped_account_names=('max-a',), auth_failed_account_names=())
+
+
+class TestParking:
+    @pytest.mark.asyncio
+    async def test_a_defer_parks_the_ticket_and_creates_nothing(self, make_interceptor, store, taskmaster):
+        interceptor = make_interceptor(_ScriptedCurator({'Capped work': [CAPPED]}))
+
+        ticket_id = await _park(interceptor, 'Capped work')
+
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.ALL_ACCOUNTS_CAPPED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_waiter_is_woken_with_awaiting_curation_and_no_task_id(self, make_interceptor, store):
+        curator = _ScriptedCurator({'Capped work': [CAPPED]})
+        curator.hold_prepare['Capped work'] = release = asyncio.Event()
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _submit(interceptor, 'Capped work')
+        waiter = asyncio.create_task(_resolve(interceptor, ticket_id))
+        await asyncio.sleep(0.2)
+        assert not waiter.done()
+        release.set()
+
+        assert await waiter == PARKED_CAPPED_ANSWER
+
+    @pytest.mark.asyncio
+    async def test_resolve_on_a_parked_ticket_returns_at_once(self, make_interceptor):
+        interceptor = make_interceptor(_ScriptedCurator({'Capped work': [CAPPED]}))
+        ticket_id = await _park(interceptor, 'Capped work')
+
+        answer = await asyncio.wait_for(
+            interceptor.resolve_ticket(ticket_id, PROJECT_ROOT, timeout_seconds=None),
+            timeout=RESOLVE_DEADLINE_SECONDS,
+        )
+
+        assert answer == PARKED_CAPPED_ANSWER
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'pool_error',
+        [
+            _frozen_pool(),
+            AllAccountsCappedException(retries=3, elapsed_secs=120.0, label='curator'),
+        ],
+        ids=['pool-frozen', 'all-accounts-capped'],
+    )
+    async def test_a_curator_raising_pool_unavailable_parks_never_creates(
+        self, make_interceptor, store, taskmaster, pool_error,
+    ):
+        curator = _ScriptedCurator({'Capped work': []})
+        curator.batch_raises.append(pool_error)
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _park(interceptor, 'Capped work')
+
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.ALL_ACCOUNTS_CAPPED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_drop_onto_a_parked_sibling_is_parked_too(self, make_interceptor, store, taskmaster):
+        curator = _ScriptedCurator({
+            'Sibling': [AUTH_FAILED],
+            'Sibling again': [CuratorDecision(
+                action='drop', batch_target_index=0, justification='same as the sibling',
+            )],
+        })
+        curator.hold_prepare['Sibling'] = release = asyncio.Event()
+        interceptor = make_interceptor(curator)
+
+        sibling = await _submit(interceptor, 'Sibling')
+        duplicate = await _submit(interceptor, 'Sibling again')
+        release.set()
+        answers = [await _resolve(interceptor, ticket_id) for ticket_id in (sibling, duplicate)]
+
+        parked_answer = {'status': AWAITING_CURATION, 'reason': 'curation-deferred: accounts-auth-failed'}
+        assert answers == [parked_answer, parked_answer]
+        assert await _parked_row(store, duplicate) == _parked(DeferReason.ACCOUNTS_AUTH_FAILED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_cancel_withdraws_a_parked_ticket(self, make_interceptor, store):
+        interceptor = make_interceptor(_ScriptedCurator({'Capped work': [CAPPED]}))
+        ticket_id = await _park(interceptor, 'Capped work')
+
+        cancelled = await interceptor.cancel_ticket(ticket_id)
+
+        assert cancelled == {'status': 'cancelled', 'ticket_id': ticket_id}
+        assert await _resolve(interceptor, ticket_id) == {'status': 'cancelled', 'reason': 'user_cancelled'}
