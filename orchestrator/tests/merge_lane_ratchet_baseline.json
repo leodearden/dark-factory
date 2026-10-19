@@ -59,7 +59,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1463, "function_local_imports": 4, "lines": 16110, "prose_lines": 9321, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1465, "function_local_imports": 4, "lines": 16133, "prose_lines": 9331, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 39, "function_local_imports": 1, "lines": 660, "prose_lines": 299, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 0, "function_local_imports": 0, "lines": 93, "prose_lines": 21, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
@@ -141,6 +141,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_reconcile_pool_storage_before_sweep": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_record_stack_base": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_refuse_foreign_band": 11,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_refuse_prior_incarnation": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_release_lane_flock": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_release_orphaned_lane_flock": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_foreign_meta_root": 2,
