@@ -345,3 +345,160 @@ class TestModeIsRequired:
             mod.build_parser().parse_args(argv)
 
         assert exc.value.code == 2
+
+
+class TestLiveReRead:
+    """INV-3: the live cluster is re-read; the gate's snapshot alone is never acted on."""
+
+    def test_stamped_scroll_members_join_the_observed_snapshot(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        snapshot = fake.seed_many(2)
+        stamped = fake.seed_many(2, topic=TOPIC)
+        seed_tasks([gate_row(31, TOPIC, observed=snapshot)])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert sorted(gate_of(payload, 31)['members']) == sorted([*snapshot, *stamped])
+
+    def test_an_observed_member_that_no_longer_exists_is_disclosed_and_dropped(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        live = fake.seed_many(3)
+        ghost = new_id()
+        seed_tasks([gate_row(32, TOPIC, observed=[*live, ghost])])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 32)
+        assert gate['absent_observed'] == [ghost]
+        assert ghost not in gate['members']
+        assert gate['verdict'] == 'pass'
+        assert gate['disposition'] == 'would_execute'
+
+    def test_an_unreadable_member_is_left_to_the_sitting(self, root, fake, seed_tasks, capsys):
+        members = fake.seed_many(3)
+        fake.read_errors[members[1]] = TimeoutError('read timed out')
+        seed_tasks([gate_row(33, TOPIC, observed=members)])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 33)
+        assert gate['disposition'] == 'left_to_sitting'
+        assert {'code': 'member_unreadable', 'ids': [members[1]]} in gate['reasons']
+
+    def test_a_correction_banner_is_left_to_the_sitting(self, root, fake, seed_tasks, capsys):
+        members = fake.seed_many(2)
+        corrected = fake.seed(content='[CORRECTION 2026-01-01] the rule was reversed')
+        seed_tasks([gate_row(34, TOPIC, observed=[*members, corrected])])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 34)
+        assert gate['disposition'] == 'left_to_sitting'
+        assert {'code': 'member_carries_correction_banner', 'ids': [corrected]} in gate['reasons']
+
+
+class TestFailClosedScroll:
+    def test_a_raising_scroll_refuses_that_gate_and_the_run_goes_on(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        fake.scroll_errors[TOPIC] = TimeoutError('qdrant down')
+        seed_tasks([
+            gate_row(41, TOPIC, observed=fake.seed_many(3)),
+            gate_row(42, OTHER_TOPIC, observed=fake.seed_many(3)),
+        ])
+
+        code, payload = drive(
+            root, fake, capsys, '--dry-run',
+            '--claim', f'{TOPIC}={CLAIM}', '--claim', f'{OTHER_TOPIC}={CLAIM}',
+        )
+
+        assert code == 0
+        failed = gate_of(payload, 41)
+        assert failed['disposition'] == 'refused'
+        assert failed['codes'] == ['member_scroll_unavailable']
+        assert gate_of(payload, 42)['disposition'] == 'would_execute'
+
+    def test_a_full_scroll_page_refuses_the_gate_as_incomplete(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        fake.seed_many(mod.closure_cli.SCROLL_LIMIT, topic=TOPIC)
+        seed_tasks([gate_row(43, TOPIC)])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 43)
+        assert gate['disposition'] == 'refused'
+        assert gate['codes'] == ['member_scroll_incomplete']
+
+
+class TestActionableRefusals:
+    def test_a_category_without_flood_weight_is_not_consolidatable(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        members = fake.seed_many(3, category='decisions_and_rationale')
+        seed_tasks([gate_row(51, TOPIC, observed=members)])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 51)
+        assert gate['disposition'] == 'refused'
+        assert gate['codes'] == ['category_not_consolidatable']
+
+    def test_more_members_than_member_max_is_out_of_range(self, root, fake, seed_tasks, capsys):
+        too_many = fake.config.consolidation_auto.member_max + 1
+        seed_tasks([gate_row(52, TOPIC, observed=fake.seed_many(too_many))])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 52)
+        assert gate['disposition'] == 'refused'
+        assert 'member_count_out_of_range' in gate['codes']
+
+    def test_a_claim_the_validator_rejects_is_refused(self, root, fake, seed_tasks, capsys):
+        seed_tasks([gate_row(53, TOPIC, observed=fake.seed_many(3))])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}=INDEX — foo bar')
+
+        gate = gate_of(payload, 53)
+        assert gate['disposition'] == 'refused'
+        assert 'claim_not_index_shaped' in gate['codes']
+
+
+class TestRunLevelRefusals:
+    @pytest.mark.parametrize(
+        'claims',
+        [
+            ['no-equals-sign-here'],
+            [f'Not A Slug={CLAIM}'],
+            [f'{TOPIC}={CLAIM}', f'{TOPIC}=Another claim entirely for the very same topic'],
+        ],
+    )
+    def test_a_bad_claim_argument_stops_the_run_before_any_read(
+        self, root, fake, seed_tasks, capsys, caplog, claims,
+    ):
+        seed_tasks([gate_row(61, TOPIC, observed=fake.seed_many(3))])
+        argv = ['--dry-run'] + [arg for claim in claims for arg in ('--claim', claim)]
+
+        code = asyncio.run(mod.run(mod.build_parser().parse_args([
+            '--project-root', str(root), '--project-id', PROJECT_ID, *argv,
+        ]), memory=fake))
+
+        assert code == 2
+        assert fake.reads == 0
+        assert claims[-1].split('=')[0] in caplog.text
+
+    def test_a_full_canonical_slug_page_stops_the_run(self, root, fake, seed_tasks, capsys):
+        from fused_memory.reconciliation.consolidation_auto_executor import CANONICAL_SLUG_LIMIT
+
+        for n in range(CANONICAL_SLUG_LIMIT):
+            fake.seed(topic=f'filler-topic-{n}', canonical=True)
+        seed_tasks([gate_row(62, TOPIC, observed=fake.seed_many(3))])
+
+        code = asyncio.run(mod.run(mod.build_parser().parse_args([
+            '--project-root', str(root), '--project-id', PROJECT_ID, '--dry-run',
+        ]), memory=fake))
+
+        assert code == 2
+        assert fake.writes() == (0, 0)
