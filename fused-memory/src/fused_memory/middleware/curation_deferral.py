@@ -38,7 +38,7 @@ def backlog_severity(reason: DeferReason) -> Literal['info', 'blocking']:
             assert_never(reason)
 
 
-POOL_UNAVAILABLE_ERRORS: Final[tuple[type[Exception], ...]] = (
+POOL_UNAVAILABLE_ERRORS: Final = (
     AllAccountsCappedException,
     PoolFrozen,
 )
