@@ -13,22 +13,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, get_args
 
 import pytest
-
-from fused_memory.backends.defect_records import (
-    DefectCreationRefused,
-    DefectEventInvalid,
-    DefectRecords,
-    DefectRefMismatch,
-    DefectRefsNotUnique,
-    DefectTransitionRefused,
-    DefectWriteRefused,
-    StoredDefectRecordsMalformed,
-    parse_declare_wire,
-    parse_outcome_wire,
-    refs_required_live,
-    require_creation_floor,
-)
-from fused_memory.backends.task_backend_errors import TaskmasterError
 from shared.defects import (
     DEFECT_TEST_RETIREMENTS_METADATA_KEY,
     DEFECTS_METADATA_KEY,
@@ -65,6 +49,22 @@ from shared.defects import (
     mint_human_ref,
 )
 from shared.governed_exceptions import Debt, TaskRef
+
+from fused_memory.backends.defect_records import (
+    DefectCreationRefused,
+    DefectEventInvalid,
+    DefectRecords,
+    DefectRefMismatch,
+    DefectRefsNotUnique,
+    DefectTransitionRefused,
+    DefectWriteRefused,
+    StoredDefectRecordsMalformed,
+    parse_declare_wire,
+    parse_outcome_wire,
+    refs_required_live,
+    require_creation_floor,
+)
+from fused_memory.backends.task_backend_errors import TaskmasterError
 
 _REF = mint_human_ref(datetime(2026, 10, 18, 12, 34, 56, tzinfo=UTC), 'Some summary')
 _OTHER_REF = mint_explore_ref('run-1', 4)
