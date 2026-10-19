@@ -5294,9 +5294,9 @@ async def queue_briefing_refresh_tasks(
 ) -> dict:
     """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
 
-    This is the briefing-refresh writer's public entry point: Stage 2's hook
-    calls it with the mismatches ``_run_briefing_known_gaps_script`` produced,
-    and tests drive it directly over a task backend.
+    Each mismatch is a dict carrying the ``task_id`` still listed in a
+    briefing's known_gaps, its ``subproject``, its ``title``, and the gap
+    text ``what``; one refresh task is filed per mismatch.
 
     Skips creation when a task with status 'pending' and the same canonical title
     already exists (exact-title de-dup, case-sensitive string equality).
