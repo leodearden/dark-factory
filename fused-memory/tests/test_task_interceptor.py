@@ -3291,9 +3291,19 @@ async def test_done_gate_does_not_fire_for_non_done_transitions(
 
     for status in ('blocked', 'cancelled', 'deferred'):
         taskmaster.set_task_status.reset_mock()
-        result = await interceptor.set_task_status('5', status, '/project')
+        taskmaster.set_status_and_stamp_audit.reset_mock()
+        deferral = (
+            {'kind': 'until_condition', 'condition': 'done gate non-done transitions'}
+            if status == 'deferred' else None
+        )
+        result = await interceptor.set_task_status('5', status, '/project', deferral=deferral)
         assert 'error' not in result, f'gate should not fire on {status}'
-        taskmaster.set_task_status.assert_called_once()
+        # An entry into deferred writes its record atomically with the status.
+        writer = (
+            taskmaster.set_status_and_stamp_audit if status == 'deferred'
+            else taskmaster.set_task_status
+        )
+        writer.assert_called_once()
 
 
 # ── Tests for done_provenance gate ─────────────────────────────────────────
@@ -12025,7 +12035,7 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     interceptor_facade,
     taskmaster,
 ):
-    """planning_mode injects human_decomposed=True into the metadata sent to tm.add_task."""
+    """planning_mode injects human_decomposed=True and the planning deferral record."""
     await interceptor_facade.submit_task(
         '/project',
         title='X',
@@ -12033,7 +12043,9 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     )
     metadata_arg = taskmaster.add_task.call_args.kwargs.get('metadata')
     assert metadata_arg is not None
-    assert json.loads(metadata_arg) == {'human_decomposed': True}
+    decoded = json.loads(metadata_arg)
+    assert decoded.pop('deferral')['kind'] == 'planning'
+    assert decoded == {'human_decomposed': True}
 
 
 @pytest.mark.asyncio
@@ -12049,6 +12061,7 @@ async def test_planning_mode_merges_caller_metadata(
         metadata={'source': 'planning-session', 'files': ['m1', 'm2']},
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded.pop('deferral')['kind'] == 'planning'
     assert decoded == {
         'source': 'planning-session',
         'files': ['m1', 'm2'],
@@ -12069,6 +12082,7 @@ async def test_planning_mode_accepts_metadata_json_string(
         metadata='{"escalation_id": "esc-1"}',
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+    assert decoded.pop('deferral')['kind'] == 'planning'
     assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True}
 
 
