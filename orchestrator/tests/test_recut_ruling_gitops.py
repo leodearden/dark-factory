@@ -1,7 +1,8 @@
 """GitOps re-cut ruling primitives (task 3154), against real git.
 
 park_prior_incarnation renames a task's prior incarnation aside and never
-resets or deletes; prior_incarnation_evidence lists what survives.
+resets or deletes; prior_incarnation_evidence lists what survives; the two
+provisioning doors refuse a pending ruling while any of it survives.
 
 Self-contained, mirroring test_lane_lifecycle_gitops.py's fixtures.
 """
@@ -9,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -20,10 +23,19 @@ import pytest
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run
+from orchestrator.lane_lifecycle import AcquireRoute
+from orchestrator.recut_ruling import RecutRuling, RecutRulingViolation
 from orchestrator.warm_lane_pool import LaneState
 
 PRE_RULING_DATE = '2026-07-22T12:00:00Z'
 PARKED_NAME = re.compile(r'^task/(?P<id>[^/]+)-\d{8}T\d{6}Z$')
+RULING = RecutRuling('esc-2896-3/D11-A', datetime(2026, 8, 30, tzinfo=UTC))
+REUSE_ROUTES = (
+    AcquireRoute.REUSE,
+    AcquireRoute.DISK_BACKSTOP_REUSE,
+    AcquireRoute.RESET_IN_PLACE_REATTACH,
+    AcquireRoute.CREATE_ONCE_REATTACH,
+)
 
 
 async def _init_repo(repo: Path) -> None:
@@ -78,6 +90,10 @@ async def _get_head(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
     return out.strip()
+
+
+def _route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) -> bool:
+    return f'route={route.value} edge=' in caplog.text
 
 
 def _git(cwd: Path, *args: str, pinned: bool = False) -> str:
@@ -291,3 +307,92 @@ class TestPriorIncarnationEvidence:
 
         assert await git_ops.prior_incarnation_evidence(task_id) == ()
 
+
+
+@pytest.mark.asyncio
+class TestProvisioningDoorsRefuseUnderPendingRuling:
+    async def test_create_worktree_refuses_registered_cold_worktree(self, git_repo: Path):
+        git_ops = GitOps(_config(warm_lane_pool=False), git_repo)
+        worktree = (await git_ops.create_worktree('7')).path
+        _commit_files(worktree, 2, 'pre-ruling')
+        tip = _resolve(git_repo, 'task/7')
+
+        with pytest.raises(RecutRulingViolation) as raised:
+            await git_ops.create_worktree('7', recut_ruling=RULING)
+
+        assert isinstance(raised.value, RuntimeError)
+        assert 'esc-2896-3/D11-A' in str(raised.value)
+        assert 'task/7' in str(raised.value)
+        assert _resolve(git_repo, 'task/7') == tip
+        assert worktree == git_ops.worktree_base / '7' and worktree.is_dir()
+
+    async def test_create_worktree_refuses_branch_only(self, git_repo: Path, tmp_path: Path):
+        _branch_with_commits(git_repo, tmp_path / 'scratch', 'task/7', 2)
+        git_ops = GitOps(_config(warm_lane_pool=False), git_repo)
+        refs_before = _git(git_repo, 'for-each-ref', '--format=%(refname) %(objectname)')
+
+        with pytest.raises(RecutRulingViolation, match='esc-2896-3/D11-A'):
+            await git_ops.create_worktree('7', recut_ruling=RULING)
+
+        assert not (git_ops.worktree_base / '7').exists()
+        assert _git(git_repo, 'for-each-ref', '--format=%(refname) %(objectname)') == refs_before
+
+    async def test_acquire_warm_lane_refuses_before_any_reuse_route(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_config(warm_lane_pool=True), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+        info = await git_ops.acquire_warm_lane('D', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+        _commit_files(info.path, 1, 'pre-ruling')
+        _write_lane_metadata(git_ops, info.path.name, 'D')
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info.path)
+        caplog.clear()
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.git_ops'),
+            pytest.raises(RecutRulingViolation, match='esc-2896-3/D11-A'),
+        ):
+            await git_ops.acquire_warm_lane('D', start_ref, recut_ruling=RULING)
+
+        for route in REUSE_ROUTES:
+            assert not _route_logged(caplog, route), caplog.text
+
+    async def test_clean_cold_id_is_cut_fresh_off_main(self, git_repo: Path):
+        git_ops = GitOps(_config(warm_lane_pool=False), git_repo)
+
+        info = await git_ops.create_worktree('9', recut_ruling=RULING)
+
+        assert info.base_commit == await _get_head(git_repo)
+        assert _resolve(git_repo, 'task/9') == await _get_head(git_repo)
+
+    async def test_clean_pooled_id_takes_a_fresh_route(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_config(warm_lane_pool=True), git_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            info = await git_ops.acquire_warm_lane(
+                'N', await _get_head(git_repo), recut_ruling=RULING,
+            )
+
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+        assert any(
+            _route_logged(caplog, route)
+            for route in (AcquireRoute.CREATE_ONCE_FRESH, AcquireRoute.RECYCLE)
+        ), caplog.text
+
+    async def test_no_ruling_reuses_the_existing_worktree(self, git_repo: Path):
+        git_ops = GitOps(_config(warm_lane_pool=False), git_repo)
+        worktree = (await git_ops.create_worktree('7')).path
+        _commit_files(worktree, 2, 'pre-ruling')
+        tip = _resolve(git_repo, 'task/7')
+
+        info = await git_ops.create_worktree('7')
+
+        assert info.path == worktree
+        assert _resolve(git_repo, 'task/7') == tip
+        assert _git(git_repo, 'rev-list', '--count', 'main..task/7') == '2'
