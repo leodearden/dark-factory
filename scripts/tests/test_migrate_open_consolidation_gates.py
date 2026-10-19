@@ -4,30 +4,31 @@ The script reads every open consolidation gate from a real tasks.db, re-reads
 each gate's topic cluster live, rules on it with the auto predicate, and
 (under ``--execute``) writes through the executor's retain arm. The stores
 here are a real tasks.db seeded with gate metadata from the real
-``build_consolidation_gate_task`` and a small stateful fake of the public
-MemoryService surface, defined below. ``run`` is driven with ``--json`` and
-the structured payload is what the assertions read.
+``build_consolidation_gate_task`` and the executor suite's stateful Mem0
+fake, ``fused-memory/tests/_auto_consolidation_fakes.py::FakeMemoryService``:
+one fake of the one MemoryService surface the script and the executor share.
+``run`` is driven with ``--json`` and the structured payload is what the
+assertions read.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import importlib.util
 import json
 import sqlite3
-import uuid
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType
 from typing import Any
 
 import migrate_open_consolidation_gates as mod
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from fused_memory.config.schema import ConsolidationAutoConfig, Mem0UpdateConfig
-from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.config.schema import ConsolidationAutoConfig
 from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
@@ -35,66 +36,54 @@ from fused_memory.reconciliation.consolidation_gate import (
 )
 from shared.project_layout import escalation_queue_dir
 
-PROJECT_ID = 'dark_factory'
-CATEGORY = 'procedural_knowledge'
-CREATED_AT = '2026-06-01T00:00:00+00:00'
+_EXECUTOR_FAKES_PATH = (
+    Path(__file__).resolve().parents[2] / 'fused-memory' / 'tests' / '_auto_consolidation_fakes.py'
+)
+
+
+def _load_executor_fakes() -> ModuleType:
+    """Load the executor suite's fakes by path: fused-memory/tests is not on this suite's sys.path."""
+    spec = importlib.util.spec_from_file_location('_auto_consolidation_fakes', _EXECUTOR_FAKES_PATH)
+    assert spec is not None and spec.loader is not None, _EXECUTOR_FAKES_PATH
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+executor_fakes = _load_executor_fakes()
+
+PROJECT_ID: str = executor_fakes.PROJECT_ID
+CATEGORY: str = executor_fakes.CATEGORY
+CLAIM: str = executor_fakes.VALID_CLAIM
+new_id = executor_fakes.new_id
+enabled_config = executor_fakes.enabled_config
 TOPIC = 'gate-topic-alpha'
 OTHER_TOPIC = 'gate-topic-beta'
-CLAIM = 'Stage one keeps reproposing the identical unaddressed duplicate cluster'
 
 
-def new_id() -> str:
-    return str(uuid.uuid4())
+class FakeMemoryService(executor_fakes.FakeMemoryService):
+    """The executor suite's stateful Mem0, plus what this script's cases need.
 
-
-def enabled_config(**overrides: Any) -> ConsolidationAutoConfig:
-    fields: dict[str, Any] = {'enabled': True, 'enabled_projects': [PROJECT_ID]}
-    fields.update(overrides)
-    return ConsolidationAutoConfig(**fields)
-
-
-class FakeMemoryService:
-    """A stateful Mem0 over ``{id: {'id', 'content', 'metadata'}}``.
-
-    Only the public MemoryService surface the script and its shared helpers
-    touch. Scroll rows omit ``content``, as the real service's do. Injection
-    points: ``read_errors`` (id -> exception), ``scroll_errors`` (topic ->
-    exception), ``update_returns`` (id -> the dict ``update_memory`` returns
-    instead of landing the patch).
+    Scroll rows drop ``content``, as the real service's do, so a member's text
+    reaches the script only through its by-id re-read. ``scroll_errors``
+    (topic -> exception) fails that one topic's scroll while every other
+    topic, and the canonical-slug scroll, still reads.
     """
 
     def __init__(self, *, consolidation_auto: ConsolidationAutoConfig | None = None) -> None:
-        self.records: dict[str, dict[str, Any]] = {}
-        self.read_errors: dict[str, BaseException] = {}
+        super().__init__(None, consolidation_auto=consolidation_auto)
         self.scroll_errors: dict[str, BaseException] = {}
-        self.update_returns: dict[str, dict[str, Any]] = {}
-        self.reads = 0
-        self.updates = 0
-        self.adds = 0
-        self.config = SimpleNamespace(
-            mem0_update=Mem0UpdateConfig(),
-            consolidation_auto=consolidation_auto or enabled_config(),
-        )
+        whole_rows = self.get_memories_by_metadata.side_effect
 
-    # ---- seeding and inspection ------------------------------------------
+        async def scroll(
+            project_id: str, filters: dict[str, Any], limit: int = 1000,
+        ) -> list[dict[str, Any]]:
+            if filters.get('topic') in self.scroll_errors:
+                raise self.scroll_errors[filters['topic']]
+            rows = await whole_rows(project_id, filters, limit)
+            return [{k: v for k, v in row.items() if k != 'content'} for row in rows]
 
-    def seed(self, *, content: str | None = None, **metadata: Any) -> str:
-        memory_id = new_id()
-        self.records[memory_id] = {
-            'id': memory_id,
-            'content': content or f'record {memory_id}',
-            'metadata': {'category': CATEGORY, **metadata},
-        }
-        return memory_id
-
-    def seed_many(self, n: int, **metadata: Any) -> list[str]:
-        return [self.seed(**metadata) for _ in range(n)]
-
-    def metadata_of(self, memory_id: str) -> dict[str, Any]:
-        return self.records[memory_id]['metadata']
-
-    def snapshot(self, memory_id: str) -> dict[str, Any]:
-        return copy.deepcopy(self.records[memory_id])
+        self.get_memories_by_metadata.side_effect = scroll
 
     def canonicals_of(self, topic: str) -> list[dict[str, Any]]:
         return [
@@ -102,77 +91,12 @@ class FakeMemoryService:
             if r['metadata'].get('topic') == topic and r['metadata'].get('canonical') is True
         ]
 
-    def writes(self) -> tuple[int, int]:
-        return self.updates, self.adds
-
-    # ---- the MemoryService surface ---------------------------------------
-
-    async def get_memory_by_id(self, project_id: str, memory_id: str) -> dict[str, Any] | None:
-        self.reads += 1
-        if memory_id in self.read_errors:
-            raise self.read_errors[memory_id]
-        record = self.records.get(memory_id)
-        return copy.deepcopy(record) if record is not None else None
-
-    def _matching(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
-        return [
-            {'id': r['id'], 'created_at': CREATED_AT, 'metadata': copy.deepcopy(r['metadata'])}
-            for r in self.records.values()
-            if all(r['metadata'].get(k) == v for k, v in filters.items())
-        ]
-
-    async def get_memories_by_metadata(
-        self, project_id: str, filters: dict[str, Any], limit: int = 1000,
-    ) -> list[dict[str, Any]]:
-        self.reads += 1
-        topic = filters.get('topic')
-        if topic in self.scroll_errors:
-            raise self.scroll_errors[topic]
-        return self._matching(filters)[:limit]
-
-    async def count_memories_by_metadata(self, project_id: str, filters: dict[str, Any]) -> int:
-        self.reads += 1
-        topic = filters.get('topic')
-        if topic in self.scroll_errors:
-            raise self.scroll_errors[topic]
-        return len(self._matching(filters))
-
-    async def update_memory(
-        self,
-        memory_id: str,
-        project_id: str = 'main',
-        content: str | None = None,
-        metadata_patch: dict[str, Any] | None = None,
-        metadata_mode: str = 'merge',
-        **_: Any,
-    ) -> dict[str, Any]:
-        self.updates += 1
-        if memory_id in self.update_returns:
-            return self.update_returns[memory_id]
-        record = self.records.get(memory_id)
-        if record is None:
-            return {'error': f'{memory_id} not found', 'error_type': 'MemoryNotFound'}
-        record['metadata'].update(metadata_patch or {})
-        if content is not None:
-            record['content'] = content
-        return {'status': 'updated', 'store': 'mem0', 'id': memory_id}
-
-    async def add_memory(
-        self,
-        content: str,
-        category: str | None = None,
-        project_id: str = 'main',
-        metadata: dict[str, Any] | None = None,
-        **_: Any,
-    ) -> AddMemoryResponse:
-        self.adds += 1
-        memory_id = new_id()
-        self.records[memory_id] = {
-            'id': memory_id,
-            'content': content,
-            'metadata': {**(metadata or {}), 'category': category},
-        }
-        return AddMemoryResponse(memory_ids=[memory_id], message='ok')
+    def read_awaits(self) -> int:
+        return (
+            self.get_memory_by_id.await_count
+            + self.get_memories_by_metadata.await_count
+            + self.count_memories_by_metadata.await_count
+        )
 
 
 # ---- fixtures and drivers ----------------------------------------------------
@@ -330,7 +254,7 @@ class TestDryRunVerdict:
         code, _ = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
 
         assert code == 0
-        assert fake.writes() == (0, 0)
+        assert fake.write_awaits() == (0, 0, 0, 0)
         assert fake.records == records_before
         assert task_rows(db_path) == before
 
@@ -494,7 +418,7 @@ class TestRunLevelRefusals:
         ]), memory=fake))
 
         assert code == 2
-        assert fake.reads == 0
+        assert fake.read_awaits() == 0
         assert claims[-1].split('=')[0] in caplog.text
 
     def test_a_full_canonical_slug_page_stops_the_run(self, root, fake, seed_tasks, capsys):
@@ -509,7 +433,7 @@ class TestRunLevelRefusals:
         ]), memory=fake))
 
         assert code == 2
-        assert fake.writes() == (0, 0)
+        assert fake.write_awaits() == (0, 0, 0, 0)
 
 
 def run_code(root: Path, fake: FakeMemoryService, *extra: str) -> int:
@@ -528,8 +452,8 @@ class TestExecuteGating:
             code = run_code(root, fake, '--execute', '--claim', f'{TOPIC}={CLAIM}')
 
         assert code == 2
-        assert fake.writes() == (0, 0)
-        assert fake.reads == 0
+        assert fake.write_awaits() == (0, 0, 0, 0)
+        assert fake.read_awaits() == 0
         assert any(
             r.name == 'migrate_open_consolidation_gates' and 'no-such-mem0-dir' in r.getMessage()
             for r in caplog.records
@@ -551,8 +475,8 @@ class TestExecuteGating:
         code = run_code(root, fake, '--execute', '--claim', f'{TOPIC}={CLAIM}')
 
         assert code == 2
-        assert fake.writes() == (0, 0)
-        assert fake.reads == 0
+        assert fake.write_awaits() == (0, 0, 0, 0)
+        assert fake.read_awaits() == 0
         assert leaf in caplog.text
         dry_code, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
         assert dry_code == 0
@@ -636,7 +560,7 @@ class TestExecuteWrites:
         for member in fresh:
             assert fake.metadata_of(member)['topic'] == TOPIC
         assert fake.snapshot(canonical) == before
-        assert fake.adds == 0
+        assert fake.add_memory.await_count == 0
         assert gate['execution']['minted'] is False
         assert gate['closure']['closed'] is True
         assert [c['arguments']['escalation_id'] for c in gate['next']] == [escalation_id]
@@ -759,12 +683,12 @@ class TestCapsAndIdempotency:
         escalations = {93: seed_gate_escalation(root, 93), 94: seed_gate_escalation(root, 94)}
         claims = ('--claim', f'{TOPIC}={CLAIM}', '--claim', f'{OTHER_TOPIC}={CLAIM}')
         drive(root, fake, capsys, '--execute', *claims)
-        writes_after_first = fake.writes()
+        writes_after_first = fake.write_awaits()
 
         code, payload = drive(root, fake, capsys, '--execute', *claims)
 
         assert code == 0
-        assert fake.writes() == writes_after_first
+        assert fake.write_awaits() == writes_after_first
         for task_id, escalation_id in escalations.items():
             gate = gate_of(payload, task_id)
             assert gate['disposition'] == 'noop'
@@ -801,7 +725,7 @@ class TestCapsAndIdempotency:
         code, payload = drive(root, fake, capsys, '--execute')
 
         assert code == 0
-        assert fake.writes() == (0, 0)
+        assert fake.write_awaits() == (0, 0, 0, 0)
         gate = gate_of(payload, 96)
         assert gate['disposition'] == 'noop'
         assert gate['closure']['closed'] is True
