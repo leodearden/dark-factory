@@ -2424,8 +2424,10 @@ def compute_marker_signature(
     The task component is :func:`compute_flag_signature`'s union, except that
     a cited task from a project other than *project_id* contributes
     ``'<project>:<task_id>'``.  Every bare id names a task of the row's own
-    ``project_id``.  A flag with no task anchor falls back to
-    :func:`compute_content_fingerprint_signature`.
+    ``project_id``.  Both halves are stripped, and a foreign citation whose
+    qualified component :func:`_is_valid_marker_task_id` would reject
+    contributes its bare id, as before.  A flag with no task anchor falls back
+    to :func:`compute_content_fingerprint_signature`.
     """
     return (
         _task_union_signature(flag, home_project_id=project_id)
@@ -2464,16 +2466,17 @@ def _task_union_signature(
 
 
 def _cited_task_component(cited: dict[str, Any], home_project_id: str | None) -> str:
+    bare = str(cited['task_id'])
     cited_project = cited.get('project_id')
-    is_foreign = (
-        home_project_id is not None
-        and isinstance(cited_project, str)
-        and bool(cited_project)
-        and cited_project != home_project_id
-    )
-    if is_foreign:
-        return f'{cited_project}:{cited["task_id"]}'
-    return str(cited['task_id'])
+    if home_project_id is None or not isinstance(cited_project, str):
+        return bare
+    project = cited_project.strip()
+    if not project or project == home_project_id:
+        return bare
+    qualified = f'{project}:{bare.strip()}'
+    if _is_valid_marker_task_component(qualified):
+        return qualified
+    return bare
 
 
 # --------------------------------------------------------------------------- #
