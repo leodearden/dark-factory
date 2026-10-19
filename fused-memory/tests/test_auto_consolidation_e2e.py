@@ -39,16 +39,20 @@ from _auto_consolidation_fakes import (
     FakeMemoryService,
     FakeTaskBackend,
     enabled_config,
+    new_id,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from mcp.server.fastmcp import FastMCP
 from reconciliation.consolidator_fixtures import make_consolidator
+from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
 
 from fused_memory.config.schema import ConsolidationAutoConfig
+from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.consolidation_auto import AutoOutcome, build_auto_canonical
 from fused_memory.reconciliation.consolidation_auto_executor import revert_auto_consolidation
+from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.consolidation_proposal import (
     PROPOSER_AGENT_ID,
     RECORD_KIND_CONSOLIDATION_PROPOSAL,
@@ -439,3 +443,91 @@ async def test_b10_reversal_round_trips_both_runs(world):
     ) == []
     assert world.fake.canonical_ids() == []
     assert (await world.row(TOPIC, 'run-b10-1')).state == 'reverted'
+
+
+def _hazard_cluster(world: World, topic: str) -> list[str]:
+    """Three unstamped members plus an incumbent canonical carrying a correction."""
+    incumbent = world.fake.seed(topic=topic, canonical=True, superseded_by=new_id())
+    return [*world.fake.seed_many(3), incumbent]
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b4_correction_on_the_incumbent_files_a_curator_gate(world):
+    member_ids = _hazard_cluster(world, TOPIC)
+    corpus = world.corpus_snapshot()
+    writes = world.mem0_writes()
+
+    result = await world.cycle('run-b4', emit=[Emission(TOPIC, member_ids)])
+
+    gate = _only(world.filed_gates(), 'gate')
+    assert gate.project_root == world.project_root
+    assert gate.metadata[HUMAN_CURATOR_GATE_KEY] is True
+    assert gate.metadata['task_kind'] == 'deterministic'
+    assert gate.metadata['always_escalates'] is True
+    block = gate.metadata[GATE_METADATA_KEY]
+    assert block['topic'] == TOPIC
+    assert block['provenance']['observed_members'] == member_ids
+    assert block['provenance']['authoritative'] is False
+    assert 'canonical_carries_correction' in block['auto_refusal']['reason_codes']
+    assert 'canonical_carries_correction' in gate.description
+    assert HUMAN_CURATOR_ADJUDICATED_AT_KEY in gate.description
+    assert deterministic_task_error(
+        gate.metadata['task_kind'], gate.metadata, world.project_root,
+    ) is None
+
+    assert world.mem0_writes() == writes
+    assert world.corpus_snapshot() == corpus
+    assert world.system_records('auto_consolidation') == []
+    row = await world.row(TOPIC, 'run-b4')
+    assert row.state == 'gated'
+    assert outcome(row).gate_task_id == gate.task_id
+    assert result.report.stats['auto_consolidation_gates_filed'] == 1
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b5_an_open_gate_makes_re_emission_a_noop_naming_it(world):
+    member_ids = _hazard_cluster(world, TOPIC)
+    await world.cycle('run-b5-1', emit=[Emission(TOPIC, member_ids)])
+    gate = _only(world.filed_gates(), 'gate')
+    corpus = world.corpus_snapshot()
+    writes = world.mem0_writes()
+
+    result = await world.cycle(
+        'run-b5-2', emit=[Emission(TOPIC, member_ids)], active_tasks=[world.as_open_gate(gate)],
+    )
+
+    row = await world.row(TOPIC, 'run-b5-2')
+    assert row.state == 'addressed'
+    assert outcome(row).verdict is AutoOutcome.NOOP
+    assert outcome(row).reason_codes == ('already_gated',)
+    assert outcome(row).gate_task_id == gate.task_id
+    assert len(world.tasks.calls) == 1
+    assert result.report.stats['auto_consolidation_gates_filed'] == 0
+    assert world.mem0_writes() == writes
+    assert world.corpus_snapshot() == corpus
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b8_supervised_cycle_records_dry_runs_and_still_gates_hazards(tmp_path, ledger):
+    world = build_world(tmp_path, ledger, config=enabled_config(enabled=False))
+    fresh = world.fake.seed_many(5)
+    hazard = _hazard_cluster(world, HAZARD_TOPIC)
+    corpus = world.corpus_snapshot()
+    writes = world.mem0_writes()
+
+    result = await world.cycle(
+        'run-b8', emit=[Emission(TOPIC, fresh), Emission(HAZARD_TOPIC, hazard)],
+    )
+
+    assert (await world.row(TOPIC, 'run-b8')).state == 'dry_run'
+    assert result.report.stats['auto_consolidations_dry_run'] == 1
+    assert result.report.stats['auto_consolidations'] == 0
+    assert world.mem0_writes() == writes
+    assert world.corpus_snapshot() == corpus
+    assert world.system_records('auto_consolidation') == []
+    gate = _only(world.filed_gates(), 'gate')
+    assert gate.metadata[GATE_METADATA_KEY]['topic'] == HAZARD_TOPIC
+    assert (await world.row(HAZARD_TOPIC, 'run-b8')).state == 'gated'
