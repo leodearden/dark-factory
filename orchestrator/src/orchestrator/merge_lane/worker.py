@@ -20391,6 +20391,49 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             landed, len(chain.links), head_sha[:8],
         )
 
+    async def _finalize_landed_by_successor(
+        self,
+        item: RealMergeItem,
+        merge_wt: Path,
+        *,
+        spec_warm: bool,
+        landed_sha: str,
+        main_sha: str,
+    ) -> None:
+        """Finalize *item* as landed by its own verified commit, which a later landing carried onto main.
+
+        Task 7196 (the "already on main" slice of 6155).  Re-verifying here
+        would gate main's own tree.  Main was moved by another item, so the
+        landing-side work that belongs to the item that moved it (the chain
+        walk, shadow compare, drift check, warm-base refresh, the landed hook)
+        is not repeated, and the main-tip cache stays at *main_sha*, never
+        regressing to *landed_sha*.
+        """
+        req = item.request
+        logger.info(
+            'Task %s: verified merge commit %s is already on main %s; '
+            'finalizing as landed without a re-verify',
+            req.task_id, landed_sha[:8], main_sha[:8],
+        )
+        self._gate_retries.pop(req.task_id, None)
+        await self._release_or_cleanup(merge_wt, spec_warm=spec_warm)
+        outcome = await _finalize_advanced_merge(
+            self._git_ops, req, self._event_store,
+            merge_commit_fallback=landed_sha,
+            base_sha=item.base_sha,
+            started_monotonic=item.started_monotonic,
+            cas_retries=self._cas_retries,
+            timeouts=self._post_merge_verify_timeouts,
+            enospc_retries=self._post_merge_verify_enospc_retries,
+            log_label=' (already on main)',
+            merged_branch_tip=item.merged_branch_tip,
+            advanced_sha=landed_sha,
+        )
+        self._resolve_or_drop_abandoned(req, outcome)
+        if outcome.status == 'done':
+            self._note_merge_landing(req.request_id)
+            self._last_known_main_sha = main_sha
+
     async def _finalize_inflight(self, entry: InflightEntry) -> bool:
         """Run the CAS advance_main + post-advance work for one in-flight item.
 
@@ -21155,6 +21198,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # _note_merge_retry docstring for the rationale).
                     self._note_merge_retry()
                     rebased_sha, rebased_from, rebased_onto = _rebased_tip(adv_outcome, req.task_id)
+                    if await self._git_ops.is_ancestor_checked(current_sha, rebased_onto) is True:
+                        await self._finalize_landed_by_successor(
+                            item, merge_wt, spec_warm=_vr_spec_warm,
+                            landed_sha=current_sha, main_sha=rebased_onto,
+                        )
+                        advanced = True
+                        return True
 
                     self._note_transition(
                         req.request_id, ItemLifecycleState.FINALIZING,

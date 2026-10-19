@@ -3679,6 +3679,54 @@
           "current": 31607
         }
       ]
+    },
+    {
+      "task_id": "7196",
+      "reason": "already-on-main short-circuit (6155 slice): the rebased_pending_reverify arm asks whether the verified commit is already an ancestor of main and, if so, finalizes it done through a new SpeculativeMergeWorker._finalize_landed_by_successor instead of re-verifying main's own tree",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2195,
+          "current": 2199
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_finalize_inflight",
+          "baseline": 99,
+          "current": 102
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22178,
+          "current": 22228
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12501,
+          "current": 12510
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4869,
+          "current": 4873
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57296,
+          "current": 57346
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31607,
+          "current": 31616
+        }
+      ]
     }
   ]
 }
