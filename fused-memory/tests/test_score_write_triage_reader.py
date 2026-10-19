@@ -605,3 +605,68 @@ class TestTheV2ScriptsImportOnlyDownward:
             f'loading {stem} also loaded {sorted(loaded - closure)} '
             f'and not {sorted(closure - loaded)}'
         )
+
+
+CALIBRATION = Path(__file__).parent.parent / 'calibration'
+_BASELINE_STEM = 'write_triage_v2_soak'
+
+
+def _calibration(suffix: str) -> Path:
+    return CALIBRATION / f'{_BASELINE_STEM}_{suffix}'
+
+
+def _jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+@functools.cache
+def _committed_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    items = _jsonl_rows(_calibration('items.jsonl'))
+    verdicts = _jsonl_rows(_calibration('verdicts.jsonl'))
+    strata = json.loads(_calibration('strata.json').read_text())
+    return items, verdicts, strata
+
+
+@functools.cache
+def _rescored_baseline() -> dict[str, Any]:
+    items, verdicts, strata = _committed_inputs()
+    return _mod().score_reader(items, verdicts, strata=strata)
+
+
+class TestTheCommittedSoakBaseline:
+    """The committed v2 soak baseline cannot drift from its committed inputs.
+
+    Built by ``scripts/build_write_triage_v2_soak_baseline.py`` from the
+    gitignored 2026-10-19 soak bundle. The invariants below are fixed by the
+    soak's v1 labels whatever the new ratings say.
+    """
+
+    def test_rescoring_the_inputs_reproduces_the_report(self) -> None:
+        committed = json.loads(_calibration('baseline.json').read_text())
+        assert _rescored_baseline() == committed
+
+    def test_the_markdown_is_the_rendered_report(self) -> None:
+        committed = json.loads(_calibration('baseline.json').read_text())
+        assert _calibration('baseline.md').read_text() == _mod().render_markdown(committed)
+
+    def test_holds_the_soaks_553_adjudicated_attaches(self) -> None:
+        population = _rescored_baseline()['population']
+        assert population['n_items'] == 553
+        assert population['by_outcome'] == {
+            'amended': 40, 'contested': 473, 'restated': 40, 'stored': 0,
+        }
+        assert sum(_committed_inputs()[2].values()) == 1822
+
+    def test_every_v1_action_changing_correction_is_a_flagged_conflict(self) -> None:
+        items, verdicts, _ = _committed_inputs()
+        contested = {item['entry_id'] for item in items if item['outcome'] == 'contested'}
+        derived_conflicts = {
+            row['entry_id'] for row in verdicts
+            if row['role'] == 'derived' and row.get('conflict') == 'YES'
+            and row['entry_id'] in contested
+        }
+        assert len(derived_conflicts) == 225
+        assert _rescored_baseline()['metrics']['m5']['hits'] >= 225
+
+    def test_counts_the_13_parents_edited_after_attach(self) -> None:
+        assert _rescored_baseline()['metrics']['m6']['parent_edited'] == 13
