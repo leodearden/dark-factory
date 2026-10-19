@@ -145,7 +145,7 @@ class TestAttachTimeText:
 
 
 class TestAssemble:
-    def _assembly(self) -> object:
+    def _assembly(self) -> Any:
         determined = {
             ('e1', 'p1'): {'home': 'YES', 'conflict': 'NO'},
             ('e2', 'p2'): {},
@@ -263,7 +263,7 @@ class TestItemRow:
 
 
 class TestShard:
-    def _shard(self) -> tuple[object, str, str]:
+    def _shard(self) -> tuple[Any, str, str]:
         child = 'c' * 300 + 'tail of the child ' * 300
         parent = 'p' * 4500
         builder = _mod()
@@ -309,3 +309,24 @@ class TestTheCli:
                 '--scratch', str(bundle / 'scratch'),
             ])
         assert list(bundle.iterdir()) == []
+
+
+class TestDecisiveTies:
+    def _vote(self, entry: str, rater: str, role: str, **answers: str) -> dict[str, Any]:
+        return {'entry_id': entry, 'target_id': 'p1', 'basis': 'current', 'rater': rater,
+                'role': role, 'batch': 'b', **answers}
+
+    def test_names_only_pairs_a_tie_blocks(self) -> None:
+        items = [_item(entry_id='tied'), _item(entry_id='calm'), _item(entry_id='harmless')]
+        verdicts = [
+            self._vote('tied', 'opus', 'primary', conflict='YES'),
+            self._vote('tied', 'sonnet', 'second', conflict='NO', home='YES', loss='NO'),
+            self._vote('calm', 'opus', 'primary', conflict='YES'),
+            self._vote('harmless', 'opus', 'primary', conflict='YES', home='YES'),
+            self._vote('harmless', 'sonnet', 'second', conflict='YES', home='NO'),
+        ]
+        assert _mod().decisive_ties(items, verdicts) == [('tied', 'p1')]
+
+    def test_an_unrated_decisive_binary_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="'unrated-item'"):
+            _mod().decisive_ties([_item(entry_id='unrated-item')], [])

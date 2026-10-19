@@ -95,6 +95,9 @@ _POLES: Mapping[Binary, tuple[Resolved, Resolved]] = MappingProxyType({
 })
 """Each binary's (positive, negative) resolution; the positive word is the one counted."""
 
+M1_BAND = OUTCOME_RESTATED
+"""The triage band whose writes M1 counts: band-winner cosine at or above t_high when written."""
+
 _UNCLEAR = 'UNCLEAR'
 _REQUIRED_KEYS = ('entry_id', 'target_id', 'basis', 'rater', 'role', 'batch')
 _IDENTITY_KEYS = ('entry_id', 'target_id', 'rater')

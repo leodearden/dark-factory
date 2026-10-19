@@ -126,7 +126,6 @@ The basis of each weight is ``calibration/write_triage_reader_metrics.md`` §wei
 
 HARM_WEIGHTS_STATUS = 'provisional'
 
-_M1_BAND = OUTCOME_RESTATED
 _BANDS = frozenset({OUTCOME_RESTATED, OUTCOME_JUDGE, OUTCOME_STORED})
 _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
 _REQUIRED_ITEM_KEYS = ('entry_id', 'outcome', 'band', 'project', 'stratum')
@@ -370,7 +369,7 @@ def _score(item: ReaderItem, judgements: Mapping[_rubric.PairKey, _rubric.Judgem
     parent = current.get(item.target_id) if item.target_id is not None else None
     return _Scored(
         item=item,
-        current=_derive(item, current, in_m1_band=item.band == _M1_BAND),
+        current=_derive(item, current, in_m1_band=item.band == _rubric.M1_BAND),
         attach_time=(
             _derive(item, attach_time, in_m1_band=False)
             if any(judgement is not None for judgement in attach_time.values()) else None
@@ -498,7 +497,7 @@ def _bootstrap(
 
 def _m1(scored: Sequence[_Scored], weights: Mapping[str, float] | None) -> dict[str, Any]:
     block = _proportion(
-        scored, lambda s: s.item.band == _M1_BAND, lambda _, d: bool(d.m1_hidden), weights,
+        scored, lambda s: s.item.band == _rubric.M1_BAND, lambda _, d: bool(d.m1_hidden), weights,
     )
     return {**block, 'band_unknown': sum(s.item.band is None for s in scored)}
 
