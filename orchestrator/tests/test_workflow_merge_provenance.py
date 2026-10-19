@@ -924,6 +924,34 @@ class TestFinaliseMergedDoneConsumesLandedRow:
         assert outbox.lookup(f.wf.task_id) is not None
 
 
+@pytest.mark.asyncio
+class TestFinaliseMergedDoneWithoutMergeSha:
+    """A sha-less merge SUCCESS resolves through the journal first (task 3113)."""
+
+    async def test_journal_row_resolves_merged_without_consulting_git(
+        self, tmp_path: Path,
+    ):
+        """The restart-replay class: an orphan's landing journalled a LandedRow
+        before main advanced, so the DONE tail stamps ``merged`` from the row.
+        ``_make`` leaves ``_merge_sha`` unset, which is the sha-less shape."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        _bind_landed_row(tmp_path, task_id=f.wf.task_id, advanced_sha='advsha')
+        f.is_ancestor.side_effect = AssertionError(
+            'is_ancestor must not be called on a journal hit',
+        )
+        queue = _arm_escalation_queue(f, tmp_path)
+
+        outcome = await f.wf._finalise_merged_done()
+
+        assert outcome == WorkflowOutcome.DONE
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='merged', sha='advsha',
+            note='landed-outbox journal hit (post-MERGE recovery)',
+        )
+        assert f.wf._merge_recovery_basis == 'journal'
+        assert queue.get_by_task(f.wf.task_id) == []
+
+
 # ---------------------------------------------------------------------------
 # TestFinaliseRecoveryDoneDeliveredChecksGuard (task 3057 — step-5 RED /
 # step-6 GREEN)
