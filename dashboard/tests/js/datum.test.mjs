@@ -705,9 +705,53 @@ test('plainDatum: a value aged past the plain bound badges through datumView', (
   assert.equal(datumView(stale, { now: RECEIVED_AT + 1000, format: String }).age, null);
 });
 
-test('plainDatum: the bound is four poll intervals — fine, ahead of the coarse banner', () => {
-  // data.js polls every POLL_INTERVAL_MS=3000 with JITTER_MAX_MS=1500, so a
-  // healthy receipt is at most ~4.5s old; 12s is ~2.6x headroom and no twitch.
+test('plainDatum: a paced receipt extends the bound by its pacing hold — a slow-but-healthy endpoint reads like a fast one', () => {
+  // data.js::refreshOne publishes the slowness-pacing hold a success imposed.
+  // The poll loop deliberately waits that long before the next request, so a
+  // paced value sitting out its hold is on schedule, not stopped.
+  const HOLD_MS = 12_000;
+  const receipt = { servedAt: null, receivedAt: RECEIVED_AT, window: null, pacingHoldMs: HOLD_MS };
+  const wrapped = plainDatum(7, TASKS_PATH, receiptsFor(receipt));
+
+  assert.equal(wrapped.freshness_bound_seconds, PLAIN_DATUM_BOUND_SECONDS + HOLD_MS / 1000);
+  assert.equal(
+    datumView(wrapped, { now: RECEIVED_AT + PLAIN_DATUM_BOUND_SECONDS * 1000 + HOLD_MS - 1 }).age,
+    null,
+    'a paced value inside its own cadence badged — the unpaced bound leaked through',
+  );
+  assert.ok(
+    datumView(wrapped, { now: RECEIVED_AT + PLAIN_DATUM_BOUND_SECONDS * 1000 + HOLD_MS + 1000 }).age,
+    'a paced value overdue past its own cadence did not badge',
+  );
+  assert.deepEqual(derivedDatum(7, TASKS_PATH, 'x', receiptsFor(receipt)), wrapped);
+});
+
+test('plainDatum: an unpaced, absent or malformed pacing hold keeps the base bound', () => {
+  // Fails toward badging: a published hold is a finite positive number by
+  // construction, so anything else must never stretch the bound and hide a
+  // stopped endpoint. '12000' is here so a coercing Number() read cannot pass.
+  for (const h of [0, undefined, null, -5000, NaN, Infinity, '12000']) {
+    const receipt = { servedAt: null, receivedAt: RECEIVED_AT };
+    if (h !== undefined) receipt.pacingHoldMs = h;
+    const wrapped = plainDatum(7, TASKS_PATH, receiptsFor(receipt));
+
+    assert.equal(
+      wrapped.freshness_bound_seconds,
+      PLAIN_DATUM_BOUND_SECONDS,
+      `pacingHoldMs=${String(h)} moved the bound`,
+    );
+    assert.ok(
+      datumView(wrapped, { now: RECEIVED_AT + (PLAIN_DATUM_BOUND_SECONDS + 1) * 1000 }).age,
+      `pacingHoldMs=${String(h)} kept a value past the base bound from badging`,
+    );
+  }
+});
+
+test('plainDatum: the BASE bound is four poll intervals — an unpaced endpoint, fine, ahead of the coarse banner', () => {
+  // data.js polls every POLL_INTERVAL_MS=3000 with JITTER_MAX_MS=1500, so an
+  // UNPACED endpoint's receipt is at most ~4.5s old; 12s leaves 7.5s of
+  // headroom and no twitch. A paced receipt adds its pacingHoldMs on top,
+  // keeping that same headroom; data.js::recordSuccess paces.
   // endpoint_staleness.js calls an endpoint stale at 3 consecutive failures
   // (~21s of backoff), so the tile badge is the first per-VALUE signal and the
   // banner the later per-ENDPOINT explanation — deliberately ordered
