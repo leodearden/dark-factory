@@ -1911,7 +1911,7 @@ def _build_ticket_janitor(
     known_projects: dict[str, str],
 ) -> TicketJanitor | None:
     """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
-    from fused_memory.middleware.ticket_janitor import TicketJanitor  # noqa: PLC0415
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
 
     janitor_cfg = getattr(config.curator, 'janitor', None)
     if janitor_cfg is None or not janitor_cfg.enabled:

@@ -855,7 +855,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
-    from fused_memory.middleware.curation_deferral import DeferReason  # noqa: PLC0415
+    from fused_memory.middleware.curation_deferral import DeferReason
     from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
@@ -874,7 +874,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.scope_violation_escalator import (
         _OVERRIDE_ANCHOR_TASK_ID as SCOPE_OVERRIDE_ANCHOR,
     )
-    from fused_memory.middleware.ticket_janitor import (  # noqa: PLC0415
+    from fused_memory.middleware.ticket_janitor import (
         curation_backlog_anchor,
     )
     from fused_memory.server.markup_guard import (  # noqa: PLC0415
