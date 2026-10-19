@@ -238,6 +238,10 @@ def gate_of(payload: dict, task_id: int) -> dict:
     return found
 
 
+def ids_by_code(gate: dict) -> list[dict]:
+    return [{'code': r['code'], 'ids': r['ids']} for r in gate['reasons']]
+
+
 def task_rows(db_path: Path) -> list[tuple]:
     with closing(sqlite3.connect(db_path)) as con:
         return con.execute('SELECT id, status, metadata FROM tasks ORDER BY id').fetchall()
@@ -389,7 +393,7 @@ class TestLiveReRead:
 
         gate = gate_of(payload, 33)
         assert gate['disposition'] == 'left_to_sitting'
-        assert {'code': 'member_unreadable', 'ids': [members[1]]} in gate['reasons']
+        assert {'code': 'member_unreadable', 'ids': [members[1]]} in ids_by_code(gate)
 
     def test_a_correction_banner_is_left_to_the_sitting(self, root, fake, seed_tasks, capsys):
         members = fake.seed_many(2)
@@ -400,7 +404,7 @@ class TestLiveReRead:
 
         gate = gate_of(payload, 34)
         assert gate['disposition'] == 'left_to_sitting'
-        assert {'code': 'member_carries_correction_banner', 'ids': [corrected]} in gate['reasons']
+        assert {'code': 'member_carries_correction_banner', 'ids': [corrected]} in ids_by_code(gate)
 
 
 class TestFailClosedScroll:
