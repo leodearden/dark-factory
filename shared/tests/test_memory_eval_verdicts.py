@@ -383,3 +383,51 @@ class TestDashboardShapedRead:
         for entry in data['entries']:
             for key in ('eval_id', 'metric_id', 'verdict', 'fingerprint', 'value', 'limit_ref', 'run_stamp'):
                 assert key in entry
+
+
+_VERDICTS_FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval_verdicts'
+_EXEMPLAR_LIMITS = {'filed': 3, 'storm': 2}
+
+
+def _exemplar_path(name: str) -> Path:
+    return _VERDICTS_FIXTURES / name / 'verdicts-current.json'
+
+
+def _read_exemplar(name: str) -> dict:
+    return json.loads(_exemplar_path(name).read_text(encoding='utf-8'))
+
+
+class TestCommittedVerdictsExemplars:
+    """The committed regression-run exemplars: K=3 files per alarm, K=2 collapses to a storm."""
+
+    @pytest.mark.parametrize('name', sorted(_EXEMPLAR_LIMITS))
+    def test_the_exemplar_is_committed_and_valid(self, name):
+        assert _exemplar_path(name).is_file()
+        load_verdicts_artifact(_exemplar_path(name))
+
+    @pytest.mark.parametrize('name', sorted(_EXEMPLAR_LIMITS))
+    def test_the_exemplar_is_exactly_what_the_builder_emits(self, name):
+        regenerated = serialize_verdicts_artifact(build_verdicts_artifact(
+            [_regression_run()], run_stamp=_REGRESSION_STAMP, alarm_limit=_EXEMPLAR_LIMITS[name],
+        ))
+        assert regenerated == _exemplar_path(name).read_text(encoding='utf-8')
+
+    def test_the_filed_exemplar_carries_three_fingerprinted_alarms(self):
+        data = _read_exemplar('filed')
+        alarms = [e for e in data['entries'] if e['verdict'] == 'alarm']
+        assert len(alarms) == 3
+        assert all(isinstance(e['fingerprint'], str) and e['fingerprint'] for e in alarms)
+        assert data['storm_escape']['triggered'] is False
+
+    def test_the_storm_exemplar_carries_a_triggered_aggregate(self):
+        storm = _read_exemplar('storm')['storm_escape']
+        assert storm['triggered'] is True
+        assert isinstance(storm['aggregate_fingerprint'], str) and storm['aggregate_fingerprint']
+
+    def test_the_exemplar_tree_cannot_be_mistaken_for_an_eval(self):
+        dirs = sorted(p.name for p in _VERDICTS_FIXTURES.rglob('*') if p.is_dir())
+        assert dirs == ['filed', 'storm']
+        assert list(_VERDICTS_FIXTURES.rglob('metrics-*.json')) == []
+
+    def test_alphas_fixture_root_still_has_no_verdicts_artifact(self):
+        assert not (_FIXTURES / 'verdicts-current.json').exists()
