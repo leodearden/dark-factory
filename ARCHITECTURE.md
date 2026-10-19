@@ -342,7 +342,10 @@ Tasks reach the queue through `mcp__fused-memory__submit_task`
   (`{"ticket": "tkt_..."}`) and returns immediately; an async `TaskCurator`
   (`fused-memory/src/fused_memory/middleware/task_curator.py`) dedupes,
   combines, or creates the real task row in the SQLite backend
-  (`<project_root>/.taskmaster/tasks/tasks.db`).
+  (`<project_root>/.taskmaster/tasks/tasks.db`). When the curator's account
+  pool cannot serve, the ticket parks as `awaiting_curation` and the ticket
+  janitor retries it until it is curated; every create the curator did not
+  judge is marked `metadata.dedupe_skipped`.
 - **`planning_mode=True` path.** Used by `/prd` batch decomposition: writes
   the task directly in status `deferred`, bypassing the curator, so a whole
   batch of interdependent tasks can be authored and wired together (deps,

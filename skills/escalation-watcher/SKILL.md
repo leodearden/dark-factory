@@ -2062,6 +2062,11 @@ Technical debt or cleanup discovered during development.
       # Record resolve["reason"] in the escalation resolution note.
       # Do NOT retry and do NOT record a task id.
       note_refused(resolve["reason"])
+  elif resolve["status"] == "awaiting_curation":
+      # Deliberately NOT in the tuple above: the ticket is parked with no
+      # task_id yet. Do NOT re-submit. Resolve the escalation with
+      # "queued for curation (ticket <ticket>)".
+      note_parked(ticket)
   elif resolve["status"] == "failed":
       # Record reason in escalation resolution note; skip this item.
       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
