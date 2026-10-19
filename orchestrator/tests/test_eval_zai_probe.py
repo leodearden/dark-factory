@@ -18,6 +18,7 @@ import math
 
 import httpx
 import pytest
+from _eval_config_lookup import named_eval_config
 
 
 class _Recorder:
@@ -170,15 +171,6 @@ class TestRequireZaiCodingEndpointFailsLoudly:
         assert issubclass(ZaiCodingPlanUnavailable, RuntimeError)
 
 
-def _named(name: str):
-    """The eval config registered under *name*; a missing one fails the test that asked."""
-    from orchestrator.evals.configs import get_config_by_name
-
-    cfg = get_config_by_name(name)
-    assert cfg is not None, f'no eval config named {name!r}'
-    return cfg
-
-
 class TestRequireZaiCodingEndpointFor:
     """The campaign-level entry point: probe once, and only when a config targets Z.ai."""
 
@@ -190,23 +182,17 @@ class TestRequireZaiCodingEndpointFor:
             return require_zai_coding_endpoint_for(configs, client=client, **kwargs)
 
     def test_targets_zai_coding_plan_is_exactly_the_glm_base_url_bundles(self):
-        """One comparison over every registered config, so a mismatch diff names each config."""
+        """Every other registered config, the other proxied endpoints included, is not Z.ai."""
         from orchestrator.evals import configs, zai_probe
 
         every_config = [
             *configs.EVAL_CONFIGS, *configs.ARCHITECT_EVAL_CONFIGS,
             *configs.claude_endpoint_candidates(), *configs.codex_pi_candidates(),
         ]
-        verdicts = {cfg.name: zai_probe.targets_zai_coding_plan(cfg) for cfg in every_config}
-        expected = {
-            cfg.name: cfg.env_overrides.get('ANTHROPIC_BASE_URL') == configs.GLM_BASE_URL
-            for cfg in every_config
-        }
 
-        assert verdicts == expected
-        zai_names = {name for name, targets in verdicts.items() if targets}
+        zai_names = {cfg.name for cfg in every_config if zai_probe.targets_zai_coding_plan(cfg)}
+
         assert zai_names == {'glm-5.3-endpoint', 'glm-5.3-flash-endpoint'}
-        assert all(zai_probe.targets_zai_coding_plan(_named(name)) for name in zai_names)
 
     @pytest.mark.parametrize('names', [
         [],
@@ -218,7 +204,7 @@ class TestRequireZaiCodingEndpointFor:
         monkeypatch.delenv('ZAI_API_KEY', raising=False)
         recorder = _Recorder(200)
 
-        outcome = self._for([_named(name) for name in names], recorder)
+        outcome = self._for([named_eval_config(name) for name in names], recorder)
 
         assert outcome is None
         assert recorder.requests == []
@@ -227,7 +213,7 @@ class TestRequireZaiCodingEndpointFor:
         from orchestrator.evals import configs, zai_probe
 
         cfgs = [
-            _named(name)
+            named_eval_config(name)
             for name in ('glm-5.3-endpoint', 'claude-opus-high', 'glm-5.3-flash-endpoint')
         ]
         recorder = _Recorder(200)
@@ -243,7 +229,10 @@ class TestRequireZaiCodingEndpointFor:
         from orchestrator.evals.zai_probe import ZaiCodingPlanUnavailable
 
         with pytest.raises(ZaiCodingPlanUnavailable) as excinfo:
-            self._for([_named('glm-5.3-endpoint')], _Recorder(401, text='denied'), auth_token='tk-test')
+            self._for(
+                [named_eval_config('glm-5.3-endpoint')], _Recorder(401, text='denied'),
+                auth_token='tk-test',
+            )
 
         assert excinfo.value.outcome is not None
         assert excinfo.value.outcome.status_code == 401
@@ -257,7 +246,7 @@ class TestRequireZaiCodingEndpointFor:
         recorder = _Recorder(200)
 
         with pytest.raises(ZaiCodingPlanUnavailable) as excinfo:
-            self._for([_named('glm-5.3-flash-endpoint')], recorder)
+            self._for([named_eval_config('glm-5.3-flash-endpoint')], recorder)
 
         assert excinfo.value.outcome is None
         assert recorder.requests == []

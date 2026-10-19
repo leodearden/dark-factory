@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
+from _eval_config_lookup import named_eval_config
 from click.testing import CliRunner, Result
 from shared.config_models import UsageCapConfig
 
@@ -37,12 +38,6 @@ class _Paths:
     config: Path
     task: Path
     tasks_dir: Path
-
-
-def _named(name: str):
-    cfg = configs_module.get_config_by_name(name)
-    assert cfg is not None, f'no eval config named {name!r}'
-    return cfg
 
 
 def _first_ofat(role: str) -> str:
@@ -170,7 +165,7 @@ def _invoke(
     argv = invocation.argv(paths)
     if invocation.ofat_additions:
         real_ofat = configs_module.ofat_candidates()
-        widened = [*real_ofat, *(_named(name) for name in invocation.ofat_additions)]
+        widened = [*real_ofat, *(named_eval_config(name) for name in invocation.ofat_additions)]
         monkeypatch.setattr(configs_module, 'ofat_candidates', lambda: widened)
 
     async def fake_stage(*args, **kwargs):
