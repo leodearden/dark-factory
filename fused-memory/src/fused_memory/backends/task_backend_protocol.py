@@ -323,10 +323,9 @@ class TaskBackendProtocol(Protocol):
 
         The one post-creation writer of both defect keys: the rules are
         ``fused_memory/backends/defect_records.py``'s, and the read-fold-write
-        runs in one write transaction. It takes no lock of the interceptor's,
-        so an in-process caller that already holds its own locks (the curator
-        combine) calls it directly; MCP callers reach it through
-        ``TaskInterceptor.apply_defect_events``.
+        runs in one write transaction. It takes none of the interceptor's
+        locks and journals nothing; its caller supplies both, as
+        ``TaskInterceptor.apply_defect_events`` does for the MCP tools.
         """
         ...
 

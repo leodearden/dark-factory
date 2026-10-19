@@ -9902,13 +9902,15 @@ def create_mcp_server(
         (``defect_ref_mismatch`` otherwise). Applied in one write under the
         same rules and refusals as ``declare_defect``.
 
-        Authority is by tool exposure (``plans/defect-tests-prd.md``
-        decision 7): only the orchestrator workflow
+        Its intended callers are the orchestrator workflow
         (``SchedulerFacade.dispatch_tool``) and ``scripts/prove_defect.py``
-        call it. It is in no dispatched role's ``allowed_tools``, which
-        ``orchestrator/tests/test_role_defect_outcome_authority.py`` guards.
-        Interactive sessions are Leo's trust domain and are not
-        machine-guarded.
+        (``plans/defect-tests-prd.md`` decision 7); interactive sessions are
+        Leo's trust domain and are not machine-guarded. No dispatched role's
+        ``allowed_tools`` grants it
+        (``orchestrator/tests/test_role_defect_outcome_authority.py``), but
+        that list is a permission allow list, not a denial: a dispatched
+        session that mounts fused-memory can still reach this tool, since no
+        role denies it through ``disallowed_tools`` yet.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('task_id', task_id):

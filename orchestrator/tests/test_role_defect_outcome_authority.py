@@ -1,12 +1,16 @@
-"""No dispatched role may call ``record_defect_outcome``.
+"""No dispatched role's ``allowed_tools`` grants ``record_defect_outcome``.
 
 Authority over a defect's proof and ruling is by tool exposure
 (``plans/defect-tests-prd.md`` decision 7): fused-memory has no authenticated
 caller identity, so the orchestrator workflow and ``scripts/prove_defect.py``
-are its only callers, and no role's ``allowed_tools`` may grant it. A grant can
-be the tool's own name, the whole ``mcp__fused-memory`` server, or a glob that
-matches it; the planted cases below show the predicate catches each form, so
-the guard over ``ROLES`` is not vacuous.
+are meant to be its only callers, and no role's ``allowed_tools`` may grant it.
+A grant can be the tool's own name, the whole ``mcp__fused-memory`` server, or
+a glob that matches it; the planted cases below show the predicate catches each
+form, so the guard over ``ROLES`` is not vacuous.
+
+This pins the grant half only. ``allowed_tools`` is a permission allow list,
+so a session that mounts fused-memory can still reach the tool; denying it
+takes a ``disallowed_tools`` entry, which no role carries yet.
 """
 
 from fnmatch import fnmatchcase

@@ -1905,10 +1905,10 @@ either key must also pass the whole list through
   defect, each keyed by its ref.
   - *Who writes it:* at creation, `submit_task` accepts only fresh `open`
     entries and refuses anything else synchronously with
-    `error == 'defect_creation_refused'`, naming the allowed values. After
-    creation `declare_defect` (`Declare`, `DeclareClosure`, `Sighting`) and
-    `record_defect_outcome` (`Proof`, `Rule`) are its only writers. A
-    defect leaves `open` only through a recorded I2 transition
+    `error == 'defect_creation_refused'`, whose `detail` names the allowed
+    values. After creation `declare_defect` (`Declare`, `DeclareClosure`,
+    `Sighting`) and `record_defect_outcome` (`Proof`, `Rule`) are its only
+    writers. A defect leaves `open` only through a recorded I2 transition
     (`shared/src/shared/defects.py::apply_event`).
   - *PRD:* `plans/defect-tests-prd.md` decisions 7, 13 and 15; Contract I1
     and I2.
@@ -1924,13 +1924,16 @@ either key must also pass the whole list through
 **The write path** for both keys is
 `fused-memory/src/fused_memory/backends/defect_records.py`, which holds the
 creation floor, the per-ref event fold and the typed refusals; read the
-rules there rather than here. `record_defect_outcome` is called only by the
-orchestrator workflow and `scripts/prove_defect.py`; no dispatched role's
-`allowed_tools` grants it (pinned by
-`orchestrator/tests/test_role_defect_outcome_authority.py`). A
-`duplicate_of` or `superseded_by` ref must already be declared on some task,
-which `lookup_defect_ref` answers. `update_task` never writes either key: it
-refuses one with `error == 'defect_records_via_update_task'`, except under
+rules there rather than here. `record_defect_outcome` is meant for the
+orchestrator workflow and `scripts/prove_defect.py` alone. No dispatched
+role's `allowed_tools` grants it (pinned by
+`orchestrator/tests/test_role_defect_outcome_authority.py`), but that list
+is a permission allow list, not a denial, so a dispatched session that
+mounts fused-memory can still reach the tool: no role denies it through
+`disallowed_tools` yet. A `duplicate_of` or `superseded_by` ref must already
+be declared on some task, which `lookup_defect_ref` answers. `update_task`
+never writes either key: it refuses one with
+`error == 'defect_records_via_update_task'`, except under
 `metadata_mode='replace'` when the payload carries the stored value through
 verbatim, the same rule as `done_provenance` above.
 
