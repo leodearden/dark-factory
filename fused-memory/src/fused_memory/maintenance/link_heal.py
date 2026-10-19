@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from pathlib import Path
@@ -578,9 +578,19 @@ def corroboration_mismatch(
     )
 
 
+def _still_a_completion_record(child: LiveRecord) -> StaleField | None:
+    return None if is_orchestrator_completion_record(child.metadata) else StaleField.SOURCE
+
+
+#: The bases whose heal rests on the child alone, each with the check of that
+#: premise. Every other basis rests on its parent too (:func:`_parent_mismatch`).
+_CHILD_ONLY_PREMISES: Mapping[BasisSource, Callable[[LiveRecord], StaleField | None]] = (
+    MappingProxyType({BasisSource.COMPLETION_RECORD: _still_a_completion_record})
+)
+
+
 def corroboration_reads_parent(planned: PlannedAction) -> bool:
-    """A completion-record detach rests on the child alone; every other heal on its parent too."""
-    return planned.basis_source is not BasisSource.COMPLETION_RECORD
+    return planned.basis_source not in _CHILD_ONLY_PREMISES
 
 
 def _child_hash_mismatch(planned: PlannedAction, child: LiveRecord) -> StaleField | None:
@@ -590,8 +600,9 @@ def _child_hash_mismatch(planned: PlannedAction, child: LiveRecord) -> StaleFiel
 def _row_premise_mismatch(
     planned: PlannedAction, child: LiveRecord, parent: LiveRecord | None,
 ) -> StaleField | None:
-    if planned.basis_source is BasisSource.COMPLETION_RECORD:
-        return None if is_orchestrator_completion_record(child.metadata) else StaleField.SOURCE
+    child_only = _CHILD_ONLY_PREMISES.get(planned.basis_source)
+    if child_only is not None:
+        return child_only(child)
     return _parent_mismatch(planned, parent)
 
 
