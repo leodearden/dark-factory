@@ -270,7 +270,10 @@ class TestShadowCellsTable:
     def test_a_pre_shadow_runs_db_gains_the_table(self, db_path):
         conn = sqlite3.connect(db_path)
         try:
-            conn.execute('CREATE TABLE task_results (run_id TEXT, task_id TEXT)')
+            conn.execute(
+                'CREATE TABLE task_results (run_id TEXT NOT NULL, task_id TEXT NOT NULL, '
+                'project_id TEXT NOT NULL, outcome TEXT NOT NULL, completed_at TEXT)'
+            )
             conn.commit()
         finally:
             conn.close()
@@ -379,3 +382,12 @@ class TestShadowCellsSchemaRedundancy:
     def test_settled_without_reason_is_accepted(self, store, db_path):
         _raw_insert(db_path, state='settled', reason=None)
         assert _row_count(db_path) == 1
+
+    def test_an_unknown_stored_enum_value_is_refused_on_read(self, store, db_path):
+        _raw_insert(db_path, shape='reviewer')
+        with pytest.raises(ValueError) as excinfo:
+            store.get_shadow_cell('01JRAW')
+        message = str(excinfo.value)
+        assert '01JRAW' in message
+        assert 'shape' in message
+        assert 'reviewer' in message

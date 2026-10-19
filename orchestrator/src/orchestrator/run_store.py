@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
@@ -117,6 +118,124 @@ class ShadowCell:
                 f'(got {parts!r})'
             )
 
+
+_REASON_REQUIRED_STATES = ', '.join(
+    f"'{state.value}'" for state in ShadowCellState if state.requires_reason
+)
+_SQL_BLANK_CHARS = f"char({', '.join(str(ord(c)) for c in _BLANK_CHARS)})"
+
+_SHADOW_CELLS_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS shadow_cells (
+    cell_id         TEXT PRIMARY KEY,
+    parent_cell_id  TEXT,
+    project_id      TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    shape           TEXT NOT NULL,
+    candidate       TEXT NOT NULL,
+    incumbent       TEXT NOT NULL,
+    stratum         TEXT NOT NULL,
+    base_sha        TEXT NOT NULL,
+    worktree_path   TEXT,
+    plan_source     TEXT,
+    state           TEXT NOT NULL,
+    reason          TEXT,
+    reference_kind  TEXT,
+    reference_sha   TEXT,
+    result_path     TEXT,
+    cost_usd        REAL NOT NULL DEFAULT 0,
+    cost_credits    REAL NOT NULL DEFAULT 0,
+    cost_basis      TEXT NOT NULL,
+    run_id          TEXT,
+    opened_at       TEXT NOT NULL,
+    running_at      TEXT,
+    settled_at      TEXT,
+    settle_deadline TEXT NOT NULL,
+    owner           TEXT NOT NULL DEFAULT '{_SHADOW_CELL_DEFAULT_OWNER}',
+    CHECK (state NOT IN ({_REASON_REQUIRED_STATES})
+           OR trim(coalesce(reason, ''), {_SQL_BLANK_CHARS}) <> ''),
+    CHECK (cost_basis <> '{CostBasis.METERED.value}' OR cost_credits = 0),
+    CHECK (cost_usd >= 0 AND cost_credits >= 0),
+    CHECK (trim(owner, {_SQL_BLANK_CHARS}) <> ''),
+    CHECK (parent_cell_id IS NULL OR parent_cell_id <> cell_id)
+);
+"""
+
+_SHADOW_CELL_COLUMNS = tuple(field.name for field in fields(ShadowCell))
+_SHADOW_CELL_ENUM_COLUMNS: dict[str, type[StrEnum]] = {
+    'shape': ShadowShape,
+    'state': ShadowCellState,
+    'cost_basis': CostBasis,
+    'plan_source': PlanSource,
+    'reference_kind': ReferenceKind,
+}
+_SHADOW_CELL_TIME_COLUMNS = ('opened_at', 'settle_deadline', 'running_at', 'settled_at')
+_SHADOW_CELL_PATH_COLUMNS = ('worktree_path', 'result_path')
+_PARENT_SHARED_COLUMNS = ('project_id', 'task_id', 'base_sha')
+
+
+def _shadow_cell_to_row(cell: ShadowCell) -> dict[str, Any]:
+    row: dict[str, Any] = {name: getattr(cell, name) for name in _SHADOW_CELL_COLUMNS}
+    for name in _SHADOW_CELL_ENUM_COLUMNS:
+        row[name] = None if row[name] is None else row[name].value
+    for name in _SHADOW_CELL_TIME_COLUMNS:
+        row[name] = None if row[name] is None else row[name].astimezone(UTC).isoformat()
+    for name in _SHADOW_CELL_PATH_COLUMNS:
+        row[name] = None if row[name] is None else str(row[name])
+    row['stratum'] = _STRATUM_SEPARATOR.join(cell.stratum)
+    return row
+
+
+def _shadow_cell_from_row(row: sqlite3.Row) -> ShadowCell:
+    values: dict[str, Any] = {name: row[name] for name in _SHADOW_CELL_COLUMNS}
+    for name, enum_cls in _SHADOW_CELL_ENUM_COLUMNS.items():
+        values[name] = _decode_enum(values['cell_id'], name, enum_cls, values[name])
+    for name in _SHADOW_CELL_TIME_COLUMNS:
+        values[name] = None if values[name] is None else datetime.fromisoformat(values[name])
+    for name in _SHADOW_CELL_PATH_COLUMNS:
+        values[name] = None if values[name] is None else Path(values[name])
+    values['stratum'] = tuple(values['stratum'].split(_STRATUM_SEPARATOR))
+    return ShadowCell(**values)
+
+
+def _decode_enum(
+    cell_id: str, column: str, enum_cls: type[StrEnum], raw: str | None,
+) -> StrEnum | None:
+    if raw is None:
+        return None
+    try:
+        return enum_cls(raw)
+    except ValueError:
+        raise ValueError(
+            f'shadow_cells row {cell_id!r}: unknown {column} value {raw!r}'
+        ) from None
+
+
+_INSERT_SHADOW_CELL_SQL = (
+    f'INSERT INTO shadow_cells ({", ".join(_SHADOW_CELL_COLUMNS)}) '
+    f'VALUES ({", ".join(f":{name}" for name in _SHADOW_CELL_COLUMNS)})'
+)
+
+
+def _require_valid_parent(conn: sqlite3.Connection, cell: ShadowCell) -> None:
+    parent = conn.execute(
+        f'SELECT {", ".join(_PARENT_SHARED_COLUMNS)} FROM shadow_cells WHERE cell_id = ?',
+        (cell.parent_cell_id,),
+    ).fetchone()
+    if parent is None:
+        raise ValueError(
+            f'ShadowCell {cell.cell_id!r}: parent_cell_id {cell.parent_cell_id!r} '
+            f'names no stored cell'
+        )
+    for column in _PARENT_SHARED_COLUMNS:
+        if parent[column] != getattr(cell, column):
+            raise ValueError(
+                f'ShadowCell {cell.cell_id!r}: parent {cell.parent_cell_id!r} has '
+                f'{column}={parent[column]!r} but the child has '
+                f'{column}={getattr(cell, column)!r}; a child cell shares its '
+                f"parent's project, task and base"
+            )
+
+
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS runs (
     run_id         TEXT PRIMARY KEY,
@@ -191,7 +310,7 @@ CREATE TABLE IF NOT EXISTS main_sweep_cold_control (
     verdict_at  TEXT NOT NULL,
     swept_sha   TEXT NOT NULL
 );
-"""
+""" + _SHADOW_CELLS_SCHEMA
 
 
 class RunStore:
@@ -676,3 +795,35 @@ class RunStore:
         if verdict_at.tzinfo is None:
             return verdict_at.replace(tzinfo=UTC)
         return verdict_at
+
+    # ------------------------------------------------------------------ #
+    # Shadow-eval cells (plans/live-shadow-eval-prd.md C1, task 5382)    #
+    # ------------------------------------------------------------------ #
+
+    def insert_shadow_cell(self, cell: ShadowCell) -> None:
+        """Insert a new cell; an existing ``cell_id`` raises ``sqlite3.IntegrityError``.
+
+        A ``parent_cell_id`` must name a stored cell of the same project, task
+        and base, else ``ValueError`` and nothing is written.
+        """
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if cell.parent_cell_id is not None:
+                    _require_valid_parent(conn, cell)
+                conn.execute(_INSERT_SHADOW_CELL_SQL, _shadow_cell_to_row(cell))
+        finally:
+            conn.close()
+
+    def get_shadow_cell(self, cell_id: str) -> ShadowCell | None:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                'SELECT * FROM shadow_cells WHERE cell_id = ?', (cell_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else _shadow_cell_from_row(row)
