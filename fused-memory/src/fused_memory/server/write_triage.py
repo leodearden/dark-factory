@@ -46,6 +46,8 @@ inject their own fakes.
 The pure/impure split mirrors ``near_duplicate_guard``: pure synchronous
 selectors and defensive ``getattr``-at-every-hop config resolvers, with the
 one async retrieval helper and the async orchestrator kept separate from them.
+The attach guard (task 7158) follows the same split: :class:`AttachGuard` owns
+its rules purely, and only the lookup of an unretrieved parent's cosine is I/O.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
@@ -360,6 +363,14 @@ def _number_or_none(value: Any) -> float | None:
 # --- pure band routing ------------------------------------------------------
 
 
+class AttachRefusal(StrEnum):
+    """Why an attach was refused and the write stored standalone (task 7158)."""
+
+    BELOW_MIN_PARENT_COSINE = 'below_min_parent_cosine'
+    HOIST_COSINE_GAP = 'hoist_cosine_gap'
+    TARGET_COSINE_UNAVAILABLE = 'target_cosine_unavailable'
+
+
 @dataclass(frozen=True)
 class BandDecision:
     """Which band a candidate set fell in, and the numbers that decided it.
@@ -386,6 +397,67 @@ class BandDecision:
     judged_candidate_id: str | None = None
     #: Where the evidence behind this decision was clipped; ``()`` when nowhere.
     truncation_facts: tuple[TruncationFact, ...] = ()
+    #: The band winner's own slate id, before hoisting; ``None`` when no band
+    #: attached anything.
+    winner_id: str | None = None
+    #: Why the attach guard refused this write's attach; empty when it did not.
+    attach_refusals: frozenset[AttachRefusal] = frozenset()
+
+    @property
+    def attach_source_id(self) -> str | None:
+        """The slate record the attach target was derived from, before hoisting."""
+        return self.judged_candidate_id if self.judged_candidate_id is not None else self.winner_id
+
+
+@dataclass(frozen=True)
+class AttachGuard:
+    """Which attach-guard rules are in force for one write, and what they refuse.
+
+    The FLOOR refuses any attach whose target's cosine to the write is below
+    ``min_parent_cosine``. The HOIST GAP refuses, in the judge band only, a
+    hoist whose parent's cosine is more than ``hoist_max_cosine_gap`` below
+    the matched child's. ``None`` switches a rule off. The evidence for each
+    value is its field description on ``config/schema.py::WriteTriageConfig``.
+    """
+
+    min_parent_cosine: float | None
+    hoist_max_cosine_gap: float | None
+
+    def _gap_applies(self, *, hoisted: bool, judged: bool) -> bool:
+        return hoisted and judged and self.hoist_max_cosine_gap is not None
+
+    def needs_target_cosine(self, *, hoisted: bool, judged: bool) -> bool:
+        """Does any rule in force need the target's cosine to decide this attach?"""
+        return self.min_parent_cosine is not None or self._gap_applies(hoisted=hoisted, judged=judged)
+
+    def refusals(
+        self,
+        *,
+        source_cosine: float | None,
+        target_cosine: float | None,
+        hoisted: bool,
+        judged: bool,
+    ) -> frozenset[AttachRefusal]:
+        """Every rule this attach trips; an unscorable target trips them all as one reason."""
+        if not self.needs_target_cosine(hoisted=hoisted, judged=judged):
+            return frozenset()
+        if target_cosine is None:
+            return frozenset({AttachRefusal.TARGET_COSINE_UNAVAILABLE})
+        refused: set[AttachRefusal] = set()
+        if self.min_parent_cosine is not None and target_cosine < self.min_parent_cosine:
+            refused.add(AttachRefusal.BELOW_MIN_PARENT_COSINE)
+        gap = self.hoist_max_cosine_gap if self._gap_applies(hoisted=hoisted, judged=judged) else None
+        if gap is not None and source_cosine is not None and target_cosine < source_cosine - gap:
+            refused.add(AttachRefusal.HOIST_COSINE_GAP)
+        return frozenset(refused)
+
+
+def resolve_attach_guard(memory_service: Any) -> AttachGuard:
+    """The attach guard *memory_service*'s config puts in force, read live per write."""
+    return AttachGuard(
+        min_parent_cosine=resolve_min_parent_cosine(memory_service),
+        hoist_max_cosine_gap=resolve_hoist_max_cosine_gap(memory_service),
+    )
 
 
 def declares_attach_keys(metadata: Any) -> bool:
@@ -555,10 +627,12 @@ def decide_band(
     if t_high is not None and similarity >= t_high:
         return BandDecision(
             OUTCOME_RESTATED, canonical_id_of(best), similarity, t_high, t_low,
+            winner_id=best.id,
         )
 
     return BandDecision(
         OUTCOME_JUDGE, canonical_id_of(best), similarity, t_high, t_low,
+        winner_id=best.id,
     )
 
 
