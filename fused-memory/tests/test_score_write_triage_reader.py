@@ -11,7 +11,10 @@ derivation table; each item's comment states its cells.
 from __future__ import annotations
 
 import functools
+import json
 import math
+import subprocess
+import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -407,3 +410,198 @@ class TestRefusal:
         report = _mod().score_reader([item], verdicts)
         assert report['metrics']['m6']['attach_time_undecided'] == 1
         assert report['metrics']['m6']['attach_time_rated'] == 0
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    return path
+
+
+class TestTheCli:
+    def _inputs(self, tmp_path: Path) -> list[str]:
+        items, verdicts = _corpus()
+        strata = tmp_path / 'strata.json'
+        strata.write_text(json.dumps(_STRATA))
+        return [
+            '--items', str(_write_jsonl(tmp_path / 'items.jsonl', items)),
+            '--verdicts', str(_write_jsonl(tmp_path / 'v1.jsonl', verdicts[:5])),
+            str(_write_jsonl(tmp_path / 'v2.jsonl', verdicts[5:])),
+            '--strata', str(strata),
+        ]
+
+    def test_prints_the_report_and_writes_both_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        out = tmp_path / 'deep' / 'report.json'
+        markdown = tmp_path / 'other' / 'report.md'
+        argv = [*self._inputs(tmp_path), '--out', str(out), '--markdown', str(markdown)]
+        assert _mod().main(argv) == 0
+        printed = json.loads(capsys.readouterr().out)
+        assert printed == _weighted_report()
+        assert json.loads(out.read_text()) == printed
+        assert markdown.read_text() == _mod().render_markdown(printed)
+
+    def test_takes_a_harm_weight_map(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        weights = tmp_path / 'weights.json'
+        weights.write_text(json.dumps({'wrong_home': 10}))
+        assert _mod().main([*self._inputs(tmp_path), '--harm-weights', str(weights)]) == 0
+        printed = json.loads(capsys.readouterr().out)
+        assert printed['harm_weights'] == {'wrong_home': 10}
+        assert printed['harm']['per_write']['triage'] == round(30 / 13, 4)
+
+    def test_a_refusal_exits_1_names_each_gap_and_writes_nothing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        items = _write_jsonl(tmp_path / 'items.jsonl', [
+            _item('X1', 'contested', 'P1'), _item('X2', 'contested', 'P2'),
+        ])
+        verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X0', 'P0', home='YES')])
+        out, markdown = tmp_path / 'report.json', tmp_path / 'report.md'
+        code = _mod().main([
+            '--items', str(items), '--verdicts', str(verdicts),
+            '--out', str(out), '--markdown', str(markdown),
+        ])
+        assert code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        lines = captured.err.strip().splitlines()
+        assert len(lines) == 3
+        assert 'X1 P1 conflict' in lines[1] and 'X2 P2 conflict' in lines[2]
+        assert not out.exists() and not markdown.exists()
+
+    def test_a_malformed_line_names_its_path_and_line(self, tmp_path: Path) -> None:
+        items = tmp_path / 'items.jsonl'
+        items.write_text(json.dumps(_item('X', 'contested', 'P')) + '\n{not json\n')
+        verdicts = _write_jsonl(tmp_path / 'verdicts.jsonl', [_vote('X', 'P', conflict='YES')])
+        with pytest.raises(ValueError, match=f'{items}:2'):
+            _mod().main(['--items', str(items), '--verdicts', str(verdicts)])
+
+
+def _table_rows(markdown: str) -> dict[str, list[str]]:
+    rows: dict[str, list[str]] = {}
+    for line in markdown.splitlines():
+        if line.startswith('|') and not set(line) <= set('|-: '):
+            cells = [cell.strip() for cell in line.strip().strip('|').split('|')]
+            assert cells[0] not in rows, f'two table rows are labelled {cells[0]!r}'
+            rows[cells[0]] = cells[1:]
+    return rows
+
+
+def _shown(value: Any) -> str:
+    return '—' if value is None else str(value)
+
+
+class TestRenderMarkdown:
+    def test_is_deterministic(self) -> None:
+        assert _mod().render_markdown(_weighted_report()) == _mod().render_markdown(
+            _weighted_report(),
+        )
+
+    def test_has_one_row_per_metric_with_the_reports_numbers(self) -> None:
+        report = _weighted_report()
+        rows = _table_rows(_mod().render_markdown(report))
+        metrics = report['metrics']
+        blocks = {
+            'M1': metrics['m1'],
+            **{f'M2 {outcome}': block for outcome, block in metrics['m2'].items()},
+            'M3': metrics['m3'],
+            'M4': metrics['m4'],
+            'M5': metrics['m5'],
+        }
+        for label, block in blocks.items():
+            assert rows[label][:7] == [
+                _shown(block[key]) for key in (
+                    'n', 'hits', 'rate', 'wilson95', 'population_rate',
+                    'population_interval95', 'unclear',
+                )
+            ], label
+        m6 = metrics['m6']
+        assert rows['M6'][:2] == [str(m6['attach_time_rated']), str(m6['drifted'])]
+
+    def test_has_a_cells_table_per_regime_with_the_weights(self) -> None:
+        report = _weighted_report()
+        rows = _table_rows(_mod().render_markdown(report))
+        for cell, rule_count in report['cells']['triage'].items():
+            assert rows[cell][:3] == [
+                str(rule_count),
+                str(report['cells']['status_quo'][cell]),
+                _shown(report['harm_weights'].get(cell)),
+            ]
+
+    def test_has_the_harm_block_and_its_weight_status(self) -> None:
+        report = _weighted_report()
+        markdown = _mod().render_markdown(report)
+        rows = _table_rows(markdown)
+        harm = report['harm']
+        assert rows['per write (sample)'] == [
+            str(harm['per_write']['triage']), str(harm['per_write']['status_quo']),
+            str(harm['delta_per_write']), str(harm['delta_interval95']),
+        ]
+        assert rows['per write (population)'] == [
+            str(harm['population_per_write']['triage']),
+            str(harm['population_per_write']['status_quo']),
+            str(harm['population_delta_per_write']),
+            str(harm['population_delta_interval95']),
+        ]
+        assert report['harm_weights_status'] in markdown
+
+    def test_has_the_kappa_table(self) -> None:
+        report = _weighted_report()
+        rows = _table_rows(_mod().render_markdown(report))
+        for binary, block in report['kappa']['by_binary'].items():
+            assert rows[binary] == [
+                str(block['n_overlap']), _shown(block['kappa']),
+                'yes' if block['floor_met'] else 'no',
+            ]
+
+
+_LAYERING_PROBE = """
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+scripts = Path('scripts')
+stems = {path.stem for path in scripts.glob('*.py')}
+stem = sys.argv[1]
+spec = importlib.util.spec_from_file_location(stem, scripts / f'{stem}.py')
+module = importlib.util.module_from_spec(spec)
+sys.modules[stem] = module
+spec.loader.exec_module(module)
+print(json.dumps(sorted(stems & set(sys.modules))))
+"""
+
+
+class TestTheV2ScriptsImportOnlyDownward:
+    """Each v2 module loads exactly its downward closure of ``scripts/`` stems.
+
+    The loads go by path, so no linter sees an upward or sideways one. Each
+    module is loaded in its OWN fresh interpreter, so a sibling cannot hide
+    behind a ``sys.modules`` entry an earlier load left.
+    """
+
+    @pytest.mark.parametrize(('stem', 'closure'), [
+        ('write_triage_stats', {'write_triage_stats'}),
+        ('write_triage_reader_rubric', {'write_triage_reader_rubric'}),
+        ('score_write_triage_reader', {
+            'score_write_triage_reader', 'write_triage_reader_rubric', 'write_triage_stats',
+        }),
+        ('build_write_triage_v2_soak_baseline', {
+            'build_write_triage_v2_soak_baseline', 'write_triage_reader_rubric',
+        }),
+    ])
+    def test_a_module_loads_exactly_its_downward_closure(
+        self, stem: str, closure: set[str],
+    ) -> None:
+        result = subprocess.run(
+            [sys.executable, '-c', _LAYERING_PROBE, stem],
+            cwd=SCRIPTS.parent, capture_output=True, text=True, check=False, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        loaded = set(json.loads(result.stdout))
+        assert loaded == closure, (
+            f'loading {stem} also loaded {sorted(loaded - closure)} '
+            f'and not {sorted(closure - loaded)}'
+        )
