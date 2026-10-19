@@ -38,10 +38,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
 
 from shared.mcp_envelope import parse_tool_result
 from shared.safe_io import load_json_or_warn
@@ -752,7 +753,43 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     return None, _response_error('get_task response carries no task', envelope)
 
 
+def _is_task_row_list(rows: object) -> TypeGuard[list[dict]]:
+    return isinstance(rows, list) and all(isinstance(row, dict) and 'task_id' in row for row in rows)
+
+
+def _extract_metadata_matches(result: object) -> tuple[list[dict], bool, Exception | None]:
+    """One ``find_tasks_by_metadata`` page from a ``dispatch_tool`` result, as ``(rows,
+    has_more, error)``.
+
+    Two branches, as in :func:`_extract_statuses_map`: a JSON-RPC body is parsed whole by
+    ``shared.mcp_envelope.parse_tool_result``, a bare shape by
+    :func:`_unwrap_dispatch_envelope`.  Rows are returned as the tool sent them, so an
+    int ``task_id`` stays an int.  Construct-don't-raise.
+    """
+    if _is_jsonrpc_response(result):
+        payload, parse_error = parse_tool_result(result, None, dict)
+        if parse_error is not None:
+            return [], False, _response_error(
+                f'find_tasks_by_metadata response unreadable ({parse_error})',
+                _unwrap_dispatch_envelope(result),
+                cause=parse_error,
+            )
+        assert payload is not None
+    else:
+        payload = _unwrap_dispatch_envelope(result)
+    rows = payload.get('results')
+    pagination = payload.get('pagination')
+    has_more = pagination.get('has_more') if isinstance(pagination, dict) else None
+    if _server_error_text(payload) or not _is_task_row_list(rows) or not isinstance(has_more, bool):
+        return [], False, _response_error(
+            'find_tasks_by_metadata response carries no page of task rows', payload,
+        )
+    return rows, has_more, None
+
+
 _SUBMIT_TASK_TIMEOUT_SECS = 30
+# The server's cap on one lookup page (fused-memory server/tools.py::find_tasks_by_metadata).
+_METADATA_LOOKUP_PAGE = 100
 
 
 class SchedulerChronicFlakeTaskClient:
@@ -867,6 +904,47 @@ class SchedulerChronicFlakeTaskClient:
             )
             return None, exc
         return _extract_task(result)
+
+    async def find_tasks_by_metadata(
+        self, key: str, value: str, statuses: Sequence[str],
+    ) -> tuple[list[dict], Exception | None]:
+        """Every task in one of *statuses* whose top-level metadata *key* holds *value*,
+        read page by page via ``dispatch_tool('find_tasks_by_metadata', ...)``.
+
+        An empty list is an answer (no such task), so a failure is reported in band as
+        ``([], error)``: never a partial list, and never a raise, like its siblings.
+        """
+        arguments = {
+            'project_root': self._project_root,
+            'key': key,
+            'value': value,
+            'statuses': list(statuses),
+            'limit': _METADATA_LOOKUP_PAGE,
+        }
+        rows: list[dict] = []
+        has_more = True
+        while has_more:
+            page, has_more, error = await self._metadata_page(arguments, offset=len(rows))
+            if error is not None:
+                return [], error
+            rows.extend(page)
+            has_more = has_more and bool(page)
+        return rows, None
+
+    async def _metadata_page(
+        self, arguments: dict, *, offset: int,
+    ) -> tuple[list[dict], bool, Exception | None]:
+        try:
+            result = await self._scheduler.dispatch_tool(
+                'find_tasks_by_metadata', {**arguments, 'offset': offset},
+            )
+        except Exception as exc:
+            logger.warning(
+                'chronic_flake: find_tasks_by_metadata dispatch failed for %s=%s',
+                arguments['key'], arguments['value'], exc_info=True,
+            )
+            return [], False, exc
+        return _extract_metadata_matches(result)
 
     async def commit_planning(self, task_ids: list[str]) -> None:
         """Release planning-mode tasks from ``deferred`` to ``pending`` via
