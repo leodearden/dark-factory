@@ -2760,8 +2760,8 @@ async def _idle_task() -> asyncio.Task:
 
 @pytest.mark.asyncio
 class TestSighupUncapsViaTransition:
-    """step-15: _on_sighup_async drives every account to AVAILABLE through
-    one forced _transition call each (DD-4)."""
+    """step-15: _on_sighup_async drives every account that is not
+    AUTH_FAILED to AVAILABLE through one forced _transition call each (DD-4)."""
 
     async def test_sighup_forces_every_account_to_available_via_transition(self):
         gate = make_gate(['a', 'b'], wait_for_reset=False, cost_store=None)
@@ -2772,8 +2772,7 @@ class TestSighupUncapsViaTransition:
         a.probe_count = 2
         a.resume_task = await _idle_task()
 
-        b.phase = AccountPhase.AUTH_FAILED
-        b.auth_failed_at = datetime.now(UTC)
+        b.phase = AccountPhase.PROBE_IN_FLIGHT
         b.auth_reprobe_task = await _idle_task()
 
         gate._open.clear()
@@ -2800,7 +2799,6 @@ class TestSighupUncapsViaTransition:
         assert a.resets_at is None
         assert a.pause_started_at is None
         assert a.probe_count == 0
-        assert b.auth_failed_at is None
         assert gate._open.is_set() is True
         assert gate._paused_reason == ''
 

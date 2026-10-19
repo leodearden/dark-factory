@@ -1813,10 +1813,13 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
                 f'\nJudging {task_id} '
                 f'({len(result_dicts)} contenders, max {max_rounds} rounds)...'
             )
-            rounds_used = await run_elo_tournament(
+            tally = await run_elo_tournament(
                 result_dicts, task, pool, max_rounds,
             )
-            click.echo(f'  {task_id}: {rounds_used} judge calls')
+            click.echo(
+                f'  {task_id}: {tally.judged} judged, '
+                f'{tally.unmeasured} unmeasured (excluded from Elo)'
+            )
 
             # Save state after each task (crash resilience)
             save_state(state)

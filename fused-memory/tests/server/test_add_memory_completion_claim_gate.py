@@ -29,10 +29,10 @@ from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 from fused_memory.memory_metadata import MemoryMetadataValidationError, MetadataViolation
 from fused_memory.server.tools import create_mcp_server
 
-# The write-triage harness, imported rather than re-derived (the established
-# pattern — see test_entities_gate_ingestion.py): reaching add_memory's C1
-# fallback call site needs triage enabled with a calibrated candidate.
-from server.test_add_memory_write_triage_gate import _candidate, _configure_config
+# The shared write-triage harness (tests/server/write_triage_harness.py),
+# imported rather than re-derived: reaching add_memory's C1 fallback call site
+# needs triage enabled with a calibrated candidate.
+from server.write_triage_harness import configure_triage_config, search_candidate
 
 _PROJECT_ID = 'dark_factory'
 _CLAIM_CONTENT = "task 5422's de-flake fix has been applied"
@@ -45,7 +45,7 @@ def _mock_service(**config_overrides) -> AsyncMock:
     mem_result = MagicMock()
     mem_result.model_dump.return_value = {'id': 'mem-1'}
     mock_service.add_memory.return_value = mem_result
-    _configure_config(
+    configure_triage_config(
         mock_service,
         **{'enabled': False, 'near_dup_guard_enabled': False, **config_overrides},
     )
@@ -211,7 +211,7 @@ class TestGateOrdering:
     @pytest.mark.asyncio
     async def test_a_rejected_write_consults_no_authority_and_files_nothing(self, tmp_path):
         mock_service = _mock_service(near_dup_guard_enabled=True)
-        mock_service.search.return_value = [_candidate('m1', 0.97, content=_CLAIM_CONTENT)]
+        mock_service.search.return_value = [search_candidate('m1', 0.97, content=_CLAIM_CONTENT)]
         server, task_interceptor = _server(mock_service, tmp_path, statuses=_IN_PROGRESS)
 
         result = await _call(server, category='procedural_knowledge')
@@ -325,7 +325,7 @@ class TestBothServiceCallSitesCarryTheTag:
             RuntimeError('parent_id rejected by the write seam'),
             mem_result,
         ]
-        mock_service.search.return_value = [_candidate('m1', 0.97, content=_CLAIM_CONTENT)]
+        mock_service.search.return_value = [search_candidate('m1', 0.97, content=_CLAIM_CONTENT)]
         server, _ = _server(mock_service, tmp_path, statuses=_IN_PROGRESS)
 
         result = await _call(server, category='procedural_knowledge')

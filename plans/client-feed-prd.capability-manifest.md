@@ -65,8 +65,8 @@ The DAG has no inversion:
 | γ | degraded heartbeat | producer γ; B19 | grep `degraded` in `publisher.py` |
 | δ | typed refusal reasons | δ's tests B11/B13/B15 | grep `not_in_tree` in `budget.py` |
 | δ | reveal floor | producer δ | grep `reveal_floor_lines` in `budget.py` |
-| ε | criterion marker plugin | producer ε; pytest 9.0.3 | grep `criterion` in `pytest_criterion.py` |
-| ε | no record_property | rejection-style; ε's tests | manual (a grep-absent on a not-yet-existing file is vacuous at main) |
+| ε | criteria map reader (amended 2026-10-16) | producer ε; map producer defect-tests β, upstream | grep `tests\.json` in `criteria.py` |
+| ε | no record_property | now defect-tests β's plugin; β's tests | manual (client-feed ships no pytest plugin) |
 | ε | criteria-results CLI | producer ε | grep `criteria-results` in `cli.py` |
 | ζ | audit-hook confinement test | producer ζ; B1 | grep `addaudithook` in `test_isolation.py` |
 | ζ | default_project_root banned | rejection-style; ζ's ban test | manual (same reason) |

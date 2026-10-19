@@ -23,6 +23,7 @@ from escalation import archive
 # makes this import legal at all: dedupe.py imports THIS module at module level,
 # so queue.py can never import dedupe.py, where the transform used to live.
 from escalation.canonical import canonical_root_cause
+from escalation.categories import require_registered_category
 from escalation.classify import classify_resolver_tier, default_resolution_class_for_resolver
 
 # The declared-pin field's normalisation (strip / drop blanks / order-preserving
@@ -1006,7 +1007,12 @@ class EscalationQueue:
         production sites diverge deliberately, so a divergent submit is correct
         and must land unchanged; the line exists only so the divergence is
         visible where it is created.  See ``make_id`` for the full contract.
+
+        An unregistered ``escalation.category`` raises
+        ``UnregisteredEscalationCategory`` before anything is written (see
+        ``escalation.categories``).
         """
+        require_registered_category(escalation.category)
         with escalation_id_lock(self.queue_dir, escalation.id):
             self._atomic_write(escalation.id, escalation.to_json(), durable=True)
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
@@ -1392,8 +1398,12 @@ class EscalationQueue:
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW
         root cause (a different failure category) escape being silently
         suppressed by an UNRELATED open L1.  Default None preserves the exact
-        prior behavior (any pending L1 counts).
+        prior behavior (any pending L1 counts).  A non-None ``category`` outside
+        ``escalation.categories.EscalationCategory`` raises
+        ``UnregisteredEscalationCategory``.
         """
+        if category is not None:
+            require_registered_category(category)
         open_l1s = self.get_by_task(task_id, status='pending', level=1)
         if category is not None:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
@@ -1440,7 +1450,11 @@ class EscalationQueue:
         OVER-matches sibling hyphenated task ids (``esc-1-2-3-9.json`` when
         scanning task ``'1-2'``), so the record's own ``task_id`` field — never
         a filename parse — is the authoritative filter.
+
+        A *category* outside ``escalation.categories.EscalationCategory`` raises
+        ``UnregisteredEscalationCategory``.
         """
+        require_registered_category(category)
         if not citation_sha:
             return None
 
@@ -1968,6 +1982,9 @@ class EscalationQueue:
         ``None``, the stamp defaults per *resolved_by* via the same
         ``default_resolution_class_for_resolver`` helper ``resolve()`` uses
         (INV-5 — one classification site for both terminal-write paths).
+        An unregistered ``escalation.category`` likewise raises
+        ``UnregisteredEscalationCategory`` before any mutation (see
+        ``escalation.categories``).
 
         Contract:
         - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by)
@@ -1982,6 +1999,7 @@ class EscalationQueue:
         - Fires ``_resolve_callback`` once (if set); never fires ``_notify_callback``.
         - Returns *escalation* (non-Optional — disk failures raise, no None case).
         """
+        require_registered_category(escalation.category)
         if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
             raise ValueError(
                 f'invalid resolution_class {resolution_class!r}; '

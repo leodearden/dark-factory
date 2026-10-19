@@ -190,7 +190,11 @@ It is strictly read-only: it opens no debt, files no task, resolves
 nothing and escalates nothing. It will not create a ledger DB for a
 project that has none, and it will not add the flake tables to a
 `runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
-and exits 0 instead.
+and exits 0 instead. On a ledger that predates the due list, its first read adds that one empty table, as every ledger entry point does.
+
+**The due list and `filing pending`.** A suppressed test no longer gets its de-flake task during the merge. The merge writes the test's occurrence row and one item on the ledger's due list (`flake_debt_due`, in the same `runs.db`) in one local transaction, and the orchestrator's `flake-debt-drain` background service files the owner afterwards, every 30 seconds, through the same `open_debt` rule as before. Until that filing completes, an open debt row with no owner and an item on the due list reads `filing pending since <time>` (its oldest item's enqueue time): expected, and normally gone within a minute. An ownerless row with no item still reads `*** NO OWNER (invariant breach) ***`. The `due list:` line gives the list's size and the age of its oldest item, and says `PAST THE 30-MINUTE BOUND` once that item has waited longer. A failed filing is retried after 5 minutes, then 10, 20, 40, and hourly after that; nothing is dropped, and nothing caps how many de-flake tasks a burst files. A suppression at a merge sha that does not contain a finished de-flake task's fix closes that task's cycle without a regression escalation.
+
+**The drain's escalation.** When any item has waited on the due list for more than 30 minutes, the drain opens one level-1 `infra_issue` escalation (task id `__flake_debt_due_stale__`, role `orchestrator-flake-debt-drain`) naming how many items are stale, the oldest, its test and its last error, amends it as that changes, and resolves it itself once no item is stale. The usual cause is fused-memory being unreachable (`last_error` reads `task_client_failed`): restore fused-memory and the drain catches up on its own; nothing needs re-filing. A `no_owner` that persists means the task store refused the filing (the orchestrator log carries its reply), which the drain cannot cure: escalate to the operator, since `orchestrator flake-ledger` is read-only and cannot set an owner. `ancestry_unreadable` means the drain could not tell whether the observation's merge sha contains the finished de-flake task's fix (`git merge-base --is-ancestor` failed, for example because the sha is gone); `owner_deferred` means a filed task has not left `deferred`. If you resolve the escalation while items are still stale, the drain does not re-open it for those items; it opens a new one only for items that become stale later.
 
 **Read the header line before the counters.** A report only measures
 anything when the ledger was actually readable. If the header says
@@ -201,6 +205,71 @@ a broken or absent ledger to go fix, not a clean bill of health. A
 `WARNING: … TRUNCATED` line means the opposite problem: the window held
 more occurrences than one read returns, so the counters cover a partial
 window.
+
+### The offline lane's red path
+
+What the offline lane does with a red test, from the pass that sees it to
+the fix task and its escalation, is specified in
+`plans/offline-lane-red-path-prd.md`; this subsection is only where to look.
+
+**Where a pass is recorded.** Every pass writes
+`data/orchestrator/offline-lane/<command-slug>/<YYYYmmddTHHMMSS-head6>/record.json`
+(the slug is the command name lower-cased with runs of other characters
+turned into `-`; the legacy legs use `legacy_numeric` and `legacy_infra`),
+next to the per-phase `detect.log`, `confirm.log` and `*.junit.xml`.
+`record.json` names the command, leg, head, pass id, the `detect` and
+`confirm` run blocks (`null` for a phase that did not run), the `outcome`,
+and `effect`: `tests_counted`, `episodes_started`,
+`episodes_extended`, `episodes_ended`, `threshold_reached`, `stale_heads`,
+`no_decision`, `tasks_filed` and `escalations_raised`. `effect` is `null` while
+a pass is still running, and stays `null` if the pass was cut short (it is
+written after the engine observes).
+
+**Where a held red is remembered.** `data/orchestrator/guards/offline_lane_episodes.json`
+holds one record per command, with one `episodes[]` element per failing
+test. A red held at 1 of 2 looks like an element with one entry in
+`counted_passes`, `covering_task_id: null`, `filed_at: null` and
+`ended_at: null`. Once the test has been reproduced on enough counted
+passes, the same element has `covering_task_id` and `filed_at` set; a
+cleared test gets `ended_at`. A filing that could not be made is kept as
+`filing_due: true` (with `filing_failure`) and retried at the start of every
+pass as well as on the poll tick.
+
+**The three knobs**, all under `git:` and all hot-reloadable with
+`mcp__escalation__reload_config` (read `applied` in the reply):
+
+- `git.offline_lane_persist_passes` (2): spaced counted passes a test must be
+  reproduced on before one fix task is filed for it. `1` restores filing on
+  the first reproduced pass.
+- `git.offline_lane_recheck_secs` (1800): the least spacing between two counted
+  passes, and how long a held red waits before the lane re-runs the command
+  (that recheck applies to generic commands only; the legacy numeric and infra
+  legs do not recheck); also how long a filing may stay due before it is
+  escalated.
+- `git.offline_lane_red_unlanded_hours` (24): how long a held episode may go
+  unextended before it expires, and how long after a fix task was filed a
+  still-red test counts as unlanded.
+
+**Escalations.** The lane files them as role `orchestrator-offline-lane`,
+level 1, against a per-command sentinel task id `__offline_lane__<command-slug>`
+(look them up with `mcp__escalation__get_task_escalations`). Category
+`dependency_discovered` means a fix task has not landed its fix
+`red_unlanded_hours` after it was filed; the detail names the task, its live
+status and the record directories. Category `infra_issue` is one of three records the lane keeps for itself.
+The stuck-write record means a fix-task filing has stayed due for
+`recheck_secs` and every retry failed; the detail carries the reason. The lane
+resolves that record itself once no filing is due. The outage and broken-probe
+records are described under *Outages* below.
+
+**Retention.** Pass directories older than 14 days are pruned, except those an
+episode (live or ended) still counts. Entries in the episode store expire
+after 14 days without a write.
+
+#### Outages and the flake ledger
+
+**Outages.** A command may declare `outage_probe`; dark-factory's `qdrant-integration` runs `python scripts/lane_dependency_probe.py` in `fused-memory/`. After a red detection run the lane runs the probe once, at normal priority, bounded by `outage_probe_timeout_secs` (180). If it exits 0 the red goes on to the confirm as usual. If it exits 75 with a first stdout line `<dependency>: <reason>`, the pass is an outage: no confirm, no fix task and no ledger row, and each held episode gets `had_outage_pass: true`. The lane then opens one `infra_issue` level-1 escalation on the command's sentinel, naming the dependency and the pass directory, and amends it only when the probe's answer changes. While the command's `last_probe_result` reads `outage`, the lane re-runs the probe alone every `recheck_secs` on its idle poll, and held reds are not rechecked. When the probe exits 0, the lane resolves its own record and any level-2 whose only member it is (a level-2 with other members is amended instead), then runs the command again. The lane also closes the outage record when the probe turns broken, or when the probe or the command is removed or disabled. You do not need to close it. If you resolve it while the dependency is still down, the lane opens nothing until the next red pass whose probe fails. Any other probe result is a broken probe: another exit code, 75 with no line, a crash, or the timeout. The red is then handled as if no probe were declared, and a second `infra_issue` record says the probe is broken until a probe next exits 0, or 75 with a name. To run the probe by hand: `cd fused-memory && python scripts/lane_dependency_probe.py; echo $?`. Name dependencies (`qdrant falkordb embedder chat-model`) to check only those. Exit 75 means "this dependency is not usable", and the printed line names it. Any other non-zero exit is a defect in the probe. The command's record in `offline_lane_episodes.json` carries `last_probe_result` (the probe object), `last_probe_at`, `outage_escalation_id` and `probe_broken_escalation_id`.
+
+Appended by later leaves of plans/offline-lane-red-path-prd.md.
 
 ### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
 
@@ -604,6 +673,7 @@ session:
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
 | `mcp__fused-memory__get_statuses` | Compact `{id: status}` map — cheap when you only need status, not full records |
+| `mcp__fused-memory__find_tasks_by_metadata` | Which tasks carry metadata key K (with value V), every status incl. deferred/cancelled — paged |
 | `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
 | `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
 
@@ -2436,7 +2506,9 @@ exhaustions, each prefixed with the label:
   headroom`, where each per-digest reason reads `<label>: all 7 pool accounts
   capped`. The run exits **0**: a deferral rather than an incident (task
   4736), with a WARNING-level escalation. It self-clears at the weekly reset,
-  so there is nothing to do.
+  and the deferred date is retried automatically once a night finishes (see
+  "Retried nights" under "Legibility trickle health probe (04:30)"), so there
+  is nothing to do.
 - `<label>: no pool accounts resolved — check that the unit's EnvironmentFile
   supplies the CLAUDE_OAUTH_TOKEN_* vars named in config/usage-accounts.yaml`.
   This is a config fault and will never clear on its own. It is paired with a
@@ -2569,6 +2641,32 @@ is how an operator ends up tuning the sampler for a crashed coder:
 - **`missing` / `malformed` / stale** — the recorder itself stopped. The
   nightly is not writing state at all, so neither streak means anything yet.
 - **`quiet`** — a legitimately quiet night. Never alarms, by construction.
+
+**Retried nights** (task 5678). A night that did not finish (a non-zero exit,
+or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
+`trickle-state.json`, as `{date: unfinished attempts}`. A DEFERRED night
+records `capped: true` and still reads `productive`, since its digests were
+built, but it leaves `last_productive_at` unchanged, since it coded nothing.
+The next night whose own pass finishes runs one extra pass for the oldest
+owed date, with its own byte budget. That pass skips sessions the session
+ledger already holds and never launches a census. It rewrites only `retry_backlog`, so the rest of the
+file, and the progress probe's verdict, still describe the scheduled night. A
+failed retry exits the unit non-zero, exactly like a failed night. In the
+journal, grep `retrying <date> from the retry backlog`, and the WARNING
+`abandoning <date>`: a date past `RETRY_MAX_AGE_DAYS` or `RETRY_MAX_ATTEMPTS`
+(`scripts/legibility/trickle_state.py`) is dropped from the backlog. Its
+sessions stay minable by the census within `census.ledger_retention_days`.
+A date the timer never ran at all (the host down across several 03:00s, or a
+catch-up that starts after UTC midnight) enters `retry_backlog` with 0
+attempts (task 6548). The gap is measured from `last_scheduled_target_date`,
+the target of the last SCHEDULED pass
+(`scripts/legibility/trickle_state.py::never_run_dates`). A manual
+`nightly.py run --date` pass never moves that cursor, so a backfill is not
+mistaken for a gap. When every later night finishes, an outage of up to
+`RETRY_MAX_AGE_DAYS` missed nights is fully recovered, one date per night;
+each later night that does not finish costs the oldest owed date. Never-run
+dates already past the window are abandoned in one WARNING,
+`abandoning <n> never-run date(s) <first>..<last>`.
 
 **The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
 (deliberately distinct from the nightly's own

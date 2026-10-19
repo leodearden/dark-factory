@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     # Annotation-only (PEP 563 via `from __future__ import annotations`): the
     # runtime import stays local to each helper, mirroring every other
     # orchestrator reference in this file.
-    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MergeOutcome
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -628,6 +628,20 @@ class TestAutoResolveSingleNotification:
 # ---------------------------------------------------------------------------
 
 
+def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object) -> None:
+    """Install *stub* where both readers of ``patch_content_contained`` look it up.
+
+    The server reads it through the façade, whose home for it is
+    ``orchestrator.merge_lane.landing_evidence``; the worker's
+    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    """
+    import orchestrator.merge_lane.landing_evidence as landing_evidence
+    import orchestrator.merge_lane.worker as worker
+
+    for module in (worker, landing_evidence):
+        monkeypatch.setattr(module, 'patch_content_contained', stub)
+
+
 def _make_orch_config(tmp_path: Path):
     """Create a minimal OrchestratorConfig without a git remote."""
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
@@ -635,7 +649,7 @@ def _make_orch_config(tmp_path: Path):
 
 
 def _make_registry():
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
     return InFlightMergeRegistry()
@@ -662,7 +676,9 @@ class TestMergeRequestRequestId:
         MergeRequest, captures req.request_id, and resolves req.result with
         MergeOutcome('done').
         """
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -841,7 +857,6 @@ class TestMergeRequestRequestId:
         so a duplicate/late resubmission would otherwise burn a head-of-line
         verify on a no-op merge.
         """
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
         from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
 
         FAKE_TIP = 'deadbeef12345678'
@@ -888,11 +903,7 @@ class TestMergeRequestRequestId:
             patch_calls.append((head, upstream, git_ops))
             return True
 
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            _patch_content_contained,
-        )
+        _stub_patch_content_contained(monkeypatch, _patch_content_contained)
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -1063,7 +1074,6 @@ class TestMergeRequestFastPathFallThrough:
         SimpleNamespace stub lacks (would AttributeError), and False is the
         semantically-correct value for a genuinely-unmerged branch anyway.
         """
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
 
         FAKE_TIP = 'aabbccdd11223344'
         git_ops_stub, resolve_calls, ancestor_calls = self._make_git_ops_stub(
@@ -1078,11 +1088,7 @@ class TestMergeRequestFastPathFallThrough:
             patch_calls.append((head, upstream, git_ops))
             return False
 
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            _patch_content_contained,
-        )
+        _stub_patch_content_contained(monkeypatch, _patch_content_contained)
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -1406,7 +1412,9 @@ class TestMergeRequestWaitSecsPositive:
         MergeOutcome('done').  The call must return the terminal outcome shape
         before the timeout.
         """
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -1653,7 +1661,9 @@ class TestMergeRequestDurableIntent:
         Retrieve the enqueued req.  Cancel the Task.  Assert that req.result is
         NOT cancelled (asyncio.shield protects it from the outer cancellation).
         """
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -1891,7 +1901,9 @@ class TestMergeCancel:
         branch; falls into the pending path, calls fut.cancel() on a done future (returns
         False), and mis-reports cancelled=True.
         """
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -2064,7 +2076,7 @@ class TestMergeCancel:
             EventStore,
             EventType,
         )
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
@@ -2227,7 +2239,9 @@ def _build_merge_server(
 
     Returns (server, mq, registry, event_store, harness).
     """
-    from orchestrator.merge_queue import InFlightMergeRegistry  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
+        InFlightMergeRegistry,
+    )
 
     esc_queue = EscalationQueue(tmp_path / 'esc')
     mq: asyncio.Queue = asyncio.Queue()
@@ -2272,14 +2286,14 @@ class TestBoundaryTableMcpSurface:
         Assert status='queued', position>=1, merge_queued event emitted.
         Extends TestMergeRequestWaitSecsZeroFree with the full §8-row-1 postcondition.
         """
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             QueuedBranch,
         )
 
         queued_spy: list[int] = []
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_queued',
+            'orchestrator.merge_lane.worker._emit_merge_queued',
             lambda *a, **kw: queued_spy.append(1),
         )
 
@@ -2454,7 +2468,7 @@ class TestBoundaryTableMcpSurface:
         import time
 
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         worker = _FakeMergeWorker()
         event_store = EventStore(db_path=tmp_path / 'events-sc4.db', run_id='sc4')
@@ -2561,8 +2575,8 @@ class TestBoundaryTableMcpSurface:
         )
 
         # Build a FRESH server (simulating restart) on the same event_store
-        from orchestrator.merge_queue import (
-            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            InFlightMergeRegistry,
         )
 
         from escalation.queue import EscalationQueue  # type: ignore[reportMissingImports]
@@ -2677,8 +2691,8 @@ class TestBoundaryTableMcpSurface:
         merge_status cross-check.
         """
         from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            InFlightMergeRegistry,  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            InFlightMergeRegistry,
             MergeOutcome,
         )
 
@@ -2750,7 +2764,7 @@ class TestBoundaryTableMcpSurface:
         """
         coalesced_spy: list[int] = []
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
+            'orchestrator.merge_lane.worker._emit_merge_coalesced',
             lambda *a, **kw: coalesced_spy.append(1),
         )
 
@@ -2901,7 +2915,7 @@ class TestBoundaryTableMcpSurface:
             EventStore,
             EventType,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
             TerminalOutcomeRetention,
         )
@@ -2976,7 +2990,7 @@ class TestBoundaryTableMcpSurface:
             EventStore,
             EventType,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
             TerminalOutcomeRetention,
         )
@@ -3059,7 +3073,9 @@ class TestBoundaryTableMcpSurface:
         status/request_id/reason/conflict_details/push_status/commit and the
         failure_diagnostic conditional, but never includes superseded_by.
         """
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         server, mq, _, _, _ = _build_merge_server(tmp_path)
 
@@ -3295,8 +3311,7 @@ class TestMergeRequestTipRecency:
         RED until step-6: without classifier_git_ops wired the MCP path
         always coalesces → returns 'attached' instead of 'queued'.
         """
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
 
@@ -3326,11 +3341,7 @@ class TestMergeRequestTipRecency:
         async def _patch_content_contained(head, upstream, git_ops):
             return False
 
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            _patch_content_contained,
-        )
+        _stub_patch_content_contained(monkeypatch, _patch_content_contained)
 
         # Build server with the stub git_ops
         server, mq, _reg, _, _ = _build_merge_server(
@@ -3414,8 +3425,7 @@ class TestMergeRequestDuplicateInVerify:
     async def test_newer_sha_in_verify_returns_structured_reject(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
 
@@ -3449,11 +3459,7 @@ class TestMergeRequestDuplicateInVerify:
         async def _patch_content_contained(head, upstream, git_ops):
             return False
 
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            _patch_content_contained,
-        )
+        _stub_patch_content_contained(monkeypatch, _patch_content_contained)
         server, mq, _reg, _, _ = _build_merge_server(
             tmp_path, registry=registry, git_ops=git_ops, worker=worker,
         )
@@ -3518,7 +3524,7 @@ class TestMergeRequestRetentionParity:
     async def test_dispatched_merge_records_terminal_outcome_in_ring(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeOutcome,
             TerminalOutcomeRetention,
         )
@@ -3560,7 +3566,7 @@ class TestMergeRequestRetentionParity:
     async def test_coalesced_merge_registers_retention_alias(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             TerminalOutcomeRetention,
         )
 
@@ -3692,9 +3698,8 @@ class TestBoundary9CancelRetire:
     async def test_scenario_9_cancel_then_immediate_resubmit_fresh(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
         from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             TerminalOutcomeRecord,
             TerminalOutcomeRetention,
         )
@@ -3728,11 +3733,7 @@ class TestBoundary9CancelRetire:
         async def _patch_content_contained(head, upstream, git_ops):
             return False
 
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            _patch_content_contained,
-        )
+        _stub_patch_content_contained(monkeypatch, _patch_content_contained)
 
         # (1) First submit dispatches fresh (worktree not on disk yet) and
         # acquires the 'b9' registry slot as rid_a.
@@ -3858,8 +3859,7 @@ async def _run_fast_path_probe(
     metadata lookup off.  ``requested_ids``, when supplied, is appended to
     with every id ``scheduler.get_task`` is actually called with.
     """
-    import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MergeOutcome
 
     class _RecordingEventStore:
         def __init__(self) -> None:
@@ -3900,9 +3900,7 @@ async def _run_fast_path_probe(
     async def _patch_content_contained(head, upstream, git_ops):
         return patch_contained
 
-    monkeypatch.setattr(
-        orchestrator_merge_queue, 'patch_content_contained', _patch_content_contained,
-    )
+    _stub_patch_content_contained(monkeypatch, _patch_content_contained)
 
     esc_queue = EscalationQueue(tmp_path / 'esc')
     mq: asyncio.Queue = asyncio.Queue()
@@ -4032,7 +4030,9 @@ class TestMergeRequestDegenerateBranchFastPath:
         a silent submit-time short-circuit.
         """
         from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         result, _, events = await _run_fast_path_probe(
             tmp_path, monkeypatch, is_ancestor_result=True,

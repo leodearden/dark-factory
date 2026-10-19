@@ -37,6 +37,7 @@ from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
@@ -45,6 +46,7 @@ from fused_memory.backends.task_backend_errors import (
     StatusWriteAuthorityError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+from fused_memory.backends.task_backend_types import MetadataLookupResult
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
@@ -6219,6 +6221,25 @@ class TaskInterceptor:
     async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)
+
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        tm = await self._ensure_taskmaster()
+        return await tm.find_tasks_by_metadata(
+            project_root, key, value,
+            statuses=statuses, limit=limit, offset=offset, tag=tag,
+            include_value=include_value,
+        )
 
     def _require_done_provenance(self) -> bool:
         """True when the provenance gate is enforcing (reject missing/invalid).

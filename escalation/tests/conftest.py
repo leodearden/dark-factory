@@ -209,7 +209,8 @@ def pytest_configure(config):
 # Both are pinned by tests in `test_serve_escalation_mcp_fixture.py`.
 
 # Read by `_start` as a global at call time, so tests may shorten it.
-_READY_TIMEOUT_S = 10.0
+# Derived from measurement: test_serve_escalation_mcp_fixture.py::test_the_readiness_bound_clears_the_measured_first_start_with_headroom.
+_READY_TIMEOUT_S = 60.0
 
 
 class EscalationServerNotReady(RuntimeError):
@@ -363,8 +364,9 @@ def _serve_escalation_mcp_impl():
     (``_bind_escalation_listener``), inside a daemon thread running its own
     event loop; teardown closes that listener.  Readiness is polled by a real
     MCP handshake (``_mcp_handshake_ready``) -- not a bare TCP connect, and no
-    fixed sleep -- until it succeeds, the serving thread exits, or ~10s pass;
-    each attempt is bounded by the time remaining.  Failure raises
+    fixed sleep -- until it succeeds, the serving thread exits, or
+    ``_READY_TIMEOUT_S`` passes; each attempt is bounded by the time
+    remaining.  Failure raises
     ``EscalationServerNotReady``.  Every server started through the factory is
     torn down when the test finishes.
 
@@ -467,9 +469,9 @@ def _serve_escalation_mcp_impl():
         # up, not that the FastMCP ASGI app has finished mounting /mcp/. Every
         # poll implicitly re-probes the TCP layer too (a refused/reset connect
         # just fails the handshake and retries), so no separate TCP wait is
-        # needed. Bounded ~10s instead of a fixed sleep, and ended early by the
-        # serving thread's death: past that point nothing of ours is listening
-        # on the port. Thread death is checked BEFORE the deadline so a thread
+        # needed. Bounded by `_READY_TIMEOUT_S` instead of a fixed sleep, and
+        # ended early by the serving thread's death: past that point nothing of
+        # ours is listening on the port. Thread death is checked BEFORE the deadline so a thread
         # that died during the final poll interval is still reported as exited.
         base_url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + _READY_TIMEOUT_S

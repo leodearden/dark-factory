@@ -880,9 +880,9 @@ class TestRowSelection:
 
 class TestVocabulary:
     def test_every_filed_category_is_registered(self):
-        server = pytest.importorskip('escalation.server')
-        assert REFUSED_CATEGORY in server.CATEGORIES
-        assert BACKLOG_CATEGORY in server.CATEGORIES
+        categories = pytest.importorskip('escalation.categories')
+        assert REFUSED_CATEGORY in categories.EscalationCategory
+        assert BACKLOG_CATEGORY in categories.EscalationCategory
 
 
 REVERT_AGENT = 'recon-stage-memory_consolidator'

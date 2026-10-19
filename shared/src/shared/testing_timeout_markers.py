@@ -17,17 +17,23 @@ smaller, and LOWERS it under verify's ``--timeout``.
 THE INVERSION BAND.  Against a verify budget B, a marker at N falls in one of
 three regimes:
 
-* N <= DELIBERATE_TIGHT_BOUND_CEILING -- small enough to read as a deliberate
-  tight bound rather than a slow test's opt-out;
-* DELIBERATE_TIGHT_BOUND_CEILING < N < B -- INVERTS.  Too large to read as a
-  deliberate fast bound, and below the budget verify passes, so the author's
-  intended LOOSENING for a slow test silently becomes a TIGHTENING of the run
-  that gates their merge: B becomes N;
-* N >= B -- loosens under both.  Safe.
+* N <= DELIBERATE_TIGHT_BOUND_CEILING -- a deliberate tight bound, for a test
+  asserting that something happens FAST;
+* N >= B -- a slow test's opt-out, granting at least what verify grants with
+  no marker.  Safe under verify;
+* DELIBERATE_TIGHT_BOUND_CEILING < N < B -- INVERTS.  Too large to be a
+  deliberate fast bound, yet it grants LESS than no marker at all, so the
+  opt-out its size is written as becomes a clamp of the merge-gating run to N.
 
-Only the middle band contradicts its author's evident intent.  What a breach
-there costs depends on the suite's ``timeout_method``; that trade lives in
-``tests/scripts/test_timeout_method_policy.py``.
+Only the middle band is neither of a marker's two legitimate uses.  What a
+breach there costs depends on the suite's ``timeout_method``; that trade lives
+in ``tests/scripts/test_timeout_method_policy.py``.
+
+WHY THE NAME.  It was coined while the ini default was 60, when such a marker
+also LOOSENED a bare local run: a sign flip between two runs.  Since the ini
+default rose above B that flip is gone, and the definition above never needed
+it.  The name is kept so the package guards, their allowlists and the guard's
+history share one noun.
 
 Each package instantiates the guard in its own
 ``tests/test_timeout_marker_inversion_guard.py`` through
@@ -219,7 +225,7 @@ def timeout_marker_sites(
 
 
 def inverts(seconds: float | None, *, verify_cli_budget: int) -> bool:
-    """True iff a marker at *seconds* TIGHTENS verify while reading as a loosening.
+    """True iff *seconds* is too big for a tight bound yet grants less than *verify_cli_budget*.
 
     The band is ``(DELIBERATE_TIGHT_BOUND_CEILING, verify_cli_budget)``, open at
     both ends: a mark AT the ceiling is still a deliberate tight bound, and one
@@ -467,10 +473,11 @@ def _inversion_failure(
         f'{len(ordered)} timeout marker(s) in the inversion band '
         f'({DELIBERATE_TIGHT_BOUND_CEILING} < N < {verify_cli_budget}).\n\n'
         'A marker there is a TWO-WAY override, not a floor: it REPLACES the '
-        'ambient budget in both directions, so a number big enough to give a '
-        'slow test room, yet below the '
-        f'--timeout={verify_cli_budget} verify passes, silently clamps the run '
-        'that actually gates your merge to N. Under timeout_method="thread" a '
+        'ambient budget in both directions, so a number too big to be a '
+        'deliberate fast bound, yet below the '
+        f'--timeout={verify_cli_budget} verify passes, clamps the run that '
+        'actually gates your merge to N -- less time than no marker at all. '
+        'Under timeout_method="thread" a '
         'breach does not even fail that one test: it kills the whole xdist '
         'worker. Which suites run thread, and why: '
         'tests/scripts/test_timeout_method_policy.py.\n\n'

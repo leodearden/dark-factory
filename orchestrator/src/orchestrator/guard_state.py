@@ -2,8 +2,7 @@
 
 Several guards across the fleet exist to say "never do this again" — a capped
 escalation the steward must stop re-adopting, a train that derailed once and
-must not re-form, a red offline-lane run whose fix task is already open, a
-resurrected task that must not re-claim an age bonus it did not earn.  Each
+must not re-form, a resurrected task that must not re-claim an age bonus it did not earn.  Each
 held that memory in process RAM while the fleet redeploys every ~8-15h, so
 each was really "never do this again *until the next redeploy*": a permanent
 verdict decayed into a per-redeploy one, and the thing the guard was supposed
@@ -29,12 +28,12 @@ collection ABCs so the guards keep the vocabulary they already speak:
 
 * :class:`PersistentSet` — a ``MutableSet`` of keys ("this happened").
 * :class:`PersistentMap` — a ``MutableMapping`` of key -> JSON value
-  ("this happened N times", "this fingerprint owns that task id").
+  ("this happened N times", "this command's held episode record").
 
 Every entry carries a ``ttl`` supplied by the guard that owns it.  That value
 is an upper bound rather than a tuning dial — it asserts "this state must not
 outlive its subject", and each guard's subject (an escalation record, a task's
-residency in the merge queue, an open fix task, a resurrected task's pending
+residency in the merge queue, a held lane episode, a resurrected task's pending
 window) has a lifetime its own module already knows, which is why the number
 lives next to the guard and not in this one.  Expiry is applied on read, on
 load and on flush, so an aged-out guard genuinely re-arms and the sidecar's
@@ -50,7 +49,14 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Iterable, Iterator, MutableMapping, MutableSet
+from collections.abc import (
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    MutableSet,
+)
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -186,11 +192,16 @@ class _GuardStore:
 
     # --- mutations (each flushes through the one chokepoint) ---
 
-    def put(self, key: str, value: Any) -> None:
-        """Store *value* under *key*, always refreshing the timestamp."""
+    def put(self, key: str, value: Any, *, flush: bool = True) -> None:
+        """Store *value* under *key*, always refreshing the timestamp.
+
+        ``flush=False`` defers the write exactly as :meth:`insert_if_absent`'s
+        does.
+        """
         self._entries[key] = _Entry(value=value, updated_at=self._now())
         self._removed.discard(key)
-        self.flush()
+        if flush:
+            self.flush()
 
     def insert_if_absent(self, key: str, value: Any, *, flush: bool = True) -> bool:
         """Store *value* under *key* only if *key* is not already present.
@@ -345,8 +356,7 @@ class PersistentSet(MutableSet[str]):
     """A restart-durable set of keys.
 
     Backs the guards whose whole state is "this key happened": a capped
-    escalation id, a derailed task id, a fingerprint whose blocker was already
-    promoted, a task id already seen non-pending.
+    escalation id, a derailed task id.
 
     ``add`` is idempotent in the strong sense — re-adding a key that is
     already present neither refreshes its TTL nor writes to disk — so a caller
@@ -380,11 +390,7 @@ class PersistentSet(MutableSet[str]):
         the whole map, so a per-element flush costs a batch of N some N+1
         writes and O(N^2) parse/serialise work.  Measured at the per-element
         shape this replaced: N=373 -> 374 writes in 3.17s, N=1500 -> 1501 in
-        19.22s.  The worst case is
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
-        whose cold start observes every active non-pending task at once —
-        N=373 in the live store when this was measured — inline on the event
-        loop of the first ``acquire_next`` tick after a fleet redeploy.
+        19.22s.
         """
         changed = False
         for value in values:
@@ -396,13 +402,10 @@ class PersistentSet(MutableSet[str]):
         """Batch-insert via :meth:`update`, so this too is one write.
 
         ``MutableSet`` supplies a ``__ior__`` that loops calling ``add``,
-        which would write per element.  Overriding it is what the three
-        production batch call sites actually depend on, since all three use
-        ``|=`` rather than ``update``:
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._update_age_anchors``,
-        ``orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_stale_sweep``
-        and
-        ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
+        which would write per element.  Overriding it is what the production
+        batch call site actually depends on, since it uses ``|=`` rather than
+        ``update``:
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._mark_coalesce_derailed``.
         It also keeps the batched write for a caller whose attribute is
         declared as the ABC — the narrow type that lets a test substitute a
         plain ``set``.
@@ -433,9 +436,10 @@ class PersistentSet(MutableSet[str]):
 class PersistentMap(MutableMapping[str, Any]):
     """A restart-durable map of key -> JSON-serialisable value.
 
-    Backs the guards that count ("this escalation has burnt N attempts",
-    "this fingerprint has advanced N times") or that remember an association
-    ("this fingerprint's open fix task is that id").
+    Backs the guards that count ("this escalation has burnt N attempts") or that remember a
+    record: ``orchestrator/src/orchestrator/offline_lane_episode_state.py::
+    EpisodeStore`` keeps one ``CommandRecord`` per lane command, with an
+    ``EPISODE_RETENTION`` TTL.
 
     Unlike :class:`PersistentSet`'s ``add``, ``__setitem__`` ALWAYS refreshes
     the timestamp: a counter that is still being bumped has a subject that is
@@ -459,6 +463,14 @@ class PersistentMap(MutableMapping[str, Any]):
 
     def __setitem__(self, key: str, value: Any) -> None:
         self._store.put(key, value)
+
+    def put_many(self, items: Mapping[str, Any]) -> None:
+        """Store every item, then write ONCE — see :meth:`PersistentSet.update`
+        for why one write.  An empty mapping writes nothing."""
+        for key, value in items.items():
+            self._store.put(key, value, flush=False)
+        if items:
+            self._store.flush()
 
     def __delitem__(self, key: str) -> None:
         if not self._store.remove(key):

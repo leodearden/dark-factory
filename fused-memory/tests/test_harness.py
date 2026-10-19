@@ -16,6 +16,7 @@ from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.testing import make_gate_mock
 
 from fused_memory.models.reconciliation import (
@@ -8392,16 +8393,22 @@ class TestHarnessFilteredTaskTreeWiring:
         # Accessing a staticmethod via the class already unwraps it to a plain function
         real_helper = ReconciliationHarness._configure_task_sync
 
-        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+        def spy(
+            stage, *, filtered_task_tree=None, filtered_task_tree_fetched_at=None, remediation_mode=False
+        ):
             spy_calls.append(
                 {
                     'stage': stage,
                     'filtered_task_tree': filtered_task_tree,
+                    'filtered_task_tree_fetched_at': filtered_task_tree_fetched_at,
                     'remediation_mode': remediation_mode,
                 }
             )
             real_helper(
-                stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode
+                stage,
+                filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                remediation_mode=remediation_mode,
             )
 
         ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
@@ -8423,6 +8430,7 @@ class TestHarnessFilteredTaskTreeWiring:
         assert isinstance(stage2, TaskKnowledgeSync)
         assert call['stage'] is stage2
         assert call['filtered_task_tree'] is expected_tree
+        assert call['filtered_task_tree_fetched_at'] is not None
         assert call['remediation_mode'] is False
 
     @pytest.mark.asyncio
@@ -8448,16 +8456,22 @@ class TestHarnessFilteredTaskTreeWiring:
         spy_calls: list = []
         real_helper = ReconciliationHarness._configure_task_sync
 
-        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+        def spy(
+            stage, *, filtered_task_tree=None, filtered_task_tree_fetched_at=None, remediation_mode=False
+        ):
             spy_calls.append(
                 {
                     'stage': stage,
                     'filtered_task_tree': filtered_task_tree,
+                    'filtered_task_tree_fetched_at': filtered_task_tree_fetched_at,
                     'remediation_mode': remediation_mode,
                 }
             )
             real_helper(
-                stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode
+                stage,
+                filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                remediation_mode=remediation_mode,
             )
 
         ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
@@ -8693,6 +8707,89 @@ class TestHarnessFilteredTaskTreeWiring:
             f"fails this ordering check"
         )
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_the_pre_stage_tree_read_instant_into_stage2(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """Stage 2 receives the instant stamped right after the tree fetch (task 5093).
+
+        Same ordering proof as the remediation test above: the instant must be at
+        or after the fetch returned and strictly before Stage 1 ran, so a fresh
+        now() taken at Stage-2 configure time fails it.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        tree = self._make_tree()
+        fetch_state: dict = {}
+
+        async def _fetch(project_root):
+            fetch_state['fetched_returned_at'] = datetime.now(UTC)
+            return tree
+
+        harness._fetch_filtered_task_tree = _fetch
+
+        stage_state: dict = {}
+
+        async def _record_stage_ran(stage):
+            await asyncio.sleep(0.05)
+            stage_state['stage_ran_at'] = datetime.now(UTC)
+
+        async def _capture_stage2(stage):
+            stage_state['tree'] = stage.filtered_task_tree
+            stage_state['fetched_at'] = stage.filtered_task_tree_fetched_at
+
+        _mock_stage_run(harness.stages[0], before_return=_record_stage_ran)
+        _mock_stage_run(harness.stages[1], before_return=_capture_stage2)
+        _mock_stage_run(harness.stages[2])
+
+        await event_buffer.push(_make_event())
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+        assert stage_state['tree'] is tree
+        fetched_at = stage_state['fetched_at']
+        assert fetched_at is not None
+        assert fetched_at >= fetch_state['fetched_returned_at']
+        assert fetched_at < stage_state['stage_ran_at']
+
+    @pytest.mark.asyncio
+    async def test_remediation_threads_supplied_tree_read_instant_into_stage2(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """_run_remediation_pass hands Stage 2 the read instant of the tree it was given."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+        captured: dict = {}
+
+        async def capture_s2(stage):
+            captured['fetched_at'] = stage.filtered_task_tree_fetched_at
+
+        _mock_stage_run(stages[0])
+        _mock_stage_run(stages[1], before_return=capture_s2)
+        _mock_stage_run(stages[2])
+
+        instant = datetime.now(UTC) - timedelta(minutes=3)
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+            filtered_task_tree=self._make_tree(),
+            filtered_task_tree_fetched_at=instant,
+        )
+
+        assert captured.get('fetched_at') == instant
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""
@@ -8754,6 +8851,29 @@ class TestConfigureTaskSync:
 
         assert stage2.remediation_mode is True
         assert stage2.filtered_task_tree is tree
+
+    def test_configure_task_sync_sets_and_resets_tree_read_instant(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """The read instant travels with its tree; a configure call without one clears it."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stage2 = harness.stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+
+        instant = datetime.now(UTC)
+        ReconciliationHarness._configure_task_sync(
+            stage2, filtered_task_tree=self._make_tree(), filtered_task_tree_fetched_at=instant
+        )
+        assert stage2.filtered_task_tree_fetched_at is instant
+
+        ReconciliationHarness._configure_task_sync(stage2, filtered_task_tree=self._make_tree())
+        assert stage2.filtered_task_tree_fetched_at is None
 
     def test_configure_task_sync_is_staticmethod(self):
         """_configure_task_sync must be declared as a @staticmethod."""
@@ -16600,17 +16720,12 @@ class TestIntegrityGateInputParityWithRenderer:
         # dropped by any other process or developer would flip `corroborated` and
         # break test_uncorroborated_in_progress_cited_task_escalates for reasons
         # having nothing to do with the code under test. Stub values mirror the
-        # real absent-file returns exactly: read_scheduler_state's empty skeleton
-        # (scheduler_state.py::_empty_skeleton) and orchestrator_started_at's None
+        # real absent-file returns exactly: read_scheduler_state's
+        # SchedulerStateSnapshot.empty() and orchestrator_started_at's None
         # for an absent/unparseable lock.
         monkeypatch.setattr(
             harness_module, 'read_scheduler_state',
-            lambda _root: {
-                'queue': [], 'parks': {}, 'park_stacks': {},
-                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-                'snapshot_at': None,
-            },
+            lambda _root: SchedulerStateSnapshot.empty(),
         )
         monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 
@@ -17232,12 +17347,7 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
         # /tmp/test-project root).
         monkeypatch.setattr(
             harness_module, 'read_scheduler_state',
-            lambda _root: {
-                'queue': [], 'parks': {}, 'park_stacks': {},
-                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-                'snapshot_at': None,
-            },
+            lambda _root: SchedulerStateSnapshot.empty(),
         )
         monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 

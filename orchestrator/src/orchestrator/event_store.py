@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -558,6 +559,12 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
+    # {anchor: int, pending_since: str}: the max_id the task's age now counts
+    # from, and the stamp whose change signalled the reset.  Emitted once per
+    # applied reset; restoring that anchor at a later process start emits
+    # nothing.
+    age_anchor_reset = 'age_anchor_reset'
     # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
     # Every emitted reservation_* event carries data.source in {pin, fairness}
     # (task 6040): an operator pin's reservation, or the automatic machinery's.
@@ -566,6 +573,8 @@ class EventType(StrEnum):
     # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
     reservation_install_blocked = 'reservation_install_blocked'
+    # reservation_expired reasons: owner-state ones on scheduler.py::Scheduler._park_hold_refusal,
+    # pin-phase ones on pin_reservation.py::PinReleaseReason.
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'
@@ -721,8 +730,14 @@ class EventType(StrEnum):
     # Audit (task 1333): exhaustive repo search found ZERO in-repo consumers
     # that ever filtered reservation_installed by data.reason == 'reserve_now'.
     # Downstream consumers outside this repo must migrate; see CHANGELOG.md.
+    # reserve_now_refused (task 6518): producer
+    # scheduler.py::Scheduler._phase_reserve_now, when the owner fails the
+    # park-hold predicate; the flag is consumed and nothing installs.  Data
+    # {reason}, in the owner-state reservation_expired vocabulary documented
+    # on scheduler.py::Scheduler._park_hold_refusal.
     reserve_now_armed = 'reserve_now_armed'
     reserve_now_consumed = 'reserve_now_consumed'
+    reserve_now_refused = 'reserve_now_refused'
 
     # Worktree hygiene (Fix B/C) — emitted when an orphaned or identity-
     # mismatched worktree is relocated to the sibling ``-orphaned`` base
@@ -926,6 +941,12 @@ class EventType(StrEnum):
     # these rows for a stranded task is therefore meaningful: nothing held it.
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
+    # strand_converted — one row per convert-to-blocked the stranded-task sweep
+    # actually applied (task 6476).  Payload:
+    # orchestrator/src/orchestrator/strand_conversion.py::strand_converted_payload.
+    # An ACTION, not a hold, so not signature-gated: one row per conversion.
+    # task_id is ALSO a first-class column.
+    strand_converted = 'strand_converted'
 
     # workflow_exit_contract — one row per run() exit whose contract verdict is
     # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
@@ -973,17 +994,69 @@ class EventType(StrEnum):
     verify_admission_wait_aged = 'verify_admission_wait_aged'
 
 
-class _MergeFinalizedKey(Enum):
-    """The field a merge_finalized read matches on; each value is its fixed SQL predicate."""
+_MERGE_FINALIZED_ROWS = f"event_type = '{EventType.merge_finalized.value}'"
 
-    request_id = "json_extract(data, '$.request_id') = ?"
-    branch = "json_extract(data, '$.branch') = ?"
-    task_id = 'task_id = ?'
-    superseded_by = "json_extract(data, '$.superseded_by') = ?"
-    absorbs = (
-        "EXISTS (SELECT 1 FROM json_each(events.data, '$.absorbed_request_ids') "
-        'WHERE json_each.value = ?)'
+
+@dataclass(frozen=True)
+class _Lookup:
+    """A partial index serves a read only if the read's WHERE implies it: reads repeat ``scope``."""
+
+    indexed: str
+    match: str
+    narrowing: str | None = None
+
+    @property
+    def scope(self) -> str:
+        if self.narrowing is None:
+            return _MERGE_FINALIZED_ROWS
+        return f'{_MERGE_FINALIZED_ROWS} AND {self.narrowing}'
+
+    @classmethod
+    def equality(cls, indexed: str) -> _Lookup:
+        return cls(indexed, f'{indexed} = ?')
+
+
+class MergeFinalizedKey(Enum):
+    """The field a merge_finalized read matches on, with the partial index that serves it."""
+
+    request_id = _Lookup.equality("json_extract(data, '$.request_id')")
+    branch = _Lookup.equality("json_extract(data, '$.branch')")
+    task_id = _Lookup.equality('task_id')
+    superseded_by = _Lookup.equality("json_extract(data, '$.superseded_by')")
+    absorbs = _Lookup(
+        indexed='event_type',
+        narrowing="json_array_length(data, '$.absorbed_request_ids') > 0",
+        match=(
+            "EXISTS (SELECT 1 FROM json_each(events.data, '$.absorbed_request_ids') "
+            'WHERE json_each.value = ?)'
+        ),
     )
+
+    @property
+    def index_ddl(self) -> str:
+        return (
+            f'CREATE INDEX IF NOT EXISTS idx_mf_{self.name} '
+            f'ON events({self.value.indexed}) WHERE {self.value.scope};'
+        )
+
+    def select(
+        self, value: str, *, run_id: str | None, latest_only: bool,
+    ) -> tuple[str, tuple[str, ...]]:
+        """The read's statement and parameters; ``run_id=None`` reads every run."""
+        lookup: _Lookup = self.value
+        if run_id is None:
+            where, params = (lookup.scope, lookup.match), (value,)
+        else:
+            where, params = (lookup.scope, 'run_id = ?', lookup.match), (run_id, value)
+        order = 'id DESC LIMIT 1' if latest_only else 'id'
+        return (
+            'SELECT run_id, task_id, data, timestamp FROM events '
+            f'WHERE {" AND ".join(where)} ORDER BY {order}',
+            params,
+        )
+
+
+_MERGE_FINALIZED_INDEXES = '\n'.join(key.index_ddl for key in MergeFinalizedKey)
 
 
 class EventStore:
@@ -1025,7 +1098,7 @@ class EventStore:
         try:
             conn = self._connect()
             try:
-                conn.executescript(_SCHEMA)
+                conn.executescript(_SCHEMA + _MERGE_FINALIZED_INDEXES)
             finally:
                 conn.close()
         except Exception:
@@ -1098,11 +1171,11 @@ class EventStore:
         fire-safe).
         """
         if request_id is not None:
-            key, value = _MergeFinalizedKey.request_id, request_id
+            key, value = MergeFinalizedKey.request_id, request_id
         elif branch is not None:
-            key, value = _MergeFinalizedKey.branch, branch
+            key, value = MergeFinalizedKey.branch, branch
         elif task_id is not None:
-            key, value = _MergeFinalizedKey.task_id, task_id
+            key, value = MergeFinalizedKey.task_id, task_id
         else:
             return None
         rows = self._select_merge_finalized(
@@ -1123,7 +1196,7 @@ class EventStore:
             return []
         return self._select_merge_finalized(
             'merge_finalized_superseded_by',
-            _MergeFinalizedKey.superseded_by,
+            MergeFinalizedKey.superseded_by,
             superseded_by,
             cross_run=cross_run,
             latest_only=False,
@@ -1145,7 +1218,7 @@ class EventStore:
             return None
         rows = self._select_merge_finalized(
             'merge_finalized_absorbing',
-            _MergeFinalizedKey.absorbs,
+            MergeFinalizedKey.absorbs,
             request_id,
             cross_run=cross_run,
             latest_only=True,
@@ -1155,27 +1228,19 @@ class EventStore:
     def _select_merge_finalized(
         self,
         reader: str,
-        key: _MergeFinalizedKey,
+        key: MergeFinalizedKey,
         value: str,
         *,
         cross_run: bool,
         latest_only: bool,
     ) -> list[dict]:
-        """Every merge_finalized read: run scope, key match, order and projection.
+        """Every merge_finalized read: runs *key*'s statement in this run's scope and projects it.
 
         *reader* names the public method in the fire-safe warning.
         """
-        sql = (
-            'SELECT run_id, task_id, data, timestamp FROM events '
-            "WHERE event_type = 'merge_finalized'"
+        sql, params = key.select(
+            value, run_id=None if cross_run else self.run_id, latest_only=latest_only,
         )
-        params: list[str] = []
-        if not cross_run:
-            sql += ' AND run_id = ?'
-            params.append(self.run_id)
-        sql += f' AND {key.value}'
-        params.append(value)
-        sql += ' ORDER BY id DESC LIMIT 1' if latest_only else ' ORDER BY id'
         try:
             conn = self._connect()
             try:

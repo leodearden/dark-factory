@@ -581,26 +581,26 @@ Review this run and provide your verdict as JSON.
         elif self.config.judge_llm_provider == 'anthropic':
             import anthropic
 
-            client = anthropic.AsyncAnthropic()
-            response = await client.messages.create(
-                model=self.config.judge_llm_model,
-                max_tokens=4096,
-                system=JUDGE_SYSTEM_PROMPT,
-                messages=[{'role': 'user', 'content': prompt}],
-            )
+            async with anthropic.AsyncAnthropic() as client:
+                response = await client.messages.create(
+                    model=self.config.judge_llm_model,
+                    max_tokens=4096,
+                    system=JUDGE_SYSTEM_PROMPT,
+                    messages=[{'role': 'user', 'content': prompt}],
+                )
             text_blocks = [b for b in response.content if b.type == 'text']
             return text_blocks[0].text if text_blocks else ''
         else:
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI()
-            response = await client.chat.completions.create(
-                model=self.config.judge_llm_model,
-                messages=[
-                    {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
-                    {'role': 'user', 'content': prompt},
-                ],
-            )
+            async with AsyncOpenAI() as client:
+                response = await client.chat.completions.create(
+                    model=self.config.judge_llm_model,
+                    messages=[
+                        {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                        {'role': 'user', 'content': prompt},
+                    ],
+                )
             return response.choices[0].message.content or ''
 
     async def _call_judge_cli(self, prompt: str) -> dict | str:

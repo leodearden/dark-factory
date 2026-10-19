@@ -2314,7 +2314,7 @@ spelling of the same set.
 
 Do NOT substitute either near-miss constant for this one -- they are different
 vocabularies that merely share the ``stash_failed`` token.
-:data:`orchestrator.merge_queue._HALT_ADVANCE_RESULTS` holds ``advance_main``
+:data:`orchestrator.merge_lane.worker._HALT_ADVANCE_RESULTS` holds ``advance_main``
 RESULT codes (its ``wip_overlap`` / ``pop_conflict`` /
 ``pop_conflict_no_advance`` members are not escalation categories at all), and
 :data:`orchestrator.stranded_verified_green.DURABLE_MERGE_FAILURE_STATUSES`

@@ -425,3 +425,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: the signal is the CI-green boundary matrix plus the script output
+signal_leaves:
+- κ
