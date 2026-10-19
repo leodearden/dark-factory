@@ -166,13 +166,13 @@ class TestTheGuardKnobs:
 
     @pytest.mark.parametrize('knob', _GUARD_KNOBS)
     def test_none_is_the_off_switch(self, knob):
-        assert getattr(WriteTriageConfig(**{knob: None}), knob) is None
+        assert getattr(WriteTriageConfig.model_validate({knob: None}), knob) is None
 
     @pytest.mark.parametrize('knob', _GUARD_KNOBS)
     @pytest.mark.parametrize('value', [-0.1, 1.5])
     def test_a_value_outside_the_cosine_range_is_rejected(self, knob, value):
         with pytest.raises(ValidationError):
-            WriteTriageConfig(**{knob: value})
+            WriteTriageConfig.model_validate({knob: value})
 
     @pytest.mark.parametrize('knob', _GUARD_KNOBS)
     def test_each_knob_is_green_tier(self, knob):
