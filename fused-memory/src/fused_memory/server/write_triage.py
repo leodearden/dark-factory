@@ -326,13 +326,32 @@ def resolve_bands(memory_service: Any) -> tuple[float | None, float | None]:
     re-calibration must take effect on a running server without a restart.
     """
     return (
-        _coerce_band(_write_triage_attr(memory_service, 't_high')),
-        _coerce_band(_write_triage_attr(memory_service, 't_low')),
+        _number_or_none(_write_triage_attr(memory_service, 't_high')),
+        _number_or_none(_write_triage_attr(memory_service, 't_low')),
     )
 
 
-def _coerce_band(value: Any) -> float | None:
-    """One band edge as a float, or ``None`` for anything that is not a number."""
+def resolve_min_parent_cosine(memory_service: Any) -> float | None:
+    """Read the attach-guard floor from *memory_service*'s config, live per write.
+
+    An absent or non-numeric leaf reads as ``None``, i.e. the rule OFF: an
+    unreadable config leaves the pre-guard routing in place, the same rule as
+    the ``enabled`` flag's. The shipped default lives only in the schema.
+    """
+    return _number_or_none(_write_triage_attr(memory_service, 'min_parent_cosine'))
+
+
+def resolve_hoist_max_cosine_gap(memory_service: Any) -> float | None:
+    """Read the attach-guard hoist gap from *memory_service*'s config, live per write.
+
+    Same reading as :func:`resolve_min_parent_cosine`: an absent or
+    non-numeric leaf is ``None``, the rule OFF.
+    """
+    return _number_or_none(_write_triage_attr(memory_service, 'hoist_max_cosine_gap'))
+
+
+def _number_or_none(value: Any) -> float | None:
+    """*value* as a float, or ``None`` for anything that is not a number (``bool`` included)."""
     if isinstance(value, int | float) and not isinstance(value, bool):
         return float(value)
     return None
