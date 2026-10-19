@@ -22,7 +22,10 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
-from fused_memory.reconciliation.coalescing import COALESCED_COUNT_KEY
+from fused_memory.reconciliation.coalescing import (
+    COALESCED_COUNT_KEY,
+    COALESCED_STATUS_PATH_KEY,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 _PROJECT = 'dark_factory'
@@ -242,3 +245,82 @@ async def test_repushing_a_buffered_event_is_still_a_no_op(buf):
     assert await buf.count_buffered(_PROJECT) == 1
     [row] = await buf.peek_buffered(_PROJECT, limit=10)
     assert row.payload == event.payload
+
+
+# ── status changes stay readable ───────────────────────────────────────
+
+
+def _transition(old: str, new: str, ts: datetime, **extra) -> ReconciliationEvent:
+    return _task_event(
+        _PROJECT, EventType.task_status_changed, '644', ts,
+        old_status=old, new_status=new, **extra,
+    )
+
+
+async def _only_row(buf: EventBuffer) -> ReconciliationEvent:
+    assert await buf.count_buffered(_PROJECT) == 1
+    [row] = await buf.peek_buffered(_PROJECT, limit=10)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_a_status_chain_folds_to_its_start_and_end(buf):
+    await buf.push(_transition('pending', 'in-progress', _at(0)))
+    await buf.push(_transition('in-progress', 'done', _at(1)))
+
+    payload = (await _only_row(buf)).payload
+    assert payload['old_status'] == 'pending'
+    assert payload['new_status'] == 'done'
+    assert payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'done']
+    assert payload[COALESCED_COUNT_KEY] == 2
+
+    await buf.push(_transition('done', 'review', _at(2)))
+    payload = (await _only_row(buf)).payload
+    assert payload['new_status'] == 'review'
+    assert payload[COALESCED_STATUS_PATH_KEY] == ['pending', 'in-progress', 'done', 'review']
+
+
+@pytest.mark.asyncio
+async def test_a_drained_fold_carries_only_the_newest_transitions_keys(buf):
+    await buf.push(_transition('pending', 'done', _at(0), done_provenance={'kind': 'merged'}))
+    await buf.push(_transition(
+        'done', 'pending', _at(1), reopen_reason='regressed', reopen_from='done'))
+    [drained] = await buf.drain(_PROJECT, run_id='r1')
+    assert drained.payload['reopen_reason'] == 'regressed'
+    assert drained.payload['reopen_from'] == 'done'
+    assert 'done_provenance' not in drained.payload
+
+
+@pytest.mark.asyncio
+async def test_a_drained_fold_does_not_carry_a_stale_deferral_entry(buf):
+    await buf.push(_transition('pending', 'deferred', _at(0), deferral={'until': '2026-11-01'}))
+    await buf.push(_transition('deferred', 'pending', _at(1), deferral_cleared={'by': 'gate'}))
+    [drained] = await buf.drain(_PROJECT, run_id='r1')
+    assert drained.payload['deferral_cleared'] == {'by': 'gate'}
+    assert 'deferral' not in drained.payload
+
+
+@pytest.mark.asyncio
+async def test_an_older_transition_arriving_late_does_not_revert_the_status(buf):
+    newer = _transition('in-progress', 'done', _at(2))
+    older = _transition('pending', 'in-progress', _at(1))
+    await buf.push(newer)
+    await buf.push(older)
+
+    row = await _only_row(buf)
+    assert row.payload['old_status'] == 'pending'
+    assert row.payload['new_status'] == 'done'
+    assert row.timestamp == older.timestamp
+
+
+@pytest.mark.asyncio
+async def test_redelivering_a_folded_away_event_changes_nothing(buf, db_path):
+    first = _transition('pending', 'in-progress', _at(0))
+    second = _transition('in-progress', 'done', _at(1))
+    await buf.push(first)
+    await buf.push(second)
+    await buf.push(second)
+
+    row = await _only_row(buf)
+    assert row.payload[COALESCED_COUNT_KEY] == 2
+    assert len(_raw(db_path, 'SELECT id FROM event_buffer')) == 1
