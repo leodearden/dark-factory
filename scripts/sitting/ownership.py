@@ -238,22 +238,32 @@ def _probe_coalesce_fold(item: OpenItem, task_rows: TaskRows, measured_at: str) 
     if isinstance(subject, ProbeResult):
         return subject
     claim = _carrier_claim(subject)
-    if isinstance(claim, str):
-        return ProbeResult(probe, 'empty', measured_at, evidence=claim)
-    target_id, evidence = claim
-    target = task_rows.rows.get(target_id)
+    if isinstance(claim, _Unclaimed):
+        return ProbeResult(probe, 'empty', measured_at, evidence=claim.evidence)
+    target = task_rows.rows.get(claim.carrier_id)
     status = target.status if target is not None else ''
     title = target.title if target is not None else 'not in the store'
     return ProbeResult(
         probe, 'owns', measured_at,
-        owner=f'task {target_id} ({status or "unknown"}): {title}',
-        evidence=evidence,
-        owner_task_id=target_id,
+        owner=f'task {claim.carrier_id} ({status or "unknown"}): {title}',
+        evidence=claim.evidence,
+        owner_task_id=claim.carrier_id,
         owner_task_status=status,
     )
 
 
-def _carrier_claim(row: TaskRow) -> tuple[str, str] | str:
+@dataclass(frozen=True)
+class _CarrierClaim:
+    carrier_id: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class _Unclaimed:
+    evidence: str
+
+
+def _carrier_claim(row: TaskRow) -> _CarrierClaim | _Unclaimed:
     """The carrier claiming *row* and the evidence for it, or why nothing claims it.
 
     The record first, then the legacy key: the order of
@@ -263,14 +273,24 @@ def _carrier_claim(row: TaskRow) -> tuple[str, str] | str:
     record = parse_record(row.metadata.get('deferral')) if deferred else None
     legacy = row.metadata.get(LEGACY_COALESCE_KEY)
     if isinstance(record, CarriedByDeferral):
-        return str(record.carrier_task_id), f'task {row.id} deferral.carrier_task_id={record.carrier_task_id}'
+        return _CarrierClaim(
+            str(record.carrier_task_id), f'task {row.id} deferral.carrier_task_id={record.carrier_task_id}'
+        )
     if record is not None and not isinstance(record, InvalidRecord):
         history = f'; its {LEGACY_COALESCE_KEY}={legacy!r} is history, not a claim' if legacy is not None else ''
-        return f'task {row.id} is held {record.kind.value}{history}'
+        return _Unclaimed(f'task {row.id} is held {record.kind.value}{history}')
     if legacy is None:
-        return f'task {row.id} carries no {LEGACY_COALESCE_KEY}'
-    unrecorded = ' (no deferral recorded)' if deferred else ''
-    return str(legacy), f'task {row.id} {LEGACY_COALESCE_KEY}={legacy!r}{unrecorded}'
+        return _Unclaimed(f'task {row.id} carries no {LEGACY_COALESCE_KEY}')
+    return _CarrierClaim(
+        str(legacy), f'task {row.id} {LEGACY_COALESCE_KEY}={legacy!r}{_unrecorded_note(deferred, record)}'
+    )
+
+
+def _unrecorded_note(deferred: bool, record: InvalidRecord | None) -> str:
+    """Why a deferred row's legacy key speaks for it: no record, or one that does not parse."""
+    if not deferred:
+        return ''
+    return ' (deferral record unreadable)' if isinstance(record, InvalidRecord) else ' (no deferral recorded)'
 
 
 def _probe_task_ruling(item: OpenItem, task_rows: TaskRows, measured_at: str) -> ProbeResult:

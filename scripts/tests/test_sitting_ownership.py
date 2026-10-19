@@ -191,7 +191,7 @@ class TestCoalesceFoldProbe:
         assert 'carrier for the fold' in result.owner
         assert result.owner_task_id == '5255'
         assert result.owner_task_status == 'pending'
-        assert 'no deferral' in result.evidence
+        assert result.evidence == 'task 4803 x_coalesced_into=5255 (no deferral recorded)'
 
     def test_a_carried_by_record_owns_over_a_stale_legacy_key(self, sessions_root, seed_tasks):
         record = _record(CarriedByDeferral(carrier_task_id=5300, **STAMPS))
@@ -223,7 +223,7 @@ class TestCoalesceFoldProbe:
 
         assert result.status == 'owns'
         assert result.owner_task_id == '5255'
-        assert 'no deferral' in result.evidence
+        assert result.evidence == 'task 4803 x_coalesced_into=5255 (deferral record unreadable)'
 
     def test_a_row_that_is_not_deferred_reads_the_legacy_key_as_before(self, sessions_root, seed_tasks):
         result = self._fold(sessions_root, seed_tasks, {'status': 'pending', 'metadata': {'x_coalesced_into': 5255}})
