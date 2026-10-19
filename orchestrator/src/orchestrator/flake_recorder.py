@@ -30,13 +30,12 @@ files the owner afterwards (PRD §5.9) and raises any ``regressed_after_resoluti
 escalation, so no network call is left on the observation path.
 
 Since ε1 (task 6864) :func:`record_call_site_observations` is the one body every call
-site records through, and :data:`_CALL_SITE_EFFECTS` says what each call site's
-observations do beyond the rows and the due items.  The merge-gate entry unwraps its
-``VerifyResult`` and delegates.
+site records through, and :data:`_CALL_SITES_WITH_LIVE_SIGNALS` names the call sites
+whose observations do more than write the rows and the due items.  The merge-gate entry
+unwraps its ``VerifyResult`` and delegates.
 
 Import discipline: this module imports ``flake_ledger`` (which depends on ``shared``
-alone) at runtime and NOTHING else from ``orchestrator``; ``flake_debt_drain`` reads its
-per-call-site table, never the reverse.
+alone) at runtime and NOTHING else from ``orchestrator``.
 ``VerifyResult`` is a ``TYPE_CHECKING``-only annotation and ``EventType`` /
 ``Escalation`` are imported lazily inside their functions, so ``flake_recorder``
 never imports ``verify`` or ``event_store`` at runtime and cannot participate in an
@@ -56,12 +55,11 @@ from escalation.categories import EscalationCategory
 
 from orchestrator.flake_ledger import (
     DebtContext,
-    DebtTrigger,
     DueItem,
-    DueRow,
     FlakeCallSite,
     FlakeSuppression,
     FlakeVerdict,
+    context_at_call_site,
     debt_context_to_json,
     enqueue_debt,
     ledger_db_path,
@@ -75,101 +73,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class RegressionOrigin:
-    """What re-opened a resolved debt, as the ``regressed_after_resolution`` escalation
-    words it: the clause naming the observation, and its label/value lines in order."""
-
-    clause: str
-    observation: tuple[tuple[str, str], ...]
-
-
-_NOT_RECORDED = '(not recorded)'
-
-
-def _merge_gate_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
-    return RegressionOrigin(
-        clause='a merge-gate suppression',
-        observation=(
-            ('observed at merge_sha:', item.head or '(none)'),
-            ('observing task_id:', item.observing_task_id or '(none)'),
-            ('observed_at:', item.observed_at),
-        ),
-    )
-
-
-_LANE_CLAUSES: Final[Mapping[DebtTrigger, str]] = {
-    DebtTrigger.cleared: 'an offline-lane clear',
-    DebtTrigger.recovered: 'an offline-lane recovery',
-}
-
-
-def _offline_lane_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
-    if context is None:
-        return RegressionOrigin(
-            clause='an offline-lane observation',
-            observation=(
-                ('observed at head:', item.head or _NOT_RECORDED),
-                ('observed_at:', item.observed_at),
-            ),
-        )
-    return RegressionOrigin(
-        clause=_LANE_CLAUSES[context.trigger],
-        observation=(
-            ('observed at head:', item.head or _NOT_RECORDED),
-            ('trigger:', context.trigger.value),
-            ('command:', context.command or _NOT_RECORDED),
-            ('pass ids:', ', '.join(context.pass_ids) or _NOT_RECORDED),
-            ('observed_at:', item.observed_at),
-        ),
-    )
-
-
-def _neutral_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
-    return RegressionOrigin(
-        clause=f'an observation at call site {item.call_site}',
-        observation=(
-            ('observed at head:', item.head or _NOT_RECORDED),
-            ('call site:', item.call_site),
-            ('observed_at:', item.observed_at),
-        ),
-    )
-
-
-@dataclass(frozen=True)
-class CallSiteEffects:
-    """What one call site's observations do beyond the ledger rows and the due items.
-
-    *live_signals*: a suppression emits ``merge_flake_suppressed`` and bumps the INV-4
-    storm streak.  The merge gate's alone: the offline lane gates no merge, so a lane
-    clear masks nothing (offline-lane PRD D6, call 1).
-
-    *regression_origin*: how the drain's regression escalation words the observation
-    that re-opened a resolved debt.
-    """
-
-    live_signals: bool
-    regression_origin: Callable[[DueRow, DebtContext | None], RegressionOrigin]
-
-
-_CALL_SITE_EFFECTS: Final[Mapping[FlakeCallSite, CallSiteEffects]] = {
-    FlakeCallSite.merge_gate: CallSiteEffects(
-        live_signals=True, regression_origin=_merge_gate_origin,
-    ),
-    FlakeCallSite.offline_lane: CallSiteEffects(
-        live_signals=False, regression_origin=_offline_lane_origin,
-    ),
-}
-_NO_ROW: Final = CallSiteEffects(live_signals=False, regression_origin=_neutral_origin)
-
-
-def call_site_effects(call_site: str) -> CallSiteEffects:
-    """*call_site*'s row of the table; the neutral row for a member with none or an
-    off-vocabulary spelling (the ``verify.py::_CALL_SITE_POLICY`` idiom)."""
-    try:
-        return _CALL_SITE_EFFECTS.get(FlakeCallSite(call_site), _NO_ROW)
-    except ValueError:
-        return _NO_ROW
+#: The call sites whose suppressions emit ``merge_flake_suppressed`` and bump the INV-4
+#: storm streak: the merge gate's alone.  The offline lane gates no merge, so a lane clear
+#: masks nothing (offline-lane PRD D6, call 1).
+_CALL_SITES_WITH_LIVE_SIGNALS: Final = frozenset({FlakeCallSite.merge_gate})
 
 
 def _emit_merge_flake_suppressed(
@@ -357,6 +264,25 @@ class _DueItems:
         return cls(per_suppression=((),) * suppressions, unnamed=())
 
 
+def _due_item(
+    test_id: str,
+    ctx: DebtContext | None,
+    *,
+    observed_at: str,
+    call_site: str,
+    head: str | None,
+    observing_task_id: str | None,
+) -> DueItem:
+    return DueItem(
+        test_id=test_id,
+        observed_at=observed_at,
+        call_site=call_site,
+        head=head,
+        observing_task_id=observing_task_id,
+        context=_context_text(test_id, context_at_call_site(call_site, ctx)),
+    )
+
+
 def _context_text(test_id: str, ctx: DebtContext | None) -> str:
     """*ctx* as due-list text; ``'{}'`` (logged) for one that will not encode: the owner
     is still owed, only its wording is lost."""
@@ -390,12 +316,15 @@ def _due_items(
     per_suppression: list[list[DueItem]] = [[] for _ in suppressions]
     unnamed: list[DueItem] = []
     for test_id, ctx in debt_eligible.items():
-        context = _context_text(test_id, ctx)
         index = next((i for i, tests in enumerate(named) if test_id in tests), None)
         if index is not None:
             s = suppressions[index]
             per_suppression[index].append(
-                DueItem(test_id, s.observed_at, s.call_site, head, observing_task_id, context),
+                _due_item(
+                    test_id, ctx,
+                    observed_at=s.observed_at, call_site=s.call_site,
+                    head=head, observing_task_id=observing_task_id,
+                ),
             )
         elif observed_at is None:
             logger.warning(
@@ -407,7 +336,11 @@ def _due_items(
             )
         else:
             unnamed.append(
-                DueItem(test_id, observed_at, call_site, head, observing_task_id, context),
+                _due_item(
+                    test_id, ctx,
+                    observed_at=observed_at, call_site=call_site,
+                    head=head, observing_task_id=observing_task_id,
+                ),
             )
     return _DueItems(tuple(tuple(items) for items in per_suppression), tuple(unnamed))
 
@@ -438,7 +371,7 @@ def _write_ledger(
 
 def _is_suppression(s: FlakeSuppression, guard: _Guard) -> bool:
     """Whether *s* is ``passes_in_isolation``, by ``==``; ``False`` (logged) for a verdict
-    that cannot be read, since a bogus live signal is worse than a missing one."""
+    that cannot be read, since a bogus item or live signal is worse than a missing one."""
     try:
         return s.verdict == FlakeVerdict.passes_in_isolation
     except Exception:
@@ -494,8 +427,8 @@ async def record_call_site_observations(
     (§5.5: the observation, not the remedy).  Every test in *debt_eligible* gets one item
     on the ledger's due list carrying its context, in the same transaction as the rows
     of the suppression that names it; which tests are eligible is the caller's call,
-    never derived from a verdict here.  Then, for a call site whose row in
-    :data:`_CALL_SITE_EFFECTS` has live signals, each ``passes_in_isolation`` suppression
+    never derived from a verdict here.  Then, for a call site in
+    :data:`_CALL_SITES_WITH_LIVE_SIGNALS`, each ``passes_in_isolation`` suppression
     emits its fact and bumps the storm streak.
 
     ORDER IS THE CONTRACT: the durable rows and items first, the in-process signals
@@ -524,7 +457,7 @@ async def record_call_site_observations(
         ledger_db_path(project_root), project_id, suppressions, due,
         head=head, observing_task_id=observing_task_id, guard=guard,
     )
-    if call_site_effects(call_site).live_signals:
+    if call_site in _CALL_SITES_WITH_LIVE_SIGNALS:
         _fire_live_signals(
             suppressions,
             head_sha=head_sha, observing_task_id=observing_task_id,
@@ -560,21 +493,7 @@ async def record_merge_flake_suppression(
         # sentinel row for it would put fiction in the evidence trail.
         return
 
-    # Read the verdict once, under its own guard, so a malformed observation cannot
-    # decide the debt by raising.  Defaults to False = "not a suppression", the
-    # fail-safe reading: a bogus item would be worse than a missing one.
-    suppressed = False
-    try:
-        suppressed = s.verdict == FlakeVerdict.passes_in_isolation
-    except Exception:
-        logger.warning(
-            'flake_recorder: unreadable verdict on the carried observation '
-            '(merge_sha=%s, task_id=%s); skipping the debt, the event and the streak bump',
-            merge_sha,
-            task_id,
-            exc_info=True,
-        )
-
+    suppressed = _is_suppression(s, _Guard(FlakeCallSite.merge_gate, merge_sha, task_id))
     debt_eligible: dict[str, DebtContext | None] = (
         {test_id: None for test_id in named_tests(s)} if suppressed else {}
     )

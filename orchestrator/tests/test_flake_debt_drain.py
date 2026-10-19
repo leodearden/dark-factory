@@ -34,6 +34,7 @@ from orchestrator.flake_debt_drain import (
     DrainPassReport,
     DrainStop,
     DueFailure,
+    call_site_evidence,
     run_drain_pass,
 )
 from orchestrator.flake_ledger import (
@@ -523,8 +524,12 @@ class TestRegressionFromTheDrain:
             'measured_at': f'opened_at={row.opened_at}',
             'ref': f'prior_resolving_commit={FIX}',
         }
+        assert esc.evidence[1] == {
+            'observation': 're-entry observed at call site merge_gate',
+            'measured_at': f'observed_at={item.observed_at}',
+            'ref': 'call_site=merge_gate',
+        }
         assert len(esc.evidence) == 2
-        assert flake_debt_drain.regression_call_site(esc.evidence) == 'merge_gate'
         assert (esc.category, esc.agent_role, esc.severity, esc.level) == (
             REGRESSED_AFTER_RESOLUTION, 'orchestrator-flake-ledger', 'critical', 2,
         )
@@ -599,13 +604,41 @@ class TestRegressionFromTheDrain:
         owner = await _owned(db, client, clock, A, 0)
         client.finish(owner, commit=FIX)
         _enqueue(db, A, 1, at=clock.now, call_site='main_probe')
+        item = _item(db, A)
 
         await _pass(db, client, clock, queue=queue)
 
         (esc,) = queue.regressions()
         assert 'main_probe' in esc.detail
         assert 'merge-gate suppression' not in esc.detail
-        assert flake_debt_drain.regression_call_site(esc.evidence) == 'main_probe'
+        assert call_site_evidence('main_probe', observed_at=item.observed_at) in esc.evidence
+
+    async def test_a_context_naming_another_call_site_is_dropped(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The item's call site is the one source: a merge-gate item carrying a lane
+        context is filed and escalated as the merge gate's, never half of each."""
+        import dataclasses
+
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        queue = _RecordingQueue(tmp_path / 'queue')
+        owner = await _owned(db, client, clock, A, 0)
+        client.finish(owner, commit=FIX)
+        lane = DebtContext(call_site=FlakeCallSite.offline_lane, trigger=DebtTrigger.cleared)
+        _enqueue(db, A, 1, at=clock.now, context=debt_context_to_json(lane))
+        item = _item(db, A)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await _pass(db, client, clock, queue=queue)
+
+        row = read_debt(db, A)
+        assert row is not None
+        assert client.submit_calls[-1] == build_deflake_task_arguments(
+            dataclasses.replace(row, owner_task_id=None),
+        )
+        (esc,) = queue.regressions()
+        assert esc.detail == merge_gate_regression_detail(row, item)
+        assert 'call_site=offline_lane on a due item at call_site=merge_gate' in caplog.text
 
     async def test_a_failed_first_filing_and_a_hand_resolve_still_raise_one_escalation(
         self, tmp_path: Path,

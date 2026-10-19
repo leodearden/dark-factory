@@ -886,7 +886,8 @@ def read_call_sites_written(db_path: Path) -> frozenset[str] | None:
 class DueItem:
     """What an observation asks the drain to do: one :func:`open_debt` call for
     *test_id*.  *observed_at* is raw (canonicalised on enqueue) and *call_site* is a
-    :class:`FlakeCallSite` or its spelling."""
+    :class:`FlakeCallSite` or its spelling, the one source of the item's call site: a
+    *context* naming another is dropped (:func:`context_at_call_site`)."""
 
     test_id: str
     observed_at: str
@@ -1366,6 +1367,28 @@ def debt_context_from_json(text: str) -> DebtContext | None:
         return None
 
 
+def context_at_call_site(call_site: str, ctx: DebtContext | None) -> DebtContext | None:
+    """*ctx* as the context of a due item at *call_site*, which is the one source of the
+    item's call site: a context naming another is dropped with a warning naming both, so
+    the de-flake task and the regression escalation are never worded for two call sites.
+    The owner is still owed; only the wording is lost."""
+    if ctx is None or ctx.call_site == call_site:
+        return ctx
+    logger.warning(
+        'flake_ledger: a debt context names call_site=%s on a due item at call_site=%s; '
+        "dropping the context, since the item's call site is the one source",
+        ctx.call_site.value,
+        call_site,
+    )
+    return None
+
+
+def due_item_context(item: DueRow) -> DebtContext | None:
+    """The context *item* carries, decoded and checked by :func:`context_at_call_site`:
+    ``None`` for none, a malformed one, or one naming another call site.  Never raises."""
+    return context_at_call_site(item.call_site, debt_context_from_json(item.context))
+
+
 #: What each lane trigger observed, worded as the observation (§5.5, §5.6).
 LANE_TRIGGER_OBSERVATIONS: Final[Mapping[DebtTrigger, str]] = {
     DebtTrigger.cleared: (
@@ -1389,7 +1412,8 @@ LANE_TEST_NOT_ON_MERGE_GATE = (
     'change lands.'
 )
 
-_NOT_RECORDED = '(not recorded)'
+#: How a de-flake task or a regression escalation states a field nobody recorded.
+NOT_RECORDED: Final = '(not recorded)'
 
 
 def _deflake_title(row: DebtRow, observation: str) -> str:
@@ -1403,7 +1427,7 @@ def _evidence_block(evidence: Sequence[RecentOccurrence]) -> str:
         return ''
     lines = [f'Recent occurrences (at most {DEBT_CONTEXT_EVIDENCE_LIMIT}, most recent last):\n']
     lines += [
-        f'  pass {e.pass_id or _NOT_RECORDED}  head {(e.head or _NOT_RECORDED)[:12]}  '
+        f'  pass {e.pass_id or NOT_RECORDED}  head {(e.head or NOT_RECORDED)[:12]}  '
         f'{EvidenceKind(e.kind).value}: {e.first_line}\n'
         for e in evidence
     ]
@@ -1415,7 +1439,7 @@ def _field_lines(fields_: Sequence[tuple[str, object]]) -> str:
 
 
 def _joined(values: Sequence[str]) -> str:
-    return ', '.join(values) if values else _NOT_RECORDED
+    return ', '.join(values) if values else NOT_RECORDED
 
 
 def _lane_task_text(row: DebtRow, ctx: DebtContext) -> tuple[str, str]:
@@ -1431,9 +1455,9 @@ def _lane_task_text(row: DebtRow, ctx: DebtContext) -> tuple[str, str]:
             ('opened_at', row.opened_at),
             ('open_count', row.open_count),
             ('trigger', ctx.trigger.value),
-            ('command', ctx.command or _NOT_RECORDED),
-            ('working directory', ctx.working_directory or _NOT_RECORDED),
-            ('reproduce', ctx.reproduce or _NOT_RECORDED),
+            ('command', ctx.command or NOT_RECORDED),
+            ('working directory', ctx.working_directory or NOT_RECORDED),
+            ('reproduce', ctx.reproduce or NOT_RECORDED),
             ('heads', _joined(ctx.heads)),
             ('pass ids', _joined(ctx.pass_ids)),
         ])
@@ -1454,10 +1478,10 @@ def _lane_task_text(row: DebtRow, ctx: DebtContext) -> tuple[str, str]:
     return _deflake_title(row, f'{ctx.trigger.value} {on}'), description
 
 
-def _merge_gate_task_text(row: DebtRow, evidence: Sequence[RecentOccurrence]) -> tuple[str, str]:
+def _merge_gate_task_text(row: DebtRow, ctx: DebtContext | None) -> tuple[str, str]:
     """The title and description of a merge-gate suppression's de-flake task, with an
-    evidence block after the field block only when there is evidence."""
-    block = _evidence_block(evidence)
+    evidence block after the field block only when *ctx* carries evidence."""
+    block = _evidence_block(() if ctx is None else ctx.evidence)
     description = (
         f'The flake ledger recorded a `{FlakeVerdict.passes_in_isolation.value}` '
         f'observation for this test and SUPPRESSED the red it produced, so a merge '
@@ -1490,6 +1514,15 @@ def _merge_gate_task_text(row: DebtRow, evidence: Sequence[RecentOccurrence]) ->
         row, f'{FlakeVerdict.passes_in_isolation.value} after a merge-gate red was suppressed',
     )
     return title, description
+
+
+#: The de-flake task text per call site.  A call site with no row, and a debt with no
+#: context, are worded as the merge gate's.
+_DEFLAKE_TASK_TEXT: Final[
+    Mapping[FlakeCallSite, Callable[[DebtRow, DebtContext], tuple[str, str]]]
+] = {
+    FlakeCallSite.offline_lane: _lane_task_text,
+}
 
 
 def _deflake_metadata(row: DebtRow, ctx: DebtContext | None) -> dict[str, Any]:
@@ -1545,14 +1578,16 @@ def build_deflake_task_arguments(row: DebtRow, context: DebtContext | None = Non
     script-suite NAME rather than a path, and a wrong or over-wide concurrency lock
     derived from a guess is worse than no lock — the de-flake agent discovers the files.
 
-    *context*, when given, words an offline-lane debt in the lane's terms (offline-lane
-    PRD §5.6) and stamps its call site, trigger and command into the metadata; any other
-    context adds only its evidence.  With none the block is the merge gate's.
+    *context*, when given, picks the text by its call site in :data:`_DEFLAKE_TASK_TEXT`
+    (an offline-lane debt is worded in the lane's terms, offline-lane PRD §5.6) and
+    stamps its call site, trigger and command into the metadata.  With none the block
+    is the merge gate's.
     """
-    if context is not None and context.call_site == FlakeCallSite.offline_lane:
-        title, description = _lane_task_text(row, context)
+    if context is None:
+        title, description = _merge_gate_task_text(row, None)
     else:
-        title, description = _merge_gate_task_text(row, () if context is None else context.evidence)
+        task_text = _DEFLAKE_TASK_TEXT.get(context.call_site, _merge_gate_task_text)
+        title, description = task_text(row, context)
     return {
         'title': title,
         'description': description,

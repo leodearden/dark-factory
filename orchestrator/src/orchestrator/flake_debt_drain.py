@@ -26,8 +26,8 @@ The drain's own ledger calls run off the event-loop thread (INV-8);
 :func:`~orchestrator.flake_ledger.open_debt`'s internal sqlite stays on it, unchanged,
 bounded by that function's connection count and by 50 calls per pass.
 
-Import discipline: ``flake_ledger``, ``flake_recorder`` (its per-call-site table) and
-``shared`` only, and ``escalation.models`` lazily.  Never a lane module or ``git_ops``: the ancestry read arrives through
+Import discipline: ``flake_ledger`` and ``shared`` only, and ``escalation.models`` lazily.
+Never a lane module or ``git_ops``: the ancestry read arrives through
 :class:`AncestryPort`.
 """
 
@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -51,13 +51,16 @@ from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
     DUE_ITEM_STALE_MINUTES,
     NEVER_WIDEN_A_TIMEOUT,
+    NOT_RECORDED,
     DebtContext,
     DebtRow,
+    DebtTrigger,
     DueRow,
     DueSummary,
+    FlakeCallSite,
     FlakeLedgerTaskClient,
-    debt_context_from_json,
     delete_due_item,
+    due_item_context,
     fix_contained,
     name_stale_due_items,
     open_debt,
@@ -67,7 +70,6 @@ from orchestrator.flake_ledger import (
     resolving_commit,
     summarize_due,
 )
-from orchestrator.flake_recorder import call_site_effects
 
 if TYPE_CHECKING:
     from escalation.models import EvidenceEntry
@@ -268,35 +270,89 @@ def _cited_commit(row: DebtRow) -> str:
     return row.prior_resolving_commit or '(none recorded)'
 
 
-_CALL_SITE_REF_PREFIX = 'call_site='
-
-
 def call_site_evidence(call_site: str, *, observed_at: str) -> EvidenceEntry:
-    """The evidence entry naming the call site whose observation re-entered the debt;
-    :func:`regression_call_site` reads it back."""
+    """The evidence entry naming the call site whose observation re-entered the debt."""
     return {
         'observation': f're-entry observed at call site {call_site}',
         'measured_at': f'observed_at={observed_at}',
-        'ref': f'{_CALL_SITE_REF_PREFIX}{call_site}',
+        'ref': f'call_site={call_site}',
     }
 
 
-def regression_call_site(evidence: Sequence[Mapping[str, Any]]) -> str | None:
-    """The call site a regression escalation's *evidence* names, or ``None``: the one
-    reader of :func:`call_site_evidence`."""
-    for entry in evidence:
-        ref = entry.get('ref')
-        if isinstance(ref, str) and ref.startswith(_CALL_SITE_REF_PREFIX):
-            return ref.removeprefix(_CALL_SITE_REF_PREFIX)
-    return None
+@dataclass(frozen=True)
+class RegressionOrigin:
+    """What re-opened a resolved debt, as the regression escalation words it: the clause
+    naming the observation, and its label/value lines in order."""
+
+    clause: str
+    observation: tuple[tuple[str, str], ...]
+
+
+def _merge_gate_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    return RegressionOrigin(
+        clause='a merge-gate suppression',
+        observation=(
+            ('observed at merge_sha:', item.head or '(none)'),
+            ('observing task_id:', item.observing_task_id or '(none)'),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+_LANE_CLAUSES: Final[Mapping[DebtTrigger, str]] = {
+    DebtTrigger.cleared: 'an offline-lane clear',
+    DebtTrigger.recovered: 'an offline-lane recovery',
+}
+
+
+def _offline_lane_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    if context is None:
+        return RegressionOrigin(
+            clause='an offline-lane observation',
+            observation=(
+                ('observed at head:', item.head or NOT_RECORDED),
+                ('observed_at:', item.observed_at),
+            ),
+        )
+    return RegressionOrigin(
+        clause=_LANE_CLAUSES[context.trigger],
+        observation=(
+            ('observed at head:', item.head or NOT_RECORDED),
+            ('trigger:', context.trigger.value),
+            ('command:', context.command or NOT_RECORDED),
+            ('pass ids:', ', '.join(context.pass_ids) or NOT_RECORDED),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+def _neutral_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    return RegressionOrigin(
+        clause=f'an observation at call site {item.call_site}',
+        observation=(
+            ('observed at head:', item.head or NOT_RECORDED),
+            ('call site:', item.call_site),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+#: The regression wording per :class:`FlakeCallSite`, looked up by the due item's call
+#: site spelling; a call site with no row is worded neutrally.
+_REGRESSION_ORIGINS: Final[
+    Mapping[str, Callable[[DueRow, DebtContext | None], RegressionOrigin]]
+] = {
+    FlakeCallSite.merge_gate: _merge_gate_origin,
+    FlakeCallSite.offline_lane: _offline_lane_origin,
+}
 
 
 def _regression_detail(row: DebtRow, *, item: DueRow, context: DebtContext | None) -> str:
     """The escalation detail for *row*'s regression, observed through *item*: every fact a
     human needs to judge whether the prior fix was cosmetic (§5.5), with the fix's
     commit quoted VERBATIM or stated as not recorded.  The observation's clause and lines
-    are its call site's (``flake_recorder.py::CallSiteEffects``)."""
-    origin = call_site_effects(item.call_site).regression_origin(item, context)
+    are its call site's (:data:`_REGRESSION_ORIGINS`)."""
+    origin = _REGRESSION_ORIGINS.get(item.call_site, _neutral_origin)(item, context)
     observation = ''.join(f'  {label:<25}{value}\n' for label, value in origin.observation)
     return (
         f'{row.test_id} flaked again after its de-flake fix landed. The flake ledger '
@@ -572,7 +628,7 @@ async def _settle(
                 return await _delete(db_path, item)
 
     client = _WatchedTaskClient(task_client)
-    context = debt_context_from_json(item.context)
+    context = due_item_context(item)
     row = await open_debt(
         db_path,
         project_id,

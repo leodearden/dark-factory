@@ -641,10 +641,16 @@ class TestRecordEnqueuesDebt:
         assert len(_due(tmp_path)) == threshold
 
 
+_STORM_AT = 5
+_STORM_SENTINEL = 'merge-flake-suppression-storm'
 _STORM_SUMMARY = (
     'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate has '
-    'suppressed 5 merge-verify reds since the last reset'
+    f'suppressed {_STORM_AT} merge-verify reds since the last reset'
 )
+
+
+def _storms(queue: EscalationQueue) -> list:
+    return queue.get_by_task(_STORM_SENTINEL, status='pending', level=2)
 
 
 def _merge_gate_title(test_id: str, cycle: int) -> str:
@@ -673,7 +679,7 @@ class TestScenario32MergeGateUnchanged:
         self, tmp_path: Path,
     ) -> None:
         queue = EscalationQueue(tmp_path / 'queue')
-        for n in range(5):
+        for n in range(_STORM_AT):
             await _record(
                 _result(_suppression(observed_at=f'2026-08-22T12:00:0{n}+00:00')),
                 tmp_path,
@@ -690,7 +696,7 @@ class TestScenario32MergeGateUnchanged:
         rows = _occurrences(tmp_path)
         assert len(rows) == 10, rows
         assert {(r.test_id, r.task_id) for r in rows} == {
-            (test_id, f'{_TASK_ID}-{n}') for test_id in _IDS for n in range(5)
+            (test_id, f'{_TASK_ID}-{n}') for test_id in _IDS for n in range(_STORM_AT)
         }
         for r in rows:
             assert (r.verdict, r.call_site, r.runner, r.merge_sha, r.detail) == (
@@ -701,7 +707,7 @@ class TestScenario32MergeGateUnchanged:
         assert sorted(d.test_id for d in debt) == sorted(_IDS)
         assert all(d.owner_task_id for d in debt), debt
 
-        (storm,) = queue.get_by_task('merge-flake-suppression-storm', status='pending', level=2)
+        (storm,) = _storms(queue)
         assert (storm.category, storm.severity, storm.summary) == (
             'merge_flake_suppression_storm', 'critical', _STORM_SUMMARY,
         )
@@ -813,29 +819,32 @@ class TestRecordCallSiteObservations:
         assert 'observed_at' in caplog.text
 
     async def test_the_lane_emits_nothing_and_bumps_nothing(self, tmp_path: Path) -> None:
-        """Scenario 30's recorder half: the storm alarm stays the merge gate's."""
-        es, q = _FakeEventStore(), _FakeEscalationQueue(open_l2=None)
-        threshold = flake_recorder._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+        """Scenario 30's recorder half: the storm alarm stays the merge gate's.  More lane
+        suppressions than the storm takes raise none, and leave the merge gate's next
+        window whole: its storm comes at its fifth suppression, not before."""
+        es, queue = _FakeEventStore(), EscalationQueue(tmp_path / 'queue')
 
-        for i in range(threshold + 1):
+        for i in range(_STORM_AT + 1):
             test_id = f'tests/test_lane.py::test_{i}'
             await _observe(
                 tmp_path,
                 (_lane_suppression(test_ids=(test_id,), observed_at=f'2026-10-19T12:00:0{i}+00:00'),),
                 debt_eligible={test_id: None},
-                event_store=es, escalation_queue=q,
+                event_store=es, escalation_queue=queue,
             )
-            if i < threshold:
-                await _record(
-                    _result(_suppression(observed_at=f'2026-08-22T12:00:0{i}+00:00')),
-                    tmp_path, task_id=f'merge-{i}', event_store=es, escalation_queue=q,
-                )
+        assert (es.emits, _storms(queue)) == ([], [])
 
-        assert len(q.submitted) == 1, q.submitted
+        for i in range(_STORM_AT):
+            assert _storms(queue) == [], f'a storm before merge suppression {i + 1}'
+            await _record(
+                _result(_suppression(observed_at=f'2026-08-22T12:00:0{i}+00:00')),
+                tmp_path, task_id=f'merge-{i}', event_store=es, escalation_queue=queue,
+            )
+
+        assert len(_storms(queue)) == 1
         assert [task_id for _type, task_id, _data in es.emits] == [
-            f'merge-{i}' for i in range(threshold)
+            f'merge-{i}' for i in range(_STORM_AT)
         ]
-        assert flake_recorder._merge_flake_suppression_streak == 0
 
     async def test_every_eligible_test_lands_with_its_context_in_its_rows_transaction(
         self, tmp_path: Path,
@@ -925,21 +934,36 @@ class TestRecordCallSiteObservations:
     async def test_a_call_site_with_no_row_writes_rows_and_no_live_signal(
         self, tmp_path: Path,
     ) -> None:
-        es, q = _FakeEventStore(), _FakeEscalationQueue(open_l2=None)
-        threshold = flake_recorder._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+        es, queue = _FakeEventStore(), EscalationQueue(tmp_path / 'queue')
 
-        for i in range(threshold):
+        for i in range(_STORM_AT):
             s = _lane_suppression(
                 call_site=FlakeCallSite.main_probe, observed_at=f'2026-10-19T12:00:0{i}+00:00',
             )
             await _observe(
                 tmp_path, (s,), call_site=FlakeCallSite.main_probe,
-                event_store=es, escalation_queue=q,
+                event_store=es, escalation_queue=queue,
             )
 
-        assert len(_occurrences(tmp_path)) == threshold
+        assert len(_occurrences(tmp_path)) == _STORM_AT
         assert es.emits == []
-        assert q.submitted == []
+        assert _storms(queue) == []
+
+    async def test_a_context_naming_another_call_site_is_enqueued_without_it(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The item's call site is the one source; the owner is still owed."""
+        s = _lane_suppression(call_site=FlakeCallSite.merge_gate)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await _observe(
+                tmp_path, (s,), call_site=FlakeCallSite.merge_gate,
+                debt_eligible={_LANE_A: _lane_context()},
+            )
+
+        (item,) = _due(tmp_path)
+        assert (item.test_id, item.call_site, item.context) == (_LANE_A, 'merge_gate', '{}')
+        assert 'call_site=offline_lane on a due item at call_site=merge_gate' in caplog.text
 
     async def test_the_rows_exist_before_the_live_signals_fire(self, tmp_path: Path) -> None:
         seen: list[int] = []
@@ -969,6 +993,9 @@ class TestRecordCallSiteObservations:
 _FIX = 'f1' * 20
 _H1 = '1' * 40
 _H2 = '2' * 40
+_LANE_RE_ENTRY = flake_debt_drain.call_site_evidence(
+    'offline_lane', observed_at='2026-10-19T13:00:00+00:00',
+)
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1048,7 @@ class TestLaneRegressionFromTheDrain:
         assert (esc.level, esc.severity, esc.agent_role, esc.category) == (
             2, 'critical', 'orchestrator-flake-ledger', 'regressed_after_resolution',
         )
-        assert flake_debt_drain.regression_call_site(esc.evidence) == 'offline_lane'
+        assert _LANE_RE_ENTRY in esc.evidence, esc.evidence
         assert client.filed == ['deflake-1', 'deflake-2'], 'the title fold swallowed cycle 2'
         assert client.submit_calls[-1]['title'].endswith(', cycle 2')
 
@@ -1040,4 +1067,4 @@ class TestLaneRegressionFromTheDrain:
 
         (esc,) = queue.regressions()
         assert 'an offline-lane recovery has now RE-OPENED it' in esc.detail, esc.detail
-        assert flake_debt_drain.regression_call_site(esc.evidence) == 'offline_lane'
+        assert _LANE_RE_ENTRY in esc.evidence, esc.evidence
