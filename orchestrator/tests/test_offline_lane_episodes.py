@@ -1116,19 +1116,42 @@ async def test_r13_a_failed_lookup_files_nothing_and_the_tick_files_once_it_read
 
 
 @pytest.mark.asyncio
-async def test_r13_an_unreadable_open_candidate_files_nothing(tmp_path):
+async def test_r13_an_unreadable_open_candidate_files_nothing_and_the_stuck_record_names_it(tmp_path):
     lane = Lane(tmp_path)
     lane.client.set_status('850', 'pending', **PRE_CUTOVER)
     lane.client.unreadable.add('850')
     await lane.red()
 
     effect = await lane.spaced_red()
-
     episode = lane.episode()
+    lane.clock.advance(minutes=30)
+    await lane.tick()
+
     assert lane.client.submitted == []
     assert effect.tasks_filed == ()
     assert (episode.filing_due, episode.covering_task_id) == (True, None)
     assert '850' in (episode.filing_failure or '')
+    (stuck,) = lane.pending(STUCK_FILING_CATEGORY)
+    assert 'open lane task 850 unreadable' in stuck.detail
+
+
+@pytest.mark.asyncio
+async def test_r13_a_pass_or_tick_looks_up_the_open_lane_tasks_once_for_all_its_filings(tmp_path):
+    lane = Lane(tmp_path)
+    lane.client.fail_submissions(*['server busy'] * 4)
+    await lane.red()
+    await lane.spaced_red()
+    await lane.spaced_red(A, B)
+    pass_start = len(lane.log)
+    await lane.spaced_red(A, B)
+    in_pass = lane.log[pass_start:]
+    tick_start = len(lane.log)
+    tick = await lane.tick()
+    in_tick = lane.log[tick_start:]
+
+    assert (in_pass.count('find_tasks_by_metadata'), in_pass.count('submit_task')) == (1, 2)
+    assert (in_tick.count('find_tasks_by_metadata'), in_tick.count('submit_task')) == (1, 2)
+    assert tick.tasks_filed == ('7001', '7002')
 
 
 @pytest.mark.asyncio

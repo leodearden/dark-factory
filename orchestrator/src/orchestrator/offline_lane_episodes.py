@@ -38,11 +38,13 @@ Rules the engine and its pure rules keep beyond the PRD's text:
   released with the level-2s that hold it.  A record resolved by hand is replaced only
   by a pass.
 - R13 before submitting for a group with no covering task, the engine looks up the
-  project's open lane fix tasks (``spawn_context`` ``offline_lane_red``, each read live)
-  and binds each test to the first that covers it (its ``x_offline_lane`` command and
-  nodes, or a pre-cutover task's ``failing_tests``), committed and named in
-  ``prior_task_ids``.  Only the rest are submitted.  A failed lookup or read files
-  nothing and keeps the filing due with that reason.
+  project's open lane fix tasks (``spawn_context`` ``offline_lane_red``, each read live),
+  at most once per pass or tick, and binds each test to the first that covers it (its
+  ``x_offline_lane`` command and nodes, or a pre-cutover task's ``failing_tests``),
+  committed and named in ``prior_task_ids``.  Only the rest are submitted.  A failed
+  lookup, or one open lane task that cannot be read, files nothing for any command in
+  that pass or tick: every such filing stays due with the reason, which names that task
+  and reaches the stuck-filing record.
 - R14 a command record that has observed no pass takes its last pass and last green
   head from the command's run records before the pass, so a cutover or a lost store
   keeps a green pass on record.
@@ -52,7 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -168,6 +170,26 @@ class TickResult:
     tasks_filed: tuple[str, ...]
 
 
+_OpenLaneTasks = tuple[dict[str, Mapping[str, Any]], str | None]
+
+
+class _OpenLaneTaskLookup:
+    """R13's read of the open lane fix tasks, made at most once per pass or tick and shared by its filings.
+
+    A task submitted later in the same pass or tick names only its own group's nodes, which no
+    other group shares, so no filing needs to see it.
+    """
+
+    def __init__(self, read: Callable[[], Awaitable[_OpenLaneTasks]]) -> None:
+        self._read = read
+        self._answer: _OpenLaneTasks | None = None
+
+    async def answer(self) -> _OpenLaneTasks:
+        if self._answer is None:
+            self._answer = await self._read()
+        return self._answer
+
+
 @dataclass(frozen=True)
 class _TaskRead:
     """One live read of a covering task; ``contained`` is D10's done question, asked only of a done task."""
@@ -226,10 +248,10 @@ def _after_submit(
             liveness = owner_liveness(status)
             if not combined or liveness is OwnerLiveness.DEFERRED:
                 return bound
-            return _with_episodes(
-                bound, nodes, planning_committed=True, filing_due=False, filing_due_since=None,
-                reproduce=None, binding_swallowed=liveness is not OwnerLiveness.OPEN,
+            committed = _with_episodes(
+                bound, nodes, planning_committed=True, binding_swallowed=liveness is not OwnerLiveness.OPEN,
             )
+            return _cleared(committed, nodes)
         case SubmittedTicket(ticket_id=ticket_id):
             failure = f'submit_task returned ticket {ticket_id!r}, not a task: planning mode did not take effect'
         case SubmitFailed(reason=reason):
@@ -239,16 +261,14 @@ def _after_submit(
 
 def _adopted(record: CommandRecord, adopted: Mapping[str, str], now: datetime) -> CommandRecord:
     """R13: each node of *adopted* bound to its open task, as a submission combined into an open task binds."""
-    episodes = dict(record.episodes)
     for node, task_id in adopted.items():
-        episode = episodes[node]
-        prior = episode.prior_task_ids
-        episodes[node] = replace(
-            episode, covering_task_id=task_id, planning_committed=True, filed_at=now, filing_due=False,
-            filing_due_since=None, reproduce=None, filing_failure=None, binding_swallowed=False,
+        prior = record.episodes[node].prior_task_ids
+        record = _with_episodes(
+            record, (node,), covering_task_id=task_id, planning_committed=True, filed_at=now,
+            filing_failure=None, binding_swallowed=False,
             prior_task_ids=prior if task_id in prior else (*prior, task_id),
         )
-    return replace(record, episodes=episodes)
+    return _cleared(record, tuple(adopted))
 
 
 def _after_commit(record: CommandRecord, nodes: Sequence[str], task_id: str, read: _TaskRead) -> CommandRecord:
@@ -415,7 +435,8 @@ class LaneEngine:
             return await self._observed_outage(observation, observation.outcome.probe)
         policy = lane_policy(self._config)
         record = await asyncio.to_thread(self._store.load, observation.command)
-        record, filed = await self._retry_due_filings(record)
+        open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
+        record, filed = await self._retry_due_filings(record, open_tasks)
         record = await self._with_recorded_history(record, observation)
         reads, statuses = await self._pass_reads(record, observation)
         applied = apply_pass(record, observation, reads, policy, self._now())
@@ -427,7 +448,7 @@ class LaneEngine:
             and (task_id := record.episodes[node].covering_task_id) is not None
         }
         groups = [*applied.to_file, *(g for g in _due_groups(record) if _covering(record, g) in unfinished)]
-        record, opened = await self._open_filings(record, groups, observation)
+        record, opened = await self._open_filings(record, groups, observation, open_tasks)
         saved = record
         record, raised = await self._raise_unlanded(record, applied.unlanded, statuses)
         record = await self._maintained_stuck_record(record, policy)
@@ -459,9 +480,10 @@ class LaneEngine:
         policy = lane_policy(self._config)
         due: list[str] = []
         filed: list[str] = []
+        open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
         for command in await asyncio.to_thread(self._store.commands):
             record = await asyncio.to_thread(self._store.load, command)
-            record, tasks = await self._retry_due_filings(record)
+            record, tasks = await self._retry_due_filings(record, open_tasks)
             filed.extend(tasks)
             saved = record
             record = await self._maintained_stuck_record(record, policy)
@@ -721,7 +743,9 @@ class LaneEngine:
         previous = await asyncio.to_thread(self._records.load_pass, record.command, record.last_pass_id)
         return None if previous is None else previous.detect
 
-    async def _retry_due_filings(self, record: CommandRecord) -> tuple[CommandRecord, list[str]]:
+    async def _retry_due_filings(
+        self, record: CommandRecord, open_tasks: _OpenLaneTaskLookup,
+    ) -> tuple[CommandRecord, list[str]]:
         if self._tasks is None:
             return record, []
         filed: list[str] = []
@@ -731,12 +755,16 @@ class LaneEngine:
                                record.command, list(group))
                 record = await self._saved(record, _cancelled(record, group))
                 continue
-            record, task_id = await self._file(self._tasks, record, group, opening=None)
+            record, task_id = await self._file(self._tasks, record, group, opening=None, open_tasks=open_tasks)
             filed.extend([task_id] if task_id else [])
         return record, filed
 
     async def _open_filings(
-        self, record: CommandRecord, groups: Sequence[tuple[str, ...]], observation: PassObservation,
+        self,
+        record: CommandRecord,
+        groups: Sequence[tuple[str, ...]],
+        observation: PassObservation,
+        open_tasks: _OpenLaneTaskLookup,
     ) -> tuple[CommandRecord, list[str]]:
         if self._tasks is None:
             for group in groups:
@@ -744,7 +772,7 @@ class LaneEngine:
             return record, []
         filed: list[str] = []
         for group in groups:
-            record, task_id = await self._file(self._tasks, record, group, opening=observation)
+            record, task_id = await self._file(self._tasks, record, group, opening=observation, open_tasks=open_tasks)
             filed.extend([task_id] if task_id else [])
         return record, filed
 
@@ -755,6 +783,7 @@ class LaneEngine:
         nodes: tuple[str, ...],
         *,
         opening: PassObservation | None,
+        open_tasks: _OpenLaneTaskLookup,
     ) -> tuple[CommandRecord, str | None]:
         """PRD 5.4, each step its own write; a retry resumes at the first step not yet recorded.
 
@@ -765,7 +794,7 @@ class LaneEngine:
         filed = None
         record = await self._saved(record, _marked_due(record, nodes, reproduce, self._now()))
         if _covering(record, nodes) is None:
-            record, nodes = await self._adopt_open_tasks(client, record, nodes)
+            record, nodes = await self._adopt_open_tasks(open_tasks, record, nodes)
             if not nodes:
                 return record, None
             outcome = await self._submit(client, await self._fix_task_arguments(record, nodes, reproduce, opening))
@@ -781,10 +810,10 @@ class LaneEngine:
         return record, filed
 
     async def _adopt_open_tasks(
-        self, client: LaneTaskClient, record: CommandRecord, nodes: tuple[str, ...],
+        self, lookup: _OpenLaneTaskLookup, record: CommandRecord, nodes: tuple[str, ...],
     ) -> tuple[CommandRecord, tuple[str, ...]]:
         """R13: the saved record with every node an open lane fix task covers bound to it; the nodes left to submit."""
-        open_tasks, failure = await self._open_lane_tasks(client)
+        open_tasks, failure = await lookup.answer()
         if failure is not None:
             logger.warning('offline-lane: %s: filing for %s not attempted, still due: %s',
                            record.command, list(nodes), failure)
@@ -799,10 +828,12 @@ class LaneEngine:
         record = await self._saved(record, _adopted(record, adopted, self._now()))
         return record, tuple(node for node in nodes if node not in adopted)
 
-    async def _open_lane_tasks(self, client: LaneTaskClient) -> tuple[dict[str, Mapping[str, Any]], str | None]:
+    async def _open_lane_tasks(self) -> _OpenLaneTasks:
         """The project's open lane fix tasks, read live, in lookup order; or why they could not be read."""
+        if self._tasks is None:
+            return {}, 'no task client'
         try:
-            rows, error = await client.find_tasks_by_metadata(SPAWN_CONTEXT_KEY, SPAWN_CONTEXT, _OPEN_STATUSES)
+            rows, error = await self._tasks.find_tasks_by_metadata(SPAWN_CONTEXT_KEY, SPAWN_CONTEXT, _OPEN_STATUSES)
         except Exception as exc:
             rows, error = [], exc
         if error is not None:
