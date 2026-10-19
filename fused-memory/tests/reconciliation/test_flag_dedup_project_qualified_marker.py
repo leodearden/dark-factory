@@ -227,40 +227,53 @@ def test_anchorless_flag_falls_back_to_content_fingerprint():
     )
 
 
+def _citing(cited: dict, *, task_id: str | None = None) -> dict:
+    return {'task_id': task_id, 'flag_type': FT, 'cited_tasks': [cited]}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'flag',
+    ('flag', 'expected_key'),
     [
-        {
-            'task_id': None,
-            'flag_type': FT,
-            'description': 'project id outside the safe-identifier allowlist',
-            'cited_tasks': [{'project_id': 'Reify Project', 'task_id': '650'}],
-        },
-        {
-            'task_id': '12',
-            'flag_type': FT,
-            'description': 'padded foreign task id',
-            'cited_tasks': [{'project_id': 'reify', 'task_id': ' 650'}],
-        },
-        {
-            'task_id': None,
-            'flag_type': FT,
-            'description': 'padded foreign project id',
-            'cited_tasks': [{'project_id': ' reify ', 'task_id': '650'}],
-        },
+        pytest.param(
+            _citing({'project_id': 'Reify Project', 'task_id': '650'}),
+            '650',
+            id='invalid-project',
+        ),
+        pytest.param(
+            _citing({'project_id': 'reify', 'task_id': ' 650'}, task_id='12'),
+            '12,reify:650',
+            id='padded-task-id',
+        ),
+        pytest.param(
+            _citing({'project_id': ' reify ', 'task_id': '650'}),
+            'reify:650',
+            id='padded-project',
+        ),
+        pytest.param(
+            _citing({'project_id': 42, 'task_id': '650'}),
+            '650',
+            id='non-str-project',
+        ),
+        pytest.param(
+            _citing({'project_id': '  ', 'task_id': '650'}),
+            '650',
+            id='blank-project',
+        ),
     ],
-    ids=['invalid-project', 'padded-task-id', 'padded-project'],
 )
-async def test_malformed_foreign_citation_is_still_deduplicated(memory_service, flag):
+async def test_malformed_foreign_citation_is_still_deduplicated(
+    memory_service, flag, expected_key
+):
     """Qualification must never turn a key the bare form would have deduplicated
     into a key the ledger refuses, because that re-flags every cycle."""
     (first,) = await dedup_flags(memory_service, RUNNING, 'r1', [flag])
-    sig = compute_marker_signature(flag, project_id=RUNNING)
-    assert sig is not None
 
+    assert compute_marker_signature(flag, project_id=RUNNING) == (expected_key, FT)
     assert 'persisted_from_run' not in first
-    assert await memory_service.recon_ledger.get_by_identity(RUNNING, MARKER, *sig, '') is not None
+    assert await memory_service.recon_ledger.get_by_identity(
+        RUNNING, MARKER, expected_key, FT, ''
+    ) is not None
 
     (second,) = await dedup_flags(memory_service, RUNNING, 'r2', [flag])
 
