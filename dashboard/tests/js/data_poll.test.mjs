@@ -905,16 +905,18 @@ const EXPECTED_MAX_POLL_DUTY_CYCLE = 0.5;
 const EXPECTED_BACKOFF_MAX_MS = 60000;
 
 // A virtual event loop: every sleep and every response resolves at a virtual
-// instant, and each endpoint answers after its configured service time. The
+// instant, and each endpoint answers after its configured service time; a path
+// in `failingPaths` rejects its fetch after that time instead. The
 // no-op timer pair keeps refreshOne's 30s deadline from arming a real timer,
 // so no deadline ever fires here: a test that needs one to fire belongs in
 // data_attempt_deadline.test.mjs, on its makeVirtualEndpoint.
-function makeVirtualServer(serviceMsByPath) {
+function makeVirtualServer(serviceMsByPath, { failingPaths = [] } = {}) {
   let clock = 0;
   const timers = [];
   const calls = new Map();
   const urls = [];
   const serviceMs = { ...serviceMsByPath };
+  const failing = new Set(failingPaths);
 
   const after = ms => new Promise(resolve => { timers.push({ at: clock + ms, fire: resolve }); });
 
@@ -922,7 +924,10 @@ function makeVirtualServer(serviceMsByPath) {
     const path = pollKey(url);
     calls.set(path, (calls.get(path) || 0) + 1);
     urls.push(url);
-    return after(serviceMs[path] ?? 0).then(() => ({ ok: true, json: async () => ({}) }));
+    return after(serviceMs[path] ?? 0).then(() => {
+      if (failing.has(path)) throw new Error(`virtual server: ${path} is down`);
+      return { ok: true, json: async () => ({}) };
+    });
   }
 
   async function advanceTo(target) {
@@ -1165,47 +1170,27 @@ test('chip change in flight: the pacing hold the superseded answer arms does not
 });
 
 test('chip change in flight: the failure backoff the superseded answer arms is waived once for the chosen window, without escalating', async () => {
-  let t = 0;
-  const urls = [];
-  let failHeld;
-  const fetchImpl = url => {
-    urls.push(url);
-    if (pollKey(url) !== COSTS_PATH) return Promise.resolve({ ok: true, json: async () => ({}) });
-    if (failHeld === undefined) return new Promise((_, reject) => { failHeld = reject; });
-    return Promise.reject(new Error('costs still down'));
-  };
-  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
-  const deps = {
-    fetchImpl,
-    now: () => t,
-    random: () => 0,
-    sleep: () => Promise.resolve(),
-    setTimeoutImpl: () => 0,
-    clearTimeoutImpl: () => {},
-  };
-  const opts = { state: api.createPollState(), deps, jitterMaxMs: 0 };
-  const costsUrls = () => urls.filter(u => pollKey(u) === COSTS_PATH);
+  const server = makeVirtualServer({ [COSTS_PATH]: 1000 }, { failingPaths: [COSTS_PATH] });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+  const costsUrls = () => server.urls.filter(u => pollKey(u) === COSTS_PATH);
   const costsFailures = () => win.DF_DATA.__stale[COSTS_PATH].failures;
 
   await quietly(async () => {
-    api.pollTick(opts);
+    await pollAt(api, server, opts, 0);
+    const chip = api.refreshDFData('7d', opts);
     await drain();
-    await api.refreshDFData('7d', opts);
-
-    t = 1000;
-    failHeld(new Error('costs went down mid-flight'));
-    await drain();
+    await server.advanceTo(1000);
+    await chip;
     assert.equal(costsFailures(), 1, 'the superseded answer still counts as a failure');
 
-    t = 3000;
-    api.pollTick(opts);
-    await drain();
+    await pollAt(api, server, opts, 3000);
     assert.deepEqual(costsUrls(), [`${COSTS_PATH}?window=24h`, `${COSTS_PATH}?window=7d`]);
+    await server.advanceTo(4000);
     assert.equal(costsFailures(), 1, 'a deferred chip attempt that fails must not escalate the timer path\'s backoff');
 
-    t = 6000;
-    api.pollTick(opts);
-    await drain();
+    await pollAt(api, server, opts, 6000);
+    await server.advanceTo(7000);
     assert.equal(costsFailures(), 2, 'the deferred force is spent: the next ordinary attempt\'s failure escalates again');
   });
 });
