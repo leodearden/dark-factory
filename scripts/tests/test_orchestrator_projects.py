@@ -217,4 +217,6 @@ class TestArguments:
         assert scan == scan_units(units_dir)
 
     def test_the_default_units_dir_is_the_user_systemd_dir(self) -> None:
-        assert orchestrator_projects.DEFAULT_UNITS_DIR == Path.home() / '.config' / 'systemd' / 'user'
+        expected = Path.home() / '.config' / 'systemd' / 'user'
+
+        assert expected == orchestrator_projects.DEFAULT_UNITS_DIR
