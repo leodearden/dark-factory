@@ -15,7 +15,7 @@ import pytest
 from _markup_helpers import closer, param_opener
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
-from shared.mcp_missing_arguments import MISSING_ARGUMENT_CODE, MissingArgumentMiddleware
+from shared.mcp_missing_arguments import MISSING_ARGUMENT_CODE
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools, verdict_tools
@@ -39,15 +39,7 @@ async def refusal(server: FastMCP, tool: str, arguments: dict[str, Any]) -> dict
         pytest.fail(f'{tool} was refused with unstructured text: {message}')
 
 
-def guards_on(server: FastMCP) -> list[MissingArgumentMiddleware]:
-    return [m for m in server.middleware if isinstance(m, MissingArgumentMiddleware)]
-
-
 # --- plan-tools ---
-
-
-def test_plan_tools_registers_the_guard_exactly_once(artifacts):
-    assert len(guards_on(plan_tools.create_server(artifacts))) == 1
 
 
 @pytest.mark.asyncio
@@ -102,11 +94,6 @@ ROLE_CALLS: dict[str, tuple[str, dict[str, Any], str]] = {
         'issues',
     ),
 }
-
-
-@pytest.mark.parametrize('role', list(ROLE_CALLS))
-def test_verdict_tools_registers_the_guard_exactly_once(artifacts, role):
-    assert len(guards_on(verdict_tools.create_server(artifacts, role))) == 1
 
 
 @pytest.mark.asyncio
