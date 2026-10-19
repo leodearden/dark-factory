@@ -11400,46 +11400,6 @@ class Harness:
             len(cancellable_redo_ids), cancellable_redo_ids,
         )
 
-    async def _trailing_24h_fetch_one(
-        self,
-        sql: str,
-        leading_params: tuple = (),
-        *,
-        label: str,
-    ) -> tuple | None:
-        """Execute an arbitrary trailing-24h aggregate query and return the first row.
-
-        ``sql`` must be a full SELECT ending with ``... completed_at >= ?`` (the
-        cutoff is appended internally as the LAST parameter).  ``leading_params``
-        are passed in front of the cutoff in the same order.
-
-        Fail-open: returns None when ``cost_store is None`` or when any
-        exception is raised by ``_require_conn()`` / cursor execute / fetchone.
-        Callers MUST treat None as "skip / assume zero" — dispatch must
-        never be blocked by a transient cost-DB error.  The ``label`` is used
-        only in the warning log.
-        """
-        if not sql.rstrip().endswith('completed_at >= ?'):
-            raise ValueError(
-                '_trailing_24h_fetch_one: sql must end with "completed_at >= ?" '
-                f'(got {sql[:80]!r})'
-            )
-        if self.cost_store is None:
-            return None
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        try:
-            conn = self.cost_store._require_conn()  # type: ignore[attr-defined]
-            cur = await conn.execute(sql, (*leading_params, cutoff))
-            row = await cur.fetchone()
-            await cur.close()
-            return tuple(row) if row is not None else None
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
-            logger.warning(
-                '%s: trailing-24h cost query failed (%s) — fail-open',
-                label, exc,
-            )
-            return None
-
     async def _auto_eval_budget_used_24h(self) -> float:
         """Sum cost_usd from invocations table for known auto-eval redo
         task_ids in the trailing 24h.
@@ -11448,16 +11408,23 @@ class Harness:
         because auto-eval is rollout instrumentation that will be sunset
         once metrics stabilise.
         """
-        if not self._auto_eval_redo_task_ids:
+        if not self._auto_eval_redo_task_ids or self.cost_store is None:
             return 0.0
-        placeholders = ','.join('?' for _ in self._auto_eval_redo_task_ids)
-        row = await self._trailing_24h_fetch_one(
-            f'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-            f'WHERE task_id IN ({placeholders}) AND completed_at >= ?',
-            tuple(self._auto_eval_redo_task_ids),
-            label='auto_eval_budget_used_24h',
-        )
-        return float(row[0]) if row and row[0] is not None else 0.0
+        since = datetime.now(UTC) - timedelta(hours=24)
+        project_id = self.config.fused_memory.project_id
+        total = 0.0
+        try:
+            for task_id in sorted(self._auto_eval_redo_task_ids):
+                total += await self.cost_store.task_invocation_cost(
+                    project_id, task_id, since=since,
+                )
+        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+            logger.warning(
+                '_auto_eval_budget_used_24h: trailing-24h cost query failed (%s) — fail-open',
+                exc,
+            )
+            return 0.0
+        return total
 
     async def _enforce_cost_ceilings(self) -> None:
         """Check daily cost ceilings and pause the scheduler on breach.
