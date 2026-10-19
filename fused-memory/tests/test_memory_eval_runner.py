@@ -23,6 +23,7 @@ from shared.memory_eval_limits import LimitsConfig, limits_artifact_path, load_l
 from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, load_metric_series
 from shared.memory_eval_verdicts import (
     RunnerFailureRecord,
+    RunnerPhase,
     StormEscape,
     VerdictsArtifact,
     build_verdicts_artifact,
@@ -393,7 +394,15 @@ def _by_fingerprint(queue: EscalationQueue) -> dict:
     return {e.dedupe_fingerprint: e for e in _pending(queue)}
 
 
-def _failure(scope: str, phase: str = 'produce', exit_code: int | None = 3) -> RunnerFailureRecord:
+def _stored(queue: EscalationQueue, esc_id: str) -> Escalation:
+    esc = queue.get(esc_id)
+    assert esc is not None, esc_id
+    return esc
+
+
+def _failure(
+    scope: str, phase: RunnerPhase = 'produce', exit_code: int | None = 3,
+) -> RunnerFailureRecord:
     return RunnerFailureRecord(
         scope=scope, phase=phase, error_type='ProducerExit', message='exited 3', exit_code=exit_code,
     )
@@ -479,7 +488,7 @@ class TestFingerprintDedup:
         queue.resolve(resolved.id, 'fixed upstream')
         _, rerun = _file(queue, run, root)
         (refiled,) = rerun.filed
-        assert queue.get(refiled).dedupe_fingerprint == resolved.dedupe_fingerprint
+        assert _stored(queue, refiled).dedupe_fingerprint == resolved.dedupe_fingerprint
 
 
 class TestStormEscape:
@@ -544,7 +553,7 @@ class TestTheRunnerNeverResolves:
         run = _regression_run(root)
         _, first = _file(queue, run, root)
         _file(queue, run, root, failures=[_failure('e4-staleness-sweep')])
-        assert {queue.get(esc_id).status for esc_id in first.filed} == {'pending'}
+        assert {_stored(queue, esc_id).status for esc_id in first.filed} == {'pending'}
 
 
 def _config(**changes):

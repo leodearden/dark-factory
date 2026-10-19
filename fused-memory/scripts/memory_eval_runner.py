@@ -22,9 +22,12 @@ failed preflight.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import traceback
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +37,7 @@ from escalation.categories import EscalationCategory
 from escalation.models import Escalation, EvidenceEntry
 from escalation.queue import EscalationQueue
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from shared import safe_io
 from shared.memory_eval_limits import (
     Alarm,
     EvaluationResult,
@@ -50,12 +54,17 @@ from shared.memory_eval_metrics import (
     load_series_window,
     metrics_artifact_path,
     report_artifact_path,
+    run_stamp,
+    validate_stamp,
 )
 from shared.memory_eval_verdicts import (
     RUNNER_FAILURE_FINGERPRINT,
     RunnerFailureRecord,
     StormEscape,
     VerdictEntry,
+    VerdictsArtifact,
+    build_verdicts_artifact,
+    serialize_verdicts_artifact,
     verdict_entries,
 )
 
@@ -66,6 +75,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'config' / 'memory-eval.yaml'
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / 'fused-memory' / 'data' / 'memory-evals'
+VERDICTS_CURRENT_NAME = 'verdicts-current.json'
 _STDERR_TAIL_CHARS = 2000
 
 EXIT_OK = 0
@@ -509,20 +519,196 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parse_args(argv)
+def verdicts_path(root: Path, stamp: str) -> Path:
+    return root / f'verdicts-{validate_stamp(stamp, what="verdicts stamp")}.json'
+
+
+def run_report_path(root: Path, stamp: str) -> Path:
+    return root / f'run-report-{validate_stamp(stamp, what="run report stamp")}.txt'
+
+
+def _write_text(path: Path, text: str) -> None:
+    safe_io.atomic_write_text(path, text, encoding='utf-8', mode=0o600)
+
+
+def write_verdicts(artifact: VerdictsArtifact, root: Path) -> tuple[Path, Path]:
+    """Write identical bytes to the stamped file, then to verdicts-current.json."""
+    root.mkdir(parents=True, exist_ok=True)
+    text = serialize_verdicts_artifact(artifact)
+    stamped = verdicts_path(root, artifact.run_stamp)
+    current = root / VERDICTS_CURRENT_NAME
+    _write_text(stamped, text)
+    _write_text(current, text)
+    return stamped, current
+
+
+def _eval_section(run: EvalRun) -> list[str]:
+    counts = Counter(entry.verdict for entry in run.entries)
+    lines = [f'{run.eval_id}: ' + ', '.join(f'{v}={counts[v]}' for v in sorted(counts))]
+    lines.extend(
+        f'  ALARM {_subject(e)} value {_num(e.value)} ({e.limit_ref})'
+        for e in run.entries if e.verdict == 'alarm'
+    )
+    return lines
+
+
+def _initial_state_section(evals: Sequence[EvalRun]) -> list[str]:
+    snapshotted = [
+        (run, entry) for run in evals for entry in run.entries
+        if entry.metric_status == 'baseline_snapshot'
+    ]
+    if not snapshotted:
+        return []
+    known_bad = [
+        f'  {run.eval_id} {_subject(entry)}'
+        for run, entry in snapshotted if entry.verdict == 'grandfathered'
+    ]
+    return ['', 'Initial-state baseline (known-bad, not alarmed):', *(known_bad or ['  none'])]
+
+
+def render_run_report(artifact: VerdictsArtifact, evals: Sequence[EvalRun]) -> str:
+    storm = artifact.storm_escape
+    lines = [f'memory-eval run {artifact.run_stamp}', '']
+    for run in evals:
+        lines.extend(_eval_section(run))
+    lines.append(
+        f'storm escape: {"TRIGGERED" if storm.triggered else "not triggered"} '
+        f'({storm.alarm_count} alarm(s), K={storm.alarm_limit})'
+    )
+    if artifact.runner_failures:
+        lines.append('runner failures:')
+        for failure in artifact.runner_failures:
+            lines.append(f'  {_failure_observation(failure)}')
+            lines.extend(f'    {line}' for line in failure.message.splitlines())
+    lines.extend(_initial_state_section(evals))
+    return '\n'.join(lines) + '\n'
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    artifact: VerdictsArtifact
+    filing: FilingOutcome
+    verdicts_path: Path
+    run_report_path: Path
+
+
+def _produce_all(
+    config: RunnerConfig, producers: Sequence[Producer], root: Path, stamp: str,
+) -> list[RunnerFailureRecord]:
+    failures: list[RunnerFailureRecord] = []
+    for producer in producers:
+        failure = run_producer(
+            producer, root=root, stamp=stamp, project_id=config.project_id,
+            timeout=config.producer_timeout_secs,
+        )
+        if failure is not None:
+            failures.append(failure)
+    return failures
+
+
+def run_program(
+    config: RunnerConfig,
+    producers: Sequence[Producer],
+    root: Path,
+    queue: EscalationQueue,
+    stamp: str,
+) -> RunOutcome:
+    """produce -> evaluate -> write verdicts and run report -> file escalations."""
+    produce_failures = _produce_all(config, producers, root, stamp)
+    failed = {failure.scope for failure in produce_failures}
+    produced = [p.eval_id for p in producers if p.eval_id not in failed]
+    runs, evaluate_failures = evaluate_evals(root, produced, stamp, config.limits_config())
+    artifact = build_verdicts_artifact(
+        [(run.series, run.result) for run in runs],
+        run_stamp=stamp,
+        alarm_limit=config.storm_alarm_limit,
+        runner_failures=[*produce_failures, *evaluate_failures],
+    )
+    stamped, _ = write_verdicts(artifact, root)
+    report = run_report_path(root, stamp)
+    _write_text(report, render_run_report(artifact, runs))
+    context = FilingContext(
+        run_stamp=stamp, project_id=config.project_id,
+        run_report_path=report, verdicts_path=stamped,
+    )
+    filing = file_run_escalations(
+        queue, runs, artifact.storm_escape, artifact.runner_failures, context,
+    )
+    return RunOutcome(artifact=artifact, filing=filing, verdicts_path=stamped, run_report_path=report)
+
+
+def _file_runner_crash(
+    queue: EscalationQueue, exc: Exception, config: RunnerConfig, root: Path, stamp: str,
+) -> FilingOutcome:
+    """Best effort: one phase='runner' failure escalation. A filing error is logged, never raised."""
+    failure = RunnerFailureRecord(
+        scope='program', phase='runner', error_type=type(exc).__name__, message=str(exc),
+    )
+    context = FilingContext(
+        run_stamp=stamp, project_id=config.project_id,
+        run_report_path=run_report_path(root, stamp), verdicts_path=verdicts_path(root, stamp),
+    )
+    filing = failure_filing([failure], context)
     try:
-        load_runner_config(args.config)
+        esc_id = file_once(queue, filing, project_id=config.project_id)
+    except Exception:
+        print('memory_eval_runner: could not file the runner-failure escalation:', file=sys.stderr)
+        traceback.print_exc()
+        return FilingOutcome(filed=(), suppressed=())
+    if esc_id is None:
+        return FilingOutcome(filed=(), suppressed=(filing.fingerprint,))
+    return FilingOutcome(filed=(esc_id,), suppressed=())
+
+
+def _print_summary(stamp: str, filing: FilingOutcome, *, failures: int, alarms: int) -> None:
+    """One JSON line on stdout, for the journal."""
+    print(json.dumps({
+        'run_stamp': stamp, 'filed': len(filing.filed), 'suppressed': len(filing.suppressed),
+        'failures': failures, 'alarms': alarms,
+    }, sort_keys=True))
+
+
+class _PreflightRefused(Exception):
+    """Carries the message main() prints before exiting EXIT_PREFLIGHT."""
+
+
+def _preflight(args: argparse.Namespace) -> tuple[RunnerConfig, EscalationQueue, str]:
+    try:
+        config = load_runner_config(args.config)
     except RunnerConfigError as exc:
-        print(f'memory_eval_runner: config refused: {exc}', file=sys.stderr)
-        return EXIT_PREFLIGHT
+        raise _PreflightRefused(f'config refused: {exc}') from exc
     queue_dir = args.queue_dir if args.queue_dir is not None else _default_queue_dir()
     try:
         assert_queue_dir_populated(queue_dir, operation='memory_eval_runner')
     except TargetStoreMissing as exc:
-        print(f'memory_eval_runner: recon escalation queue {queue_dir}: {exc}', file=sys.stderr)
+        raise _PreflightRefused(f'recon escalation queue {queue_dir}: {exc}') from exc
+    try:
+        stamp = run_stamp()
+    except ValueError as exc:
+        raise _PreflightRefused(f'run stamp refused: {exc}') from exc
+    return config, EscalationQueue(queue_dir), stamp
+
+
+def main(argv: Sequence[str] | None = None, *, producers: Sequence[Producer] = DEFAULT_PRODUCERS) -> int:
+    args = _parse_args(argv)
+    try:
+        config, queue, stamp = _preflight(args)
+    except _PreflightRefused as exc:
+        print(f'memory_eval_runner: {exc}', file=sys.stderr)
         return EXIT_PREFLIGHT
-    return EXIT_OK
+    try:
+        outcome = run_program(config, producers, args.artifact_root, queue, stamp)
+    except Exception as exc:
+        traceback.print_exc()
+        filing = _file_runner_crash(queue, exc, config, args.artifact_root, stamp)
+        _print_summary(stamp, filing, failures=1, alarms=0)
+        return EXIT_RUN_FAILED
+    artifact = outcome.artifact
+    _print_summary(
+        stamp, outcome.filing,
+        failures=len(artifact.runner_failures), alarms=artifact.storm_escape.alarm_count,
+    )
+    return EXIT_RUN_FAILED if artifact.runner_failures else EXIT_OK
 
 
 if __name__ == '__main__':
