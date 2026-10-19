@@ -315,6 +315,22 @@ class TestStrata:
         low, high = harm['population_delta_interval95']
         assert low <= high
 
+    def test_a_domain_interval_varies_with_how_many_sampled_items_fall_in_the_domain(self) -> None:
+        # M3's domain is the CONFLICT writes. Every restated one is hidden and no
+        # contested one is, so only the restated sample's share of CONFLICT
+        # writes can move the rate; the interval must not collapse to a point.
+        conflict = {'home': 'YES', 'loss': 'NO', 'conflict': 'YES', 'scope': 'CENTRAL'}
+        items = [_item(f'R{n}', 'restated', f'P{n}') for n in range(1, 5)]
+        items += [_item(f'C{n}', 'contested', f'Q{n}') for n in range(1, 5)]
+        verdicts = [_vote('R1', 'P1', **conflict), _vote('R2', 'P2', **conflict),
+                    _vote('R3', 'P3', **_FLAT), _vote('R4', 'P4', **_FLAT)]
+        verdicts += [_vote(f'C{n}', f'Q{n}', **conflict) for n in range(1, 5)]
+        m3 = _mod().score_reader(items, verdicts, strata={'r': 40, 'c': 4})['metrics']['m3']
+        assert (m3['n'], m3['hits']) == (6, 2)
+        assert m3['population_rate'] == round(20 / 24, 4)
+        low, high = m3['population_interval95']
+        assert low < m3['population_rate'] < high
+
     def test_the_strata_are_echoed(self) -> None:
         assert _weighted_report()['population']['strata'] == _STRATA
 

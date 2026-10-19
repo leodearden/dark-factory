@@ -460,23 +460,28 @@ def _proportion(
     """One metric block: *hit* among the decided *member* items (narrowed by *within*).
 
     ``unclear`` counts the member items whose derivation was UNCLEAR; they are
-    outside n. The population figures are None without stratum weights.
+    outside n. The population figures are None without stratum weights. They
+    are a domain estimate: every scored item is a unit of its stratum, counting
+    in the denominator only when it is in n, so the bootstrap keeps each
+    stratum's sample size and lets the number of items in n vary.
     """
     members = [s for s in scored if member(s)]
-    decided = [
-        (s, s.decided) for s in members
-        if s.decided is not None and (within is None or within(s, s.decided))
-    ]
-    hits = [hit(s, d) for s, d in decided]
+    hit_by_index = {
+        index: hit(s, s.decided) for index, s in enumerate(scored)
+        if member(s) and s.decided is not None and (within is None or within(s, s.decided))
+    }
+    n, hits = len(hit_by_index), sum(hit_by_index.values())
     units = [
-        _stats.StratumUnit(s.item.stratum, float(is_hit), 1.0)
-        for (s, _), is_hit in zip(decided, hits, strict=True)
+        _stats.StratumUnit(
+            s.item.stratum, float(hit_by_index.get(index, False)), float(index in hit_by_index),
+        )
+        for index, s in enumerate(scored)
     ]
     return {
-        'n': len(decided),
-        'hits': sum(hits),
-        'rate': _rate(sum(hits), len(decided)),
-        'wilson95': _stats.wilson95(sum(hits), len(decided)),
+        'n': n,
+        'hits': hits,
+        'rate': _rate(hits, n),
+        'wilson95': _stats.wilson95(hits, n),
         'unclear': sum(s.decided is None for s in members),
         'population_rate': None if weights is None else _stats.stratified_ratio(units, weights),
         'population_interval95': None if weights is None else _bootstrap(units, weights),
