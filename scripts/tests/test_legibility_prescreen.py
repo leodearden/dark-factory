@@ -7,7 +7,7 @@ import copy
 from typing import Any
 
 import pytest
-from legibility import codebook, prescreen
+from legibility import census_findings, codebook, prescreen, verdict
 
 _RUN = "census-dark_factory-20261019"
 _NO_SLUGS: tuple[str, ...] = ()
@@ -305,3 +305,130 @@ def test_only_the_novel_payload_mints_a_pending_candidate():
         ("Brand new shape", "pending")
     ]
     assert "attached_by" not in minted[0]["sightings"][0]
+
+
+# ---------------------------------------------------------------------------
+# The key rule: a verdict at a keyed entry's (area, anchor) attaches to it
+# ---------------------------------------------------------------------------
+
+_ANCHOR = "orchestrator/x.py::f"
+_STANDING = census_findings.FindingIdentity.mint("orchestrator", _ANCHOR, ("h13", verdict.KIND_TAG))
+_VERIFIER_TAGS = ("h11", verdict.KIND_TAG)
+
+
+def _found(tags: tuple[str, ...] = _VERIFIER_TAGS, anchor: str = _ANCHOR) -> verdict.Verdict:
+    return verdict.Verdict(
+        verified=True,
+        reason="the verifier read orchestrator/x.py",
+        anchor=anchor,
+        tags=tags,
+        severity="medium",
+        severity_reason="r",
+        route=verdict.Route.MECHANICAL,
+        remediation=None,
+    )
+
+
+def _minted(area: str = "orchestrator", anchor: str = _ANCHOR, tags=_VERIFIER_TAGS):
+    return census_findings.FindingIdentity.mint(area, anchor, tags)
+
+
+def _keyed_codebook(*candidate_sessions: str) -> dict:
+    entry = {
+        **_entry("entry-cand-20261001-1", "A title", "sess-a"),
+        **_STANDING.to_fields(),
+        "first_seen_run": "census-dark_factory-20261001",
+        "last_seen_runs": ["census-dark_factory-20261001"],
+    }
+    promoted = _candidate(
+        "cand-20261001-1", "A title", "sess-a", "promoted",
+        promoted_to="entry-cand-20261001-1", **_STANDING.to_fields(),
+    )
+    pending = _candidate("cand-20261019-1", "B title", "sess-b", "pending")
+    pending["sightings"] = [_sighting(session) for session in candidate_sessions or ("sess-b",)]
+    return {
+        "version": 2,
+        "entries": [_entry("entry-unkeyed", "Unkeyed", "sess-u"), entry],
+        "candidates": [promoted, pending],
+    }
+
+
+def test_keyed_entry_matches_area_and_anchor_whatever_the_primary_tag():
+    cb = _keyed_codebook()
+
+    entry = prescreen.keyed_entry(cb, _minted())
+
+    assert entry is not None
+    assert entry["id"] == "entry-cand-20261001-1"
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [_minted(anchor="orchestrator/x.py::g"), _minted(area="shared")],
+    ids=["other-anchor", "other-area"],
+)
+def test_keyed_entry_finds_nothing_at_another_location(identity):
+    assert prescreen.keyed_entry(_keyed_codebook(), identity) is None
+
+
+def test_keyed_entry_never_matches_an_unkeyed_entry():
+    cb = _keyed_codebook()
+    cb["entries"] = cb["entries"][:1]
+
+    assert prescreen.keyed_entry(cb, _minted()) is None
+
+
+def _attach(cb: dict, found: verdict.Verdict | None = None):
+    entry = prescreen.keyed_entry(cb, _minted())
+    assert entry is not None
+    return prescreen.attach_by_key(cb, "cand-20261019-1", entry, found or _found(), run_id=_RUN)
+
+
+def _by_id(cb: dict, record_id: str) -> dict:
+    return next(record for record in (*cb["entries"], *cb["candidates"]) if record["id"] == record_id)
+
+
+def test_a_key_attach_promotes_the_candidate_onto_the_standing_entry():
+    cb = _keyed_codebook()
+    before = copy.deepcopy(cb)
+
+    attached, _ = _attach(cb)
+
+    assert cb == before
+    candidate = _by_id(attached, "cand-20261019-1")
+    assert candidate["disposition"] == "promoted"
+    assert candidate["promoted_to"] == "entry-cand-20261001-1"
+    assert candidate["attached_by"] == {"method": "key", "run_id": _RUN}
+    assert census_findings.FindingIdentity.from_record(candidate) == _STANDING
+    entry = _by_id(attached, "entry-cand-20261001-1")
+    assert census_findings.FindingIdentity.from_record(entry) == _STANDING
+    assert len(attached["entries"]) == len(cb["entries"])
+    assert codebook.validate(attached) == []
+
+
+def test_a_key_attach_lands_the_candidates_sightings_on_the_entry_with_the_verifier_tags():
+    attached, _ = _attach(_keyed_codebook("sess-a", "sess-b"))
+
+    sightings = _by_id(attached, "entry-cand-20261001-1")["sightings"]
+    assert [sighting["session"] for sighting in sightings] == ["sess-a", "sess-b"]
+    assert "attached_by" not in sightings[0]
+    assert sightings[1]["attached_by"] == {"method": "key", "run_id": _RUN}
+    assert sightings[1]["verifier_tags"] == list(_VERIFIER_TAGS)
+    assert codebook.validate(attached) == []
+
+
+def test_a_key_attach_names_what_it_joined_and_the_tag_disagreement():
+    _, key_attach = _attach(_keyed_codebook())
+
+    assert key_attach.title == "B title"
+    assert key_attach.candidate_id == "cand-20261019-1"
+    assert key_attach.entry_id == "entry-cand-20261001-1"
+    assert key_attach.identity == _STANDING
+    assert key_attach.verifier_tags == _VERIFIER_TAGS
+    assert key_attach.tag_disagreement == ("h13", "h11")
+
+
+def test_a_key_attach_with_the_same_primary_tag_reports_no_disagreement():
+    _, key_attach = _attach(_keyed_codebook(), _found(tags=("h13", verdict.KIND_TAG)))
+
+    assert key_attach.tag_disagreement is None
