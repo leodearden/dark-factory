@@ -25,10 +25,12 @@ where it lands.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+import json
+from collections.abc import Iterator, Sequence
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from shared.memory_eval_limits import (
     EvaluationResult,
@@ -37,16 +39,32 @@ from shared.memory_eval_limits import (
     RuleKind,
     VerdictStatus,
 )
-from shared.memory_eval_metrics import Metric, MetricSeries, validate_stamp
+from shared.memory_eval_metrics import Metric, MetricSeries, canonical_json_text, validate_stamp
 
 __all__ = [
+    'ARTIFACT_SCHEMA_VERSION',
+    'GENERATOR',
+    'RUNNER_FAILURE_FINGERPRINT',
+    'RunnerFailureRecord',
+    'RunnerPhase',
+    'StormEscape',
     'Verdict',
     'VerdictEntry',
+    'VerdictsArtifact',
+    'VerdictsSchemaError',
+    'build_verdicts_artifact',
+    'load_verdicts_artifact',
     'metric_fingerprint',
+    'serialize_verdicts_artifact',
+    'storm_fingerprint',
     'verdict_entries',
 ]
 
+ARTIFACT_SCHEMA_VERSION = 1
+GENERATOR = 'shared.memory_eval_verdicts'
+
 Verdict = Literal['alarm', 'no_alarm', 'insufficient_data', 'grandfathered']
+RunnerPhase = Literal['produce', 'evaluate', 'runner']
 
 _FINGERPRINT_NAMESPACE = 'memory-eval'
 _UNIT_SEPARATOR = '\x1f'
@@ -76,6 +94,15 @@ def metric_fingerprint(
     if window is not None and item is None:
         return _fingerprint(eval_id, metric_id, 'window', window)
     raise ValueError('metric_fingerprint needs exactly one of item= or window=')
+
+
+def storm_fingerprint(run_stamp: str) -> str:
+    """The aggregate escalation's fingerprint: scoped to ONE run, so each storm files once."""
+    return _fingerprint('storm', validate_stamp(run_stamp, what='run_stamp'))
+
+
+RUNNER_FAILURE_FINGERPRINT = _fingerprint('runner-failure')
+"""Program-scoped and stamp-free: a multi-day outage keeps ONE pending escalation."""
 
 
 def _window_label(config: LimitsConfig) -> str:
@@ -211,3 +238,134 @@ def verdict_entries(series: MetricSeries, result: EvaluationResult) -> tuple[Ver
         else:
             entries.append(_whole_metric_entry(judged[metric.metric_id], result))
     return tuple(entries)
+
+
+class VerdictsSchemaError(ValueError):
+    """A verdicts artifact that does not match the schema; callers need no pydantic import."""
+
+
+class StormEscape(BaseModel):
+    """Whether this run's alarms exceed the storm limit K, collapsing them to one escalation."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    triggered: bool
+    alarm_count: int = Field(ge=0)
+    alarm_limit: int = Field(ge=1)
+    aggregate_fingerprint: str | None = None
+
+    @model_validator(mode='after')
+    def _check_consistent(self) -> StormEscape:
+        if self.triggered != (self.alarm_count > self.alarm_limit):
+            raise ValueError(
+                f'storm_escape: triggered={self.triggered} disagrees with '
+                f'alarm_count={self.alarm_count} > alarm_limit={self.alarm_limit}.'
+            )
+        if self.triggered != (self.aggregate_fingerprint is not None):
+            raise ValueError('storm_escape: aggregate_fingerprint is present iff triggered.')
+        return self
+
+
+class RunnerFailureRecord(BaseModel):
+    """One thing the runner could not do this run; ``scope`` is an eval_id or ``'program'``."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    scope: str = Field(min_length=1)
+    phase: RunnerPhase
+    error_type: str = Field(min_length=1)
+    message: str
+    exit_code: int | None = None
+
+
+class VerdictsArtifact(BaseModel):
+    """The whole run: every eval's entries, the storm block, and what failed to run."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    schema_version: Literal[1]
+    generator: str = Field(min_length=1)
+    run_stamp: str
+    entries: list[VerdictEntry] = Field(default_factory=list)
+    storm_escape: StormEscape
+    runner_failures: list[RunnerFailureRecord] = Field(default_factory=list)
+    runner_failure_fingerprint: str | None = None
+
+    @field_validator('run_stamp')
+    @classmethod
+    def _check_stamp_shape(cls, value: str) -> str:
+        return validate_stamp(value, what='run_stamp')
+
+    @model_validator(mode='after')
+    def _check_entries(self) -> VerdictsArtifact:
+        foreign = sorted({e.run_stamp for e in self.entries} - {self.run_stamp})
+        if foreign:
+            raise ValueError(f'verdicts {self.run_stamp}: entries from other runs {foreign}.')
+        fingerprints = [entry.fingerprint for entry in self.entries]
+        if len(set(fingerprints)) != len(fingerprints):
+            raise ValueError(f'verdicts {self.run_stamp}: more than one entry per fingerprint.')
+        alarms = sum(1 for entry in self.entries if entry.verdict == 'alarm')
+        if alarms != self.storm_escape.alarm_count:
+            raise ValueError(
+                f'verdicts {self.run_stamp}: storm_escape counts '
+                f'{self.storm_escape.alarm_count} alarm(s), the entries carry {alarms}.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _check_run_fingerprints(self) -> VerdictsArtifact:
+        aggregate = self.storm_escape.aggregate_fingerprint
+        if aggregate is not None and aggregate != storm_fingerprint(self.run_stamp):
+            raise ValueError(f'verdicts {self.run_stamp}: aggregate_fingerprint is not this run\'s.')
+        expected = RUNNER_FAILURE_FINGERPRINT if self.runner_failures else None
+        if self.runner_failure_fingerprint != expected:
+            raise ValueError(
+                f'verdicts {self.run_stamp}: runner_failure_fingerprint must be '
+                f'{expected!r} when {len(self.runner_failures)} failure(s) are recorded.'
+            )
+        return self
+
+
+def build_verdicts_artifact(
+    evaluations: Sequence[tuple[MetricSeries, EvaluationResult]],
+    *,
+    run_stamp: str,
+    alarm_limit: int,
+    runner_failures: Sequence[RunnerFailureRecord] = (),
+) -> VerdictsArtifact:
+    """Assemble one run's artifact; entries concatenate in *evaluations* order."""
+    entries = [entry for series, result in evaluations for entry in verdict_entries(series, result)]
+    alarm_count = sum(1 for entry in entries if entry.verdict == 'alarm')
+    triggered = alarm_count > alarm_limit
+    return VerdictsArtifact(
+        schema_version=ARTIFACT_SCHEMA_VERSION,
+        generator=GENERATOR,
+        run_stamp=run_stamp,
+        entries=entries,
+        storm_escape=StormEscape(
+            triggered=triggered,
+            alarm_count=alarm_count,
+            alarm_limit=alarm_limit,
+            aggregate_fingerprint=storm_fingerprint(run_stamp) if triggered else None,
+        ),
+        runner_failures=list(runner_failures),
+        runner_failure_fingerprint=RUNNER_FAILURE_FINGERPRINT if runner_failures else None,
+    )
+
+
+def serialize_verdicts_artifact(artifact: VerdictsArtifact) -> str:
+    """Canonical text under the null convention stated in ``shared.memory_eval_metrics``.
+
+    Every nullable field here is optional, so ``exclude_none`` alone is the whole
+    convention; the round-trip test is what would catch a required-nullable one.
+    """
+    return canonical_json_text(artifact.model_dump(mode='json', exclude_none=True))
+
+
+def load_verdicts_artifact(path: str | Path) -> VerdictsArtifact:
+    target = Path(path)
+    raw = json.loads(target.read_text(encoding='utf-8'))
+    try:
+        return VerdictsArtifact.model_validate(raw)
+    except ValidationError as exc:
+        raise VerdictsSchemaError(f'{target}: not a valid verdicts artifact: {exc}') from exc
