@@ -1,18 +1,26 @@
-"""Every deferred row's hold, classified with the shared deferral model.
+"""Every deferred row's hold, classified with the shared deferral model; ``--check`` gates on it.
 
 Contract: plans/deferral-flip-condition-prd.md §4 decision 10 ("Census") and §9 ε.
+Run it as ``uv run --project shared python scripts/deferral_census.py``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import argparse
+import sys
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import IntEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import Final, TextIO
 
-from deferral_store import TaskRow
+import deferral_store
+import orchestrator_projects
+from deferral_store import DeferralStore, RecordHit, StoreUnreachable, TaskRow
+from orchestrator_projects import ProjectTarget
 from shared.process_identity import (
     PROC_ROOT,
     Liveness,
@@ -20,9 +28,11 @@ from shared.process_identity import (
     ProcessIdentityUnreadable,
     liveness,
 )
+from shared.project_layout import tasks_db
 from shared.task_deferral import (
     CarriedByDeferral,
     Deferral,
+    DeferralKind,
     HeldBySessionDeferral,
     InvalidRecord,
     NeedsHumanReason,
@@ -39,6 +49,10 @@ INVALID_RECORD: Final = 'invalid record'
 _FAILS_CHECK: Final = frozenset(
     {NeedsHumanReason.MISSING_RECORD, NeedsHumanReason.INVALID_RECORD, NeedsHumanReason.EXPIRY_OVERDUE}
 )
+_HELD_ORDER: Final = (*(kind.value for kind in DeferralKind), NO_RECORD, INVALID_RECORD)
+_LISTED: Final = tuple(reason for reason in NeedsHumanReason if reason not in _FAILS_CHECK)
+_DETAIL_CHARS: Final = 300
+_TOOL: Final = 'deferral_census.py'
 
 
 @dataclass(frozen=True)
@@ -48,6 +62,7 @@ class RowVerdict:
     held: str
     needs_human: NeedsHumanReason | None
     deflake_owner: bool
+    invalid_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +116,7 @@ def _verdict(
         held=_held(record),
         needs_human=needs_human(record, now, carrier_status, holder),
         deflake_owner=_is_deflake_owner(row),
+        invalid_detail=record.detail if isinstance(record, InvalidRecord) else None,
     )
 
 
@@ -126,3 +142,169 @@ def holder_liveness(identity: ProcessIdentity, *, proc_root: Path = PROC_ROOT) -
         return liveness(identity, proc_root=proc_root)
     except ProcessIdentityUnreadable:
         return None
+
+
+class CensusExit(IntEnum):
+    OK = 0
+    VIOLATIONS = 1
+    UNREADABLE = 2
+
+
+@dataclass(frozen=True)
+class ProjectCensus:
+    target: ProjectTarget
+    verdicts: tuple[RowVerdict, ...]
+    strays: tuple[RecordHit, ...]
+    record_count: int
+
+    @property
+    def failing(self) -> tuple[RowVerdict, ...]:
+        return tuple(verdict for verdict in self.verdicts if fails_check(verdict))
+
+    @property
+    def violates(self) -> bool:
+        return bool(self.failing or self.strays)
+
+    @property
+    def no_producer(self) -> bool:
+        """Deferred rows exist and no row anywhere carries a record: nothing has written one yet."""
+        return bool(self.verdicts) and self.record_count == 0
+
+
+@dataclass(frozen=True)
+class UnreadableProject:
+    target: ProjectTarget
+    reason: str
+    unknown: bool = False
+
+
+def census_project(store: DeferralStore, target: ProjectTarget, *, now: datetime) -> ProjectCensus | UnreadableProject:
+    if not deferral_store.known_project(target.root):
+        return UnreadableProject(target, f'no task store at {tasks_db(target.root)}', unknown=True)
+    try:
+        rows = store.deferred_rows(target.root)
+        hits = store.rows_with_record(target.root)
+        found = referents(rows)
+        carrier_statuses = store.statuses(target.root, found.carrier_ids)
+    except StoreUnreachable as exc:
+        return UnreadableProject(target, str(exc))
+    holder_states = {task_id: holder_liveness(holder) for task_id, holder in found.holders.items()}
+    return ProjectCensus(
+        target=target,
+        verdicts=classify_deferred(rows, now=now, carrier_statuses=carrier_statuses, holder_liveness=holder_states),
+        strays=tuple(hit for hit in hits if hit.status is not TaskStatus.DEFERRED),
+        record_count=len(hits),
+    )
+
+
+def _one_line(text: str) -> str:
+    flat = ' '.join(text.split())
+    return flat if len(flat) <= _DETAIL_CHARS else f'{flat[:_DETAIL_CHARS]}…'
+
+
+def _ids(task_ids: Iterable[int]) -> str:
+    return ', '.join(str(task_id) for task_id in sorted(task_ids))
+
+
+def _failing_line(verdict: RowVerdict) -> str:
+    reason = verdict.needs_human.value if verdict.needs_human else ''
+    detail = f' — {_one_line(verdict.invalid_detail)}' if verdict.invalid_detail else ''
+    return f'FAIL #{verdict.task_id} {reason}: {verdict.title}{detail}'
+
+
+def _listed_lines(verdicts: Sequence[RowVerdict]) -> list[str]:
+    lines: list[str] = []
+    for reason in _LISTED:
+        matching = [verdict for verdict in verdicts if verdict.needs_human is reason]
+        if reason is NeedsHumanReason.LEGACY_UNKNOWN:
+            owners = [verdict.task_id for verdict in matching if verdict.deflake_owner]
+            others = [verdict.task_id for verdict in matching if not verdict.deflake_owner]
+            lines += [f'{reason.value}: {_ids(others)}'] if others else []
+            lines += [f'{reason.value} (de-flake owner): {_ids(owners)}'] if owners else []
+        elif matching:
+            lines.append(f'{reason.value}: {_ids(verdict.task_id for verdict in matching)}')
+    return lines
+
+
+def _closing_line(census: ProjectCensus) -> list[str]:
+    if census.no_producer:
+        return [f'no deferral producer has written: {len(census.verdicts)} deferred rows, no record on any row']
+    if census.violates:
+        return []
+    return ['clean: no missing, invalid or overdue record, and no stray record']
+
+
+def _census_lines(census: ProjectCensus) -> list[str]:
+    counts = Counter(verdict.held for verdict in census.verdicts)
+    table = [f'{counts[held]:>7}  {held}' for held in _HELD_ORDER if counts[held]]
+    return [
+        f'deferred rows by hold ({len(census.verdicts)}):',
+        *(table or ['      0  (no deferred rows)']),
+        f'needs human: {sum(verdict.needs_human is not None for verdict in census.verdicts)}',
+        *(_failing_line(verdict) for verdict in census.failing),
+        *(f'FAIL #{hit.task_id} stray record on a {hit.status.value} row: {hit.title}' for hit in census.strays),
+        *_listed_lines(census.verdicts),
+        *_closing_line(census),
+    ]
+
+
+def _body(result: ProjectCensus | UnreadableProject) -> list[str]:
+    if isinstance(result, ProjectCensus):
+        return _census_lines(result)
+    return [f'{"UNKNOWN PROJECT" if result.unknown else "UNREADABLE"}: {result.reason}']
+
+
+def render(results: Iterable[ProjectCensus | UnreadableProject], *, out: TextIO) -> None:
+    for result in results:
+        print(f'{result.target.root} — {result.target.sweep_label}', file=out)
+        for line in _body(result):
+            print(f'  {line}', file=out)
+
+
+def exit_code(results: Sequence[ProjectCensus | UnreadableProject], *, check: bool) -> CensusExit:
+    if any(isinstance(result, UnreadableProject) for result in results):
+        return CensusExit.UNREADABLE
+    if check and any(isinstance(result, ProjectCensus) and result.violates for result in results):
+        return CensusExit.VIOLATIONS
+    return CensusExit.OK
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Classify every deferred task's hold with the shared deferral model, per project.",
+        epilog=(
+            'Exit 0: every project was read (and, with --check, passed). Exit 1: --check found a missing, '
+            'invalid or overdue record, or a record on a row that is not deferred. Exit 2: a project could '
+            'not be read, or there was no project to census.'
+        ),
+    )
+    orchestrator_projects.add_arguments(parser)
+    deferral_store.add_store_argument(parser)
+    parser.add_argument(
+        '--check',
+        action='store_true',
+        help='exit 1 on a missing, invalid or overdue record, or a stray record (default: report only)',
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    targets, scan = orchestrator_projects.targets_from_args(args)
+    for problem in scan.problems:
+        print(f'{_TOOL}: {problem}', file=sys.stderr)
+    if not targets:
+        print(
+            f'{_TOOL}: no project to census: no --project-root, and no unit under {args.units_dir} names one',
+            file=sys.stderr,
+        )
+        return CensusExit.UNREADABLE
+    store = deferral_store.store_from_args(args)
+    now = datetime.now(UTC)
+    results = [census_project(store, target, now=now) for target in targets]
+    render(results, out=sys.stdout)
+    return exit_code(results, check=args.check)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
