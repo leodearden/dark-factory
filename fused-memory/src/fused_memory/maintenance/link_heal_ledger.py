@@ -43,6 +43,8 @@ UNDO_ACTION = 'undo'
 class RunSource(StrEnum):
     CORPUS = 'corpus'
     ADJUDICATOR = 'adjudicator'
+    #: A plan whose heals rest on the deterministic rows alone.
+    DETERMINISTIC = 'deterministic'
     UNDO = 'undo'
 
 
