@@ -453,6 +453,9 @@ _CREATE_FALLTHROUGH_LABELS: dict[str, str] = {
 }
 
 
+_CURATOR_DISABLED = 'disabled'
+
+
 def _create_labels(
     decision: CuratorDecision | None, *, curator_unavailable: str | None,
 ) -> list[str]:
@@ -485,13 +488,14 @@ def _dedupe_skipped_reason(
     """The ``dedupe_skipped`` marker reason for a create no curator verdict judged, else None.
 
     Marked: a fail-open create (``degraded``), a curator that produced no
-    decision, and a combine or drop that fell through to create. Not marked: a
-    healthy create, ``route_deterministic``, or no curator at all.
+    decision or could not be had (construction failed, interceptor closed),
+    and a combine or drop that fell through to create. Not marked: a healthy
+    create, ``route_deterministic``, or a curator disabled by config.
     """
-    if curator_unavailable is not None:
+    if curator_unavailable == _CURATOR_DISABLED:
         return None
     if decision is None or decision.degraded or decision.action in ('combine', 'drop'):
-        return ': '.join(_create_labels(decision, curator_unavailable=None))
+        return ': '.join(_create_labels(decision, curator_unavailable=curator_unavailable))
     return None
 
 
@@ -2094,7 +2098,7 @@ class TaskInterceptor:
         if self._closed:
             return 'closed'
         if self._config is None or not self._config.curator.enabled:
-            return 'disabled'
+            return _CURATOR_DISABLED
         if self._curator_construction_error is not None:
             return f'construction-failed: {self._curator_construction_error}'
         return 'unknown'

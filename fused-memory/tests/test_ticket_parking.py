@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -654,4 +655,37 @@ class TestDedupeSkippedMarker:
         assert metadata == {
             **_CALLER_METADATA,
             DEDUPE_SKIPPED_KEY: {'reason': 'llm-failed: boom', 'at': metadata[DEDUPE_SKIPPED_KEY]['at']},
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_curator_that_failed_to_construct_is_marked(self, make_interceptor, taskmaster):
+        config = FusedMemoryConfig()
+        config.taskmaster = None
+        interceptor = make_interceptor(None, config=config)
+
+        with patch(
+            'fused_memory.middleware.task_interceptor.TaskCurator',
+            side_effect=RuntimeError('qdrant down'),
+        ):
+            [metadata] = await _created_metadata(interceptor, taskmaster, 'Work')
+
+        assert _marker_of(metadata) == {
+            'reason': 'curator-unavailable: construction-failed: RuntimeError: qdrant down',
+            'at': metadata[DEDUPE_SKIPPED_KEY]['at'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_create_after_close_is_marked(self, make_interceptor, taskmaster):
+        interceptor = make_interceptor(None, config=FusedMemoryConfig())
+        await interceptor.close()
+
+        await interceptor._dispatch_ticket_decision(
+            ticket_id='tkt_closed', project_root=PROJECT_ROOT, project_id='project',
+            candidate=CandidateTask(title='After close'), decision=None,
+            kwargs={'title': 'After close'}, metadata=_CALLER_METADATA, curator=None,
+        )
+
+        [metadata] = taskmaster.added_metadata()
+        assert _marker_of(metadata) == {
+            'reason': 'curator-unavailable: closed', 'at': metadata[DEDUPE_SKIPPED_KEY]['at'],
         }
