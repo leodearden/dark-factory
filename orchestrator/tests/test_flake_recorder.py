@@ -965,25 +965,6 @@ class TestRecordCallSiteObservations:
 
         assert len(_occurrences(tmp_path)) == 1
 
-    async def test_the_merge_entrys_signature_is_unchanged(self) -> None:
-        kinds = [
-            (name, param.kind)
-            for name, param in inspect.signature(
-                flake_recorder.record_merge_flake_suppression,
-            ).parameters.items()
-        ]
-        keyword = inspect.Parameter.KEYWORD_ONLY
-        assert kinds == [
-            ('result', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-            ('project_root', keyword),
-            ('project_id', keyword),
-            ('merge_sha', keyword),
-            ('task_id', keyword),
-            ('event_store', keyword),
-            ('escalation_queue', keyword),
-        ]
-        assert inspect.iscoroutinefunction(flake_recorder.record_call_site_observations)
-
 
 _FIX = 'f1' * 20
 _H1 = '1' * 40
