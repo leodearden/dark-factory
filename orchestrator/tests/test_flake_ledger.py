@@ -5944,6 +5944,52 @@ def _named_items(s) -> list:
     ]
 
 
+class TestReadCallSitesWritten:
+    """``read_call_sites_written``: every call_site spelling the occurrence table holds.
+    SYNC-ONLY CLASS."""
+
+    def test_it_returns_the_distinct_stored_spellings(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_call_sites_written, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        for n, call_site in enumerate(('merge_gate', 'offline_lane', 'merge_gate')):
+            record_flake_occurrence(
+                db_path, 'dark_factory',
+                _suppression(call_site=call_site, observed_at=f'2026-08-06T12:00:0{n}+00:00'),
+                merge_sha=None, task_id=None,
+            )
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "INSERT INTO flake_occurrence (observed_at, test_id, project_id, verdict, "
+                "call_site) VALUES ('2026-08-06T12:00:09+00:00', 't', 'p', "
+                "'unconfirmable', 'merge-gate')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert read_call_sites_written(db_path) == frozenset(
+            {'merge_gate', 'offline_lane', 'merge-gate'},
+        )
+
+    def test_an_empty_table_is_an_empty_set(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import ensure_schema, read_call_sites_written
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+
+        assert read_call_sites_written(db_path) == frozenset()
+
+    def test_an_unreadable_ledger_is_none_not_empty(self, tmp_path: Path, caplog) -> None:
+        from orchestrator.flake_ledger import read_call_sites_written
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert read_call_sites_written(_corrupt_path(tmp_path)) is None
+
+        assert caplog.records
+
+
 class TestNamedTests:
     """``named_tests``: the debt-eligible test ids an observation names.  SYNC-ONLY."""
 
