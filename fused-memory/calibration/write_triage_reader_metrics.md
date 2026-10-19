@@ -48,8 +48,11 @@ it would otherwise have joined.
 
 Every proportion is reported as n, hits, rate and a Wilson 95% interval over
 the decided sample. With a strata map it also carries a population rate, each
-item weighted N_h / n_h, and a stratified bootstrap 95% interval. An item whose
-deciding binary resolved UNCLEAR is left out of n and counted as `unclear`.
+item weighted N_h / n_h, and a stratified bootstrap 95% interval. The bootstrap
+resamples each stratum's whole sample, so a metric over a sub-population (M1,
+M3, M4's splits) also carries the uncertainty in how many sampled writes fall
+in it. An item whose deciding binary resolved UNCLEAR is left out of n and
+counted as `unclear`.
 
 | Metric | Rule | Population and unit | Sample | Status |
 |---|---|---|---|---|
@@ -180,5 +183,97 @@ edges and every cosine-derived threshold move with the embedder.
 
 ## 8. Soak baseline
 
-To be filled when the soak's 553 adjudicated items are rated under v2 (task
-7157 step 16).
+The 2026-10-19 soak's 553 adjudicated attaches, re-based on rubric v2. The
+report is `write_triage_v2_soak_baseline.json` (rendered as
+`write_triage_v2_soak_baseline.md`). It is the scorer's output over
+`write_triage_v2_soak_{items.jsonl,verdicts.jsonl,strata.json}`, and
+`fused-memory/tests/test_score_write_triage_reader.py::TestTheCommittedSoakBaseline`
+pins that re-scoring those inputs reproduces it. Every figure below is quoted
+from it unless marked otherwise.
+
+**This baseline is scored through a kappa floor miss and through a failed
+derivation check (both below).** §4 forbids that for the 3131 measurement.
+Read the baseline as the record of what was measured, not as a calibrated
+comparison point.
+
+### Provenance
+
+- **Inputs**, read-only: the soak bundle's `correctness/adjudications.jsonl`,
+  `items_all.json` (current parent text, read from Qdrant on 2026-10-19),
+  `hoist.json` and `attaches_soak.json`, and `~/.mem0/history.db` for
+  attach-time text. Built by `fused-memory/scripts/build_write_triage_v2_soak_baseline.py`
+  with seed 7157. Shards, the key and the raw rater output are in a gitignored
+  scratch directory, `data/write-triage-v2-rebase-2026-10-19/`.
+- **What the v1 labels fix**: `build_write_triage_v2_soak_baseline.py::v1_determined`.
+  312 items needed rating, and 241 were fully fixed by v1.
+- **Rating volume**: 459 blind ratings in 11 shards. Opus primary: 7 shards,
+  347 items, of which 35 are fully fixed anchors. Opus attach-time: 1 shard, all
+  13 parent-edited items, every one recoverable from history.db. Sonnet second:
+  2 shards, an 80-item seeded overlap. Opus third: 1 shard, 19 decisive ties.
+  16 binaries remain tied and are not decisive: loss 8, digest 5, scope 3.
+  One item resolved UNCLEAR and is left out of every rate.
+- **Kappa, primary against second.** In the corpus, a rated answer is kept only
+  on a binary that v1 left open. On that basis no binary meets the floor:
+  home 0.00 (n 3), loss 0.40 (n 80), conflict 0.58 (n 74), scope 0.49 (n 18),
+  digest −0.04 (n 48). Over every answer both raters gave, in the scratch
+  ratings: home 0.95 (n 80), loss 0.40 (n 80), conflict 0.62 (n 80), scope 0.59
+  (n 21), digest −0.04 (n 48). Raw agreement on digest is 42 of 48, but almost
+  every answer is NO, so kappa is near zero. LOSS, CONFLICT and DIGEST need the
+  brief refined before the 3131 measurement (§4).
+- **Derivation check** (`write_triage_v2_soak_derivation.json`): rated answers
+  compared with the v1-fixed answer on the same binary. Overall: home 261 of
+  389, conflict 50 of 66, scope 30 of 38, loss 2 of 2. Per v1 word:
+  - RELATED/UNRELATED → HOME NO: 223 of 223 hold.
+  - SAME → YES: 6 of 6 hold. SUBSUMED → YES: 2 of 3 hold.
+  - **EXTENDS → HOME YES: 30 of 157 hold.** Raters, who agree with each other
+    on HOME at kappa 0.95, read most v1 EXTENDS pairs as a different claim.
+  - CORRECTS + action-changing → CONFLICT YES: 38 of 40 hold.
+  - SAME/SUBSUMED/UNRELATED → CONFLICT NO: 10 of 10 hold.
+  - **CORRECTS, not action-changing → CONFLICT NO: 2 of 16 hold.**
+
+### Headline figures
+
+Sample rate (Wilson 95%), then population rate (stratified bootstrap 95%).
+
+| Figure | Soak baseline | Reference |
+|---|---|---|
+| M1 hidden in band | 18 / 39 = 0.46 [0.32, 0.61]; pop. 0.47 [0.32, 0.63] | v1 proxy 0.50; gate 0.15 |
+| M2 restated correct | 13 / 40 = 0.33 [0.20, 0.48] | |
+| M2 amended correct | 25 / 40 = 0.63 [0.47, 0.76] | |
+| M2 contested correct | 315 / 472 = 0.67 [0.62, 0.71] | |
+| M3 hidden corrections | 15 / 340 = 0.04 [0.03, 0.07]; pop. 0.36 [0.17, 0.50] | bound unset |
+| M4 wrong home | 127 / 552 = 0.23 [0.20, 0.27]; pop. 0.30 [0.20, 0.40] | 0.20 |
+| M4 direct / via sibling | 0.13 (n 426) / 0.56 (n 122) | |
+| M5 conflict-flag precision | 325 / 472 = 0.69 [0.65, 0.73]; central 166, secondary 156, unknown 3 | |
+| M6 drift | 9 of 13 parent-edited children change cells at attach time | report-only |
+| Harm per write, sample | triage 0.87, status quo 0.94, delta −0.07 [−0.22, 0.08] | provisional weights |
+| Harm per write, population | triage 0.70, status quo 0.46, delta +0.24 [0.12, 0.38] | provisional weights |
+
+M3's ending split: restated 10, amended 5, contested 325. The sample rate is
+dominated by the contested census. The population rate is dominated by the 5
+amended conflicts, each of which stands for 30.6 amended writes.
+
+**Sensitivity to the failed derivation rows** (scratch ratings, not committed,
+and not reproducible from the committed corpus). This takes the raters' HOME on
+all 114 v1 EXTENDS items in place of v1's YES:
+
+- M2 amended falls to 0.25 (10 / 40).
+- M4 rises to 0.34 sample and 0.61 population.
+- M1 falls to 0.41.
+- The population harm delta rises to +0.56 [0.42, 0.68].
+
+Also taking the raters' CONFLICT on the 16 CORRECTS, not action-changing,
+items moves M5 to 0.71 and M4 to 0.32 sample (0.61 population). Read the
+as-built M4 as a lower bound on wrong homes, and M2 amended as an upper bound
+on amended correctness.
+
+### Caveats
+
+- The soak holds no stored items, so stored cells and M3's stored endings are
+  unmeasured.
+- The status quo's earlier records are only each write's parent, so its
+  orphaned_conflict and duplicate_clutter counts are a lower bound on its harm.
+- Restated and amended are 40-item samples of 125 and 1,224, weighted by
+  strata. The contested stratum is the census of 473.
+- One contested item (`e7f06b8d-5bf4-4070-b085-e2db2d29d655`) resolved UNCLEAR
+  and is left out.
