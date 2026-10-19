@@ -11090,3 +11090,84 @@ def test_within_run_twins_at_one_anchor_promote_one_entry(tmp_path):
     assert record["method"]["extra"]["screened"]["key"] == 1
     assert [row["id"] for row in record["findings"] if row["verdict"] == "confirmed"] == [entry["id"]]
     assert len(kwargs["submit_fn"].calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# task 6405 (PRD L6) cross-instrument rule, end to end (contract §9): a
+# promotion at a location another instrument's newest record already keys is
+# re-observed under that key, and the record's run_id is consumed.
+# ---------------------------------------------------------------------------
+
+_REVIEW_ALL_RUN = "review-all-dark_factory-20261008"
+_EXTERNAL_KEY = finding_key("orchestrator", _ROW5_ANCHOR, "h4")
+_EXTERNAL_OLD_KEY = finding_key("orchestrator", "orchestrator/x.py::old", "h4")
+
+
+def _write_review_all_record(root) -> None:
+    (root / "plans").mkdir(exist_ok=True)
+    (root / "plans" / f"{_REVIEW_ALL_RUN}.json").write_text(json.dumps({
+        "method": {"run_id": _REVIEW_ALL_RUN, "as_of_sha": "b" * 40},
+        "findings": [{
+            "key": _EXTERNAL_KEY,
+            "area": "orchestrator",
+            "anchor": _ROW5_ANCHOR,
+            "tags": ["h4", "kind:defect"],
+            "severity": "high",
+            "statement": "s",
+            "first_seen": "review-all-dark_factory-20261001",
+            "supersedes": [_EXTERNAL_OLD_KEY, "positional:clusters[0].findings[0]"],
+        }],
+    }), encoding="utf-8")
+
+
+def test_a_promotion_at_an_externally_keyed_location_is_re_observed_under_that_key(tmp_path):
+    _write_review_all_record(tmp_path)
+    kwargs = _keyed_kwargs(tmp_path, FakeTaskStore())
+    run_id = kwargs["run_id"]
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["finding_key"] == _EXTERNAL_KEY
+    assert entry["finding_tags"] == ["h13", verdict.KIND_TAG]
+    assert entry["supersedes"] == [_EXTERNAL_OLD_KEY]
+    assert entry["first_seen_run"] == "review-all-dark_factory-20261001"
+    assert entry["last_seen_runs"] == [run_id]
+
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["screened"]["cross_instrument"] == 1
+    assert record["method"]["inputs_consumed"] == [_REVIEW_ALL_RUN]
+    screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
+    assert [line for line in screened.splitlines() if _PROMOTED_TITLE in line and _REVIEW_ALL_RUN in line]
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"]["x_finding_key"] == _EXTERNAL_KEY
+
+
+def test_with_no_instrument_records_nothing_is_consumed_and_the_minted_key_stands(tmp_path):
+    kwargs = _keyed_kwargs(tmp_path, FakeTaskStore())
+
+    mod.run_census(**kwargs)
+
+    method = _run_record(kwargs)["method"]
+    assert method["inputs_consumed"] == []
+    assert "/review-all: no record matching plans/review-all-dark_factory-" in method["extra"]["inputs_consumed_note"]
+    assert method["extra"]["screened"]["cross_instrument"] == 0
+    assert _persisted_promoted_entry(kwargs)["finding_key"] == _ROW5_KEY
+
+
+def test_a_codebook_entry_at_the_location_wins_over_the_external_finding(tmp_path):
+    _write_review_all_record(tmp_path)
+    _write_briefing(tmp_path)
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_verifying_at_the_row5_anchor())
+    kwargs["codebook_dict"] = _keyed_standing_codebook()
+
+    mod.run_census(**kwargs)
+
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["screened"]["key"] == 1
+    assert record["method"]["extra"]["screened"]["cross_instrument"] == 0
+    assert record["method"]["inputs_consumed"] == [_REVIEW_ALL_RUN]
+    persisted = codebook.load(kwargs["codebook_path"])
+    standing = next(e for e in persisted["entries"] if e["id"] == _STANDING_ENTRY_ID)
+    assert standing["finding_key"] == _ROW5_KEY
