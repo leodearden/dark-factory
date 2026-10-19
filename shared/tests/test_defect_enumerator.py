@@ -8,6 +8,7 @@ import pytest
 
 from shared.defect_enumerator import (
     Carrier,
+    DisablingMark,
     EnumerationGap,
     FileEnumeration,
     GapReason,
@@ -394,3 +395,106 @@ def test_only_the_last_definition_of_a_test_name_carries():
     ''')
     assert result.carriers == {REF_B: (_runnable('test_a'),)}
     assert result.non_static == (NonStaticMark(REF_A, 1),)
+
+
+_DISABLING_SPELLINGS = [
+    ('pytest.mark.skip', DisablingMark.SKIP),
+    ("pytest.mark.skip(reason='x')", DisablingMark.SKIP),
+    ("pytest.mark.skipif(sys.platform == 'win32', reason='x')", DisablingMark.SKIPIF),
+    ('pytest.mark.xfail', DisablingMark.XFAIL),
+    ('pytest.mark.xfail(strict=True)', DisablingMark.XFAIL),
+]
+
+_DISABLING_SCOPES = {
+    'function-decorator': ("""
+        @{mark}
+        @pytest.mark.defect({ref})
+        def test_a():
+            pass
+    """, 'test_a'),
+    'class-decorator': ("""
+        @{mark}
+        class TestA:
+            @pytest.mark.defect({ref})
+            def test_m(self):
+                pass
+    """, 'TestA::test_m'),
+    'class-pytestmark': ("""
+        class TestA:
+            pytestmark = {mark}
+
+            @pytest.mark.defect({ref})
+            def test_m(self):
+                pass
+    """, 'TestA::test_m'),
+    'module-pytestmark': ("""
+        pytestmark = [{mark}]
+
+        @pytest.mark.defect({ref})
+        def test_a():
+            pass
+    """, 'test_a'),
+}
+
+
+@pytest.mark.parametrize(('mark', 'disabling'), _DISABLING_SPELLINGS)
+@pytest.mark.parametrize('scope', sorted(_DISABLING_SCOPES))
+def test_a_skip_or_xfail_mark_reaching_a_carrier_disables_it(mark, disabling, scope):
+    template, name = _DISABLING_SCOPES[scope]
+    result = _enumerate(template.format(mark=mark, ref=repr(REF_A)))
+    (carrier,) = result.carriers[REF_A]
+    assert carrier == Carrier(_node(name), frozenset({disabling}))
+    assert carrier.runnable is False
+
+
+def test_disabling_marks_from_every_scope_accumulate():
+    result = _enumerate(f'''
+        @pytest.mark.skip
+        class TestA:
+            @pytest.mark.xfail
+            @pytest.mark.defect({REF_A!r})
+            def test_m(self):
+                pass
+    ''')
+    assert result.carriers == {
+        REF_A: (Carrier(_node('TestA::test_m'), frozenset({DisablingMark.SKIP, DisablingMark.XFAIL})),),
+    }
+
+
+@pytest.mark.parametrize('mark', [
+    'pytest.mark.slow',
+    "pytest.mark.parametrize('x', [1, 2])",
+    'pytest.mark.timeout(5)',
+])
+def test_an_unrelated_mark_leaves_the_carrier_runnable(mark):
+    result = _enumerate(f'''
+        @{mark}
+        @pytest.mark.defect({REF_A!r})
+        def test_a(x):
+            pass
+    ''')
+    (carrier,) = result.carriers[REF_A]
+    assert carrier.runnable is True
+
+
+def test_an_xfail_inside_pytest_param_does_not_disable_the_function_carrier():
+    result = _enumerate(f'''
+        @pytest.mark.parametrize('x', [1, pytest.param(2, marks=pytest.mark.xfail)])
+        @pytest.mark.defect({REF_A!r})
+        def test_a(x):
+            pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_a'),)}
+
+
+def test_a_skip_on_a_sibling_test_does_not_leak():
+    result = _enumerate(f'''
+        @pytest.mark.skip
+        def test_skipped():
+            pass
+
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_a'),)}
