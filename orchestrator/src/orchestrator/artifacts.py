@@ -347,6 +347,32 @@ class TaskArtifacts:
         """
         return worktree_base / TASK_META_DIRNAME / worktree_name
 
+    @staticmethod
+    def read_lane_task_id(meta_root: Path) -> str | None:
+        """The task id ``<meta_root>/metadata.json`` was dispatched for, else None.
+
+        The lane->task key of ``GitOps``'s disk backstop. One root, no
+        ``plan.json`` and no legacy fallback: PRD
+        ``plans/task-meta-task-keying-prd.md`` decision 7. Never raises.
+        """
+        meta_path = meta_root / 'metadata.json'
+        if not meta_path.exists():
+            return None
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except (ValueError, OSError) as exc:
+            logger.warning('Unreadable metadata.json at %s: %s', meta_path, exc)
+            return None
+        if not isinstance(metadata, dict):
+            logger.warning('Malformed metadata.json at %s: not an object', meta_path)
+            return None
+        task_id = metadata.get('task_id')
+        if isinstance(task_id, str):
+            return task_id or None
+        if isinstance(task_id, int) and not isinstance(task_id, bool):
+            return str(task_id)
+        return None
+
     def init(
         self,
         task_id: str,
