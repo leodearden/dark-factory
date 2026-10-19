@@ -4,12 +4,16 @@ cluster, so the census spends no verify call on what it already knows
 from __future__ import annotations
 
 import copy
+import dataclasses
 import enum
+import json
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from legibility import census_findings, codebook, verdict
+from legibility import census_findings, codebook, finding_area, verdict
 
 
 class Rule(enum.StrEnum):
@@ -290,4 +294,186 @@ def attach_by_key(
         entry_id=target["id"],
         identity=identity,
         verifier_tags=found.tags,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Other instruments' findings (docs/quality-findings-contract.md §5, §9)
+# ---------------------------------------------------------------------------
+
+_SHAPE_PLACEHOLDERS = {
+    "<YYYYMMDD>": r"(?P<date>\d{8})",
+    "<YYYY-MM-DD>": r"(?P<date>\d{4}-\d{2}-\d{2})",
+    "[-<n>]": r"(?:-(?P<n>\d+))?",
+}
+_SHAPE_PLACEHOLDER_RE = re.compile("|".join(re.escape(placeholder) for placeholder in _SHAPE_PLACEHOLDERS))
+
+
+def _basename_regex(shape: str) -> re.Pattern[str]:
+    parts, position = [], 0
+    for placeholder in _SHAPE_PLACEHOLDER_RE.finditer(shape):
+        parts += [re.escape(shape[position:placeholder.start()]), _SHAPE_PLACEHOLDERS[placeholder.group()]]
+        position = placeholder.end()
+    return re.compile("".join([*parts, re.escape(shape[position:])]))
+
+
+@dataclass(frozen=True)
+class InstrumentHome:
+    """Where an instrument writes its run records, and their basename shape
+    as its report-format names it: a date and an optional ``-<n>``."""
+
+    name: str
+    directory: str
+    shape: str
+
+    def newest(self, project_root: Path) -> Path | None:
+        """The record of the latest run: the greatest (date, n), read as
+        numbers, since a bare basename sorts after its own ``-2`` as text."""
+        pattern = _basename_regex(self.shape)
+        directory = project_root / self.directory
+        runs = []
+        if directory.is_dir():
+            for path in directory.iterdir():
+                found = pattern.fullmatch(path.name)
+                if found is not None and path.is_file():
+                    order = (int(found["date"].replace("-", "")), int(found["n"] or 1))
+                    runs.append((order, path))
+        return max(runs)[1] if runs else None
+
+    def where(self) -> str:
+        return f"{self.directory}/{self.shape}"
+
+
+def instrument_homes(project_id: str) -> tuple[InstrumentHome, ...]:
+    return (
+        InstrumentHome("/review", "review/reports", f"review-{project_id}-<YYYYMMDD>[-<n>].json"),
+        InstrumentHome("/hotspot-survey", "plans", "bug-hotspot-survey-<YYYY-MM-DD>[-<n>]-full-findings.json"),
+        InstrumentHome("/review-all", "plans", f"review-all-{project_id}-<YYYYMMDD>[-<n>].json"),
+    )
+
+
+@dataclass(frozen=True)
+class ExternalFinding:
+    """A finding another instrument's newest record carries."""
+
+    key: str
+    area: str
+    anchor: str
+    primary_tag: str | None
+    first_seen: str | None
+    supersedes: tuple[str, ...]
+    run_id: str
+
+    @classmethod
+    def of(cls, finding: object, *, run_id: str) -> ExternalFinding | None:
+        """The finding, or None when it has no valid key, area and anchor."""
+        if not isinstance(finding, Mapping):
+            return None
+        key, area, anchor = finding.get("key"), finding.get("area"), finding.get("anchor")
+        if not (
+            isinstance(key, str) and codebook.is_finding_key(key)
+            and isinstance(area, str) and re.fullmatch(finding_area.AREA_KEY_PATTERN, area)
+            and isinstance(anchor, str) and verdict.is_anchor(anchor)
+        ):
+            return None
+        tags = finding.get("tags")
+        first_seen = finding.get("first_seen")
+        supersedes = finding.get("supersedes")
+        return cls(
+            key=key,
+            area=area,
+            anchor=anchor,
+            primary_tag=tags[0] if isinstance(tags, list) and tags and isinstance(tags[0], str) else None,
+            first_seen=first_seen if isinstance(first_seen, str) and first_seen else None,
+            supersedes=tuple(
+                old for old in supersedes if isinstance(old, str) and codebook.is_finding_key(old)
+            ) if isinstance(supersedes, list) else (),
+            run_id=run_id,
+        )
+
+
+class AdoptedBy(enum.StrEnum):
+    KEY = "key"
+    LOCATION = "location"
+
+
+@dataclass(frozen=True)
+class Adoption:
+    """A census promotion re-observing *external*: it takes the external key
+    in place of its minted one, and the external supersedes and first_seen."""
+
+    identity: census_findings.FindingIdentity
+    supersedes: tuple[str, ...]
+    first_seen: str | None
+    external: ExternalFinding
+    matched_by: AdoptedBy
+
+
+@dataclass(frozen=True)
+class InstrumentFindings:
+    """What the census read of the other instruments: the run_id of every
+    record it consumed, why any instrument gave it none, and their findings."""
+
+    consumed: tuple[str, ...]
+    note: str | None
+    findings: tuple[ExternalFinding, ...]
+
+    def match(self, identity: census_findings.FindingIdentity) -> Adoption | None:
+        """The finding *identity* re-observes: an equal key first, else an
+        equal (area, anchor)."""
+        location = (identity.area, identity.anchor)
+        by_key = next((found for found in self.findings if found.key == identity.key), None)
+        by_location = next((found for found in self.findings if (found.area, found.anchor) == location), None)
+        external, matched_by = (by_key, AdoptedBy.KEY) if by_key is not None else (by_location, AdoptedBy.LOCATION)
+        if external is None:
+            return None
+        return Adoption(
+            identity=dataclasses.replace(identity, key=external.key),
+            supersedes=external.supersedes,
+            first_seen=external.first_seen,
+            external=external,
+            matched_by=matched_by,
+        )
+
+
+@dataclass(frozen=True)
+class _Read:
+    run_id: str | None
+    findings: tuple[ExternalFinding, ...]
+    note: str | None
+
+
+def _read_record(home: InstrumentHome, project_root: Path) -> _Read:
+    path = home.newest(project_root)
+    if path is None:
+        return _Read(None, (), f"{home.name}: no record matching {home.where()}")
+    where = path.relative_to(project_root).as_posix()
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _Read(None, (), f"{home.name}: {where} is unreadable: {exc}")
+    method = record.get("method") if isinstance(record, dict) else None
+    run_id = method.get("run_id") if isinstance(method, dict) else None
+    if not isinstance(run_id, str) or not run_id:
+        return _Read(None, (), f"{home.name}: {where} is not a contract record: it has no method.run_id")
+    raw = record.get("findings")
+    if not isinstance(raw, list):
+        return _Read(None, (), f"{home.name}: {where} is not a contract record: its findings is not a list")
+    findings = tuple(found for item in raw if (found := ExternalFinding.of(item, run_id=run_id)) is not None)
+    skipped = len(raw) - len(findings)
+    note = f"{home.name}: skipped {skipped} finding(s) in {where} with no valid key, area or anchor" if skipped else None
+    return _Read(run_id, findings, note)
+
+
+def load_instrument_findings(project_root: str | Path, project_id: str) -> InstrumentFindings:
+    """Read each other instrument's newest record under *project_root*.
+
+    Never raises: a missing, unreadable or non-contract record, or a finding
+    with no usable identity, becomes a line of the note instead."""
+    reads = [_read_record(home, Path(project_root)) for home in instrument_homes(project_id)]
+    notes = [read.note for read in reads if read.note is not None]
+    return InstrumentFindings(
+        consumed=tuple(read.run_id for read in reads if read.run_id is not None),
+        note="; ".join(notes) if notes else None,
+        findings=tuple(found for read in reads for found in read.findings),
     )
