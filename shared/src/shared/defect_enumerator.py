@@ -42,6 +42,9 @@ class DisablingMark(StrEnum):
     XFAIL = 'xfail'
 
 
+_DISABLING_MARKS = frozenset(DisablingMark)
+
+
 class GapReason(StrEnum):
     SYNTAX_ERROR = 'syntax_error'
     UNREADABLE_REF = 'unreadable_ref'
@@ -151,10 +154,13 @@ class _ScopeMarks:
     """The marks that reach a scope from it and every scope enclosing it."""
 
     defect_marks: tuple[ast.expr, ...] = ()
+    disabled_by: frozenset[DisablingMark] = frozenset()
 
     def with_elements(self, elements: Sequence[ast.expr]) -> _ScopeMarks:
-        defect_marks = tuple(element for element in elements if marker_name(element) == _DEFECT_MARKER)
-        return _ScopeMarks(self.defect_marks + defect_marks)
+        named = [(element, marker_name(element)) for element in elements]
+        defect_marks = tuple(element for element, name in named if name == _DEFECT_MARKER)
+        disabled_by = frozenset(DisablingMark(name) for _, name in named if name in _DISABLING_MARKS)
+        return _ScopeMarks(self.defect_marks + defect_marks, self.disabled_by | disabled_by)
 
 
 _Definition = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
@@ -208,7 +214,7 @@ def _carriers(
             reached.add(id(mark))
             reading = readings[id(mark)]
             if isinstance(reading, str):
-                carriers.setdefault(reading, {})[Carrier(node_of(name), frozenset())] = None
+                carriers.setdefault(reading, {})[Carrier(node_of(name), marks.disabled_by)] = None
     return {ref: tuple(item_carriers) for ref, item_carriers in carriers.items()}, frozenset(reached)
 
 
