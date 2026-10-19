@@ -46,7 +46,8 @@ from reconciliation.consolidator_fixtures import make_consolidator
 
 from fused_memory.config.schema import ConsolidationAutoConfig
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
-from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
+from fused_memory.reconciliation.consolidation_auto import AutoOutcome, build_auto_canonical
+from fused_memory.reconciliation.consolidation_auto_executor import revert_auto_consolidation
 from fused_memory.reconciliation.consolidation_proposal import (
     PROPOSER_AGENT_ID,
     RECORD_KIND_CONSOLIDATION_PROPOSAL,
@@ -321,3 +322,97 @@ async def test_b1_fresh_cluster_passes(world):
     assert world.pending('milestone_gate') == []
     assert world.queue.get_pending() == []
     assert world.tasks.calls == []
+
+
+async def _consolidated(world: World, run_id: str) -> tuple[list[str], str]:
+    """Five members consolidated by one B1 cycle: the members and their canonical."""
+    members = world.fake.seed_many(5)
+    await world.cycle(run_id, emit=[Emission(TOPIC, members)])
+    assert (await world.row(TOPIC, run_id)).state == 'addressed'
+    return members, _only(world.fake.canonical_ids(), 'canonical')
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b2_re_emission_with_regrowth_tags_only_the_new_members(world):
+    members, incumbent = await _consolidated(world, 'run-b2-1')
+    fresh = world.fake.seed_many(3)
+    before = world.fake.snapshot(incumbent)
+
+    result = await world.cycle('run-b2-2', emit=[Emission(TOPIC, [*members, *fresh, incumbent])])
+
+    landed = outcome(await world.row(TOPIC, 'run-b2-2'))
+    assert landed.verdict is AutoOutcome.PASS_TAG_ONLY
+    assert landed.stripped_ids == (incumbent,)
+    assert landed.canonical_id == incumbent
+    assert landed.canonical_minted is False
+    assert landed.tagged_ids == tuple(fresh)
+    for member in fresh:
+        assert world.fake.metadata_of(member)['topic'] == TOPIC
+        assert world.fake.metadata_of(member)['x_auto_consolidated_run'] == 'run-b2-2'
+    for member in members:
+        assert world.fake.metadata_of(member)['x_auto_consolidated_run'] == 'run-b2-1'
+    assert world.fake.snapshot(incumbent) == before
+    assert world.fake.canonical_ids() == [incumbent]
+    assert result.report.stats['auto_consolidations_tag_only'] == 1
+    assert result.report.stats['auto_consolidations'] == 0
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b3_fully_consolidated_re_emission_is_a_noop(world):
+    members, _ = await _consolidated(world, 'run-b3-1')
+    corpus = world.corpus_snapshot()
+    writes = world.mem0_writes()
+
+    result = await world.cycle('run-b3-2', emit=[Emission(TOPIC, members)])
+
+    row = await world.row(TOPIC, 'run-b3-2')
+    assert row.state == 'addressed'
+    assert outcome(row).verdict is AutoOutcome.NOOP
+    assert outcome(row).reason_codes == ('already_consolidated',)
+    assert world.mem0_writes() == writes
+    assert world.corpus_snapshot() == corpus
+    assert len(world.system_records('auto_consolidation')) == 1
+    assert result.report.stats['auto_consolidations_noop'] == 1
+
+
+@REQUIRES_EXECUTOR
+@pytest.mark.asyncio
+async def test_b10_reversal_round_trips_both_runs(world):
+    members, incumbent = await _consolidated(world, 'run-b10-1')
+    fresh = world.fake.seed_many(3)
+    await world.cycle('run-b10-2', emit=[Emission(TOPIC, [*members, *fresh, incumbent])])
+    assert (await world.row(TOPIC, 'run-b10-2')).state == 'addressed'
+    before = world.fake.snapshot(incumbent)
+
+    regrowth = await revert_auto_consolidation(
+        world.stage.memory, await world.row(TOPIC, 'run-b10-2'), agent_id=REVERT_AGENT,
+    )
+
+    assert regrowth.reverted is True
+    assert regrowth.canonical_deleted is None
+    assert regrowth.untagged == tuple(fresh)
+    for member in fresh:
+        assert 'topic' not in world.fake.metadata_of(member)
+        assert 'x_auto_consolidated_run' not in world.fake.metadata_of(member)
+    for member in members:
+        assert world.fake.metadata_of(member)['topic'] == TOPIC
+    assert world.fake.snapshot(incumbent) == before
+    assert (await world.row(TOPIC, 'run-b10-2')).state == 'reverted'
+
+    minting = await revert_auto_consolidation(
+        world.stage.memory, await world.row(TOPIC, 'run-b10-1'), agent_id=REVERT_AGENT,
+    )
+
+    assert minting.reverted is True
+    assert minting.canonical_deleted == incumbent
+    assert minting.untagged == tuple(members)
+    assert incumbent not in world.fake.records
+    for member in [*members, *fresh]:
+        assert 'topic' not in world.fake.metadata_of(member)
+    assert await world.stage.memory.get_memories_by_metadata(
+        project_id=PROJECT_ID, filters={'topic': TOPIC},
+    ) == []
+    assert world.fake.canonical_ids() == []
+    assert (await world.row(TOPIC, 'run-b10-1')).state == 'reverted'
