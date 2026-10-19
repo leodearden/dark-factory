@@ -283,16 +283,17 @@ class LinkHealHarness:
         parent_text: str | None = PARENT_TEXT,
         project: str = DF,
         contested: bool = False,
+        meta: Mapping[str, Any] | None = None,
     ) -> None:
-        """A child linked to a parent; ``parent_text=None`` seeds no parent."""
+        """A child, carrying *meta* too, linked to a parent; ``parent_text=None`` seeds no parent."""
         if parent_text is not None:
             self.seed(project, parent, parent_text)
-        meta: dict[str, object] = {PARENT_ID_KEY: parent}
+        child_meta: dict[str, Any] = {**(meta or {}), PARENT_ID_KEY: parent}
         if kind is not None:
-            meta['kind'] = kind
+            child_meta['kind'] = kind
         if contested:
-            meta[CONTESTED_METADATA_KEY] = True
-        self.seed(project, child, child_text, **meta)
+            child_meta[CONTESTED_METADATA_KEY] = True
+        self.seed(project, child, child_text, **child_meta)
 
     def journal_rows(self, kind: str = 'write') -> list[dict[str, Any]]:
         """The journal's ``write_ops`` rows of *kind*, oldest first, params decoded."""
@@ -364,6 +365,25 @@ async def run_corpus_plan(
     )
 
 
+async def run_deterministic_plan(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    plan_path: Path,
+    projects: Sequence[str] = PROJECTS,
+) -> RunReport:
+    """``run_plan`` with no bases: only the deterministic rows plan a heal."""
+    return await run_plan(
+        (),
+        store=harness.store(),
+        census=harness.mem0,
+        ledger=ledger,
+        limits=DEFAULT_LIMITS,
+        projects=projects,
+        source=RunSource.DETERMINISTIC,
+        plan_path_for=lambda _run_id: plan_path,
+    )
+
+
 class RecordingFiler:
     """An ``EscapeFiler`` that files nowhere and remembers every escape."""
 
@@ -390,6 +410,24 @@ async def run_corpus_apply(
         limits=limits,
         filer=filer or RecordingFiler(),
         source=RunSource.CORPUS,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+
+
+async def run_deterministic_apply(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    *,
+    filer: EscapeFiler | None = None,
+    approved_plan_sha256: str | None = None,
+) -> RunReport:
+    """``run_apply`` of the deterministically planned heals over the harness's store."""
+    return await run_apply(
+        store=harness.store(),
+        ledger=ledger,
+        limits=DEFAULT_LIMITS,
+        filer=filer or RecordingFiler(),
+        source=RunSource.DETERMINISTIC,
         approved_plan_sha256=approved_plan_sha256,
     )
 
