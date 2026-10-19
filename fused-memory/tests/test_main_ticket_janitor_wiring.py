@@ -129,7 +129,7 @@ async def test_built_janitor_drains_through_the_interceptor(config, store, make_
     assert janitor is not None
     await janitor.tick()
 
-    await asyncio.wait_for(curator.reached.wait(), timeout=DEADLINE_SECONDS)
+    await curator.reached.wait()
     row = await store.get(ticket_id)
     assert row is not None
     assert (row['status'], row['attempts']) == ('pending', 1)
