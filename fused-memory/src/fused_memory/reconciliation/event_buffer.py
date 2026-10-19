@@ -116,6 +116,11 @@ _MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
 # O(rows deleted) — see cleanup_drained's docstring for the measurement.
 _CLEANUP_FETCH_CHUNK: int = 10_000
 
+# A folded row announces itself at WARNING each time its fold count reaches a
+# multiple of this.  A looping task no longer builds backlog once its events
+# fold, so the reconciliation_backlog alarm cannot see it; this line can.
+_COALESCE_HOT_TASK_WARNING_INTERVAL: int = 100
+
 
 class _PushOutcome(StrEnum):
     """What one push did to the buffer."""
@@ -128,6 +133,29 @@ class _PushOutcome(StrEnum):
 class _PushResult(NamedTuple):
     outcome: _PushOutcome
     coalesced_count: int = 1
+
+
+def _log_push(event: ReconciliationEvent, key: str | None, result: _PushResult) -> None:
+    """One structured line per push; a WARNING when a folded row turns hot."""
+    if result.outcome is not _PushOutcome.coalesced:
+        logger.info(
+            f'reconciliation.event_{result.outcome.value}',
+            extra={
+                'project_id': event.project_id,
+                'event_type': event.type.value,
+                'agent_id': event.agent_id,
+            },
+        )
+        return
+    fold_extra = {
+        'project_id': event.project_id,
+        'event_type': event.type.value,
+        'coalesce_key': key,
+        'coalesced_count': result.coalesced_count,
+    }
+    logger.info('reconciliation.event_coalesced', extra=fold_extra)
+    if result.coalesced_count % _COALESCE_HOT_TASK_WARNING_INTERVAL == 0:
+        logger.warning('reconciliation.coalesce_hot_task', extra=fold_extra)
 
 
 class EventBuffer:
@@ -302,25 +330,7 @@ class EventBuffer:
         if event.agent_id is not None:
             await self._update_burst_state(event.agent_id, event.timestamp)
 
-        if result.outcome is _PushOutcome.coalesced:
-            logger.info(
-                'reconciliation.event_coalesced',
-                extra={
-                    'project_id': event.project_id,
-                    'event_type': event.type.value,
-                    'coalesce_key': key,
-                    'coalesced_count': result.coalesced_count,
-                },
-            )
-        else:
-            logger.info(
-                f'reconciliation.event_{result.outcome.value}',
-                extra={
-                    'project_id': event.project_id,
-                    'event_type': event.type.value,
-                    'agent_id': event.agent_id,
-                },
-            )
+        _log_push(event, key, result)
 
     async def _fold_into_oldest(
         self, db: aiosqlite.Connection, event: ReconciliationEvent, key: str,
@@ -358,6 +368,18 @@ class EventBuffer:
         await db.execute(
             'UPDATE event_buffer SET payload = ?, timestamp = ? WHERE id = ?',
             (json.dumps(fold.payload), fold.row_timestamp.isoformat(), target['id']),
+        )
+        await db.execute(
+            """INSERT INTO event_coalesced_hourly
+                   (project_id, hour_bucket, event_type, coalesced_count)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(project_id, hour_bucket, event_type)
+               DO UPDATE SET coalesced_count = coalesced_count + excluded.coalesced_count""",
+            (
+                event.project_id,
+                utc_hour_bucket(fold.folded_timestamp.isoformat()),
+                event.type.value,
+            ),
         )
         return _PushResult(_PushOutcome.coalesced, coalesced_count(fold.payload))
 
