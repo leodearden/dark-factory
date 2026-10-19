@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+
 from orchestrator.recut_ruling import (
     RECUT_EXECUTED_KEY,
     RECUT_RULING_KEY,
