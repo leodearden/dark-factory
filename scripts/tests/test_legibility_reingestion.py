@@ -14,6 +14,7 @@ import pytest
 from legibility import coder, reingestion
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
+    CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
     TRICKLE_CODER_PREAMBLE,
@@ -23,6 +24,7 @@ from legibility_carrier_fixtures import (
     json_fenced,
     merger_prompt,
     recon_run_review_text,
+    steward_continuation_prompt,
     user_record,
     with_origin,
 )
@@ -224,6 +226,16 @@ class TestHarnessInjectedTurnFilter:
         # keeps merge-conflict dispatches (7 per 14 days, measured) out of
         # the digest's gold user_corrections section.
         assert reingestion.is_harness_injected_turn(merger_prompt(tmp_path)) is True
+
+    def test_steward_continuation_prompt_is_excluded_lockstep(self, tmp_path):
+        # LOCKSTEP via the REAL builder, like test_merger_prompt_is_excluded_lockstep.
+        # The sighted records (reify 77fb6617 records 237 and 289) carry no
+        # origin and no isMeta, so provenance cannot exclude them; only this
+        # text rule can.
+        assert reingestion.is_harness_injected_turn(steward_continuation_prompt(tmp_path)) is True
+
+    def test_human_turn_quoting_the_census_sighting_is_retained(self):
+        assert reingestion.is_harness_injected_turn(CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD) is False
 
     def test_human_turn_with_one_merger_heading_is_retained(self):
         # The all-of guard MERGER_HEADINGS is matched under: a human turn
