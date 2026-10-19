@@ -4,10 +4,14 @@ L6), through the module's public API only."""
 from __future__ import annotations
 
 import copy
+import dataclasses
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 from legibility import census_findings, codebook, prescreen, verdict
+from shared.finding_key import finding_key
 
 _RUN = "census-dark_factory-20261019"
 _NO_SLUGS: tuple[str, ...] = ()
@@ -432,3 +436,192 @@ def test_a_key_attach_with_the_same_primary_tag_reports_no_disagreement():
     _, key_attach = _attach(_keyed_codebook(), _found(tags=("h13", verdict.KIND_TAG)))
 
     assert key_attach.tag_disagreement is None
+
+
+# ---------------------------------------------------------------------------
+# The cross-instrument rule's input: the newest /review, /hotspot-survey and
+# /review-all records (docs/quality-findings-contract.md §5, §9)
+# ---------------------------------------------------------------------------
+
+_REVIEW_RUN = "review-dark_factory-20261009-2"
+_HOTSPOT_RUN = "hotspot-survey-dark_factory-20261009"
+_REVIEW_ALL_RUN = "review-all-dark_factory-20261008"
+_EXTERNAL_KEY = finding_key("orchestrator", _ANCHOR, "h4")
+_OLD_KEY = finding_key("orchestrator", "orchestrator/x.py::old", "h4")
+
+
+def _external(key: str, area: str, anchor: str, **fields: Any) -> dict:
+    return {
+        "key": key,
+        "area": area,
+        "anchor": anchor,
+        "tags": ["h4", "kind:defect"],
+        "severity": "high",
+        "statement": "s",
+        "first_seen": "review-all-dark_factory-20261001",
+        "supersedes": [],
+        **fields,
+    }
+
+
+def _write(root: Path, relpath: str, content: Any) -> None:
+    path = root / relpath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content if isinstance(content, str) else json.dumps(content), encoding="utf-8")
+
+
+def _contract_record(run_id: str, *findings: dict) -> dict:
+    return {"method": {"run_id": run_id, "as_of_sha": "abc1234"}, "findings": list(findings)}
+
+
+def _review_all_finding() -> dict:
+    return _external(
+        _EXTERNAL_KEY, "orchestrator", _ANCHOR,
+        supersedes=[_OLD_KEY, "positional:clusters[0].findings[0]"],
+    )
+
+
+def _all_instruments(root: Path) -> None:
+    _write(root, "review/reports/review-dark_factory-20261009.json", "{not json")
+    _write(
+        root, "review/reports/review-dark_factory-20261009-2.json",
+        _contract_record(_REVIEW_RUN, _external(finding_key("dashboard", "dashboard/a.py", "h11"), "dashboard", "dashboard/a.py")),
+    )
+    _write(root, "plans/bug-hotspot-survey-2026-07-06-full-findings.json", {"clusters": []})
+    _write(
+        root, "plans/bug-hotspot-survey-2026-10-09-full-findings.json",
+        _contract_record(_HOTSPOT_RUN, _external(finding_key("shared", "shared/b.py", "h10"), "shared", "shared/b.py")),
+    )
+    _write(root, "plans/review-all-dark_factory-20261008.json", _contract_record(_REVIEW_ALL_RUN, _review_all_finding()))
+    _write(root, "plans/quality-metrics/review-all-dark_factory-20261008.json", {"run_id": "metrics-only"})
+
+
+def test_only_each_instruments_newest_record_is_consumed(tmp_path):
+    _all_instruments(tmp_path)
+
+    found = prescreen.load_instrument_findings(tmp_path, "dark_factory")
+
+    assert found.consumed == (_REVIEW_RUN, _HOTSPOT_RUN, _REVIEW_ALL_RUN)
+    assert found.note is None
+    assert {external.run_id for external in found.findings} == {_REVIEW_RUN, _HOTSPOT_RUN, _REVIEW_ALL_RUN}
+
+
+def test_an_external_finding_keeps_its_identity_and_only_its_key_supersedes(tmp_path):
+    _all_instruments(tmp_path)
+
+    found = prescreen.load_instrument_findings(tmp_path, "dark_factory")
+
+    (external,) = [finding for finding in found.findings if finding.run_id == _REVIEW_ALL_RUN]
+    assert external == prescreen.ExternalFinding(
+        key=_EXTERNAL_KEY,
+        area="orchestrator",
+        anchor=_ANCHOR,
+        primary_tag="h4",
+        first_seen="review-all-dark_factory-20261001",
+        supersedes=(_OLD_KEY,),
+        run_id=_REVIEW_ALL_RUN,
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"key": "fk-nothex"},
+        {"area": "orchestrator/merge-queue"},
+        {"anchor": "orchestrator/x.py:12"},
+        {"anchor": None},
+    ],
+    ids=["key", "area", "anchor-line-pin", "anchor-missing"],
+)
+def test_a_finding_without_a_valid_identity_is_skipped_and_counted(tmp_path, malformed):
+    bad = {**_review_all_finding(), **malformed}
+    _write(tmp_path, "plans/review-all-dark_factory-20261008.json", _contract_record(_REVIEW_ALL_RUN, bad))
+
+    found = prescreen.load_instrument_findings(tmp_path, "dark_factory")
+
+    assert found.findings == ()
+    assert found.consumed == (_REVIEW_ALL_RUN,)
+    assert found.note is not None
+    assert "1 finding" in found.note
+    assert "plans/review-all-dark_factory-20261008.json" in found.note
+
+
+def test_with_no_records_nothing_is_consumed_and_the_note_says_where_it_looked(tmp_path):
+    found = prescreen.load_instrument_findings(tmp_path, "dark_factory")
+
+    assert found.consumed == ()
+    assert found.findings == ()
+    assert found.note is not None
+    for named in ("/review", "review/reports", "/hotspot-survey", "/review-all", "plans"):
+        assert named in found.note
+
+
+@pytest.mark.parametrize(
+    "content, why",
+    [
+        ("{not json", "unreadable"),
+        ({"findings": []}, "method.run_id"),
+        ({"method": {"run_id": _REVIEW_ALL_RUN}, "findings": {}}, "findings"),
+        ([1, 2], "method.run_id"),
+    ],
+    ids=["bad-json", "no-run-id", "findings-not-a-list", "not-an-object"],
+)
+def test_an_unusable_newest_record_is_noted_never_consumed_and_never_raises(tmp_path, content, why):
+    _write(tmp_path, "plans/review-all-dark_factory-20261008.json", content)
+
+    found = prescreen.load_instrument_findings(tmp_path, "dark_factory")
+
+    assert found.consumed == ()
+    assert found.note is not None
+    assert "plans/review-all-dark_factory-20261008.json" in found.note
+    assert why in found.note
+
+
+def _loaded(tmp_path: Path) -> prescreen.InstrumentFindings:
+    _all_instruments(tmp_path)
+    return prescreen.load_instrument_findings(tmp_path, "dark_factory")
+
+
+def test_an_equal_key_is_adopted_with_the_external_supersedes_and_first_seen(tmp_path):
+    minted = census_findings.FindingIdentity.mint("orchestrator", _ANCHOR, ("h4", verdict.KIND_TAG))
+
+    adoption = _loaded(tmp_path).match(minted)
+
+    assert adoption is not None
+    assert adoption.matched_by is prescreen.AdoptedBy.KEY
+    assert adoption.identity == minted
+    assert adoption.supersedes == (_OLD_KEY,)
+    assert adoption.first_seen == "review-all-dark_factory-20261001"
+    assert adoption.external.run_id == _REVIEW_ALL_RUN
+
+
+def test_an_equal_location_is_adopted_with_only_the_key_replaced(tmp_path):
+    minted = _minted(tags=("h13", verdict.KIND_TAG))
+
+    adoption = _loaded(tmp_path).match(minted)
+
+    assert adoption is not None
+    assert adoption.matched_by is prescreen.AdoptedBy.LOCATION
+    assert adoption.identity == dataclasses.replace(minted, key=_EXTERNAL_KEY)
+    assert adoption.external.run_id == _REVIEW_ALL_RUN
+
+
+def test_an_equal_key_wins_over_an_equal_location(tmp_path):
+    _all_instruments(tmp_path)
+    elsewhere = finding_key("orchestrator", "orchestrator/y.py", "h4")
+    assert elsewhere != _EXTERNAL_KEY
+    _write(
+        tmp_path, "review/reports/review-dark_factory-20261009-2.json",
+        _contract_record(_REVIEW_RUN, _external(elsewhere, "orchestrator", _ANCHOR)),
+    )
+    minted = census_findings.FindingIdentity.mint("orchestrator", _ANCHOR, ("h4", verdict.KIND_TAG))
+
+    adoption = prescreen.load_instrument_findings(tmp_path, "dark_factory").match(minted)
+
+    assert adoption is not None
+    assert adoption.matched_by is prescreen.AdoptedBy.KEY
+    assert adoption.external.run_id == _REVIEW_ALL_RUN
+
+
+def test_an_unmatched_identity_adopts_nothing(tmp_path):
+    assert _loaded(tmp_path).match(_minted(anchor="orchestrator/x.py::g")) is None
