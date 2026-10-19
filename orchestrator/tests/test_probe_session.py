@@ -46,9 +46,15 @@ def test_a_probe_session_leaves_the_hosts_default_temp_root_untouched(
     output = run.stdout[-3000:] + run.stderr[-2000:]
     assert run.returncode == 0, output
     assert '1 passed' in run.stdout, output
-    assert len(list(basetemp.rglob('written'))) == 1, (
+    recorded = list(basetemp.rglob('inherited-temproot'))
+    assert len(recorded) == 1, (
         f'the probe must run under the basetemp it was given ({basetemp}); '
         f'found {_listing(basetemp) if basetemp.exists() else "no such dir"}'
+    )
+    assert recorded[0].read_text() == str(host), (
+        'the probe session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
+        'use the real host temp root and leave the stand-in untouched with or '
+        'without --basetemp: the assertion below would pass vacuously'
     )
     after = _listing(host)
     assert after == before, (
