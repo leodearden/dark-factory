@@ -1082,7 +1082,7 @@ test('pacing: a chip change still forces a paced WINDOWED endpoint, only the win
 
 test('pacing: requestOnDemand is never paced - a user action is not a poll loop, even handed a poll cadence in its deps', async () => {
   const server = makeVirtualServer({ [TASKS_PATH]: 4000 });
-  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
   const state = api.createPollState();
   const deps = { ...server.deps, pollIntervalMs: EXPECTED_POLL_INTERVAL_MS };
 
@@ -1090,6 +1090,7 @@ test('pacing: requestOnDemand is never paced - a user action is not a poll loop,
   await drain();
   await server.advanceTo(4000);
   assert.equal(await first, api.REFRESH_OUTCOMES.applied);
+  assert.deepEqual(Object.values(win.DF_DATA.__receipt).map(r => r.pacingHoldMs), [0], 'an on-demand success imposed a hold');
 
   const second = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
   await drain();
@@ -1119,6 +1120,78 @@ test('pacing: a service time inflated by a wall-clock jump can never hold an end
   api.pollTick(opts);
   await drain();
   assert.equal(server.count(CURATOR_PATH), 2, `held off past ${EXPECTED_BACKOFF_MAX_MS}ms after its request started`);
+});
+
+test('pacing: each success publishes the hold it imposed on its receipt — paced, capped and unpaced', async () => {
+  const server = makeVirtualServer({ [TASKS_PATH]: 3900 });
+  const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts);
+  await drain();
+  await server.advanceTo(3900);
+  assert.equal(win.DF_DATA.__receipt[TASKS_PATH].pacingHoldMs, 7800, 'a 3900ms answer holds twice its service time');
+  assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].pacingHoldMs, 0, 'a fast answer in the same cycle published a hold');
+
+  const jumpedServiceMs = 36_000_000;
+  const jumped = makeVirtualServer({ [CURATOR_PATH]: jumpedServiceMs });
+  const { api: jumpedApi, window: jumpedWin } = loadDataJs({ fetchStub: jumped.deps.fetchImpl });
+  jumpedApi.pollTick({ state: jumpedApi.createPollState(), deps: jumped.deps, jitterMaxMs: 0 });
+  await drain();
+  await jumped.advanceTo(jumpedServiceMs);
+  assert.equal(
+    jumpedWin.DF_DATA.__receipt[CURATOR_PATH].pacingHoldMs,
+    EXPECTED_BACKOFF_MAX_MS,
+    'the published hold is not the capped one the poll loop imposed',
+  );
+});
+
+// Advances the virtual clock to `t`, firing a poll tick when `t` lands on one.
+async function advanceAndTick(api, server, opts, t) {
+  await server.advanceTo(t);
+  if (t % EXPECTED_POLL_INTERVAL_MS !== 0) return;
+  api.pollTick(opts);
+  await drain();
+}
+
+test("pacing: a slow-but-healthy endpoint's plain tile never badges between landings, and badges once it stops answering past its paced bound", async () => {
+  // The bound datum.js::plainDatum gives an unpaced receipt, restated rather
+  // than imported so this pins the composed data.js -> datum.js behaviour.
+  const EXPECTED_PLAIN_BOUND_MS = 12_000;
+  const SAMPLE_MS = 250;
+  const HEALTHY_FOR_MS = 120_000;
+  // /tasks as measured 2026-09-23, then the band that badged before task 5832.
+  for (const serviceMs of [3886, 6000, 8500]) {
+    const server = makeVirtualServer({ [CURATOR_PATH]: serviceMs });
+    const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+    const opts = { state: api.createPollState(), deps: { ...server.deps, random: () => 0.99 } };
+    const { plainDatum, datumView } = win.DF_DATUM;
+    const tile = now => datumView(plainDatum(1, CURATOR_PATH, win.DF_DATA.__receipt), { now }).age;
+
+    let t = 0;
+    for (; t <= HEALTHY_FOR_MS; t += SAMPLE_MS) {
+      await advanceAndTick(api, server, opts, t);
+      if (!win.DF_DATA.__receipt[CURATOR_PATH]) continue;
+      const age = tile(t);
+      assert.equal(age, null, `${serviceMs}ms endpoint: its healthy tile badged '${age}' at t=${t}`);
+    }
+
+    // A hung request never aborts here (makeVirtualServer arms no deadline), so
+    // the in-flight guard skips every later tick. The request already in flight
+    // keeps its old service time, so let it land before reading the receipt.
+    server.serviceMs[CURATOR_PATH] = Infinity;
+    const inFlightLandedBy = t + serviceMs + EXPECTED_JITTER_MAX_MS + EXPECTED_POLL_INTERVAL_MS;
+    for (; t <= inFlightLandedBy; t += SAMPLE_MS) await advanceAndTick(api, server, opts, t);
+
+    const last = win.DF_DATA.__receipt[CURATOR_PATH];
+    assert.ok(last.pacingHoldMs > 0, `${serviceMs}ms endpoint: its last receipt published no pacing hold (${last.pacingHoldMs})`);
+    const overdueAt = last.receivedAt + EXPECTED_PLAIN_BOUND_MS + last.pacingHoldMs + 1000;
+    for (; t < overdueAt; t += SAMPLE_MS) await advanceAndTick(api, server, opts, t);
+    await server.advanceTo(overdueAt);
+
+    assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, last.receivedAt, `${serviceMs}ms endpoint: delivered after it stopped`);
+    assert.ok(tile(overdueAt), `${serviceMs}ms endpoint: silent ${overdueAt - last.receivedAt}ms and its tile did not badge`);
+  }
 });
 
 // ---------------------------------------------------------------------------
