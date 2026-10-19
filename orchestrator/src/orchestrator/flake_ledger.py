@@ -1183,6 +1183,11 @@ RESPONSIBILITY_REMOVE_FROM_LEDGER = (
 )
 
 
+def _deflake_title(row: DebtRow, observation: str) -> str:
+    """The one shape of a de-flake title: the test, what was observed, and the cycle."""
+    return f'Flake debt: {row.test_id} — {observation}, cycle {row.open_count}'
+
+
 def build_deflake_task_arguments(row: DebtRow) -> dict:
     """The ``submit_task`` argument block for the task that owns *row*'s debt (§5.9).
 
@@ -1212,20 +1217,19 @@ def build_deflake_task_arguments(row: DebtRow) -> dict:
       breaks for every non-standard path.  The adapter already HOLDS the project root and
       injects it (``chronic_flake.py::SchedulerChronicFlakeTaskClient.submit_task``).
 
-    The title carries the cycle ordinal from the second cycle on (the first cycle's
-    title is unchanged): the task store folds a submission whose title matches an
-    existing non-cancelled task, DONE ones included, so a re-entry filed under the
-    finished owner's title would be folded onto that done task and refused as no owner.
+    The title names the cycle on every cycle, the first included: the task store folds
+    a submission whose title matches an existing non-cancelled task, DONE ones
+    included, so a re-entry can never be filed under its finished owner's title, folded
+    onto that done task and refused as no owner.
 
     ``metadata.files`` is likewise omitted deliberately: a ``test_id`` may be a reify
     script-suite NAME rather than a path, and a wrong or over-wide concurrency lock
     derived from a guess is worse than no lock — the de-flake agent discovers the files.
     """
-    cycle = f' (cycle {row.open_count})' if row.open_count > 1 else ''
     return {
-        'title': (
-            f'Flake debt: {row.test_id}{cycle} — {FlakeVerdict.passes_in_isolation.value} '
-            f'after a merge-gate red was suppressed'
+        'title': _deflake_title(
+            row,
+            f'{FlakeVerdict.passes_in_isolation.value} after a merge-gate red was suppressed',
         ),
         'description': (
             f'The flake ledger recorded a `{FlakeVerdict.passes_in_isolation.value}` '
