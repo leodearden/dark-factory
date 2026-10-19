@@ -22,20 +22,27 @@ failed preflight.
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from shared.memory_eval_limits import LimitsConfig
+from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, metrics_artifact_path
+from shared.memory_eval_verdicts import RunnerFailureRecord
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.utils.target_store_preflight import TargetStoreMissing, assert_queue_dir_populated
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPTS_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'config' / 'memory-eval.yaml'
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / 'fused-memory' / 'data' / 'memory-evals'
+_STDERR_TAIL_CHARS = 2000
 
 EXIT_OK = 0
 EXIT_RUN_FAILED = 1
@@ -85,6 +92,91 @@ def resolve_recon_queue_dir(queue_dir_setting: str, repo_root: Path) -> Path:
     """The recon queue setting is relative to the repo root, fused-memory.service's WorkingDirectory."""
     setting = Path(queue_dir_setting)
     return setting if setting.is_absolute() else repo_root / setting
+
+
+ArgvBuilder = Callable[[Path, str, str], list[str]]
+"""``(artifact_root, eval_id, project_id) -> producer arguments``."""
+
+
+@dataclass(frozen=True)
+class Producer:
+    eval_id: str
+    script: Path
+    build_argv: ArgvBuilder
+
+
+def _probe_argv(root: Path, eval_id: str, project_id: str) -> list[str]:
+    return ['--out-root', str(root)]
+
+
+def _sweep_argv(root: Path, eval_id: str, project_id: str) -> list[str]:
+    return ['--metrics-root', str(root), '--eval-id', eval_id, '--project-id', project_id]
+
+
+DEFAULT_PRODUCERS: tuple[Producer, ...] = (
+    Producer('e1-retrieval-health', _SCRIPTS_DIR / 'memory_eval_retrieval_probe.py', _probe_argv),
+    Producer('e4-staleness-sweep', _SCRIPTS_DIR / 'memory_eval_staleness_sweep.py', _sweep_argv),
+    Producer('e6-corpus-health', _SCRIPTS_DIR / 'audit_duplicate_memories.py', _sweep_argv),
+)
+"""Every scheduled producer, run read-only: no argv here may carry --apply or --no-metrics."""
+
+
+def _text(stream: str | bytes | None) -> str:
+    if isinstance(stream, bytes):
+        return stream.decode('utf-8', errors='replace')
+    return stream or ''
+
+
+def _relay(producer: Producer, *streams: str | bytes | None) -> None:
+    print(f'--- producer {producer.eval_id} output ---', file=sys.stderr)
+    for stream in streams:
+        text = _text(stream)
+        if text:
+            sys.stderr.write(text if text.endswith('\n') else text + '\n')
+
+
+def _produce_failure(
+    producer: Producer,
+    error_type: str,
+    what: str,
+    stderr: str | bytes | None = None,
+    exit_code: int | None = None,
+) -> RunnerFailureRecord:
+    tail = _text(stderr)[-_STDERR_TAIL_CHARS:].strip()
+    message = f'{producer.script.name}: {what}' + (f'; stderr tail:\n{tail}' if tail else '')
+    return RunnerFailureRecord(
+        scope=producer.eval_id, phase='produce', error_type=error_type,
+        message=message, exit_code=exit_code,
+    )
+
+
+def run_producer(
+    producer: Producer, *, root: Path, stamp: str, project_id: str, timeout: float,
+) -> RunnerFailureRecord | None:
+    """Run one producer under the shared stamp; None when its series landed."""
+    argv = [sys.executable, str(producer.script), *producer.build_argv(root, producer.eval_id, project_id)]
+    try:
+        completed = subprocess.run(
+            argv, cwd=REPO_ROOT, env=os.environ | {RUN_STAMP_ENV_VAR: stamp},
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _relay(producer, exc.stdout, exc.stderr)
+        return _produce_failure(producer, 'TimeoutExpired', f'exceeded {timeout}s', exc.stderr)
+    except OSError as exc:
+        return _produce_failure(producer, type(exc).__name__, f'could not start: {exc}')
+    _relay(producer, completed.stdout, completed.stderr)
+    if completed.returncode != 0:
+        return _produce_failure(
+            producer, 'ProducerExit', f'exited {completed.returncode}',
+            completed.stderr, completed.returncode,
+        )
+    expected = metrics_artifact_path(root, producer.eval_id, stamp)
+    if not expected.is_file():
+        return _produce_failure(
+            producer, 'MissingArtifact', f'exited 0 without writing {expected}', completed.stderr, 0,
+        )
+    return None
 
 
 def _default_queue_dir() -> Path:
