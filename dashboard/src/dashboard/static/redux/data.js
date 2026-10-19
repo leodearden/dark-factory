@@ -482,7 +482,6 @@ function recordFailure(st, forced, deps) {
 // below that, the tick alone already holds the endpoint under the cap. Pacing
 // lives in nextAllowedAt, so the chip-change bypass covers it too. Pinned by
 // data_poll.test.mjs's "Slowness pacing" section.
-// Each hold rides the receipt, so datum.js::plainDatum never reads it as a stop.
 const MAX_POLL_DUTY_CYCLE = 0.5;
 
 // Pacing never holds an endpoint past BACKOFF_MAX_MS after its request started.

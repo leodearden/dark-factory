@@ -253,10 +253,13 @@ function datumView(datum, opts) {
 // 7.5s of headroom and never twitches; only a value overdue past its own cadence
 // badges. An absent or malformed hold reads as the base, failing toward badging.
 //
-// ORDERED FINE-THEN-COARSE, not aligned with endpoint_staleness.js's banner
-// (~21s of backoff): tile first per value, banner later per endpoint, one
-// authority each. Matching 21s would read as a duplicate of the banner; the
-// PRD's suggested 6s would badge a healthy tile whenever a jittered poll ran late.
+// THE BASE IS ORDERED FINE-THEN-COARSE, not aligned with endpoint_staleness.js's
+// banner (~21s of backoff): for an unpaced endpoint the tile badges first per
+// value and the banner explains later per endpoint, one authority each. A paced
+// bound can outlast the banner, so a paced endpoint that starts failing may
+// raise the banner first, which then names a real failure. Matching 21s would
+// read as a duplicate of the banner; the PRD's suggested 6s would badge a
+// healthy tile whenever a jittered poll ran late.
 const PLAIN_DATUM_BOUND_SECONDS = 12;
 
 function plainBoundSecondsFor(receipt) {
@@ -300,8 +303,6 @@ function plainBoundSecondsFor(receipt) {
 // `== null` and never `!value`: a measured 0 (or '' or false) IS a measurement.
 // `undefined` is in, because an optional-chained read (`x?.y`) is the commonest
 // way a missing payload field reaches a tile.
-//
-// THE BOUND IS PER RECEIPT: plainBoundSecondsFor, beside the base bound above.
 function plainDatum(value, endpointKey, receipts) {
   const receipt = endpointReceipt(endpointKey, receipts);
   if (!receipt) return unknownDatum('not yet fetched');
