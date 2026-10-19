@@ -50,9 +50,13 @@ async def test_every_prune_batch_seeks_between_its_resume_point_and_cutoff(journ
     )
 
 
-async def _seed(journal: WriteJournal, *, operation: str, kind: str, age_days: float) -> str:
+async def _seed(
+    journal: WriteJournal, *, operation: str, kind: str, age_days: float, success: bool = True
+) -> str:
+    """One stored row, aged. Since task 5405 a successful non-search read is
+    counted, not stored, so a read-horizon row is seeded as a failed read."""
     op_id = str(uuid.uuid4())
-    await journal.log_write_op(write_op_id=op_id, operation=operation, kind=kind)
+    await journal.log_write_op(write_op_id=op_id, operation=operation, kind=kind, success=success)
     created_at = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
     with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
         conn.execute('UPDATE write_ops SET created_at = ? WHERE id = ?', (created_at, op_id))
@@ -70,9 +74,15 @@ async def test_pass_takes_every_horizon_from_the_config(journal):
     config = WriteJournalConfig(
         read_retention_days=10, search_retention_days=15, write_retention_days=15
     )
-    rows = [('get_task', 'read'), ('search', 'read'), ('add_memory', 'write')]
-    aged = {await _seed(journal, operation=op, kind=kind, age_days=20) for op, kind in rows}
-    recent = {await _seed(journal, operation=op, kind=kind, age_days=5) for op, kind in rows}
+    rows = [('get_task', 'read', False), ('search', 'read', True), ('add_memory', 'write', True)]
+    aged = {
+        await _seed(journal, operation=op, kind=kind, success=ok, age_days=20)
+        for op, kind, ok in rows
+    }
+    recent = {
+        await _seed(journal, operation=op, kind=kind, success=ok, age_days=5)
+        for op, kind, ok in rows
+    }
 
     deleted = await prune_write_ops_pass(journal, config)
 
@@ -91,7 +101,7 @@ async def test_pass_takes_its_row_budget_from_the_config(journal):
         read_retention_days=10, prune_max_rows_per_run=1, prune_batch_size=1
     )
     for _ in range(2):
-        await _seed(journal, operation='get_task', kind='read', age_days=20)
+        await _seed(journal, operation='get_task', kind='read', success=False, age_days=20)
 
     assert await prune_write_ops_pass(journal, config) == 1
     assert len(_surviving_ids(journal)) == 1
@@ -103,7 +113,7 @@ async def test_the_next_pass_resumes_a_backlog_the_row_budget_left(journal):
         read_retention_days=10, prune_max_rows_per_run=2, prune_batch_size=1
     )
     for _ in range(4):
-        await _seed(journal, operation='get_task', kind='read', age_days=20)
+        await _seed(journal, operation='get_task', kind='read', success=False, age_days=20)
 
     assert await prune_write_ops_pass(journal, config) == 2
     assert await prune_write_ops_pass(journal, config) == 2
@@ -113,10 +123,10 @@ async def test_the_next_pass_resumes_a_backlog_the_row_budget_left(journal):
 @pytest.mark.asyncio
 async def test_each_horizon_resumes_where_the_last_pass_drained_it(journal):
     config = WriteJournalConfig(read_retention_days=10)
-    await _seed(journal, operation='get_task', kind='read', age_days=20)
+    await _seed(journal, operation='get_task', kind='read', success=False, age_days=20)
     assert await prune_write_ops_pass(journal, config) == 1
 
-    behind = await _seed(journal, operation='get_task', kind='read', age_days=30)
+    behind = await _seed(journal, operation='get_task', kind='read', success=False, age_days=30)
 
     assert await prune_write_ops_pass(journal, config) == 0, (
         'the second pass re-walked the range the first one drained; on the live '
@@ -138,7 +148,7 @@ async def test_each_horizon_resumes_where_the_last_pass_drained_it(journal):
 async def test_a_pass_without_the_kind_time_index_fails_loudly_instead_of_scanning(
     journal, caplog
 ):
-    aged = await _seed(journal, operation='get_task', kind='read', age_days=60)
+    aged = await _seed(journal, operation='get_task', kind='read', success=False, age_days=60)
     with contextlib.closing(sqlite3.connect(journal.db_path)) as conn:
         conn.execute('DROP INDEX idx_wo_kind_time')
 

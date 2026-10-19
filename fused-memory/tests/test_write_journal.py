@@ -2137,6 +2137,17 @@ async def test_search_read_keeps_its_raw_row_and_is_not_counted(journal):
 
 
 @pytest.mark.asyncio
+async def test_a_search_given_another_kind_is_stored_once_as_a_read_and_not_counted(journal):
+    await journal.log_write_op(
+        write_op_id='search-as-write', operation='search', kind='write', project_id='p'
+    )
+
+    rows = await _write_ops_rows(journal)
+    assert [(row['id'], row['kind']) for row in rows] == [('search-as-write', 'read')]
+    assert await _read_op_counts_rows(journal) == []
+
+
+@pytest.mark.asyncio
 async def test_failed_read_keeps_its_raw_row_with_the_error_and_is_not_counted(journal):
     await journal.log_write_op(
         write_op_id='failed-1',
