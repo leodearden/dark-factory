@@ -343,7 +343,8 @@ def _raw_insert(db_path: Path, **overrides) -> None:
 
 
 class TestShadowCellsSchemaRedundancy:
-    """The DDL refuses rows that bypass ShadowCell: it is the contract every writer meets."""
+    """A raw writer bypassing ShadowCell meets the DDL's NOT NULL, reason, cost, owner and
+    self-parent rules; enum membership is refused only on read."""
 
     @pytest.mark.parametrize(
         'overrides',

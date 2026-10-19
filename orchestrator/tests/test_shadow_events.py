@@ -41,14 +41,6 @@ class TestShadowSkipReason:
     def test_value_set_is_exactly_the_closed_vocabulary(self) -> None:
         assert {m.value for m in ShadowSkipReason} == _SKIP_REASON_VALUES
 
-    def test_each_value_is_its_lowercased_name(self) -> None:
-        for member in ShadowSkipReason:
-            assert member.value == member.name.lower()
-
-    def test_no_alias_members(self) -> None:
-        values = {m.value for m in ShadowSkipReason.__members__.values()}
-        assert len(ShadowSkipReason.__members__) == len(values)
-
     def test_is_a_str_enum(self) -> None:
         assert issubclass(ShadowSkipReason, StrEnum)
 

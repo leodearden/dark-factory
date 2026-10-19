@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 import yaml
@@ -27,7 +26,6 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
-from orchestrator.run_store import RunStore
 from orchestrator.shadow_types import ShadowShape
 
 _FULL_BLOCK = {
@@ -184,8 +182,6 @@ class TestHarnessReload:
         config_path.write_text(yaml.safe_dump({'shadow_eval': {'enabled': False}}))
         monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
         harness = Harness(load_config())
-        harness._run_store = MagicMock(spec=RunStore)
-        harness._run_id = 'run-test-0001'
         harness.event_store = EventStore(tmp_path / 'events.db', 'run-test-0001')
 
         config_path.write_text(yaml.safe_dump({
