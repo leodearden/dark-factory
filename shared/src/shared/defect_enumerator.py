@@ -9,10 +9,14 @@ rules only, so a project that overrides them is a known, fail-safe limit.
 from __future__ import annotations
 
 import ast
+import os
 import posixpath
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from fnmatch import fnmatchcase
+from pathlib import Path
 from types import MappingProxyType
 
 from shared.defects import MalformedDefectRef, NodeId, parse_ref
@@ -25,13 +29,21 @@ __all__ = [
     'FileEnumeration',
     'GapReason',
     'NonStaticMark',
+    'TreeEnumeration',
     'enumerate_source',
+    'enumerate_tree',
+    'is_test_file',
 ]
 
 _DEFECT_MARKER = 'defect'
+_CONSTRUCTORS = frozenset({'__init__', '__new__'})
+
+# pytest 9.0.3's defaults: python_files, python_functions and python_classes (_pytest/python.py),
+# and norecursedirs (_pytest/main.py). All matching is case-sensitive.
+_PYTHON_FILES = ('test_*.py', '*_test.py')
 _TEST_FUNCTION_PREFIX = 'test'
 _TEST_CLASS_PREFIX = 'Test'
-_CONSTRUCTORS = frozenset({'__init__', '__new__'})
+_NORECURSE_DIRS = ('*.egg', '.*', '_darcs', 'build', 'CVS', 'dist', 'node_modules', 'venv', '{arch}')
 
 
 class DisablingMark(StrEnum):
@@ -253,3 +265,87 @@ def enumerate_source(path: str, source: str | bytes, *, module_root: str) -> Fil
         return NodeId(module_root=module_root, path=relative_path, name=name)
 
     return _enumerate_module(path, node_of, tree)
+
+
+@dataclass(frozen=True)
+class TreeEnumeration:
+    """An aggregation of FileEnumerations, one per distinct path and held in path order."""
+
+    files: tuple[FileEnumeration, ...]
+
+    def __post_init__(self) -> None:
+        counts = Counter(file.path for file in self.files)
+        duplicated = sorted(path for path, count in counts.items() if count > 1)
+        if duplicated:
+            raise ValueError(f'TreeEnumeration holds more than one enumeration of {duplicated}')
+        object.__setattr__(self, 'files', tuple(sorted(self.files, key=lambda file: file.path)))
+
+    @property
+    def carriers(self) -> Mapping[str, tuple[Carrier, ...]]:
+        """Every file's carriers merged per ref: refs sorted, carriers in path then source order."""
+        merged: dict[str, list[Carrier]] = {}
+        for file in self.files:
+            for ref, carriers in file.carriers.items():
+                merged.setdefault(ref, []).extend(carriers)
+        return MappingProxyType({ref: tuple(merged[ref]) for ref in sorted(merged)})
+
+    @property
+    def runnable_refs(self) -> frozenset[str]:
+        return frozenset(
+            ref for ref, carriers in self.carriers.items() if any(carrier.runnable for carrier in carriers)
+        )
+
+    @property
+    def non_static_refs(self) -> frozenset[str]:
+        return frozenset(mark.ref for file in self.files for mark in file.non_static)
+
+    @property
+    def incomplete_files(self) -> tuple[str, ...]:
+        return tuple(file.path for file in self.files if not file.complete)
+
+    @property
+    def complete(self) -> bool:
+        return not self.incomplete_files
+
+
+def is_test_file(path: str) -> bool:
+    """Whether pytest's default python_files collects the file at *path*."""
+    name = posixpath.basename(path)
+    return any(fnmatchcase(name, pattern) for pattern in _PYTHON_FILES)
+
+
+def _is_norecurse(directory_name: str) -> bool:
+    return any(fnmatchcase(directory_name, pattern) for pattern in _NORECURSE_DIRS)
+
+
+def _refuse_unlistable(error: OSError) -> None:
+    raise error
+
+
+def _test_file_paths(root: Path) -> list[str]:
+    """Tree-relative POSIX paths of every test file under *root*, sorted; an unlistable directory raises."""
+    paths: list[str] = []
+    for directory, directory_names, file_names in os.walk(root, onerror=_refuse_unlistable, followlinks=False):
+        directory_names[:] = [name for name in directory_names if not _is_norecurse(name)]
+        relative = Path(directory).relative_to(root)
+        paths.extend((relative / name).as_posix() for name in file_names if is_test_file(name))
+    return sorted(paths)
+
+
+def _enumerate_file(root: Path, path: str, module_root: str) -> FileEnumeration:
+    try:
+        source = (root / path).read_bytes()
+    except OSError:
+        return FileEnumeration(path, {}, gaps=(EnumerationGap(GapReason.UNREADABLE_FILE, None),))
+    return enumerate_source(path, source, module_root=module_root)
+
+
+def enumerate_tree(root: Path, *, module_root_of: Callable[[str], str]) -> TreeEnumeration:
+    """Enumerate every test file pytest's default rules would collect under *root*.
+
+    *module_root_of* maps each tree-relative path to the module root that qualifies its NodeIds.
+    A file that cannot be read is an UNREADABLE_FILE gap, so the walk always covers the rest.
+    """
+    return TreeEnumeration(tuple(
+        _enumerate_file(root, path, module_root_of(path)) for path in _test_file_paths(root)
+    ))

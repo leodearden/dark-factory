@@ -671,3 +671,8 @@ def test_an_unreadable_test_file_is_an_unreadable_file_gap_and_the_walk_continue
         _file('a/test_ok.py', _MARKED),
     )
     assert tree.incomplete_files == ('a/test_gone.py',)
+
+
+def test_enumerate_tree_refuses_a_root_it_cannot_list(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        enumerate_tree(tmp_path / 'missing', module_root_of=_dot_root)
