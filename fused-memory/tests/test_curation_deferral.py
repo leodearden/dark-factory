@@ -16,117 +16,69 @@ from fused_memory.middleware.curation_deferral import (
     pool_defer_reason,
 )
 
-SUBMITTED = datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC)
+NOW = datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC)
 
 
-def _policy(base: float = 60.0, max_backoff: float = 1800.0, bound: float = 1800.0) -> DeferralPolicy:
-    return DeferralPolicy(
-        backoff_base_seconds=base, backoff_max_seconds=max_backoff, max_defer_seconds=bound,
-    )
+def _policy(base: float = 60.0, max_backoff: float = 1800.0) -> DeferralPolicy:
+    return DeferralPolicy(backoff_base_seconds=base, backoff_max_seconds=max_backoff)
 
 
 class TestDeferralPolicy:
     def test_first_retry_waits_the_base(self):
-        now = SUBMITTED + timedelta(seconds=5)
-
-        assert _policy().next_attempt_at(attempts=1, submitted_at=SUBMITTED, now=now) == (
-            now + timedelta(seconds=60)
-        )
+        assert _policy().next_attempt_at(attempts=1, now=NOW) == NOW + timedelta(seconds=60)
 
     def test_retries_double_up_to_the_max(self):
-        policy = _policy(base=60.0, max_backoff=300.0, bound=100_000.0)
-        now = SUBMITTED
+        policy = _policy(base=60.0, max_backoff=300.0)
 
         delays = [
-            (policy.next_attempt_at(attempts=n, submitted_at=SUBMITTED, now=now) - now).total_seconds()
+            (policy.next_attempt_at(attempts=n, now=NOW) - NOW).total_seconds()
             for n in range(1, 8)
         ]
 
         assert delays == [60.0, 120.0, 240.0, 300.0, 300.0, 300.0, 300.0]
 
     def test_a_huge_attempt_count_waits_the_max(self):
-        policy = _policy(base=60.0, max_backoff=300.0, bound=100_000.0)
+        policy = _policy(base=60.0, max_backoff=300.0)
 
-        at = policy.next_attempt_at(attempts=5000, submitted_at=SUBMITTED, now=SUBMITTED)
+        assert policy.next_attempt_at(attempts=5000, now=NOW) == NOW + timedelta(seconds=300)
 
-        assert at == SUBMITTED + timedelta(seconds=300)
+    def test_retries_continue_at_the_max_however_long_the_deferral(self):
+        policy = _policy(base=60.0, max_backoff=1800.0)
+        days_later = NOW + timedelta(days=3)
 
-    def test_a_retry_never_lands_after_the_deadline(self):
-        policy = _policy(base=60.0, max_backoff=1800.0, bound=1800.0)
-        now = SUBMITTED + timedelta(seconds=1700)
-
-        at = policy.next_attempt_at(attempts=3, submitted_at=SUBMITTED, now=now)
-
-        assert at == policy.deadline(SUBMITTED) == SUBMITTED + timedelta(seconds=1800)
-
-    def test_a_retry_after_the_deadline_is_due_at_the_deadline(self):
-        policy = _policy()
-        now = SUBMITTED + timedelta(seconds=5000)
-
-        assert policy.next_attempt_at(attempts=2, submitted_at=SUBMITTED, now=now) == (
-            policy.deadline(SUBMITTED)
+        assert policy.next_attempt_at(attempts=200, now=days_later) == (
+            days_later + timedelta(seconds=1800)
         )
 
     def test_attempts_counts_the_deferral_being_recorded(self):
         with pytest.raises(ValueError, match='attempts'):
-            _policy().next_attempt_at(attempts=0, submitted_at=SUBMITTED, now=SUBMITTED)
-
-    def test_expired_at_and_after_the_deadline(self):
-        policy = _policy(bound=1800.0)
-
-        assert not policy.expired(SUBMITTED, SUBMITTED + timedelta(seconds=1799.999))
-        assert policy.expired(SUBMITTED, SUBMITTED + timedelta(seconds=1800))
-        assert policy.expired(SUBMITTED, SUBMITTED + timedelta(seconds=1801))
+            _policy().next_attempt_at(attempts=0, now=NOW)
 
     def test_naive_datetimes_are_rejected(self):
-        policy = _policy()
-        naive = datetime(2026, 10, 18, 12, 0, 0)
-
         with pytest.raises(ValueError, match='timezone'):
-            policy.deadline(naive)
-        with pytest.raises(ValueError, match='timezone'):
-            policy.expired(SUBMITTED, naive)
-        with pytest.raises(ValueError, match='timezone'):
-            policy.expired(naive, SUBMITTED)
-        with pytest.raises(ValueError, match='timezone'):
-            policy.next_attempt_at(attempts=1, submitted_at=naive, now=SUBMITTED)
-        with pytest.raises(ValueError, match='timezone'):
-            policy.next_attempt_at(attempts=1, submitted_at=SUBMITTED, now=naive)
+            _policy().next_attempt_at(attempts=1, now=datetime(2026, 10, 18, 12, 0, 0))
 
     @pytest.mark.parametrize(
-        ('base', 'max_backoff', 'bound', 'named'),
+        ('base', 'max_backoff', 'named'),
         [
-            (0.0, 1800.0, 1800.0, ('0.0',)),
-            (60.0, -1.0, 1800.0, ('-1.0',)),
-            (60.0, 1800.0, 0.0, ('0.0',)),
-            (float('nan'), 1800.0, 1800.0, ('nan',)),
-            (120.0, 90.0, 1800.0, ('120.0', '90.0')),
+            (0.0, 1800.0, ('0.0',)),
+            (60.0, -1.0, ('-1.0',)),
+            (float('nan'), 1800.0, ('nan',)),
+            (120.0, 90.0, ('120.0', '90.0')),
         ],
-        ids=['zero-base', 'negative-max', 'zero-bound', 'nan-base', 'max-below-base'],
+        ids=['zero-base', 'negative-max', 'nan-base', 'max-below-base'],
     )
-    def test_non_positive_or_inverted_bounds_are_rejected(self, base, max_backoff, bound, named):
+    def test_non_positive_or_inverted_bounds_are_rejected(self, base, max_backoff, named):
         with pytest.raises(ValueError) as excinfo:
-            _policy(base=base, max_backoff=max_backoff, bound=bound)
+            _policy(base=base, max_backoff=max_backoff)
 
         for value in named:
             assert value in str(excinfo.value)
 
     def test_from_config_reads_the_curator_knobs(self):
-        curator = CuratorConfig(
-            deferral_backoff_base_seconds=7.0,
-            deferral_backoff_max_seconds=70.0,
-            deferral_max_seconds=700.0,
-        )
+        curator = CuratorConfig(deferral_backoff_base_seconds=7.0, deferral_backoff_max_seconds=70.0)
 
-        assert DeferralPolicy.from_config(curator) == _policy(base=7.0, max_backoff=70.0, bound=700.0)
-
-    def test_give_up_justification_names_bound_and_reason(self):
-        assert _policy(bound=1800.0).give_up_justification(DeferReason.ALL_ACCOUNTS_CAPPED) == (
-            'curation-gave-up after 1800s: all-accounts-capped'
-        )
-        assert _policy(bound=90.5).give_up_justification(DeferReason.ACCOUNTS_AUTH_FAILED) == (
-            'curation-gave-up after 90.5s: accounts-auth-failed'
-        )
+        assert DeferralPolicy.from_config(curator) == _policy(base=7.0, max_backoff=70.0)
 
 
 def _frozen(*, capped=(), auth_failed=(), scope=None) -> PoolFrozen:
@@ -172,18 +124,18 @@ class TestDedupeSkippedMarker:
     def test_marker_shape_and_utc_at(self):
         at = datetime(2026, 10, 18, 14, 30, 0, tzinfo=timezone(timedelta(hours=2)))
 
-        marker = dedupe_skipped_marker('curation-gave-up after 1800s: all-accounts-capped', at=at)
+        marker = dedupe_skipped_marker('create: llm-failed: TimeoutError', at=at)
 
         assert marker == {
             DEDUPE_SKIPPED_KEY: {
-                'reason': 'curation-gave-up after 1800s: all-accounts-capped',
+                'reason': 'create: llm-failed: TimeoutError',
                 'at': '2026-10-18T12:30:00+00:00',
             },
         }
         assert DEDUPE_SKIPPED_KEY == 'dedupe_skipped'
 
     def test_reason_truncated_to_500(self):
-        marker = dedupe_skipped_marker('x' * 501, at=SUBMITTED)
+        marker = dedupe_skipped_marker('x' * 501, at=NOW)
 
         assert marker[DEDUPE_SKIPPED_KEY]['reason'] == 'x' * 500
 

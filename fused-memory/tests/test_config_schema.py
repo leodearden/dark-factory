@@ -1804,12 +1804,11 @@ class TestCurationDeferralConfig:
         cfg = CuratorConfig()
         assert cfg.deferral_backoff_base_seconds == 60.0
         assert cfg.deferral_backoff_max_seconds == 1800.0
-        assert cfg.deferral_max_seconds == 1800.0
         assert TicketJanitorConfig().curation_backlog_escalation_min_attempts == 2
 
     @pytest.mark.parametrize(
         'field',
-        ['deferral_backoff_base_seconds', 'deferral_backoff_max_seconds', 'deferral_max_seconds'],
+        ['deferral_backoff_base_seconds', 'deferral_backoff_max_seconds'],
     )
     @pytest.mark.parametrize('value', [0.0, -1.0])
     def test_seconds_must_be_positive(self, field, value):
@@ -1835,6 +1834,9 @@ class TestCurationDeferralConfig:
     def test_backoff_max_equal_to_base_is_accepted(self):
         cfg = CuratorConfig(deferral_backoff_base_seconds=90.0, deferral_backoff_max_seconds=90.0)
         assert cfg.deferral_backoff_max_seconds == 90.0
+
+    def test_there_is_no_terminal_deferral_bound(self):
+        assert 'deferral_max_seconds' not in CuratorConfig.model_fields
 
     def test_none_is_hot_reloadable(self):
         from fused_memory.config.reload import RELOADABLE_FIELDS

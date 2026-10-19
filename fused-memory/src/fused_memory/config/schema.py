@@ -2181,9 +2181,8 @@ class TicketJanitorConfig(BaseModel):
     info-severity ``ticket_failure`` escalation per batch.
 
     It is also the only retrier of tickets parked ``awaiting_curation``, so
-    ``enabled=False`` strands them: they are never retried and never reach
-    ``CuratorConfig.deferral_max_seconds``, as a dead worker's pending rows
-    are never reaped.
+    ``enabled=False`` strands them: they are never retried, as a dead
+    worker's pending rows are never reaped.
     """
 
     enabled: bool = Field(default=True)
@@ -2425,12 +2424,11 @@ class CuratorConfig(BaseModel):
     degraded_streak_threshold: int = Field(default=5, ge=1)
 
     # A submission the account pool could not serve parks awaiting_curation and
-    # is retried on this backoff; deferral_max_seconds, measured from the
-    # ticket's submission, is the terminal bound past which it is created
-    # marked dedupe_skipped (fused_memory/middleware/curation_deferral.py).
+    # is retried on this backoff until an attempt yields a verdict; the max is
+    # the retry-interval cap, not a bound on how long a ticket stays parked
+    # (fused_memory/middleware/curation_deferral.py).
     deferral_backoff_base_seconds: float = Field(default=60.0, gt=0)
     deferral_backoff_max_seconds: float = Field(default=1800.0, gt=0)
-    deferral_max_seconds: float = Field(default=1800.0, gt=0)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching

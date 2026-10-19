@@ -935,7 +935,7 @@ class TestDedupHealthWindow:
 # ---------------------------------------------------------------------------
 
 
-_POLICY = DeferralPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0, max_defer_seconds=1800.0)
+_POLICY = DeferralPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0)
 
 
 def _rewrite_row(db_path, ticket_id: str, **columns) -> None:
@@ -1022,18 +1022,18 @@ class TestCurationParking:
         assert row['task_id'] is None
 
     @pytest.mark.asyncio
-    async def test_park_schedules_by_policy_and_clamps_to_the_deadline(self, store):
+    async def test_park_schedules_by_policy(self, store):
         tid = await store.submit('p', '{}')
         submitted = await _submitted_at(store, tid)
 
         await _park(store, tid, after_seconds=10.0)
         first = await store.get(tid)
         assert await store.requeue_awaiting_curation(tid) is True
-        assert await _park(store, tid, after_seconds=1750.0) == 2
+        assert await _park(store, tid, after_seconds=5000.0) == 2
         second = await store.get(tid)
 
         assert datetime.fromisoformat(first['next_attempt_at']) == submitted + timedelta(seconds=70)
-        assert datetime.fromisoformat(second['next_attempt_at']) == submitted + timedelta(seconds=1800)
+        assert datetime.fromisoformat(second['next_attempt_at']) == submitted + timedelta(seconds=5120)
 
     @pytest.mark.asyncio
     async def test_park_refuses_a_non_pending_row(self, store):

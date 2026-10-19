@@ -351,17 +351,13 @@ class TicketStore:
         now = datetime.now(UTC) if now is None else now
         async with self._require_access().write() as db:
             row = next(iter(await db.execute_fetchall(
-                "SELECT created_at, attempts FROM tickets WHERE ticket_id = ? AND status = 'pending'",
+                "SELECT attempts FROM tickets WHERE ticket_id = ? AND status = 'pending'",
                 (ticket_id,),
             )), None)
             if row is None:
                 return None
             attempts = row['attempts'] + 1
-            next_attempt_at = policy.next_attempt_at(
-                attempts=attempts,
-                submitted_at=datetime.fromisoformat(row['created_at']),
-                now=now,
-            )
+            next_attempt_at = policy.next_attempt_at(attempts=attempts, now=now)
             await db.execute(
                 """
                 UPDATE tickets
