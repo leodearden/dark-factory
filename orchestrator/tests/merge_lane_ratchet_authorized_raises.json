@@ -3403,6 +3403,24 @@
           "current": 6557
         }
       ]
+    },
+    {
+      "task_id": "3113",
+      "reason": "Net-additive regression test: TestFinaliseMergedDoneWithoutMergeSha pins that a sha-less merge success resolves through the landed-outbox journal. It must live in this file because it needs the module's autouse MergeProvenance reset, and its one private read is the call to _finalise_merged_done, the method under test; the basis-marker read was cut.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_workflow_merge_provenance.py",
+          "baseline": 88,
+          "current": 89
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6542,
+          "current": 6543
+        }
+      ]
     }
   ]
 }

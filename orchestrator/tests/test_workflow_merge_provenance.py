@@ -933,7 +933,8 @@ class TestFinaliseMergedDoneWithoutMergeSha:
     ):
         """The restart-replay class: an orphan's landing journalled a LandedRow
         before main advanced, so the DONE tail stamps ``merged`` from the row.
-        ``_make`` leaves ``_merge_sha`` unset, which is the sha-less shape."""
+        ``_make`` leaves ``_merge_sha`` unset, which is the sha-less shape, and
+        the journal-only note pins the arm that stamped it."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         _bind_landed_row(tmp_path, task_id=f.wf.task_id, advanced_sha='advsha')
         f.is_ancestor.side_effect = AssertionError(
@@ -948,7 +949,6 @@ class TestFinaliseMergedDoneWithoutMergeSha:
             f.wf.task_id, kind='merged', sha='advsha',
             note='landed-outbox journal hit (post-MERGE recovery)',
         )
-        assert f.wf._merge_recovery_basis == 'journal'
         assert queue.get_by_task(f.wf.task_id) == []
 
 

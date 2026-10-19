@@ -4501,8 +4501,11 @@ class TaskWorkflow:
         and ``_set_task_scope()``.
 
         Derives the module set from *plan_files*; if it already matches
-        ``self.modules`` this is a no-op (returns an applied result without
-        touching the scheduler). Otherwise asks the scheduler to expand/reconcile the lock
+        ``self.modules`` the locks are left alone and an applied result is
+        returned, but a ``metadata.files`` whose module set diverges from the
+        plan's is first repaired from *plan_files*
+        (:meth:`_heal_metadata_files_if_diverged`, task 3113). Otherwise asks
+        the scheduler to expand/reconcile the lock
         via ``handle_blast_radius_expansion`` (``persist_files=plan_files`` —
         this call persists ``metadata.files=plan_files`` on EVERY successful
         refinement (widen, narrow, or shift) AND on the lock-conflict/requeue
@@ -4520,6 +4523,7 @@ class TaskWorkflow:
             plan_files, self.config.lock_depth, task_id=self.task_id,
         )
         if set(new_modules) == set(self.modules):
+            await self._heal_metadata_files_if_diverged(plan_files, new_modules)
             return BlastRadiusResult(applied=True)
         expansion = await self.scheduler.handle_blast_radius_expansion(
             self.task_id, self.modules, new_modules,
@@ -4534,6 +4538,48 @@ class TaskWorkflow:
         self.modules = new_modules
         self._module_configs = self._resolve_module_configs()
         return expansion
+
+    async def _heal_metadata_files_if_diverged(
+        self, plan_files: list[str], plan_modules: list[str],
+    ) -> bool:
+        """Restore ``metadata.files`` from *plan_files* when their module sets differ (task 3113).
+
+        Compared at module granularity like :meth:`_check_scope_invariant`, but
+        on set EQUALITY rather than that tripwire's directional containment
+        (task 3429): it also repairs the superset shape the tripwire tolerates,
+        and after a heal the tripwire is silent by construction.  The restore
+        direction is FROM plan.files, the authoritative source, whose persisted
+        mirror ``metadata.files`` is (module_charter Contract 1).  The
+        predicate is divergence, not emptiness: reify 5602 re-dispatched with a
+        non-empty but wrong record.  Fail-open: a failed write is logged and
+        leaves the record as it was, so a repair never fails a plan, and the
+        MERGE-entry tripwire stays the backstop.  Returns whether it healed.
+        """
+        recorded = (self.task.get('metadata') or {}).get('files') or []
+        recorded_modules = derive_modules(
+            recorded, self.config.lock_depth, task_id=self.task_id,
+        )
+        if set(recorded_modules) == set(plan_modules):
+            return False
+        logger.warning(
+            'Task %s: metadata.files diverges from plan.files at the plan '
+            'boundary — healing from plan.files. metadata files=%s modules=%s; '
+            'plan files=%s modules=%s',
+            self.task_id, recorded, sorted(recorded_modules),
+            plan_files, sorted(plan_modules),
+        )
+        try:
+            await self._persist_metadata_files(
+                plan_files, log_context='scope heal (unchanged lock set)',
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: metadata.files heal write failed (%s); leaving the '
+                'record for the MERGE-entry tripwire',
+                self.task_id, exc,
+            )
+            return False
+        return True
 
     async def _set_task_scope(self, new_files: list[str]) -> BlastRadiusResult:
         """Orchestrator-side single choke point for widening a task's file
@@ -5329,9 +5375,7 @@ class TaskWorkflow:
             f'from {len(plan_files)} files: {plan_modules}'
         )
 
-        if set(plan_modules) != set(self.modules) and not (
-            expansion := await self._reconcile_scope_locks(plan_files)
-        ).applied:
+        if not (expansion := await self._reconcile_scope_locks(plan_files)).applied:
             # Annotate the requeue so the per-task retry-cap report can
             # name *why* — without this, three blast-radius requeues in a
             # row produce a cap-exhaust report with phase/reason='unknown'
@@ -5341,7 +5385,7 @@ class TaskWorkflow:
                 'Plan expansion',
             )
         # self.modules/_module_configs already updated by
-        # _reconcile_scope_locks on success (no-op if scope unchanged).
+        # _reconcile_scope_locks on success (unchanged if the module set is).
 
         # Write plan decisions to memory
         await self._write_decisions_to_memory()
@@ -5497,12 +5541,7 @@ class TaskWorkflow:
         # overlapping module — fall through to the architect path which
         # already handles the requeue case.
         plan_files = plan.get('files', [])
-        plan_modules = derive_modules(
-            plan_files, self.config.lock_depth, task_id=self.task_id,
-        )
-        if set(plan_modules) != set(self.modules) and not (
-            scope := await self._reconcile_scope_locks(plan_files)
-        ).applied:
+        if not (scope := await self._reconcile_scope_locks(plan_files)).applied:
             logger.info(
                 'Task %s: revalidation skip declined — blast-radius '
                 'expansion denied (re-pend error: %r)',
@@ -5510,7 +5549,7 @@ class TaskWorkflow:
             )
             return None
         # self.modules/_module_configs already updated by
-        # _reconcile_scope_locks on success (no-op if scope unchanged).
+        # _reconcile_scope_locks on success (unchanged if the module set is).
 
         # Bump revalidation stamp + base commit (mirrors confirm_plan).
         try:
@@ -5698,14 +5737,10 @@ class TaskWorkflow:
         # case where the SIMPLE_TASK agent expanded scope by one file).
         plan_files = self.plan.get('files', [])
         if plan_files:
-            plan_modules = derive_modules(
-                plan_files, self.config.lock_depth, task_id=self.task_id,
-            )
-            if set(plan_modules) != set(self.modules):
-                # Silent no-op on lock conflict (same as before this was
-                # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
-                # fail out here, it just doesn't re-tighten the lock.
-                await self._reconcile_scope_locks(plan_files)
+            # Silent no-op on lock conflict (same as before this was
+            # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
+            # fail out here, it just doesn't re-tighten the lock.
+            await self._reconcile_scope_locks(plan_files)
 
         await self._stamp_optimistic_path('simple_task')
 
