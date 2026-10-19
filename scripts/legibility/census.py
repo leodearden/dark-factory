@@ -3086,6 +3086,8 @@ def run_census(
     promoted: list[census_findings.Adjudication] = []
     refuted: list[census_findings.Adjudication] = []
     promoted_entry_ids: dict[int, str] = {}
+    key_attaches: list[prescreen.KeyAttach] = []
+    filed_under_standing: dict[int, dict] = {}
 
     for index, cluster in enumerate(verified):
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -3113,6 +3115,20 @@ def run_census(
                 promoted_entry_ids[index] = standing_entry_id
             continue
         found = cluster["verdict"]
+        # The key rule (plans/census-incremental-prd.md L6): a verdict at an
+        # entry's (area, anchor), this run's promotions included, attaches to
+        # that entry, which keeps its key, instead of promoting a duplicate.
+        standing = prescreen.keyed_entry(updated_codebook, cluster["finding"])
+        if standing is not None:
+            updated_codebook, key_attach = prescreen.attach_by_key(
+                updated_codebook, cand_id, standing, found, run_id=run_id,
+            )
+            key_attaches.append(key_attach)
+            promoted_entry_ids[index] = key_attach.entry_id
+            filed_under_standing[index] = {**cluster, "finding": key_attach.identity}
+            if key_attach.entry_id not in {adjudication.record_id for adjudication in promoted}:
+                promoted.append(census_findings.Adjudication(key_attach.entry_id, found, cluster.get("cause")))
+            continue
         entry_fields = {
             "id": f"entry-{cand_id}",
             "title": cluster.get("title"),
@@ -3134,7 +3150,7 @@ def run_census(
         promoted_entry_ids[index] = entry_fields["id"]
 
     fileable = [
-        (cluster, promoted_entry_ids.get(index))
+        (filed_under_standing.get(index, cluster), promoted_entry_ids.get(index))
         for index, (cluster, fileable_now) in enumerate(zip(verified, files_now, strict=True))
         if fileable_now
     ]
@@ -3315,7 +3331,9 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
-    screen_report = prescreen.ScreenReport(screen, (), (), prescreen.InstrumentFindings((), None, ()))
+    screen_report = prescreen.ScreenReport(
+        screen, tuple(key_attaches), (), prescreen.InstrumentFindings((), None, ()),
+    )
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
