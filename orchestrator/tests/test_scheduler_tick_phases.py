@@ -16,9 +16,9 @@ import pytest
 from _recording_event_store import _RecordingEventStore
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
+from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, apply_reload
 from orchestrator.overrides import OverrideRow, OverrideStore
-from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext, TickOutcome
+from orchestrator.scheduler import _CONTINUE, PsiHold, Scheduler, TickContext, TickOutcome
 
 
 @pytest.fixture
@@ -64,7 +64,7 @@ class TestTickContextShape:
         assert default_ctx.candidates == []
         assert default_ctx.gated_ids == set()
         assert default_ctx.stale_ids == set()
-        assert default_ctx.psi_hold is False
+        assert default_ctx.psi_hold is None
         assert default_ctx.dispatch_deferred_emitted is False
 
 
@@ -702,11 +702,15 @@ class TestSelectionPhases:
             candidates=[scored_task],
             overrides={'P': pinned_row},
             effective_priorities={'P': 'medium', 'S': 'medium'},
-            psi_sample=PsiSample(
-                cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0,
-                io_some10=0.0, read_ok=True,
+            psi_hold=PsiHold(
+                metric='cpu_some_avg10',
+                sample=PsiSample(
+                    cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0,
+                    io_some10=0.0, read_ok=True,
+                ),
+                in_flight=1,
+                floor=1,
             ),
-            psi_hold=True,
         )
 
         pins_result = await scheduler._phase_select_pins(ctx)
@@ -736,20 +740,73 @@ class TestSelectionPhases:
         """DA-D6 fail-open: an unreadable PSI sample (``read_ok=False``) must
         never hold dispatch, even though every raw metric looks saturated —
         ``saturated()`` is unconditionally False when ``read_ok`` is False."""
-        scheduler._read_psi_sample = lambda: PsiSample(
-            cpu_some10=99.0, mem_some10=99.0, mem_full10=99.0, io_some10=99.0,
-            read_ok=False,
-        )
+        reads: list[PsiSample] = []
+
+        def _unreadable() -> PsiSample:
+            reads.append(PsiSample(
+                cpu_some10=99.0, mem_some10=99.0, mem_full10=99.0, io_some10=99.0,
+                read_ok=False,
+            ))
+            return reads[-1]
+
+        scheduler._read_psi_sample = _unreadable
         scheduler._dispatched.update({'X', 'Y'})  # in_flight >= min_inflight_floor
         ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
 
         result = await scheduler._phase_psi_gate(ctx)
 
         assert result is _CONTINUE
-        assert ctx.psi_sample is not None
-        assert ctx.psi_sample.read_ok is False
-        assert ctx.psi_hold is False, 'an unreadable PSI sample must fail OPEN'
-        assert ctx.psi_in_flight == len(scheduler._dispatched)
+        assert len(reads) == 1, 'the gate sampled PSI'
+        assert ctx.psi_hold is None, 'an unreadable PSI sample must fail OPEN'
+
+    @pytest.mark.asyncio
+    async def test_deferral_reports_the_hold_the_gate_decided_across_a_reload(self):
+        """A hot reload landing between ``_phase_psi_gate`` and a deferral
+        (``apply_reload`` mutates ``config.psi_admission`` in place) changes
+        neither the outcome nor the report: the event names the metric and
+        floor the gate decided on, even when the reload turned that arm off."""
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(
+            max_per_module=1,
+            psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0, min_inflight_floor=1),
+        )
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        scheduler._read_psi_sample = lambda: PsiSample(
+            cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True,
+        )
+        scheduler._dispatched.add('inflight1')
+        task = {
+            'id': 'H', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_h/x.py']}, 'priority': 'medium',
+        }
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'H': 'pending'},
+            tasks_by_id={'H': task},
+            candidates=[task],
+            candidate_signals={'H': None},
+            effective_priorities={'H': 'medium'},
+            transitive_counts={'H': 0},
+        )
+
+        await scheduler._phase_psi_gate(ctx)
+        reloaded = apply_reload(
+            scheduler.config,
+            OrchestratorConfig(
+                max_per_module=1,
+                psi_admission=PsiAdmissionConfig(cpu_some_avg10=None, min_inflight_floor=5),
+            ),
+        )
+        result = await scheduler._phase_select_scored(ctx)
+
+        assert reloaded['reloaded'] is True
+        assert scheduler.config.psi_admission.cpu_some_avg10 is None
+        assert isinstance(result, TickOutcome)
+        assert result.assignment is None, 'the tick-start hold still governs this tick'
+        [deferred] = [e for e in event_store.events if e[0] == 'dispatch_deferred']
+        assert deferred[1]['data']['metric'] == 'cpu_some_avg10'
+        assert deferred[1]['data']['floor'] == 1
 
 
 class TestTickPhaseOrderLiteral:
