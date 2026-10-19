@@ -1193,6 +1193,11 @@ class TestConsolidationAutoConfig:
     def test_default_proposal_ttl_hours_is_one_week(self):
         assert ConsolidationAutoConfig().proposal_ttl_hours == 168
 
+    def test_default_canonical_absent_bonus_is_2(self):
+        """A cluster whose topic has no canonical yet ranks as if twice its
+        size (PRD C4 ranking formula; consolidation_flood_control.rank_and_cap)."""
+        assert ConsolidationAutoConfig().canonical_absent_bonus == 2.0
+
     def test_default_category_weights_are_the_three_mem0_primaries(self):
         """PRD §12 Q1 — the three Mem0-primary categories, with
         observations_and_summaries down-weighted because its corpus is
@@ -1298,6 +1303,16 @@ class TestConsolidationAutoConfig:
     def test_proposal_ttl_hours_negative_rejected(self):
         with pytest.raises(ValidationError):
             ConsolidationAutoConfig(proposal_ttl_hours=-1)
+
+    def test_canonical_absent_bonus_below_one_rejected(self):
+        """A bonus below 1 would PENALISE a canonical-absent cluster, inverting
+        the policy it exists to express."""
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(canonical_absent_bonus=0.9)
+
+    def test_canonical_absent_bonus_float_override_accepted(self):
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.5).canonical_absent_bonus == 1.5
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.0).canonical_absent_bonus == 1.0
 
     def test_backlog_multiplier_zero_rejected(self):
         with pytest.raises(ValidationError):

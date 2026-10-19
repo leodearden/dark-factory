@@ -3283,11 +3283,27 @@ class ConsolidationAutoConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'How many candidate clusters the ranking considers per cycle, as a '
-            'multiple of max_auto_per_cycle. Greater than 1 so the cycle picks '
-            'the best few of a wider field rather than the first few it saw; '
-            'bounded so ranking cost stays proportional to what can actually '
-            'be executed. Green-tier hot-reloadable.'
+            'Proposals above (max_auto_per_cycle + max_gate_filings_per_cycle) '
+            'x this trip the backlog regime: the cycle executes and files '
+            'nothing and emits ONE aggregate escalation, so a flooding proposer '
+            'costs one human-visible record per cycle rather than a gate per '
+            'cluster. Applied by '
+            'reconciliation/consolidation_flood_control.py::rank_and_cap. '
+            'Green-tier hot-reloadable.'
+        ),
+    )
+    canonical_absent_bonus: float = Field(
+        default=2.0,
+        ge=1.0,
+        description=(
+            'Ranking multiplier applied by '
+            'reconciliation/consolidation_flood_control.py::rank_and_cap to a '
+            'cluster whose topic has no canonical yet, so an unconsolidated '
+            'cluster outranks a regrowth of one already consolidated. Ordering '
+            'only: it can never raise how much a cycle executes, the per-cycle '
+            'caps do that. At least 1.0, because a value below 1 would penalise '
+            'exactly the clusters it exists to favour. Green-tier '
+            'hot-reloadable.'
         ),
     )
     refusal_streak_threshold: int = Field(

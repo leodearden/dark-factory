@@ -607,7 +607,7 @@ mem0_update:
 # Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237,
 # plans/memory-auto-consolidation-prd.md). Recon Stage 1 proposes a cluster, a
 # pure predicate rules on it, and a passing cluster is consolidated WITH NO
-# HUMAN IN THE LOOP. All thirteen leaves are green-tier hot-reloadable: they
+# HUMAN IN THE LOOP. All fourteen leaves are green-tier hot-reloadable: they
 # are registered in `config/reload.py::RELOADABLE_FIELDS`, which is the
 # authoritative list, and `mcp__escalation__reload_config` applies a change to
 # any of them to a RUNNING server with no restart.
@@ -654,10 +654,13 @@ mem0_update:
 #   # rest of the pipeline proposing and recording.
 #   max_auto_per_cycle: 3
 #   max_gate_filings_per_cycle: 3
-#   # How many candidate clusters the ranking considers per cycle, as a multiple
-#   # of max_auto_per_cycle — so the cycle picks the best few of a wider field
-#   # rather than the first few it saw.
+#   # Proposals above (max_auto_per_cycle + max_gate_filings_per_cycle) x this
+#   # trip the backlog regime: the cycle executes and files nothing and emits
+#   # ONE aggregate escalation.
 #   backlog_multiplier: 5
+#   # Ranking multiplier for a cluster whose topic has no canonical yet. Orders
+#   # the slice only; it never raises how much a cycle executes. At least 1.0.
+#   canonical_absent_bonus: 2.0
 #   # Consecutive refusals of the SAME topic before it stops being re-proposed
 #   # and goes to a human. A refusal no LLM re-emission can fix would otherwise
 #   # repeat every cycle forever, which is cost with no information.
