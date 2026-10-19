@@ -50,9 +50,9 @@ from escalation.categories import EscalationCategory
 from orchestrator.flake_ledger import (
     DueItem,
     FlakeVerdict,
-    due_items_for,
     enqueue_debt,
     ledger_db_path,
+    named_tests,
 )
 
 if TYPE_CHECKING:
@@ -306,7 +306,12 @@ async def record_merge_flake_suppression(
         )
 
     items: tuple[DueItem, ...] = (
-        due_items_for(s, head=merge_sha or None, observing_task_id=task_id) if suppressed else ()
+        tuple(
+            DueItem(test_id, s.observed_at, s.call_site, merge_sha or None, task_id)
+            for test_id in named_tests(s)
+        )
+        if suppressed
+        else ()
     )
     _guarded(
         'ledger',

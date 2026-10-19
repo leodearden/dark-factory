@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS flake_occurrence (   -- append-only; many rows per te
     test_id         TEXT    NOT NULL,   -- pytest node-id, or script-suite test name
     project_id      TEXT    NOT NULL,   -- denormalised: the dashboard aggregates across runs.db files
     verdict         TEXT    NOT NULL,   -- passes_in_isolation | fails_in_isolation | unconfirmable
-    call_site       TEXT    NOT NULL,   -- merge_gate | main_probe | chronic_marker
+    call_site       TEXT    NOT NULL,   -- merge_gate | main_probe | chronic_marker | offline_lane
     runner          TEXT,               -- 'local' | remote host name — WHERE the discriminator ran
     merge_sha       TEXT,
     task_id         TEXT,
@@ -196,12 +196,33 @@ class FlakeCallSite(StrEnum):
     merge_gate = 'merge_gate'  # the pre-merge verify gate
     main_probe = 'main_probe'  # the periodic probe of main
     chronic_marker = 'chronic_marker'  # a reify CHRONIC-FLAKY marker parsed from verify stdout
+    offline_lane = 'offline_lane'  # the offline integration lane (plans/offline-lane-red-path-prd.md D6)
+
+
+class EvidenceKind(StrEnum):
+    """How a test went red: an assertion failure or an error outside the assertion."""
+
+    failed = 'failed'
+    error = 'error'
+
+
+@dataclass(frozen=True)
+class FailureEvidence:
+    """One test's failure, as the observer saw it: the kind, the first line of the
+    report, and where the full record lives when one was kept."""
+
+    kind: EvidenceKind
+    first_line: str
+    record_dir: str | None = None
 
 
 @dataclass(frozen=True)
 class FlakeSuppression:
     """Discriminator output. Produced WHEREVER the worktree is (local or remote);
-    consumed ONLY on the dispatcher. Rides VerifyResult across the wire."""
+    consumed ONLY on the dispatcher. Rides VerifyResult across the wire.
+
+    Not hashable once *evidence* is set: the mapping is a plain ``dict``, so
+    ``dataclasses.asdict`` and the runner codec flatten it."""
 
     verdict: FlakeVerdict
     test_ids: tuple[str, ...]  # node-ids examined — EMPTY is legal only for `unconfirmable`
@@ -210,6 +231,7 @@ class FlakeSuppression:
     runner: str  # 'local' | remote host name — WHERE the re-run ran
     psi_cpu_some10: float | None  # shared.psi at observation; None when read_ok is False
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
+    evidence: Mapping[str, FailureEvidence] | None = None  # per test id, for those it covers
 
 
 def _coerce_test_ids(value: object, *, context: str, warn: bool = True) -> tuple[str, ...]:
@@ -316,6 +338,9 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
         if kwargs.get('test_ids') is not None:
             kwargs['test_ids'] = _coerce_test_ids(kwargs['test_ids'], context='the wire')
 
+        if 'evidence' in kwargs:
+            kwargs['evidence'] = _evidence_from_wire(kwargs['evidence'])
+
         # A missing REQUIRED key raises TypeError here and is caught below — a truncated
         # payload is a producer bug worth a loud line, not a half-built observation.
         return FlakeSuppression(**kwargs)
@@ -325,6 +350,33 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
             '%r; dropping the observation (a malformed sub-payload must never cost a '
             're-verify)',
             d,
+            exc_info=True,
+        )
+        return None
+
+
+def _evidence_from_wire(value: object) -> dict[str, FailureEvidence] | None:
+    """Rebuild a suppression's evidence from its JSON form, each entry projected onto
+    :class:`FailureEvidence`'s declared fields as the observation itself is.  ``None``
+    for none, and ``None`` plus a warning for anything malformed: the observation is
+    never dropped for its evidence."""
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, dict):
+            raise TypeError(f'evidence is a {type(value).__name__}, not a dict')
+        declared = tuple(f.name for f in fields(FailureEvidence))
+        evidence: dict[str, FailureEvidence] = {}
+        for test_id, entry in value.items():
+            kwargs = {name: entry[name] for name in declared if name in entry}
+            kwargs['kind'] = EvidenceKind(kwargs.get('kind'))
+            evidence[test_id] = FailureEvidence(**kwargs)
+        return evidence
+    except Exception:
+        logger.warning(
+            'flake_ledger: could not rebuild the evidence of a wire observation (%r); '
+            'keeping the observation without it',
+            value,
             exc_info=True,
         )
         return None
@@ -587,11 +639,7 @@ def _occurrence_rows(
         )
         return []
 
-    detail = (
-        json.dumps({'unconfirmable_reason': s.unconfirmable_reason})
-        if s.unconfirmable_reason
-        else '{}'
-    )
+    evidence = _evidence_by_test(s)
     # Columns are named explicitly, never a positional `INSERT INTO t VALUES (...)`:
     # run_store.py:53-58's ALTER-parity note — a migrated DB and a fresh one must both
     # accept the same statement.
@@ -606,10 +654,46 @@ def _occurrence_rows(
             merge_sha,
             task_id,
             s.psi_cpu_some10,  # bound directly, so None becomes SQL NULL, never 0.0
-            detail,
+            _row_detail(s.unconfirmable_reason, evidence.get(test_id)),
         )
         for test_id in test_ids
     ]
+
+
+def _evidence_by_test(s: FlakeSuppression) -> Mapping[str, FailureEvidence]:
+    """*s*'s evidence, read once and checked; ``{}`` (logged) when it is malformed, so
+    bad evidence costs the evidence and never the rows."""
+    try:
+        evidence = s.evidence
+        if evidence is None:
+            return {}
+        if not isinstance(evidence, Mapping):
+            raise TypeError(f'evidence is a {type(evidence).__name__}, not a mapping')
+        for test_id, entry in evidence.items():
+            if not isinstance(entry, FailureEvidence):
+                raise TypeError(f'evidence for {test_id!r} is a {type(entry).__name__}')
+            EvidenceKind(entry.kind)
+        return evidence
+    except Exception:
+        logger.warning(
+            'flake_ledger: malformed evidence on an observation at call_site=%s; writing '
+            'its rows without evidence',
+            getattr(s, 'call_site', None),
+            exc_info=True,
+        )
+        return {}
+
+
+def _row_detail(reason: str | None, evidence: FailureEvidence | None) -> str:
+    """One row's ``detail`` JSON.  A row with no evidence keeps the bytes it always had."""
+    detail: dict[str, Any] = {'unconfirmable_reason': reason} if reason else {}
+    if evidence is not None:
+        detail['evidence'] = {
+            'kind': EvidenceKind(evidence.kind).value,
+            'first_line': evidence.first_line,
+            'record_dir': evidence.record_dir,
+        }
+    return json.dumps(detail) if detail else '{}'
 
 
 def _write_observation(conn: sqlite3.Connection, rows: Sequence[tuple]) -> set[_OccurrenceKey]:
@@ -848,36 +932,23 @@ def _to_due_row(row: sqlite3.Row) -> DueRow:
     )
 
 
-def due_items_for(
-    s: FlakeSuppression, *, head: str | None, observing_task_id: str | None,
-) -> tuple[DueItem, ...]:
-    """One :class:`DueItem` per test *s* names, the sentinel excepted.
+def named_tests(s: FlakeSuppression) -> tuple[str, ...]:
+    """The tests *s* names, the sentinel excepted: the ids a debt can be opened for.
 
     Verdict-agnostic: whether the observation makes its tests debt-eligible is the
-    caller's decision.  Never raises; a malformed *s* is logged and owes nothing.
+    caller's decision.  Never raises; a malformed *s* is logged and names nothing.
 
-    A bare-``str`` ``test_ids`` is coerced here WITHOUT the warning: the items are
-    written by ``enqueue_debt(items, occurrence=s)``, whose row derivation warns once
-    for the same payload.
+    A bare-``str`` ``test_ids`` is coerced here WITHOUT the warning: the same payload's
+    rows are derived by :func:`enqueue_debt`, which warns once for it.
     """
     try:
         test_ids = _coerce_test_ids(
             s.test_ids, context=f'call_site={s.call_site}', warn=False,
         )
-        return tuple(
-            DueItem(
-                test_id=test_id,
-                observed_at=s.observed_at,
-                call_site=s.call_site,
-                head=head,
-                observing_task_id=observing_task_id,
-            )
-            for test_id in test_ids
-            if test_id != UNKNOWN_TEST_ID
-        )
+        return tuple(test_id for test_id in test_ids if test_id != UNKNOWN_TEST_ID)
     except Exception:
         logger.warning(
-            'flake_ledger: could not derive due items from an observation', exc_info=True,
+            'flake_ledger: could not read the tests an observation names', exc_info=True,
         )
         return ()
 
