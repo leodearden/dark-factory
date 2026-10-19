@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator import session_registry
+from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +313,7 @@ def _env_slug_ownership(
     root: Path | str | None,
     *,
     allow_remint: bool = False,
-    probes: _EventProbes,
+    probes: EventProbes,
 ) -> tuple[bool, bool, _RecordSnapshot | None]:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
 
@@ -331,7 +332,7 @@ def _env_slug_ownership(
 
     So ``may_bind`` is False on exactly one shape: an inherited env slug
     whose record carries NO binding yet AND whose ownership is merely
-    unproven (``_owner_ppid_verdict`` returns None -- a session spawned by a
+    unproven (``session_ownership_probes.py::EventProbes.owner_ppid_verdict`` returns None -- a session spawned by a
     pre-task-4193 spawn-claude.sh, every record already live on deploy day,
     or a platform with no ``/proc`` such as macOS). There the record is left
     OPEN for its true owner, which is precisely the "leave them unbound and
@@ -367,7 +368,7 @@ def _env_slug_ownership(
     record. That window is wide (median ~27s over the live fleet, p90 ~141s)
     and unbounded, and the FIRST event to arrive in it binds, owner or
     inheritor. So the stateless ``CLAUDE_SPAWN_OWNER_PPID`` probe decides
-    there instead (``_owner_ppid_verdict``): a positive MISMATCH forks; a
+    there instead (``session_ownership_probes.py::EventProbes.owner_ppid_verdict``): a positive MISMATCH forks; a
     match, or no verdict at all, adopts. Deliberately keyed on
     unbound-ness rather than ``status is LAUNCHING``, so sibling-mode spawns
     -- never LAUNCHING by the time a hook sees them -- are covered too
@@ -381,7 +382,7 @@ def _env_slug_ownership(
     not "disproved" -- forking there would split the owner's own record on
     every routine automatic compaction wherever ``/proc`` is unavailable.
 
-    *probes* is this event's ``_EventProbes`` memo, so the ownership walk it
+    *probes* is this event's ``EventProbes`` memo, so the ownership walk it
     performs here is the SAME observation ``_withhold_from_launching`` and
     ``_bind_claude_session_id`` later consult -- see that class's docstring.
 
@@ -457,7 +458,7 @@ def _env_slug_is_owned(
     root: Path | str | None,
     *,
     allow_remint: bool = False,
-    probes: _EventProbes,
+    probes: EventProbes,
 ) -> bool:
     """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
 
@@ -493,7 +494,7 @@ def _resolve_hook_slug(
     root: Path | str | None,
     *,
     allow_remint: bool = False,
-    probes: _EventProbes,
+    probes: EventProbes,
 ) -> _HookSlugResolution:
     """Resolve this hook event's registry identity -- see ``_HookSlugResolution``.
 
@@ -651,7 +652,7 @@ def hook_session_slug(
     so calling it re-reads what the probe already read -- the handlers go
     through ``_resolve_hook_slug`` directly for exactly that reason.
     """
-    probes = _EventProbes(env, process_tree)
+    probes = EventProbes(env, process_tree)
     return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint, probes=probes).slug
 
 
@@ -686,7 +687,7 @@ def _bind_claude_session_id(
     hook_input: Mapping[str, Any],
     *,
     allow_rebind: bool = False,
-    probes: _EventProbes,
+    probes: EventProbes,
 ) -> bool:
     """Stamp this hook's Claude Code session_id onto an unbound *record*.
 
@@ -729,7 +730,7 @@ def _bind_claude_session_id(
 
 def _stamp_session_pointer(
     record: session_registry.SessionRecord,
-    probes: _EventProbes,
+    probes: EventProbes,
     root: Path | str | None,
 ) -> None:
     """Point this event's claude pid at *record*, iff the record names it as owner.
@@ -798,306 +799,6 @@ def hook_display_title(
 # ---------------------------------------------------------------------------
 # SessionStart handler: hand-launched-capture + refresh
 # ---------------------------------------------------------------------------
-
-
-def _hand_launched_liveness_pid() -> int:
-    """A durable pid-liveness proxy for a hand-launched session's new record.
-
-    ``os.getppid()`` would resolve to THIS hook invocation's own bash
-    entrypoint (session-start.sh), which exits within seconds of this call
-    returning. ``reap_stale_records``'s ``stale_pid`` rule reclaims a
-    non-terminal record once its ``launcher_pid`` is dead AND
-    ``NON_TERMINAL_HEARTBEAT_TTL`` has elapsed since its last write -- so a
-    hand-launched session that goes idle for over an hour with no further
-    hook write would be reaped even though its terminal is still open,
-    defeating T6's registry-visibility goal.
-
-    ``os.getsid(0)`` instead resolves to THIS process's POSIX *session
-    leader* -- ordinarily the interactive shell (or ``claude`` itself) that
-    owns the controlling terminal. Claude Code does not ``setsid`` the hook
-    subprocesses it spawns, so they inherit that same session id; the leader
-    lives for the terminal's whole lifetime, which is the liveness signal T6
-    actually wants. Falls back to ``os.getppid()`` on the rare
-    platform/sandbox where ``getsid`` raises.
-    """
-    try:
-        return os.getsid(0)
-    except OSError:
-        return os.getppid()
-
-
-def _parent_pid_of(pid: int) -> int | None:
-    """The parent pid of *pid* per ``/proc/<pid>/status``, or None.
-
-    ``status`` (not ``stat``) is parsed deliberately: its ``PPid:`` line is
-    plainly whitespace-delimited, immune to the ``(comm)`` field's embedded
-    spaces and parens. Returns None -- never raises -- on a platform with no
-    ``/proc``, on a race where *pid* exits mid-read, and on any unparseable
-    body, so every caller can treat the answer as a best-effort hint.
-    """
-    try:
-        for line in Path(f'/proc/{pid}/status').read_text().splitlines():
-            if line.startswith('PPid:'):
-                return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
-
-
-#: How far up the ancestor chain ``_owning_claude_pid`` will look for the
-#: firing ``claude``. The measured tree needs 3 hops (``hook.sh -> sh ->
-#: claude``); the headroom absorbs an extra wrapper level without ever
-#: letting a reparented hook walk to init.
-_MAX_CLAUDE_ANCESTOR_HOPS = 6
-
-
-def _process_comm(pid: int) -> str | None:
-    """``/proc/<pid>/comm`` for *pid*, stripped, or None.
-
-    Returns None -- never raises -- on a platform with no ``/proc``, on a
-    race where *pid* exits mid-read, and on any unreadable body, so callers
-    can treat the answer as a best-effort hint.
-    """
-    try:
-        return Path(f'/proc/{pid}/comm').read_text().strip()
-    except OSError:
-        return None
-
-
-@dataclass(frozen=True)
-class ProcessTree:
-    """The process tree one hook event's ownership probes read.
-
-    ``ProcessTree()`` reads the live tree: this process's parent, then
-    ``/proc``. The hook entry points accept one as ``process_tree=``, so a
-    caller names the tree to be judged rather than patching these readers.
-    """
-
-    hook_parent_pid: Callable[[], int] = os.getppid
-    parent_pid_of: Callable[[int], int | None] = _parent_pid_of
-    comm_of: Callable[[int], str | None] = _process_comm
-
-
-def _owning_claude_pid(tree: ProcessTree) -> int | None:
-    """The pid of the ``claude`` process that fired THIS hook event, or None.
-
-    Resolved by IDENTITY, not by a fixed depth: walk up *tree* from this
-    hook's parent and return the first ancestor whose comm is ``claude``.
-
-    A fixed depth is wrong. Claude Code runs a hook command through a
-    SHELL, so the real tree is ``claude -> sh -c -> <hook>.sh -> python``
-    and this process's grandparent is the ephemeral ``sh`` wrapper, not
-    ``claude``. Measured end-to-end with a probe hook on claude 2.1.241::
-
-        2028041(python3) -> 2028035(hook.sh) -> 2028032(sh) -> 2025347(claude)
-
-    Taking the grandparent there yields the ``sh`` pid, whose parent IS the
-    claude -- so ``_owner_ppid_verdict``'s comparison against
-    ``CLAUDE_SPAWN_OWNER_PPID`` (the payload bash, i.e. claude's parent)
-    came out one level short and judged every GENUINE owner an inheritor,
-    reintroducing the very task-2511 split this module exists to prevent
-    (task 4193 review). Walking to the first ``claude`` ancestor is immune
-    to that wrapper level whether or not it is present.
-
-    Note what this is NOT: an ancestry test against the spawn launcher.
-    "Is this process a descendant of the launcher" cannot discriminate,
-    because a nested ``claude`` is also a descendant (task 4193 detail item
-    4). This resolves ONE specific process's identity, which callers then
-    compare by EQUALITY: a ``/clear`` or an automatic compaction happens
-    INSIDE the owning process and keeps its pid, whereas a nested
-    ``claude`` is a different process and can never present the same one.
-    A nested ``claude``'s own first ``claude`` ancestor is ITSELF, whose
-    parent is the agent's Bash-tool shell -- so it still mismatches.
-
-    Returns None -- never raises -- wherever no ``claude`` ancestor is
-    found within ``_MAX_CLAUDE_ANCESTOR_HOPS`` (no ``/proc`` on macOS, a
-    mid-read race, a reparented hook). Callers treat None as "cannot prove
-    ownership" and take the fail-safe branch.
-
-    Memoized per hook event by ``_EventProbes``, which reads ONE
-    ``ProcessTree``, so the adopt/fork decision, the launch-window withhold
-    decision and ``_bind_claude_session_id``'s ``claude_owner_pid`` stamp
-    all read ONE walk of that tree. Call the memo, not this, from anywhere
-    inside an event that already holds one.
-    """
-    pid: int | None = tree.hook_parent_pid()
-    for _ in range(_MAX_CLAUDE_ANCESTOR_HOPS):
-        if pid is None or pid <= 1:
-            return None
-        if tree.comm_of(pid) == 'claude':
-            return pid
-        pid = tree.parent_pid_of(pid)
-    return None
-
-
-#: Sentinel for "this probe has not been resolved yet", distinct from None --
-#: which is a legitimate RESOLVED answer for both memoized probes (no
-#: ``claude`` ancestor found; no ownership verdict available).
-_UNRESOLVED: Any = object()
-
-
-class _EventProbes:
-    """Per-event memo for this module's two ``/proc`` ownership probes.
-
-    ONE hook event consults ``_owner_ppid_verdict`` TWICE -- once to decide
-    whether to adopt the inherited ``CLAUDE_SPAWN_SESSION_ID`` slug
-    (``_env_slug_ownership``) and again to decide whether to withhold a
-    status from a still-LAUNCHING record (``_withhold_from_launching``) --
-    and reads ``_owning_claude_pid`` a third time to stamp
-    ``claude_owner_pid`` at bind time (``_bind_claude_session_id``). All
-    three fire together on exactly the case that matters most: the owner's
-    own pre-SessionStart Notification against an unbound LAUNCHING record
-    (task 4193 L2 ruling item 4-iii).
-
-    Each walk costs up to ``_MAX_CLAUDE_ANCESTOR_HOPS`` (6) hops x 2
-    ``/proc`` reads, charged against the hard ``_HOOK_TIMEOUT_SECS`` = 10s
-    budget this module's own ``_resolve_wm_window_id`` already prices at
-    ~10.8s in the pathological case. Memoizing pays that once.
-
-    Efficiency is not the only reason. Memoizing also closes a TOCTOU gap on
-    the verdict itself: the adopt/fork decision and the withhold decision
-    are now made from ONE observation of the process tree, so they can no
-    longer disagree because the tree changed between two walks. One
-    decision from one observation is a correctness property.
-
-    Scope is exactly one hook event -- construct it at the top of a handler
-    and thread it down. It deliberately does NOT cache across events; the
-    process tree is live state, and the memo's whole safety argument is that
-    its lifetime is shorter than any interval over which that state can
-    meaningfully change.
-
-    Each memo reads ONE ``ProcessTree``: *process_tree*, or the live tree
-    when it is None.
-    """
-
-    def __init__(self, env: Mapping[str, str], process_tree: ProcessTree | None) -> None:
-        self._env = env
-        self._tree = ProcessTree() if process_tree is None else process_tree
-        self._pid: Any = _UNRESOLVED
-        self._verdict: Any = _UNRESOLVED
-
-    def owning_claude_pid(self) -> int | None:
-        """``_owning_claude_pid`` over this memo's tree, walked at most once per event."""
-        if self._pid is _UNRESOLVED:
-            self._pid = _owning_claude_pid(self._tree)
-        return self._pid
-
-    def parent_pid_of(self, pid: int) -> int | None:
-        """*pid*'s parent in this memo's tree."""
-        return self._tree.parent_pid_of(pid)
-
-    def owner_ppid_verdict(self) -> bool | None:
-        """``_owner_ppid_verdict`` over this memo, computed at most once per event."""
-        if self._verdict is _UNRESOLVED:
-            self._verdict = _owner_ppid_verdict(self._env, probes=self)
-        return self._verdict
-
-
-def _owner_ppid_verdict(env: Mapping[str, str], *, probes: _EventProbes) -> bool | None:
-    """Does this event come from the claude spawn-claude.sh actually launched?
-
-    Returns True (positively the owner), False (positively an inheritor), or
-    None (no verdict -- the probe is unavailable, so callers must fail soft).
-
-    The discriminator is ``CLAUDE_SPAWN_OWNER_PPID``, exported by
-    spawn-claude.sh INSIDE ``$inner`` and therefore carrying the pid of the
-    payload bash that is about to run ``claude``. That ``claude`` is invoked
-    without ``exec``, so the owning process's DIRECT PARENT is always exactly
-    that pid, on every backend branch. A nested ``claude`` started from
-    inside the session (an agent's Bash tool, ``scripts/legibility/coder.py``,
-    a ``cli_invoke`` without ``spawn_env``) inherits the VALUE but has some
-    other parent, so it mismatches.
-
-    Why this exists alongside the ``claude_session_id`` binding: that binding
-    is the discriminator only ONCE a record is bound. Before the owner's own
-    SessionStart lands, the spawn-created record carries no binding at all,
-    and that window is wide -- measured over the live fleet, median ~27s,
-    p90 ~141s, and nothing bounds it (no LAUNCHING reaper). This probe works
-    with NO persisted state, so it covers exactly that window (task 4193 L2
-    ruling item 4-i).
-
-    Why not lineage against ``CLAUDE_SPAWN_LAUNCHER_PID``: that variable is
-    never exported into a spawned session (``sanitize_env`` strips the whole
-    namespace and only four values are re-exported), and under a detached
-    emulator the launcher is not even in the owning claude's ancestry --
-    gnome-terminal reparents the payload to gnome-terminal-server. An
-    ancestry test also cannot discriminate at all, since a nested claude is
-    likewise a descendant (task 4193 detail item 4). This is a parent
-    EQUALITY test on one specific process, not an ancestry test.
-
-    Every unresolvable input yields None rather than False: an absent or
-    unparseable env var (a hand-launched session, or one spawned by a
-    pre-task-4193 spawn-claude.sh), an unresolvable owning pid, or a platform
-    with no ``/proc`` (macOS -- a first-class lane, cf. task 4058). Callers
-    treat None as "adopt", the fail-soft direction this module documents.
-
-    *probes* is this event's ``_EventProbes`` memo, so the owning-pid walk
-    is shared with the event's other consumers rather than repeated, and the
-    owner's parent is read from the same tree.
-
-    Within one hook event this verdict is computed ONCE and reused by the
-    adopt/fork decision (``_env_slug_ownership``) and the launch-window
-    withhold decision (``_withhold_from_launching``). That is a correctness
-    property before it is an efficiency one: two decisions taken from one
-    observation of the process tree cannot disagree because the tree moved
-    in between.
-    """
-    raw = (env.get('CLAUDE_SPAWN_OWNER_PPID') or '').strip()
-    if not raw:
-        return None
-    try:
-        expected = int(raw)
-    except ValueError:
-        logger.warning('unparseable CLAUDE_SPAWN_OWNER_PPID %r; no ownership verdict', raw)
-        return None
-    if expected <= 1:
-        return None
-    owner_pid = probes.owning_claude_pid()
-    if owner_pid is None:
-        return None
-    actual = probes.parent_pid_of(owner_pid)
-    if actual is None:
-        return None
-    return actual == expected
-
-
-def _nested_claude_liveness_pid(*, probes: _EventProbes) -> int:
-    """A liveness pid that actually DIES with a forked inheritor's session.
-
-    ``_hand_launched_liveness_pid``'s ``os.getsid(0)`` is deliberately the
-    terminal's POSIX session leader, which OUTLIVES every nested ``claude``
-    started inside that terminal. Stamped on a forked-inheritor record it
-    would make the record unreapable: ``reap_stale_records``'s ``stale_pid``
-    rule needs a dead ``launcher_pid`` (plus the heartbeat TTL), and
-    IDLE/AWAITING_INPUT are non-terminal so ``terminal_ttl`` never applies
-    either -- so every nested ``claude -p`` an agent shells out to would
-    leave a permanent extra registry row for the terminal's whole lifetime.
-    Nested invocation is routine agent behaviour, so that is registry growth
-    proportional to it (task 4193 review).
-
-    ``_owning_claude_pid`` resolves the nested ``claude`` itself --
-    exactly the process whose exit should make the record reclaimable. It
-    is reused here rather than re-deriving the ancestry inline: the earlier
-    inline copy took this process's GRANDPARENT, which the real
-    ``claude -> sh -c -> <hook>.sh -> python`` tree makes the ephemeral
-    ``sh`` wrapper. That wrapper exits milliseconds after the hook returns,
-    so a forked-inheritor record was stamped with an ALREADY-DEAD
-    ``launcher_pid`` and ``stale_pid`` could reclaim the record of a live
-    nested session -- a long ``claude -p`` that emits no hook events for an
-    hour would vanish from the cockpit mid-run (task 4193 review).
-
-    Falls back to ``_hand_launched_liveness_pid()`` whenever no ``claude``
-    ancestor can be resolved (no ``/proc``, a mid-read race, or a hook
-    reparented to init), i.e. degrades to the durable-but-coarse pid rather
-    than guessing. Note the fallback is only ever *coarser*: ``stale_pid``
-    also requires ``NON_TERMINAL_HEARTBEAT_TTL`` of silence, so a
-    mis-resolved pid cannot reap a record that is still being written to.
-
-    *probes* supplies the owning pid from this event's memo rather than
-    walking ``/proc`` again -- the fork path has already resolved it once to
-    reach the ownership verdict that sent it here.
-    """
-    return probes.owning_claude_pid() or _hand_launched_liveness_pid()
 
 
 def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
@@ -1364,7 +1065,7 @@ def run_session_start(
     parent and would render this session as its spawner's sibling. The
     ``CLAUDE_SPAWN_WM_TITLE`` display resolution is skipped (see
     ``_resolve_display``) and ``launcher_pid`` comes from
-    ``_nested_claude_liveness_pid`` so the forked record stays reapable.
+    ``session_ownership_probes.py::EventProbes.nested_claude_liveness_pid`` so the forked record stays reapable.
 
     RESIDUAL sibling fixed (task 4663): the three overrides above left
     ``resolve_hook_identity``/``hook_display_title`` still reading
@@ -1378,7 +1079,7 @@ def run_session_start(
     *process_tree* is the tree this event's ownership probes read; None reads
     the live one (see ``ProcessTree``).
     """
-    probes = _EventProbes(env, process_tree)
+    probes = EventProbes(env, process_tree)
     resolution = _resolve_hook_slug(
         hook_input, env, root, allow_remint=True, probes=probes
     )
@@ -1411,11 +1112,11 @@ def run_session_start(
         if forked_from is not None:
             # An inherited CLAUDE_SPAWN_LAUNCHER_PID would be the SPAWNER's,
             # and the terminal's session leader outlives this nested claude.
-            launcher_pid = _nested_claude_liveness_pid(probes=probes)
+            launcher_pid = probes.nested_claude_liveness_pid()
         elif launcher_pid_raw:
             launcher_pid = int(launcher_pid_raw)
         else:
-            launcher_pid = _hand_launched_liveness_pid()
+            launcher_pid = probes.hand_launched_liveness_pid()
         record = session_registry.SessionRecord(
             session_slug=slug,
             status=session_registry.Status.RUNNING,
@@ -1548,7 +1249,7 @@ def _in_unbound_launch_window(
 
     This answers only the RECORD-SHAPE question. Whether the caller actually
     withholds is decided in ``_run_status_refresh_and_retitle``, which also
-    consults ``_owner_ppid_verdict`` (a positively-identified owner is never
+    consults ``session_ownership_probes.py::EventProbes.owner_ppid_verdict`` (a positively-identified owner is never
     withheld) and ``_launch_window_withholding_expired``.
     """
     if prior is None or prior.status is not session_registry.Status.LAUNCHING:
@@ -1559,14 +1260,14 @@ def _in_unbound_launch_window(
 def _withhold_from_launching(
     prior: session_registry.SessionRecord,
     *,
-    probes: _EventProbes,
+    probes: EventProbes,
 ) -> bool:
     """Given a record in the unbound launch window, withhold this event?
 
     False -- write normally -- in exactly two cases:
 
     * ``CLAUDE_SPAWN_OWNER_PPID`` positively identifies this event as the
-      OWNER's (``_owner_ppid_verdict`` is True). Its own status and pending
+      OWNER's (``session_ownership_probes.py::EventProbes.owner_ppid_verdict`` is True). Its own status and pending
       question belong on this record whether or not its SessionStart has
       landed yet, and withholding them was the regression this repairs.
     * The record has been stuck in the window past
@@ -1668,7 +1369,7 @@ def _run_status_refresh_and_retitle(
     so a session already running when the pointer shipped -- a long-lived
     watcher -- is linked by its next Notification/Stop, not its next restart.
     """
-    probes = _EventProbes(env, process_tree)
+    probes = EventProbes(env, process_tree)
     resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
     slug, may_bind = resolution.slug, resolution.may_bind
     # THE event's only read of the slug it writes: the ownership probe
