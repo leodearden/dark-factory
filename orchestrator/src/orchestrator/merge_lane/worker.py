@@ -77,6 +77,7 @@ from orchestrator.merge_lane.drift import (
 from orchestrator.merge_lane.gates import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+    GateClearance,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _check_post_merge_pyright,
@@ -6776,12 +6777,14 @@ def _emit_train_attempt(
     *,
     started_monotonic: float,
     attempt: int | None = None,
+    gate_clearance: GateClearance | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` for *req*'s train, tagged with its train id and members."""
     _emit_merge_attempt(
         event_store, req.task_id, outcome,
         attempt=attempt, duration_ms=_elapsed_ms(started_monotonic),
         train_id=req.train_id, member_task_ids=req.member_task_ids,
+        gate_clearance=gate_clearance,
     )
 
 
@@ -6941,6 +6944,7 @@ async def _advance_train(
         tip = _rebased_tip(adv, req.task_id)
         gate = await _reverify_rebased_tree(
             git_ops, req, merge_wt,
+            verified_merge_sha=candidate,
             rebased_from=candidate_base,
             rebased_onto=tip.rebased_onto,
             timeouts=worker._post_merge_verify_timeouts,
@@ -6950,18 +6954,18 @@ async def _advance_train(
             merge_sha=tip.rebased_sha,
             run_post_merge_verify=train_verify,
         )
-        if gate is not None:
+        if isinstance(gate, MergeOutcome):
             return _TrainAdvance(adv, landing_base=candidate_base, reverify_failure=gate)
         candidate = tip.rebased_sha
         candidate_base = expected_main = tip.rebased_onto
         logger.info(
-            'Train %s: rebased tip %s cleared the re-verify gate; advancing '
+            'Train %s: rebased tip %s cleared the re-verify gate (%s); advancing '
             '(retry %d/%d)',
-            req.train_id, candidate[:8], retries, worker.MAX_CAS_RETRIES,
+            req.train_id, candidate[:8], gate, retries, worker.MAX_CAS_RETRIES,
         )
         _emit_train_attempt(
             worker._event_store, req, OutcomeKind.gate_retry,
-            attempt=retries, started_monotonic=started_monotonic,
+            attempt=retries, started_monotonic=started_monotonic, gate_clearance=gate,
         )
 
 
@@ -21158,6 +21162,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     gate = await _reverify_rebased_tree(
                         self._git_ops, req, merge_wt,
+                        verified_merge_sha=current_sha,
                         rebased_from=rebased_from,
                         rebased_onto=rebased_onto,
                         timeouts=self._post_merge_verify_timeouts,
@@ -21168,7 +21173,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         keep_worktrees=set(self._owned_merge_worktrees),
                         run_post_merge_verify=_run_post_merge_verify,
                     )
-                    if gate is not None:
+                    if isinstance(gate, MergeOutcome):
                         # task 2604: route through the unified terminal
                         # chokepoint so _retire_item fires (mirrors the three
                         # converted sites and the FAIL/skip branch). A raw
@@ -21231,15 +21236,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         item, base_sha=rebased_onto, remerge_recovery=False,
                     )
                     logger.info(
-                        'Task %s: gate cleared (disjoint or green re-verify); '
+                        'Task %s: gate cleared (%s); '
                         'advancing with rebased SHA %s (gate attempt %d/%d)',
-                        req.task_id, rebased_sha[:8],
+                        req.task_id, gate, rebased_sha[:8],
                         gate_total, self.MAX_CAS_RETRIES,
                     )
                     _emit_merge_attempt(
                         self._event_store, req.task_id, OutcomeKind.gate_retry,
                         attempt=gate_total,
                         duration_ms=_elapsed_ms(item.started_monotonic),
+                        gate_clearance=gate,
                     )
                     self._note_transition(
                         req.request_id, ItemLifecycleState.GATE_REVERIFY,
