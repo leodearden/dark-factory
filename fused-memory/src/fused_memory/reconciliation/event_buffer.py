@@ -330,6 +330,7 @@ class EventBuffer:
         Runs on the open write unit's connection.  The just-inserted row is
         uncommitted, so deleting it leaves no trace any reader could see.
         """
+        # Oldest buffered row: stable id, MIN(timestamp) and ORDER BY position (see push).
         async with db.execute(
             """SELECT id, payload, timestamp FROM event_buffer
                WHERE project_id = ? AND coalesce_key = ? AND status = 'buffered'
