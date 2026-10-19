@@ -1169,6 +1169,31 @@ test('chip change in flight: the pacing hold the superseded answer arms does not
   assert.equal(server.count(COSTS_PATH), 3);
 });
 
+test('chip change in flight: a chip change back to the window in flight defers no force - that answer is current, so its pacing hold stands', async () => {
+  const server = makeVirtualServer({ [COSTS_PATH]: 4000 });
+  const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
+  const opts = { state: api.createPollState(), deps: server.deps, jitterMaxMs: 0 };
+  const costsUrls = () => server.urls.filter(u => pollKey(u) === COSTS_PATH);
+
+  await pollAt(api, server, opts, 0);
+  await server.advanceTo(1000);
+  const away = api.refreshDFData('7d', opts);
+  await drain();
+  await server.advanceTo(2000);
+  const back = api.refreshDFData('24h', opts);
+  await drain();
+  assert.equal(server.count(COSTS_PATH), 1, 'precondition: both chips found costs in flight');
+
+  await server.advanceTo(4000);
+  await Promise.all([away, back]);
+
+  await pollAt(api, server, opts, 6000);
+  assert.equal(server.count(COSTS_PATH), 1, 'the answer in flight was for the chosen window, so the pacing hold it armed must stand');
+
+  await pollAt(api, server, opts, 9000);
+  assert.deepEqual(costsUrls(), [`${COSTS_PATH}?window=24h`, `${COSTS_PATH}?window=24h`]);
+});
+
 test('chip change in flight: the failure backoff the superseded answer arms is waived once for the chosen window, without escalating', async () => {
   const server = makeVirtualServer({ [COSTS_PATH]: 1000 }, { failingPaths: [COSTS_PATH] });
   const { api, window: win } = loadDataJs({ fetchStub: server.deps.fetchImpl });

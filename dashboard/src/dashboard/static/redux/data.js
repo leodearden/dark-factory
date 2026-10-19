@@ -436,7 +436,7 @@ function pollKey(url) {
 function stateFor(state, stateKey) {
   let st = state.get(stateKey);
   if (!st) {
-    st = { inFlight: false, forceNextAttempt: false, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
+    st = { inFlight: false, deferredForceUrl: null, failures: 0, nextAllowedAt: 0, lastSuccessAt: 0 };
     state.set(stateKey, st);
   }
   return st;
@@ -665,15 +665,15 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   const st = stateFor(state, stateKey);
   // already in flight for this endpoint — skip this tick, do not queue. A
   // forced attempt refused here is deferred, not dropped: the endpoint's next
-  // attempt is forced instead.
+  // attempt is forced instead, unless the answer in flight is for that url.
   if (st.inFlight) {
-    if (deps.ignoreBackoff) st.forceNextAttempt = true;
+    if (deps.ignoreBackoff) st.deferredForceUrl = url;
     return REFRESH_OUTCOMES.skippedInFlight;
   }
-  const forced = Boolean(deps.ignoreBackoff || st.forceNextAttempt);
+  const forced = Boolean(deps.ignoreBackoff || st.deferredForceUrl);
   // still backed off
   if (deps.now() < st.nextAllowedAt && !forced) return REFRESH_OUTCOMES.skippedBackoff;
-  st.forceNextAttempt = false;
+  st.deferredForceUrl = null;
   st.inFlight = true;
   // Fall back inline (not via DEFAULT_POLL_DEPS) so a caller that hand-builds
   // a partial deps object — e.g. refreshOne invoked directly with just
@@ -731,6 +731,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   } finally {
     clearTimeoutFn(timeoutId);
     st.inFlight = false;
+    if (st.deferredForceUrl === url) st.deferredForceUrl = null;
     // In `finally` so the `!resp.ok` early return is covered too, not just
     // the success and thrown-error paths.
     publishStaleness(stateKey, st);
