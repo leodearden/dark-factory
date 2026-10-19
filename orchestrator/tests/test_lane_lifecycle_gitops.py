@@ -16,6 +16,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -980,48 +981,84 @@ class TestPoolStorageSentinelDelegation:
 
 
 # ---------------------------------------------------------------------------
-# Disk-backstop plan.json relocation: new-then-old via TaskArtifacts.meta_root_for
+# Disk-backstop lane->task scan: keyed off the meta root's metadata.json
 # ---------------------------------------------------------------------------
 
 
-class TestDiskBackstopPlanJsonRelocation:
-    """_find_lane_by_plan_task_id (the on-disk backstop scan) must read
-    plan.json from the NEW .task-meta location first, falling back to the
-    legacy <lane>/.task/plan.json path (W11 gamma .task -> .task-meta
-    relocation, PRD decision 7: new-then-old reads, side-effect-free)."""
+def _pooled_git_ops(tmp_path: Path, pool_size: int = 1) -> GitOps:
+    project_root = tmp_path / 'project'
+    project_root.mkdir()
+    return GitOps(_warm_config(), project_root, warm_lane_pool_size=pool_size)
 
-    def test_finds_lane_via_new_task_meta_path(self, tmp_path: Path):
-        project_root = tmp_path / 'project'
-        project_root.mkdir()
-        git_ops = GitOps(_warm_config(), project_root, warm_lane_pool_size=1)
-        lane = git_ops.worktree_base / '_lane-0'
+
+class TestDiskBackstopLaneTaskIdScan:
+    """_find_lane_by_plan_task_id resolves a pool lane by its meta root's
+    metadata.json task_id and nothing else: no plan.json key, no legacy
+    <lane>/.task fallback (PRD plans/task-meta-task-keying-prd.md decision 7).
+    """
+
+    @pytest.mark.parametrize(
+        ('dir_name', 'in_meta_root', 'filename', 'task_id', 'resolves'),
+        [
+            pytest.param('_lane-0', True, 'metadata.json', '777', True,
+                         id='finds_lane_via_metadata_json'),
+            pytest.param('_lane-0', False, 'plan.json', '777', False,
+                         id='legacy_lane_plan_json_no_longer_resolves'),
+            pytest.param('_lane-0', True, 'plan.json', '777', False,
+                         id='meta_root_plan_json_no_longer_resolves'),
+            pytest.param('_lane-0', True, 'metadata.json', 777, True,
+                         id='integer_task_id_in_metadata_resolves'),
+            pytest.param('_lane-0', True, 'metadata.json', 'OTHER', False,
+                         id='no_match_returns_none'),
+            pytest.param('not-a-lane', True, 'metadata.json', '777', False,
+                         id='non_lane_dir_does_not_resolve'),
+        ],
+    )
+    def test_scan_keys_off_meta_root_metadata_json(
+        self, tmp_path: Path, dir_name: str, in_meta_root: bool,
+        filename: str, task_id: object, resolves: bool,
+    ):
+        git_ops = _pooled_git_ops(tmp_path)
+        base = git_ops.worktree_base
+        lane = base / '_lane-0'
         lane.mkdir(parents=True)
-        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, '_lane-0')
-        meta_root.mkdir(parents=True)
-        (meta_root / 'plan.json').write_text(json.dumps({'task_id': '777'}))
-
-        found = git_ops._find_lane_by_plan_task_id('777')
-
-        assert found == lane, (
-            f'expected the new .task-meta/plan.json to resolve lane {lane}, '
-            f'got {found!r}'
+        (base / dir_name).mkdir(exist_ok=True)
+        root = (
+            TaskArtifacts.meta_root_for(base, dir_name)
+            if in_meta_root else base / dir_name / '.task'
         )
-
-    def test_falls_back_to_legacy_task_path(self, tmp_path: Path):
-        project_root = tmp_path / 'project'
-        project_root.mkdir()
-        git_ops = GitOps(_warm_config(), project_root, warm_lane_pool_size=1)
-        lane = git_ops.worktree_base / '_lane-0'
-        legacy_dir = lane / '.task'
-        legacy_dir.mkdir(parents=True)
-        (legacy_dir / 'plan.json').write_text(json.dumps({'task_id': '777'}))
-        # Deliberately no plan.json at the new .task-meta path at all.
+        root.mkdir(parents=True, exist_ok=True)
+        (root / filename).write_text(json.dumps({'task_id': task_id}))
 
         found = git_ops._find_lane_by_plan_task_id('777')
 
-        assert found == lane, (
-            f'expected new-then-old fallback to find legacy plan.json at '
-            f'{legacy_dir}, got {found!r}'
+        assert found == (lane if resolves else None)
+
+    def test_corrupt_metadata_does_not_abort_scan(self, tmp_path: Path):
+        git_ops = _pooled_git_ops(tmp_path, pool_size=2)
+        base = git_ops.worktree_base
+        for name in ('_lane-0', '_lane-1'):
+            (base / name).mkdir(parents=True)
+            TaskArtifacts.meta_root_for(base, name).mkdir(parents=True)
+        (TaskArtifacts.meta_root_for(base, '_lane-0') / 'metadata.json').write_text(
+            '{not json'
+        )
+        (TaskArtifacts.meta_root_for(base, '_lane-1') / 'metadata.json').write_text(
+            json.dumps({'task_id': '777'})
+        )
+        visited: list[str] = []
+        real_read = TaskArtifacts.read_lane_task_id
+
+        def _record(meta_root: Path) -> str | None:
+            visited.append(meta_root.name)
+            return real_read(meta_root)
+
+        with patch.object(TaskArtifacts, 'read_lane_task_id', staticmethod(_record)):
+            found = git_ops._find_lane_by_plan_task_id('777')
+
+        assert found == base / '_lane-1'
+        assert visited == ['_lane-0', '_lane-1'], (
+            f'the corrupt lane must be visited before the match; visited={visited}'
         )
 
 
