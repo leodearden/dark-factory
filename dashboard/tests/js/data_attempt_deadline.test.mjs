@@ -76,7 +76,7 @@ test('staleness: past the threshold the per-attempt deadline drops to STALE_TIME
     armed[before],
     STALE_TIMEOUT_MS,
     `an endpoint at ${STALE_FAILURE_THRESHOLD} consecutive failures must arm a ` +
-      `${STALE_TIMEOUT_MS}ms deadline, not 30000 — got ${armed[before]}`,
+      `${STALE_TIMEOUT_MS}ms deadline, not ${DEFAULT_TIMEOUT_MS} — got ${armed[before]}`,
   );
 });
 
@@ -119,7 +119,7 @@ test('staleness: an explicit deps.timeoutMs still wins over both defaults', asyn
     armed[before], 1234,
     `an explicitly injected deps.timeoutMs must win even past the threshold; ` +
       `got ${armed[before]} (${STALE_TIMEOUT_MS} means the reduced default ` +
-      'overrode the caller, 30000 means the full default did)',
+      `overrode the caller, ${DEFAULT_TIMEOUT_MS} means the full default did)`,
   );
 });
 
@@ -132,7 +132,7 @@ test('staleness: DEFAULT_TIMEOUT_MS survives untouched as a parsable literal', (
   // named constant rather than a redefinition of this one.
   const match = DATA_JS_SOURCE.match(/DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/);
   assert.ok(match, 'DEFAULT_TIMEOUT_MS is no longer a literal assignment in data.js');
-  assert.equal(Number(match[1]), 30000);
+  assert.equal(Number(match[1]), DEFAULT_TIMEOUT_MS);
 
   const stale = DATA_JS_SOURCE.match(/STALE_TIMEOUT_MS\s*=\s*(\d+)/);
   assert.ok(stale, 'STALE_TIMEOUT_MS must be its own named literal constant');
@@ -191,7 +191,7 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
   for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) await cycle();
 
   assert.equal(
-    armed[0], 30000,
+    armed[0], DEFAULT_TIMEOUT_MS,
     'the FIRST attempt must still use the full 30s deadline through the production merge',
   );
   for (const st of state.values()) {
@@ -209,7 +209,7 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
     assert.equal(
       ms, STALE_TIMEOUT_MS,
       'an endpoint past the threshold must arm a ' + STALE_TIMEOUT_MS + 'ms deadline through ' +
-        'the PRODUCTION deps merge, not 30000 — measured 4 consecutive ~30000ms aborts in ' +
+        `the PRODUCTION deps merge, not ${DEFAULT_TIMEOUT_MS} — measured 4 consecutive ~30000ms aborts in ` +
         'Chrome 151 because DEFAULT_POLL_DEPS pinned timeoutMs',
     );
   }
@@ -252,7 +252,6 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
 // clock; the no-op timers of data_poll.test.mjs::makeVirtualServer never fire.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_TIMEOUT_MS = 30000;
 const EXPECTED_STALE_PROBE_EVERY = 4;
 
 // The /tasks service times task 5823's ticket measured under degraded conditions.
