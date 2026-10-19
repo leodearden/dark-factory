@@ -498,25 +498,59 @@ class TestDispatchAdmissionFailOpen:
 
     async def test_degradation_warning_is_rate_limited_across_ticks(self, caplog) -> None:
         caplog.set_level('WARNING')
-        clock = _FakeClock()
-        scheduler = Scheduler(
-            OrchestratorConfig(
-                max_per_module=1, psi_admission=PsiAdmissionConfig(runqueue_ratio=4.0),
-            ),
-            time_source=clock,
-        )
-        scheduler.finish_startup()
-        scheduler._read_psi_sample = lambda: _psi(runqueue_read_ok=False)
-        scheduler._dispatched = {'inflight1'}
-        scheduler.get_tasks = AsyncMock(
-            return_value=[_heavy_task('H1', files=['h1']), _heavy_task('H2', files=['h2'])]
-        )
+        degraded_runqueue = _psi(runqueue_read_ok=False)
 
-        assert await scheduler.acquire_next() is not None
-        clock.advance(10.0)  # well within the 180s rate-limit window
-        assert await scheduler.acquire_next() is not None
+        await _dispatch_through(
+            [degraded_runqueue, degraded_runqueue], PsiAdmissionConfig(runqueue_ratio=4.0)
+        )
 
         assert len(_unreadable_warnings(caplog)) == 1
+
+    async def test_a_newly_degraded_component_is_reported_inside_the_window(
+        self, caplog
+    ) -> None:
+        caplog.set_level('WARNING')
+
+        await _dispatch_through(
+            [_psi(runqueue_read_ok=False), _psi(read_ok=False, runqueue_read_ok=False)],
+            PsiAdmissionConfig(runqueue_ratio=4.0),
+        )
+
+        runqueue_only, with_host = _unreadable_warnings(caplog)
+        assert 'host PSI' not in runqueue_only
+        assert 'host PSI' in with_host
+        assert 'runqueue' in with_host
+
+    async def test_a_flapping_component_is_reported_once_per_window(self, caplog) -> None:
+        caplog.set_level('WARNING')
+
+        await _dispatch_through(
+            [_psi(runqueue_read_ok=False), _psi(runqueue_read_ok=True), _psi(runqueue_read_ok=False)],
+            PsiAdmissionConfig(runqueue_ratio=4.0),
+        )
+
+        assert len(_unreadable_warnings(caplog)) == 1
+
+
+async def _dispatch_through(samples: list[PsiSample], psi_cfg: PsiAdmissionConfig) -> None:
+    """Dispatch one heavy candidate per sample, ticks 10s apart.
+
+    Every tick lands well inside the 180s degradation-WARNING window.
+    """
+    clock = _FakeClock()
+    feed = iter(samples)
+    scheduler = Scheduler(
+        OrchestratorConfig(max_per_module=1, psi_admission=psi_cfg), time_source=clock
+    )
+    scheduler.finish_startup()
+    scheduler._read_psi_sample = lambda: next(feed)
+    scheduler._dispatched = {'inflight1'}
+    scheduler.get_tasks = AsyncMock(
+        return_value=[_heavy_task(f'H{i}', files=[f'h{i}']) for i in range(len(samples))]
+    )
+    for _ in samples:
+        assert await scheduler.acquire_next() is not None
+        clock.advance(10.0)
 
 
 def _unreadable_warnings(caplog) -> list[str]:

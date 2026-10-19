@@ -462,7 +462,9 @@ dispatch-admission WARNING streams:
   inert. If it is the own cgroup, the WARNING gives the cgroup path (or
   `(unresolved)`) and the `own_cpu_some_avg10` arm is inert. A degraded
   component behind an arm that is off is not reported, but its `read_ok` still
-  shows in every row's `sample`.
+  shows in every row's `sample`. Each component has its own rate-limit window,
+  so a component that newly degrades is reported at once, even inside another
+  component's window.
 
 **What a hold buys.** `verify_admission_task_slots` is back at 1, so the
 task-verify lane is already bounded by the admission gate above. The dispatch

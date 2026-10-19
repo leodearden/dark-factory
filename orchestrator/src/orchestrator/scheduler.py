@@ -2174,23 +2174,26 @@ def _park_records(parks_by_owner: Mapping[str, Mapping[str, Any]]) -> dict[str, 
     return {owner: ParkRecord.model_validate(rec) for owner, rec in parks_by_owner.items()}
 
 
-def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> tuple[str, ...]:
-    """Name each degraded load component whose loss disables a LIVE gate arm.
+def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, str]:
+    """Map each degraded load component whose loss disables a LIVE gate arm
+    to the operator-facing description of that loss.
 
     Host PSI always counts: an unreadable host sample makes every arm inert
     this tick (DA-D6 fail-open). The runqueue and own-cgroup components count
     only while their arm is on, because a degraded component behind an off arm
     costs the gate nothing (PRD plans/load-throttle-harmonisation-prd.md D2).
     """
-    degraded: list[str] = []
+    degraded: dict[str, str] = {}
     if not sample.read_ok:
-        degraded.append('host PSI /proc/pressure: failing open, heavy dispatch is NOT throttled')
+        degraded['host_psi'] = (
+            'host PSI /proc/pressure: failing open, heavy dispatch is NOT throttled'
+        )
     if cfg.runqueue_ratio is not None and not sample.runqueue_read_ok:
-        degraded.append('/proc/stat runqueue: runqueue_ratio arm inert')
+        degraded['runqueue'] = '/proc/stat runqueue: runqueue_ratio arm inert'
     if cfg.own_cpu_some_avg10 is not None and not sample.own_read_ok:
         own_cgroup = sample.own_cgroup or '(unresolved)'
-        degraded.append(f'own cgroup {own_cgroup}: own_cpu_some_avg10 arm inert')
-    return tuple(degraded)
+        degraded['own_cgroup'] = f'own cgroup {own_cgroup}: own_cpu_some_avg10 arm inert'
+    return degraded
 
 
 class Scheduler:
@@ -2732,12 +2735,12 @@ class Scheduler:
             read_psi_sample, project_id=config.fused_memory.project_id
         )
         # Rate-limit timestamps (monotonic, via self._time_source) for the
-        # dispatch-admission gate's two WARNING streams — deliberately
+        # dispatch-admission gate's WARNING streams — deliberately
         # separate so "PSI unreadable" (fail-open, DA-D6) and "deferring
         # heavy dispatch" (throttle, DA-D2) cannot rate-limit each other into
-        # silence.
+        # silence, and kept per degraded component for the same reason.
         self._last_dispatch_deferred_log: float = 0.0
-        self._last_psi_read_fail_log: float = 0.0
+        self._psi_degradation_logged_at: dict[str, float] = {}
         # Injected async hook installed by the Harness — the already-landed
         # pre-dispatch gate (task 2313), architecturally parallel to
         # _landed_outbox_gate above but sourced from live git state (ancestry
@@ -7555,22 +7558,13 @@ class Scheduler:
 
         A degraded load component never holds: ``saturated()`` treats its
         arm as inert (every arm, when host PSI is unreadable — DA-D6). The
-        loud operator signal is one rate-limited WARNING naming each
-        degraded component behind a live arm (``_psi_degradations``).
+        loud operator signal is ``_warn_psi_degradations``.
         """
         cfg_psi = self.config.psi_admission
         hold: PsiHold | None = None
         if cfg_psi.enabled:
             psi_sample = self._read_psi_sample()
-            degraded = _psi_degradations(psi_sample, cfg_psi)
-            if degraded:
-                _now = self._time_source()
-                if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
-                    logger.warning(
-                        'Dispatch-admission gate: load component unreadable — %s',
-                        '; '.join(degraded),
-                    )
-                    self._last_psi_read_fail_log = _now
+            self._warn_psi_degradations(_psi_degradations(psi_sample, cfg_psi))
             in_flight = len(self._dispatched)
             if psi_sample.saturated(cfg_psi) and in_flight >= cfg_psi.min_inflight_floor:
                 hold = PsiHold(
@@ -7581,6 +7575,27 @@ class Scheduler:
                 )
         ctx.psi_hold = hold
         return _CONTINUE
+
+    def _warn_psi_degradations(self, degraded: Mapping[str, str]) -> None:
+        """WARN once, naming every degraded component, when any of them is
+        due — not reported within the rate-limit window.
+
+        Each component keeps its own window: one that newly degrades (host PSI
+        failing while the runqueue arm is already inert) is reported at once,
+        and one that flaps is reported at most once per window.
+        """
+        now = self._time_source()
+        logged_at = self._psi_degradation_logged_at
+        if not any(
+            now - logged_at.get(component, -math.inf) >= _DISPATCH_DEFERRED_LOG_SECS
+            for component in degraded
+        ):
+            return
+        logger.warning(
+            'Dispatch-admission gate: load component unreadable — %s',
+            '; '.join(degraded.values()),
+        )
+        logged_at.update(dict.fromkeys(degraded, now))
 
     def _note_heavy_deferral(
         self, ctx: TickContext, hold: PsiHold, deferred_task_id: str
