@@ -1,9 +1,15 @@
-"""The one way an orchestrator test runs a probe file in a nested serial pytest session under this subproject's inifile.
+"""Runs an orchestrator probe file in a nested serial pytest session from ORCH_DIR, under this subproject's inifile and conftest chain.
 
 A probe session never uses the host's default pytest temp root, whose
 exit-time cleanup of other sessions' dead dirs is unbounded and runs outside
 pytest-timeout; it runs under the ``basetemp`` its caller names instead
 (contract: test_probe_session.py).
+
+Not every nested session goes through here:
+``test_aiosqlite_leak_isolation.py::_run_probe_session`` is deliberately
+separate. It compares two inifiles from its probe's own directory with
+``--confcutdir`` pinned there, and its probe requests no ``tmp_path``, so it
+never creates a dir in the host's temp root.
 """
 from __future__ import annotations
 
