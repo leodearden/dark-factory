@@ -3463,9 +3463,8 @@ class Harness:
         name`` (the new ``.task-meta`` sibling location, W11 beta), falling
         back to the legacy ``entry / '.task' / name`` when the new path is
         absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
-        contract and ``GitOps._find_lane_by_plan_task_id``'s plan.json scan,
-        for the ``_recover_crashed_tasks`` reads that don't go through a
-        ``TaskArtifacts`` instance.
+        contract, for the ``_recover_crashed_tasks`` reads that don't go
+        through a ``TaskArtifacts`` instance.
         """
         new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
         if new_path.exists():
