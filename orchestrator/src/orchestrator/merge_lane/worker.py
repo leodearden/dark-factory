@@ -14679,11 +14679,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Periodically probe quarantined remote hosts and clear on recovery.
 
         Runs independently of the merger/verifier loops so it fires even when
-        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and delegates
-        to the clock-injectable :meth:`_reprobe_quarantined_hosts`.
+        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and runs two
+        sweeps: the tracker-driven :meth:`_reprobe_quarantined_hosts` first, then
+        :meth:`_reprobe_untracked_parked_slots`, the backstop for PARKED hosts
+        with no tracker entry.
 
-        Any unexpected exception is logged and swallowed (same pattern as
-        _heartbeat_loop) so a probe bug can never crash the worker.
+        Each sweep is fault-isolated: an unexpected exception is logged and
+        swallowed (same pattern as _heartbeat_loop), so a probe bug can neither
+        crash the worker nor disable the other sweep.
         """
         while self._running:
             await self._clock.sleep(self._reprobe_interval_s)
@@ -14691,6 +14694,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 await self._reprobe_quarantined_hosts(self._clock.now())
             except Exception:
                 logger.exception('reprobe_quarantined_hosts: unexpected error in loop')
+            try:
+                await self._reprobe_untracked_parked_slots()
+            except Exception:
+                logger.exception('reprobe_untracked_parked_slots: unexpected error in loop')
+
+    async def _reprobe_untracked_parked_slots(self) -> None:
+        """Free PARKED hosts the tracker sweep cannot see; tracked ones stay its job."""
+        if not isinstance(self._host_allocator, HostAllocator):
+            return
+        await self._host_allocator.reprobe_parked_slots(
+            exclude=frozenset(self._runner_unavailable),
+        )
 
     # ── supervisor (task 1857) ───────────────────────────────────────────
 
@@ -17902,8 +17917,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
         ``probe_clean()`` polls fail, so
         :meth:`~orchestrator.verify_runner.HostAllocator.cancel_and_release`
-        leaves the slot **PARKED** and non-acquirable (verify_runner.py:3202,
-        3211).  That is the correct fail-closed state — the cancel RPC failed,
+        leaves the slot **PARKED** and non-acquirable.  That is the correct
+        fail-closed state — the cancel RPC failed,
         so a stale verify process may still be running there — but it writes
         **only** ``_slots``: the host is NOT added to ``_quarantine``, so
         ``quarantined_remote_runners()`` never yields it and
@@ -17924,7 +17939,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         PARKED, not ``not ok``, is the discriminator: the cancel-fail path
         returns False *regardless* of the probe outcome, so a host whose probe
         came back clean (slot FREE, perfectly healthy) would otherwise be
-        quarantined on a false positive.
+        quarantined on a false positive.  Detection runs in a ``finally``, so a
+        CancelledError during the multi-second probe loop, where the slot is
+        already PARKED, still records the strand and then propagates unchanged.
 
         The PARKED read is gated on ``isinstance(..., HostAllocator)`` — the
         house pattern task 3275 established at :meth:`_host_states_block`,
@@ -17941,29 +17958,40 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if lease is None or self._host_allocator is None:
             return True
 
-        ok = await self._host_allocator.cancel_and_release(lease)
-
-        if not ok and not getattr(lease, 'is_local', False):
-            try:
-                _parked = (
-                    isinstance(self._host_allocator, HostAllocator)
-                    and self._host_allocator.is_parked(lease.name)
-                )
-                if _parked:
-                    self._quarantine_unreachable_host(
-                        lease.name,
-                        f'verify cancel/probe failed against {lease.name!r} — '
-                        'host slot PARKED (presumed unreachable)',
-                        self._clock.now(),
-                    )
-            except Exception:
-                logger.warning(
-                    f'strand check after cancel_and_release({lease.name!r}) '
-                    'failed; host may be PARKED without a tracker entry',
-                    exc_info=True,
-                )
-
+        ok = False
+        try:
+            ok = await self._host_allocator.cancel_and_release(lease)
+        finally:
+            if not ok:
+                self._record_parked_strand(lease)
         return ok
+
+    def _record_parked_strand(self, lease: Any) -> None:
+        """Quarantine and track *lease*'s remote host if its slot was left PARKED.
+
+        Synchronous on purpose: it runs in :meth:`_cancel_and_release_tracked`'s
+        ``finally``, possibly while a CancelledError is unwinding.
+        """
+        if getattr(lease, 'is_local', False):
+            return
+        try:
+            _parked = (
+                isinstance(self._host_allocator, HostAllocator)
+                and self._host_allocator.is_parked(lease.name)
+            )
+            if _parked:
+                self._quarantine_unreachable_host(
+                    lease.name,
+                    f'verify cancel/probe failed against {lease.name!r} — '
+                    'host slot PARKED (presumed unreachable)',
+                    self._clock.now(),
+                )
+        except Exception:
+            logger.warning(
+                f'strand check after cancel_and_release({lease.name!r}) '
+                'failed; host may be PARKED without a tracker entry',
+                exc_info=True,
+            )
 
     async def _teardown_verify_task(
         self,

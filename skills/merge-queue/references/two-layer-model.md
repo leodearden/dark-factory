@@ -103,12 +103,15 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `hosts` | list\[dict\] | Per-verify-host state: `{name, is_local, slot_state: free\|busy\|parked\|null, quarantined, quarantine_class: ru\|divergence\|null, unavailable_since, unavailable_secs, streak, reason}` (task 3275) |
 
 `hosts` is what makes an under-full `verifying N/M hosts` line diagnosable — it
-has four possible causes, each with its own discriminator: **RU-quarantine**
+has five possible causes, each with its own discriminator: **RU-quarantine**
 (`quarantine_class == 'ru'` — auto-recovers via `_reprobe_quarantined_hosts`);
 **divergence-quarantine** (`quarantine_class == 'divergence'` — held for verdict
-parity, operator-cleared only); **leaked slot** (`slot_state` `busy`/`parked`
-with no matching `occupancy.inflight_by_host` occupant); and **free and never
-asked for** (`slot_state == 'free'`, `quarantined == false`). `unavailable_since`
+parity, operator-cleared only); **untracked PARK** (`slot_state == 'parked'`
+with `quarantine_class == null` — a cancel failed and its probe gave up;
+auto-recovers via `HostAllocator.reprobe_parked_slots` once the host probes
+clean); **leaked slot** (`slot_state == 'busy'` with no matching
+`occupancy.inflight_by_host` occupant); and **free and never asked for**
+(`slot_state == 'free'`, `quarantined == false`). `unavailable_since`
 / `unavailable_secs` / `streak` / `reason` are populated whenever the host is
 RU-tracked, independent of quarantine, so a host accumulating failures below the
 quarantine threshold is visible too — `unavailable_since` is an absolute epoch

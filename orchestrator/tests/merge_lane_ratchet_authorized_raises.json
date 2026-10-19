@@ -3727,6 +3727,66 @@
           "current": 31616
         }
       ]
+    },
+    {
+      "task_id": "3310",
+      "reason": "task 3310 item 1: PARK strand recorded in a finally so cancellation cannot strand the slot; task 3310 item 2: _slots-driven backstop sweep for untracked PARKED hosts wired into _reprobe_loop; regression tests for the PARK strand under cancellation drive the existing _cancel_and_release_tracked/_resolve_and_release seams (ported from task/3310 31e0f7e25a..b0c74fd5e6)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2199,
+          "current": 2200
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_reprobe_loop",
+          "baseline": 3,
+          "current": 5
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22228,
+          "current": 22256
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_multihost_wiring.py",
+          "baseline": 345,
+          "current": 347
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12510,
+          "current": 12521
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4873,
+          "current": 4874
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57346,
+          "current": 57374
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6541,
+          "current": 6543
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31616,
+          "current": 31627
+        }
+      ]
     }
   ]
 }

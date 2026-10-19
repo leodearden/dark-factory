@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, raises
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore
@@ -5432,6 +5433,79 @@ class TestParkedRemoteLeaseIsRecorded:
             side_effect=RuntimeError('boom'),
         ):
             assert await worker._cancel_and_release_tracked(lease) is False
+
+
+@pytest.mark.asyncio
+class TestParkedStrandSurvivesCancellation:
+    """A CancelledError landing in cancel_and_release's multi-second probe loop
+    still leaves the PARKED slot RECORDED, and still propagates (task 3310).
+
+    The slot is PARKED before the first probe, so a cancellation there that
+    skipped strand detection would strand it: PARKED, unquarantined, untracked.
+    """
+
+    def _block_probe(self, runner) -> asyncio.Event:
+        """Make runner.probe_clean block forever; return the Event it sets on entry."""
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _blocking_probe():
+            entered.set()
+            await never.wait()
+            return True
+
+        runner.probe_clean = _blocking_probe
+        return entered
+
+    def _laptop_row(self, worker) -> dict:
+        return {h['name']: h for h in worker.snapshot()['hosts']}['leo-laptop']
+
+    async def test_cancellation_mid_probe_propagates_and_records_the_strand(self):
+        worker, _eq, alloc, runner = _make_parking_worker()
+        entered = self._block_probe(runner)
+
+        t = asyncio.create_task(worker._cancel_and_release_tracked(alloc.acquire_remote()))
+        await wait_responsive(entered.wait(), label="the PARK probe to block")
+        assert alloc.is_parked('leo-laptop') is True
+        t.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        row = self._laptop_row(worker)
+        assert row['slot_state'] == 'parked'
+        assert row['quarantine_class'] == 'ru'
+
+    async def test_cancellation_through_a_suppressing_call_site_records_the_strand(self):
+        """_resolve_and_release wraps the release in contextlib.suppress(BaseException)."""
+        from orchestrator.merge_lane.worker import InflightEntry, MergeOutcome
+
+        worker, _eq, alloc, runner = _make_parking_worker()
+        seed = _make_ru_entry(worker, 'leo-laptop')
+        lease = alloc.acquire_remote()
+        assert lease is not None
+        entry = InflightEntry(
+            item=seed.item,
+            lease=lease,
+            verify_task=seed.verify_task,
+            merge_wt=seed.merge_wt,
+            was_speculative=False,
+        )
+        entered = self._block_probe(runner)
+
+        t = asyncio.create_task(worker._resolve_and_release(
+            entry, MergeOutcome('blocked', reason='cascade'),
+            chain_failed=True, cancel_lease=True,
+        ))
+        await wait_responsive(entered.wait(), label="the PARK probe to block")
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+        assert entry.verify_task is not None
+        await entry.verify_task
+
+        row = self._laptop_row(worker)
+        assert row['slot_state'] == 'parked'
+        assert row['quarantine_class'] == 'ru'
 
 
 # ---------------------------------------------------------------------------
