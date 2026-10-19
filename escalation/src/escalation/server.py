@@ -135,6 +135,25 @@ def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Es
     return {mid: queue.get(mid) for mid in dict.fromkeys(member_ids)}
 
 
+def _partition_usable_members(
+    members: dict[str, Escalation | None],
+) -> tuple[dict[str, str], list[str]]:
+    """Split *members* into ``({id: severity} usable, [id] unusable)``.
+
+    USABLE means the id resolves AND its severity is in ``KNOWN_SEVERITIES``;
+    :func:`_derive_l2_severity` says why.  The one home of that rule for both
+    the derivation and :func:`_info_only_refusal`.
+    """
+    usable: dict[str, str] = {}
+    unusable: list[str] = []
+    for mid, member in members.items():
+        if member is not None and member.severity in KNOWN_SEVERITIES:
+            usable[mid] = member.severity
+        else:
+            unusable.append(mid)
+    return usable, unusable
+
+
 def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     """Return max(member severities) for a promoted L2, or None if none is usable.
 
@@ -184,21 +203,17 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     seed would be indistinguishable from a real info member, and the explicit
     nothing-usable branch is what carries the fail-safe.
     """
-    resolved: list[str] = []
-    unusable: list[str] = []
-    for mid, member in members.items():
-        if member is None:
-            unusable.append(mid)
-        elif member.severity not in KNOWN_SEVERITIES:
+    usable, unusable = _partition_usable_members(members)
+    for mid in unusable:
+        member = members[mid]
+        if member is not None:
             logger.warning(
                 'promote_to_l2: member escalation %s carries out-of-vocabulary '
                 'severity %r (expected one of %s); excluding it from the derived '
                 'L2 severity rather than propagating it.',
                 mid, member.severity, sorted(KNOWN_SEVERITIES),
             )
-            unusable.append(mid)
-        else:
-            resolved.append(member.severity)
+    resolved = list(usable.values())
 
     if not resolved:
         logger.warning(
@@ -219,6 +234,25 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     for sev in resolved[1:]:
         derived = max_severity(derived, sev)
     return derived
+
+
+def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
+    """The ``info_only_cluster`` refusal for a cluster that derived ``'info'``.
+
+    The refusal's ``members`` key names only the records the derivation used —
+    each one ``'info'``, since they derived ``'info'`` — so each is safe to
+    close at L1.  Every other id goes to ``unusable``: a phantom id has no
+    record to close, and an out-of-vocabulary severity is not known to be
+    informational.  The *members* argument is :func:`_read_members`' answer.
+    """
+    usable, unusable = _partition_usable_members(members)
+    return {
+        'status': 'refused',
+        'code': 'info_only_cluster',
+        'members': list(usable),
+        'unusable': unusable,
+        'derived_severity': 'info',
+    }
 
 
 def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset[str]:
@@ -286,7 +320,8 @@ def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str
 
 
 # The role the steward's own filings carry (orchestrator.steward
-# _auto_escalate_to_human hard-codes ``agent_role='steward'``). Level-1 is the
+# _auto_escalate_to_human files under orchestrator.agents.roles.STEWARD.name,
+# which escalation cannot import). Level-1 is the
 # steward's documented recourse, so an L1 from this role — or from a harness
 # sentinel — is the EXPECTED shape and is not logged.
 _EXPECTED_L1_FILER_ROLE = 'steward'
@@ -3201,7 +3236,9 @@ def create_server(
         3997): the record's OWN framing stays immutable, but the framing a fold
         carried in is no longer lost.  That list is bounded — oldest-shed at
         ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
-        ``amendments_truncated``.
+        ``amendments_truncated``.  The info-only refusal (see *severity*) is
+        judged BEFORE this fold, so an all-info cluster is never folded into an
+        already-pending L2 either.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -3283,7 +3320,11 @@ def create_server(
             INHERITS ``max(member severities)``** — this is the correct default
             in the overwhelming majority of cases, and is what stops a cluster
             of purely-informational L1s from being born ``'blocking'`` and
-            paging a human (task 3976).
+            paging a human (task 3976).  An omitted severity whose members
+            derive ``'info'`` is REFUSED rather than minted or folded (PRD
+            ``plans/info-l0-disposition-router-prd.md`` D4, task 5222): see
+            **Info-only refusal** under Response shapes.  An explicit value
+            bypasses that refusal in both directions.
 
             An EXPLICIT value overrides the derivation in BOTH directions at
             mint time.  Upward in particular stays fully available and is not
@@ -3318,10 +3359,13 @@ def create_server(
             ``'blocking'`` and classified ``QUEUE_HANDOFF`` in
             ``escalation.pins``, and the only info-severity L2s were ones
             ``escalation.queue.EscalationQueue.park()`` promoted from an
-            already-open L0/L1.  Link 1 in ``escalation.pins`` short-circuits
+            already-open L0/L1.  Since task 5222 a silent all-info promote
+            mints nothing, so an info L2 now comes only from an explicit
+            ``severity='info'`` or from ``park()``.  Link 1 in
+            ``escalation.pins`` short-circuits
             on ``severity == 'info'`` BEFORE the ``level != 0`` link — "an
-            info record never pins, at any level" — so an inherited-info L2
-            no longer vetoes its subject task's ``done`` flip.  That is the
+            info record never pins, at any level" — so such an info L2
+            does not veto its subject task's ``done`` flip.  That is the
             INTENDED semantics and was considered here, not an oversight: the
             members it clusters were themselves non-pinning, and a record that
             does not merit a human's attention must not hold a task open
@@ -3354,6 +3398,15 @@ def create_server(
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
         on the update path is the post-floor value, not the argument.
+
+        Info-only refusal (an omitted *severity* whose members derive
+        ``'info'``; nothing is minted and nothing is folded)::
+
+            {'status': 'refused', 'code': 'info_only_cluster',
+             'members': [<the info members the derivation used>],
+             'unusable': [<ids that did not resolve, or carry an
+                           out-of-vocabulary severity>],
+             'derived_severity': 'info'}
 
         Error::
 
@@ -3460,6 +3513,7 @@ def create_server(
                 members = _read_members(queue, member_ids)
                 derived = None if severity is not None else _derive_l2_severity(members)
                 return (
+                    members,
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
                     _sentinel_bound_task_ids(members),
@@ -3467,7 +3521,7 @@ def create_server(
                 )
 
             (
-                derived, existing_id, required_task_ids, eval_lane_members,
+                members, derived, existing_id, required_task_ids, eval_lane_members,
             ) = await asyncio.to_thread(_read_for_promote)
 
             if eval_lane_members:
@@ -3481,6 +3535,17 @@ def create_server(
                     for member_id, reason in eval_lane_members.items()
                 )
                 return _eval_lane_refusal(f'member(s) {named} are eval-lane artifacts')
+
+            # PRD info-l0-disposition-router D4: a cluster whose members derive
+            # 'info' never enters L2 by default — not minted, not folded into an
+            # existing L2.  An explicit severity bypasses it in both directions.
+            if severity is None and derived == 'info':
+                logger.info(
+                    'promote_to_l2: refused info-only cluster under task_id=%r '
+                    'root_cause=%r; members=%s',
+                    task_id, root_cause, member_ids,
+                )
+                return _info_only_refusal(members)
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.

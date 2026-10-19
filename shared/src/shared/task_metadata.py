@@ -1340,6 +1340,11 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # §10): written and read back only by
         # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
         'audit_trail_rotation',
+        # Plan task-text provenance mirror (task 4031): written by orchestrator
+        # TaskWorkflow._mirror_plan_text_fp at plan authoring; read by
+        # fused-memory's amendment advisory (task 4034).
+        'plan_text_fp',
+        'plan_authored_at',
     }
 )
 

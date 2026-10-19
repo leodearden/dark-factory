@@ -43,6 +43,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
     inject_task_kind,
@@ -8993,6 +8994,9 @@ def create_mcp_server(
         heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        deferral: dict | None = None,
+        expected_stamped_at: str | None = None,
+        restamp_only: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -9063,6 +9067,27 @@ def create_mcp_server(
             client_op_id: Optional client-supplied idempotency key (task 2712).
                 A retry with the same key applies once and returns the recorded
                 outcome. Omit for today's behavior.
+            deferral: What ends the hold. REQUIRED to enter ``deferred``, refused
+                with any other status. One of
+                ``{'kind': 'carried_by', 'carrier_task_id': <id>}``,
+                ``{'kind': 'until_condition', 'condition': <text>, 'expires_at': <ISO, optional>}``
+                or ``{'kind': 'held_by_session', 'holder_pid': <your $CLAUDE_PID>,
+                'grace_secs': <600..86400, optional>}``; each may add ``reason``.
+                On a row already ``deferred`` it re-stamps (replaces) the record
+                without a status change. Every successful write echoes the
+                stored record as ``deferral`` (entry, re-stamp) or the removed
+                one as ``deferral_cleared`` (any exit from ``deferred``); no echo
+                means the server predates the gate. Refusals: ``deferral_required``,
+                ``deferral_invalid`` (with ``reason_code``, ``field``, ``value``),
+                ``deferral_changed``. Recipe: docs/task-authoring.md §9
+                "Deferring a task".
+            expected_stamped_at: Compare-and-set, single id only: the write is
+                refused ``deferral_changed`` unless the row's current record has
+                this ``stamped_at``.
+            restamp_only: Guarded re-stamp, single id only, ``status='deferred'``
+                and a ``deferral`` required: refused ``deferral_changed`` unless
+                the row is ``deferred`` now with the record named by
+                ``expected_stamped_at`` (omitted = no record).
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -9091,6 +9116,9 @@ def create_mcp_server(
             reopen_reason=reopen_reason,
             agent_id=agent_id,
             client_op_id=client_op_id,
+            deferral=deferral,
+            expected_stamped_at=expected_stamped_at,
+            restamp_only=restamp_only,
             **claimant_kwargs,
         )
 
@@ -9825,6 +9853,9 @@ def create_mcp_server(
         project_root: str,
         task_ids: str,
         target_status: str = 'pending',
+        deferral: dict | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
 
@@ -9846,6 +9877,19 @@ def create_mcp_server(
             target_status: ``pending`` to release for scheduling (default),
                 ``deferred`` to leave them parked, or ``cancelled`` to discard
                 the planned batch.  Other status values are rejected.
+            deferral: Required iff ``target_status='deferred'``: what ends the
+                hold, in the ``set_task_status`` ``deferral`` shape. Each id is
+                re-stamped with it (its ``deferred_at`` is kept) and the record
+                is echoed per id as ``deferral``.
+            agent_id: Which agent is committing (optional, auto-derived from
+                MCP context); a re-stamp records it as ``stamped_by``.
+
+        RELEASE RULE (``pending``/``cancelled``): only a ``planning`` hold, or a
+        row with no record, is released. Any other hold is refused per id with
+        ``deferral_invalid`` / ``reason_code='not_planning_hold'`` and stays
+        parked; a plain ``set_task_status(status='pending')`` still releases
+        it. Each released id echoes the record it removed as
+        ``deferral_cleared`` (``None`` when there was none).
 
         A ``pending`` commit stamps ONE shared ``metadata.pending_since``
         across the whole batch (task 3816, PRD
@@ -10028,10 +10072,14 @@ def create_mcp_server(
                 for f in findings
             )
 
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
             status=target_status,
             project_root=project_root,
+            agent_id=agent_id,
+            deferral=deferral,
+            scope=StatusWriteScope.COMMIT_PLANNING,
         )
         if target_status == 'pending':
             # Best-effort/never-raising (see index_committed_tasks docstring) —
@@ -10050,16 +10098,13 @@ def create_mcp_server(
             # already-fetched tasks_data (no extra reads). Only attaches the
             # report key when a sidecar actually exists on disk, so a batch
             # with no capability-manifest involvement gets a byte-identical
-            # legacy response. agent_id is intentionally omitted: unlike most
-            # write tools in this module, commit_planning takes no
-            # agent_id/ctx parameter of its own — the set_task_status call
-            # above this one is likewise un-attributed — so passing None
-            # here is parity with that call, not a missed wiring.
+            # legacy response.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
+                agent_id=agent_id,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report

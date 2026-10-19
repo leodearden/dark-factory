@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from _escalation_seed import seed_escalation
+from _filing_tools import call_promote
 from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 from shared.merge_state import MergeReason
 
@@ -1967,12 +1968,6 @@ class TestChokepointSeverityDowngrade:
 # Helpers for promote_to_l2 tests
 # ---------------------------------------------------------------------------
 
-async def _promote_to_l2(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the promote_to_l2 MCP tool directly."""
-    tool = await server.get_tool('promote_to_l2')
-    return await tool.fn(**kwargs)
-
-
 async def _resolve_issue(server, **kwargs: Any) -> dict[str, Any]:
     """Invoke the resolve_issue MCP tool directly (sync tool)."""
     tool = await server.get_tool('resolve_issue')
@@ -2032,7 +2027,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
@@ -2047,7 +2042,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             task_id='t-1',
             agent_role='watcher-auto',
@@ -2073,7 +2068,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-solo']},
         )
 
@@ -2090,7 +2085,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': []},
         )
 
@@ -2103,7 +2098,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': ''},
         )
@@ -2117,7 +2112,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': '   '},
         )
@@ -2137,7 +2132,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'severity': 'CRITICAL'},
         )
@@ -2154,7 +2149,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'severity': severity},
         )
@@ -2171,7 +2166,7 @@ class TestPromoteToL2Create:
         server = create_server(queue)
 
         for sev in KNOWN_SEVERITIES:
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server,
                 task_id=f'task-{sev}',
                 agent_role='watcher',
@@ -2196,7 +2191,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2235,10 +2230,10 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']},
         )
 
@@ -2254,11 +2249,11 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        await _promote_to_l2(
+        await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         # Pass both the existing member (should not duplicate) and a new one
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
 
@@ -2274,8 +2269,8 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']})
-        await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']})
+        await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']})
+        await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']})
 
         pending_l2 = [e for e in queue.get_pending() if e.level == 2]
         assert len(pending_l2) == 1, (
@@ -2291,7 +2286,7 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server,
             task_id='t-1',
             agent_role='watcher',
@@ -2302,7 +2297,7 @@ class TestPromoteToL2Dedup:
             summary='First summary',
         )
         # Second call with different evidence, options, summary — should NOT overwrite
-        await _promote_to_l2(
+        await call_promote(
             server,
             task_id='t-2',
             agent_role='watcher',
@@ -2326,11 +2321,11 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'root cause A'},
         )
-        second = await _promote_to_l2(
+        second = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2'], 'root_cause': 'root cause B'},
         )
@@ -2350,13 +2345,13 @@ class TestPromoteToL2Dedup:
         server = create_server(queue)
 
         # Create and resolve the first L2
-        first = await _promote_to_l2(
+        first = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         queue.resolve(first['id'], 'Previous resolution')
 
         # Second call: same root_cause, but first is resolved → new L2 (status='created')
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']},
         )
 
@@ -2392,7 +2387,7 @@ class TestPromoteToL2Dedup:
             queue, 'add_members_to_l2', lambda esc_id, ids, **kwargs: None,
         )
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
@@ -2423,50 +2418,10 @@ class TestPromoteToL2SeverityInheritance:
 
     The explicit argument stays fully honoured — a cluster of individually
     informational findings CAN be collectively blocking, and the watcher must
-    still be able to say so.
+    still be able to say so.  A derivation that lands on 'info' is now REFUSED
+    rather than minted (PRD info-l0-disposition-router D4, task 5222), and is
+    observable through the refusal's ``derived_severity``.
     """
-
-    @pytest.mark.asyncio
-    async def test_lone_info_member_yields_info_l2(self, tmp_path: Path):
-        """(a) The esc-3037 regression: an info L1 must not mint a blocking L2.
-
-        Observed incident: esc-3037-1 (L0, info, architect) → esc-3037-3 (L1,
-        info, harness-orphan-reaper — severity faithfully preserved) →
-        esc-3037-4 (L2, *blocking*, escalation-watcher-auto,
-        members=['esc-3037-3'], later closed as benign).  The inflation happens
-        at the promotion seam and only there.
-        """
-        queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
-
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
-        )
-
-        assert 'error' not in result, f'Unexpected error: {result}'
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', (
-            f'Lone info member must yield an info L2, got {record.severity!r}'
-        )
-        assert record.level == 2, f'Expected level=2, got {record.level}'
-
-    @pytest.mark.asyncio
-    async def test_all_info_members_yield_info_l2(self, tmp_path: Path):
-        """(b) An all-info member set inherits 'info'."""
-        queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
-        _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
-
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-a', 'esc-l1-b']},
-        )
-
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', f'Expected info, got {record.severity!r}'
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2485,7 +2440,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
         _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
 
-        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+        result = await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': order})
 
         record = queue.get(result['id'])
         assert record is not None
@@ -2511,7 +2466,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
         _seed_l1(queue, 'esc-l1-crit', 'task-2', 'critical')
 
-        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+        result = await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': order})
 
         record = queue.get(result['id'])
         assert record is not None
@@ -2535,7 +2490,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
         _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2562,7 +2517,7 @@ class TestPromoteToL2SeverityInheritance:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk'], 'severity': 'info'},
         )
@@ -2590,7 +2545,7 @@ class TestPromoteToL2SeverityInheritance:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
             )
 
@@ -2629,7 +2584,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-warn', 'task-1', 'warn')
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-warn']},
             )
 
@@ -2666,7 +2621,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
 
         for order in (['esc-l1-warn', 'esc-l1-info'], ['esc-l1-info', 'esc-l1-warn']):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server,
                 **{
                     **_L2_DEFAULTS,
@@ -2674,12 +2629,12 @@ class TestPromoteToL2SeverityInheritance:
                     'root_cause': f'corrupt-sibling {order[0]}',
                 },
             )
-            record = queue.get(result['id'])
-            assert record is not None
-            assert record.severity == 'info', (
+            assert result['status'] == 'refused', result
+            assert result['derived_severity'] == 'info', (
                 f'Order {order} must derive from the valid subset only, got '
-                f'{record.severity!r}'
+                f'{result!r}'
             )
+        assert await _get_pending(server, level=2) == []
 
     @pytest.mark.asyncio
     async def test_partial_resolution_derives_from_the_resolvable_subset(
@@ -2695,16 +2650,15 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server,
                 **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info', 'esc-phantom-2']},
             )
 
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', (
+        assert result['status'] == 'refused', result
+        assert result['derived_severity'] == 'info', (
             'Partial resolution must derive from the resolvable subset, '
-            f'got {record.severity!r}'
+            f'got {result!r}'
         )
         warned = [
             r for r in caplog.records
@@ -2729,7 +2683,7 @@ class TestPromoteToL2SeverityInheritance:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2763,16 +2717,20 @@ class TestPromoteToL2SeverityInResponse:
     async def test_create_response_reports_the_inherited_severity(
         self, tmp_path: Path,
     ):
-        """(a) An inherited severity is visible in the response and matches disk."""
+        """(a) An inherited severity is visible in the response and matches disk.
+
+        A lone 'critical' member, because an inherited 'critical' cannot be
+        mistaken for the create path's fail-safe 'blocking'.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-crit', 'task-1', 'critical')
 
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        result = await call_promote(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-crit']},
         )
 
-        assert result['severity'] == 'info', (
+        assert result['severity'] == 'critical', (
             f'Response must report the inherited severity, got: {result}'
         )
         assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
@@ -2786,7 +2744,7 @@ class TestPromoteToL2SeverityInResponse:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2806,7 +2764,7 @@ class TestPromoteToL2SeverityInResponse:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
         )
 
@@ -2822,13 +2780,14 @@ class TestPromoteToL2SeverityInResponse:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert first['severity'] == 'info'
 
         _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
 
@@ -2845,12 +2804,12 @@ class TestPromoteToL2SeverityInResponse:
         """(e) The added key is purely additive — no existing consumer breaks."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
 
-        created = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        created = await call_promote(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
-        updated = await _promote_to_l2(
+        updated = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-other']},
         )
 
@@ -2885,12 +2844,12 @@ class TestPromoteToL2FramingPreservation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(
+        created = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
-        result = await _promote_to_l2(server, **{
+        result = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'evidence': 'SECOND-pass evidence, authored by this promote',
@@ -2937,7 +2896,7 @@ class TestPromoteToL2FramingPreservation:
         # early and silently discard everything it was handed.
         before = queue.get(created['id'])
         assert before is not None
-        third = await _promote_to_l2(server, **{
+        third = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],  # already a member: nothing new to add
             'evidence': 'THIRD-pass evidence',
@@ -2983,7 +2942,7 @@ class TestAmendmentTruncationStorm:
     @staticmethod
     async def _fold(server, tag: str) -> dict[str, Any]:
         """Promote the same root_cause again — always a fold, always framing."""
-        return await _promote_to_l2(server, **{
+        return await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],  # already a member after the first call
             'evidence': f'fold evidence {tag}',
@@ -3001,7 +2960,7 @@ class TestAmendmentTruncationStorm:
         def pending_ids() -> set[str]:
             return {e.id for e in queue.get_pending()}
 
-        created = await _promote_to_l2(
+        created = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         assert created['status'] == 'created', f'Unexpected first result: {created}'
@@ -3128,7 +3087,7 @@ class TestAmendmentTruncationStorm:
         def pending_ids() -> set[str]:
             return {e.id for e in queue.get_pending()}
 
-        created = await _promote_to_l2(
+        created = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         assert created['status'] == 'created', f'Unexpected first result: {created}'
@@ -3166,7 +3125,9 @@ class TestPromoteToL2SeverityFloorOnUpdate:
     The root-cause dedup path appends members to an existing pending L2.  Now
     that an L2 can be born `info`, that path must raise the record when the
     incoming members justify it — otherwise the inherited default would trade
-    the old inflation for under-escalation, which is strictly worse.
+    the old inflation for under-escalation, which is strictly worse.  The info
+    L2s below are minted with an explicit ``severity='info'``, because a silent
+    all-info promote is refused rather than minted (task 5222).
     """
 
     @pytest.mark.asyncio
@@ -3180,13 +3141,14 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
         _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
 
@@ -3205,14 +3167,15 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
         assert queue.get(first['id']).severity == 'blocking'  # type: ignore[union-attr]
 
         _seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
-        second = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        second = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
 
         assert second['status'] == 'updated'
@@ -3236,14 +3199,15 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
         # Explicit UP on an append: honoured.
         _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
-        raised = await _promote_to_l2(
+        raised = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-b'], 'severity': 'critical'},
         )
@@ -3254,7 +3218,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
 
         # Explicit DOWN on an append: capped by the monotonic floor.
         _seed_l1(queue, 'esc-l1-c', 'task-3', 'info')
-        lowered = await _promote_to_l2(
+        lowered = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-c'], 'severity': 'info'},
         )
@@ -3288,15 +3252,16 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         before = queue.get(first['id'])
         assert before is not None and before.severity == 'info'
         updated_at_before = before.updated_at
 
         # Same root_cause → update path, with a member id that resolves to nothing.
-        appended = await _promote_to_l2(
+        appended = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
         )
 
@@ -3330,11 +3295,12 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         # Append a phantom id once so it is already a member...
-        await _promote_to_l2(
+        await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
         )
         before = queue.get(first['id'])
@@ -3343,7 +3309,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
 
         # ...then re-promote the SAME unresolvable id: nothing to append, and
         # nothing derivable to floor with.
-        again = await _promote_to_l2(
+        again = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
         )
 
@@ -3380,7 +3346,7 @@ class TestPromoteToL2Cascade:
         _seed_l1(queue, 'esc-l1-1', 'task-1')
         _seed_l1(queue, 'esc-l1-2', 'task-2')
 
-        await _promote_to_l2(
+        await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
@@ -3403,7 +3369,7 @@ class TestPromoteToL2Cascade:
         _seed_l1(queue, 'esc-l1-1', 'task-1')
         _seed_l1(queue, 'esc-l1-2', 'task-2')
 
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
@@ -3431,7 +3397,7 @@ class TestPromoteToL2Cascade:
         server = create_server(queue)
 
         _seed_l1(queue, 'esc-l1-1', 'task-1')
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
@@ -3451,7 +3417,7 @@ class TestPromoteToL2Cascade:
         server = create_server(queue)
 
         _seed_l1(queue, 'esc-l1-1', 'task-1')
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
@@ -3473,7 +3439,7 @@ class TestPromoteToL2Cascade:
 
         _seed_l1(queue, 'esc-l1-1', 'task-1')
         _seed_l1(queue, 'esc-l1-2', 'task-2')
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
@@ -3536,7 +3502,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         member_before = queue.get('esc-streak-5469-1')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
         )
@@ -3556,7 +3522,7 @@ class TestPromoteToL2SentinelIdentity:
         server = create_server(queue)
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3579,7 +3545,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3603,7 +3569,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3625,7 +3591,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         _seed_l1(queue, 'esc-5469-3', '5469')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3645,7 +3611,7 @@ class TestPromoteToL2SentinelIdentity:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-ghost-1']},
         )
@@ -3661,7 +3627,7 @@ class TestPromoteToL2SentinelIdentity:
         server = create_server(queue)
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3681,7 +3647,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         _seed_streak_alarm(queue, 'esc-streak-5469-2', _STREAK_SENTINEL_5469)
         root_cause = 'recovery-veto-streak-noise-from-pending-l2-pin:esc-5469-9'
-        first = await _promote_to_l2(
+        first = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3692,7 +3658,7 @@ class TestPromoteToL2SentinelIdentity:
         )
         assert first.get('status') == 'created', first
 
-        second = await _promote_to_l2(
+        second = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3720,7 +3686,7 @@ class TestPromoteToL2SentinelIdentity:
             lambda: {'x-escalation-identity': 'not-a-promote-identity'},
         )
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
         )
@@ -3733,7 +3699,7 @@ class TestPromoteToL2SentinelIdentity:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': []},
         )
 
@@ -7175,14 +7141,14 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(server, **{
+        created = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],
             'root_cause': 'Watcher lease stolen.',
         })
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
-        folded = await _promote_to_l2(server, **{
+        folded = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'root_cause': 'watcher  lease STOLEN',
@@ -7213,12 +7179,12 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(server, **{
+        created = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],
             'root_cause': 'Watcher lease stolen.',
         })
-        await _promote_to_l2(server, **{
+        await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'root_cause': 'watcher  lease STOLEN',
@@ -7242,12 +7208,12 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(server, **{
+        created = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],
             'root_cause': 'Watcher lease stolen.',
         })
-        folded = await _promote_to_l2(server, **{
+        folded = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'root_cause': 'watcher  lease STOLEN',
@@ -7274,10 +7240,10 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(server, **{
+        first = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'risk:3184',
         })
-        second = await _promote_to_l2(server, **{
+        second = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-2'], 'root_cause': 'risk:318:4',
         })
 
@@ -7308,7 +7274,7 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(server, **{
+        result = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': root_cause,
         })
 
@@ -7326,7 +7292,7 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(server, **{
+        result = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'ロック競合:2370',
         })
 
@@ -7364,7 +7330,7 @@ class TestRootCauseOverfoldReport:
     @staticmethod
     async def _fold(server, spelling: str, member: str) -> dict[str, Any]:
         """Fold into the same canonical cluster under a DISTINCT spelling."""
-        return await _promote_to_l2(server, **{
+        return await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': [member],
             'root_cause': spelling,
@@ -7550,7 +7516,7 @@ class TestRootCauseOverfoldReport:
         )
 
         for i in range(_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD + 2):
-            result = await _promote_to_l2(server, **{
+            result = await call_promote(server, **{
                 **_L2_DEFAULTS,
                 'member_ids': [f'esc-l1-{i}'],
                 'root_cause': f'genuinely-distinct-cause:{i}',

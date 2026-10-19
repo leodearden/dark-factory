@@ -2532,6 +2532,8 @@ choose your response:
   success upstream — shouldn't reach you, but if it does, investigate.
 - **UNKNOWN** — no specific signal. Use the full diagnostic_detail to decide.
 
+To move a task to `deferred`, pass `deferral={"kind": "until_condition", "condition": "<what ends the hold>"}` to `set_task_status`; without it the write is refused with `deferral_required`.
+
 ## Marking tasks done
 
 You are the only workflow role that may call `mcp__fused-memory__set_task_status`

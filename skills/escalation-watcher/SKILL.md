@@ -1104,18 +1104,21 @@ switches on and off. Three behavioural shifts:
        (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
        re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
        esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
-       1. `update_task(id, metadata={'x_deferral': {'escalation_id': '<esc-id>', 'until_condition':
-          'Leo rules <esc-id>', 'reason': '<one line>'}}, metadata_mode='merge')`;
-       2. `set_task_status(id, status='deferred')`;
-       3. confirm both with `get_task` about 30 s later.
+       1. `set_task_status(id, status='deferred', deferral={'kind': 'until_condition',
+          'condition': 'Leo rules <esc-id>', 'reason': '<one line>'})`, and confirm the response
+          echoes `deferral`. No echo means the fused-memory server predates the deferral gate
+          and the hold is unrecorded: fall back to `update_task(id, metadata={'x_deferral':
+          {'escalation_id': '<esc-id>', 'until_condition': 'Leo rules <esc-id>', 'reason':
+          '<one line>'}}, metadata_mode='merge')`, which the deferral migration maps, and
+          re-stamp with the call above after fused-memory restarts;
+       2. confirm with `get_task` about 30 s later that the task is `deferred` with its record.
 
        A deferral keeps a not-yet-running task out of dispatch. It does not stop a live run, and
        an info filer was told to keep driving, so leave an `in-progress` task alone (leave
        pending + digest). When the ruling lands, carry it out, then re-pend the task with
-       `set_task_status(id, status='pending')` unless the ruling says otherwise, and set
-       `x_deferral` to null. Once the deferral-record gate is live (task 6525), the record goes
-       in `set_task_status(..., deferral=...)` instead. Task 6579 makes it the typed
-       `until_escalation` kind. And
+       `set_task_status(id, status='pending')` unless the ruling says otherwise; that removes the
+       record. Task 6579 makes this hold the typed `until_escalation` kind. Recipe:
+       `docs/task-authoring.md` §9 "Deferring a task". And
    - File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
      Registry" below) — IN ADDITION to the follow-up task, so the parked decision surfaces in the
      cockpit decision queue.

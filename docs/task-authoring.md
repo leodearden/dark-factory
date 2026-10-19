@@ -119,12 +119,18 @@ in-progress ─block→ blocked ─re-pend→ pending
 pending ─deterministic-gate(born-at-L2)→ blocked
 in-progress ─park(train)→ merge-deferred → done/blocked/cancelled/pending
 in-progress ─requeue→ pending
-pending → deferred (planning) → pending/done/blocked/cancelled
+pending/in-progress/blocked → deferred (with a deferral record) → pending/done/blocked/cancelled
 any non-terminal → cancelled
 in-progress ⇄ infra-hold; in-progress ⇄ review
 blocked ─resume(infra)→ in-progress
 done/cancelled ─reopen (audit, requires reopen_reason)→ *
 ```
+
+**`deferred` carries a record.** Entering `deferred` needs a `deferral`
+saying what ends the hold (refused `deferral_required` without one), a
+`submit_task(planning_mode=True)` birth is stamped `planning` by the server,
+and every exit from `deferred` removes the record in the same write. See §9
+"Deferring a task".
 
 Load-bearing enforcement of who may perform which transition lives in
 fused-memory's `TaskInterceptor`, keyed by actor class — for example, a
@@ -1356,7 +1362,7 @@ related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation
+claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1377,6 +1383,14 @@ moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
 correct refusal. Every other key in this list is unregistered.
+
+`deferral` is, like `milestone`, a registered submodel
+(`shared/src/shared/task_deferral.py::DeferralRecord`) and deliberately not
+Tier-A blessed. Only the status writers write it: `set_task_status` and
+`commit_planning` stamp it, and every exit from `deferred` removes it.
+`update_task` and `submit_task` refuse any add, alter or removal with
+`deferral_write_authority`; an unchanged echo of the stored record passes.
+Its shapes and use are §9 "Deferring a task".
 
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
@@ -1877,6 +1891,38 @@ most of the corpus. It is now admitted when the payload carries the stored
 which is exactly what the migration script sends. Any other shape that
 touches the key is still refused.
 
+### Defect keys: `defects` and `defect_test_retirements`
+
+Both are registered submodels with list cardinality. Their record shapes,
+enums, ref grammar and transition table live in one place,
+`shared/src/shared/defects.py`. This subsection names who writes each key
+and deliberately restates none of that. The registration validates each
+entry alone, so it passes a list that names one ref twice; every writer of
+either key must also pass the whole list through
+`shared/src/shared/defects.py::require_unique_refs`.
+
+- **`defects`**: a list of `DefectDeclaration` records, one per declared
+  defect, each keyed by its ref.
+  - *Who writes it:* at creation, `submit_task` accepts only fresh `open`
+    entries. After creation only `declare_defect` and
+    `record_defect_outcome` write it, never `update_task`; the PRD's α2 leaf
+    builds those two tools and the `update_task` refusal. A defect leaves
+    `open` only through a recorded I2 transition
+    (`shared/src/shared/defects.py::apply_event`).
+  - *PRD:* `plans/defect-tests-prd.md` decisions 7, 13 and 15; Contract I1
+    and I2.
+- **`defect_test_retirements`**: a list of `Retirement` records, carried on
+  the task whose diff removes a proven defect's test, not on the defect's
+  own task.
+  - *Who writes it:* declared through `declare_defect` (a
+    `DeclareRetirement` event) and ruled through `record_defect_outcome` (a
+    `Rule` event).
+  - *PRD:* `plans/defect-tests-prd.md` decisions 13 and 14.
+
+**Census corollary:** like `delivered_checks` above, both registrations are
+an import side effect of `shared.defects`, so a census script must import
+that module first or it will count both keys as `unknown_key`.
+
 ---
 
 ## 9. Practical recipes
@@ -1939,6 +1985,86 @@ in its `files`, because that list is the lock.
 filer reached through literals, constants, imports or forwarding wrappers. It
 cannot see fully dynamic values (subscripts, call results from other modules);
 only the submit-time check catches those.
+
+### Deferring a task
+
+`deferred` parks a task where the scheduler will not dispatch it. Every
+`deferred` row carries `metadata.deferral`: what ends the hold, who ends it,
+and what bounds it (`shared/src/shared/task_deferral.py`; contract
+`plans/deferral-flip-condition-prd.md`). This is the one prose home of that
+vocabulary; other docs point here.
+
+**Is it a deferral at all?** Three holds are not:
+- only another task finishing first: keep it `pending` and `add_dependency`;
+- only a time: keep it `pending` with `metadata.milestone {mode: 'dated', at: …}` (§6);
+- a human judgment needed at dispatch: an escalate-on-dispatch pure gate
+  (`metadata.execution_class='operational'`, §4 and §5).
+
+**Kinds.** Enter with `set_task_status(id=…, status='deferred', deferral={…})`
+from `pending`, `in-progress` or `blocked`. Every kind also takes an optional
+free-text `reason` (≤ 2,000 chars) that nothing parses.
+
+| Kind | `deferral` | Ends when |
+|---|---|---|
+| `carried_by` | `{'kind': 'carried_by', 'carrier_task_id': 4711}` | a human closes or re-pends the row once the carrier is terminal |
+| `until_condition` | `{'kind': 'until_condition', 'condition': 'reify 812 lands', 'expires_at': '2026-11-01T00:00:00Z'}` | a human judges the condition (≤ 500 chars); an optional future `expires_at` bounds it (the sweep below) |
+| `held_by_session` | `{'kind': 'held_by_session', 'holder_pid': <your $CLAUDE_PID>, 'grace_secs': 7200}` | the holding session lands or releases it (the lease rule below) |
+
+The server checks that a `carried_by` carrier exists and is not the task
+itself, and that `holder_pid` is a live `claude` process on its own host.
+`planning` is stamped only by the server, on every `planning_mode` birth;
+`legacy_unknown` is written only by the migration, as a guarded re-stamp of
+an unrecorded row. Either from a caller is refused `server_only_kind`.
+
+**Echo check.** Every successful `set_task_status` or `commit_planning`
+write echoes the stored record as `deferral` (entry, re-stamp) or the
+removed one as `deferral_cleared` (any exit). Confirm it, or confirm
+`get_task` shows `metadata.deferral`. No echo means the fused-memory server
+predates the gate and dropped the argument: treat the hold as unrecorded and
+re-stamp it once fused-memory restarts. A `planning_mode` birth echoes no
+record; read its `planning` record with `get_task`.
+
+**Refusals** carry what is needed to self-correct: `deferral_required`
+(no record), `deferral_invalid` (`reason_code`, `field`, `value`),
+`deferral_changed` (a guarded write lost a race) and
+`deferral_write_authority` (`update_task`/`submit_task` touched the record).
+
+**Re-stamp.** `set_task_status(status='deferred', deferral={…})` on a row
+already `deferred` replaces its record without a status change: `deferred_at`
+is kept, `stamped_at` and `stamped_by` are new, and only a
+`deferral_restamped` event is emitted. This is how a hold changes kind, moves
+to a new session, or gives a planning birth a real reason. A `deferred` write
+without `deferral` on a deferred row stays a no-op.
+
+**Guarded writes** (single id only). `expected_stamped_at=<the stamped_at
+you read>` makes any status write a compare-and-set: it is refused
+`deferral_changed` if the record moved or the row left `deferred`. Add
+`restamp_only=True` to a re-stamp to refuse it unless the row is still
+deferred with the record you read; there, an omitted `expected_stamped_at`
+means "expects no record".
+
+**Release.** `set_task_status(status='pending')` releases any hold.
+`commit_planning(target_status='pending'|'cancelled')` releases only
+`planning` holds and unrecorded rows; any other hold in the batch is refused
+`not_planning_hold` and stays parked. `commit_planning(target_status='deferred',
+deferral={…})` re-stamps a batch held out of the commit.
+
+**Hand-carry.** A session carrying a task's merge itself holds the task
+`held_by_session` with `holder_pid=$CLAUDE_PID`. When the merge moves to a
+separate carrier task, re-stamp the task `carried_by(<carrier>)`.
+
+**The lease rule.** A live holder is never released or notified, however
+long it waits. Once the holder dies, the deferral sweep files one
+informational notice, and after `grace_secs` (600 to 86,400, default 7,200)
+of observed death it releases the row to `pending`. It releases an
+`until_condition` row the same way once its `expires_at` passes. A
+`/resume`d session is a new process: re-stamp the hold with its new pid
+within the grace window.
+
+**Until the sweep lands** (task 6526), nothing releases a hold on its own:
+a dead holder's row and a lapsed `expires_at` stay `deferred` until someone
+releases them. A session that ends without landing its hold releases it
+first.
 
 ## 10. Rotating a long-running audit-trail task
 

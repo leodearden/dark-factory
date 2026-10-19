@@ -166,9 +166,10 @@ taskmaster:
   tool_mode: "all"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# write_journal — RED-TIER / restart-only. The prune runs once at startup
-# (server/main.py), so nothing re-reads these values afterwards; a changed leaf
-# is correctly reported restart_required by mcp__escalation__reload_config.
+# write_journal — RED-TIER / restart-only. The prune runs at startup and every
+# prune_interval_seconds (services/write_ops_retention.py); nothing re-reads
+# these values after startup, so a changed leaf is correctly reported
+# restart_required by mcp__escalation__reload_config.
 #
 # These are the DEPLOYED values, and they are meant to be edited. The fallback
 # for an omitted leaf is config/schema.py::WriteJournalConfig, which is the one
@@ -182,7 +183,7 @@ taskmaster:
 #   reads   35,170,444 (99.27%) — get_task 20.9M, get_tasks 7.5M,
 #                                 get_statuses 5.1M, get_external_statuses 1.2M
 #                                 = 34,669,782 task reads (97.9% of the whole
-#                                 table, ~220,800/day) with NO consumer
+#                                 table) with NO consumer
 #   search     481,447 (1.36%, ~3,066/day) — leaf eta's (task 3213) sole data
 #                                 source and leaf theta's (3214) retro corpus
 #   writes     258,271 (0.73%)  — the causation-joined durable audit trail
@@ -198,25 +199,57 @@ taskmaster:
 #
 # THIS BOUNDS GROWTH; IT DOES NOT SHRINK THE FILE. `PRAGMA auto_vacuum` is NONE
 # on this database, so deleted pages go to SQLite's freelist for reuse — `ls -lh`
-# still reports ~16 GB after a fully successful prune, and those freed pages are
-# what absorbs the per-result detail above. Reclaiming disk needs an offline
-# VACUUM (a full-file rewrite needing ~16 GB of scratch), never run at startup.
+# still reports the same size after a fully successful prune (17.3 GB on
+# 2026-10-11), and those freed pages are what absorbs the per-result detail
+# above. Reclaiming disk needs an offline VACUUM (a full-file rewrite needing
+# as much scratch again), never run at startup.
 #
-# A first run against a large backlog legitimately needs many restarts to drain;
-# each partial sweep logs a WARNING naming which horizon is still behind AND the
-# rows/sec it achieved. Reads accrue at ~220,800/day, so a sweep must sustain
-# ~2,500-7,400 rows/sec (at 1-3 fleet redeploys/day) to make net progress. If the
-# measured rate comes in under that, raise prune_max_seconds here for the drain
-# phase, or bulk-delete once against a STOPPED server where no startup grace
-# applies — otherwise the WARNING repeats forever while the backlog never clears.
+# SIZING BASIS (measured 2026-10-11, task 6655, read-only against the live
+# journal and fused-memory's user journal):
+#   inserts   trailing-7d mean 985,237 rows/day; highest 24 h window 1,128,719;
+#             a ~2x step around 2026-09-30 (09-25..09-30 ran 394k-639k/day)
+#   backlog   14,134,288 reads beyond the 30-day horizon, the oldest from
+#             2026-08-12
+#   restarts  6.55 startups/day over 16.8 days (8.29/day over the last 7)
+#   startup   every startup pass halted on the 30 s deadline, never the row
+#   passes    budget, at a median 90k rows and 2,941 rows/s (p25 2,556, min 908)
+#   net       pruned 576k-702k rows/day against 985k/day inserted: a
+#             startup-only prune lost ground, with its capacity set by how
+#             often the fleet happened to redeploy
+#
+# So the pass also runs every prune_interval_seconds: 1800 s x a 30 s deadline
+# = 48 passes/day, about 3.7M rows/day at the p25 rate with no credit taken for
+# restarts. That covers peak accrual (1.13M/day) plus a ~7-day drain of the
+# backlog (2.02M/day). The row budget and deadline are unchanged: no pass ever
+# reached the budget, and a longer deadline would lengthen every startup, which
+# prunes before READY. Once drained, each pass removes ~20k rows (985k / 48)
+# in ~7-8 s, finishes inside the deadline and logs no WARNING.
+#
+# SERVING COST, which sets prune_batch_size. The periodic pass runs while
+# serving, and every journalled tool call (~11.4/s at 985k rows/day) queues on
+# the journal's connection lock behind the batch in flight, so one batch is the
+# longest any of them waits: prune_batch_size / rows/s. At 5,000 rows that was
+# 1.7 s at the median rate, 2.0 s at p25 and 5.5 s at the minimum; at 500 it is
+# 0.17 s, 0.20 s and 0.55 s. The price is one more synchronous=FULL commit
+# (~1-5 ms) per 500 rows, 1-3% of a pass. Every rate above was measured while
+# each batch re-walked all kept search rows, which
+# WriteJournal.prune_write_ops no longer repeats, so these figures are
+# conservative.
+#
+# Each partial pass logs a WARNING naming the horizons still behind AND the
+# rows/sec it achieved. If periodic WARNINGs persist about a week after deploy,
+# re-measure from their rows/sec and lower prune_interval_seconds. Task 5405
+# (read-row rollup) changes the accrual rate and should re-size this block
+# when it lands.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
   search_retention_days: ${WRITE_JOURNAL_SEARCH_RETENTION_DAYS:365}
   write_retention_days: ${WRITE_JOURNAL_WRITE_RETENTION_DAYS:730}
-  prune_batch_size: ${WRITE_JOURNAL_PRUNE_BATCH_SIZE:5000}
+  prune_batch_size: ${WRITE_JOURNAL_PRUNE_BATCH_SIZE:500}
   prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
+  prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
@@ -574,7 +607,7 @@ mem0_update:
 # Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237,
 # plans/memory-auto-consolidation-prd.md). Recon Stage 1 proposes a cluster, a
 # pure predicate rules on it, and a passing cluster is consolidated WITH NO
-# HUMAN IN THE LOOP. All thirteen leaves are green-tier hot-reloadable: they
+# HUMAN IN THE LOOP. All fourteen leaves are green-tier hot-reloadable: they
 # are registered in `config/reload.py::RELOADABLE_FIELDS`, which is the
 # authoritative list, and `mcp__escalation__reload_config` applies a change to
 # any of them to a RUNNING server with no restart.
@@ -621,10 +654,13 @@ mem0_update:
 #   # rest of the pipeline proposing and recording.
 #   max_auto_per_cycle: 3
 #   max_gate_filings_per_cycle: 3
-#   # How many candidate clusters the ranking considers per cycle, as a multiple
-#   # of max_auto_per_cycle — so the cycle picks the best few of a wider field
-#   # rather than the first few it saw.
+#   # Proposals above (max_auto_per_cycle + max_gate_filings_per_cycle) x this
+#   # trip the backlog regime: the cycle executes and files nothing and emits
+#   # ONE aggregate escalation.
 #   backlog_multiplier: 5
+#   # Ranking multiplier for a cluster whose topic has no canonical yet. Orders
+#   # the slice only; it never raises how much a cycle executes. At least 1.0.
+#   canonical_absent_bonus: 2.0
 #   # Consecutive refusals of the SAME topic before it stops being re-proposed
 #   # and goes to a human. A refusal no LLM re-emission can fix would otherwise
 #   # repeat every cycle forever, which is cost with no information.

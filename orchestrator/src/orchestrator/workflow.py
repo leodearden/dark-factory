@@ -21,13 +21,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
 # Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
-# escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
+# escalation.models is listed under TYPE_CHECKING for the Escalation
 # type annotation; a separate runtime import is needed here because
-# _is_gating_escalation evaluates the set at call time, not just for type hints.
+# _needs_human evaluates the set at call time, not just for type hints.
 # This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
-# nothing in it imports orchestrator.
+# nothing in it imports orchestrator.  escalation.pins (is_queue_handoff, the
+# severity semantics _needs_human consumes) is pure and imports only
+# escalation.models, so it is cycle-safe too; harness.py already imports it at
+# module top.
 from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
+from escalation.pins import is_queue_handoff
 from pydantic import ValidationError
 from shared.cli_invoke import (
     AgentFailureKind,
@@ -50,6 +54,11 @@ from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
+from shared.task_text_fingerprint import (
+    TaskTextDrift,
+    task_text_drift,
+    task_text_fingerprint,
+)
 from shared.transcript_archive import (
     archive_before_delete,
     archive_task_transcripts,
@@ -71,6 +80,7 @@ from orchestrator.agents.roles import (
     REVIEWER_COMPREHENSIVE,
     ROLES,
     SIMPLE_TASK,
+    STEWARD,
     AgentRole,
 )
 from orchestrator.agents.triage import suggestion_hash
@@ -81,6 +91,7 @@ from orchestrator.agents.write_set import (
 )
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    PLAN_TASK_TEXT_FP_KEY,
     ReviewAggregation,
     TaskArtifacts,
 )
@@ -346,18 +357,38 @@ def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -
     return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
 
 
+def _needs_human(e: Escalation) -> bool:
+    """Return True if only a human can dispose of *e* — no steward applies.
+
+    Either disjunct suffices:
+    - Born-at-L2 severity: ``severity in BORN_AT_L2_SEVERITIES``, i.e.
+      'critical' or 'urgent' — these bypass the auto-watcher and route
+      straight to a human regardless of level.
+    - A level ≥ 2 record that ``escalation.pins`` classifies a queue handoff
+      (PRD ``plans/info-l0-disposition-router-prd.md`` D3): an info-severity
+      L2 never needs a human here, while an unknown severity fails safe to
+      needing one.  Severity semantics live in ``escalation.pins`` (INV-5) —
+      never hand-roll ``severity != 'info'`` here.
+
+    The single home of that rule for both consumers: disjuncts 2 and 3 of
+    :func:`_is_gating_escalation`, and the stop-the-line short-circuit in
+    ``TaskWorkflow._wait_for_resolution``.
+    """
+    return e.severity in BORN_AT_L2_SEVERITIES or (
+        e.level >= 2 and is_queue_handoff(e)
+    )
+
+
 def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
 
     Gating policy — an escalation gates when ANY disjunct fires:
     1. Plain blocking L0: ``severity == 'blocking' and level == 0``
        (fresh agent-filed blocker awaiting steward triage).
-    2. Born-at-L2 severity: ``severity in BORN_AT_L2_SEVERITIES``
-       i.e. 'critical' or 'urgent' — these bypass the auto-watcher and route
-       straight to a human regardless of level.
-    3. Any level ≥ 2: ``level >= 2``
-       (escalation-watcher promoted to L2; a human must decide before the
-       workflow proceeds — applies to any severity, including 'info').
+    2. Born-at-L2 severity — see :func:`_needs_human`.
+    3. A level ≥ 2 queue handoff (escalation-watcher promoted to L2; a human
+       must decide before the workflow proceeds; never an info record) — see
+       :func:`_needs_human`.
 
     Deliberately NOT gating:
     - Plain blocking L1 (``severity == 'blocking' and level == 1``): this is a
@@ -368,18 +399,14 @@ def _is_gating_escalation(e: Escalation) -> bool:
       DOES gate the current run — that is the intended stop-the-line semantics
       for high-severity escalations (D4 accepted consequence).
     """
-    return (
-        (e.severity == 'blocking' and e.level == 0)
-        or e.severity in BORN_AT_L2_SEVERITIES
-        or e.level >= 2
-    )
+    return (e.severity == 'blocking' and e.level == 0) or _needs_human(e)
 
 
 def _format_reescalation_detail(escalations: list[Escalation]) -> str:
-    """Render the payload carried by ``_StewardReescalated`` into a rich
+    """Render the payload carried by a ``_HumanHandoff`` into a rich
     ``_mark_blocked(detail=...)`` string (task 2553).
 
-    Without this, ``run()``'s ``except _StewardReescalated`` clause discarded
+    Without this, ``run()``'s hand-off ``except`` clause discarded
     the exception's ``escalations`` payload and called ``_mark_blocked``
     without ``detail=``, so ``_mark_blocked``'s ``detail = detail or reason``
     fallback made ``TerminalReport.detail`` an exact copy of
@@ -391,11 +418,11 @@ def _format_reescalation_detail(escalations: list[Escalation]) -> str:
     resolution turn count (``resolution_turns``), then the full ``summary``
     and ``detail`` text. Multiple escalations (a burst may hold more than
     one) are joined with a blank line between them. Returns ``''`` for an
-    empty list — defensive; the two raise sites in ``_wait_for_resolution``
-    (born-at-L2 / level>=2, and steward-gave-up level-1) both guarantee a
-    non-empty list, and ``''`` preserves ``_mark_blocked``'s
+    empty list — defensive; every ``_HumanHandoff`` raise site in
+    ``_wait_for_resolution`` guarantees a non-empty list, and ``''`` preserves ``_mark_blocked``'s
     ``detail or reason`` fallback rather than emitting an empty-but-present
-    detail.
+    detail.  The header is disposition-neutral: the block reason names which
+    hand-off fired, so the detail must not claim a steward acted.
     """
     if not escalations:
         return ''
@@ -414,15 +441,43 @@ def _format_reescalation_detail(escalations: list[Escalation]) -> str:
         lines.append(f'Detail: {e.detail}')
         blocks.append('\n'.join(lines))
 
-    header = f'Steward re-escalated; {len(escalations)} pending escalation(s):'
+    header = f'{len(escalations)} pending escalation(s) awaiting a human:'
     return header + '\n\n' + '\n\n'.join(blocks)
 
 
-class _StewardReescalated(Exception):
-    """Raised when the steward re-escalates to level-1 (consumed by the auto-watcher, which may promote to L2 for a human)."""
+class _HumanHandoff(Exception):
+    """``_wait_for_resolution`` ended with the task's open records in a human's hands.
 
-    def __init__(self, escalations):
+    Every hand-off is constructed with the ``block_reason`` its catch site
+    reports, so the two catch sites say WHICH hand-off fired rather than one
+    fixed string (PRD ``plans/info-l0-disposition-router-prd.md`` D13).
+    """
+
+    def __init__(self, escalations: list[Escalation], block_reason: str):
+        super().__init__(block_reason)
         self.escalations = escalations
+        self.block_reason = block_reason
+
+
+class _StewardReescalated(_HumanHandoff):
+    """The steward filed a hand-off L1 during this wait — through its own
+    give-up path or its agent's ``escalate_blocker(level=1)`` (consumed by the
+    auto-watcher, which may promote to L2 for a human)."""
+
+    def __init__(self, escalations: list[Escalation]):
+        super().__init__(escalations, 'Steward re-escalated to human')
+
+
+class _NoStewardApplicable(_HumanHandoff):
+    """Open records end the wait that no steward acted on: the stop-the-line
+    ``'L2'`` records :func:`_needs_human` selects, raised before the wait ever
+    awaits, or ``'L1'`` hand-offs left open by anyone but this wait's steward."""
+
+    def __init__(self, escalations: list[Escalation], tier: Literal['L1', 'L2']):
+        ids = ', '.join(e.id for e in escalations)
+        super().__init__(
+            escalations, f'Gated by open {tier} {ids}; no steward applicable',
+        )
 
 if TYPE_CHECKING:
     from escalation.models import Escalation, TrainState
@@ -534,6 +589,7 @@ class _BriefingLike(Protocol):
         self, task: dict, existing_plan: dict,
         changed_files: list[str], worktree: Path | None = ...,
         context: str | None = ...,
+        *, text_drift: TaskTextDrift | None = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
@@ -2775,10 +2831,10 @@ class TaskWorkflow:
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                     try:
                         resolution = await self._wait_for_resolution()
-                    except _StewardReescalated as reesc:
+                    except _HumanHandoff as handoff:
                         return await self._mark_blocked(
-                            'Steward re-escalated to human',
-                            detail=_format_reescalation_detail(reesc.escalations),
+                            handoff.block_reason,
+                            detail=_format_reescalation_detail(handoff.escalations),
                             skip_escalation=True,
                         )
                     # If branch is already on main AND has genuine prior
@@ -3668,7 +3724,8 @@ class TaskWorkflow:
         await self._check_scope_invariant(backend_metadata=_entry_metadata)
 
         # Defense-in-depth: any blocking L0 escalation, or any
-        # born-at-L2 (critical/urgent), or any level≥2 escalation
+        # born-at-L2 (critical/urgent), or any non-info level≥2
+        # escalation (see _is_gating_escalation; task 5222)
         # created during execute/verify/review (e.g. plan-overwrite
         # from _amend, or any future code path that escalates outside
         # the implementer/debugger callsites) must gate the merge.
@@ -3969,7 +4026,7 @@ class TaskWorkflow:
         A deliberate mirror of ``run()``'s ESCALATED branch (workflow.py:
         2636-2647) — ``_enter_phase(ESCALATED)`` →
         :meth:`_ensure_steward_started` → :meth:`_wait_for_resolution` →
-        ``except _StewardReescalated`` → :meth:`_mark_blocked`, plus that
+        ``except _HumanHandoff`` → :meth:`_mark_blocked`, plus that
         branch's steward-terminal-decision guard, which honours a row the
         steward parked while resolving instead of proceeding over it.  The
         guard is not copied but SHARED —
@@ -4056,7 +4113,7 @@ class TaskWorkflow:
         _wait_started = asyncio.get_event_loop().time()
         try:
             await self._wait_for_resolution()
-        except _StewardReescalated as reesc:
+        except _HumanHandoff as handoff:
             # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
             # default False so the row lands `blocked` at _mark_blocked's ENTRY
             # gate (spec S1).  Post-3537 a merge_phase=True call would also
@@ -4067,8 +4124,8 @@ class TaskWorkflow:
             # queue submission in-place, which is the ONLY thing merge_phase
             # is for.
             return await self._mark_blocked(
-                'Steward re-escalated to human',
-                detail=_format_reescalation_detail(reesc.escalations),
+                handoff.block_reason,
+                detail=_format_reescalation_detail(handoff.escalations),
                 skip_escalation=True,
             )
         waited = asyncio.get_event_loop().time() - _wait_started
@@ -4139,7 +4196,7 @@ class TaskWorkflow:
         # waiting on while a DIFFERENT gating record is open — most sharply a
         # born-at-L2 filed mid-resolution, which the wait cannot see at all
         # (its loop polls level-0, its stop-the-line check ran at entry before
-        # the record existed, and its tail's has_open_l1 matches level-1).
+        # the record existed, and its tail reads level-1 queue handoffs).
         # Without this, such a record is merged straight past.  Re-uses the
         # SAME _is_gating_escalation predicate rather than an equivalent
         # inline condition, so there is exactly one gate policy in this file.
@@ -4166,7 +4223,7 @@ class TaskWorkflow:
             # 12623) use.  Unlike the sibling exits, this one reaches
             # _mark_blocked with the steward STILL LIVE — the expiry branch's
             # steward was already stopped by the wait itself, and the
-            # _StewardReescalated branch's L2 is out of the steward's reach —
+            # _NoStewardApplicable branch's records are out of its reach —
             # and _mark_blocked(escalate_to_human=True) fires
             # _spawn_dry_run_unblock, which runs run_dry_run_unblock against
             # self.worktree: the SAME worktree TaskSteward invokes its agent in
@@ -4765,6 +4822,7 @@ class TaskWorkflow:
         revalidation_changed_files: list[str] = []
         build_prompt: PromptBuilder
         existing_plan = self.artifacts.read_plan()
+        finalized_before_invoke = existing_plan.get('_finalized_at')
         if (
             existing_plan
             and existing_plan.get('steps')
@@ -4805,6 +4863,7 @@ class TaskWorkflow:
                 '(%d changed files, %d overlap with plan)',
                 self.task_id, len(revalidation_changed_files), len(overlap),
             )
+            text_drift = self._check_plan_text_drift(existing_plan)
 
             # ── Lever B: revalidation skip ────────────────────────────
             # When main has gained no changes that touch the plan's files,
@@ -4815,6 +4874,7 @@ class TaskWorkflow:
             if (
                 self.config.revalidation_skip_enabled
                 and not overlap
+                and text_drift is None
                 and await self._can_skip_revalidation(existing_plan)
             ):
                 skipped = await self._apply_revalidation_skip(
@@ -4830,7 +4890,7 @@ class TaskWorkflow:
             async def build_revalidation_prompt() -> str:
                 return await self.briefing.build_revalidation_prompt(
                     self.task, self._live_plan() or existing_plan, changed_files,
-                    worktree=self.worktree,
+                    worktree=self.worktree, text_drift=text_drift,
                 )
 
             build_prompt = build_revalidation_prompt
@@ -5150,7 +5210,7 @@ class TaskWorkflow:
             return outcome
 
         # Stamp provenance and acquire lock (run_id — task 3563; see _drive)
-        self.artifacts.stamp_plan_provenance(self.session_id)
+        await self._stamp_architect_plan(finalized_before_invoke)
         self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
@@ -5208,6 +5268,70 @@ class TaskWorkflow:
             f'{len(self.plan.get("steps", []))} steps'
         )
         return WorkflowOutcome.PLANNED
+
+    def _current_task_text_fp(self) -> str:
+        return task_text_fingerprint(self.task.get('description'), self.task.get('details'))
+
+    def _check_plan_text_drift(self, plan: dict) -> TaskTextDrift | None:
+        """The plan's task-text drift, or None when current or the gate is off; a drift is emitted."""
+        if not self.config.plan_text_fp_gate_enabled:
+            return None
+        current_fp = self._current_task_text_fp()
+        plan_fp = plan.get(PLAN_TASK_TEXT_FP_KEY)
+        drift = task_text_drift(plan_fp, current_fp)
+        if drift is TaskTextDrift.CURRENT:
+            return None
+        logger.info(
+            'Task %s: plan task-text %s (plan %r, task %s) — revalidating',
+            self.task_id, drift.value, plan_fp, current_fp,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.plan_text_drift, task_id=self.task_id, phase='plan',
+                data={
+                    'drift': drift.value,
+                    'plan_text_fp': plan_fp if isinstance(plan_fp, str) else None,
+                    'task_text_fp': current_fp,
+                    'plan_session_id': str(plan.get('_session_id') or ''),
+                },
+            )
+        return drift
+
+    async def _stamp_architect_plan(self, finalized_before_invoke: object) -> None:
+        """Mint the text fingerprint only when this pass confirmed the plan.
+
+        confirm_plan() rewrites ``_finalized_at``, so an unchanged marker means
+        the architect left the prior plan untouched (salvaged after a cap, or
+        exited without confirming) and the plan keeps the fingerprint it has.
+        """
+        assert self.artifacts is not None
+        if self.plan.get('_finalized_at') != finalized_before_invoke:
+            await self._stamp_authored_plan()
+        else:
+            self.artifacts.stamp_plan_provenance(self.session_id)
+
+    def _stamped_task_text_fp(self) -> str | None:
+        assert self.artifacts is not None
+        fp = self.artifacts.read_plan().get(PLAN_TASK_TEXT_FP_KEY)
+        return fp if isinstance(fp, str) else None
+
+    async def _stamp_authored_plan(self) -> None:
+        """Provenance-stamp a plan just authored against ``self.task`` and mirror its text fingerprint."""
+        assert self.artifacts is not None
+        fp = self._current_task_text_fp()
+        self.artifacts.stamp_plan_provenance(self.session_id, task_text_fp=fp)
+        await self._mirror_plan_text_fp(fp, self.artifacts.read_plan().get('_created_at'))
+
+    async def _mirror_plan_text_fp(self, fp: str, authored_at: object) -> None:
+        mirror = {'plan_text_fp': fp, 'plan_authored_at': authored_at}
+        # Best-effort: plan.json is authoritative. update_task's default is a
+        # shallow merge, so this two-key payload clobbers no sibling key.
+        try:
+            if not await self.scheduler.update_task(self.task_id, mirror):
+                logger.warning('Task %s: plan_text_fp mirror write refused', self.task_id)
+        except Exception as exc:
+            logger.warning('Task %s: plan_text_fp mirror write failed: %s', self.task_id, exc)
+        self._mutable_task_metadata().update(mirror)
 
     async def _can_skip_revalidation(self, plan: dict) -> bool:
         """Lever B pre-flight checks for the revalidation skip.
@@ -5475,7 +5599,7 @@ class TaskWorkflow:
 
         # Stamp provenance + acquire plan lock (same shape as _plan()).
         try:
-            self.artifacts.stamp_plan_provenance(self.session_id)
+            await self._stamp_authored_plan()
         except ValueError as exc:
             logger.warning(
                 'Task %s: SIMPLE_TASK provenance stamp failed (%s) — '
@@ -8131,6 +8255,7 @@ class TaskWorkflow:
                 f'Task {self.task_id}: review cycle {review_cycle}, '
                 f'{len(reviews.blocking_issues)} blocking issues'
             )
+            stamped_fp = self._stamped_task_text_fp()
             await self._replan(reviews)
             # Re-stamp provenance — architect may have overwritten plan.json
             assert self.artifacts is not None
@@ -8147,7 +8272,9 @@ class TaskWorkflow:
                 )
             if outcome := await self._validate_prerequisites_or_block('replan'):
                 return outcome
-            self.artifacts.stamp_plan_provenance(self.session_id)
+            self.artifacts.stamp_plan_provenance(
+                self.session_id, task_text_fp=stamped_fp,
+            )
             # Task 2874: the architect may have WIDENED plan.files while
             # addressing review feedback ("you may add new steps"), so route
             # the possibly-widened files through the same scope-
@@ -8497,8 +8624,9 @@ class TaskWorkflow:
             # issues from prior runs of this same task stay in the queue until a
             # human or escalation-watcher resolves them; we must not let them
             # sink the current run.  Fresh L0 blocking escalations gate progress
-            # here, AND born-at-L2 (critical/urgent) escalations AND any level≥2
-            # escalations also gate regardless of severity — D4 accepted consequence:
+            # here, AND born-at-L2 (critical/urgent) escalations AND any non-info
+            # level≥2 escalations (see _is_gating_escalation; info never gates
+            # since task 5222) also gate — D4 accepted consequence:
             # a pending critical/urgent from a prior incarnation DOES sink a fresh
             # run (intended stop-the-line semantics).  See _is_gating_escalation.
             blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
@@ -10190,8 +10318,9 @@ class TaskWorkflow:
 
             # Check for escalations from debugger.  Same filter as the post-implementer
             # check — a stale plain blocking L1 from a prior run must not sink a
-            # successful debug pass.  Born-at-L2 (critical/urgent) AND any level≥2
-            # escalations also gate here — D4 accepted consequence: a pending
+            # successful debug pass.  Born-at-L2 (critical/urgent) AND any non-info
+            # level≥2 escalations (see _is_gating_escalation) also gate here —
+            # D4 accepted consequence: a pending
             # critical/urgent from a prior incarnation DOES sink a fresh run
             # (intended stop-the-line semantics).  See _is_gating_escalation.
             blocking = [e for e in self._check_escalations() if _is_gating_escalation(e)]
@@ -14291,17 +14420,22 @@ class TaskWorkflow:
     async def _wait_for_resolution(self) -> str:
         """Wait for all level-0 pending escalations to be resolved.
 
-        Born-at-L2 (critical/urgent severity) and any level≥2 pending
-        escalations are stop-the-line events — they cannot be resolved by
-        the auto-watcher/steward and require immediate human intervention.
+        Pending escalations that :func:`_needs_human` selects (a born-at-L2
+        severity, or a level≥2 queue handoff — never an info record) are
+        stop-the-line events — they cannot be resolved by the
+        auto-watcher/steward and require immediate human intervention.
         Rather than waiting (which would either spin or block forever with
-        no resolver), they immediately raise ``_StewardReescalated`` so
+        no resolver), they immediately raise ``_NoStewardApplicable`` so
         that ``run()`` calls ``_mark_blocked`` and halts.
 
-        Raises ``_StewardReescalated`` if:
-        - A pending escalation with ``severity in BORN_AT_L2_SEVERITIES``
-          or ``level >= 2`` exists — immediate terminal, stop the line; OR
-        - The steward re-escalated to level-1 (consumed by auto-watcher).
+        Raises a ``_HumanHandoff``:
+        - ``_NoStewardApplicable('L2')`` if any pending escalation needs a
+          human — immediate terminal, stop the line, before any await; OR,
+          once the level-0 wait ends with level-1 queue handoffs open (never
+          an info record, PRD D3):
+        - ``_StewardReescalated`` if this wait's steward re-escalated, else
+        - ``_NoStewardApplicable('L1')`` — the L1s predate the wait or came
+          from elsewhere, so no steward acted on them (PRD D13).
 
         When no escalation queue is available (e.g. eval mode), returns
         an empty string immediately — the caller treats this as "no
@@ -14375,9 +14509,9 @@ class TaskWorkflow:
         worktree (``cwd = self.worktree``, steward.py:542, 590) that the
         resumed implementer edits and commits in, so dismissing or resuming
         beside a live steward agent means two agents committing in one git
-        worktree.  The tail then yields exactly two dispositions:
-        ``_StewardReescalated`` (blocking, with the already-open L1) when one
-        is open, or the collected resolutions (resuming) when none is.  It
+        worktree.  The tail then yields exactly two dispositions: a
+        ``_HumanHandoff`` (blocking, with the open level-1 queue handoffs) when
+        one is open, or the collected resolutions (resuming) when none is.  It
         deliberately does NOT call :meth:`_mark_blocked`, which would file a
         fresh L0 and could add a SECOND full grace window for what is a pure
         wait-timeout.
@@ -14403,18 +14537,18 @@ class TaskWorkflow:
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
 
-        # Born-at-L2 (critical/urgent) and any level≥2 escalations are
-        # stop-the-line: no auto-watcher can resolve them, so waiting for the
+        # Records that need a human are stop-the-line: no auto-watcher or
+        # steward can resolve them, so waiting for the
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
         # fires → _wait_for_resolution returns '' → resume → gate fires again).
-        # Treat identically to _StewardReescalated so run() calls _mark_blocked
-        # and halts for human intervention rather than looping.
-        pending_high_sev = [
-            e for e in self.escalation_queue.get_by_task(self.task_id, status='pending')
-            if e.severity in BORN_AT_L2_SEVERITIES or e.level >= 2
-        ]
-        if pending_high_sev:
-            raise _StewardReescalated(pending_high_sev)
+        # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
+        # human intervention rather than looping; the reason says no steward
+        # was applicable (D13).
+        open_at_entry = self.escalation_queue.get_by_task(self.task_id, status='pending')
+        pending_l2 = [e for e in open_at_entry if _needs_human(e)]
+        if pending_l2:
+            raise _NoStewardApplicable(pending_l2, 'L2')
+        open_ids_at_entry = {e.id for e in open_at_entry}
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
         # window (task 3170, fix C + review fix D1).  See the method docstring
@@ -14576,12 +14710,20 @@ class TaskWorkflow:
         # outcome out of _await_steward_completion.
         self._drain_steward_outcomes()
 
-        # Check for level-1 re-escalation (steward gave up)
-        if self.escalation_queue.has_open_l1(self.task_id):
-            pending_l1 = self.escalation_queue.get_by_task(
+        handoff_l1 = [
+            e for e in self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=1,
             )
-            raise _StewardReescalated(pending_l1)
+            if is_queue_handoff(e)
+        ]
+        if handoff_l1:
+            steward_filed_one = any(
+                e.agent_role == STEWARD.name and e.id not in open_ids_at_entry
+                for e in handoff_l1
+            )
+            if steward_filed_one:
+                raise _StewardReescalated(handoff_l1)
+            raise _NoStewardApplicable(handoff_l1, 'L1')
 
         # Collect resolutions (filter ensures resolution is non-None str for join)
         resolutions = [

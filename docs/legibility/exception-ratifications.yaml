@@ -24,4 +24,156 @@
 #     covers: What this ruling keeps, in one sentence.
 #
 # An empty table is written `[]`.
-[]
+
+# Day-one rulings, esc-5603-1 (docs/legibility/inv12-day-one-rulings.md).
+
+- id: inv12-shrink-only-baselines
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    The two shrink-only baseline units, scripts/inline_suppression_baseline.json
+    and orchestrator/tests/merge_lane_ratchet_baseline.json, whose grandfathered
+    entries may only fall and convert to an owned disposition when touched, with
+    no burn-down scheduled.
+
+- id: inv12-dashboard-unit-divergence
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Environment= names whose values the dashboard unit-parity check does not
+    compare between the committed and installed units because they are host-local
+    by design (scripts/check_dashboard_unit_parity.py::DIVERGENCE_ALLOWLIST, the
+    divergence projection of scripts/systemd_unit_parity.py::ENV_POLICY).
+
+- id: inv12-task-metadata-blessed-keys
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Conventional task-metadata keys outside the typed TaskMetadata schema that the
+    metadata census accepts without warning, including retired keys kept blessed
+    for their historical carriers (shared/src/shared/task_metadata.py::_BLESSED_METADATA_KEYS).
+
+- id: inv12-memory-metadata-blessed-keys
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Conventional high-volume memory-metadata keys that the metadata census accepts
+    without an unknown-key warning (fused-memory/src/fused_memory/memory_metadata.py::BLESSED_METADATA_KEYS).
+
+- id: inv12-ruff-e501-line-length
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    The workspace-wide ruff E501 ignore, because line length is deliberately not
+    enforced while ruff format is not adopted (CONTRIBUTING.md section 3).
+
+- id: inv12-config-dir-unarchived-by-design
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    TaskConfigDir construction sites whose transcripts are deliberately not
+    archived because they carry no signal worth keeping, namely the two UsageGate
+    cap-probe dirs and the legibility SessionRunner dir (the UNARCHIVED_BY_DESIGN
+    rows of shared/tests/config_dir_archival_allowlist.py).
+
+- id: inv12-by-design-session-resume-reasons
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Session-resume fallback reasons that are expected by design and so do not feed
+    the session-resume fallback streak alarm
+    (orchestrator/src/orchestrator/harness.py::_BY_DESIGN_SESSION_RESUME_REASONS).
+
+- id: inv12-toolcall-markup-never-touch
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Files the tool-call markup sweep never rewrites because they are verbatim
+    records of earlier leaks (scripts/sweep_toolcall_markup.py::NEVER_TOUCH).
+
+- id: inv12-cancelled-premise-blocklist
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Premises that were tried, shipped and reverted, whose re-proposals the task
+    curator drops before any LLM call (fused-memory/config/cancelled_premise_blocklist.yaml).
+
+- id: inv12-recon-code-fix-premise-registry
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Recon code-fix premises an architect refuted against live source, which the
+    curator drops only while their source assertions still hold
+    (fused-memory/config/recon_code_fix_premise_registry.yaml).
+
+- id: inv12-flag-dedup-snapshot-categories
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Stage 3 finding categories in which a flag matching the blocked
+    task-count-snapshot signature is dropped
+    (fused-memory/src/fused_memory/reconciliation/flag_dedup.py::_SUPPRESSED_SNAPSHOT_CATEGORIES).
+
+- id: inv12-flag-dedup-ceiling-categories
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Stage 3 finding categories in which a flag matching the retired
+    contamination-ceiling signature is dropped
+    (fused-memory/src/fused_memory/reconciliation/flag_dedup.py::_SUPPRESSED_CEILING_CATEGORIES).
+
+- id: inv12-internal-writer-agent-id-prefixes
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    agent_id prefixes that identify a memory write as house-operated, so a
+    possible-injection or fabricated-content flag citing it is dropped
+    (fused-memory/src/fused_memory/reconciliation/internal_writers.py::INTERNAL_WRITER_AGENT_ID_PREFIXES).
+
+- id: inv12-mem0-tombstone-protected-audit-kinds
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Audit-record kinds the Mem0 tombstone sweep never deletes, even after their
+    cited task goes terminal
+    (fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py::PROTECTED_AUDIT_KINDS).
+
+- id: inv12-operational-suggestion-weak-markers
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Weak operational-suggestion markers whose match is suppressed when the same
+    field names a code-level artifact
+    (fused-memory/src/fused_memory/middleware/operational_suggestion_guard.py::_WEAK_MARKER_LABELS).
+
+- id: inv12-claim-verification-excluded-pathspecs
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Pathspecs (tests, docs, prompts) excluded from the recon claim-verification
+    presence probe, so an example token there never verifies a fabricated claim
+    (fused-memory/src/fused_memory/middleware/recon_claim_verification_guard.py::_EXCLUDED_PATHSPECS).
+
+- id: inv12-routing-intent-exempt-classes
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Execution classes other than code_tdd, whose submissions the routing-intent
+    guard does not check
+    (fused-memory/src/fused_memory/middleware/routing_intent_guard.py::_EXEMPT_EXECUTION_CLASSES).
+
+- id: inv12-operational-suggestion-exempt-classes
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Execution classes other than code_tdd, whose submissions the
+    operational-suggestion guard does not check
+    (fused-memory/src/fused_memory/middleware/operational_suggestion_guard.py::_EXEMPT_EXECUTION_CLASSES).
+
+- id: inv12-gitignored-deliverable-exempt-classes
+  date: 2026-10-19
+  source: esc-5603-1
+  covers: >-
+    Execution classes other than code_tdd, whose submissions the
+    gitignored-deliverable guard does not check
+    (fused-memory/src/fused_memory/middleware/gitignored_deliverable_guard.py::_EXEMPT_EXECUTION_CLASSES).

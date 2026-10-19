@@ -674,6 +674,10 @@ class EventType(StrEnum):
 
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
+    # Task 4031 — the revalidation branch found the plan's _task_text_fp absent or unequal to the
+    #   task's current text; the Lever-B skip is declined and the architect told.
+    #   data: {drift, plan_text_fp, task_text_fp, plan_session_id}
+    plan_text_drift = 'plan_text_drift'
 
     # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted
     # by Harness.reload_config() on every call, success or failure. Data
