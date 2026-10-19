@@ -860,6 +860,23 @@ def read_occurrences(
         return []
 
 
+def read_call_sites_written(db_path: Path) -> frozenset[str] | None:
+    """Every ``call_site`` spelling ``flake_occurrence`` holds, at any age.  ``None``
+    (logged) when the read failed (B12): a failed read is not an empty set."""
+    try:
+        conn = _open(db_path)
+        try:
+            rows = conn.execute('SELECT DISTINCT call_site FROM flake_occurrence').fetchall()
+        finally:
+            conn.close()
+        return frozenset(call_site for (call_site,) in rows)
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to read the call sites written to %s', db_path, exc_info=True,
+        )
+        return None
+
+
 # ---------------------------------------------------------------------------
 # The due list: what an observation owes open_debt, drained afterwards (task 6934)
 # ---------------------------------------------------------------------------
