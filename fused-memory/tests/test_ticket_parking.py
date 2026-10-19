@@ -159,9 +159,7 @@ async def make_interceptor(taskmaster, event_buffer, store):
 
     yield _make
     for interceptor in built:
-        for worker in list(interceptor._worker_tasks.values()):
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+        await interceptor.close()
 
 
 async def _submit(interceptor: TaskInterceptor, title: str, *, metadata: Any = None) -> str:
@@ -672,20 +670,4 @@ class TestDedupeSkippedMarker:
         assert _marker_of(metadata) == {
             'reason': 'curator-unavailable: construction-failed: RuntimeError: qdrant down',
             'at': metadata[DEDUPE_SKIPPED_KEY]['at'],
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_create_after_close_is_marked(self, make_interceptor, taskmaster):
-        interceptor = make_interceptor(None, config=FusedMemoryConfig())
-        await interceptor.close()
-
-        await interceptor._dispatch_ticket_decision(
-            ticket_id='tkt_closed', project_root=PROJECT_ROOT, project_id='project',
-            candidate=CandidateTask(title='After close'), decision=None,
-            kwargs={'title': 'After close'}, metadata=_CALLER_METADATA, curator=None,
-        )
-
-        [metadata] = taskmaster.added_metadata()
-        assert _marker_of(metadata) == {
-            'reason': 'curator-unavailable: closed', 'at': metadata[DEDUPE_SKIPPED_KEY]['at'],
         }

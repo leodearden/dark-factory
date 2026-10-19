@@ -101,9 +101,7 @@ async def make_interceptor(config, store, tmp_path):
 
     yield _make
     for interceptor in built:
-        for worker in list(interceptor._worker_tasks.values()):
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+        await interceptor.close()
     await buffer.close()
 
 
