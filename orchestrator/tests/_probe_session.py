@@ -19,6 +19,12 @@ def run_probe_session(
     probe: Path, *, basetemp: Path, kill_secs: int, backstop_secs: float,
     extra: Sequence[str] = (),
 ) -> subprocess.CompletedProcess[str]:
+    smuggled = [arg for arg in extra if arg == '--basetemp' or arg.startswith('--basetemp=')]
+    if smuggled:
+        raise ValueError(
+            'a probe session runs under the basetemp passed as basetemp=, never '
+            f'one from extra; refusing {smuggled!r}'
+        )
     return subprocess.run(
         [
             sys.executable, '-m', 'pytest', str(probe),
