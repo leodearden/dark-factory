@@ -411,6 +411,7 @@ class TestFlakeCallSite:
             'merge_gate',
             'main_probe',
             'chronic_marker',
+            'offline_lane',
         }
 
     def test_is_str_comparable(self) -> None:
@@ -421,6 +422,30 @@ class TestFlakeCallSite:
         assert FlakeCallSite.merge_gate == 'merge_gate'
         assert FlakeCallSite.main_probe == 'main_probe'
         assert FlakeCallSite.chronic_marker == 'chronic_marker'
+        assert FlakeCallSite.offline_lane == 'offline_lane'
+
+
+class TestFailureEvidence:
+    """Per-test failure evidence a suppression may carry (offline-lane PRD D6)."""
+
+    def test_evidence_kind_has_exactly_two_members(self) -> None:
+        from orchestrator.flake_ledger import EvidenceKind
+
+        assert {k.value for k in EvidenceKind} == {'failed', 'error'}
+
+    def test_is_frozen(self) -> None:
+        import dataclasses
+
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        e = FailureEvidence(kind=EvidenceKind.failed, first_line='AssertionError: x')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            e.first_line = 'other'  # type: ignore[misc]
+
+    def test_record_dir_defaults_to_none(self) -> None:
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        assert FailureEvidence(kind=EvidenceKind.error, first_line='x').record_dir is None
 
 
 class TestFlakeSuppression:
@@ -481,6 +506,19 @@ class TestFlakeSuppression:
         )
         assert s.test_ids == ()
         assert s.unconfirmable_reason == 'node-ids mapped to no discovered subproject'
+
+    def test_evidence_defaults_to_none(self) -> None:
+        assert self._suppression().evidence is None
+
+    def test_an_evidence_mapping_is_held_as_given(self) -> None:
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        evidence = {
+            'tests/test_a.py::test_one': FailureEvidence(
+                kind=EvidenceKind.failed, first_line='AssertionError', record_dir='/r/1',
+            ),
+        }
+        assert self._suppression(evidence=evidence).evidence == evidence
 
 
 def _suppression(**overrides):
@@ -696,6 +734,79 @@ class TestFlakeSuppressionFromWire:
         assert rt.psi_cpu_some10 is None
         assert rt.unconfirmable_reason is None
 
+    @staticmethod
+    def _evidenced():
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        return _suppression(
+            test_ids=('a::t1', 'b::t2'),
+            evidence={
+                'a::t1': FailureEvidence(
+                    kind=EvidenceKind.failed, first_line='AssertionError: 1 != 2',
+                    record_dir='/records/p1',
+                ),
+                'b::t2': FailureEvidence(kind=EvidenceKind.error, first_line='ImportError'),
+            },
+        )
+
+    def test_evidence_round_trips_to_an_equal_suppression(self) -> None:
+        from orchestrator.flake_ledger import (
+            EvidenceKind,
+            FailureEvidence,
+            flake_suppression_from_wire,
+        )
+
+        s = self._evidenced()
+        rt = flake_suppression_from_wire(self._wire(s))
+
+        assert rt == s
+        assert rt is not None and rt.evidence is not None
+        for evidence in rt.evidence.values():
+            assert isinstance(evidence, FailureEvidence)
+            assert isinstance(evidence.kind, EvidenceKind)
+
+    def test_an_old_producer_with_no_evidence_key_rebuilds_with_none(self) -> None:
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d.pop('evidence', None)
+
+        rt = flake_suppression_from_wire(d)
+        assert rt is not None and rt.evidence is None
+
+    def test_a_newer_producers_unknown_keys_still_rebuild_with_the_evidence(self) -> None:
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        s = self._evidenced()
+        d = self._wire(s)
+        d['some_field_from_the_future'] = 1
+        d['evidence']['a::t1']['some_evidence_field_from_the_future'] = [1]
+
+        assert flake_suppression_from_wire(d) == s
+
+    @pytest.mark.parametrize(
+        'bad',
+        [
+            ['a::t1'],
+            {'a::t1': {'kind': 'failed'}},
+            {'a::t1': {'kind': 'bogus', 'first_line': 'x'}},
+        ],
+        ids=['a-list', 'missing-first-line', 'off-vocabulary-kind'],
+    )
+    def test_malformed_evidence_costs_only_the_evidence(self, caplog, bad) -> None:
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(self._evidenced())
+        d['evidence'] = bad
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            rt = flake_suppression_from_wire(d)
+
+        assert rt is not None, 'an observation is never dropped for its evidence'
+        assert rt.evidence is None
+        assert rt.test_ids == ('a::t1', 'b::t2')
+        assert self._warnings(caplog)
+
     def test_the_reconstruction_is_frozen_like_the_original(self) -> None:
         """A wire-built suppression is a value too — the recorder must not be able to
         amend an observation it merely transports."""
@@ -843,6 +954,99 @@ class TestRecordFlakeOccurrence:
 
         assert db_path.exists()
         assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_occurrence')[0]['n'] == 1
+
+
+class TestOccurrenceEvidenceInDetail:
+    """A suppression's per-test evidence lands in that test's row's ``detail``; a row
+    with no evidence keeps today's bytes."""
+
+    A = 'tests/test_a.py::test_one'
+    B = 'tests/test_a.py::test_two'
+
+    @staticmethod
+    def _evidence():
+        from orchestrator.flake_ledger import EvidenceKind, FailureEvidence
+
+        return FailureEvidence(
+            kind=EvidenceKind.failed, first_line='AssertionError: 1 != 2', record_dir='/records/p1',
+        )
+
+    @staticmethod
+    def _details(db_path: Path) -> dict[str, str]:
+        from orchestrator.flake_ledger import read_occurrences
+
+        return {r.test_id: r.detail for r in read_occurrences(db_path)}
+
+    def test_each_row_carries_only_its_own_tests_evidence(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(test_ids=(self.A, self.B), evidence={self.A: self._evidence()})
+        record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        details = self._details(db_path)
+        assert json.loads(details[self.A]) == {
+            'evidence': {
+                'kind': 'failed',
+                'first_line': 'AssertionError: 1 != 2',
+                'record_dir': '/records/p1',
+            },
+        }
+        assert details[self.B] == '{}'
+
+    def test_an_unconfirmable_row_carries_its_reason_and_its_evidence(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(self.A,),
+            unconfirmable_reason='could not re-run',
+            evidence={self.A: self._evidence()},
+        )
+        record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        detail = json.loads(self._details(db_path)[self.A])
+        assert detail['unconfirmable_reason'] == 'could not re-run'
+        assert detail['evidence']['first_line'] == 'AssertionError: 1 != 2'
+
+    def test_an_unconfirmable_row_without_evidence_keeps_todays_bytes(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict, record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(self.A,),
+            unconfirmable_reason='could not re-run',
+        )
+        record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        assert self._details(db_path)[self.A] == '{"unconfirmable_reason": "could not re-run"}'
+
+    @pytest.mark.parametrize(
+        'bad',
+        [
+            {'tests/test_a.py::test_one': {'kind': 'failed', 'first_line': 'x'}},
+            ['tests/test_a.py::test_one'],
+        ],
+        ids=['not-a-FailureEvidence', 'not-a-mapping'],
+    )
+    def test_malformed_evidence_still_writes_the_rows(
+        self, tmp_path: Path, caplog, bad,
+    ) -> None:
+        from orchestrator.flake_ledger import record_flake_occurrence
+
+        db_path = tmp_path / 'runs.db'
+        s = _suppression(test_ids=(self.A, self.B), evidence=cast(Any, bad))
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            record_flake_occurrence(db_path, 'dark_factory', s, merge_sha=None, task_id=None)
+
+        assert self._details(db_path) == {self.A: '{}', self.B: '{}'}
+        assert 'evidence' in caplog.text
 
 
 class TestRecordFlakeOccurrenceIdempotence:
@@ -5388,6 +5592,44 @@ def _all_due(db_path: Path) -> list:
     return items
 
 
+def _named_items(s) -> list:
+    """One due item per test *s* names, built through :func:`named_tests`."""
+    from orchestrator.flake_ledger import DueItem, named_tests
+
+    return [
+        DueItem(test_id, s.observed_at, s.call_site, 'a' * 40, '7001')
+        for test_id in named_tests(s)
+    ]
+
+
+class TestNamedTests:
+    """``named_tests``: the debt-eligible test ids an observation names.  SYNC-ONLY."""
+
+    def test_a_bare_str_test_ids_is_one_id_and_warns_nothing(self, caplog) -> None:
+        from orchestrator.flake_ledger import named_tests
+
+        s = _suppression(test_ids=cast(Any, 'tests/test_a.py::test_one'))
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert named_tests(s) == ('tests/test_a.py::test_one',)
+
+        assert caplog.records == []
+
+    def test_the_sentinel_is_dropped(self) -> None:
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, named_tests
+
+        s = _suppression(test_ids=(UNKNOWN_TEST_ID, 'tests/test_a.py::test_one'))
+        assert named_tests(s) == ('tests/test_a.py::test_one',)
+
+    def test_a_malformed_observation_names_nothing_and_logs(self, caplog) -> None:
+        from orchestrator.flake_ledger import named_tests
+
+        s = _suppression(test_ids=cast(Any, 17))
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert named_tests(s) == ()
+
+        assert caplog.records
+
+
 class TestDueList:
     """The due list (task 6934): what an observation owes ``open_debt``, written beside
     its occurrence rows and drained afterwards.  SYNC-ONLY CLASS."""
@@ -5421,12 +5663,12 @@ class TestDueList:
         assert len(_all_due(db_path)) == 1
 
     def test_rows_and_items_land_in_one_call(self, tmp_path: Path) -> None:
-        from orchestrator.flake_ledger import due_items_for, enqueue_debt
+        from orchestrator.flake_ledger import enqueue_debt
 
         db_path = tmp_path / 'runs.db'
         s = _suppression(test_ids=('tests/test_a.py::test_one', 'tests/test_a.py::test_two'))
         enqueue_debt(
-            db_path, 'dark_factory', due_items_for(s, head='a' * 40, observing_task_id='7001'),
+            db_path, 'dark_factory', _named_items(s),
             occurrence=s, merge_sha='a' * 40, task_id='7001', now=_DUE_NOW,
         )
 
@@ -5438,11 +5680,11 @@ class TestDueList:
     ) -> None:
         """The newly-inserted rule: an item whose row this call did NOT newly insert is a
         replay.  The lane's items-only recovery of the same key is not a replay."""
-        from orchestrator.flake_ledger import delete_due_item, due_items_for, enqueue_debt
+        from orchestrator.flake_ledger import delete_due_item, enqueue_debt
 
         db_path = tmp_path / 'runs.db'
         s = _suppression()
-        items = due_items_for(s, head='a' * 40, observing_task_id='7001')
+        items = _named_items(s)
         enqueue_debt(db_path, 'dark_factory', items, occurrence=s, now=_DUE_NOW)
         (item,) = _all_due(db_path)
         assert delete_due_item(db_path, item.id)
@@ -5454,13 +5696,11 @@ class TestDueList:
         assert len(_all_due(db_path)) == 1
 
     def test_the_sentinel_is_never_enqueued(self, tmp_path: Path) -> None:
-        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, due_items_for, enqueue_debt
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, enqueue_debt
 
         db_path = tmp_path / 'runs.db'
         s = _suppression(test_ids=(UNKNOWN_TEST_ID, 'tests/test_a.py::test_one'))
-        assert [i.test_id for i in due_items_for(s, head=None, observing_task_id=None)] == [
-            'tests/test_a.py::test_one',
-        ]
+        assert [i.test_id for i in _named_items(s)] == ['tests/test_a.py::test_one']
         enqueue_debt(db_path, 'dark_factory', [_due_item(UNKNOWN_TEST_ID)], now=_DUE_NOW)
 
         assert _all_due(db_path) == []
