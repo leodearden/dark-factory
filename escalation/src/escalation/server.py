@@ -2355,11 +2355,15 @@ def create_server(
         the capability and legality problems first.  None of the four mutates
         the record, so the ordering is an error-reporting precedence only.
 
-        NOTE: the ``target_status`` values above are not yet written by
-        resolve_issue — this call changes only the escalation record; the
-        task-status effects described in the table earlier in this docstring
-        remain owned by the orchestrator harness. Wiring the harness to
-        consume Table B directly is a separate, out-of-scope follow-up.
+        NOTE: resolve_issue itself writes no task status — this call changes
+        only the escalation record. The ``target_status`` values above are
+        applied by the orchestrator harness, which reads the SAME Table B
+        through ``effect_for``:
+        ``orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved``
+        (reached through the resolve callback the harness registers on the
+        queue; it dispatches on ``workflow_disposition``) and
+        ``orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member``
+        (the ``resume`` re-pend target).
         """
         if terminate is not None:
             return {
