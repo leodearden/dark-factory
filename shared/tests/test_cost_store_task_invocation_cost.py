@@ -96,3 +96,64 @@ class TestTaskInvocationCost:
         await store.close()
         with pytest.raises(RuntimeError):
             await store.task_invocation_cost('dark_factory', 't1')
+
+
+@pytest.mark.asyncio
+class TestTasksInvocationCost:
+    async def test_sums_every_named_task_of_that_project(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'runs.db') as store:
+            await _save(store, cost_usd=1.5, task_id='t1')
+            await _save(store, cost_usd=2.25, task_id='t2')
+            await _save(store, cost_usd=10.0, task_id='t3')
+            await _save(store, cost_usd=20.0, task_id='t1', project_id='reify')
+            await _save(store, cost_usd=40.0, task_id=None)
+
+            assert await store.tasks_invocation_cost(
+                'dark_factory', {'t1', 't2', 'absent'},
+            ) == pytest.approx(3.75)
+
+    async def test_since_bounds_every_task(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'runs.db') as store:
+            await _save(store, cost_usd=1.0, task_id='t1', completed_at=_NOW)
+            await _save(store, cost_usd=2.0, task_id='t2', completed_at=_NOW)
+            await _save(store, cost_usd=100.0, task_id='t2', completed_at=_NOW - timedelta(hours=25))
+
+            assert await store.tasks_invocation_cost(
+                'dark_factory', ['t1', 't2'], since=_NOW,
+            ) == pytest.approx(3.0)
+
+    async def test_agrees_with_the_per_task_reader(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'runs.db') as store:
+            await _save(store, cost_usd=1.5, task_id='t1')
+            await _save(store, cost_usd=2.5, task_id='t2')
+
+            per_task = [await store.task_invocation_cost('dark_factory', t) for t in ('t1', 't2')]
+            assert await store.tasks_invocation_cost(
+                'dark_factory', ('t1', 't2'),
+            ) == pytest.approx(sum(per_task))
+
+    async def test_no_tasks_is_a_float_zero(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'runs.db') as store:
+            await _save(store, cost_usd=1.0)
+            total = await store.tasks_invocation_cost('dark_factory', ())
+        assert total == 0.0
+        assert isinstance(total, float)
+
+    async def test_a_bare_task_id_string_is_refused(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'runs.db') as store:
+            with pytest.raises(TypeError, match='task_ids'):
+                await store.tasks_invocation_cost('dark_factory', 't1')
+
+    async def test_a_naive_since_is_refused(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'runs.db') as store:
+            with pytest.raises(ValueError, match='since'):
+                await store.tasks_invocation_cost(
+                    'dark_factory', ['t1'], since=datetime(2026, 10, 19, 12, 0),
+                )
+
+    async def test_a_closed_store_raises_rather_than_reading_zero(self, tmp_path: Path):
+        store = CostStore(tmp_path / 'runs.db')
+        await store.open()
+        await store.close()
+        with pytest.raises(RuntimeError):
+            await store.tasks_invocation_cost('dark_factory', ['t1'])

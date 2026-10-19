@@ -11411,20 +11411,18 @@ class Harness:
         if not self._auto_eval_redo_task_ids or self.cost_store is None:
             return 0.0
         since = datetime.now(UTC) - timedelta(hours=24)
-        project_id = self.config.fused_memory.project_id
-        total = 0.0
         try:
-            for task_id in sorted(self._auto_eval_redo_task_ids):
-                total += await self.cost_store.task_invocation_cost(
-                    project_id, task_id, since=since,
-                )
+            return await self.cost_store.tasks_invocation_cost(
+                self.config.fused_memory.project_id,
+                frozenset(self._auto_eval_redo_task_ids),
+                since=since,
+            )
         except Exception as exc:  # noqa: BLE001 — never block dispatch on this
             logger.warning(
                 '_auto_eval_budget_used_24h: trailing-24h cost query failed (%s) — fail-open',
                 exc,
             )
             return 0.0
-        return total
 
     async def _enforce_cost_ceilings(self) -> None:
         """Check daily cost ceilings and pause the scheduler on breach.

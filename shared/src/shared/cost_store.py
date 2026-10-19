@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import enum
 import logging
+from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -406,19 +407,36 @@ class CostStore(AsyncSqliteBase):
         *,
         since: datetime | None = None,
     ) -> float:
-        """Per-task production spend: the single reader of per-task invocation cost.
+        """One task's production spend; see :meth:`tasks_invocation_cost`."""
+        return await self.tasks_invocation_cost(project_id, (task_id,), since=since)
+
+    async def tasks_invocation_cost(
+        self,
+        project_id: str,
+        task_ids: Collection[str],
+        *,
+        since: datetime | None = None,
+    ) -> float:
+        """Summed production spend of *task_ids* in one query: the single reader of per-task cost.
 
         *since*, when given, is an inclusive aware lower bound on ``completed_at``
-        (live-shadow PRD S1). Raises ``ValueError`` on a naive *since* and
-        ``RuntimeError`` when the store is not open.
+        (live-shadow PRD S1). Raises ``TypeError`` when *task_ids* is a bare
+        ``str``, ``ValueError`` on a naive *since* and ``RuntimeError`` when the
+        store is not open.
         """
+        if isinstance(task_ids, str):
+            raise TypeError(
+                f'tasks_invocation_cost: task_ids must be a collection of ids, not a str '
+                f'(got {task_ids!r})'
+            )
         if since is not None and since.utcoffset() is None:
-            raise ValueError(f'task_invocation_cost: since must be timezone-aware (got {since!r})')
+            raise ValueError(f'tasks_invocation_cost: since must be timezone-aware (got {since!r})')
+        ids = tuple(task_ids)
         sql = (
             'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
-            'WHERE project_id = ? AND task_id = ?'
+            f'WHERE project_id = ? AND task_id IN ({", ".join("?" for _ in ids)})'
         )
-        params: tuple[Any, ...] = (project_id, task_id)
+        params: tuple[Any, ...] = (project_id, *ids)
         if since is not None:
             sql += ' AND completed_at >= ?'
             params += (since.astimezone(UTC).isoformat(),)
