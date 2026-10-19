@@ -2268,10 +2268,17 @@ class TaskWorkflow:
         reliance on ``merge_sha^2`` for the verified branch tip) and yields
         exactly this task's own branch changes.
 
-        Fall-back path: when ``_merge_sha`` is None (already-on-main shortcuts,
-        eval mode without a merge), write an empty list — the fused-memory
-        gate-skip-when-verified-provenance branch handles the missing-files
-        case from there.
+        Uncomputable diff (task 3113): when ``_merge_sha`` is None
+        (already-on-main shortcuts, eval mode without a merge) or the merge
+        diff errors, the merge diff is UNKNOWN — "cannot compute", never
+        "touched nothing" — so the backend's existing ``metadata.files`` is
+        preserved.  ``[]`` is persisted only when something authoritative says
+        so: an explicit override, or a prior scope that was already empty.
+        Blanking here wiped reify 5367's and 5602's lock scope and tripped the
+        MERGE-entry divergence tripwire on re-dispatch.  The rule covers every
+        sha-less caller: the architect already-done stamp
+        (:meth:`_handle_already_done_report`) and the journal recovery arms
+        through :meth:`_finalise_recovery_done`.
 
         ``override_files`` (task 2372, Layer C): when provided (not ``None``),
         it REPLACES the ``_merge_sha``-derived computation entirely — used by
@@ -2299,27 +2306,46 @@ class TaskWorkflow:
         The strip can only shrink the declared set (a file-level subset of what
         landed), which keeps the phantom-done gate honest.
         """
-        if override_files is not None:
-            files = override_files
-        elif self._merge_sha:
+        files, unknown_reason = override_files, 'no merge_sha'
+        if files is None and self._merge_sha:
             files, err = await self.git_ops.get_merge_commit_diff_files(
                 self._merge_sha,
             )
             if err is not None:
-                files = []
-        else:
-            files = []
-        merged = await self._merge_fresh_metadata(
-            self.task.get('metadata') or {},
-            log_context='done metadata files reconcile',
+                files, unknown_reason = None, f'merge diff failed: {err}'
+        persisted = await self._persist_metadata_files(
+            files, log_context='done metadata files reconcile',
         )
-        merged['files'] = sanitize_files_for_persist(files)
-        # Optimistically update in-memory so downstream reads in this session
-        # see the expected state.  In-memory is intentionally optimistic; the
-        # backend is the authority and will be re-read on the next reconcile
-        # cycle if this write fails (consistent with _handle_no_plan_failure).
+        if files is None and persisted:
+            logger.warning(
+                'Task %s: done reconcile cannot compute the merge diff (%s); '
+                'preserving the recorded metadata.files %s',
+                self.task_id, unknown_reason, persisted,
+            )
+
+    async def _persist_metadata_files(
+        self, files: list[str] | None, *, log_context: str,
+    ) -> list[str]:
+        """The one orchestrator-side write seam for ``metadata.files``.
+
+        A read-modify-write through :meth:`_merge_fresh_metadata`, so sibling
+        keys (``memory_hints``, ``_causation_id``) survive and backend keys win
+        on collision.  ``files=None`` means "uncomputable here; keep what the
+        backend has".  The chosen list is sanitized to file-level paths
+        (``sanitize_files_for_persist``) and mirrored into
+        ``self.task['metadata']`` optimistically before the write — the backend
+        stays the authority and is re-read on the next reconcile.  Exceptions
+        propagate: each caller owns its failure policy.  Returns the persisted
+        list.
+        """
+        merged = await self._merge_fresh_metadata(
+            self.task.get('metadata') or {}, log_context=log_context,
+        )
+        chosen = (merged.get('files') or []) if files is None else files
+        merged['files'] = sanitize_files_for_persist(chosen)
         self.task['metadata'] = merged
         await self.scheduler.update_task(self.task_id, merged)
+        return merged['files']
 
     def _enter_phase(self, new_state: WorkflowState) -> None:
         """Transition to a new workflow phase, emitting events.
@@ -4470,8 +4496,8 @@ class TaskWorkflow:
         be widened while metadata.files stayed behind, tripping the MERGE-entry
         ``_check_scope_invariant`` divergence tripwire. So on a successful
         reconcile that left ``self.modules`` UNCHANGED, persist
-        ``metadata.files=new_files`` directly (mirroring the done-metadata
-        reconcile read-modify-write). On the module-CHANGE success path and the
+        ``metadata.files=new_files`` directly through the
+        :meth:`_persist_metadata_files` seam. On the module-CHANGE success path and the
         lock-CONFLICT path this is skipped — ``handle_blast_radius_expansion``
         already persisted ``metadata.files=new_files``. The module-CHANGE
         success path now ALWAYS persists (widen, narrow, or shift): a pure-widen
@@ -4486,13 +4512,9 @@ class TaskWorkflow:
         modules_before = set(self.modules)
         reconciled = await self._reconcile_scope_locks(new_files)
         if reconciled.applied and set(self.modules) == modules_before:
-            merged = await self._merge_fresh_metadata(
-                self.task.get('metadata') or {},
-                log_context='scope-grant files persist',
+            await self._persist_metadata_files(
+                new_files, log_context='scope-grant files persist',
             )
-            merged['files'] = sanitize_files_for_persist(new_files)
-            self.task['metadata'] = merged
-            await self.scheduler.update_task(self.task_id, merged)
         return reconciled
 
     async def _requeue_on_lock_conflict(
