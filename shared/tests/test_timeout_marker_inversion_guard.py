@@ -3,8 +3,8 @@
 The extractor, the band, the judgement, its failure messages and their
 rationale live in shared/src/shared/testing_timeout_markers.py.  This module
 supplies only this package's inputs: its tests root, the verify test_command
-its own orchestrator.yaml passes, its grandfather allowlist and its
-anti-vacuity floors.
+its own orchestrator.yaml passes and its anti-vacuity floors.  It reads its
+grandfather allowlist from shared_timeout_marker_grandfathered.py.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import yaml
+from shared_timeout_marker_grandfathered import INVERSION_BAND_GRANDFATHERED
 
 from shared.testing_timeout_markers import (
     InversionVerdict,
@@ -30,16 +31,6 @@ _ORCH_YAML = _TESTS_DIR.parent / 'orchestrator.yaml'
 #: the same stated limit as orchestrator's.
 _SANCTIONED: Mapping[str, float] = {}
 
-#: In-band sites that predate this guard: 1, MEASURED on 2026-10-07 at main
-#: 1c6a52dbfd.  Entries may only ever be REMOVED; migration is follow-up
-#: tkt_0RVDQ479918XDV0C80NXAVT8HX.  Keyed per SITE on the path RELATIVE to
-#: tests/.  The site's own comment still reasons against a 60s ini default that
-#: is now 540, which is why 180 reads to its author as a loosening.
-_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset({
-    # test_root_config_integration_deselection.py -- 1 site at 180s
-    ('test_root_config_integration_deselection.py', 'TestRootConfigIntegrationDeselection'),
-})
-
 #: Set below the 138 files and 38 sites measured on 2026-10-07.
 _FLOORS = SweepFloors(test_files=100, marker_sites=25)
 
@@ -49,7 +40,7 @@ def _verdict() -> InversionVerdict:
     return judge_inversion_band(
         scan_timeout_marker_sites(_TESTS_DIR, _SANCTIONED),
         verify_test_command=yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))['test_command'],
-        grandfathered=_GRANDFATHERED,
+        grandfathered=INVERSION_BAND_GRANDFATHERED,
         floors=_FLOORS,
     )
 
