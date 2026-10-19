@@ -718,3 +718,91 @@ class TestExecuteWrites:
 
         assert code == 0
         assert f"resolve_issue(escalation_id='{escalation_id}'" in capsys.readouterr().out
+
+
+class TestCapsAndIdempotency:
+    def test_the_per_run_cap_defers_the_higher_gate_until_the_next_run(
+        self, root, seed_tasks, capsys,
+    ):
+        fake = FakeMemoryService(consolidation_auto=enabled_config(max_auto_per_cycle=1))
+        first_members = fake.seed_many(3)
+        second_members = fake.seed_many(3)
+        seed_tasks([
+            gate_row(92, OTHER_TOPIC, observed=second_members),
+            gate_row(91, TOPIC, observed=first_members),
+        ])
+        claims = ('--claim', f'{TOPIC}={CLAIM}', '--claim', f'{OTHER_TOPIC}={CLAIM}')
+
+        code, payload = drive(root, fake, capsys, '--execute', *claims)
+
+        assert code == 0
+        assert gate_of(payload, 91)['disposition'] == 'executed'
+        deferred = gate_of(payload, 92)
+        assert deferred['disposition'] == 'deferred'
+        assert deferred['codes'] == ['cycle_cap_reached']
+        assert fake.canonicals_of(OTHER_TOPIC) == []
+        for member in second_members:
+            assert 'topic' not in fake.metadata_of(member)
+
+        _, again = drive(root, fake, capsys, '--execute', *claims)
+
+        assert gate_of(again, 91)['disposition'] == 'noop'
+        assert gate_of(again, 92)['disposition'] == 'executed'
+
+    def test_a_second_run_is_a_noop_that_writes_nothing_and_lists_the_resume_again(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        seed_tasks([
+            gate_row(93, TOPIC, observed=fake.seed_many(3)),
+            gate_row(94, OTHER_TOPIC, observed=fake.seed_many(3)),
+        ])
+        escalations = {93: seed_gate_escalation(root, 93), 94: seed_gate_escalation(root, 94)}
+        claims = ('--claim', f'{TOPIC}={CLAIM}', '--claim', f'{OTHER_TOPIC}={CLAIM}')
+        drive(root, fake, capsys, '--execute', *claims)
+        writes_after_first = fake.writes()
+
+        code, payload = drive(root, fake, capsys, '--execute', *claims)
+
+        assert code == 0
+        assert fake.writes() == writes_after_first
+        for task_id, escalation_id in escalations.items():
+            gate = gate_of(payload, task_id)
+            assert gate['disposition'] == 'noop'
+            assert 'already_consolidated' in gate['codes']
+            assert [c['arguments']['escalation_id'] for c in gate['next']] == [escalation_id]
+
+    def test_a_member_the_arm_could_not_stamp_leaves_the_gate_open_and_exits_1(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        members = fake.seed_many(3)
+        fake.update_returns[members[2]] = {'error': 'gone', 'error_type': 'MemoryNotFound'}
+        seed_tasks([gate_row(95, TOPIC, observed=members)])
+        seed_gate_escalation(root, 95)
+
+        code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 1
+        gate = gate_of(payload, 95)
+        assert gate['disposition'] == 'executed'
+        assert [f['id'] for f in gate['execution']['retain_failures']] == [members[2]]
+        assert gate['closure']['closed'] is False
+        unstamped = [r for r in gate['closure']['reasons'] if r['code'] == 'unstamped_cluster_member']
+        assert members[2] in unstamped[0]['ids']
+        assert gate['next'] == []
+
+    def test_an_already_closed_noop_gate_lists_its_resume_with_no_writes(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        fake.seed(topic=TOPIC, canonical=True)
+        stamped = fake.seed_many(3, topic=TOPIC)
+        seed_tasks([gate_row(96, TOPIC, observed=stamped)])
+        escalation_id = seed_gate_escalation(root, 96)
+
+        code, payload = drive(root, fake, capsys, '--execute')
+
+        assert code == 0
+        assert fake.writes() == (0, 0)
+        gate = gate_of(payload, 96)
+        assert gate['disposition'] == 'noop'
+        assert gate['closure']['closed'] is True
+        assert [c['arguments']['escalation_id'] for c in gate['next']] == [escalation_id]
