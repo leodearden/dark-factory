@@ -17,8 +17,15 @@ from pathlib import Path
 import pytest
 import yaml
 from _fm_helpers import load_script_module
+from escalation.queue import EscalationQueue
 from shared.memory_eval_limits import LimitsConfig, limits_artifact_path, load_limits_artifact
 from shared.memory_eval_metrics import load_metric_series
+from shared.memory_eval_verdicts import (
+    RunnerFailureRecord,
+    StormEscape,
+    VerdictsArtifact,
+    build_verdicts_artifact,
+)
 
 _FM_ROOT = Path(__file__).parent.parent
 SCRIPT_PATH = _FM_ROOT / 'scripts' / 'memory_eval_runner.py'
@@ -334,3 +341,201 @@ class TestEvaluateEvals:
         runs, failures = _mod().evaluate_evals(tmp_path, ['e-missing', _E1], _FIRST, _LIMITS)
         assert [run.eval_id for run in runs] == [_E1]
         assert [(f.scope, f.phase) for f in failures] == [('e-missing', 'evaluate')]
+
+
+_PROGRAM_TASK = 'memory-eval-program'
+
+
+def _regression_run(root: Path):
+    _seed(root, *_ALL_STAMPS[:4])
+    _evaluate(root, _FIRST)
+    return _evaluate(root, _REGRESSION)
+
+
+def _context(root: Path, stamp: str = _REGRESSION):
+    return _mod().FilingContext(
+        run_stamp=stamp,
+        project_id='dark_factory',
+        run_report_path=root / f'run-report-{stamp}.txt',
+        verdicts_path=root / f'verdicts-{stamp}.json',
+    )
+
+
+def _artifact(run, *, k: int = 10, failures=()) -> VerdictsArtifact:
+    return build_verdicts_artifact(
+        [(run.series, run.result)], run_stamp=_REGRESSION, alarm_limit=k, runner_failures=failures,
+    )
+
+
+def _file(queue, run, root: Path, *, k: int = 10, failures=()):
+    artifact = _artifact(run, k=k, failures=failures)
+    outcome = _mod().file_run_escalations(
+        queue, [run], artifact.storm_escape, artifact.runner_failures, _context(root),
+    )
+    return artifact, outcome
+
+
+def _pending(queue: EscalationQueue):
+    return [e for e in queue.get_pending() if e.category == 'eval_regression']
+
+
+def _alarm_fingerprints(run) -> set[str]:
+    return {e.fingerprint for e in run.entries if e.verdict == 'alarm'}
+
+
+def _by_fingerprint(queue: EscalationQueue) -> dict:
+    return {e.dedupe_fingerprint: e for e in _pending(queue)}
+
+
+def _failure(scope: str, phase: str = 'produce', exit_code: int | None = 3) -> RunnerFailureRecord:
+    return RunnerFailureRecord(
+        scope=scope, phase=phase, error_type='ProducerExit', message='exited 3', exit_code=exit_code,
+    )
+
+
+class TestPerAlarmFiling:
+    def test_one_escalation_per_alarm_entry(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        run = _regression_run(tmp_path / 'root')
+        _, outcome = _file(queue, run, tmp_path / 'root')
+        assert len(outcome.filed) == 3
+        assert set(_by_fingerprint(queue)) == _alarm_fingerprints(run)
+
+    def test_each_filing_is_contract_shaped(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        run = _regression_run(tmp_path / 'root')
+        _file(queue, run, tmp_path / 'root')
+        for esc in _pending(queue):
+            assert esc.category == 'eval_regression'
+            assert (esc.severity, esc.level, esc.status) == ('blocking', 1, 'pending')
+            assert esc.task_id == f'memory-eval-{_E1}'
+            assert esc.agent_role == 'memory-eval-runner'
+            assert esc.project_id == 'dark_factory'
+            assert esc.evidence
+            for entry in esc.evidence:
+                assert set(entry) == {'observation', 'measured_at', 'ref'}
+                assert entry['measured_at'] == f'run_stamp={_REGRESSION}'
+
+    def test_the_summary_names_the_metric_item_and_value_against_baseline(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        run = _regression_run(root)
+        _file(queue, run, root)
+        filed = _by_fingerprint(queue)
+        alarm_entries = [e for e in run.entries if e.verdict == 'alarm']
+        alarms = {(a.metric_id, a.item_key): a for a in run.result.alarms}
+        for entry in alarm_entries:
+            alarm = alarms[(entry.metric_id, entry.item)]
+            summary = filed[entry.fingerprint].summary
+            assert _E1 in summary and entry.metric_id in summary
+            if entry.item is not None:
+                assert entry.item in summary
+            assert f'{alarm.value:g}' in summary
+            assert f'{alarm.baseline:g}' in summary
+
+    def test_the_detail_cites_the_limit_window_artifacts_and_a_remediation(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        run = _regression_run(root)
+        _file(queue, run, root)
+        context = _context(root)
+        for entry in (e for e in run.entries if e.verdict == 'alarm'):
+            detail = _by_fingerprint(queue)[entry.fingerprint].detail
+            for cited in (
+                entry.metric_id, entry.rule_kind, str(run.limits_path), str(run.report_path),
+                str(context.run_report_path), str(context.verdicts_path), 'Remediation:',
+            ):
+                assert cited in detail, cited
+            if entry.rule_kind == 'tripwire':
+                assert 'grandfather_set_hash=' in detail
+            else:
+                assert 'alpha=' in detail and 'p_value=' in detail
+                assert all(stamp in detail for stamp in run.result.baseline_run_stamps)
+
+
+class TestFingerprintDedup:
+    def test_a_rerun_while_pending_files_nothing(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        run = _regression_run(root)
+        _file(queue, run, root)
+        _, rerun = _file(queue, run, root)
+        assert rerun.filed == ()
+        assert set(rerun.suppressed) == _alarm_fingerprints(run)
+        assert len(_pending(queue)) == 3
+
+    def test_resolving_one_lets_exactly_that_fingerprint_refile(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        run = _regression_run(root)
+        _file(queue, run, root)
+        resolved = _pending(queue)[0]
+        queue.resolve(resolved.id, 'fixed upstream')
+        _, rerun = _file(queue, run, root)
+        (refiled,) = rerun.filed
+        assert queue.get(refiled).dedupe_fingerprint == resolved.dedupe_fingerprint
+
+
+class TestStormEscape:
+    def test_alarms_over_k_file_one_aggregate_and_no_per_metric_escalation(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        run = _regression_run(root)
+        artifact, outcome = _file(queue, run, root, k=2)
+        (only,) = _pending(queue)
+        assert outcome.filed == (only.id,)
+        assert only.dedupe_fingerprint == artifact.storm_escape.aggregate_fingerprint
+        assert only.task_id == _PROGRAM_TASK
+        assert '3' in only.summary
+        assert str(_context(root).run_report_path) in only.summary
+        assert not _alarm_fingerprints(run) & {e.dedupe_fingerprint for e in _pending(queue)}
+
+    def test_a_rerun_of_the_storm_stamp_files_nothing(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        run = _regression_run(root)
+        _file(queue, run, root, k=2)
+        _, rerun = _file(queue, run, root, k=2)
+        assert rerun.filed == ()
+        assert len(_pending(queue)) == 1
+
+
+class TestRunnerFailureFiling:
+    def test_all_failures_in_a_run_collapse_to_one_escalation(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        failures = [_failure('e4-staleness-sweep'), _failure('e6-corpus-health', 'evaluate', None)]
+        artifact = build_verdicts_artifact(
+            [], run_stamp=_REGRESSION, alarm_limit=10, runner_failures=failures,
+        )
+        outcome = _mod().file_run_escalations(
+            queue, [], artifact.storm_escape, artifact.runner_failures, _context(root),
+        )
+        (only,) = _pending(queue)
+        assert outcome.filed == (only.id,)
+        assert only.task_id == _PROGRAM_TASK
+        assert only.dedupe_fingerprint == artifact.runner_failure_fingerprint
+        assert len(only.evidence) == 2
+        first, second = (entry['observation'] for entry in only.evidence)
+        assert 'e4-staleness-sweep' in first and 'produce' in first and '3' in first
+        assert 'e6-corpus-health' in second and 'evaluate' in second and 'ProducerExit' in second
+
+    def test_a_later_failure_files_nothing_while_one_is_pending(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        quiet_storm = StormEscape(triggered=False, alarm_count=0, alarm_limit=10)
+        file_run = _mod().file_run_escalations
+        file_run(queue, [], quiet_storm, [_failure('e4-staleness-sweep')], _context(root))
+        later = file_run(queue, [], quiet_storm, [_failure('e6-corpus-health')], _context(root, _QUIET))
+        assert later.filed == ()
+        assert len(_pending(queue)) == 1
+
+
+class TestTheRunnerNeverResolves:
+    def test_no_filed_record_changes_status_during_a_run(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        root = tmp_path / 'root'
+        run = _regression_run(root)
+        _, first = _file(queue, run, root)
+        _file(queue, run, root, failures=[_failure('e4-staleness-sweep')])
+        assert {queue.get(esc_id).status for esc_id in first.filed} == {'pending'}
