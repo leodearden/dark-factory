@@ -1520,31 +1520,33 @@ class TaskInterceptor:
                 _journal_params['done_provenance_kind'] = _provenance_kind(done_provenance)
                 _journal_agent_id = agent_id
 
-            deferral_write = deferral_gate.plan(
-                old_status=old_status,
-                stored_metadata=before.get('metadata') if isinstance(before, dict) else None,
-                status=status,
-                call=deferral_call,
-                task_id=task_id,
-                agent_id=agent_id,
-            )
-            if not isinstance(deferral_write, deferral_gate.DeferralWrite):
-                return await self._journal_deferral_refusal(
-                    deferral_write, project_root, _journal_params, agent_id,
-                )
-            if deferral_write.is_restamp:
-                return await self._apply_restamp(
-                    tm,
-                    task_id=task_id,
-                    project_root=project_root,
-                    tag=tag,
-                    deferral_write=deferral_write,
-                    journal_params=_journal_params,
-                    journal_agent_id=_journal_agent_id,
-                )
-            audit_fields.update(deferral_write.audit_fields)
+            stored_metadata = before.get('metadata') if isinstance(before, dict) else None
 
             if status == old_status:
+                same_status = deferral_gate.plan_same_status(
+                    status=status,
+                    stored_metadata=stored_metadata,
+                    call=deferral_call,
+                    task_id=task_id,
+                    agent_id=agent_id,
+                )
+                match same_status:
+                    case deferral_gate.Restamp():
+                        return await self._apply_restamp(
+                            tm,
+                            task_id=task_id,
+                            project_root=project_root,
+                            tag=tag,
+                            restamp=same_status,
+                            journal_params=_journal_params,
+                            journal_agent_id=_journal_agent_id,
+                        )
+                    case deferral_gate.NoWrite():
+                        pass
+                    case refusal:
+                        return await self._journal_deferral_refusal(
+                            refusal, project_root, _journal_params, agent_id,
+                        )
                 if status == 'done' and done_provenance:
                     repair = await _repair_done_provenance_same_status(
                         tm,
@@ -1821,6 +1823,23 @@ class TaskInterceptor:
                     actor,
                 )
 
+            # 2f. The deferral gate runs last, so a refusal's self-correction
+            # hint never sends the caller into a gate above that refuses the
+            # retry (a terminal exit with no reopen_reason, an illegal edge).
+            deferral_write = deferral_gate.plan_status_change(
+                old_status=old_status,
+                status=status,
+                stored_metadata=stored_metadata,
+                call=deferral_call,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+            if isinstance(deferral_write, deferral_gate.GateRefusal):
+                return await self._journal_deferral_refusal(
+                    deferral_write, project_root, _journal_params, agent_id,
+                )
+            audit_fields.update(deferral_write.audit_fields)
+
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
             # Sits after the same-status no-op (C4-E5) and feeds both writers:
@@ -1970,7 +1989,7 @@ class TaskInterceptor:
         task_id: str,
         project_root: str,
         tag: str | None,
-        deferral_write: deferral_gate.DeferralWrite,
+        restamp: deferral_gate.Restamp,
         journal_params: dict[str, Any],
         journal_agent_id: str | None,
     ) -> dict:
@@ -1983,7 +2002,7 @@ class TaskInterceptor:
                 journal_params,
                 _status_write_body(
                     tm, task_id, TaskStatus.DEFERRED.value, project_root, tag,
-                    audit_fields=dict(deferral_write.audit_fields),
+                    audit_fields=restamp.audit_fields,
                     clear_keys=frozenset(),
                     claimant_kwargs={},
                 ),
@@ -1996,14 +2015,10 @@ class TaskInterceptor:
             self._make_event(
                 EventType.deferral_restamped,
                 project_root,
-                {
-                    'task_id': task_id,
-                    'old': deferral_write.restamp_old,
-                    'new': deferral_write.restamp_new,
-                },
+                {'task_id': task_id, 'old': restamp.old, 'new': restamp.new},
             )
         )
-        return {**result, **deferral_write.echo}
+        return {**result, **restamp.echo}
 
     async def _mint_recurrence_successor(
         self, *, task_id: str, project_root: str, tag: str | None, project_id: str,

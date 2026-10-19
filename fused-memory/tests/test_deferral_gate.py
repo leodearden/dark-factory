@@ -26,6 +26,7 @@ from shared.project_layout import tasks_db
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import DeferralWriteAuthorityError
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware import deferral_gate
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.models.reconciliation import ReconciliationEvent
@@ -266,6 +267,38 @@ async def test_entry_without_record_is_refused_and_journalled(
     assert 'deferral_required' in rows[0]['error']
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_status', ['done', 'cancelled'])
+async def test_terminal_row_answers_the_terminal_exit_gate_first(
+    stack: Stack, terminal_status: str,
+) -> None:
+    task_id = await stack.seed(terminal_status, f'row 1 from {terminal_status}')
+    condition = _until_condition(f'row 1 from {terminal_status}')
+
+    bare = await stack.call('set_task_status', id=task_id, status='deferred')
+    recorded = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=condition,
+    )
+    reopened = await stack.call(
+        'set_task_status', id=task_id, status='deferred', reopen_reason='re-scope',
+    )
+
+    assert bare['error'] == 'terminal_exit_rejected', bare
+    assert recorded['error'] == 'terminal_exit_rejected', recorded
+    assert reopened['error'] == 'deferral_required', reopened
+    await _assert_untouched(stack, task_id, terminal_status)
+
+    entered = await stack.call(
+        'set_task_status', id=task_id, status='deferred', deferral=condition,
+        reopen_reason='re-scope',
+    )
+
+    assert 'error' not in entered, entered
+    row = await stack.read(task_id)
+    assert row['status'] == 'deferred'
+    assert entered['deferral'] == row['metadata']['deferral']
+
+
 # Rows 3, 4 and 26: the record is validated, and a holder is corroborated in /proc.
 
 
@@ -356,6 +389,38 @@ async def test_request_shape_refusals(stack: Stack) -> None:
     await _assert_untouched(stack, first, 'pending')
     await _assert_untouched(stack, second, 'pending')
     await _assert_untouched(stack, unrecorded, 'deferred')
+
+
+# Row 5's invariant, held by the planner too: a request never rides a write away from
+# `deferred`, so no exit can keep a stale record even if a caller skips corroborate.
+
+
+def _uncorroborated_call(raw_deferral: dict[str, Any]) -> deferral_gate.DeferralCall:
+    now = datetime.now(UTC)
+    return deferral_gate.DeferralCall(
+        request=task_deferral.parse_request(raw_deferral, now=now),
+        holder=None,
+        expected_stamped_at=None,
+        expected_stamped_at_text=None,
+        restamp_only=False,
+        scope=deferral_gate.StatusWriteScope.STATUS,
+        now=now,
+    )
+
+
+def test_planner_raises_on_a_request_away_from_deferred() -> None:
+    call = _uncorroborated_call(_until_condition('stale record'))
+    stored = {'deferral': {'kind': 'until_condition', 'condition': 'stale record'}}
+
+    with pytest.raises(ValueError, match='every exit'):
+        deferral_gate.plan_status_change(
+            old_status='deferred', status='pending', stored_metadata=stored,
+            call=call, task_id='1', agent_id=None,
+        )
+    with pytest.raises(ValueError, match='every exit'):
+        deferral_gate.plan_same_status(
+            status='pending', stored_metadata=None, call=call, task_id='1', agent_id=None,
+        )
 
 
 @pytest.mark.asyncio
