@@ -21,14 +21,264 @@ fails the suite.
 
 from __future__ import annotations
 
-import pytest
-from _auto_consolidation_fakes import CATEGORY, VALID_CLAIM
+import json
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
+import pytest
+import pytest_asyncio
+from _auto_consolidation_fakes import (
+    CATEGORY,
+    PROJECT_ID,
+    VALID_CLAIM,
+    FakeMemoryService,
+    FakeTaskBackend,
+    enabled_config,
+)
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
+from mcp.server.fastmcp import FastMCP
+from reconciliation.consolidator_fixtures import make_consolidator
+
+from fused_memory.config.schema import ConsolidationAutoConfig
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
+from fused_memory.reconciliation.consolidation_proposal import (
+    PROPOSER_AGENT_ID,
+    RECORD_KIND_CONSOLIDATION_PROPOSAL,
+    ProposalOutcome,
+    outcome_from_record,
+)
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.stages import memory_consolidator as memory_consolidator_module
+from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.task_filter import filter_task_tree
+from fused_memory.server.tools import create_mcp_server
 
 TOPIC = 'e2e-topic-alpha'
+RATIONALE = 'These records state the same rule in different words.'
+
+#: The Mem0 methods the executor, the closure scroll and the revert call.
+_MEM0_SURFACE = (
+    'get_memory_by_id',
+    'update_memory',
+    'add_memory',
+    'delete_memory',
+    'count_memories_by_metadata',
+    'get_memories_by_metadata',
+    'add_system_record',
+    'search',
+)
+
+
+# ---- harness ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Emission:
+    """One proposal the Stage-1 LLM turn emits through the tool."""
+
+    topic: str
+    member_ids: Sequence[str]
+    claim: str = VALID_CLAIM
+    category: str = CATEGORY
+
+
+@dataclass(frozen=True)
+class CycleResult:
+    report: StageReport
+    emissions: tuple[dict[str, Any], ...]
+
+
+@dataclass
+class World:
+    """One Stage-1 instance over the fake corpus, the real ledger and the real queue.
+
+    ``fake`` is for seeding and inspection; the stage, the tool and a revert all
+    reach the corpus through ``stage.memory``.
+    """
+
+    stage: MemoryConsolidator
+    fake: FakeMemoryService
+    ledger: ReconLedgerStore
+    queue: EscalationQueue
+    tasks: FakeTaskBackend
+    server: FastMCP
+    project_id: str
+    project_root: str
+
+    async def cycle(
+        self,
+        run_id: str,
+        *,
+        emit: Sequence[Emission] = (),
+        active_tasks: Sequence[dict[str, Any]] = (),
+    ) -> CycleResult:
+        """One full Stage-1 cycle whose LLM turn emits *emit*, over *active_tasks*."""
+        self.stage.filtered_task_tree = filter_task_tree({'tasks': list(active_tasks)})
+        emissions: list[dict[str, Any]] = []
+
+        async def llm_turn(*_args: Any, **_kwargs: Any) -> StageReport:
+            for emission in emit:
+                emissions.append(await self._propose(run_id, emission))
+            now = datetime.now(UTC)
+            return StageReport(
+                stage=StageId.memory_consolidator, started_at=now, completed_at=now, stats={},
+            )
+
+        with patch.object(BaseStage, 'run', new=llm_turn):
+            report = await self.stage.run(
+                events=[],
+                watermark=Watermark(project_id=self.project_id),
+                prior_reports=[],
+                run_id=run_id,
+            )
+        return CycleResult(report=report, emissions=tuple(emissions))
+
+    async def _propose(self, run_id: str, emission: Emission) -> dict[str, Any]:
+        result = await self.server._tool_manager.call_tool(
+            'propose_consolidation',
+            {
+                'project_id': self.project_id,
+                'run_id': run_id,
+                'topic': emission.topic,
+                'member_ids': list(emission.member_ids),
+                'category': emission.category,
+                'claim': emission.claim,
+                'rationale': RATIONALE,
+                'agent_id': PROPOSER_AGENT_ID,
+            },
+        )
+        return _parse_tool_result(result)
+
+    async def row(self, topic: str, run_id: str) -> ReconLedgerRecord:
+        """The proposal row for (*topic*, *run_id*), which must exist."""
+        row = await self.ledger.get_by_identity(
+            project_id=self.project_id,
+            record_kind=RECORD_KIND_CONSOLIDATION_PROPOSAL,
+            task_id='',
+            flag_type=topic,
+            run_id=run_id,
+        )
+        assert row is not None, f'no proposal row for {topic!r} in {run_id!r}'
+        return row
+
+    def system_records(self, kind: str) -> list[dict[str, Any]]:
+        return [r for r in self.fake.system_records if r['metadata'].get('record_kind') == kind]
+
+    def pending(self, category: str | None = None) -> list[Escalation]:
+        return [
+            esc for esc in self.queue.get_pending() if category is None or esc.category == category
+        ]
+
+    async def cycle_summary_stats(self, run_id: str) -> dict[str, Any]:
+        """The stats Stage 1's cycle-summary ledger row recorded for *run_id*."""
+        rows = await self.ledger.list_by_kind(self.project_id, 'cycle_summary', 'active')
+        row = _only([r for r in rows if r.run_id == run_id], 'cycle summary row')
+        return json.loads(row.payload_json)['stats']
+
+
+def _parse_tool_result(result: Any) -> dict[str, Any]:
+    """A FastMCP ``call_tool`` result (a list of TextContent) as the tool's dict."""
+    if isinstance(result, list):
+        return json.loads(result[0].text)
+    return result
+
+
+def build_world(
+    tmp_path: Path,
+    ledger: ReconLedgerStore,
+    *,
+    project_id: str = PROJECT_ID,
+    config: ConsolidationAutoConfig | None = None,
+) -> World:
+    stage = make_consolidator(project_root=str(tmp_path / 'project'), project_id=project_id)
+    fake = FakeMemoryService(
+        ledger, consolidation_auto=config if config is not None else enabled_config(),
+    )
+    memory = stage.memory
+    for name in _MEM0_SURFACE:
+        setattr(memory, name, getattr(fake, name))
+    memory.recon_ledger = ledger
+    memory.config.consolidation_auto = fake.config.consolidation_auto
+    memory.config.mem0_update = fake.config.mem0_update
+    memory.durable_queue = None
+    queue = EscalationQueue(tmp_path / 'esc')
+    stage._escalation_queue = queue
+    tasks = FakeTaskBackend()
+    assert stage.taskmaster is not None
+    stage.taskmaster.add_task = tasks.add_task
+    return World(
+        stage=stage,
+        fake=fake,
+        ledger=ledger,
+        queue=queue,
+        tasks=tasks,
+        server=create_mcp_server(memory),
+        project_id=project_id,
+        project_root=stage.project_root,
+    )
+
+
+def _only(items: Sequence[Any], what: str = 'item') -> Any:
+    assert len(items) == 1, f'expected exactly one {what}, got {items!r}'
+    return items[0]
+
+
+def outcome(row: ReconLedgerRecord) -> ProposalOutcome:
+    recorded = outcome_from_record(row)
+    assert recorded is not None, f'no outcome was recorded on the {row.state!r} row'
+    return recorded
+
+
+async def _no_executor(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+@pytest_asyncio.fixture
+async def ledger(tmp_path):
+    store = ReconLedgerStore(tmp_path / 'ledger.db')
+    await store.initialize()
+    yield store
+    await store.close()
+
+
+@pytest.fixture
+def world(tmp_path, ledger) -> World:
+    return build_world(tmp_path, ledger)
+
+
+@pytest.fixture(
+    params=[
+        'real',
+        pytest.param(
+            'reverted',
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=AssertionError,
+                reason=(
+                    'INV-10 (PRD eta): every executor-dependent row must be RED when '
+                    'run_auto_consolidation is a no-op'
+                ),
+            ),
+        ),
+    ],
+)
+def executor(request, monkeypatch) -> str:
+    if request.param == 'reverted':
+        monkeypatch.setattr(memory_consolidator_module, 'run_auto_consolidation', _no_executor)
+    return request.param
+
 
 REQUIRES_EXECUTOR = pytest.mark.usefixtures('executor')
+
+
+# ---- rows -------------------------------------------------------------------
 
 
 @REQUIRES_EXECUTOR
@@ -40,8 +290,8 @@ async def test_b1_fresh_cluster_passes(world):
 
     assert _only(result.emissions, 'emission')['ok'] is True
     for member in members:
-        assert world.fake.metadata_of(member)['topic'] == TOPIC
-        assert world.fake.metadata_of(member)['x_auto_consolidated_run'] == 'run-b1'
+        assert world.fake.metadata_of(member).get('topic') == TOPIC
+        assert world.fake.metadata_of(member).get('x_auto_consolidated_run') == 'run-b1'
     canonical = _only(world.fake.canonical_ids(), 'canonical')
     record = world.fake.records[canonical]
     assert record['content'] == build_auto_canonical(VALID_CLAIM, TOPIC, 5, 'run-b1')
