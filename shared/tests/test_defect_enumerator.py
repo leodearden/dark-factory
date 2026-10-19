@@ -261,3 +261,136 @@ def test_non_static_marks_and_gaps_are_ordered_by_line():
         EnumerationGap(GapReason.UNREADABLE_REF, 3),
         EnumerationGap(GapReason.UNREADABLE_REF, 6),
     )
+
+
+def test_a_test_class_decorator_marks_every_test_method():
+    result = _enumerate(f'''
+        @pytest.mark.defect({REF_A!r})
+        class TestA:
+            def test_m(self):
+                pass
+
+            def test_n(self):
+                pass
+
+            def helper(self):
+                pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('TestA::test_m'), _runnable('TestA::test_n'))}
+    assert result.non_static == ()
+
+
+def test_a_method_decorator_marks_only_that_method():
+    result = _enumerate(f'''
+        class TestA:
+            @pytest.mark.defect({REF_B!r})
+            def test_m(self):
+                pass
+
+            def test_n(self):
+                pass
+    ''')
+    assert result.carriers == {REF_B: (_runnable('TestA::test_m'),)}
+
+
+def test_a_nested_test_class_inherits_its_outer_class_marks():
+    result = _enumerate(f'''
+        @pytest.mark.defect({REF_A!r})
+        class TestOuter:
+            class TestInner:
+                def test_m(self):
+                    pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('TestOuter::TestInner::test_m'),)}
+
+
+def test_a_class_body_pytestmark_marks_every_test_method():
+    result = _enumerate(f'''
+        class TestA:
+            pytestmark = pytest.mark.defect({REF_A!r})
+
+            def test_m(self):
+                pass
+
+            def test_n(self):
+                pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('TestA::test_m'), _runnable('TestA::test_n'))}
+
+
+def test_a_module_pytestmark_marks_every_function_and_test_class_method():
+    result = _enumerate(f'''
+        pytestmark = [pytest.mark.defect({REF_A!r})]
+
+        def test_a():
+            pass
+
+        class TestA:
+            def test_m(self):
+                pass
+    ''')
+    assert result.carriers == {REF_A: (_runnable('test_a'), _runnable('TestA::test_m'))}
+
+
+def test_only_the_last_module_pytestmark_binding_carries():
+    result = _enumerate(f'''
+        pytestmark = pytest.mark.defect({REF_A!r})
+        pytestmark = pytest.mark.defect({REF_B!r})
+
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {REF_B: (_runnable('test_a'),)}
+    assert result.non_static == (NonStaticMark(REF_A, 1),)
+
+
+@pytest.mark.parametrize('class_name', ['Helper', 'testLower'])
+def test_a_class_pytest_does_not_collect_carries_nothing(class_name):
+    result = _enumerate(f'''
+        @pytest.mark.defect({REF_A!r})
+        class {class_name}:
+            def test_m(self):
+                pass
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == (NonStaticMark(REF_A, 1),)
+
+
+@pytest.mark.parametrize('constructor', ['__init__', '__new__'])
+def test_a_test_class_with_its_own_constructor_carries_nothing(constructor):
+    result = _enumerate(f'''
+        class TestA:
+            def {constructor}(self):
+                pass
+
+            @pytest.mark.defect({REF_A!r})
+            def test_m(self):
+                pass
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == (NonStaticMark(REF_A, 5),)
+
+
+def test_a_test_function_inside_an_if_carries_nothing():
+    result = _enumerate(f'''
+        if True:
+            @pytest.mark.defect({REF_A!r})
+            def test_a():
+                pass
+    ''')
+    assert result.carriers == {}
+    assert result.non_static == (NonStaticMark(REF_A, 2),)
+
+
+def test_only_the_last_definition_of_a_test_name_carries():
+    result = _enumerate(f'''
+        @pytest.mark.defect({REF_A!r})
+        def test_a():
+            pass
+
+        @pytest.mark.defect({REF_B!r})
+        def test_a():
+            pass
+    ''')
+    assert result.carriers == {REF_B: (_runnable('test_a'),)}
+    assert result.non_static == (NonStaticMark(REF_A, 1),)
