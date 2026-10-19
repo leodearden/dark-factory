@@ -28,9 +28,9 @@ from typing import Any, cast
 import pytest
 from _flake_golden import merge_gate_deflake_description
 from escalation.queue import EscalationQueue
-from test_flake_debt_drain import _FakeLedgerTaskClient
+from test_flake_debt_drain import _FakeLedgerTaskClient, _RecordingQueue
 
-from orchestrator import flake_recorder
+from orchestrator import flake_debt_drain, flake_recorder
 from orchestrator.flake_debt_drain import run_drain_pass
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
@@ -983,3 +983,80 @@ class TestRecordCallSiteObservations:
             ('escalation_queue', keyword),
         ]
         assert inspect.iscoroutinefunction(flake_recorder.record_call_site_observations)
+
+
+_FIX = 'f1' * 20
+_H1 = '1' * 40
+_H2 = '2' * 40
+
+
+@pytest.mark.asyncio
+class TestLaneRegressionFromTheDrain:
+    """Scenario 31's ledger half: a lane test that clears again after its de-flake task
+    landed raises the ledger's regression escalation, worded for the lane, and files a
+    second owner the title fold cannot swallow.  ASYNC-ONLY CLASS."""
+
+    async def _first_cycle(self, tmp_path: Path, client: _FakeLedgerTaskClient) -> None:
+        ctx1 = _lane_context(heads=(_H1,), pass_ids=('p1',))
+        await _observe(
+            tmp_path, (_lane_suppression(observed_at='2026-10-19T12:00:00+00:00'),),
+            head_sha=_H1, debt_eligible={_LANE_A: ctx1},
+        )
+        await run_drain_pass(
+            ledger_db_path(tmp_path), _PROJECT_ID, task_client=client, git=None,
+            escalation_queue=None,
+        )
+        assert client.filed == ['deflake-1']
+        assert client.submit_calls[0]['title'].endswith(', cycle 1')
+        client.finish('deflake-1', commit=_FIX)
+
+    async def _drain(self, tmp_path: Path, client: _FakeLedgerTaskClient) -> _RecordingQueue:
+        queue = _RecordingQueue(tmp_path / 'queue')
+        await run_drain_pass(
+            ledger_db_path(tmp_path), _PROJECT_ID, task_client=client, git=None,
+            escalation_queue=queue,
+        )
+        return queue
+
+    async def test_a_clear_after_the_fix_raises_one_lane_worded_regression(
+        self, tmp_path: Path,
+    ) -> None:
+        client = _FakeLedgerTaskClient(folds_titles=True)
+        await self._first_cycle(tmp_path, client)
+        ctx2 = _lane_context(heads=(_H2,), pass_ids=('p2',))
+        await _observe(
+            tmp_path, (_lane_suppression(observed_at='2026-10-19T13:00:00+00:00'),),
+            head_sha=_H2, debt_eligible={_LANE_A: ctx2},
+        )
+
+        queue = await self._drain(tmp_path, client)
+
+        (esc,) = queue.regressions()
+        assert 'an offline-lane clear has now RE-OPENED it' in esc.detail, esc.detail
+        for text in ('cleared', 'p2', _H2, 'qdrant-integration'):
+            assert text in esc.detail, text
+        assert 'merge-gate suppression' not in esc.detail
+        assert 'observed at merge_sha' not in esc.detail
+        assert (esc.level, esc.severity, esc.agent_role, esc.category) == (
+            2, 'critical', 'orchestrator-flake-ledger', 'regressed_after_resolution',
+        )
+        assert flake_debt_drain.regression_call_site(esc.evidence) == 'offline_lane'
+        assert client.filed == ['deflake-1', 'deflake-2'], 'the title fold swallowed cycle 2'
+        assert client.submit_calls[-1]['title'].endswith(', cycle 2')
+
+    async def test_a_recovery_after_the_fix_raises_a_recovery_worded_regression(
+        self, tmp_path: Path,
+    ) -> None:
+        client = _FakeLedgerTaskClient(folds_titles=True)
+        await self._first_cycle(tmp_path, client)
+        recovered = _lane_context(DebtTrigger.recovered, heads=(_H2,), pass_ids=('p2',))
+        await _observe(
+            tmp_path, (), head_sha=_H2, observed_at='2026-10-19T13:00:00+00:00',
+            debt_eligible={_LANE_A: recovered},
+        )
+
+        queue = await self._drain(tmp_path, client)
+
+        (esc,) = queue.regressions()
+        assert 'an offline-lane recovery has now RE-OPENED it' in esc.detail, esc.detail
+        assert flake_debt_drain.regression_call_site(esc.evidence) == 'offline_lane'

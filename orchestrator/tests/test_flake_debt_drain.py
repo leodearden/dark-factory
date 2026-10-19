@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _flake_golden import merge_gate_regression_detail
 from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask
 
@@ -37,9 +38,14 @@ from orchestrator.flake_debt_drain import (
 )
 from orchestrator.flake_ledger import (
     NEVER_WIDEN_A_TIMEOUT,
+    DebtContext,
+    DebtTrigger,
     DueItem,
     DueRow,
+    FlakeCallSite,
     FlakeLedgerTaskClient,
+    build_deflake_task_arguments,
+    debt_context_to_json,
     enqueue_debt,
     open_debt,
     read_debt,
@@ -278,11 +284,12 @@ def _observed(n: int) -> str:
 
 def _enqueue(
     db: Path, test_id: str, n: int, *, at: datetime, head: str | None = GOOD_HEAD,
+    call_site: str = 'merge_gate', context: str = '{}',
 ) -> None:
     enqueue_debt(
         db,
         PROJECT,
-        [DueItem(test_id, _observed(n), 'merge_gate', head, TASK_ID)],
+        [DueItem(test_id, _observed(n), call_site, head, TASK_ID, context)],
         now=at,
     )
 
@@ -493,6 +500,112 @@ class TestRegressionFromTheDrain:
             assert line in esc.detail, (line, esc.detail)
         assert any(FIX in entry['ref'] for entry in esc.evidence), esc.evidence
         assert _items(db) == []
+
+    async def test_a_merge_gate_re_entry_detail_is_byte_identical(self, tmp_path: Path) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        queue = _RecordingQueue(tmp_path / 'queue')
+        owner = await _owned(db, client, clock, A, 0)
+        client.finish(owner, commit=FIX)
+        _enqueue(db, A, 1, at=clock.now)
+        item = _item(db, A)
+
+        await _pass(db, client, clock, queue=queue)
+
+        row = read_debt(db, A)
+        assert row is not None
+        (esc,) = queue.regressions()
+        assert esc.detail == merge_gate_regression_detail(row, item)
+        assert esc.evidence[0] == {
+            'observation': (
+                f'{A} re-entered flake debt: open_count 2, prior cycle resolved at '
+                f'{row.prior_resolved_at}'
+            ),
+            'measured_at': f'opened_at={row.opened_at}',
+            'ref': f'prior_resolving_commit={FIX}',
+        }
+        assert len(esc.evidence) == 2
+        assert flake_debt_drain.regression_call_site(esc.evidence) == 'merge_gate'
+        assert (esc.category, esc.agent_role, esc.severity, esc.level) == (
+            REGRESSED_AFTER_RESOLUTION, 'orchestrator-flake-ledger', 'critical', 2,
+        )
+        assert esc.task_id == f'flake-regressed-after-resolution:{A}:cycle-2'
+        assert esc.summary == f'Flake regressed after its fix: {A} re-entered flake debt (cycle 2)'
+
+    async def test_an_item_context_reaches_the_filed_task(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        cleared = DebtContext(
+            call_site=FlakeCallSite.offline_lane,
+            trigger=DebtTrigger.cleared,
+            command='qdrant-integration',
+            heads=(GOOD_HEAD,),
+            pass_ids=('p1',),
+        )
+        _enqueue(
+            db, A, 0, at=clock.now, call_site='offline_lane', context=debt_context_to_json(cleared),
+        )
+
+        await _pass(db, client, clock)
+
+        row = read_debt(db, A)
+        assert row is not None
+        (block,) = client.submit_calls
+        assert block == build_deflake_task_arguments(
+            dataclasses.replace(row, owner_task_id=None), cleared,
+        )
+        assert block['title'].endswith(', cycle 1')
+        assert (
+            block['metadata']['flake_debt_call_site'],
+            block['metadata']['flake_debt_trigger'],
+            block['metadata']['flake_debt_command'],
+        ) == ('offline_lane', 'cleared', 'qdrant-integration')
+
+    async def test_an_empty_context_files_the_merge_gate_text(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        _enqueue(db, A, 0, at=clock.now, context='{}')
+
+        await _pass(db, client, clock)
+
+        row = read_debt(db, A)
+        assert row is not None
+        assert client.submit_calls == [
+            build_deflake_task_arguments(dataclasses.replace(row, owner_task_id=None)),
+        ]
+
+    async def test_a_malformed_context_still_gets_an_owner(self, tmp_path: Path, caplog) -> None:
+        """The owner invariant (§5.9) outranks the wording."""
+        import dataclasses
+
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        _enqueue(db, A, 0, at=clock.now, call_site='offline_lane', context='{"call_site": 1}')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            report = await _pass(db, client, clock)
+
+        row = read_debt(db, A)
+        assert row is not None and row.owner_task_id == 'deflake-1'
+        assert client.submit_calls == [
+            build_deflake_task_arguments(dataclasses.replace(row, owner_task_id=None)),
+        ]
+        assert report.settled == 1 and _items(db) == []
+        assert 'debt context' in caplog.text
+
+    async def test_a_call_site_with_no_row_is_worded_neutrally(self, tmp_path: Path) -> None:
+        db, clock, client = _db(tmp_path), _Clock(), _FakeLedgerTaskClient()
+        queue = _RecordingQueue(tmp_path / 'queue')
+        owner = await _owned(db, client, clock, A, 0)
+        client.finish(owner, commit=FIX)
+        _enqueue(db, A, 1, at=clock.now, call_site='main_probe')
+
+        await _pass(db, client, clock, queue=queue)
+
+        (esc,) = queue.regressions()
+        assert 'main_probe' in esc.detail
+        assert 'merge-gate suppression' not in esc.detail
+        assert flake_debt_drain.regression_call_site(esc.evidence) == 'main_probe'
 
     async def test_a_failed_first_filing_and_a_hand_resolve_still_raise_one_escalation(
         self, tmp_path: Path,
