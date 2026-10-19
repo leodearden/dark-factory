@@ -8,6 +8,8 @@ injected as tiny fake scripts, and escalations are filed into a real
 from __future__ import annotations
 
 import functools
+import json
+import shutil
 import textwrap
 import types
 from pathlib import Path
@@ -15,6 +17,8 @@ from pathlib import Path
 import pytest
 import yaml
 from _fm_helpers import load_script_module
+from shared.memory_eval_limits import LimitsConfig, limits_artifact_path, load_limits_artifact
+from shared.memory_eval_metrics import load_metric_series
 
 _FM_ROOT = Path(__file__).parent.parent
 SCRIPT_PATH = _FM_ROOT / 'scripts' / 'memory_eval_runner.py'
@@ -224,3 +228,109 @@ class TestRunProducer:
         assert (failure.scope, failure.phase, failure.error_type) == (
             _E1, 'produce', 'TimeoutExpired',
         )
+
+
+_TRIPWIRE = 'topic-canonical-present'
+_FIRST, _REGRESSION, _QUIET = '20260701T031500Z', '20260704T031500Z', '20260705T031500Z'
+_ALL_STAMPS = (_FIRST, '20260702T031500Z', '20260703T031500Z', _REGRESSION, _QUIET)
+_LIMITS = LimitsConfig(false_alarm_budget=1.0, runs_per_quarter=90, min_samples=10, baseline_window=3)
+
+
+def _seed(root: Path, *stamps: str, eval_id: str = _E1) -> None:
+    (root / eval_id).mkdir(parents=True, exist_ok=True)
+    for stamp in stamps:
+        shutil.copy(_alpha_series(stamp), root / eval_id / f'metrics-{stamp}.json')
+
+
+def _failing(stamp: str) -> list[str]:
+    series = load_metric_series(_alpha_series(stamp))
+    tripwire = next(m for m in series.metrics if m.metric_id == _TRIPWIRE)
+    return sorted(f'{_TRIPWIRE}::{i.item_key}' for i in tripwire.items or [] if not i.passed)
+
+
+def _tripwire_status(run) -> str:
+    return next(v.status for v in run.result.verdicts if v.metric_id == _TRIPWIRE)
+
+
+def _alarm_keys(run) -> set[tuple[str, str | None]]:
+    return {(a.metric_id, a.item_key) for a in run.result.alarms}
+
+
+def _evaluate(root: Path, stamp: str, limits: LimitsConfig = _LIMITS):
+    return _mod().evaluate_eval(root, _E1, stamp, limits)
+
+
+class TestEvaluateEval:
+    def test_the_first_run_is_the_grandfather_snapshot(self, tmp_path):
+        _seed(tmp_path, _FIRST)
+        run = _evaluate(tmp_path, _FIRST)
+        assert _tripwire_status(run) == 'baseline_snapshot'
+        assert run.result.alarms == ()
+        persisted = load_limits_artifact(limits_artifact_path(tmp_path, _E1))
+        assert persisted.grandfather_set == _failing(_FIRST)
+        assert _TRIPWIRE in persisted.snapshotted_metric_ids
+        assert run.limits_path == limits_artifact_path(tmp_path, _E1)
+
+    def test_each_run_resumes_from_the_persisted_state(self, tmp_path):
+        _seed(tmp_path, *_ALL_STAMPS[:4])
+        _evaluate(tmp_path, _FIRST)
+        run = _evaluate(tmp_path, _REGRESSION)
+        tripwire_alarms = {key for metric, key in _alarm_keys(run) if metric == _TRIPWIRE}
+        assert tripwire_alarms == {'t-worktree-lifecycle'}
+        persisted = load_limits_artifact(limits_artifact_path(tmp_path, _E1))
+        assert persisted.grandfather_set == [f'{_TRIPWIRE}::t-recon-watcher-triage']
+
+    def test_deleting_the_limits_artifact_starts_a_fresh_snapshot(self, tmp_path):
+        _seed(tmp_path, *_ALL_STAMPS[:4])
+        _evaluate(tmp_path, _FIRST)
+        limits_artifact_path(tmp_path, _E1).unlink()
+        run = _evaluate(tmp_path, _REGRESSION)
+        assert _tripwire_status(run) == 'baseline_snapshot'
+        assert not [a for a in run.result.alarms if a.metric_id == _TRIPWIRE]
+
+    def test_the_window_is_the_trailing_runs_before_the_current_stamp(self, tmp_path):
+        _seed(tmp_path, *_ALL_STAMPS)
+        narrow = LimitsConfig(
+            false_alarm_budget=1.0, runs_per_quarter=90, min_samples=10, baseline_window=2,
+        )
+        run = _evaluate(tmp_path, _REGRESSION, narrow)
+        assert run.result.baseline_run_stamps == ('20260702T031500Z', '20260703T031500Z')
+
+    def test_evaluating_a_stamp_twice_is_idempotent(self, tmp_path):
+        _seed(tmp_path, *_ALL_STAMPS[:4])
+        _evaluate(tmp_path, _FIRST)
+        first = _evaluate(tmp_path, _REGRESSION)
+        second = _evaluate(tmp_path, _REGRESSION)
+        assert _alarm_keys(first) == _alarm_keys(second)
+        assert first.result.grandfather_hash == second.result.grandfather_hash
+
+    def test_the_run_carries_its_artifact_paths_and_entries(self, tmp_path):
+        _seed(tmp_path, _FIRST)
+        run = _evaluate(tmp_path, _FIRST)
+        assert run.metrics_path == tmp_path / _E1 / f'metrics-{_FIRST}.json'
+        assert run.report_path == tmp_path / _E1 / f'report-{_FIRST}.txt'
+        assert run.series.run_stamp == _FIRST
+        assert run.entries and all(e.run_stamp == _FIRST for e in run.entries)
+
+
+class TestEvaluateEvals:
+    def test_a_hand_edited_grandfather_set_is_an_evaluate_failure(self, tmp_path):
+        _seed(tmp_path, _FIRST, _REGRESSION)
+        _evaluate(tmp_path, _FIRST)
+        limits = limits_artifact_path(tmp_path, _E1)
+        data = json.loads(limits.read_text(encoding='utf-8'))
+        data['grandfather_set'] = data['grandfather_set'][:1]
+        limits.write_text(json.dumps(data), encoding='utf-8')
+
+        runs, failures = _mod().evaluate_evals(tmp_path, [_E1], _REGRESSION, _LIMITS)
+        assert runs == []
+        (failure,) = failures
+        assert (failure.scope, failure.phase, failure.error_type) == (
+            _E1, 'evaluate', 'LimitsSchemaError',
+        )
+
+    def test_healthy_evals_are_evaluated_beside_a_broken_one(self, tmp_path):
+        _seed(tmp_path, _FIRST)
+        runs, failures = _mod().evaluate_evals(tmp_path, ['e-missing', _E1], _FIRST, _LIMITS)
+        assert [run.eval_id for run in runs] == [_E1]
+        assert [(f.scope, f.phase) for f in failures] == [('e-missing', 'evaluate')]
