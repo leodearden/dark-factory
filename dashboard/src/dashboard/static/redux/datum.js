@@ -246,18 +246,24 @@ function datumView(datum, opts) {
 }
 
 // ── How long a plain-wrapped value may sit before its tile badges ──
-// TWELVE SECONDS = FOUR POLL INTERVALS. data.js polls every 3000ms with up to
-// 1500ms of jitter, so a healthy endpoint's receipt is at most ~4.5s old; 12s
-// is ~2.6x headroom, enough that a jittered late poll never makes a working
-// tile twitch.
+// 12s is the BASE: four poll intervals for an UNPACED endpoint, whose receipt
+// is at most ~4.5s old (3000ms tick + 1500ms jitter). A receipt's pacingHoldMs
+// (data.js::refreshOne) adds the slowness-pacing hold the poll loop deliberately
+// leaves between request starts, so a slow-but-healthy endpoint keeps the same
+// 7.5s of headroom and never twitches; only a value overdue past its own cadence
+// badges. An absent or malformed hold reads as the base, failing toward badging.
 //
-// ORDERED FINE-THEN-COARSE AGAINST THE BANNER, deliberately not aligned with
-// it: endpoint_staleness.js declares an endpoint stale after ~21s of backoff,
-// so badging at 12s makes the tile the FIRST per-value signal and the banner
-// the later per-endpoint explanation — one authority each. Matching 21s would
-// read as a duplicate of the banner; the PRD's suggested 6s would badge a
-// healthy tile whenever a jittered poll ran late.
+// ORDERED FINE-THEN-COARSE, not aligned with endpoint_staleness.js's banner
+// (~21s of backoff): tile first per value, banner later per endpoint, one
+// authority each. Matching 21s would read as a duplicate of the banner; the
+// PRD's suggested 6s would badge a healthy tile whenever a jittered poll ran late.
 const PLAIN_DATUM_BOUND_SECONDS = 12;
+
+function plainBoundSecondsFor(receipt) {
+  const holdMs = receipt.pacingHoldMs;
+  const paced = Number.isFinite(holdMs) && holdMs > 0;
+  return paced ? PLAIN_DATUM_BOUND_SECONDS + holdMs / 1000 : PLAIN_DATUM_BOUND_SECONDS;
+}
 
 // ── Provenance for a value the server does not yet serve as a Datum ──
 // Every polled payload is still a bare number: PRD leaf beta has not landed.
@@ -294,6 +300,8 @@ const PLAIN_DATUM_BOUND_SECONDS = 12;
 // `== null` and never `!value`: a measured 0 (or '' or false) IS a measurement.
 // `undefined` is in, because an optional-chained read (`x?.y`) is the commonest
 // way a missing payload field reaches a tile.
+//
+// THE BOUND IS PER RECEIPT: plainBoundSecondsFor, beside the base bound above.
 function plainDatum(value, endpointKey, receipts) {
   const receipt = endpointReceipt(endpointKey, receipts);
   if (!receipt) return unknownDatum('not yet fetched');
@@ -307,7 +315,7 @@ function plainDatum(value, endpointKey, receipts) {
       as_of: receipt.servedAt || new Date(receipt.receivedAt).toISOString(),
       state: 'fresh',
       reason: null,
-      freshness_bound_seconds: PLAIN_DATUM_BOUND_SECONDS,
+      freshness_bound_seconds: plainBoundSecondsFor(receipt),
     },
     receipt,
   );
