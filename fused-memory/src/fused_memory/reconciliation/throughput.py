@@ -8,7 +8,9 @@ Answers three operator questions about a project's reconciliation pipeline:
   (backlog chunk, steady state, remediation, targeted) and what that costs
   per event;
 * **capacity** — the sustainable events/day that falls out of those two, and
-  whether it clears the observed burst inflow.
+  whether it clears the observed burst inflow;
+* **concentration** — which task ids the live inflow comes from, each buffered
+  row weighed by the events push folded into it (task 4278).
 
 Everything here is read-only over the reconciliation SQLite DB plus pure
 arithmetic, so the report can be run out-of-process against a live production
@@ -49,6 +51,12 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from fused_memory.reconciliation.coalescing import (
+    COALESCED_LAST_TIMESTAMP_KEY,
+    coalesced_count,
+    task_id_key,
+)
 
 __all__ = [
     'FITTED_CYCLE_FIXED_SECONDS',
@@ -321,23 +329,41 @@ def _ranked_counts(counts: Counter[str]) -> dict[str, int]:
     return {key: counts[key] for key in sorted(counts, key=lambda k: (-counts[k], k))}
 
 
-def _payload_task_id(payload: str) -> str | None:
-    """The task id a stored payload names, as a string; None when it names none.
+class _Attribution(NamedTuple):
+    """What a stored payload says about the events its row stands for."""
 
-    A payload that is not JSON names no task: attribution is advisory, so one
-    bad row is counted as unattributed rather than taking the report down.
-    Writers emit int or str ids, so only those are attributed: ``str()`` of a
-    float or a bool would mint a key ('7.0', 'True') that never merges with
-    the task's real id.
+    task_id: str | None  # None when it names no task
+    weight: int  # pushed events folded into the row, at least 1
+    last_instant: datetime | None  # the newest folded event's instant, if any
+
+
+def _payload_attribution(payload: str) -> _Attribution:
+    """Parse a stored payload once into its task id, fold weight and newest instant.
+
+    Attribution is advisory, so a payload that is not JSON, or carries a
+    malformed fold count or timestamp, degrades to an unattributed weight-1
+    row instead of taking the report down.
     """
     try:
         decoded = json.loads(payload)
     except json.JSONDecodeError:
+        decoded = None
+    if not isinstance(decoded, dict):
+        return _Attribution(task_id=None, weight=1, last_instant=None)
+    return _Attribution(
+        task_id=task_id_key(decoded.get('task_id')),
+        weight=coalesced_count(decoded),
+        last_instant=_optional_instant(decoded.get(COALESCED_LAST_TIMESTAMP_KEY)),
+    )
+
+
+def _optional_instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
         return None
-    task_id = decoded.get('task_id') if isinstance(decoded, dict) else None
-    if isinstance(task_id, bool) or not isinstance(task_id, int | str):
+    try:
+        return _parse_utc(value)
+    except ValueError:
         return None
-    return str(task_id)
 
 
 class _LiveRow(NamedTuple):
@@ -389,6 +415,10 @@ def inflow_concentration(
 ) -> dict[str, Any]:
     """Which task ids a project's live inflow comes from, largest first.
 
+    Counts EVENTS, not rows: a row ``push`` folded repeat task events into
+    (task 4278) weighs its fold count, and widens the window to its newest
+    folded event, so a looping task reads as large as it is.
+
     Covers LIVE ``event_buffer`` rows only, because only they carry a payload:
     ``cleanup_drained`` rolls a swept row up to (project, hour, event_type) and
     its task id is gone.  That loses nothing that matters — while a backlog
@@ -402,11 +432,13 @@ def inflow_concentration(
         top_n: How many tasks to report.
 
     Returns:
-        ``{'window_start', 'window_end', 'live_events', 'unattributed_events',
-        'top_tasks': [{'task_id', 'events', 'share', 'composition'}]}``.  The
-        window bounds are the earliest and latest UTC instants counted (None
-        with no rows).  ``share`` is against ALL live rows, task-less ones
-        included, so it reads directly as a fraction of inflow.  Ties order by
+        ``{'window_start', 'window_end', 'live_events', 'live_rows',
+        'unattributed_events', 'top_tasks': [{'task_id', 'events', 'share',
+        'composition'}]}``.  The window bounds are the earliest and latest UTC
+        instants counted (None with no rows).  ``live_rows`` is the row count
+        the ``live_events`` events sit in.  ``share`` is against ALL live
+        events, task-less ones included, so it reads directly as a fraction of
+        inflow.  Ties order by
         task id, so the truncation is deterministic.
 
     Raises:
@@ -414,19 +446,24 @@ def inflow_concentration(
     """
     window: tuple[datetime, datetime] | None = None
     live_events = 0
+    live_rows = 0
     unattributed = 0
     per_task: dict[str, Counter[str]] = {}
 
     conn = _connect_ro(db_path)
     try:
         for live in _live_rows(conn, project_id, _normalise_since(since)):
+            attribution = _payload_attribution(live.payload)
             window = _widen(window, live.instant)
-            live_events += 1
-            task_id = _payload_task_id(live.payload)
-            if task_id is None:
-                unattributed += 1
+            if attribution.last_instant is not None:
+                window = _widen(window, attribution.last_instant)
+            live_rows += 1
+            live_events += attribution.weight
+            if attribution.task_id is None:
+                unattributed += attribution.weight
                 continue
-            per_task.setdefault(task_id, Counter())[live.event_type] += 1
+            per_task.setdefault(attribution.task_id, Counter())[
+                live.event_type] += attribution.weight
     finally:
         conn.close()
 
@@ -435,6 +472,7 @@ def inflow_concentration(
         'window_start': window[0].isoformat() if window else None,
         'window_end': window[1].isoformat() if window else None,
         'live_events': live_events,
+        'live_rows': live_rows,
         'unattributed_events': unattributed,
         'top_tasks': [
             {
@@ -1071,10 +1109,11 @@ def _format_report(report: dict[str, Any]) -> str:
 
 def _format_concentration(section: dict[str, Any]) -> list[str]:
     """The readable per-task lines, headed by the live-row window they cover."""
-    if section['live_events'] == 0:
+    if section['live_rows'] == 0:
         return ['by task: no live event_buffer rows to attribute']
     lines = [
-        f'by task: {section["live_events"]} live event_buffer row(s), '
+        f'by task: {section["live_events"]} event(s) on '
+        f'{section["live_rows"]} live event_buffer row(s), '
         f'{section["window_start"]} .. {section["window_end"]}',
     ]
     for entry in section['top_tasks']:
