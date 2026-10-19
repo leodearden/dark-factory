@@ -10,6 +10,7 @@ WARNING naming the project whenever that fallback is used.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import pytest

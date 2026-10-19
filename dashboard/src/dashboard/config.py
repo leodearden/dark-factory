@@ -6,6 +6,7 @@ import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Final
 
@@ -227,9 +228,12 @@ class DashboardConfig:
         """Every configured project root, ``project_root`` first, each named once."""
         return tuple(dict.fromkeys((self.project_root, *self.known_project_roots)))
 
-    @property
+    @cached_property
     def project_labels(self) -> ProjectLabels:
-        """Each root in :attr:`all_project_roots` by its label, unique across that roster."""
+        """Each root in :attr:`all_project_roots` by its label, unique across that roster.
+
+        Built once per config; a ``dataclasses.replace`` copy is labelled afresh.
+        """
         return ProjectLabels.of_roots(self.all_project_roots)
 
     def _runtime_data_dir(self, env_var: str, subdir: str) -> Path:
