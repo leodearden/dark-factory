@@ -44,6 +44,7 @@ from _auto_consolidation_fakes import (
     new_id,
     propose,
 )
+from _fastmcp_tool_result import tool_result_dict
 from _fused_memory_tool_surface import (
     FUSED_MEMORY_TOOL_PREFIX,
     REVIEWED_FUSED_MEMORY_STAGE_SAFE,
@@ -202,7 +203,7 @@ class World:
                 'agent_id': PROPOSER_AGENT_ID,
             },
         )
-        return _parse_tool_result(result)
+        return tool_result_dict(result)
 
     async def row(self, topic: str, run_id: str) -> ReconLedgerRecord:
         """The proposal row for (*topic*, *run_id*), which must exist."""
@@ -283,13 +284,6 @@ class World:
             'title': gate.title,
             'metadata': gate.metadata,
         }
-
-
-def _parse_tool_result(result: Any) -> dict[str, Any]:
-    """A FastMCP ``call_tool`` result (a list of TextContent) as the tool's dict."""
-    if isinstance(result, list):
-        return json.loads(result[0].text)
-    return result
 
 
 def build_world(
@@ -579,7 +573,7 @@ async def test_b10_reversal_round_trips_both_runs(world):
     for member in [*members, *fresh]:
         assert 'topic' not in world.fake.metadata_of(member)
     assert await world.stage.memory.get_memories_by_metadata(
-        project_id=PROJECT_ID, filters={'topic': TOPIC},
+        project_id=world.project_id, filters={'topic': TOPIC},
     ) == []
     assert world.fake.canonical_ids() == []
     assert (await world.row(TOPIC, 'run-b10-1')).state == 'reverted'
@@ -684,7 +678,7 @@ async def test_b6_a_label_claim_is_refused_at_emit(world):
     assert result['error_type'] == 'ValidationError'
     assert result['hint']
     assert await world.ledger.list_by_kind(
-        PROJECT_ID, RECORD_KIND_CONSOLIDATION_PROPOSAL, 'proposed',
+        world.project_id, RECORD_KIND_CONSOLIDATION_PROPOSAL, 'proposed',
     ) == []
     assert cycle.report.stats['auto_consolidation_proposals_listed'] == 0
     assert world.corpus_snapshot() == corpus
@@ -705,7 +699,7 @@ async def test_b7_an_aged_oversized_row_is_refused_in_stage_and_the_streak_escal
     assert record.level == 1
     assert record.severity == 'info'
     assert record.summary == f'{TOPIC}: member_count_out_of_range'
-    assert record.project_id == PROJECT_ID
+    assert record.project_id == world.project_id
     row = await world.row(TOPIC, 'run-b7-p0')
     assert row.state == 'refused'
     assert outcome(row).reason_codes == ('member_count_out_of_range',)
