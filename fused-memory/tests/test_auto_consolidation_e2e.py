@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -67,6 +67,8 @@ from fused_memory.reconciliation.task_filter import filter_task_tree
 from fused_memory.server.tools import create_mcp_server
 
 TOPIC = 'e2e-topic-alpha'
+#: A second topic whose token-Jaccard against TOPIC stays under slug_collision_jaccard.
+HAZARD_TOPIC = 'e2e-corrected-incumbent'
 RATIONALE = 'These records state the same rule in different words.'
 #: The curator sitting, one of the reversal's two callers (PRD C4).
 REVERT_AGENT = 'curator-auto-consolidation-revert'
@@ -103,12 +105,24 @@ class CycleResult:
     emissions: tuple[dict[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class FiledGate:
+    """One task the raw backend accepted, as it received it."""
+
+    task_id: str
+    project_root: str
+    title: str
+    description: str
+    metadata: dict[str, Any]
+
+
 @dataclass
 class World:
     """One Stage-1 instance over the fake corpus, the real ledger and the real queue.
 
     ``fake`` is for seeding and inspection; the stage, the tool and a revert all
-    reach the corpus through ``stage.memory``.
+    reach the corpus through ``stage.memory``. ``accepted_tasks`` pairs each
+    accepted ``add_task`` call's kwargs with the id the backend returned.
     """
 
     stage: MemoryConsolidator
@@ -119,6 +133,7 @@ class World:
     server: FastMCP
     project_id: str
     project_root: str
+    accepted_tasks: list[tuple[dict[str, Any], str]]
 
     async def cycle(
         self,
@@ -210,6 +225,28 @@ class World:
             if record['metadata'].get('kind') != 'cycle_summary'
         }
 
+    def filed_gates(self) -> list[FiledGate]:
+        """Every task the raw backend accepted, metadata parsed from the JSON it received."""
+        return [
+            FiledGate(
+                task_id=task_id,
+                project_root=kwargs['project_root'],
+                title=kwargs['title'],
+                description=kwargs['description'],
+                metadata=json.loads(kwargs['metadata']),
+            )
+            for kwargs, task_id in self.accepted_tasks
+        ]
+
+    def as_open_gate(self, gate: FiledGate) -> dict[str, Any]:
+        """*gate* as the task tree carries a filed human gate awaiting its curator."""
+        return {
+            'id': int(gate.task_id),
+            'status': 'blocked',
+            'title': gate.title,
+            'metadata': gate.metadata,
+        }
+
 
 def _parse_tool_result(result: Any) -> dict[str, Any]:
     """A FastMCP ``call_tool`` result (a list of TextContent) as the tool's dict."""
@@ -239,8 +276,15 @@ def build_world(
     queue = EscalationQueue(tmp_path / 'esc')
     stage._escalation_queue = queue
     tasks = FakeTaskBackend()
+    accepted: list[tuple[dict[str, Any], str]] = []
+
+    async def add_task(**kwargs: Any) -> dict[str, str]:
+        added = await tasks.add_task(**kwargs)
+        accepted.append((kwargs, added['id']))
+        return added
+
     assert stage.taskmaster is not None
-    stage.taskmaster.add_task = tasks.add_task
+    stage.taskmaster.add_task = AsyncMock(side_effect=add_task)
     return World(
         stage=stage,
         fake=fake,
@@ -250,6 +294,7 @@ def build_world(
         server=create_mcp_server(memory),
         project_id=project_id,
         project_root=stage.project_root,
+        accepted_tasks=accepted,
     )
 
 
