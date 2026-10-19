@@ -9,6 +9,7 @@ import os
 import uuid as uuid_mod
 from collections.abc import Awaitable, Mapping
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args
 
@@ -456,16 +457,32 @@ _CREATE_FALLTHROUGH_LABELS: dict[str, str] = {
 }
 
 
-_CURATOR_DISABLED = 'disabled'
+class CuratorUnavailableCause(StrEnum):
+    DISABLED = 'disabled'
+    CLOSED = 'closed'
+    CONSTRUCTION_FAILED = 'construction-failed'
+    UNKNOWN = 'unknown'
+
+
+@dataclasses.dataclass(frozen=True)
+class CuratorUnavailable:
+    cause: CuratorUnavailableCause
+    detail: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.detail is None:
+            return str(self.cause)
+        return f'{self.cause}: {self.detail}'
 
 
 def _create_labels(
-    decision: CuratorDecision | None, *, curator_unavailable: str | None,
+    decision: CuratorDecision | None, *, curator_unavailable: CuratorUnavailable | None,
 ) -> list[str]:
     if decision is None:
         if curator_unavailable is None:
             return ['no-curator-decision']
-        return ['curator-unavailable', curator_unavailable]
+        return ['curator-unavailable', curator_unavailable.label]
     labels = []
     if decision.action in _CREATE_FALLTHROUGH_LABELS:
         labels.append(_CREATE_FALLTHROUGH_LABELS[decision.action])
@@ -475,7 +492,7 @@ def _create_labels(
 
 
 def _create_reason(
-    decision: CuratorDecision | None, *, curator_unavailable: str | None = None,
+    decision: CuratorDecision | None, *, curator_unavailable: CuratorUnavailable | None = None,
 ) -> str:
     """The ``tickets.reason`` a ``created`` ticket persists: why it was created.
 
@@ -486,7 +503,7 @@ def _create_reason(
 
 
 def _dedupe_skipped_reason(
-    decision: CuratorDecision | None, *, curator_unavailable: str | None,
+    decision: CuratorDecision | None, *, curator_unavailable: CuratorUnavailable | None,
 ) -> str | None:
     """The ``dedupe_skipped`` marker reason for a create no curator verdict judged, else None.
 
@@ -495,7 +512,7 @@ def _dedupe_skipped_reason(
     and a combine or drop that fell through to create. Not marked: a healthy
     create, ``route_deterministic``, or a curator disabled by config.
     """
-    if curator_unavailable == _CURATOR_DISABLED:
+    if curator_unavailable is not None and curator_unavailable.cause is CuratorUnavailableCause.DISABLED:
         return None
     if decision is None or decision.degraded or decision.action in ('combine', 'drop'):
         return ': '.join(_create_labels(decision, curator_unavailable=curator_unavailable))
@@ -2221,15 +2238,21 @@ class TaskInterceptor:
             self._curator_construction_error = exception_summary(exc)
             return None
 
-    def _curator_unavailable_reason(self) -> str:
-        """Why ``_get_curator()`` has no curator to hand out right now."""
-        if self._closed:
-            return 'closed'
+    def _curator_unavailable(self) -> CuratorUnavailable:
+        """Why ``_get_curator()`` has no curator to hand out right now.
+
+        Disabled-by-config outranks closed: a curator that config switched off
+        never judged anything, whether or not the interceptor is closing.
+        """
         if self._config is None or not self._config.curator.enabled:
-            return _CURATOR_DISABLED
+            return CuratorUnavailable(CuratorUnavailableCause.DISABLED)
+        if self._closed:
+            return CuratorUnavailable(CuratorUnavailableCause.CLOSED)
         if self._curator_construction_error is not None:
-            return f'construction-failed: {self._curator_construction_error}'
-        return 'unknown'
+            return CuratorUnavailable(
+                CuratorUnavailableCause.CONSTRUCTION_FAILED, self._curator_construction_error,
+            )
+        return CuratorUnavailable(CuratorUnavailableCause.UNKNOWN)
 
     async def _maybe_backfill_corpus(self, curator: TaskCurator, project_root: str) -> None:
         """Trigger a one-shot background backfill if the collection is empty.
@@ -4869,7 +4892,7 @@ class TaskInterceptor:
         reason: str | None = None
         result_dict: dict | None = None
 
-        curator_unavailable = self._curator_unavailable_reason() if curator is None else None
+        curator_unavailable = self._curator_unavailable() if curator is None else None
         skipped_reason = _dedupe_skipped_reason(decision, curator_unavailable=curator_unavailable)
         if skipped_reason is not None:
             metadata = {
