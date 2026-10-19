@@ -55,9 +55,10 @@ from orchestrator.offline_lane_episode_state import (
     apply_outage,
     recheck_due,
     unconfirmable_node,
+    with_recorded_history,
 )
 from orchestrator.offline_lane_filing import EvidenceNote
-from orchestrator.offline_lane_records import ProbeKind, ProbeResult
+from orchestrator.offline_lane_records import PassRecord, ProbeKind, ProbeResult
 
 OUTAGE_PROBE = ProbeResult(ProbeKind.OUTAGE, OUTAGE_EXIT_STATUS, 'qdrant: get collections: ConnectError',
                            'qdrant: get collections: ConnectError', 1.5)
@@ -570,3 +571,49 @@ def test_no_recheck_falls_due_while_the_command_is_in_an_outage():
 
     assert recheck_due(record, HEAD1, POLICY, now) is not None
     assert recheck_due(replace(record, last_probe_result=OUTAGE_PROBE), HEAD1, POLICY, now) is None
+
+
+# --- R14: a cold command record takes its history from the run records --------------
+
+
+def _recorded(index: int, head: str, *, detect_returncode: int | None) -> PassRecord:
+    at = T0 + index * SPACED
+    detect = None if detect_returncode is None else _run('detect', head, at, returncode=detect_returncode)
+    return PassRecord(
+        command=COMMAND, leg='generic', head=head, pass_id=f'p{index}', started_at=at,
+        detect=detect, confirm=None, outcome=None, effect=None,
+    )
+
+
+def test_a_record_that_has_observed_a_pass_is_not_seeded_from_run_records():
+    record = _record(last_pass_id='p-observed')
+
+    assert with_recorded_history(record, [_recorded(0, HEAD0, detect_returncode=0)]) == record
+
+
+def test_no_run_records_leave_a_cold_record_unchanged():
+    record = _record()
+
+    assert with_recorded_history(record, ()) == record
+
+
+def test_a_cold_record_takes_the_newest_pass_and_the_head_of_the_newest_green_one():
+    record = _record()
+    recorded = [
+        _recorded(0, HEAD0, detect_returncode=0),
+        _recorded(1, HEAD1, detect_returncode=0),
+        _recorded(2, HEAD2, detect_returncode=1),
+    ]
+
+    assert with_recorded_history(record, recorded) == replace(record, last_pass_id='p2', last_green_head=HEAD1)
+
+
+def test_a_run_record_with_no_detect_or_a_failing_detect_is_never_green():
+    record = _record()
+    recorded = [
+        _recorded(0, HEAD0, detect_returncode=None),
+        _recorded(1, HEAD1, detect_returncode=2),
+        _recorded(2, HEAD2, detect_returncode=1),
+    ]
+
+    assert with_recorded_history(record, recorded) == replace(record, last_pass_id='p2', last_green_head=None)

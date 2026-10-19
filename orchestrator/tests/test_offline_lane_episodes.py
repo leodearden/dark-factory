@@ -165,6 +165,13 @@ class Lane:
         self.clock.advance(minutes=minutes)
         return await self.red(nodes or (A,), **fields)
 
+    def unobserved(
+        self, head: str, *, failing: tuple[str, ...] = (), outcomes: dict[str, str] | None = None,
+    ) -> None:
+        """A pass as a pre-cutover worker ran it: its run records are written and the engine is never told."""
+        lane_pass = self.records.allocate_pass(COMMAND, 'generic', head)
+        self.records.write_run(lane_pass, _run('detect', head, self.clock(), failing=failing, outcomes=outcomes))
+
     async def tick(self, *, head: str = HEAD1) -> TickResult:
         return await self.engine.tick(head=head)
 
@@ -1137,3 +1144,46 @@ async def test_r13_an_adopted_task_still_red_a_day_on_raises_one_unlanded_record
     (record,) = lane.pending(UNLANDED_RED_CATEGORY)
     assert '850' in record.summary
     assert lane.client.submitted == []
+
+
+# --- R14: a cold command record takes its last pass and green head from the run records
+
+
+@pytest.mark.asyncio
+async def test_r14_a_cold_record_takes_its_last_green_head_from_the_run_records_before_the_pass(tmp_path):
+    lane = Lane(tmp_path)
+    lane.unobserved(HEAD0)
+    lane.clock.advance(minutes=30)
+    lane.unobserved(HEAD1, failing=(A,))
+    lane.clock.advance(minutes=30)
+
+    await lane.red(head=HEAD2)
+    started, stored = lane.episode(A), lane.stored()
+    await lane.spaced_red(head=HEAD2)
+
+    assert (started.last_green_head, stored.last_green_head) == (HEAD0, HEAD0)
+    assert lane.lane_metadata()['last_green_head'] == HEAD0
+    description = lane.client.submitted[0]['description']
+    assert f'Suspect range (last all-green head..first red head): {HEAD0}..{HEAD2}' in description
+
+
+@pytest.mark.asyncio
+async def test_r14_the_seeded_last_pass_answers_r1_for_a_test_it_passed(tmp_path):
+    lane = Lane(tmp_path)
+    lane.unobserved(HEAD0)
+    lane.clock.advance(minutes=30)
+    lane.unobserved(HEAD1, failing=(B,), outcomes={A: 'passed', B: 'failed'})
+    lane.clock.advance(minutes=30)
+
+    await lane.red((A, B), head=HEAD2)
+
+    assert (lane.episode(A).last_green_head, lane.episode(B).last_green_head) == (HEAD1, HEAD0)
+
+
+@pytest.mark.asyncio
+async def test_r14_with_no_run_records_before_the_pass_the_green_head_stays_unknown(tmp_path):
+    lane = Lane(tmp_path)
+
+    await lane.red(head=HEAD2)
+
+    assert (lane.episode(A).last_green_head, lane.stored().last_green_head) == (None, None)
