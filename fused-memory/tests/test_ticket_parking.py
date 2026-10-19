@@ -10,6 +10,7 @@ import asyncio
 import json
 from collections import deque
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -17,10 +18,12 @@ import pytest_asyncio
 from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import PoolFrozen
 
-from fused_memory.middleware.curation_deferral import DeferReason
+from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.middleware.curation_deferral import DEDUPE_SKIPPED_KEY, DeferReason
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
+    CuratorFailureError,
     PreparedCandidate,
     RewrittenTask,
     TaskCurator,
@@ -506,3 +509,149 @@ class TestRequeue:
 
         assert (requeued, alive_on_return) == (True, True)
         assert (await _resolve(restarted, ticket_id))['status'] == 'combined'
+
+
+def _marker_of(metadata: Any) -> dict[str, str] | None:
+    marker = metadata.get(DEDUPE_SKIPPED_KEY) if isinstance(metadata, dict) else None
+    if marker is None:
+        return None
+    stamped_at = datetime.fromisoformat(marker['at'])
+    assert stamped_at.utcoffset() == timedelta(0), marker
+    return marker
+
+
+async def _created_metadata(interceptor: TaskInterceptor, taskmaster: _RecordingTaskmaster, *titles: str) -> list[Any]:
+    ticket_ids = [await _submit(interceptor, title, metadata=_CALLER_METADATA) for title in titles]
+    for ticket_id in ticket_ids:
+        await _resolve(interceptor, ticket_id)
+    return taskmaster.added_metadata()
+
+
+def _held_batch(script: Mapping[str, Sequence[Verdict]], first: str) -> tuple[_ScriptedCurator, asyncio.Event]:
+    curator = _ScriptedCurator(script)
+    curator.hold_prepare[first] = release = asyncio.Event()
+    return curator, release
+
+
+async def _batch_created_metadata(
+    interceptor: TaskInterceptor, taskmaster: _RecordingTaskmaster, release: asyncio.Event, *titles: str,
+) -> list[Any]:
+    ticket_ids = [await _submit(interceptor, title, metadata=_CALLER_METADATA) for title in titles]
+    release.set()
+    for ticket_id in ticket_ids:
+        await _resolve(interceptor, ticket_id)
+    return taskmaster.added_metadata()
+
+
+class TestDedupeSkippedMarker:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('script', 'batch_error', 'reason'),
+        [
+            (
+                [CuratorDecision(action='create', degraded=True, justification='llm-failed: boom')],
+                None, 'llm-failed: boom',
+            ),
+            (
+                [CuratorFailureError('llm down')],
+                CuratorFailureError('batch down'), 'curator-failed: CuratorFailureError: llm down',
+            ),
+            ([], RuntimeError('curator exploded'), 'no-curator-decision'),
+            (
+                [CuratorDecision(action='drop', batch_target_index=5, justification='dup')],
+                None, 'batch-target-out-of-range: local=5',
+            ),
+            (
+                [CuratorDecision(action='combine', target_id='404', justification='overlaps 404')],
+                None, 'combine-failed: overlaps 404',
+            ),
+            (
+                [CuratorDecision(action='drop', justification='dup of nothing')],
+                None, 'drop-failed: dup of nothing',
+            ),
+        ],
+        ids=[
+            'curator-degraded-create', 'curator-failed', 'no-curator-decision',
+            'batch-target-out-of-range', 'combine-fell-through', 'drop-fell-through',
+        ],
+    )
+    async def test_a_create_no_verdict_judged_is_marked(
+        self, make_interceptor, taskmaster, script, batch_error, reason,
+    ):
+        curator = _ScriptedCurator({'Work': script})
+        if batch_error is not None:
+            curator.batch_raises.append(batch_error)
+
+        [metadata] = await _created_metadata(make_interceptor(curator), taskmaster, 'Work')
+
+        assert _marker_of(metadata) == {'reason': reason, 'at': metadata[DEDUPE_SKIPPED_KEY]['at']}
+
+    @pytest.mark.asyncio
+    async def test_a_drop_onto_a_sibling_that_created_nothing_is_marked(self, make_interceptor, taskmaster):
+        curator, release = _held_batch({
+            'Refused sibling': [CuratorDecision(action='refuse', justification='premise cancelled')],
+            'Its duplicate': [CuratorDecision(action='drop', batch_target_index=0, justification='dup')],
+        }, first='Refused sibling')
+
+        [metadata] = await _batch_created_metadata(
+            make_interceptor(curator), taskmaster, release, 'Refused sibling', 'Its duplicate',
+        )
+
+        assert _marker_of(metadata) == {
+            'reason': 'batch-sibling-failed: degraded to create', 'at': metadata[DEDUPE_SKIPPED_KEY]['at'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_batch_cycle_coerced_to_create_is_marked(self, make_interceptor, taskmaster):
+        curator, release = _held_batch({
+            'Left': [CuratorDecision(action='drop', batch_target_index=1, justification='dup')],
+            'Right': [CuratorDecision(action='drop', batch_target_index=0, justification='dup')],
+        }, first='Left')
+
+        created = await _batch_created_metadata(make_interceptor(curator), taskmaster, release, 'Left', 'Right')
+
+        assert [(_marker_of(m) or {}).get('reason') for m in created] == [
+            'batch-cycle: coerced to create', 'batch-cycle: coerced to create',
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'decision',
+        [
+            CuratorDecision(action='create', justification='nothing like it'),
+            CuratorDecision(action='route_deterministic', justification='operational-ask-registry: x'),
+        ],
+        ids=['healthy-create', 'route-deterministic'],
+    )
+    async def test_a_create_a_verdict_judged_is_not_marked(self, make_interceptor, taskmaster, decision):
+        [metadata] = await _created_metadata(
+            make_interceptor(_ScriptedCurator({'Work': [decision]})), taskmaster, 'Work',
+        )
+
+        assert _marker_of(metadata) is None
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_curator_create_is_not_marked(self, make_interceptor, store, taskmaster):
+        config = FusedMemoryConfig()
+        config.taskmaster = None
+        config.curator.enabled = False
+        interceptor = make_interceptor(None, config=config)
+
+        ticket_id = await _submit(interceptor, 'Work', metadata=_CALLER_METADATA)
+        answer = await _resolve(interceptor, ticket_id)
+
+        assert answer['reason'] == 'create: curator-unavailable: disabled'
+        assert taskmaster.added_metadata() == [_CALLER_METADATA]
+
+    @pytest.mark.asyncio
+    async def test_marker_merges_into_caller_metadata(self, make_interceptor, taskmaster):
+        curator = _ScriptedCurator({'Work': [
+            CuratorDecision(action='create', degraded=True, justification='llm-failed: boom'),
+        ]})
+
+        [metadata] = await _created_metadata(make_interceptor(curator), taskmaster, 'Work')
+
+        assert metadata == {
+            **_CALLER_METADATA,
+            DEDUPE_SKIPPED_KEY: {'reason': 'llm-failed: boom', 'at': metadata[DEDUPE_SKIPPED_KEY]['at']},
+        }

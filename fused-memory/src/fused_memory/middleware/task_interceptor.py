@@ -52,6 +52,7 @@ from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     DeferralPolicy,
+    dedupe_skipped_marker,
     pool_defer_reason,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
@@ -455,6 +456,7 @@ def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
     return CuratorDecision(
         action='create',
         justification=f'curator-failed: {exception_summary(exc)}',
+        degraded=True,
         degraded_by_zot=exc.zero_output_timeout,
     )
 
@@ -469,6 +471,21 @@ _CREATE_FALLTHROUGH_LABELS: dict[str, str] = {
 }
 
 
+def _create_labels(
+    decision: CuratorDecision | None, *, curator_unavailable: str | None,
+) -> list[str]:
+    if decision is None:
+        if curator_unavailable is None:
+            return ['no-curator-decision']
+        return ['curator-unavailable', curator_unavailable]
+    labels = []
+    if decision.action in _CREATE_FALLTHROUGH_LABELS:
+        labels.append(_CREATE_FALLTHROUGH_LABELS[decision.action])
+    if decision.justification:
+        labels.append(decision.justification)
+    return labels
+
+
 def _create_reason(
     decision: CuratorDecision | None, *, curator_unavailable: str | None = None,
 ) -> str:
@@ -477,16 +494,23 @@ def _create_reason(
     *curator_unavailable* is given only when no curator existed to decide; a
     curator that existed but produced no decision is ``no-curator-decision``.
     """
-    if decision is None:
-        if curator_unavailable is None:
-            return 'create: no-curator-decision'
-        return f'create: curator-unavailable: {curator_unavailable}'
-    parts = ['create']
-    if decision.action in _CREATE_FALLTHROUGH_LABELS:
-        parts.append(_CREATE_FALLTHROUGH_LABELS[decision.action])
-    if decision.justification:
-        parts.append(decision.justification)
-    return ': '.join(parts)
+    return ': '.join(['create', *_create_labels(decision, curator_unavailable=curator_unavailable)])
+
+
+def _dedupe_skipped_reason(
+    decision: CuratorDecision | None, *, curator_unavailable: str | None,
+) -> str | None:
+    """The ``dedupe_skipped`` marker reason for a create no curator verdict judged, else None.
+
+    Marked: a fail-open create (``degraded``), a curator that produced no
+    decision, and a combine or drop that fell through to create. Not marked: a
+    healthy create, ``route_deterministic``, or no curator at all.
+    """
+    if curator_unavailable is not None:
+        return None
+    if decision is None or decision.degraded or decision.action in ('combine', 'drop'):
+        return ': '.join(_create_labels(decision, curator_unavailable=None))
+    return None
 
 
 class TaskInterceptor:
@@ -4741,6 +4765,14 @@ class TaskInterceptor:
         reason: str | None = None
         result_dict: dict | None = None
 
+        curator_unavailable = self._curator_unavailable_reason() if curator is None else None
+        skipped_reason = _dedupe_skipped_reason(decision, curator_unavailable=curator_unavailable)
+        if skipped_reason is not None:
+            metadata = {
+                **self._fresh_metadata_copy(metadata, 'dedupe-skipped-marker'),
+                **dedupe_skipped_marker(skipped_reason, at=datetime.now(UTC)),
+            }
+
         tm = await self._ensure_taskmaster()
         metadata_json: str | None = None
         if metadata:
@@ -4799,12 +4831,7 @@ class TaskInterceptor:
             # strand the task and cause duplicate-on-retry.
             task_id = task_id_str
             status = 'created'
-            reason = _create_reason(
-                decision,
-                curator_unavailable=(
-                    self._curator_unavailable_reason() if curator is None else None
-                ),
-            )
+            reason = _create_reason(decision, curator_unavailable=curator_unavailable)
             result_dict = dict(result)
             if curator_degrade_reason is not None:
                 result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
@@ -5463,6 +5490,7 @@ class TaskInterceptor:
                                 rec.decision = CuratorDecision(
                                     action='create',
                                     justification=(f'batch-target-out-of-range: local={local_bti}'),
+                                    degraded=True,
                                 )
                                 rec.target = None
                         else:
@@ -5605,6 +5633,7 @@ class TaskInterceptor:
                             effective_decision = CuratorDecision(
                                 action='create',
                                 justification='batch-sibling-failed: degraded to create',
+                                degraded=True,
                             )
 
                     t = rec.ticket
@@ -5689,6 +5718,7 @@ class TaskInterceptor:
                         rec.decision = CuratorDecision(
                             action='create',
                             justification='batch-cycle: coerced to create',
+                            degraded=True,
                         )
                         rec.target = None
                     # Don't update pending — the next iteration will drain them.
