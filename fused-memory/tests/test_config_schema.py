@@ -4255,6 +4255,33 @@ def test_shipped_config_max_staleness_still_bounds_latency(monkeypatch):
     )
 
 
+# ── coalesce_task_events (task 4278, recon lever 3) ──────────────────
+#
+# Push-time folding of repeat task events is on by default, switchable, and
+# restart-only: EventBuffer captures the flag by value at construction.
+
+
+def test_coalesce_task_events_defaults_on_and_can_be_switched_off():
+    assert ReconciliationConfig().coalesce_task_events is True
+    assert ReconciliationConfig(coalesce_task_events=False).coalesce_task_events is False
+
+
+def test_shipped_config_coalesces_task_events(monkeypatch):
+    assert _shipped_reconciliation_config(monkeypatch).coalesce_task_events is True
+
+
+def test_coalesce_task_events_is_restart_only():
+    from fused_memory.config.reload import RELOADABLE_FIELDS
+
+    assert 'reconciliation.coalesce_task_events' not in RELOADABLE_FIELDS
+
+
+def test_event_buffer_default_matches_the_config_default():
+    from fused_memory.reconciliation.event_buffer import EventBuffer
+
+    assert EventBuffer().coalesce_task_events is ReconciliationConfig().coalesce_task_events
+
+
 class TestWriteJournalConfig:
     """Task 3212 item 4: `write_ops` retention is operator-tunable and its
     read/search asymmetry is enforced, not merely documented.
