@@ -57,3 +57,22 @@ def test_a_probe_session_leaves_the_hosts_default_temp_root_untouched(
         "sessions' dead dirs runs outside pytest-timeout\n"
         f'before: {before}\nafter:  {after}'
     )
+
+
+@pytest.mark.parametrize(
+    'spelling', [('--basetemp={}',), ('--basetemp', '{}')], ids=['joined', 'separate'],
+)
+def test_a_basetemp_smuggled_through_extra_is_refused_before_any_session_starts(
+    tmp_path: Path, spelling: tuple[str, ...],
+) -> None:
+    smuggled = tmp_path / 'elsewhere'
+    extra = tuple(arg.format(smuggled) for arg in spelling)
+    basetemp = tmp_path / 'probe-basetemp'
+
+    with pytest.raises(ValueError, match='--basetemp') as refused:
+        run_probe_session(
+            _PROBE, basetemp=basetemp, kill_secs=60, backstop_secs=240, extra=extra,
+        )
+
+    assert extra[0] in str(refused.value)
+    assert not basetemp.exists() and not smuggled.exists(), 'a session started anyway'
