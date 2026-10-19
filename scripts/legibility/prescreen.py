@@ -9,6 +9,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from legibility import census_findings, codebook, verdict
+
 
 class Rule(enum.StrEnum):
     """The pre-screen's rules. A rule that attaches a sighting writes its
@@ -215,3 +217,77 @@ def routed_records(records: Sequence[dict], catalogue: Catalogue, *, run_id: str
             record["matches"] = matches
         routed.append(record)
     return routed
+
+
+def keyed_entry(cb: Mapping[str, Any], identity: census_findings.FindingIdentity) -> dict | None:
+    """The first entry whose finding identity stands at *identity*'s area and
+    anchor, whatever its primary tag (plans/census-incremental-prd.md T2)."""
+    for entry in cb.get("entries") or []:
+        standing = census_findings.FindingIdentity.from_record(entry)
+        if standing is not None and (standing.area, standing.anchor) == (identity.area, identity.anchor):
+            return entry
+    return None
+
+
+@dataclass(frozen=True)
+class KeyAttach:
+    """A verified cluster's candidate promoted onto the entry already standing
+    at its location, which keeps its key: *identity* is that entry's."""
+
+    title: str
+    candidate_id: str
+    entry_id: str
+    identity: census_findings.FindingIdentity
+    verifier_tags: tuple[str, ...]
+
+    @property
+    def tag_disagreement(self) -> tuple[str, str] | None:
+        """The standing and the verifier's primary tag, when they differ."""
+        standing, offered = self.identity.tags[0], self.verifier_tags[0]
+        return None if standing == offered else (standing, offered)
+
+
+def _record_by_id(records: Iterable[dict], record_id: str, *, kind: str) -> dict:
+    for record in records:
+        if record.get("id") == record_id:
+            return record
+    raise ValueError(f"attach_by_key: no {kind} {record_id!r}")
+
+
+def attach_by_key(
+    cb: dict, candidate_id: str, entry: Mapping[str, Any], found: verdict.Verdict, *, run_id: str,
+) -> tuple[dict, KeyAttach]:
+    """A new codebook in which pending *candidate_id* is promoted onto
+    *entry* instead of to an entry of its own, and the attach it made.
+
+    The candidate takes the entry's standing identity; each of its sightings
+    from a session the entry does not carry is appended to the entry, marked
+    with the attach and the verifier's tags."""
+    identity = census_findings.FindingIdentity.from_record(entry)
+    if identity is None:
+        raise ValueError(f"attach_by_key: entry {entry.get('id')!r} carries no finding identity")
+    result = copy.deepcopy(cb)
+    candidate = _record_by_id(result.get("candidates") or [], candidate_id, kind="candidate")
+    target = _record_by_id(result.get("entries") or [], entry["id"], kind="entry")
+    attached_by = _attached_by(Rule.KEY, run_id)
+
+    candidate.update(census_findings.stamped(candidate, identity))
+    candidate.update(disposition="promoted", promoted_to=target["id"], attached_by=attached_by)
+    sightings = target.setdefault("sightings", [])
+    carried = set(_sessions_of(target))
+    for sighting in candidate.get("sightings") or []:
+        if sighting.get("session") in carried:
+            continue
+        carried.add(sighting.get("session"))
+        sightings.append({
+            **copy.deepcopy(sighting), "attached_by": dict(attached_by), "verifier_tags": list(found.tags),
+        })
+
+    codebook.assert_no_deletion(cb, result)
+    return result, KeyAttach(
+        title=candidate.get("title") or "",
+        candidate_id=candidate_id,
+        entry_id=target["id"],
+        identity=identity,
+        verifier_tags=found.tags,
+    )
