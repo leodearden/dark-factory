@@ -1821,6 +1821,7 @@ async def _ensure_owner_task(
     *,
     task_client: FlakeLedgerTaskClient | None,
     owner_read: _OwnerRead | None = None,
+    context: DebtContext | None = None,
 ) -> DebtRow:
     """Enforce §5.9's invariant for *row*, returning the row as it stands afterwards.
 
@@ -1976,7 +1977,7 @@ async def _ensure_owner_task(
     # the other side-effects — the "independently guarded side-effects" discipline
     # `orchestrator/src/orchestrator/flake_recorder.py::_guarded` established.
     try:
-        outcome = await task_client.submit_task(build_deflake_task_arguments(row))
+        outcome = await task_client.submit_task(build_deflake_task_arguments(row, context))
     except Exception:
         logger.warning(
             'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s) '
@@ -2250,6 +2251,7 @@ async def open_debt(
     on_regressed_after_resolution: Callable[[DebtRow], None] | None = None,
     resolve_budget_secs: float = _RESOLVE_BUDGET_SECS,
     head_contains_fix: Callable[[Mapping[str, Any]], Awaitable[bool | None]] | None = None,
+    context: DebtContext | None = None,
 ) -> DebtRow | None:
     """Open (or advance) the single ``flake_debt`` row for *test_id* (PRD §8.3).
 
@@ -2292,6 +2294,8 @@ async def open_debt(
     and the closed row is returned; ``None`` (undecided, or the check raised) decides
     nothing — no close, no upsert — and returns the row as read.  The check bounds its
     own wait.
+
+    *context* only shapes the filed task's text and metadata (offline-lane PRD D6).
 
     REGRESSION REPORT (task η).  A RE-ENTRY means the test flaked again after its fix
     landed, and *on_regressed_after_resolution* receives the re-entered row EXACTLY ONCE
@@ -2440,7 +2444,8 @@ async def open_debt(
     # already renders as the §5.9 breach it is -- never to "no row at all".
     try:
         return await _ensure_owner_task(
-            db_path, project_id, debt_row, task_client=task_client, owner_read=owner_read
+            db_path, project_id, debt_row,
+            task_client=task_client, owner_read=owner_read, context=context,
         )
     except Exception:
         logger.warning(
