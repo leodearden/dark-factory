@@ -668,12 +668,13 @@ tasks:
     binding: capability→substrate (wired) — root test_command and scripts/orchestrator.yaml both run pytest tests/scripts/ (`grep:tests/scripts/test_scripts_module_config.py::test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites`); `grep:tests/scripts/test_skills_module_config_decision.py::test_skills_has_no_tests_of_its_own` forbids tests under skills/; verified on main 3ed84d5c5a
     verdict: PASS
   - name: fixture-walk-script
-    binding: built by this leaf — the PRD's signal; executable with a shebang, since kind script runs <root>/<script> directly
+    binding: built by this leaf — the PRD's signal; executable with a shebang. A path check until the script is on main, because shared/tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets requires every checked-in kind script target to exist and be executable already; fixture-walk-test runs it
     verdict: PASS
     delivered_check:
-      kind: script
-      script: scripts/check_review_all_program_fixture.py
-      timeout_secs: 90
+      kind: path
+      expect: present
+      paths:
+      - scripts/check_review_all_program_fixture.py
   - name: fixture-walk-test
     binding: built by this leaf
     verdict: PASS
