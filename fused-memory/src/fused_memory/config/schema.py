@@ -1443,6 +1443,9 @@ class ReconciliationConfig(BaseModel):
     # Buffer triggers
     buffer_size_threshold: int = Field(default=10)
     max_staleness_seconds: int = Field(default=1800)
+    # Task 4278 (recon lever 3): fold repeat task events per task at push time.
+    # Restart-only: EventBuffer captures it at construction.
+    coalesce_task_events: bool = Field(default=True)
 
     # WP-B: fire-and-forget in-memory event queue sits in front of the
     # SQLite event buffer on the MCP write path. Capacity bounds how many

@@ -374,6 +374,14 @@ reconciliation:
   # `python -m fused_memory.reconciliation.throughput --db ... --project ...`
   # rather than trusting it indefinitely.
   conditional_trigger_ratio: 0.6
+  # Task 4278 (recon lever 3). Folds repeat task_status_changed events, and
+  # task_modified events with operation update_task, into one buffered row per
+  # task at push time. Live fold ratios for update_task on 2026-10-19: 2.28x
+  # dark_factory, 2.69x solar_challenge, 1.31x reify. RESTART-only: captured at
+  # EventBuffer construction and absent from config/reload.py::RELOADABLE_FIELDS.
+  # false restores pre-4278 behaviour. Rationale and the reading of the
+  # throughput report: plans/recon-throughput-capacity.md (Lever 3).
+  coalesce_task_events: true
   burst_window_seconds: 30
   burst_cooldown_seconds: 150
   stale_lock_seconds: 7200
