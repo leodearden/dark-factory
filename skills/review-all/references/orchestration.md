@@ -99,8 +99,9 @@ export const meta = {
   phases: [
     { title: 'Area review', detail: 'one seat per area slice; all fourteen heuristics and both stances', model: 'opus' },
     { title: 'Verify', detail: 'one skeptic per seat, blinded to proposals', model: 'sonnet' },
-    { title: 'Calibrate', detail: 'when the area skeptics refuted nothing: ten confirmed findings (every high first) re-verified by fresh skeptics', model: 'sonnet' },
+    { title: 'Calibrate', detail: 'when the area skeptics refuted under 5 %: ten confirmed findings (every high first) re-verified by fresh skeptics', model: 'sonnet' },
     { title: 'Cross-area', detail: 'h11 SPOT, h9 layering, h3 orthogonal dimensions, h7 stateless interactions', model: 'opus' },
+    { title: 'Reverify high stratum', detail: 'when the calibration sample disputes >= 30 % or >= 2 highs: every remaining confirmed high re-verified by a fresh skeptic', model: 'sonnet' },
     { title: 'Synthesize', detail: 'join prior and new findings by short id; area x heuristic ranked view; candidate streams' },
     { title: 'Critique', detail: 'a critic reads the assembled synthesis for join errors' },
   ],
@@ -379,7 +380,7 @@ async function verifySeat(r, label) {
   return { ...r, verdicts: (v && v.verdicts) || [] }
 }
 
-const calibration = { downgraded_unreproduced: 0 }
+const calibration = { downgraded_unreproduced: 0, high_stratum_reverified: false }
 // A confirmed verdict with an unreproduced measurement is weakened (failure mode 4). Pure, so the Calibrate
 // phase applies the same rule without counting its sample into the run's figures.
 function falsificationGate(v) {
@@ -450,8 +451,10 @@ for (const r of seats) for (const f of r.findings) {
   else known.set(f.canonical, f)
 }
 
+const notRefuted = (f) => f.verdict !== 'refuted'
+const digestFinding = (f) => ({ display_id: f.display_id, canonical: f.canonical, area: f.area, anchor: f.anchor, tags: f.tags, severity: f.severity, verdict: f.verdict, verdict_notes: f.verdict_notes, class: f.class, statement: f.statement.slice(0, 600), measurements: f.measurements.slice(0, 3) })
 function digestFindings(fs) {
-  return fs.filter(f => f.verdict !== 'refuted').map(f => ({ display_id: f.display_id, canonical: f.canonical, area: f.area, anchor: f.anchor, tags: f.tags, severity: f.severity, verdict: f.verdict, class: f.class, statement: f.statement.slice(0, 600), measurements: f.measurements.slice(0, 3) }))
+  return fs.filter(notRefuted).map(digestFinding)
 }
 
 function crossPrompt(l) {
@@ -474,10 +477,11 @@ RULES
 At most ${MAX} findings. State what you read and computed in method.`
 }
 
-// Calibrate (failure mode 4): when the area skeptics refuted nothing, one fresh skeptic per sampled confirmed
-// finding re-verifies it, so the lead reads ten outcomes rather than re-reading code. Started here, it runs
-// alongside the cross lenses with no barrier and is awaited before the return; its agents name their phase
-// in opts rather than calling phase(), which the concurrent cross arm sets.
+// Calibrate (failure modes 4, 19): when the area skeptics refuted under 5 % of what they verified, one fresh
+// skeptic per sampled confirmed finding re-verifies it, so the lead reads ten outcomes rather than re-reading
+// code. Started here, it runs alongside the cross lenses with no barrier and is awaited before the digest, so
+// the synthesis and critic see its disputes; its agents name their phase in opts rather than calling phase(),
+// which the concurrent cross arm sets.
 const CALIBRATION_SAMPLE = 10
 // Evenly spaced picks over a canonical-sorted list: deterministic (the script cannot use Math.random) and
 // spread across areas, where the first k entries would all come from the alphabetically first area.
@@ -485,29 +489,59 @@ function spreadPick(list, k) {
   if (list.length <= k) return list
   return Array.from({ length: k }, (_, i) => list[Math.floor(i * list.length / k)])
 }
+async function freshVerdict(f, seat, phaseTitle, label) {
+  const v = await agent(skepticPrompt(seat, blind([f]), []), { label, phase: phaseTitle, model: A.routing.skeptic.model, effort: A.routing.skeptic.effort, schema: SKEPTIC_SCHEMA })
+  const vs = (v && v.verdicts) || []
+  const got = vs.find(x => x.display_id === f.display_id) || vs[0]
+  return got ? falsificationGate(got) : null
+}
+// A fresh skeptic that does not confirm records a dispute beside the finding; the finding's own verdict stays,
+// because one skeptic does not silently overwrite another — the deliberation rules.
+function recordOutcome(f, g) {
+  const outcome = g ? g.verdict : 'lost'
+  if (outcome === 'weakened' || outcome === 'refuted') f.calibration_disputes_verdict = { to: outcome, note: g.notes }
+  return { canonical: f.canonical, display_id: f.display_id, severity: f.severity, outcome, note: g ? g.notes : 'skeptic lost', falsification: g ? g.falsification : [] }
+}
+function tally(outcomes) {
+  const n = (o) => outcomes.filter(x => x.outcome === o).length
+  return { confirmed: n('confirmed'), weakened: n('weakened'), refuted: n('refuted'), lost: n('lost') }
+}
+const isDisputed = (o) => o.outcome === 'weakened' || o.outcome === 'refuted'
 async function calibrate() {
   const c = countVerdicts(seats)
-  if (c.refuted > 0 || (c.confirmed + c.weakened) <= 10) return null
+  // Rate rule: sample whenever the area skeptics refuted under 5 % of the findings they verified — a rate near
+  // zero is the soft-skeptic signal, not only zero itself — and more than ten findings survived.
+  if (c.refuted / (c.confirmed + c.weakened + c.refuted) >= 0.05 || (c.confirmed + c.weakened) <= 10) return null
   const byCanonical = (a, b) => (a.f.canonical < b.f.canonical ? -1 : a.f.canonical > b.f.canonical ? 1 : 0)
   const confirmed = seats.flatMap(r => r.findings.filter(f => f.verdict === 'confirmed').map(f => ({ f, seat: r.seat }))).sort(byCanonical)
   const highs = spreadPick(confirmed.filter(x => x.f.severity === 'high'), CALIBRATION_SAMPLE)
   const rest = spreadPick(confirmed.filter(x => x.f.severity !== 'high'), CALIBRATION_SAMPLE - highs.length)
   const sample = [...highs, ...rest]
-  log(`calibrate: the area skeptics refuted nothing — ${sample.length} confirmed findings (${highs.length} high) go to fresh skeptics`)
-  const results = await parallel(sample.map(({ f, seat }) => async () => {
-    const v = await agent(skepticPrompt(seat, blind([f]), []), { label: `calibrate:${f.display_id}`, phase: 'Calibrate', model: A.routing.skeptic.model, effort: A.routing.skeptic.effort, schema: SKEPTIC_SCHEMA })
-    const vs = (v && v.verdicts) || []
-    const got = vs.find(x => x.display_id === f.display_id) || vs[0]
-    return got ? falsificationGate(got) : null
-  }))
-  const outcomes = sample.map(({ f }, i) => {
-    const g = results[i]
-    return { canonical: f.canonical, display_id: f.display_id, severity: f.severity, outcome: g ? g.verdict : 'lost', note: g ? g.notes : 'skeptic lost', falsification: g ? g.falsification : [] }
-  })
-  const n = (o) => outcomes.filter(x => x.outcome === o).length
-  const sampled = { sampled: sample.length, strata: { high: highs.length, random: rest.length }, confirmed: n('confirmed'), weakened: n('weakened'), refuted: n('refuted'), lost: n('lost'), outcomes }
-  log(`calibrate: ${sampled.confirmed} confirmed, ${sampled.weakened} weakened, ${sampled.refuted} refuted, ${sampled.lost} lost of ${sample.length}`)
+  log(`calibrate: the area skeptics refuted ${c.refuted} of ${c.confirmed + c.weakened + c.refuted} — ${sample.length} confirmed findings (${highs.length} high) go to fresh skeptics`)
+  const results = await parallel(sample.map(({ f, seat }) => () => freshVerdict(f, seat, 'Calibrate', `calibrate:${f.display_id}`)))
+  const outcomes = sample.map(({ f }, i) => recordOutcome(f, results[i]))
+  const disputed = outcomes.filter(isDisputed)
+  // Drift signal: >= 30 % of the sample, or >= 2 sampled highs, disputed re-verifies the whole high stratum.
+  const drift = disputed.length >= 0.3 * sample.length || disputed.filter(o => o.severity === 'high').length >= 2
+  const sampled = { sampled: sample.length, strata: { high: highs.length, random: rest.length }, ...tally(outcomes), drift, outcomes }
+  log(`calibrate: ${sampled.confirmed} confirmed, ${sampled.weakened} weakened, ${sampled.refuted} refuted, ${sampled.lost} lost of ${sample.length}${drift ? ' — drift: the high stratum is re-verified' : ''}`)
   return sampled
+}
+// Every confirmed high the sample did not cover gets a fresh skeptic; outcomes are recorded as Calibrate's are.
+async function reverifyHighStratum(sample, rs) {
+  const covered = new Set(sample.outcomes.map(o => o.canonical))
+  const stratum = []
+  for (const r of rs) for (const f of r.findings) {
+    if (f.verdict !== 'confirmed' || f.severity !== 'high' || covered.has(f.canonical)) continue
+    covered.add(f.canonical)
+    stratum.push({ f, seat: r.seat })
+  }
+  log(`reverify: ${stratum.length} remaining confirmed highs go to fresh skeptics`)
+  const results = await parallel(stratum.map(({ f, seat }) => () => freshVerdict(f, seat, 'Reverify high stratum', `reverify:${f.display_id}`)))
+  const outcomes = stratum.map(({ f }, i) => recordOutcome(f, results[i]))
+  calibration.high_stratum_reverified = true
+  calibration.high_stratum = { reverified: stratum.length, ...tally(outcomes), outcomes }
+  log(`reverify: ${calibration.high_stratum.confirmed} confirmed, ${calibration.high_stratum.weakened} weakened, ${calibration.high_stratum.refuted} refuted, ${calibration.high_stratum.lost} lost of ${stratum.length}`)
 }
 const calibrationRun = calibrate()
 
@@ -539,6 +573,11 @@ const crossSeats = (await pipeline(
 for (const r of crossSeats) for (const f of r.findings) if (f.verdict !== 'refuted' && !known.has(f.canonical)) known.set(f.canonical, f)
 
 const all = [...seats, ...crossSeats]
+const yellowFlagSample = await calibrationRun
+if (yellowFlagSample && yellowFlagSample.drift) {
+  phase('Reverify high stratum')
+  await reverifyHighStratum(yellowFlagSample, all)
+}
 const counts = countVerdicts(all)
 const verified = counts.confirmed + counts.weakened + counts.refuted
 calibration.refutation_rate = verified ? Math.round(1000 * counts.refuted / verified) / 1000 : null
@@ -589,18 +628,20 @@ for (const [c, f] of known) {
 }
 for (const r of crossSeats) for (const o of r.re_observations || []) addOnce(observation.re_observed, o.canonical)
 
+const refuted = all.flatMap(r => r.findings.filter(f => f.verdict === 'refuted').map(f => ({ seat: r.seat, display_id: f.display_id, canonical: f.canonical, anchor: f.anchor, why: f.verdict_notes })))
+
 const digest = {
   run_id: A.run_id, as_of_sha: A.as_of_sha, since: A.since,
   ids_rule: 'every finding and prior carries a short id (f<n> this run, p<n> prior; one id per canonical); the synthesis and critic refer to findings by these ids only',
-  seats: all.map(r => ({ seat: r.seat, area: r.area, area_health: r.area_health, read_coverage: r.read_coverage, h14_measurements: r.h14_measurements, prior_verdicts: r.prior_verdicts, findings: digestFindings(r.findings).map(f => ({ id: idOf.get(f.canonical), ...f, proposal: (known.get(f.canonical) || {}).proposal, next_change: (known.get(f.canonical) || {}).next_change, supersedes_canonical: (known.get(f.canonical) || {}).supersedes_canonical })) })),
+  seats: all.map(r => ({ seat: r.seat, area: r.area, area_health: r.area_health, read_coverage: r.read_coverage, h14_measurements: r.h14_measurements, prior_verdicts: r.prior_verdicts, findings: r.findings.filter(notRefuted).map(f => ({ id: idOf.get(f.canonical), ...digestFinding(f), calibration_disputes_verdict: f.calibration_disputes_verdict, proposal: (known.get(f.canonical) || {}).proposal, next_change: (known.get(f.canonical) || {}).next_change, supersedes_canonical: (known.get(f.canonical) || {}).supersedes_canonical })) })),
   prior_ids: PRIOR_OPEN_ALL.filter((p, i, a) => a.findIndex(q => q.canonical === p.canonical) === i).map(p => ({ id: idOf.get(p.canonical), canonical: p.canonical, key: p.key || null, sub_area: p.sub_area || null })),
-  prior_open_file: A.prior.full_path, prior_open_count: priorOpen.size, standing: A.prior.standing, observation, verification: counts, calibration, dropped,
+  prior_open_file: A.prior.full_path, prior_open_count: priorOpen.size, standing: A.prior.standing, observation, verification: counts, calibration, dropped, refuted,
 }
 
-function synthesisPrompt(critique) {
+function synthesisPrompt(critique, mechanical) {
   return `You are the synthesis seat of a whole-project quality review of ${A.project.id} at ${ROOT} (detached checkout of ${A.as_of_sha}). READ-ONLY; verify in code where a join depends on it.
 
-${QUALITY}then read docs/quality-findings-contract.md §1–§4, §6 (in the dark-factory checkout if this project carries no copy). Below: verified findings from ${seats.length} area seats and ${crossSeats.length} cross-area seats, standing (accepted) findings, and the observation classes already computed (new / re_observed / standing / fixed). The ${priorOpen.size} prior open findings from earlier instrument runs are in the JSON file ${A.prior.full_path} — Read it: their statements, severities, classes and keys are inputs to the matrix and streams exactly like this run's findings. digest.prior_ids maps each prior's short id to its canonical in that file.
+${QUALITY}then read docs/quality-findings-contract.md §1–§4, §6 (in the dark-factory checkout if this project carries no copy). Below: verified findings from ${seats.length} area seats and ${crossSeats.length} cross-area seats, standing (accepted) findings, and the observation classes already computed (new / re_observed / standing / fixed). The ${priorOpen.size} prior open findings from earlier instrument runs are in the JSON file ${A.prior.full_path} — Read it: their statements, severities, classes and keys are inputs to the matrix and streams exactly like this run's findings. digest.prior_ids maps each prior's short id to its canonical in that file. Each finding carries its skeptic's verdict_notes (and calibration_disputes_verdict where a fresh skeptic disputed it); digest.refuted lists the refuted findings with why — none is ranked.
 
 IDS: every finding and prior has a short id (f<n>, p<n>) in the digest. In matrix.ranked, streams.canonicals and contradictions.between write bare ids and nothing else — no canonicals, no paths, no abbreviation scheme of your own, no area prefixes, no appended flags such as [w] or [p]; the pipeline maps ids back to canonicals, and anything that is not a bare id is reported as unresolved. Name findings by id in exonerations and method too.
 
@@ -611,7 +652,7 @@ JOBS
 4. CONTRADICTIONS: seats proposing conflicting remedies, or a remedy that duplicates a mechanism that already exists; resolve or pose the question.
 5. EXONERATIONS: what the metrics flag that the reading shows healthy.
 A weakened finding keeps its weight through its id; the report marks it from the record. Never rank by, or justify a severity with, a measure from the doc's Do-not-steer list.
-${critique ? `\nA critic read your previous synthesis and found these join errors. Fix each you accept, say in method how, and fill critic_responses with one entry per item in order (accepted true/false and how); a declined item needs its reason:\n${JSON.stringify(critique, null, 1)}\n` : ''}
+${critique ? `\nA critic read your previous synthesis and found these join errors. Fix each you accept, say in method how, and fill critic_responses with one entry per item in order (accepted true/false and how); a declined item needs its reason:\n${JSON.stringify(critique, null, 1)}\n` : ''}${mechanical && mechanical.length ? `\nThe pipeline's mechanical join checks found these in your previous synthesis; fix each and say how in method:\n${JSON.stringify(mechanical, null, 1)}\n` : ''}
 DIGEST:
 ${JSON.stringify(digest, null, 1)}`
 }
@@ -620,22 +661,44 @@ phase('Synthesize')
 const degenerateSynthesis = (s) => !s || (s.method || '').length < 50 || (known.size > 0 && !(s.matrix || []).length)
 const degenerateCritic = (c) => !c || !['accept', 'revise'].includes(c.verdict) || (c.verdict === 'revise' && !(c.join_errors || []).length)
 const synthOpts = (label) => ({ label, phase: 'Synthesize', model: A.routing.synthesis.model, effort: A.routing.synthesis.effort, schema: SYNTHESIS_SCHEMA })
-let synthesis = await seatWithRetry('synthesize', (note) => agent(synthesisPrompt(null) + note, synthOpts(note ? 'synthesize:retry' : 'synthesize')), degenerateSynthesis)
+let synthesis = await seatWithRetry('synthesize', (note) => agent(synthesisPrompt(null, null) + note, synthOpts(note ? 'synthesize:retry' : 'synthesize')), degenerateSynthesis)
 
-function criticPrompt() {
+// Set-membership joins checked by the script, not the critic (failure mode 21): a key in two streams, a key
+// twice in one matrix cell, a high structural finding in no stream (mechanical highs are filed by the lead, never streamed). Runs on short ids, before mapIds.
+function mechanicalJoinErrors(syn) {
+  if (!syn) return []
+  const errors = []
+  const streamsOf = new Map()
+  for (const st of syn.streams || []) for (const id of new Set((st.canonicals || []).map(x => String(x).trim()))) streamsOf.set(id, [...(streamsOf.get(id) || []), st.name])
+  for (const [id, names] of streamsOf) if (names.length > 1) errors.push({ check: 'key-in-two-streams', id, canonical: canonicalOf.get(id) || null, where: names })
+  for (const cell of syn.matrix || []) {
+    const ids = (cell.ranked || []).map(x => String(x).trim())
+    for (const id of new Set(ids.filter((x, i) => ids.indexOf(x) !== i))) errors.push({ check: 'duplicate-in-cell', id, canonical: canonicalOf.get(id) || null, where: [`${cell.area}×${cell.tag}`] })
+  }
+  for (const [c, f] of known) if (f.severity === 'high' && f.class === 'structural' && !streamsOf.has(idOf.get(c))) errors.push({ check: 'high-in-no-stream', id: idOf.get(c), canonical: c, where: [] })
+  if (errors.length) log(`synthesis: ${errors.length} mechanical join errors — ${errors.map(e => `${e.check} ${e.id}`).join(', ')}`)
+  return errors
+}
+const firstJoinErrors = mechanicalJoinErrors(synthesis)
+
+function criticPrompt(mechanical) {
   return `You are the critic of an assembled synthesis for a whole-project quality review of ${A.project.id} at ${ROOT}. READ-ONLY; open code where a check needs it.
 
 You are not a third reviewer of the code. You read the JOIN: the places where seats' results were combined. ${QUALITY}attend to its "What to measure" and "Do not steer by" sections. Findings are named by short id (f<n>, p<n>) in both documents below; use those ids in where. Check, and report each hit as a join_error with a fix:
 - inconsistent-rule: two figures compared under different rules (one seat counted prose lines, another did not; one measured per function, another per module) — compare the rules figure by figure, not seat by seat.
 - one-term-of-sum: a conclusion about complexity or size that reads one term of a pair (module total without the per-function maximum, or the reverse; a split that lowers file size while total complexity rises).
-- evidence-contradicts-conclusion: a ranking, stream or exoneration that a seat's own measurements or a skeptic's notes contradict.
+- evidence-contradicts-conclusion: a ranking, stream or exoneration that a seat's own measurements or a skeptic's notes contradict. The skeptic's verdict_notes are in the digest on every finding, with calibration_disputes_verdict where a fresh skeptic disputed it, and digest.refuted lists the refuted ones: check every weakened or disputed finding's rank and stream against its notes.
 - do-not-steer-leak: a line count, average complexity, coverage or test count used as ranking input or severity support.
 - duplicate-mechanism: a stream remedy that re-creates a mechanism the tree already has (grep for it).
 - unverified-fixed: a canonical classed fixed without a confirmed gone verdict.
 - severity-unsupported: a high whose next_change scenario does not support it — set severity_to to the severity the scenario does support, so the correction can be applied to the record.
 - area-unmapped: a finding whose area is not the area of its anchor path.
 - weakened-hidden: a weakened verdict that vanished from the matrix or a stream.
+The pipeline has already checked three set-membership joins — a key in two streams, a key twice in one matrix cell, a high structural finding in no stream — and its hits are listed below; do not re-report them. Spend the reading on evidence-contradicts-conclusion and the exonerations: across three runs 17 of 53 critic errors were in exonerations and 8 were duplicate-mechanism.
 Verdict: accept, or revise when any error changes a ranking, a stream or a disposition.
+
+MECHANICAL JOIN ERRORS (already found):
+${JSON.stringify(mechanical, null, 1)}
 
 SYNTHESIS:
 ${JSON.stringify(synthesis, null, 1)}
@@ -651,11 +714,11 @@ if (!synthesis) {
   log('synthesis lost — critic skipped; the lead synthesises from the digest by hand and the report says so')
 } else {
   critic = await seatWithRetry('critic',
-    (note) => agent(criticPrompt() + note, { label: note ? 'critic:retry' : 'critic', phase: 'Critique', model: A.routing.critic.model, effort: A.routing.critic.effort, schema: CRITIC_SCHEMA }),
+    (note) => agent(criticPrompt(firstJoinErrors) + note, { label: note ? 'critic:retry' : 'critic', phase: 'Critique', model: A.routing.critic.model, effort: A.routing.critic.effort, schema: CRITIC_SCHEMA }),
     degenerateCritic)
   if (critic && critic.verdict === 'revise') {
     log(`critic: ${critic.join_errors.length} join errors — one revision of the synthesis`)
-    const revisedSynthesis = await seatWithRetry('synthesize:revised', (note) => agent(synthesisPrompt(critic.join_errors) + note, synthOpts(note ? 'synthesize:revised:retry' : 'synthesize:revised')), degenerateSynthesis)
+    const revisedSynthesis = await seatWithRetry('synthesize:revised', (note) => agent(synthesisPrompt(critic.join_errors, firstJoinErrors) + note, synthOpts(note ? 'synthesize:revised:retry' : 'synthesize:revised')), degenerateSynthesis)
     if (revisedSynthesis) { synthesis = revisedSynthesis; revised = true } else log('revision lost — the unrevised synthesis is returned with the critic errors attached')
   }
 }
@@ -672,15 +735,15 @@ const severityCorrections = ((critic && critic.join_errors) || []).map((e, i) =>
   })
 if (severityCorrections.some(s => !s.canonical)) log(`critic: ${severityCorrections.filter(s => !s.canonical).length} severity correction(s) name no resolvable id — listed with canonical null`)
 
-const yellowFlagSample = await calibrationRun
+const joinErrorsMechanical = revised ? mechanicalJoinErrors(synthesis) : firstJoinErrors
 
 return {
   run_id: A.run_id, as_of_sha: A.as_of_sha, since: A.since,
   seats: all.map(r => ({ ...r, verdicts: undefined })),
-  refuted: all.flatMap(r => r.findings.filter(f => f.verdict === 'refuted').map(f => ({ seat: r.seat, display_id: f.display_id, canonical: f.canonical, anchor: f.anchor, why: f.verdict_notes }))),
+  refuted,
   verification: counts, calibration, yellow_flag_sample: yellowFlagSample, observation, dropped,
   short_ids: [...idOf].map(([c, id]) => ({ id, canonical: c })),
-  synthesis: mapIds(synthesis), critic, synthesis_revised: revised, severity_corrections: severityCorrections,
+  synthesis: synthesis && { ...mapIds(synthesis), join_errors_mechanical: joinErrorsMechanical }, critic, synthesis_revised: revised, severity_corrections: severityCorrections,
 }
 ```
 
@@ -692,7 +755,8 @@ Set in `args.routing` by the lead, explicit on every `agent()`; the session mode
 |---|---|---|---|
 | area review (per slice) | opus | high | judgment-dense: architectural review against a definition, not a checklist |
 | skeptic (per seat) | sonnet | high | bounded verification of concrete claims that rewards thinking; the cheapest seat that reproduces a measurement |
-| calibration skeptic (×10, only when the area skeptics refuted nothing) | sonnet | high | the same skeptic prompt and falsification protocol on one finding, fresh context; ~60–100k each |
+| calibration skeptic (×10, only when the area skeptics refuted under 5 %) | sonnet | high | the same skeptic prompt and falsification protocol on one finding, fresh context; ~60–100k each |
+| high-stratum skeptic (one per remaining confirmed high, only when the sample drifts) | sonnet | high | the same seat as the calibration skeptic, over the rest of the high stratum |
 | cross-area lens (×4) | opus | high | cross-input synthesis over a graph plus N reports |
 | synthesis | fable (standing in the DF overlay; else per the provenance rule) | high | synthesis of conflicting complex reports — the team skill's named fable case; fallback opus / xhigh |
 | critic | fable (standing in the DF overlay; else per the provenance rule) | high | adversarial review of that synthesis — the other named case; fallback opus / xhigh |
@@ -706,7 +770,7 @@ Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k
 1. **Degenerate structured output passes the schema** (hotspot failure mode 1). `cleanSeat` + `degenerateSeat` check every finding's anchor shape, statement length, measurement presence, next-change scenario and placeholder text; cross seats (`degenerateCross`), the synthesis (`degenerateSynthesis`) and the critic (`degenerateCritic`) have their own checks through `seatWithRetry`. Every seat is re-run once and then dropped with a `dropped` record the report prints; a lost synthesis skips the critic rather than handing it `null`.
 2. **Fourteen-times-N trivial findings.** Prevented by the prompt's next-change filter and the `maxItems` cap; detected by the critic's `severity-unsupported` class. If a seat returns `MAX` findings all `low`, the lead reads its `area_health` before trusting any of them.
 3. **A split proposed without the heuristic-14 protocol.** Dropped mechanically (`h14 without measurement protocol`); the report lists it so the seat's omission is visible.
-4. **Skeptic anchoring and a skeptic that never refutes.** The skeptic never sees proposals or severities (`blind`). Measured on the first dark-factory run: 0 refutations across 203 findings, and 0 across the hotspot refresh (174) and the `/review` run (159) at the same tree — 536 findings, 0 refuted; the five-finding sample all reproduced, which cannot tell "all real" from "skeptic too soft". So the skeptic now records one falsification attempt per measurement (what it ran, what would have refuted it, what it found, whether it reproduced), and `enforceFalsification` downgrades a `confirmed` verdict with any unreproduced measurement to `weakened` (counted in `calibration.downgraded_unreproduced`). Zero refutations from the area skeptics with more than ten surviving findings starts the `Calibrate` phase: a stratified sample of ten confirmed findings — every confirmed `high` first, then the rest, each stratum taken as evenly spaced picks over its canonical-sorted list because the script cannot use `Math.random` — goes to one fresh skeptic each (`A.routing.skeptic`, the same `skepticPrompt` and falsification protocol, `falsificationGate` applied without counting into `calibration`), concurrently with the cross lenses, and the result's `yellow_flag_sample` carries the per-finding outcomes (`lost` for a skeptic that returned nothing). The lead's context is the scarce resource, so the re-verification is a seat's job, not the lead's (SKILL.md §Lead context budget): the lead reads the sample's outcomes, the digest copies it to `extra.yellow_flag_sample`, and the lead compares `calibration.refutation_rate` with the previous runs' `## Method` `verification.refutation_rate`. The full-run YELLOW FLAG log still fires on zero refutations across every seat.
+4. **Skeptic anchoring and a skeptic that never refutes.** The skeptic never sees proposals or severities (`blind`). Measured on the first dark-factory run: 0 refutations across 203 findings, and 0 across the hotspot refresh (174) and the `/review` run (159) at the same tree — 536 findings, 0 refuted; the five-finding sample all reproduced, which cannot tell "all real" from "skeptic too soft". So the skeptic now records one falsification attempt per measurement (what it ran, what would have refuted it, what it found, whether it reproduced), and `enforceFalsification` downgrades a `confirmed` verdict with any unreproduced measurement to `weakened` (counted in `calibration.downgraded_unreproduced`). A refutation rate under 5 % from the area skeptics (refuted / (confirmed + weakened + refuted)), with more than ten surviving findings, starts the `Calibrate` phase: a stratified sample of ten confirmed findings — every confirmed `high` first, then the rest, each stratum taken as evenly spaced picks over its canonical-sorted list because the script cannot use `Math.random` — goes to one fresh skeptic each (`A.routing.skeptic`, the same `skepticPrompt` and falsification protocol, `falsificationGate` applied without counting into `calibration`), concurrently with the cross lenses, and the result's `yellow_flag_sample` carries the per-finding outcomes (`lost` for a skeptic that returned nothing). The lead's context is the scarce resource, so the re-verification is a seat's job, not the lead's (SKILL.md §Lead context budget): the lead reads the sample's outcomes, the digest copies it to `extra.yellow_flag_sample`, and the lead compares `calibration.refutation_rate` with the previous runs' `verification.refutation_rate`. Those prior figures, `refutation_rate_prior_runs` in the record (`report-format.md` §Artefact 1), are READ by the digest from each previous record's `method.verification.refutation_rate`, never typed (solar_challenge_platform cited reify as 0.0; reify's record says 0.003). What the sample's outcomes feed is failure mode 19. The full-run YELLOW FLAG log still fires on zero refutations across every seat.
 5. **Verdict join by display_id.** Unmatched ids fall to `unverified` and are counted separately; never conflate "survived" with "confirmed".
 6. **`fixed` without evidence.** A prior finding is `fixed` only when the seat said `gone` and the skeptic confirmed the locating evidence; the critic's `unverified-fixed` is the backstop.
 7. **The result is too large to read raw** (expect 300–600 KB). The lead writes it to `<scratch>/workflow-result.json` and digests with a script (SKILL.md Phase 5).
@@ -718,6 +782,9 @@ Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k
 13. **The synthesis invents an abbreviation scheme.** Asked to repeat 480 canonicals in the matrix, the fable synthesis shortened them its own way — path tokens (`O:=` for the orchestrator package), omitted `<area>|` prefixes, trailing `[w,p,m]` flags, `alias:filed-by-anchor` notes — and the lead's digest had to reverse-engineer it. The script now assigns short ids (`p<n>` priors, `f<n>` findings, one per canonical), the prompts forbid anything but bare ids in `ranked`, `canonicals` and `between`, and `mapIds` maps them back before returning, listing anything unresolvable under `synthesis.unresolved_ids`; `short_ids` in the result lets the lead's digest read the ids the critic prose and `method`/`exonerations` still use.
 14. **An accepted critic correction never reaches the record.** The critic's `severity-unsupported` on `fk-3505aba0481d` (`evals/runner.py::run_architect_eval`, high → medium) was accepted in the revised synthesis, but the findings record kept the seat's `high` and the lead had to rule at decompose. The critic now states `severity_to`, the revision answers each item in `critic_responses`, and the script returns `severity_corrections` with the acceptance; the lead's digest applies the accepted ones and flags the rest (`report-format.md` §Artefact 2).
 15. **A file larger than the read budget.** `merge_lane/worker.py` was 22,081 lines against a 15k budget; the seat read 9,970 verbatim and the rest as a code-only rendition, and nothing in `read_coverage` said so. The area prompt now prescribes the protocol (symbol index, module-level state, functions in descending cognitive max from the snapshot's `functions` table) and `read_coverage.partial` records it, so the report can show what was not read.
-16. **A usage cap mid-run.** Measured on the first reify run (`review-all-reify-20261010`): the account's weekly usage limit fired at 11.2M subagent tokens, 37 of 70 agents failed with "usage limit", and the workflow kept dispatching until every remaining call had failed — `agent()` returns `null` on a terminal API error, so each failure was logged as a degenerate seat and its retry burned another call. Such a run must be **resumed, not restarted**: `Workflow({scriptPath, resumeFromRunId})` once the limit resets. But a resume replays only the longest unchanged prefix of `agent()` calls *in journal order*, and under `pipeline()` (and the Calibrate phase running beside the cross lenses) the completion order differs between runs, so every call after the first divergence runs live again: on reify 5 already-completed area seats and 6 completed skeptics re-ran, about 1.2M tokens. Two rules follow. (a) Never stop a run to patch prompts for seats that have not run yet — an edited prompt moves the divergence point earlier still. Let it finish, then re-run only the changed tail as a standalone workflow over the completed results: a script that rebuilds the synthesis digest from `workflow-result.json` (seat identity from the slice list, short ids, `prior_ids`, `calibration`), embeds it with the current `orchestration.md`'s Calibrate, Synthesize and Critique code lifted verbatim, and runs Calibrate → Synthesize → Critique (the reify run's `build_synth_input.py` + `gen_synth_workflow.py` pair, kept with its intermediates, is the shape to lift; its paths are that run's). (b) At the cost gate, check the account's remaining weekly headroom against the roster's estimate, Phase 2 included (SKILL.md §Cost gate); a run that will not fit waits for the reset rather than being cut by the cap mid-pipeline.
+16. **A usage cap mid-run.** Measured on the first reify run (`review-all-reify-20261010`): the account's weekly usage limit fired at 11.2M subagent tokens, 37 of 70 agents failed with "usage limit", and the workflow kept dispatching until every remaining call had failed — `agent()` returns `null` on a terminal API error, so each failure was logged as a degenerate seat and its retry burned another call. Such a run must be **resumed, not restarted**: `Workflow({scriptPath, resumeFromRunId})` once the limit resets. But a resume replays only the longest unchanged prefix of `agent()` calls *in journal order*, and under `pipeline()` (and the Calibrate phase running beside the cross lenses) the completion order differs between runs, so every call after the first divergence runs live again: on reify 5 already-completed area seats and 6 completed skeptics re-ran, about 1.2M tokens. Two rules follow. (a) Never stop a run to patch prompts for seats that have not run yet — an edited prompt moves the divergence point earlier still. Let it finish, then re-run only the changed tail as a standalone workflow over the completed results: a script that rebuilds the synthesis digest from `workflow-result.json` (seat identity from the slice list, short ids, `prior_ids`, `calibration`), embeds it with the current `orchestration.md`'s Calibrate (with its high-stratum step), Synthesize and Critique code lifted verbatim, and runs Calibrate → Synthesize → Critique (the reify run's `build_synth_input.py` + `gen_synth_workflow.py` pair, kept with its intermediates, is the shape to lift; its paths are that run's). (b) At the cost gate, check the account's remaining weekly headroom against the roster's estimate, Phase 2 included (SKILL.md §Cost gate); a run that will not fit waits for the reset rather than being cut by the cap mid-pipeline.
 17. **An anchor-shape drop is silent to the seat.** `cleanSeat` drops a finding whose anchor fails `ANCHOR_RE` and never re-asks, so neither its skeptic nor the synthesis sees it. Measured on the first reify run: 15 of 347 findings dropped for `anchor shape`, 3 of them `high` — Rust method anchors `path.rs::Type::method` (`engine_eval.rs::Engine::eval_cached`, `::Engine::evaluate_let_bindings`, `reify-kernel-occt/src/lib.rs::OcctKernel::execute`), which the grammar's single `::symbol` rejects; the lead recovered them from the journal by hand. `normAnchor` now maps a symbol path after the file onto the class-level form (`::Type::method` → `::Type.method`, in parity with `findings_artefact.py::normalise_anchor`) before the shape check, and `cleanSeat` logs each normalisation; other shape failures are still dropped and listed under `dropped`, so read that list before trusting a seat's count.
 18. **Seats read about half their plan.** Measured on the first reify run: 30 area seats handed 427k lines (15k each) reported 234k read; 12 read under half, typically stopping 4–8k lines into a slice of two 13–15k-line files, and none of the 9 listed files with a per-function CCN max ≥ 60 was reported read in full. The area prompt now states the budget in lines, tells the seat to read until it is spent and to take a file it cannot finish through the large-file protocol (failure mode 15), and `reviewSeat` records `read_coverage.planned_lines` beside the seat's own `lines_read`, so the report's read-coverage table shows the shortfall per seat. The lead sizes read lists at ~8–12k lines and rotates them across runs (SKILL.md Phase 1 §Read shortfall, §Rotation).
+19. **Calibration outcomes went nowhere.** Measured on reify: 5 of 10 sampled highs came back `weakened` (solar_challenge_platform: 2 of 10), and every one stayed `confirmed` in the record, the matrix and the streams — `calibrate()` returned its outcomes and nothing consumed them; it also ran only at zero refutations. Now it runs under a 5 % refutation rate (failure mode 4); `recordOutcome` attaches `calibration_disputes_verdict: {to, note}` to each sampled finding a fresh skeptic weakens (or refutes) and leaves the finding's own verdict standing — one skeptic does not silently overwrite another, the deliberation rules (`report-format.md` §Artefact 2); and a sample with ≥ 30 % disputed or ≥ 2 disputed highs is the drift signal: the `Reverify high stratum` step gives every remaining confirmed `high` a fresh skeptic (`A.routing.skeptic`), records outcomes the same way under `calibration.high_stratum`, and sets `calibration.high_stratum_reverified = true`. The sample is awaited before the digest, so the synthesis and the critic see the disputes.
+20. **Skeptic notes never reached the join.** `digestFindings` carried the verdict but not the skeptic's note, so a weakened finding reached the synthesis uncorrected and the critic could not check it (reify's critic worked "vs fNN skeptic notes" by hand; solar_challenge's: "skeptic notes are absent"). The digest now carries each finding's `verdict_notes` and `calibration_disputes_verdict`, and `digest.refuted` the refuted list (the one the result returns), and the critic prompt tells it to check weakened and disputed findings against them.
+21. **Critics re-found set-membership errors by hand.** All three critics reported the same structural join errors, and the lesser items never reached the revision. `mechanicalJoinErrors` now runs after the synthesis and again after a revision — new: a key in two streams, a key twice in one matrix cell, a high structural finding in no stream (mechanical highs are filed by the lead, not streamed; priors carry no severity in the script and are not checked) — logs them, feeds the first set to the critic (as already found) and to the revision, and returns the final set as `synthesis.join_errors_mechanical`. Kept unchanged: the critic's `weakened-hidden` class and the pipeline's duplicate-canonical-across-seats log. The critic's budget goes to evidence-contradicts-conclusion and exonerations (17 of 53 critic errors across three runs were in exonerations; 8 were duplicate-mechanism).

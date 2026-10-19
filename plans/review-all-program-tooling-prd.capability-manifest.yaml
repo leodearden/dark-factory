@@ -1,0 +1,686 @@
+prd: plans/review-all-program-tooling-prd.md
+schema_version: 1
+# Authored 2026-10-19 in author mode; folded the same day from the D8 critic. task_id fields stay
+# null until commit_planning stamps them. Every grep/path/script check fails on main 3ed84d5c5a
+# (unchanged at 93f478fa3b) except κ's two expect-absent checks, whose phrases live only in the
+# sibling seat's uncommitted working-tree amendments; they fail once the wave commits, which precedes
+# decompose (GATE_REF is main of project_root); lint reads them vacuous_absent until then. σ1's absent check
+# lints absent_overbroad unless σ1's metadata.files names scripts/sitting/ownership.py. Multi-path grep checks are avoided: git grep over
+# several paths passes on any one of them, so every required path has its own check.
+tasks:
+- label: α
+  task_id: null
+  title: 'state.py: schema constants, return validator, state home, append-only JSONL, the one store reader; fixture and fake store'
+  capabilities:
+  - name: lookup-tool-wired
+    binding: capability→substrate (wired) — `grep:fused-memory/src/fused_memory/server/tools.py::find_tasks_by_metadata` pages on has_more, include_value under RESULT_BYTE_BUDGET; verified on main 3ed84d5c5a (2026-10-19)
+    verdict: PASS
+  - name: unknown-argument-dropped-silently
+    binding: capability→substrate (wired, as a hazard) — mcp.server.fastmcp.utilities.func_metadata.ArgModelBase keeps pydantic extra='ignore' (model_config has no extra key; measured on the installed mcp); task 4867 documents the class; the reader keys on ρ's echo, not on a rejection
+    verdict: PASS
+  - name: mcp-wire-shape
+    binding: capability→substrate (wired) — `grep:scripts/migrate_metadata_modules_to_files.py::FusedMemoryClient` (_initialize, _post, _reply_payload) is the handshake α restates in urllib; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: held-leaf-key-shapes
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/report-format.md` §Artefact 3 Held leaf names x_seam_wait {stream, contract, release_owner} and x_seam_released; this worktree's amended copy; α makes SEAM_WAIT_KEYS the machine home
+    verdict: PASS
+  - name: state-library-present
+    binding: built by this leaf — state.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/state.py
+  - name: fixture-and-fake-store-present
+    binding: built by this leaf — fixture/fake_store.py, fixture/store.json, fixture/program.json, fixture/returns/
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/fixture/fake_store.py
+      - skills/review-all/scripts/program/fixture/store.json
+      - skills/review-all/scripts/program/fixture/program.json
+  - name: return-schema-constant
+    binding: built by this leaf — RETURN_SCHEMA is the one home of the schema id
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^RETURN_SCHEMA = 'review-all-prd-return/1'
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/state.py
+  - name: seam-key-constants
+    binding: built by this leaf — SEAM_WAIT_KEYS / SEAM_RELEASED_KEYS are the machine home of the held-leaf key names
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^SEAM_WAIT_KEYS
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/state.py
+  - name: ledger-ops-and-ruling-ids
+    binding: built by this leaf — LEDGER_OPS and next_ruling_id live here, so β and γ add nothing to state.py in parallel (decision 17)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def next_ruling_id\(
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/state.py
+  - name: reader-refuses-missing-echo
+    binding: built by this leaf — StoreReaderUnsupported raised when the include_rows echo or a row's metadata/dependencies is missing, or the server rejects the argument (INV-11)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class StoreReaderUnsupported\(
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/state.py
+- label: ρ
+  task_id: null
+  title: 'find_tasks_by_metadata(include_rows=True): metadata and dependencies per row under the byte budget, echoed'
+  capabilities:
+  - name: lookup-layering
+    binding: capability→substrate (wired) — `grep:fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.find_tasks_by_metadata`, `grep:fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor.find_tasks_by_metadata`, `grep:fused-memory/src/fused_memory/server/tools.py::find_tasks_by_metadata`, `grep:fused-memory/src/fused_memory/backends/metadata_lookup.py::validate_metadata_query`; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: dependency-edges-at-backend
+    binding: capability→substrate (wired) — `grep:fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.get_dependency_edges`; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: budget-fitter
+    binding: capability→substrate (wired) — `grep:fused-memory/src/fused_memory/server/tools.py::_fit_rows_to_budget` and RESULT_BYTE_BUDGET; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: no-ledger-row-needed
+    binding: capability→substrate (wired) — `grep:shared/tests/test_loop_blocking_gate.py` keys AUDITED_SITES rows on sha256(ast.unparse(call node))[:12], invariant under body edits; ρ adds no blocking call, so shared/tests/loop_blocking_allowlist.py (task 5270) is untouched
+    verdict: PASS
+  - name: param-wiring-checker
+    binding: capability→substrate (wired) — `grep:scripts/check_method_param_wiring.py` (--file --function --param --forwards-to), the task-6581 pattern; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: tool-declares-and-forwards-include-rows
+    binding: built by this leaf — the MCP tool declares include_rows and forwards it by name into the interceptor
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_method_param_wiring.py
+      args:
+      - --file
+      - fused-memory/src/fused_memory/server/tools.py
+      - --function
+      - find_tasks_by_metadata
+      - --param
+      - include_rows
+      - --forwards-to
+      - find_tasks_by_metadata
+      timeout_secs: 60
+  - name: interceptor-declares-and-forwards-include-rows
+    binding: built by this leaf — the interceptor pass-through forwards include_rows by name into the backend
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_method_param_wiring.py
+      args:
+      - --file
+      - fused-memory/src/fused_memory/middleware/task_interceptor.py
+      - --function
+      - find_tasks_by_metadata
+      - --param
+      - include_rows
+      - --forwards-to
+      - find_tasks_by_metadata
+      timeout_secs: 60
+  - name: backend-include-rows
+    binding: built by this leaf — the backend method grows the keyword and reads rows plus edges in one connection
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: include_rows
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/backends/sqlite_task_backend.py
+  - name: include-rows-validated-as-bool
+    binding: built by this leaf — validate_metadata_query checks include_rows as it checks include_value
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: include_rows
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/backends/metadata_lookup.py
+  - name: include-rows-echoed
+    binding: built by this leaf — the response envelope echoes include_rows beside key, value and statuses (the client's only way to tell honoured from dropped, D8 B1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''include_rows'':'
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+  - name: lone-row-elision
+    binding: built by this leaf — an over-budget lone row returns truncated_row
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: truncated_row
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+  - name: live-signal-with-echo
+    binding: built by this leaf — after a fused-memory restart the MCP call with include_rows=True echoes `include_rows` as true and returns task 6385's metadata and dependencies
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: requires the running service restarted onto the landed code; asserted by the fused-memory suite's boundary rows and observed live by the next lead
+- label: β
+  task_id: null
+  title: 'apply_return.py and record.py: validate, move, append, digest, --check, --from-store, idempotence'
+  capabilities:
+  - name: state-library
+    binding: capability→producer (upstream) — α (validate_return, append, StoreReader)
+    verdict: PASS
+  - name: scripts-present
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/apply_return.py
+      - skills/review-all/scripts/program/record.py
+  - name: check-mode
+    binding: built by this leaf — --check validates without writing; the brief tells every seat to run it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''--check'''
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/apply_return.py
+  - name: from-store-reconstruction
+    binding: built by this leaf — --from-store rebuilds filed/held/released from the store for a lost return
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''--from-store'''
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/apply_return.py
+- label: γ
+  task_id: null
+  title: 'program_doc.py: render into the home, .state/ snapshot, heading self-check, --publish, --roster, --handoff'
+  capabilities:
+  - name: state-library
+    binding: capability→producer (upstream) — α
+    verdict: PASS
+  - name: section-shape
+    binding: capability→substrate (wired) — `grep:skills/hotspot-survey/references/report-format.md` §Artifact 3 and `grep:skills/review-all/references/report-format.md` §Artefact 3; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: run-record-method-extra
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/report-format.md` §Artefact 1 method.extra (launched_from, fable_seats) read by --handoff; this worktree's amended copy
+    verdict: PASS
+  - name: script-present
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/program_doc.py
+  - name: heading-self-check
+    binding: built by this leaf — a render that would drop a ## heading of the published doc is refused unless --allow-drop names it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: --allow-drop
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/program_doc.py
+  - name: publish-step
+    binding: built by this leaf — --publish copies the doc and .state/ from the home into plans_dir and prints the path list
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''--publish'''
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/program_doc.py
+- label: δ
+  task_id: null
+  title: 'gen_brief.py: wave-aware brief at spawn time; --spawn creates the sessions.json entry and prints the pointer-prompt command'
+  capabilities:
+  - name: state-library
+    binding: capability→producer (upstream) — α
+    verdict: PASS
+  - name: prompt-file-and-self-exit-inputs
+    binding: capability→producer (upstream) — σ1 adds --prompt-file and the CLAUDE_SPAWN_SELF_EXIT input to spawn-claude.sh
+    verdict: PASS
+  - name: run-record-findings-and-filings
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/report-format.md` §Artefact 2 findings[] with calibration_disputes_verdict and filings[]; this worktree's amended copy
+    verdict: PASS
+  - name: script-present
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/gen_brief.py
+  - name: spawn-command-uses-prompt-file
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: --prompt-file
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/gen_brief.py
+  - name: spawn-command-opts-in-to-self-exit
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CLAUDE_SPAWN_SELF_EXIT
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/gen_brief.py
+- label: ε
+  task_id: null
+  title: 'clerk_batch.py: write (batch, CLERK_RULES prompt, release/repath recipes, --scan over moves), ingest'
+  capabilities:
+  - name: state-library
+    binding: capability→producer (upstream) — α (tasks_with_delivered_checks)
+    verdict: PASS
+  - name: delivered-checks-shape
+    binding: capability→substrate (wired) — `grep:docs/task-authoring.md` delivered_checks (kind, pattern, expect, paths); the scan passes kind through untouched (task 7150's vocabulary); verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: commit-planning-hold-kinds
+    binding: capability→substrate (wired) — `grep:fused-memory/src/fused_memory/server/tools.py::commit_planning` refuses a non-planning hold with not_planning_hold; a re-run on a pending task stamps the sidecar located from metadata.prd_path (decompose-mode.md Step 5.5); verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: script-present
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/clerk_batch.py
+  - name: clerk-rules-home
+    binding: built by this leaf — CLERK_RULES is the one home of the standing rules and the release/repath recipes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^CLERK_RULES
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/clerk_batch.py
+  - name: impact-scan
+    binding: built by this leaf — --scan emits repath actions from moves
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def impact_scan\(
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/clerk_batch.py
+- label: ζ
+  task_id: null
+  title: 'gate_check.py (both trigger-chain forms) and seam_scan.py'
+  capabilities:
+  - name: state-library
+    binding: capability→producer (upstream) — α (StoreReader.gate, completion_gate, tasks_declaring_files)
+    verdict: PASS
+  - name: gate-identity-both-forms
+    binding: capability→substrate (wired) — `grep:skills/_shared/filing-the-trigger-chain.md` §3 final (human_gate depends on completion_gate only) and §4 interim (high/critical leaves); scripts/check_run_completion.py absent on main, task 6389 pending; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: scripts-present
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/gate_check.py
+      - skills/review-all/scripts/program/seam_scan.py
+  - name: form-detection
+    binding: built by this leaf — gate_check detects the final form by the completion_gate sibling
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: completion_gate
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/gate_check.py
+- label: η
+  task_id: null
+  title: 'watch_sessions.py: resolve records, archive on first sight, final vs checkpoint, apply the inbox file once'
+  capabilities:
+  - name: state-library
+    binding: capability→producer (upstream) — α
+    verdict: PASS
+  - name: apply-return
+    binding: capability→producer (upstream) — β
+    verdict: PASS
+  - name: outcome-vocabulary-home
+    binding: capability→producer (upstream) — σ1 (session_registry.RESULT_OUTCOMES, TERMINAL_RESULT_OUTCOMES, parse_result_outcome)
+    verdict: PASS
+  - name: registry-importable-under-isolated-python
+    binding: capability→substrate (wired) — `grep:orchestrator/src/orchestrator/session_registry.py::TERMINAL_STATUSES`, `grep:orchestrator/src/orchestrator/session_registry.py::RESULT_FILENAME`; the module imports only the stdlib and loads under env -i python3 -I -S with a sys.path insert (measured 2026-10-19)
+    verdict: PASS
+  - name: script-present
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/watch_sessions.py
+  - name: final-rule
+    binding: built by this leaf — final iff terminal outcome and (record terminal, or exit_requested_at with a dead owner pid)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def is_final\(
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/watch_sessions.py
+  - name: imports-the-registry-not-a-copy
+    binding: built by this leaf — the record shape and outcome parser are imported from session_registry
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator.session_registry import
+      expect: present
+      paths:
+      - skills/review-all/scripts/program/watch_sessions.py
+- label: σ1
+  task_id: null
+  title: 'Spawn contract: --prompt-file pointer prompt, /reflect and in-progress in the trailer, the marker instruction, CLAUDE_SPAWN_SELF_EXIT → record.self_exit, the outcome vocabulary moved to session_registry.py'
+  capabilities:
+  - name: trailer-and-payload
+    binding: capability→substrate (wired) — `grep:skills/spawn/spawn-claude.sh` trailer block gated on CLAUDE_SPAWN_RESULT_FILE, printf %q of the prompt into bash -c; `grep:tests/scripts/test_spawn_claude.py`; tmux refuses a command over 16,240 bytes (D8 B2); verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: pointer-prompt-prescribed
+    binding: capability→substrate (wired) — `grep:skills/spawn/SKILL.md` "write it to a file … spawn a short prompt pointing at it"
+    verdict: PASS
+  - name: outcome-parser-today
+    binding: capability→substrate (wired) — `grep:scripts/sitting/ownership.py::RESULT_OUTCOMES`, `grep:scripts/sitting/ownership.py::parse_result_outcome`; task 6528 (in progress) holds the file, σ1 is sequenced after it; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: launching-record-from-env
+    binding: capability→substrate (wired) — `grep:orchestrator/src/orchestrator/session_registry.py::_run_launching` builds the record from CLAUDE_SPAWN_* env; SCHEMA_MINOR additive rule; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: prompt-file-flag-in-script
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: --prompt-file
+      expect: present
+      paths:
+      - skills/spawn/spawn-claude.sh
+  - name: prompt-file-flag-documented
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: --prompt-file
+      expect: present
+      paths:
+      - skills/spawn/SKILL.md
+  - name: trailer-vocabulary-line
+    binding: built by this leaf — the trailer spells the outcome line in the pinned order
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'outcome: done\|blocked\|abandoned\|handed-off\|in-progress'
+      expect: present
+      paths:
+      - skills/spawn/spawn-claude.sh
+  - name: spawn-skill-vocabulary-line
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: handed-off\|in-progress
+      expect: present
+      paths:
+      - skills/spawn/SKILL.md
+  - name: watcher-skill-vocabulary-line
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: handed-off\|in-progress
+      expect: present
+      paths:
+      - skills/escalation-watcher/SKILL.md
+  - name: vocabulary-home-in-registry
+    binding: built by this leaf — RESULT_OUTCOMES moves to session_registry.py beside RESULT_FILENAME
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^RESULT_OUTCOMES
+      expect: present
+      paths:
+      - orchestrator/src/orchestrator/session_registry.py
+  - name: vocabulary-copy-removed-from-ownership
+    binding: built by this leaf — ownership.py imports the symbols instead of defining them
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^RESULT_OUTCOMES
+      expect: absent
+      paths:
+      - scripts/sitting/ownership.py
+  - name: self-exit-input
+    binding: built by this leaf — CLAUDE_SPAWN_SELF_EXIT consumed by spawn-claude.sh, stamped as record.self_exit
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CLAUDE_SPAWN_SELF_EXIT
+      expect: present
+      paths:
+      - skills/spawn/spawn-claude.sh
+  - name: self-exit-record-field
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: self_exit
+      expect: present
+      paths:
+      - orchestrator/src/orchestrator/session_registry.py
+  - name: exit-requested-instruction
+    binding: built by this leaf — the trailer tells a self-exit session to write its session id into exit-requested last
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: exit-requested
+      expect: present
+      paths:
+      - skills/spawn/spawn-claude.sh
+- label: σ2
+  task_id: null
+  title: 'Opt-in Stop-hook self-termination in session_self_exit.py'
+  capabilities:
+  - name: trailer-and-record-flag
+    binding: capability→producer (upstream) — σ1 (record.self_exit, the marker instruction)
+    verdict: PASS
+  - name: probes-extracted
+    binding: capability→producer (upstream) — task 6922 extracts ProcessTree, _EventProbes and _owning_claude_pid into their own module; σ2 imports from there
+    verdict: PASS
+  - name: stop-hook-wired
+    binding: capability→substrate (wired) — `grep:orchestrator/src/orchestrator/session_hooks.py::run_stop` → `grep:orchestrator/src/orchestrator/session_hooks.py::_run_status_refresh_and_retitle` (one write_record, then _stamp_session_pointer; no logging handler installed); stop.sh installed in ~/.claude/settings.json; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: shared-host-guard
+    binding: capability→substrate (wired) — `grep:orchestrator/src/orchestrator/session_registry.py::_is_shared_session_host`, `grep:orchestrator/src/orchestrator/session_registry.py::SessionRecord` claude_owner_pid; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: hook-input-lists
+    binding: capability→substrate (verified statically) — the 2.1.303 binary's Stop schema carries background_tasks and session_crons as optional arrays ("Empty array when nothing is in flight"); element shape unmeasured; σ2 refuses on absence; σ3 records the shape
+    verdict: PASS
+  - name: self-exit-module
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - orchestrator/src/orchestrator/session_self_exit.py
+  - name: marker-in-record-dir
+    binding: built by this leaf — acts only on exit-requested in the proven record dir; the content is stamped as marker_session_id, not compared (re-mint tolerance, D10 N4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: exit-requested
+      expect: present
+      paths:
+      - orchestrator/src/orchestrator/session_self_exit.py
+  - name: background-work-guard
+    binding: built by this leaf — refuses unless background_tasks and session_crons are present and empty
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: session_crons
+      expect: present
+      paths:
+      - orchestrator/src/orchestrator/session_self_exit.py
+  - name: exit-request-sink
+    binding: built by this leaf — exit_request {state refused|attempted|kill_failed, reason, pid, at, marker_session_id} and exit_requested_at stamped on the record in the one write (kill_failed in a second, fail-soft write); SCHEMA_MINOR bumped
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: exit_requested_at
+      expect: present
+      paths:
+      - orchestrator/src/orchestrator/session_registry.py
+  - name: stdlib-containment-row
+    binding: built by this leaf — session_self_exit.py listed in test_session_registry.py::TestStdlibOnlySelfContainment's entrypoint rows
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: session_self_exit
+      expect: present
+      paths:
+      - orchestrator/tests/test_session_registry.py
+  - name: unit-tests
+    binding: built by this leaf — B15 with injected ProcessTree and kill
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - orchestrator/tests/test_session_self_exit.py
+- label: σ3
+  task_id: null
+  title: 'Acceptance probe: one scratch tmux-lane spawn with self-exit on and a brief over 16 KB self-terminates (human-run)'
+  capabilities:
+  - name: self-termination
+    binding: capability→producer (upstream) — σ1, σ2
+    verdict: PASS
+  - name: sigint-graceful-exit
+    binding: capability→substrate (unmeasured) — binary strings of claude 2.1.303 and changelog.md 5687 say SIGINT runs graceful shutdown with exit 0; this leaf is the measurement
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a human spawns one scratch tmux-lane session with CLAUDE_SPAWN_SELF_EXIT=1 and a >16 KB brief and records exit 0, exited last, the --resume hint, record.exit_request's pid, the launcher command length, and the measured element shapes of background_tasks and session_crons in the task
+- label: κ
+  task_id: null
+  title: 'Skill text cites the scripts and the machine homes (SKILL.md, deliberation.md, report-format.md)'
+  capabilities:
+  - name: scripts-landed
+    binding: capability→producer (upstream) — α, β, γ, δ, ε, ζ, η, ω
+    verdict: PASS
+  - name: held-leaf-prose-owner
+    binding: capability→producer (upstream) — task 6959 re-stamps the Held-leaf bullet κ then re-points at state.py
+    verdict: PASS
+  - name: phrases-present-today
+    binding: capability→substrate (wired) — `grep:skills/review-all/references/deliberation.md` "by hand until the program-tooling PRD lands"; `grep:skills/review-all/SKILL.md` "by hand until then"; present in this worktree's working tree, absent at main until the wave commits
+    verdict: PASS
+  - name: by-hand-pointer-removed
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: by hand until the program-tooling PRD lands
+      expect: absent
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: handoff-pointer-removed
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: by hand until then
+      expect: absent
+      paths:
+      - skills/review-all/SKILL.md
+  - name: scripts-cited
+    binding: built by this leaf — apply_return.py named in deliberation.md
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: apply_return\.py
+      expect: present
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: clerk-rules-cited
+    binding: built by this leaf — deliberation.md cites clerk_batch.py::CLERK_RULES instead of restating the recipes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CLERK_RULES
+      expect: present
+      paths:
+      - skills/review-all/references/deliberation.md
+  - name: held-leaves-section
+    binding: built by this leaf — report-format.md §Artefact 3 gains ## Held leaves and ## Ledger
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '## Held leaves'
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+  - name: seam-keys-cited
+    binding: built by this leaf — report-format.md cites state.py::SEAM_WAIT_KEYS instead of restating the field list
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: SEAM_WAIT_KEYS
+      expect: present
+      paths:
+      - skills/review-all/references/report-format.md
+  - name: cites-test
+    binding: built by this leaf — the mirror test over the three files (INV-10)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - tests/scripts/test_review_all_skill_text_cites_scripts.py
+- label: ω
+  task_id: null
+  title: 'Integration gate: the fixture walk (B1–B14), every script a subprocess under python3 -I -S'
+  capabilities:
+  - name: all-scripts
+    binding: capability→producer (upstream) — α, β, γ, δ, ε, ζ, η; ρ for the live shape the fake store serves
+    verdict: PASS
+  - name: tests-collected
+    binding: capability→substrate (wired) — root test_command and scripts/orchestrator.yaml both run pytest tests/scripts/ (`grep:tests/scripts/test_scripts_module_config.py::test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites`); `grep:tests/scripts/test_skills_module_config_decision.py::test_skills_has_no_tests_of_its_own` forbids tests under skills/; verified on main 3ed84d5c5a
+    verdict: PASS
+  - name: fixture-walk-script
+    binding: built by this leaf — the PRD's signal; executable with a shebang, since kind script runs <root>/<script> directly
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_review_all_program_fixture.py
+      timeout_secs: 90
+  - name: fixture-walk-test
+    binding: built by this leaf
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - tests/scripts/test_review_all_program_fixture_walk.py
+signal_leaves:
+- ω
