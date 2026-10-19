@@ -16,7 +16,7 @@ from enum import StrEnum
 from types import MappingProxyType
 
 from shared.defects import MalformedDefectRef, NodeId, parse_ref
-from shared.pytest_mark_grammar import marker_name
+from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 
 __all__ = [
     'Carrier',
@@ -30,6 +30,8 @@ __all__ = [
 
 _DEFECT_MARKER = 'defect'
 _TEST_FUNCTION_PREFIX = 'test'
+_TEST_CLASS_PREFIX = 'Test'
+_CONSTRUCTORS = frozenset({'__init__', '__new__'})
 
 
 class DisablingMark(StrEnum):
@@ -144,18 +146,57 @@ def _defect_marks(tree: ast.Module) -> list[ast.expr]:
     return sorted(marks, key=lambda mark: (mark.lineno, mark.col_offset))
 
 
-def _test_items(body: Sequence[ast.stmt]) -> Iterator[tuple[str, list[ast.expr]]]:
+@dataclass(frozen=True)
+class _ScopeMarks:
+    """The marks that reach a scope from it and every scope enclosing it."""
+
+    defect_marks: tuple[ast.expr, ...] = ()
+
+    def with_elements(self, elements: Sequence[ast.expr]) -> _ScopeMarks:
+        defect_marks = tuple(element for element in elements if marker_name(element) == _DEFECT_MARKER)
+        return _ScopeMarks(self.defect_marks + defect_marks)
+
+
+_Definition = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+
+
+def _winning_definitions(body: Sequence[ast.stmt]) -> list[_Definition]:
+    """The scope's direct-child definitions, the last one of each name winning its first's place."""
+    definitions: dict[str, _Definition] = {}
     for statement in body:
-        is_function = isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
-        if is_function and statement.name.startswith(_TEST_FUNCTION_PREFIX):
-            yield statement.name, statement.decorator_list
+        if isinstance(statement, _Definition):
+            definitions[statement.name] = statement
+    return list(definitions.values())
+
+
+def _is_test_class(node: ast.ClassDef) -> bool:
+    if not node.name.startswith(_TEST_CLASS_PREFIX):
+        return False
+    return not any(
+        isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef) and statement.name in _CONSTRUCTORS
+        for statement in node.body
+    )
+
+
+def _test_items(
+    body: Sequence[ast.stmt], inherited: _ScopeMarks, class_chain: tuple[str, ...]
+) -> Iterator[tuple[str, _ScopeMarks]]:
+    """Each item pytest's default collection takes from a scope *body*, named, with the marks reaching it."""
+    scope = inherited.with_elements(pytestmark_elements(body))
+    for definition in _winning_definitions(body):
+        marks = scope.with_elements(definition.decorator_list)
+        if isinstance(definition, ast.ClassDef):
+            if _is_test_class(definition):
+                yield from _test_items(definition.body, marks, (*class_chain, definition.name))
+        elif definition.name.startswith(_TEST_FUNCTION_PREFIX):
+            yield '::'.join((*class_chain, definition.name)), marks
 
 
 _Reading = str | EnumerationGap
 
 
 def _carriers(
-    items: Iterator[tuple[str, list[ast.expr]]],
+    items: Iterator[tuple[str, _ScopeMarks]],
     readings: Mapping[int, _Reading],
     node_of: Callable[[str], NodeId],
 ) -> tuple[dict[str, tuple[Carrier, ...]], frozenset[int]]:
@@ -163,11 +204,9 @@ def _carriers(
     carriers: dict[str, dict[Carrier, None]] = {}
     reached: set[int] = set()
     for name, marks in items:
-        for mark in marks:
-            reading = readings.get(id(mark))
-            if reading is None:
-                continue
+        for mark in marks.defect_marks:
             reached.add(id(mark))
+            reading = readings[id(mark)]
             if isinstance(reading, str):
                 carriers.setdefault(reading, {})[Carrier(node_of(name), frozenset())] = None
     return {ref: tuple(item_carriers) for ref, item_carriers in carriers.items()}, frozenset(reached)
@@ -186,7 +225,7 @@ def _non_static(
 def _enumerate_module(path: str, node_of: Callable[[str], NodeId], tree: ast.Module) -> FileEnumeration:
     marks = _defect_marks(tree)
     readings = {id(mark): _read_ref(mark) for mark in marks}
-    carriers, reached = _carriers(_test_items(tree.body), readings, node_of)
+    carriers, reached = _carriers(_test_items(tree.body, _ScopeMarks(), ()), readings, node_of)
     gaps = tuple(reading for reading in readings.values() if isinstance(reading, EnumerationGap))
     return FileEnumeration(path, carriers, non_static=_non_static(marks, readings, reached), gaps=gaps)
 
