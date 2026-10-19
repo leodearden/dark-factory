@@ -357,7 +357,6 @@ class TicketStore:
         ``pending`` (unknown, cancelled, resolved, or already parked).
         """
         now = datetime.now(UTC) if now is None else now
-        defer_reason = DeferReason(reason)
         async with self._require_access().write() as db:
             row = next(iter(await db.execute_fetchall(
                 "SELECT attempts FROM tickets WHERE ticket_id = ? AND status = 'pending'",
@@ -375,7 +374,7 @@ class TicketStore:
                 """,
                 (
                     AWAITING_CURATION, attempts, _utc_iso(next_attempt_at),
-                    defer_reason.value, deferral_justification(defer_reason), ticket_id,
+                    reason.value, deferral_justification(reason), ticket_id,
                 ),
             )
         return attempts
