@@ -31,9 +31,23 @@ from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from shared.memory_eval_limits import LimitsConfig
-from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, metrics_artifact_path
-from shared.memory_eval_verdicts import RunnerFailureRecord
+from shared.memory_eval_limits import (
+    EvaluationResult,
+    LimitsConfig,
+    evaluate_series,
+    limits_artifact_path,
+    load_limits_artifact,
+    write_limits_artifact,
+)
+from shared.memory_eval_metrics import (
+    RUN_STAMP_ENV_VAR,
+    MetricSeries,
+    load_metric_series,
+    load_series_window,
+    metrics_artifact_path,
+    report_artifact_path,
+)
+from shared.memory_eval_verdicts import RunnerFailureRecord, VerdictEntry, verdict_entries
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.utils.target_store_preflight import TargetStoreMissing, assert_queue_dir_populated
@@ -177,6 +191,70 @@ def run_producer(
             producer, 'MissingArtifact', f'exited 0 without writing {expected}', completed.stderr, 0,
         )
     return None
+
+
+@dataclass(frozen=True)
+class EvalRun:
+    eval_id: str
+    series: MetricSeries
+    result: EvaluationResult
+    metrics_path: Path
+    report_path: Path
+    limits_path: Path
+    entries: tuple[VerdictEntry, ...]
+
+
+def evaluate_eval(root: Path, eval_id: str, stamp: str, limits_config: LimitsConfig) -> EvalRun:
+    """Judge this run's series, resuming from (and rewriting) the eval's limits-current.json.
+
+    Nothing is carried in memory between runs: the grandfather state is re-read
+    from disk every time, so a missing limits file means a first run, which is
+    the grandfather snapshot (D1).
+    """
+    metrics_path = metrics_artifact_path(root, eval_id, stamp)
+    series = load_metric_series(metrics_path)
+    if (series.eval_id, series.run_stamp) != (eval_id, stamp):
+        raise ValueError(
+            f'{metrics_path} holds {series.eval_id}@{series.run_stamp}, not {eval_id}@{stamp}.'
+        )
+    window = load_series_window(
+        root, eval_id, limit=limits_config.baseline_window, before_stamp=stamp,
+    )
+    limits_path = limits_artifact_path(root, eval_id)
+    prior = load_limits_artifact(limits_path) if limits_path.is_file() else None
+    result = evaluate_series(
+        series,
+        window,
+        limits_config,
+        frozenset(prior.grandfather_set) if prior is not None else None,
+        prior.snapshotted_metric_ids if prior is not None else None,
+    )
+    write_limits_artifact(result, limits_path)
+    return EvalRun(
+        eval_id=eval_id,
+        series=series,
+        result=result,
+        metrics_path=metrics_path,
+        report_path=report_artifact_path(root, eval_id, stamp),
+        limits_path=limits_path,
+        entries=verdict_entries(series, result),
+    )
+
+
+def evaluate_evals(
+    root: Path, eval_ids: Sequence[str], stamp: str, limits_config: LimitsConfig,
+) -> tuple[list[EvalRun], list[RunnerFailureRecord]]:
+    """Evaluate each eval in turn; one eval's failure is recorded and never stops the rest."""
+    runs: list[EvalRun] = []
+    failures: list[RunnerFailureRecord] = []
+    for eval_id in eval_ids:
+        try:
+            runs.append(evaluate_eval(root, eval_id, stamp, limits_config))
+        except Exception as exc:
+            failures.append(RunnerFailureRecord(
+                scope=eval_id, phase='evaluate', error_type=type(exc).__name__, message=str(exc),
+            ))
+    return runs, failures
 
 
 def _default_queue_dir() -> Path:
