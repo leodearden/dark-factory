@@ -23,14 +23,17 @@ _CONTROL_KILL_SECS = 15
 _TREATMENT_KILL_SECS = 60
 
 
-def _nested_session(kill_secs: int, *extra: str) -> subprocess.CompletedProcess[str]:
+def _nested_session(
+    basetemp: Path, kill_secs: int, *extra: str,
+) -> subprocess.CompletedProcess[str]:
     return run_probe_session(
-        _PROBE, kill_secs=kill_secs, backstop_secs=kill_secs * 8, extra=extra,
+        _PROBE, basetemp=basetemp, kill_secs=kill_secs,
+        backstop_secs=kill_secs * 8, extra=extra,
     )
 
 
-def test_without_the_drain_the_leak_hangs_loop_teardown_until_killed() -> None:
-    run = _nested_session(_CONTROL_KILL_SECS, '--noconftest')
+def test_without_the_drain_the_leak_hangs_loop_teardown_until_killed(tmp_path: Path) -> None:
+    run = _nested_session(tmp_path / 'probe-basetemp', _CONTROL_KILL_SECS, '--noconftest')
     assert run.returncode != 0, run.stdout[-2000:]
     assert 'Timeout' in run.stdout and '_cancel_all_tasks' in run.stdout, (
         'the control arm must die of pytest-timeout INSIDE loop teardown, '
@@ -39,7 +42,7 @@ def test_without_the_drain_the_leak_hangs_loop_teardown_until_killed() -> None:
     )
 
 
-def test_with_the_drain_the_same_leak_is_harmless() -> None:
-    run = _nested_session(_TREATMENT_KILL_SECS)
+def test_with_the_drain_the_same_leak_is_harmless(tmp_path: Path) -> None:
+    run = _nested_session(tmp_path / 'probe-basetemp', _TREATMENT_KILL_SECS)
     assert run.returncode == 0, run.stdout[-3000:] + run.stderr[-2000:]
     assert '1 passed' in run.stdout, run.stdout[-500:]
