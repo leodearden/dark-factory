@@ -59,7 +59,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1446, "function_local_imports": 6, "lines": 16007, "prose_lines": 9319, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1440, "function_local_imports": 5, "lines": 15999, "prose_lines": 9314, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 39, "function_local_imports": 1, "lines": 660, "prose_lines": 299, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 0, "function_local_imports": 0, "lines": 93, "prose_lines": 21, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
@@ -91,7 +91,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::__init__": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_abort_lane_acquisition": 20,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_acquire_lane_flock_off_thread": 3,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::_acquire_warm_lane_impl": 110,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_acquire_warm_lane_impl": 104,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_anchor_diff_lines": 19,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_assemble_warm_lane_census": 4,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_await_index_lock_clear": 9,

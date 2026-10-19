@@ -31,6 +31,7 @@ from orchestrator.git_ops import (
 from orchestrator.lane_lifecycle import (
     LANE_STATE_DIRNAME,
     AcquireRoute,
+    LaneLifecycle,
     LaneState,
 )
 
@@ -432,7 +433,7 @@ class TestAcquireRouteClassification:
 
         assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
         assert result.path == lane
-        record = git_ops._lane_lifecycle.read(result.path)
+        record = LaneLifecycle(git_ops.worktree_base).read(result.path)
         assert record is not None and record.state is LaneState.ASSIGNED
         assert record.task_id == 'D'
         _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
