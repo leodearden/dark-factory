@@ -11,10 +11,9 @@ configuration and must simply pass.
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
-from _orch_helpers import ORCH_DIR, ORCH_PYPROJECT, sanitized_probe_env
+from _probe_session import run_probe_session
 
 _PROBE = Path(__file__).with_name('_leaked_task_drain_probe.py')
 #: The control arm's whole run time: it hangs until pytest-timeout kills it.
@@ -25,15 +24,8 @@ _TREATMENT_KILL_SECS = 60
 
 
 def _nested_session(kill_secs: int, *extra: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable, '-m', 'pytest', str(_PROBE),
-            '-c', str(ORCH_PYPROJECT), '-o', 'addopts=', '-p', 'no:cacheprovider',
-            f'--timeout={kill_secs}', '--timeout-method=thread', '-q',
-            *extra,
-        ],
-        cwd=ORCH_DIR, env=sanitized_probe_env(), capture_output=True, text=True,
-        timeout=kill_secs * 8,
+    return run_probe_session(
+        _PROBE, kill_secs=kill_secs, backstop_secs=kill_secs * 8, extra=extra,
     )
 
 
