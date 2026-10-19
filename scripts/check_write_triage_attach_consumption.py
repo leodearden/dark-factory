@@ -231,10 +231,14 @@ def _attach_id_for(module: Any, candidate: Any) -> Any:
 
     ``canonical_id_of`` makes hoisting a child to its parent mandatory, so a
     correct remedy lands there. The ref's own function decides, so the probe
-    cannot drift from the write side. The metadata rule is only the fallback
-    for a ref that renamed it.
+    cannot drift from the write side; a ref older than the public name still
+    spells it ``_canonical_id_of``. The metadata rule is only the fallback for
+    a ref that spells it neither way.
     """
-    hoist = getattr(module, 'canonical_id_of', None)
+    hoist = (
+        getattr(module, 'canonical_id_of', None)
+        or getattr(module, '_canonical_id_of', None)
+    )
     if callable(hoist):
         try:
             resolved = hoist(candidate)
