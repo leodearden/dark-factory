@@ -14,11 +14,11 @@ import re
 from pathlib import Path
 
 import pytest
-from shared.memory_eval_verdicts import VerdictEntry, metric_fingerprint, verdict_entries
 from test_memory_eval_boundary import evaluate_exemplar
 
 from shared.memory_eval_limits import EvaluationResult, LimitsConfig, evaluate_series
 from shared.memory_eval_metrics import MetricSeries, load_metric_series, metrics_artifact_path
+from shared.memory_eval_verdicts import VerdictEntry, metric_fingerprint, verdict_entries
 
 _FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval'
 _EVAL_ID = 'e1-retrieval-health'
