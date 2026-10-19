@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
 from _orch_helpers import mcp_tool_envelope
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
@@ -1683,6 +1684,136 @@ def _debt_row(**overrides):
     return DebtRow(**fields)
 
 
+_LANE_HEAD = '1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b'
+_LANE_PASS = '20261019T120000-abc123'
+
+
+def _lane_context(**overrides):
+    """A cleared offline-lane :class:`DebtContext` with every field set."""
+    from orchestrator.flake_ledger import (
+        DebtContext,
+        DebtTrigger,
+        EvidenceKind,
+        FlakeCallSite,
+        RecentOccurrence,
+    )
+
+    kwargs: dict[str, Any] = {
+        'call_site': FlakeCallSite.offline_lane,
+        'trigger': DebtTrigger.cleared,
+        'command': 'qdrant-integration',
+        'working_directory': '/srv/dark-factory/fused-memory',
+        'reproduce': 'uv run pytest -m integration tests/test_x.py::test_y',
+        'heads': (_LANE_HEAD,),
+        'pass_ids': (_LANE_PASS,),
+        'evidence': (
+            RecentOccurrence(
+                pass_id='20261018T090000-000aaa', head='9f' * 20,
+                kind=EvidenceKind.error, first_line='ConnectionError: qdrant refused',
+            ),
+            RecentOccurrence(
+                pass_id=_LANE_PASS, head=_LANE_HEAD,
+                kind=EvidenceKind.failed, first_line='AssertionError: 3 != 4',
+            ),
+        ),
+    }
+    kwargs.update(overrides)
+    return DebtContext(**kwargs)
+
+
+def _occurrence(n: int):
+    from orchestrator.flake_ledger import EvidenceKind, RecentOccurrence
+
+    return RecentOccurrence(
+        pass_id=f'pass-{n}', head=None, kind=EvidenceKind.failed, first_line=f'line {n}',
+    )
+
+
+class TestDebtContext:
+    """The context an observation hands ``open_debt`` (offline-lane PRD D6, §5.6).
+    SYNC-ONLY CLASS."""
+
+    def test_is_frozen(self) -> None:
+        import dataclasses
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            _lane_context().command = 'other'  # type: ignore[misc]
+
+    def test_debt_trigger_has_exactly_two_members(self) -> None:
+        from orchestrator.flake_ledger import DebtTrigger
+
+        assert {t.value for t in DebtTrigger} == {'cleared', 'recovered'}
+
+    def test_only_the_call_site_and_the_trigger_are_required(self) -> None:
+        from orchestrator.flake_ledger import DebtContext, DebtTrigger, FlakeCallSite
+
+        ctx = DebtContext(
+            call_site=FlakeCallSite.merge_gate,
+            trigger=DebtTrigger.cleared,
+            evidence=(_occurrence(1),),
+        )
+        assert (ctx.command, ctx.heads, ctx.evidence) == (None, (), (_occurrence(1),))
+
+    def test_more_evidence_than_the_limit_is_refused_by_name(self) -> None:
+        from orchestrator.flake_ledger import DEBT_CONTEXT_EVIDENCE_LIMIT
+
+        assert DEBT_CONTEXT_EVIDENCE_LIMIT == 5
+        with pytest.raises(ValueError, match='5') as raised:
+            _lane_context(evidence=tuple(_occurrence(n) for n in range(6)))
+        assert '6' in str(raised.value)
+
+    def test_the_json_codec_round_trips_to_an_equal_context(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtTrigger,
+            EvidenceKind,
+            FlakeCallSite,
+            debt_context_from_json,
+            debt_context_to_json,
+        )
+
+        ctx = _lane_context()
+        rt = debt_context_from_json(debt_context_to_json(ctx))
+
+        assert rt == ctx
+        assert rt is not None
+        assert rt.call_site is FlakeCallSite.offline_lane
+        assert rt.trigger is DebtTrigger.cleared
+        assert isinstance(rt.heads, tuple) and isinstance(rt.evidence, tuple)
+        assert all(isinstance(e.kind, EvidenceKind) for e in rt.evidence)
+
+    def test_an_empty_context_decodes_to_none(self) -> None:
+        from orchestrator.flake_ledger import debt_context_from_json
+
+        assert debt_context_from_json('{}') is None
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'not json',
+            '[]',
+            '{"call_site": "offline_lane"}',
+            '{"call_site": "offline_lane", "trigger": "bogus"}',
+            '{"call_site": "bogus", "trigger": "cleared"}',
+            json.dumps({
+                'call_site': 'offline_lane',
+                'trigger': 'cleared',
+                'evidence': [
+                    {'pass_id': None, 'head': None, 'kind': 'failed', 'first_line': str(n)}
+                    for n in range(6)
+                ],
+            }),
+        ],
+        ids=['not-json', 'not-an-object', 'no-trigger', 'bad-trigger', 'bad-call-site', 'six'],
+    )
+    def test_a_malformed_context_decodes_to_none_loudly(self, caplog, text: str) -> None:
+        from orchestrator.flake_ledger import debt_context_from_json
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert debt_context_from_json(text) is None
+
+        assert caplog.records
+
+
 class TestBuildDeflakeTaskArguments:
     """``build_deflake_task_arguments`` — the ``submit_task`` argument block ζ files.
 
@@ -1771,19 +1902,22 @@ class TestBuildDeflakeTaskArguments:
         assert FlakeVerdict.passes_in_isolation.value in args['title']
         assert FlakeVerdict.passes_in_isolation.value in args['description']
 
+    @pytest.mark.parametrize('trigger', [None, 'cleared', 'recovered'])
     @pytest.mark.parametrize('word', REMEDY_WORDS)
-    def test_title_presupposes_no_remedy(self, word: str) -> None:
+    def test_title_presupposes_no_remedy(self, word: str, trigger: str | None) -> None:
         """§5.5's corollary, machine-checked on the field an agent reads first.
 
-        The test_id is EXCISED before scanning: a test legitimately named
-        ``test_fix_timeout`` must not make this vacuously fail on a title that is
+        The test_id and the command are EXCISED before scanning: a test legitimately
+        named ``test_fix_timeout`` must not make this vacuously fail on a title that is
         itself clean."""
         from orchestrator.flake_ledger import build_deflake_task_arguments
 
         row = _debt_row()
-        title = build_deflake_task_arguments(row)['title']
+        context = None if trigger is None else _lane_context(trigger=trigger)
+        title = build_deflake_task_arguments(row, context)['title']
 
-        assert word not in title.replace(row.test_id, '').lower()
+        scanned = title.replace(row.test_id, '').replace('qdrant-integration', '')
+        assert word not in scanned.lower()
 
     def test_description_carries_the_never_widen_constraint(self) -> None:
         """The binding constraint of §5.5, carried in the filed task rather than left
@@ -1810,6 +1944,156 @@ class TestBuildDeflakeTaskArguments:
 
         assert RESPONSIBILITY_FIX_ROOT_DEFECT in description
         assert RESPONSIBILITY_REMOVE_FROM_LEDGER in description
+
+    @staticmethod
+    def _metadata(row) -> dict:
+        return {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': row.test_id,
+            'flake_debt_open_count': row.open_count,
+            'flake_debt_opened_at': row.opened_at,
+        }
+
+    def test_with_no_context_the_text_is_the_merge_gates(self) -> None:
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        row = _debt_row(open_count=2)
+        args = build_deflake_task_arguments(row)
+
+        assert args['description'] == merge_gate_deflake_description(row)
+        assert args['metadata'] == self._metadata(row)
+        assert build_deflake_task_arguments(row, None) == args
+
+    def test_a_cleared_lane_context_is_worded_in_the_lanes_terms(self) -> None:
+        from orchestrator.flake_ledger import (
+            LANE_NOTHING_SUPPRESSED,
+            LANE_TEST_NOT_ON_MERGE_GATE,
+            LANE_TRIGGER_OBSERVATIONS,
+            LIVE_DEPENDENCY_ROOT_DEFECT,
+            NEVER_WIDEN_A_TIMEOUT,
+            RESPONSIBILITY_FIX_ROOT_DEFECT,
+            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            DebtTrigger,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row(open_count=3)
+        ctx = _lane_context()
+        args = build_deflake_task_arguments(row, ctx)
+        description = args['description']
+
+        assert args['title'] == (
+            f'Flake debt: {row.test_id} — cleared on the offline lane (qdrant-integration), '
+            f'cycle 3'
+        )
+        expected = [
+            LANE_TRIGGER_OBSERVATIONS[DebtTrigger.cleared],
+            LANE_NOTHING_SUPPRESSED,
+            'qdrant-integration',
+            '/srv/dark-factory/fused-memory',
+            'uv run pytest -m integration tests/test_x.py::test_y',
+            *ctx.heads,
+            *ctx.pass_ids,
+            RESPONSIBILITY_FIX_ROOT_DEFECT,
+            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            NEVER_WIDEN_A_TIMEOUT,
+            LIVE_DEPENDENCY_ROOT_DEFECT,
+            LANE_TEST_NOT_ON_MERGE_GATE,
+        ]
+        for entry in ctx.evidence:
+            expected += [entry.pass_id, entry.kind.value, entry.first_line]
+        for text in expected:
+            assert text in description, text
+        assert 'merge landed' not in description
+        assert 'SUPPRESSED the red' not in description
+        assert args['metadata'] == {
+            **self._metadata(row),
+            'flake_debt_call_site': 'offline_lane',
+            'flake_debt_trigger': 'cleared',
+            'flake_debt_command': 'qdrant-integration',
+        }
+        assert (args['priority'], args['planning_mode']) == ('medium', True)
+
+    def test_a_recovered_lane_context_says_recovered(self) -> None:
+        from orchestrator.flake_ledger import (
+            LANE_TRIGGER_OBSERVATIONS,
+            DebtTrigger,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        args = build_deflake_task_arguments(row, _lane_context(trigger=DebtTrigger.recovered))
+
+        assert 'recovered on the offline lane' in args['title']
+        assert LANE_TRIGGER_OBSERVATIONS[DebtTrigger.recovered] in args['description']
+        assert LANE_TRIGGER_OBSERVATIONS[DebtTrigger.cleared] not in args['description']
+        assert args['metadata']['flake_debt_trigger'] == 'recovered'
+
+    def test_a_lane_context_with_nothing_but_its_trigger_says_not_recorded(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtContext,
+            DebtTrigger,
+            FlakeCallSite,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        args = build_deflake_task_arguments(
+            row, DebtContext(call_site=FlakeCallSite.offline_lane, trigger=DebtTrigger.cleared),
+        )
+
+        assert args['title'] == (
+            f'Flake debt: {row.test_id} — cleared on the offline lane, cycle 1'
+        )
+        assert 'flake_debt_command' not in args['metadata']
+        assert '(not recorded)' in args['description']
+        assert 'None' not in args['description']
+
+    def test_a_merge_gate_context_with_evidence_adds_an_evidence_block(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtContext,
+            DebtTrigger,
+            FlakeCallSite,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        evidence = (_occurrence(1), _occurrence(2))
+        ctx = DebtContext(
+            call_site=FlakeCallSite.merge_gate, trigger=DebtTrigger.cleared, evidence=evidence,
+        )
+        description = build_deflake_task_arguments(row, ctx)['description']
+
+        golden = merge_gate_deflake_description(row)
+        fields_end = golden.index('\n\nWhat that verdict means')
+        assert description.startswith(golden[:fields_end])
+        assert description.endswith(golden[fields_end:])
+        for entry in evidence:
+            for text in (entry.pass_id, entry.kind.value, entry.first_line):
+                assert text in description[fields_end:-len(golden[fields_end:])], text
+
+    def test_a_merge_gate_context_without_evidence_is_the_golden(self) -> None:
+        from orchestrator.flake_ledger import (
+            DebtContext,
+            DebtTrigger,
+            FlakeCallSite,
+            build_deflake_task_arguments,
+        )
+
+        row = _debt_row()
+        ctx = DebtContext(call_site=FlakeCallSite.merge_gate, trigger=DebtTrigger.cleared)
+
+        assert build_deflake_task_arguments(row, ctx)['description'] == (
+            merge_gate_deflake_description(row)
+        )
+
+    def test_building_with_a_context_opens_no_connection(self, monkeypatch) -> None:
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        opened = _count_connections(monkeypatch)
+        build_deflake_task_arguments(_debt_row(), _lane_context())
+
+        assert opened == []
 
 def _task(task_id: str, status: str | None = 'deferred', combined: bool = False) -> SubmittedTask:
     """A planning-mode ``submit_task`` outcome: the task, created ``deferred``."""
