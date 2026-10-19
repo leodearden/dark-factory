@@ -911,6 +911,7 @@ def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
 def promote_candidate(
     cb: dict, cand_id: str, entry_fields: dict, *,
     finding: census_findings.FindingIdentity | None = None,
+    supersedes: Sequence[str] = (),
 ) -> dict:
     """Promote candidate *cand_id* in *cb* to a new codebook entry.
 
@@ -923,9 +924,10 @@ def promote_candidate(
     what was actually observed, not *entry_fields*). The candidate itself
     is stamped ``disposition="promoted"`` and ``promoted_to`` naming the
     new entry id -- RETAINED, never removed (PRD decision 3). A *finding*
-    identity is stamped on the candidate (``census_findings.stamped``), and
-    the entry carries the stamped candidate's identity and supersedes chain
-    (``census_findings.carried_identity``).
+    identity is stamped on the candidate (``census_findings.stamped``), then
+    *supersedes* (another instrument's chain for an adopted key) is merged
+    into the candidate's chain, and the entry carries the stamped candidate's
+    identity and supersedes chain (``census_findings.carried_identity``).
     ``codebook.assert_no_deletion`` is run against the pre-transform *cb*
     before returning, as a construction-independent safety net.
     """
@@ -933,6 +935,8 @@ def promote_candidate(
     candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="promote_candidate")
     if finding is not None:
         candidate.update(census_findings.stamped(candidate, finding))
+    if supersedes:
+        candidate["supersedes"] = list(dict.fromkeys([*candidate.get("supersedes", []), *supersedes]))
 
     new_entry_id = entry_fields["id"]
     entry = {**entry_fields, **census_findings.carried_identity(candidate)}
@@ -2676,7 +2680,10 @@ def run_census(
     verdict parser's defaults) and ``retire_entry`` for any entry ids
     *verify_fn* reports fixed; contract finding keys are stamped at promotion
     and at a verdict-bearing rejection (``census_findings``, areas from
-    ``finding_area.load_area_map``), and every entry sighted this run has the
+    ``finding_area.load_area_map``) -- a verdict at a keyed entry's location
+    attaches to that entry (``prescreen.attach_by_key``), and a promotion at
+    a finding another instrument's newest record keys adopts that key
+    (``prescreen.load_instrument_findings``) -- and every entry sighted this run has the
     run appended to its ``last_seen_runs`` -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the route gate
     (``disposition.files``, contract §6: a structural verdict stays promoted
@@ -2894,6 +2901,7 @@ def run_census(
     area_map = finding_area.load_area_map(project_root)
     for note in area_map.notes:
         logger.warning("census: finding area map: %s", note)
+    instrument_findings = prescreen.load_instrument_findings(project_root, project_id)
     mining_result = mine_to_saturation(
         batch_source,
         codebook_dict,
@@ -3087,7 +3095,11 @@ def run_census(
     refuted: list[census_findings.Adjudication] = []
     promoted_entry_ids: dict[int, str] = {}
     key_attaches: list[prescreen.KeyAttach] = []
-    filed_under_standing: dict[int, dict] = {}
+    re_observed: list[prescreen.ReObserved] = []
+    # A verified cluster whose entry stands on an identity other than the one
+    # it minted (a key attach's standing key, an adopted external key) files
+    # under its entry's.
+    filed_under_entry_identity: dict[int, dict] = {}
 
     for index, cluster in enumerate(verified):
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -3125,7 +3137,7 @@ def run_census(
             )
             key_attaches.append(key_attach)
             promoted_entry_ids[index] = key_attach.entry_id
-            filed_under_standing[index] = {**cluster, "finding": key_attach.identity}
+            filed_under_entry_identity[index] = {**cluster, "finding": key_attach.identity}
             if key_attach.entry_id not in {adjudication.record_id for adjudication in promoted}:
                 promoted.append(census_findings.Adjudication(key_attach.entry_id, found, cluster.get("cause")))
             continue
@@ -3139,18 +3151,28 @@ def run_census(
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
             **census_findings.first_sighting_fields(run_id),
         }
+        # The cross-instrument rule (contract §9): a promotion at a finding
+        # another instrument's newest record keys takes that key, its
+        # supersedes and its first_seen, instead of minting a second key.
+        adoption = instrument_findings.match(cluster["finding"])
+        identity = cluster["finding"] if adoption is None else adoption.identity
+        if adoption is not None:
+            entry_fields["first_seen_run"] = adoption.first_seen or run_id
+            re_observed.append(prescreen.ReObserved(cluster["title"], entry_fields["id"], adoption))
+            filed_under_entry_identity[index] = {**cluster, "finding": identity}
         held = held_back.get(cluster.get("title"))
         if held is not None:
             entry_fields[ENTRY_FILING_KEY] = ENTRY_FILING_WITHHELD
             marked_withheld.append(held)
         updated_codebook = promote_candidate(
-            updated_codebook, cand_id, entry_fields, finding=cluster["finding"],
+            updated_codebook, cand_id, entry_fields, finding=identity,
+            supersedes=() if adoption is None else adoption.supersedes,
         )
         promoted.append(census_findings.Adjudication(entry_fields["id"], found, cluster.get("cause")))
         promoted_entry_ids[index] = entry_fields["id"]
 
     fileable = [
-        (filed_under_standing.get(index, cluster), promoted_entry_ids.get(index))
+        (filed_under_entry_identity.get(index, cluster), promoted_entry_ids.get(index))
         for index, (cluster, fileable_now) in enumerate(zip(verified, files_now, strict=True))
         if fileable_now
     ]
@@ -3331,9 +3353,7 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
-    screen_report = prescreen.ScreenReport(
-        screen, tuple(key_attaches), (), prescreen.InstrumentFindings((), None, ()),
-    )
+    screen_report = prescreen.ScreenReport(screen, tuple(key_attaches), tuple(re_observed), instrument_findings)
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
