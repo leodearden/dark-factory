@@ -560,6 +560,9 @@ function staleFailureThreshold() {
 }
 
 // The abort deadline for an endpoint's next attempt, given its failure streak.
+// A forced (ignoreBackoff) chip-click attempt gets the same deadline, so clicks
+// hold a wedged endpoint's socket no longer than the timer path does; it never
+// moves the streak (recordFailure), so it can neither trigger nor skip a probe.
 function attemptDeadlineMs(failures) {
   const pastThreshold = failures - staleFailureThreshold();
   if (pastThreshold < 0) return DEFAULT_TIMEOUT_MS;

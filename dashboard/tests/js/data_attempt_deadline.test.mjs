@@ -253,6 +253,8 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
 // ---------------------------------------------------------------------------
 
 const EXPECTED_STALE_PROBE_EVERY = 4;
+// The deadlines one probe cycle past the threshold arms, probe last.
+const PROBE_CYCLE = [...Array(EXPECTED_STALE_PROBE_EVERY - 1).fill(STALE_TIMEOUT_MS), DEFAULT_TIMEOUT_MS];
 
 // The /tasks service times task 5823's ticket measured under degraded conditions.
 const SPIKE_SERVICE_MS = 33000;
@@ -303,13 +305,14 @@ function makeVirtualEndpoint() {
     },
   };
 
-  // One refreshOne attempt, run to its outcome. It first waits out any backoff
-  // the way the poll loop's wall clock does, then fires timers in time order
-  // until the attempt settles. The clock never moves backwards.
-  async function attempt(api, state, path) {
-    clock = Math.max(clock, state.get(path)?.nextAllowedAt ?? 0);
+  // One refreshOne attempt, run to its outcome. A timer attempt first waits out
+  // any backoff the way the poll loop's wall clock does; a forced one starts at
+  // once, past its backoff, as a chip click does. Timers then fire in time
+  // order until the attempt settles. The clock never moves backwards.
+  async function attempt(api, state, path, { forced = false } = {}) {
+    if (!forced) clock = Math.max(clock, state.get(path)?.nextAllowedAt ?? 0);
     let outcome = null;
-    api.refreshOne(path, {}, state, deps).then(result => { outcome = result; });
+    api.refreshOne(path, {}, state, { ...deps, ignoreBackoff: forced }).then(result => { outcome = result; });
     await drain();
     while (outcome === null) {
       const timer = earliestTimer();
@@ -378,11 +381,38 @@ test('deadline: a wedged endpoint past the threshold arms the full deadline on o
 
   await attemptsQuietly(endpoint, api, state, STALE_FAILURE_THRESHOLD + 3 * EXPECTED_STALE_PROBE_EVERY);
 
-  const probeCycle = [...Array(EXPECTED_STALE_PROBE_EVERY - 1).fill(STALE_TIMEOUT_MS), DEFAULT_TIMEOUT_MS];
   assert.deepEqual(endpoint.armed, [
     ...Array(STALE_FAILURE_THRESHOLD).fill(DEFAULT_TIMEOUT_MS),
-    ...probeCycle,
-    ...probeCycle,
-    ...probeCycle,
+    ...PROBE_CYCLE,
+    ...PROBE_CYCLE,
+    ...PROBE_CYCLE,
   ]);
+});
+
+test('deadline: a forced attempt on a stale endpoint arms the deadline its timer streak dictates and never moves the probe', async () => {
+  // Pins the policy noted at data.js::attemptDeadlineMs: a chip click gets no
+  // full deadline of its own, and since it never advances the streak, the
+  // timer path's probe still lands on its own fourth attempt.
+  const endpoint = makeVirtualEndpoint();
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  await quietly(async () => {
+    for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) await endpoint.attempt(api, state, TASKS_PATH);
+    for (let i = 0; i < EXPECTED_STALE_PROBE_EVERY; i += 1) {
+      await endpoint.attempt(api, state, TASKS_PATH, { forced: true });
+      await endpoint.attempt(api, state, TASKS_PATH);
+    }
+  });
+
+  assert.deepEqual(
+    endpoint.armed.slice(STALE_FAILURE_THRESHOLD),
+    PROBE_CYCLE.flatMap(ms => [ms, ms]),
+    'each forced attempt must arm the deadline of the timer attempt that follows it',
+  );
+  assert.equal(
+    win.DF_DATA.__stale[TASKS_PATH].failures,
+    STALE_FAILURE_THRESHOLD + EXPECTED_STALE_PROBE_EVERY,
+    'only the timer attempts may advance the failure streak',
+  );
 });
