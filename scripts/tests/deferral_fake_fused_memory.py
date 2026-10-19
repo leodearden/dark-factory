@@ -5,13 +5,31 @@ A plain module rather than a conftest fixture, the same convention as
 ``sys.path``, so the test files import it by bare name. ``FakeFusedMemory.post``
 has the ``httpx.post`` signature ``legibility.census_trigger.post_mcp_envelope``
 calls, so a test installs it with ``install_fake_httpx(fake.post)``.
+
+``set_task_status`` emulates β's guarded re-stamp (``restamp_only``) through
+the shared model: ``task_deferral.parse_request`` decides every pure refusal,
+and only the two store checks β corroborates (the carrier exists, the carrier
+is not the row itself) are modelled here.
 """
 
 from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
+
+from shared.task_deferral import (
+    CarriedByRequest,
+    DeferralInvalid,
+    DeferralInvalidReason,
+    DeferralRefusalCode,
+    InvalidRecord,
+    parse_record,
+    parse_request,
+    record_to_json,
+    stamp,
+)
 
 METADATA_LOOKUP_LIMIT_CAP = 100
 
@@ -40,14 +58,27 @@ def _int_id(row: Mapping[str, Any]) -> int:
 
 class FakeFusedMemory:
     """*projects* maps a project root string to its get_tasks-wire row dicts.
-    A root not in *projects*, or in ``unreadable``, answers an error payload."""
+    A root not in *projects*, or in ``unreadable``, answers an error payload.
+    With *echo* False a successful re-stamp omits ``deferral``, as a server
+    that predates the deferral gate would."""
 
-    def __init__(self, projects: Mapping[str, Sequence[Mapping[str, Any]]]) -> None:
+    def __init__(self, projects: Mapping[str, Sequence[Mapping[str, Any]]], *, echo: bool = True) -> None:
         self.projects: dict[str, list[dict[str, Any]]] = {
             root: [copy.deepcopy(dict(row)) for row in rows] for root, rows in projects.items()
         }
+        self.echo = echo
         self.unreadable: set[str] = set()
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._moves: dict[tuple[str, int], str] = {}
+        self._kind_refusals: dict[tuple[str, int, str], DeferralInvalidReason] = {}
+
+    def move_before_write(self, root: str, task_id: int, status: str) -> None:
+        """Just before *task_id*'s next write, another writer moves the row to *status*."""
+        self._moves[(root, task_id)] = status
+
+    def refuse_kind(self, root: str, task_id: int, kind: str, reason_code: DeferralInvalidReason) -> None:
+        """Every write of a *kind* record to *task_id* is refused deferral_invalid *reason_code*."""
+        self._kind_refusals[(root, task_id, kind)] = reason_code
 
     def row(self, root: str, task_id: int) -> dict[str, Any]:
         (found,) = [row for row in self.projects[root] if _int_id(row) == task_id]
@@ -76,6 +107,8 @@ class FakeFusedMemory:
                 return self._get_statuses(rows, arguments)
             case 'find_tasks_by_metadata':
                 return self._find_tasks_by_metadata(rows, arguments)
+            case 'set_task_status':
+                return self._set_task_status(root, rows, arguments)
         return {'error': f'the fake has no tool {tool!r}', 'error_type': 'ValidationError'}
 
     @staticmethod
@@ -116,3 +149,66 @@ class FakeFusedMemory:
                 'has_more': offset + len(page) < len(matches),
             },
         }
+
+    def _set_task_status(self, root: str, rows: list[dict[str, Any]], arguments: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = int(arguments['id'])
+        moved = self._moves.pop((root, task_id), None)
+        found = [row for row in rows if _int_id(row) == task_id]
+        if not found:
+            return {'success': False, 'error': f'task {task_id} not found', 'error_type': 'TaskNotFoundError'}
+        (row,) = found
+        if moved is not None:
+            row['status'] = moved
+        if arguments.get('status') != 'deferred' or not arguments.get('restamp_only'):
+            return {'error': 'the fake models only the restamp_only write to deferred', 'error_type': 'ValidationError'}
+        now = datetime.now(UTC)
+        try:
+            request = parse_request(arguments.get('deferral'), now=now)
+            self._corroborate(rows, request)
+        except DeferralInvalid as exc:
+            return _invalid(task_id, exc.reason, exc.field, exc.value)
+        changed = self._changed(row, task_id, arguments)
+        if changed is not None:
+            return changed
+        if isinstance(request, CarriedByRequest) and request.carrier_task_id == task_id:
+            return _invalid(task_id, DeferralInvalidReason.CARRIER_IS_SELF, 'carrier_task_id', task_id)
+        forced = self._kind_refusals.get((root, task_id, request.kind.value))
+        if forced is not None:
+            return _invalid(task_id, forced, 'kind', request.kind.value)
+        record = record_to_json(stamp(request, stamped_at=now, stamped_by=arguments.get('agent_id'), deferred_at=None))
+        metadata = row['metadata'] if isinstance(row.get('metadata'), dict) else {}
+        row['metadata'] = {**metadata, 'deferral': record}
+        reply: dict[str, Any] = {'success': True, 'task_id': str(task_id), 'status': 'deferred'}
+        return {**reply, 'deferral': record} if self.echo else reply
+
+    @staticmethod
+    def _corroborate(rows: list[dict[str, Any]], request: object) -> None:
+        if isinstance(request, CarriedByRequest) and request.carrier_task_id not in {_int_id(row) for row in rows}:
+            raise DeferralInvalid(DeferralInvalidReason.CARRIER_NOT_FOUND, 'carrier_task_id', request.carrier_task_id)
+
+    @staticmethod
+    def _changed(row: Mapping[str, Any], task_id: int, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
+        metadata = _metadata(row)
+        record = parse_record(metadata.get('deferral')) if isinstance(metadata, dict) else None
+        current = None if record is None or isinstance(record, InvalidRecord) else record.stamped_at
+        if row['status'] == 'deferred' and current is None and arguments.get('expected_stamped_at') is None:
+            return None
+        return {
+            'success': False,
+            'error': DeferralRefusalCode.CHANGED.value,
+            'task_id': str(task_id),
+            'expected_stamped_at': arguments.get('expected_stamped_at'),
+            'current_stamped_at': None if current is None else current.isoformat(),
+            'current_status': row['status'],
+        }
+
+
+def _invalid(task_id: int, reason: DeferralInvalidReason, field: str, value: object) -> dict[str, Any]:
+    return {
+        'success': False,
+        'error': DeferralRefusalCode.INVALID.value,
+        'task_id': str(task_id),
+        'reason_code': reason.value,
+        'field': field,
+        'value': value,
+    }

@@ -14,8 +14,23 @@ from typing import Any
 import deferral_store
 import pytest
 from deferral_fake_fused_memory import FakeFusedMemory
-from deferral_store import DeferralStore, RecordHit, StoreUnreachable, TaskRow
+from deferral_store import (
+    Changed,
+    DeferralStore,
+    RecordHit,
+    Refused,
+    Stamped,
+    StoreUnreachable,
+    TaskRow,
+    Unechoed,
+)
 from legibility import census_trigger
+from shared.task_deferral import (
+    CarriedByDeferral,
+    DeferralInvalidReason,
+    DeferralRefusalCode,
+    record_to_json,
+)
 from shared.task_statuses import TaskStatus
 
 URL = 'http://fake'
@@ -177,3 +192,82 @@ class TestKnownProject:
         project_root_with_tasks_db(root)
 
         assert deferral_store.known_project(root) is True
+
+
+class TestRestamp:
+    AGENT = 'migrate-deferrals'
+    CARRIED_BY = {'kind': 'carried_by', 'carrier_task_id': 2, 'reason': 'migrated'}
+
+    def test_the_write_is_a_guarded_restamp_and_an_echo_is_stamped(
+        self, root: Path, store: DeferralStore, serve: Any
+    ) -> None:
+        fake = serve(FakeFusedMemory({str(root): [_row(1), _row(2, 'pending')]}))
+
+        outcome = store.restamp(root, 1, self.CARRIED_BY, agent_id=self.AGENT)
+
+        assert fake.calls_to('set_task_status') == [
+            {
+                'project_root': str(root),
+                'id': '1',
+                'status': 'deferred',
+                'deferral': self.CARRIED_BY,
+                'restamp_only': True,
+                'agent_id': self.AGENT,
+            }
+        ]
+        assert isinstance(outcome, Stamped)
+        assert isinstance(outcome.record, CarriedByDeferral)
+        assert outcome.record.carrier_task_id == 2
+        assert outcome.record.stamped_by == self.AGENT
+        assert fake.row(str(root), 1)['metadata']['deferral'] == record_to_json(outcome.record)
+
+    def test_deferral_invalid_is_refused_with_its_reason(self, root: Path, store: DeferralStore, serve: Any) -> None:
+        serve(FakeFusedMemory({str(root): [_row(1)]}))
+
+        outcome = store.restamp(root, 1, {**self.CARRIED_BY, 'carrier_task_id': 77}, agent_id=self.AGENT)
+
+        assert outcome == Refused(
+            code=DeferralRefusalCode.INVALID,
+            reason_code=DeferralInvalidReason.CARRIER_NOT_FOUND,
+            field='carrier_task_id',
+            value=77,
+        )
+
+    def test_deferral_changed_is_changed(self, root: Path, store: DeferralStore, serve: Any) -> None:
+        fake = serve(FakeFusedMemory({str(root): [_row(1), _row(2, 'pending')]}))
+        fake.move_before_write(str(root), 1, 'pending')
+
+        outcome = store.restamp(root, 1, self.CARRIED_BY, agent_id=self.AGENT)
+
+        assert outcome == Changed(current_status='pending', current_stamped_at=None)
+        assert fake.row(str(root), 1)['status'] == 'pending'
+
+    def test_a_success_without_the_echo_is_unechoed(self, root: Path, store: DeferralStore, serve: Any) -> None:
+        serve(FakeFusedMemory({str(root): [_row(1), _row(2, 'pending')]}, echo=False))
+
+        outcome = store.restamp(root, 1, self.CARRIED_BY, agent_id=self.AGENT)
+
+        assert isinstance(outcome, Unechoed)
+        assert outcome.reply['success'] is True
+
+    def test_another_error_code_is_refused_with_that_code(self, root: Path) -> None:
+        reply = {'success': False, 'error': 'deferral_write_authority', 'task_id': '1'}
+
+        outcome = _replying(reply).restamp(root, 1, self.CARRIED_BY, agent_id=self.AGENT)
+
+        assert outcome == Refused(code='deferral_write_authority', reason_code=None, field=None, value=None)
+
+    def test_an_echo_that_does_not_parse_is_refused(self, root: Path) -> None:
+        reply = {'success': True, 'deferral': {'kind': 'carried_by'}}
+
+        outcome = _replying(reply).restamp(root, 1, self.CARRIED_BY, agent_id=self.AGENT)
+
+        assert isinstance(outcome, Refused)
+        assert outcome.code == 'echo_unparseable'
+
+    def test_a_transport_raise_is_unreachable(self, root: Path) -> None:
+        def post(url: str, tool: str, arguments: dict[str, Any], *, timeout: float) -> Any:
+            raise TimeoutError('slow')
+
+        with pytest.raises(StoreUnreachable, match='set_task_status'):
+            DeferralStore(url=URL, post=post).restamp(root, 1, self.CARRIED_BY, agent_id=self.AGENT)
