@@ -39,7 +39,7 @@ import json
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -139,8 +139,12 @@ class TicketJanitor:
         known_projects: dict[str, str] | None = None,
         probe_defect_threshold: int = 3,
         dedup_outage: DedupOutageDetectorConfig | None = None,
+        requeue_ticket: Callable[[str, str], Awaitable[bool]] | None = None,
+        curation_backlog_min_attempts: int = 2,
     ) -> None:
         self._store = store
+        self._requeue_ticket = requeue_ticket
+        self._curation_backlog_min_attempts = curation_backlog_min_attempts
         # None (the default) leaves the dedup-outage detector off.
         self._dedup_outage_cfg = dedup_outage
         self._cooldown_secs = cooldown_secs
@@ -380,6 +384,23 @@ class TicketJanitor:
         if submitted:
             self._escalation_log[key].append(now)
 
+    async def _drain_awaiting_curation(self, requeue_ticket: Callable[[str, str], Awaitable[bool]]) -> None:
+        try:
+            due = await self._store.fetch_due_awaiting_curation(
+                now=datetime.now(UTC), limit=self._batch_limit,
+            )
+        except Exception:
+            logger.exception('ticket_janitor: fetch_due_awaiting_curation failed')
+            return
+        for row in due:
+            try:
+                await requeue_ticket(row['project_id'], row['ticket_id'])
+            except Exception:
+                logger.exception(
+                    'ticket_janitor: requeue of parked ticket %s failed; it stays '
+                    'parked for the next tick', row['ticket_id'],
+                )
+
     async def tick(self) -> None:
         """One janitor pass.
 
@@ -387,9 +408,16 @@ class TicketJanitor:
         loop never crashes the server. Background work for an MCP server
         should be allergic to unhandled exceptions.
         """
-        # 1) terminalise pending tickets whose project has no live curator
-        #    worker — replaces the old wall-clock TTL janitor with an honest
-        #    "is the worker actually processing?" signal.
+        if self._requeue_ticket is not None:
+            await self._drain_awaiting_curation(self._requeue_ticket)
+        await self._reap_dead_workers()
+        cfg = self._dedup_outage_cfg
+        if cfg is not None and cfg.enabled:
+            await self._check_dedup_outage(cfg)
+        await self._escalate_failed_tickets()
+
+    async def _reap_dead_workers(self) -> None:
+        """Recover the pending tickets of every project whose curator worker is gone."""
         if self._liveness_probe is not None:
             _pending_list_ok = False
             try:
@@ -463,11 +491,8 @@ class TicketJanitor:
                 for _stale_pid in _stale:
                     self._probe_failures.pop(_stale_pid, None)
 
-        # 1b) the dedup-outage detector, fault-isolated per project.
-        cfg = self._dedup_outage_cfg
-        if cfg is not None and cfg.enabled:
-            await self._check_dedup_outage(cfg)
-
+    async def _escalate_failed_tickets(self) -> None:
+        """Surface each group of un-escalated failed tickets as one ``ticket_failure``."""
         # 2) collect rows that haven't been escalated yet
         try:
             rows = await self._store.fetch_unescalated_failures(

@@ -16,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Literal, overload
 
@@ -25,8 +26,9 @@ from _fm_helpers import LoopFreedomProbe
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import ticket_janitor
+from fused_memory.middleware.curation_deferral import DeferralPolicy, DeferReason
 from fused_memory.middleware.ticket_janitor import TicketJanitor
-from fused_memory.middleware.ticket_store import TicketStore
+from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
 
 
 @pytest_asyncio.fixture
@@ -1240,3 +1242,135 @@ class TestDedupOutageDetector:
 
         assert len(self._escalations(roots['alpha'])) == 1
         assert self._escalations(roots['beta']) == []
+
+
+_PARK_POLICY = DeferralPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0)
+
+
+async def _park(
+    store: TicketStore,
+    project_id: str,
+    *,
+    title: str = 'A task',
+    reason: DeferReason = DeferReason.ALL_ACCOUNTS_CAPPED,
+    deferrals: int = 1,
+    parked_at: datetime | None = None,
+) -> str:
+    """Submit a ticket and defer it *deferrals* times, leaving it parked."""
+    parked_at = datetime.now(UTC) - timedelta(hours=1) if parked_at is None else parked_at
+    ticket_id = await store.submit(project_id=project_id, candidate_json=_candidate_blob(title=title))
+    for deferral in range(deferrals):
+        if deferral:
+            assert await store.requeue_awaiting_curation(ticket_id)
+        attempts = await store.mark_awaiting_curation(
+            ticket_id, reason=reason, policy=_PARK_POLICY, now=parked_at,
+        )
+        assert attempts == deferral + 1
+    return ticket_id
+
+
+class _RecordingRequeue:
+    """A stand-in for the interceptor's requeue: hands the row back to ``pending``."""
+
+    def __init__(self, store: TicketStore, events: list[str] | None = None) -> None:
+        self._store = store
+        self.calls: list[tuple[str, str]] = []
+        self._events = events if events is not None else []
+
+    async def __call__(self, project_id: str, ticket_id: str) -> bool:
+        self.calls.append((project_id, ticket_id))
+        self._events.append(f'requeue:{ticket_id}')
+        return await self._store.requeue_awaiting_curation(ticket_id)
+
+
+class TestCurationDrain:
+    """Tick step 0 hands each due parked ticket back to curation, oldest first."""
+
+    @pytest.mark.asyncio
+    async def test_drain_requeues_due_parked_rows_oldest_first(self, store, tmp_path):
+        pid = _project_id_for(tmp_path)
+        oldest, middle, newest = [await _park(store, pid, title=t) for t in 'ABC']
+        requeue = _RecordingRequeue(store)
+
+        await TicketJanitor(store, known_projects={}, requeue_ticket=requeue, batch_limit=2).tick()
+
+        assert requeue.calls == [(pid, oldest), (pid, middle)]
+        assert [(await store.get(t))['status'] for t in (oldest, middle, newest)] == [
+            'pending', 'pending', AWAITING_CURATION,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_drain_skips_rows_not_yet_due(self, store, tmp_path):
+        pid = _project_id_for(tmp_path)
+        due = await _park(store, pid, title='due')
+        not_due = await _park(store, pid, title='not-due', parked_at=datetime.now(UTC))
+        requeue = _RecordingRequeue(store)
+
+        await TicketJanitor(store, known_projects={}, requeue_ticket=requeue).tick()
+
+        assert requeue.calls == [(pid, due)]
+        assert (await store.get(not_due))['status'] == AWAITING_CURATION
+
+    @pytest.mark.asyncio
+    async def test_a_raising_requeue_leaves_the_row_parked_and_the_tick_running(
+        self, store, tmp_path,
+    ):
+        pid = _project_id_for(tmp_path)
+        doomed, survivor = await _park(store, pid, title='doomed'), await _park(store, pid, title='ok')
+        handed_back: list[str] = []
+
+        async def requeue(project_id: str, ticket_id: str) -> bool:
+            if ticket_id == doomed:
+                raise RuntimeError('worker start failed')
+            handed_back.append(ticket_id)
+            return await store.requeue_awaiting_curation(ticket_id)
+
+        probed: list[str] = []
+
+        def probe(project_id: str) -> bool:
+            probed.append(project_id)
+            return True
+
+        janitor = TicketJanitor(store, known_projects={}, requeue_ticket=requeue, liveness_probe=probe)
+        await janitor.tick()
+
+        assert handed_back == [survivor]
+        assert (await store.get(doomed))['status'] == AWAITING_CURATION
+        assert probed == [pid]
+
+    @pytest.mark.asyncio
+    async def test_drain_runs_before_the_reaper(self, store, tmp_path):
+        pid = _project_id_for(tmp_path)
+        ticket = await _park(store, pid)
+        events: list[str] = []
+
+        def probe(project_id: str) -> bool:
+            events.append(f'probe:{project_id}')
+            return True
+
+        janitor = TicketJanitor(
+            store, known_projects={}, requeue_ticket=_RecordingRequeue(store, events),
+            liveness_probe=probe,
+        )
+        await janitor.tick()
+
+        assert events == [f'requeue:{ticket}', f'probe:{pid}']
+
+    @pytest.mark.asyncio
+    async def test_reaper_signals_reparked_and_failed(self, store, tmp_path):
+        pid = _project_id_for(tmp_path)
+        never_deferred = await store.submit(project_id=pid, candidate_json=_candidate_blob(title='new'))
+        deferred_in_flight = await _park(store, pid, title='requeued')
+        assert await store.requeue_awaiting_curation(deferred_in_flight)
+        signalled: list[str] = []
+
+        janitor = TicketJanitor(
+            store, known_projects={}, liveness_probe=lambda _pid: False,
+            signal_ticket_resolved=signalled.append,
+        )
+        await janitor.tick()
+
+        assert sorted(signalled) == sorted([never_deferred, deferred_in_flight])
+        failed, reparked = await store.get(never_deferred), await store.get(deferred_in_flight)
+        assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
+        assert (reparked['status'], reparked['attempts']) == (AWAITING_CURATION, 1)
