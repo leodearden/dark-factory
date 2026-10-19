@@ -3403,6 +3403,48 @@
           "current": 6557
         }
       ]
+    },
+    {
+      "task_id": "3154",
+      "reason": "net-additive: task 3154 re-cut ruling park primitive (park_prior_incarnation + prior_incarnation_evidence and five helpers, each <=8 cognitive) in git_ops.py; Part A of the same task already lowered git_ops.py (cognitive 1446->1432, lines 16007->15977)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1432,
+          "current": 1463
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15977,
+          "current": 16110
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9302,
+          "current": 9321
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4825,
+          "current": 4856
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57046,
+          "current": 57179
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31545,
+          "current": 31564
+        }
+      ]
     }
   ]
 }
