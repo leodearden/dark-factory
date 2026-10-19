@@ -26,8 +26,12 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
+from escalation.queue import EscalationQueue
+from test_flake_debt_drain import _FakeLedgerTaskClient
 
 from orchestrator import flake_recorder
+from orchestrator.flake_debt_drain import run_drain_pass
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
     DueRow,
@@ -37,6 +41,7 @@ from orchestrator.flake_ledger import (
     delete_due_item,
     ledger_db_path,
     list_open_debt,
+    read_debt,
     read_due_items,
     read_occurrences,
 )
@@ -629,3 +634,78 @@ class TestRecordEnqueuesDebt:
         assert q.submitted[0].task_id == flake_recorder._MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
         assert q.submitted[0].level == 2
         assert len(_due(tmp_path)) == threshold
+
+
+_STORM_SUMMARY = (
+    'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate has '
+    'suppressed 5 merge-verify reds since the last reset'
+)
+
+
+def _merge_gate_title(test_id: str, cycle: int) -> str:
+    return (
+        f'Flake debt: {test_id} — passes_in_isolation after a merge-gate red was '
+        f'suppressed, cycle {cycle}'
+    )
+
+
+def _metadata(row) -> dict:
+    return {
+        'spawn_context': 'flake_ledger_debt',
+        'flake_debt_test': row.test_id,
+        'flake_debt_open_count': row.open_count,
+        'flake_debt_opened_at': row.opened_at,
+    }
+
+
+@pytest.mark.asyncio
+class TestScenario32MergeGateUnchanged:
+    """Scenario 32 (plans/offline-lane-red-path-prd.md): the merge gate through the one
+    recorder body and the drain leaves today's rows, debt, storm escalation and task
+    text, with the cycle now named in the de-flake title.  ASYNC-ONLY CLASS."""
+
+    async def test_five_suppressions_and_one_drain_pass_leave_todays_effects(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'queue')
+        for n in range(5):
+            await _record(
+                _result(_suppression(observed_at=f'2026-08-22T12:00:0{n}+00:00')),
+                tmp_path,
+                task_id=f'{_TASK_ID}-{n}',
+                escalation_queue=queue,
+            )
+        client = _FakeLedgerTaskClient()
+
+        await run_drain_pass(
+            ledger_db_path(tmp_path), _PROJECT_ID,
+            task_client=client, git=None, escalation_queue=queue,
+        )
+
+        rows = _occurrences(tmp_path)
+        assert len(rows) == 10, rows
+        assert {(r.test_id, r.task_id) for r in rows} == {
+            (test_id, f'{_TASK_ID}-{n}') for test_id in _IDS for n in range(5)
+        }
+        for r in rows:
+            assert (r.verdict, r.call_site, r.runner, r.merge_sha, r.detail) == (
+                'passes_in_isolation', 'merge_gate', 'remote-lab-1', _MERGE_SHA, '{}',
+            )
+        assert _due(tmp_path) == []
+        debt = list_open_debt(ledger_db_path(tmp_path))
+        assert sorted(d.test_id for d in debt) == sorted(_IDS)
+        assert all(d.owner_task_id for d in debt), debt
+
+        (storm,) = queue.get_by_task('merge-flake-suppression-storm', status='pending', level=2)
+        assert (storm.category, storm.severity, storm.summary) == (
+            'merge_flake_suppression_storm', 'critical', _STORM_SUMMARY,
+        )
+
+        assert len(client.submit_calls) == 2, client.submit_calls
+        for block in client.submit_calls:
+            row = read_debt(ledger_db_path(tmp_path), block['metadata']['flake_debt_test'])
+            assert row is not None
+            assert block['title'] == _merge_gate_title(row.test_id, 1)
+            assert block['description'] == merge_gate_deflake_description(row)
+            assert block['metadata'] == _metadata(row)
+            assert (block['priority'], block['planning_mode']) == ('medium', True)
