@@ -7,21 +7,27 @@ import json
 import logging
 import os
 import uuid as uuid_mod
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared import process_identity
+from shared.defects import DeclareEvent, OutcomeEvent
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
-from fused_memory.backends.defect_records import DefectCreationRefused, require_creation_floor
+from fused_memory.backends import defect_ref_lookup
+from fused_memory.backends.defect_records import (
+    DefectCreationRefused,
+    DefectWriteRefused,
+    require_creation_floor,
+)
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
@@ -6521,6 +6527,50 @@ class TaskInterceptor:
             statuses=statuses, limit=limit, offset=offset, tag=tag,
             include_value=include_value,
         )
+
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        operation: Literal['declare_defect', 'record_defect_outcome'],
+        agent_id: str | None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """The defect-record tools' write: the backend core under the write lock, journalled.
+
+        No backlog gate and no idempotency key: a proof or ruling must never be
+        shed under reconciliation backlog, and a replayed proof is refused by
+        I2's later-proof rule rather than replayed. A refusal returns its
+        ``to_error_dict()``; nothing was written.
+        """
+        tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
+        async with self._write_lock(project_id):
+            try:
+                result = await self._journal_around(
+                    operation,
+                    project_root,
+                    {'task_id': task_id, 'events': [event.model_dump(mode='json') for event in events]},
+                    tm.apply_defect_events(task_id, project_root, events, tag=tag),
+                    agent_id=agent_id,
+                )
+            except DefectWriteRefused as exc:
+                return exc.to_error_dict(task_id=task_id)
+        await self._journal(
+            self._make_event(
+                EventType.task_modified,
+                project_root,
+                {'task_id': task_id, 'operation': operation},
+            )
+        )
+        return {'success': True, **result}
+
+    async def lookup_defect_ref(
+        self, project_root: str, ref: str, *, tag: str | None = None,
+    ) -> defect_ref_lookup.DefectRefLookup:
+        return await defect_ref_lookup.lookup_defect_ref(self, project_root, ref, tag=tag)
 
     def _require_done_provenance(self) -> bool:
         """True when the provenance gate is enforcing (reject missing/invalid).

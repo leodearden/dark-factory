@@ -139,7 +139,9 @@ async def stack(tmp_path: Path) -> AsyncIterator[ToolStack]:
     root = _git_init_root(tmp_path / 'project')
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=root))
     await backend.start()
-    interceptor = TaskInterceptor(backend, None, EventBuffer(db_path=None))
+    event_buffer = EventBuffer(db_path=tmp_path / 'events.db', buffer_size_threshold=100)
+    await event_buffer.initialize()
+    interceptor = TaskInterceptor(backend, None, event_buffer)
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
     seeded = 0
 
@@ -160,6 +162,7 @@ async def stack(tmp_path: Path) -> AsyncIterator[ToolStack]:
     finally:
         await interceptor.close()
         await backend.close()
+        await event_buffer.close()
 
 
 # --- (a) the round trip -----------------------------------------------------------
