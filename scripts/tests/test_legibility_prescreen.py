@@ -625,3 +625,102 @@ def test_an_equal_key_wins_over_an_equal_location(tmp_path):
 
 def test_an_unmatched_identity_adopts_nothing(tmp_path):
     assert _loaded(tmp_path).match(_minted(anchor="orchestrator/x.py::g")) is None
+
+
+# ---------------------------------------------------------------------------
+# ScreenReport: per-rule counts, the run record, and the ## Screened section
+# rendered from the record alone (contract §5)
+# ---------------------------------------------------------------------------
+
+_NO_INPUTS_NOTE = "/review: no record matching review/reports/review-dark_factory-<YYYYMMDD>[-<n>].json"
+
+
+def _full_report(tmp_path: Path) -> prescreen.ScreenReport:
+    inputs = _loaded(tmp_path)
+    minted = _minted(tags=("h13", verdict.KIND_TAG))
+    adoption = inputs.match(minted)
+    assert adoption is not None
+    _, key_attach = _attach(_keyed_codebook())
+    return prescreen.ScreenReport(
+        screen=_screen(
+            _cluster("Rejected shape"),
+            _cluster("ENTRY only shape"),
+            _cluster("Brand new shape", session="sess-pending"),
+            _cluster("Fixed shape"),
+            _cluster("Novel shape"),
+        ),
+        attached=(key_attach,),
+        re_observed=(prescreen.ReObserved(title="C title", entry_id="entry-cand-20261019-3", adoption=adoption),),
+        inputs=inputs,
+    )
+
+
+def _empty_report() -> prescreen.ScreenReport:
+    return prescreen.ScreenReport(
+        screen=prescreen.Screen((), (), ()),
+        attached=(),
+        re_observed=(),
+        inputs=prescreen.InstrumentFindings((), _NO_INPUTS_NOTE, ()),
+    )
+
+
+def test_the_report_counts_each_rule(tmp_path):
+    assert _full_report(tmp_path).counts() == {"title": 2, "session": 1, "key": 1, "cross_instrument": 1}
+
+
+def test_an_empty_report_counts_zero_for_every_rule():
+    assert _empty_report().counts() == {"title": 0, "session": 0, "key": 0, "cross_instrument": 0}
+
+
+def test_the_report_record_round_trips_through_json(tmp_path):
+    record = _full_report(tmp_path).to_record()
+
+    assert json.loads(json.dumps(record)) == record
+
+
+def _section(report: prescreen.ScreenReport) -> list[str]:
+    return prescreen.report_lines(json.loads(json.dumps(report.to_record())))
+
+
+def _lines_naming(lines: list[str], *needles: str) -> list[str]:
+    return [line for line in lines if all(needle in line for needle in needles)]
+
+
+def test_the_section_opens_with_its_heading_and_one_count_line(tmp_path):
+    lines = _section(_full_report(tmp_path))
+
+    assert lines[:3] == ["", "## Screened", ""]
+    assert len(_lines_naming(lines, "title", "session", "key", "cross_instrument")) == 1
+
+
+def test_the_section_names_the_consumed_runs(tmp_path):
+    lines = _section(_full_report(tmp_path))
+
+    assert _lines_naming(lines, _REVIEW_RUN, _HOTSPOT_RUN, _REVIEW_ALL_RUN)
+
+
+def test_the_section_names_every_item_and_where_it_went(tmp_path):
+    lines = _section(_full_report(tmp_path))
+
+    assert _lines_naming(lines, "Rejected shape", "cand-20260701-3")
+    assert _lines_naming(lines, "ENTRY only shape", "entry-only")
+    assert _lines_naming(lines, "Brand new shape", "cand-20260701-1")
+    assert _lines_naming(lines, "Fixed shape", "entry-fixed", "surfaced")
+    assert not _lines_naming(lines, "Novel shape")
+    assert _lines_naming(lines, "B title", "entry-cand-20261001-1")
+    assert _lines_naming(lines, "C title", "entry-cand-20261019-3", _REVIEW_ALL_RUN)
+
+
+def test_a_key_attach_with_a_tag_disagreement_names_both_tags(tmp_path):
+    lines = _section(_full_report(tmp_path))
+
+    assert _lines_naming(lines, "B title", "h13", "h11")
+
+
+def test_an_empty_report_still_renders_zero_counts_and_the_inputs_note():
+    lines = _section(_empty_report())
+
+    assert lines[:3] == ["", "## Screened", ""]
+    (count_line,) = _lines_naming(lines, "title", "session", "key", "cross_instrument")
+    assert "1" not in count_line
+    assert _lines_naming(lines, _NO_INPUTS_NOTE)
