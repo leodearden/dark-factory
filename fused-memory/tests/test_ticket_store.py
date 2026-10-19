@@ -11,7 +11,7 @@ from _fm_helpers import seed_resolved_ticket
 from shared.async_sqlite_base import CheckpointResult
 from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
-from fused_memory.middleware.curation_deferral import DeferralPolicy
+from fused_memory.middleware.curation_deferral import DeferralPolicy, DeferReason
 from fused_memory.middleware.ticket_store import (
     AWAITING_CURATION,
     CurationBacklog,
@@ -86,6 +86,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
             'escalated_at',
             'attempts',
             'next_attempt_at',
+            'defer_reason',
         }
         assert expected_columns == col_names, (
             f"Missing columns: {expected_columns - col_names}; "
@@ -256,7 +257,7 @@ async def test_get_returns_row_or_none(store):
     expected_keys = {
         'ticket_id', 'project_id', 'candidate_json', 'status',
         'task_id', 'reason', 'result_json', 'created_at', 'resolved_at',
-        'expires_at', 'escalated_at', 'attempts', 'next_attempt_at',
+        'expires_at', 'escalated_at', 'attempts', 'next_attempt_at', 'defer_reason',
     }
     assert expected_keys == set(row.keys())
     assert row['ticket_id'] == ticket_id
@@ -954,11 +955,15 @@ async def _submitted_at(store: TicketStore, ticket_id: str) -> datetime:
     return datetime.fromisoformat(row['created_at'])
 
 
-async def _park(store: TicketStore, ticket_id: str, *, after_seconds: float = 10.0) -> int | None:
+async def _park(
+    store: TicketStore,
+    ticket_id: str,
+    *,
+    after_seconds: float = 10.0,
+    reason: DeferReason = DeferReason.ALL_ACCOUNTS_CAPPED,
+) -> int | None:
     now = await _submitted_at(store, ticket_id) + timedelta(seconds=after_seconds)
-    return await store.mark_awaiting_curation(
-        ticket_id, reason='curation-deferred: all-accounts-capped', policy=_POLICY, now=now,
-    )
+    return await store.mark_awaiting_curation(ticket_id, reason=reason, policy=_POLICY, now=now)
 
 
 class TestCurationParking:
@@ -967,7 +972,7 @@ class TestCurationParking:
         return tmp_path / 'tickets.db'
 
     @pytest.mark.asyncio
-    async def test_legacy_db_gains_attempts_and_next_attempt_at(self, tmp_path):
+    async def test_legacy_db_gains_attempts_next_attempt_at_and_defer_reason(self, tmp_path):
         db_path = tmp_path / 'tickets.db'
         with sqlite3.connect(db_path) as conn:
             conn.execute("""
@@ -997,6 +1002,7 @@ class TestCurationParking:
             assert legacy is not None
             assert legacy['attempts'] == 0
             assert legacy['next_attempt_at'] is None
+            assert legacy['defer_reason'] is None
             assert await _park(store, 'tkt_legacy') == 1
         finally:
             await store.close()
@@ -1004,7 +1010,7 @@ class TestCurationParking:
         with sqlite3.connect(db_path) as conn:
             columns = {row[1] for row in conn.execute('PRAGMA table_info(tickets)')}
             indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
-        assert {'attempts', 'next_attempt_at'} <= columns
+        assert {'attempts', 'next_attempt_at', 'defer_reason'} <= columns
         assert 'ix_tickets_status_next_attempt' in indexes
 
     @pytest.mark.asyncio
@@ -1018,6 +1024,7 @@ class TestCurationParking:
         assert row['status'] == AWAITING_CURATION == 'awaiting_curation'
         assert row['attempts'] == 1
         assert row['reason'] == 'curation-deferred: all-accounts-capped'
+        assert row['defer_reason'] == 'all-accounts-capped'
         assert row['resolved_at'] is None
         assert row['task_id'] is None
 
@@ -1045,15 +1052,32 @@ class TestCurationParking:
         assert await _park(store, resolved) is None
         assert await _park(store, parked) is None
         assert await store.mark_awaiting_curation(
-            'tkt_unknown', reason='r', policy=_POLICY, now=datetime.now(UTC),
+            'tkt_unknown', reason=DeferReason.ALL_ACCOUNTS_CAPPED, policy=_POLICY, now=datetime.now(UTC),
         ) is None
         assert (await store.get(resolved))['status'] == 'created'
         assert (await store.get(parked))['attempts'] == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('reason', list(DeferReason))
+    async def test_park_derives_the_human_reason_from_the_defer_reason(self, store, reason):
+        tid = await store.submit('p', '{}')
+
+        await _park(store, tid, reason=reason)
+
+        row = await store.get(tid)
+        assert row['defer_reason'] == reason.value
+        assert row['reason'] == f'curation-deferred: {reason.value}'
+
+    @pytest.mark.asyncio
+    async def test_a_never_parked_row_has_no_defer_reason(self, store):
+        tid = await store.submit('p', '{}')
+
+        assert (await store.get(tid))['defer_reason'] is None
+
+    @pytest.mark.asyncio
     async def test_requeue_flips_parked_to_pending_keeping_attempts(self, store):
         tid = await store.submit('p', '{}')
-        await _park(store, tid)
+        await _park(store, tid, reason=DeferReason.ACCOUNTS_AUTH_FAILED)
 
         assert await store.requeue_awaiting_curation(tid) is True
 
@@ -1062,6 +1086,18 @@ class TestCurationParking:
         assert row['attempts'] == 1
         assert row['next_attempt_at'] is None
         assert row['resolved_at'] is None
+        assert row['defer_reason'] == 'accounts-auth-failed'
+
+    @pytest.mark.asyncio
+    async def test_a_reparked_row_records_the_latest_defer_reason(self, store):
+        tid = await store.submit('p', '{}')
+        await _park(store, tid, reason=DeferReason.ACCOUNTS_AUTH_FAILED)
+        await store.requeue_awaiting_curation(tid)
+
+        await _park(store, tid, reason=DeferReason.ALL_ACCOUNTS_CAPPED)
+
+        row = await store.get(tid)
+        assert (row['defer_reason'], row['attempts']) == ('all-accounts-capped', 2)
 
     @pytest.mark.asyncio
     async def test_requeue_refuses_a_non_parked_row(self, store):
@@ -1111,25 +1147,35 @@ class TestCurationParking:
             await store.fetch_due_awaiting_curation(now=datetime(2026, 10, 18, 12, 0, 0), limit=10)
 
     @pytest.mark.asyncio
-    async def test_summarise_groups_parked_rows_by_project(self, store, db_path):
+    async def test_summarise_groups_parked_rows_by_project_and_defer_reason(self, store, db_path):
+        capped = DeferReason.ALL_ACCOUNTS_CAPPED
+        auth_failed = DeferReason.ACCOUNTS_AUTH_FAILED
         twice = await store.submit('p', '{}')
         once = await store.submit('p', '{}')
+        p_auth = await store.submit('p', '{}')
         other = await store.submit('q', '{}')
         await store.submit('p', '{}')
         for tid in (twice, once, other):
             await _park(store, tid)
+        await _park(store, p_auth, reason=auth_failed)
         await store.requeue_awaiting_curation(twice)
         await _park(store, twice)
         _rewrite_row(db_path, once, created_at='2026-10-18T09:00:00+00:00')
         _rewrite_row(db_path, twice, created_at='2026-10-18T09:30:00+00:00')
+        _rewrite_row(db_path, p_auth, created_at='2026-10-18T10:00:00+00:00')
         _rewrite_row(db_path, other, created_at='2026-10-18T08:00:00+00:00')
 
         backlog = await store.summarise_awaiting_curation()
 
         assert backlog == [
-            CurationBacklog(project_id='p', count=2, oldest_created_at='2026-10-18T09:00:00+00:00', max_attempts=2),
-            CurationBacklog(project_id='q', count=1, oldest_created_at='2026-10-18T08:00:00+00:00', max_attempts=1),
+            CurationBacklog(project_id='p', defer_reason=auth_failed, count=1,
+                            oldest_created_at='2026-10-18T10:00:00+00:00', max_attempts=1),
+            CurationBacklog(project_id='p', defer_reason=capped, count=2,
+                            oldest_created_at='2026-10-18T09:00:00+00:00', max_attempts=2),
+            CurationBacklog(project_id='q', defer_reason=capped, count=1,
+                            oldest_created_at='2026-10-18T08:00:00+00:00', max_attempts=1),
         ]
+        assert all(type(group.defer_reason) is DeferReason for group in backlog)
 
     @pytest.mark.asyncio
     async def test_summarise_is_empty_with_nothing_parked(self, store):
@@ -1187,7 +1233,7 @@ async def test_flush_keeps_parked_rows_and_makes_them_due(store):
 @pytest.mark.asyncio
 async def test_flush_reparks_a_requeued_pending_row(store):
     requeued = await store.submit('p', '{}')
-    await _park(store, requeued)
+    await _park(store, requeued, reason=DeferReason.ACCOUNTS_AUTH_FAILED)
     await store.requeue_awaiting_curation(requeued)
     never_deferred = await store.submit('p', '{}')
 
@@ -1199,6 +1245,7 @@ async def test_flush_reparks_a_requeued_pending_row(store):
     assert row['attempts'] == 1
     assert row['next_attempt_at'] is None
     assert row['resolved_at'] is None
+    assert row['defer_reason'] == 'accounts-auth-failed'
     fresh = await store.get(never_deferred)
     assert (fresh['status'], fresh['reason']) == ('failed', 'server_restart')
 
@@ -1206,7 +1253,7 @@ async def test_flush_reparks_a_requeued_pending_row(store):
 @pytest.mark.asyncio
 async def test_recover_for_dead_worker_reparks_requeued_and_fails_the_rest(store):
     requeued = await store.submit('p', '{}')
-    await _park(store, requeued)
+    await _park(store, requeued, reason=DeferReason.ACCOUNTS_AUTH_FAILED)
     await store.requeue_awaiting_curation(requeued)
     never_deferred = await store.submit('p', '{}')
     parked = await store.submit('p', '{}')
@@ -1218,9 +1265,9 @@ async def test_recover_for_dead_worker_reparks_requeued_and_fails_the_rest(store
 
     assert recovery == OrphanedPendingRecovery(failed_ids=(never_deferred,), reparked_ids=(requeued,))
     reparked = await store.get(requeued)
-    assert (reparked['status'], reparked['attempts'], reparked['next_attempt_at']) == (
-        AWAITING_CURATION, 1, None,
-    )
+    assert (
+        reparked['status'], reparked['attempts'], reparked['next_attempt_at'], reparked['defer_reason'],
+    ) == (AWAITING_CURATION, 1, None, 'accounts-auth-failed')
     failed = await store.get(never_deferred)
     assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
     assert await store.get(parked) == parked_before
@@ -1254,7 +1301,7 @@ async def test_a_verdict_after_parking_counts_its_parked_latency(store, tmp_path
     submitted = datetime.now(UTC) - timedelta(seconds=900)
     _rewrite_row(tmp_path / 'tickets.db', tid, created_at=submitted.isoformat())
     await store.mark_awaiting_curation(
-        tid, reason='curation-deferred: all-accounts-capped', policy=_POLICY,
+        tid, reason=DeferReason.ALL_ACCOUNTS_CAPPED, policy=_POLICY,
     )
     await store.requeue_awaiting_curation(tid)
     await store.mark_resolved(tid, status='combined', task_id='12', reason='combine: same as 12')

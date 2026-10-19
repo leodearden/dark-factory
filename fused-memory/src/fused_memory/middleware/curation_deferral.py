@@ -14,7 +14,7 @@ import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal, assert_never
 
 from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import PoolFrozen
@@ -26,6 +26,16 @@ if TYPE_CHECKING:
 class DeferReason(StrEnum):
     ALL_ACCOUNTS_CAPPED = 'all-accounts-capped'
     ACCOUNTS_AUTH_FAILED = 'accounts-auth-failed'
+
+
+def backlog_severity(reason: DeferReason) -> Literal['info', 'blocking']:
+    match reason:
+        case DeferReason.ALL_ACCOUNTS_CAPPED:
+            return 'info'
+        case DeferReason.ACCOUNTS_AUTH_FAILED:
+            return 'blocking'
+        case _:
+            assert_never(reason)
 
 
 POOL_UNAVAILABLE_ERRORS: Final[tuple[type[Exception], ...]] = (

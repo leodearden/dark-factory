@@ -5,7 +5,10 @@ Tickets survive fused-memory restarts via SQLite (sibling DB to reconciliation.d
 Two statuses are non-terminal. ``pending`` is queued for, or in, curation.
 ``awaiting_curation`` is parked: the curator's account pool could not judge
 the submission, so it waits for its ``next_attempt_at`` and the ticket janitor
-requeues it to ``pending``. ``attempts`` counts its deferrals.
+requeues it to ``pending``. ``attempts`` counts its deferrals and
+``defer_reason`` holds the :class:`DeferReason` of the latest one; both
+survive the requeue. A parked ticket has no terminal bound: it waits for a
+verdict.
 
 A ``pending`` row whose worker is gone (a restart, or a dead worker) is
 recovered by one rule: one already deferred (``attempts > 0``) is re-parked,
@@ -33,6 +36,8 @@ from shared.async_sqlite_base import (
     connect_daemon,
 )
 
+from fused_memory.middleware.curation_deferral import DeferReason
+
 if TYPE_CHECKING:
     from fused_memory.middleware.curation_deferral import DeferralPolicy
 
@@ -51,9 +56,10 @@ class DedupHealth:
 
 @dataclass(frozen=True)
 class CurationBacklog:
-    """One project's parked tickets (see :meth:`TicketStore.summarise_awaiting_curation`)."""
+    """One project's parked tickets for one reason (see :meth:`TicketStore.summarise_awaiting_curation`)."""
 
     project_id: str
+    defer_reason: DeferReason
     count: int
     oldest_created_at: str
     max_attempts: int
@@ -112,7 +118,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     expires_at  TEXT NOT NULL,
     escalated_at TEXT,
     attempts    INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT
+    next_attempt_at TEXT,
+    defer_reason TEXT
 );
 """
 
@@ -150,6 +157,7 @@ SCHEMA_SQL = TABLE_SQL + INDEX_SQL
 _CURATION_RETRY_COLUMNS: Final = {
     'attempts': 'attempts INTEGER NOT NULL DEFAULT 0',
     'next_attempt_at': 'next_attempt_at TEXT',
+    'defer_reason': 'defer_reason TEXT',
 }
 
 
@@ -339,16 +347,17 @@ class TicketStore:
         self,
         ticket_id: str,
         *,
-        reason: str,
+        reason: DeferReason,
         policy: DeferralPolicy,
         now: datetime | None = None,
     ) -> int | None:
-        """Park a ``pending`` ticket the curator could not judge.
+        """Park a ``pending`` ticket the curator could not judge, for *reason*.
 
         Returns the ticket's new ``attempts``, or ``None`` when the row is not
         ``pending`` (unknown, cancelled, resolved, or already parked).
         """
         now = datetime.now(UTC) if now is None else now
+        defer_reason = DeferReason(reason)
         async with self._require_access().write() as db:
             row = next(iter(await db.execute_fetchall(
                 "SELECT attempts FROM tickets WHERE ticket_id = ? AND status = 'pending'",
@@ -361,10 +370,13 @@ class TicketStore:
             await db.execute(
                 """
                 UPDATE tickets
-                SET status = ?, attempts = ?, next_attempt_at = ?, reason = ?
+                SET status = ?, attempts = ?, next_attempt_at = ?, defer_reason = ?, reason = ?
                 WHERE ticket_id = ? AND status = 'pending'
                 """,
-                (AWAITING_CURATION, attempts, _utc_iso(next_attempt_at), reason, ticket_id),
+                (
+                    AWAITING_CURATION, attempts, _utc_iso(next_attempt_at),
+                    defer_reason.value, f'curation-deferred: {defer_reason}', ticket_id,
+                ),
             )
         return attempts
 
@@ -401,19 +413,20 @@ class TicketStore:
         return [dict(r) for r in rows]
 
     async def summarise_awaiting_curation(self) -> list[CurationBacklog]:
-        """Return every project's parked-ticket backlog, ordered by project."""
+        """Return the parked-ticket backlog per ``(project_id, defer_reason)``, in that order."""
         rows = await self._require_access().read_all(
             """
-            SELECT project_id, COUNT(*) AS count, MIN(created_at) AS oldest_created_at,
-                   MAX(attempts) AS max_attempts
+            SELECT project_id, defer_reason, COUNT(*) AS count,
+                   MIN(created_at) AS oldest_created_at, MAX(attempts) AS max_attempts
             FROM tickets WHERE status = ?
-            GROUP BY project_id ORDER BY project_id
+            GROUP BY project_id, defer_reason ORDER BY project_id, defer_reason
             """,
             (AWAITING_CURATION,),
         )
         return [
             CurationBacklog(
                 project_id=row['project_id'],
+                defer_reason=DeferReason(row['defer_reason']),
                 count=row['count'],
                 oldest_created_at=row['oldest_created_at'],
                 max_attempts=row['max_attempts'],

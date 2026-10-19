@@ -12,6 +12,7 @@ from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
     DeferralPolicy,
     DeferReason,
+    backlog_severity,
     dedupe_skipped_marker,
     pool_defer_reason,
 )
@@ -118,6 +119,18 @@ class TestPoolDeferReason:
         assert [reason.value for reason in DeferReason] == [
             'all-accounts-capped', 'accounts-auth-failed',
         ]
+
+
+class TestBacklogSeverity:
+    def test_a_capped_backlog_is_info_because_it_heals_at_reset(self):
+        assert backlog_severity(DeferReason.ALL_ACCOUNTS_CAPPED) == 'info'
+
+    def test_an_auth_failed_backlog_is_blocking_because_it_never_self_heals(self):
+        assert backlog_severity(DeferReason.ACCOUNTS_AUTH_FAILED) == 'blocking'
+
+    @pytest.mark.parametrize('reason', list(DeferReason))
+    def test_every_reason_has_a_severity(self, reason):
+        assert backlog_severity(reason) in ('info', 'blocking')
 
 
 class TestDedupeSkippedMarker:
