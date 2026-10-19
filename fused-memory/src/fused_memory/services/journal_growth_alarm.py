@@ -49,10 +49,11 @@ _ANCHOR_TASK_IDS = {
 
 _SUGGESTED_ACTIONS = {
     JournalCeiling.FILE_SIZE: (
-        'Check whether prune_write_ops is keeping up: its startup WARNING reports '
-        'the rows/sec it achieved and which horizon is still behind. Then decide '
-        'between an offline VACUUM (fused-memory stopped) and a deliberately raised '
-        f'max_file_bytes, recording the reason in {_BASIS}.'
+        'Check whether prune_write_ops is keeping up: its WARNING (logged at '
+        'startup and on every periodic pass) reports the rows/sec it achieved and '
+        'which horizon is still behind. Then decide between an offline VACUUM '
+        '(fused-memory stopped) and a deliberately raised max_file_bytes, '
+        f'recording the reason in {_BASIS}.'
     ),
     JournalCeiling.INSERT_RATE: (
         'Find which operation and agent drove the trailing-24 h insert count, e.g. '

@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _eval_refusal import answered
+from _orch_helpers import build_usage_gate
 from shared.cli_invoke import AgentResult
+from shared.config_models import AccountConfig
 
+from orchestrator.evals.measurement import (
+    MeasurementStage,
+    Scored,
+    Unmeasured,
+    UnmeasuredCause,
+)
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import (
     IssueMatch,
+    MatchedIssues,
     ScoringResult,
     _deduplicate_issues,
     _normalize_location,
@@ -164,20 +175,6 @@ class TestScoringMetrics:
         assert result.f1 > 0
 
 
-def _make_matcher_result(cost_usd: float = 0.42, structured: dict | None = None, output: str = '') -> AgentResult:
-    """Build a real AgentResult for invoke_agent in match_issues.
-
-    Uses the actual AgentResult dataclass so that field-shape changes are
-    caught at test time rather than silently diverging via SimpleNamespace.
-    """
-    return AgentResult(
-        success=True,
-        output=output,
-        cost_usd=cost_usd,
-        structured_output=structured,
-    )
-
-
 def _make_gt(gt_id: str = 'gt1') -> GroundTruthIssue:
     return GroundTruthIssue(
         id=gt_id,
@@ -189,70 +186,107 @@ def _make_gt(gt_id: str = 'gt1') -> GroundTruthIssue:
     )
 
 
-class TestMatchIssuesCost:
-    """Tests that match_issues returns a 3-tuple (matches, unmatched, cost_usd)."""
+_ONE_ISSUE = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
+
+
+class TestMatchIssues:
+    """match_issues is a Scored MatchedIssues with its cost, or an Unmeasured."""
 
     @pytest.mark.asyncio
-    async def test_returns_three_tuple_with_cost(self) -> None:
-        """match_issues returns (matches, unmatched, cost_usd) capturing the LLM call cost."""
-        fake_result = _make_matcher_result(cost_usd=0.42, structured={'matches': []})
-        reviewer_issues = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
-        ground_truth = [_make_gt('gt1')]
-
+    async def test_parseable_answer_is_scored_with_its_cost(self) -> None:
         with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = fake_result
-            result = await match_issues(
-                reviewer_issues=reviewer_issues,
-                ground_truth=ground_truth,
+            mock_invoke.return_value = answered({'matches': []}, cost_usd=0.42)
+            outcome = await match_issues(
+                reviewer_issues=_ONE_ISSUE,
+                ground_truth=[_make_gt('gt1')],
                 diff_text='diff',
             )
 
-        assert isinstance(result, tuple)
-        assert len(result) == 3
-        matches, unmatched, cost = result
-        assert isinstance(matches, list)
-        assert isinstance(unmatched, list)
-        assert cost == pytest.approx(0.42)
+        assert isinstance(outcome, Scored)
+        assert outcome.value == MatchedIssues(matches=[], false_positives=_ONE_ISSUE)
+        assert outcome.cost_usd == pytest.approx(0.42)
 
     @pytest.mark.asyncio
-    async def test_empty_inputs_cost_is_zero(self) -> None:
-        """match_issues returns 0.0 cost and does NOT call invoke_agent for empty inputs."""
+    async def test_a_valid_match_is_kept_and_its_finding_is_not_a_false_positive(self) -> None:
+        answer = {'matches': [{
+            'reviewer_issue_index': 0, 'ground_truth_id': 'gt1',
+            'confidence': 0.9, 'reasoning': 'same bug',
+        }]}
         with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            result_empty_reviewers = await match_issues(
+            mock_invoke.return_value = answered(answer, cost_usd=0.1)
+            outcome = await match_issues(
+                reviewer_issues=_ONE_ISSUE,
+                ground_truth=[_make_gt('gt1')],
+                diff_text='diff',
+            )
+
+        assert isinstance(outcome, Scored)
+        assert outcome.value.matches == [IssueMatch(
+            reviewer_issue=_ONE_ISSUE[0], ground_truth_id='gt1',
+            match_confidence=0.9, match_reasoning='same bug',
+        )]
+        assert outcome.value.false_positives == []
+
+    @pytest.mark.asyncio
+    async def test_empty_inputs_are_scored_without_invoking(self) -> None:
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            no_findings = await match_issues(
                 reviewer_issues=[],
                 ground_truth=[_make_gt('gt1')],
                 diff_text='diff',
             )
-            result_empty_gt = await match_issues(
-                reviewer_issues=[{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}],
+            no_ground_truth = await match_issues(
+                reviewer_issues=_ONE_ISSUE,
                 ground_truth=[],
                 diff_text='diff',
             )
             mock_invoke.assert_not_called()
 
-        assert result_empty_reviewers[2] == 0.0
-        assert result_empty_gt[2] == 0.0
+        assert no_findings == Scored(MatchedIssues(matches=[], false_positives=[]), cost_usd=0.0)
+        assert no_ground_truth == Scored(
+            MatchedIssues(matches=[], false_positives=_ONE_ISSUE), cost_usd=0.0,
+        )
 
     @pytest.mark.asyncio
     async def test_unparseable_output_still_reports_cost(self) -> None:
-        """match_issues reports incurred cost even when LLM output is unparseable."""
-        fake_result = _make_matcher_result(cost_usd=0.42, structured=None, output='not json at all')
-
-        reviewer_issues = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
-        ground_truth = [_make_gt('gt1')]
+        """PRD D1: an unparseable matcher answer is Unmeasured carrying its real spend."""
+        fake_result = AgentResult(
+            success=True, output='not json at all', cost_usd=0.42, structured_output=None,
+        )
 
         with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             mock_invoke.return_value = fake_result
-            result = await match_issues(
-                reviewer_issues=reviewer_issues,
-                ground_truth=ground_truth,
+            outcome = await match_issues(
+                reviewer_issues=_ONE_ISSUE,
+                ground_truth=[_make_gt('gt1')],
                 diff_text='diff',
             )
 
-        matches, unmatched, cost = result
-        assert matches == []
-        assert unmatched == reviewer_issues
-        assert cost == pytest.approx(0.42)
+        assert not isinstance(outcome, tuple)
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.stage is MeasurementStage.MATCHER
+        assert outcome.cause is UnmeasuredCause.UNPARSEABLE
+        assert outcome.cost_usd == pytest.approx(0.42)
+
+    @pytest.mark.parametrize('output', [
+        '{}',
+        json.dumps({'matches': 'x'}),
+        json.dumps({'matches': ['not-an-object']}),
+    ])
+    @pytest.mark.asyncio
+    async def test_an_answer_without_a_matches_list_is_unparseable(self, output: str) -> None:
+        fake_result = AgentResult(success=True, output=output, cost_usd=0.2)
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            outcome = await match_issues(
+                reviewer_issues=_ONE_ISSUE,
+                ground_truth=[_make_gt('gt1')],
+                diff_text='diff',
+            )
+
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.cause is UnmeasuredCause.UNPARSEABLE
 
 
 class TestScoringResultMatchCost:
@@ -297,7 +331,7 @@ class TestScorePanelRunCost:
         )
 
         with patch('orchestrator.evals.reviewer_trial.scorer.match_issues', new_callable=AsyncMock) as mock_match:
-            mock_match.return_value = ([], [], 0.37)
+            mock_match.return_value = Scored(MatchedIssues([], []), cost_usd=0.37)
             score = await score_panel_run(run, diff)
 
         assert score.cost_usd == pytest.approx(1.25)
@@ -342,7 +376,7 @@ class TestScorePanelRunCost:
 
         with patch('orchestrator.evals.reviewer_trial.scorer.match_issues', new_callable=AsyncMock) as mock_match:
             # Return one match, no false positives, and a non-zero matcher cost
-            mock_match.return_value = ([matched], [], 0.25)
+            mock_match.return_value = Scored(MatchedIssues([matched], []), cost_usd=0.25)
             score = await score_panel_run(run, diff)
 
         assert score.cost_usd == pytest.approx(2.00)
@@ -352,6 +386,33 @@ class TestScorePanelRunCost:
         # 1 true positive out of 1 finding → precision == 1.0
         assert score.precision == pytest.approx(1.0)
         assert score.f1 == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_score_panel_run_threads_its_gate_to_the_matcher(self) -> None:
+        diff = CorpusDiff(
+            diff_id='d3', language='python', source='synthetic',
+            diff_text='diff', description='d', ground_truth=[_make_gt('gt1')],
+        )
+        run = PanelRunResult(
+            variant_name='v1', diff_id='d3', total_cost_usd=1.0,
+            reviews={'r1': {'verdict': 'NEEDS_CHANGES', 'issues': _ONE_ISSUE}},
+        )
+        calls: list[dict] = []
+
+        async def recording_invoke(**kwargs: object) -> AgentResult:
+            calls.append(kwargs)
+            return answered({'matches': []})
+
+        gate = build_usage_gate(
+            [AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A')], ['tok-a'],
+        )
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', recording_invoke):
+            await score_panel_run(run, diff, usage_gate=gate)
+            await score_panel_run(run, diff)
+
+        gated, ungated = calls
+        assert gated['oauth_token'] == 'tok-a'
+        assert ungated.get('oauth_token') is None
 
 
 class TestMatcherIsolation:
@@ -363,7 +424,7 @@ class TestMatcherIsolation:
     @pytest.mark.asyncio
     async def test_matcher_denies_tools_and_strict_scopes_mcp(self) -> None:
         with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = _make_matcher_result(structured={'matches': []})
+            mock_invoke.return_value = answered({'matches': []})
             await match_issues(
                 reviewer_issues=[{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}],
                 ground_truth=[_make_gt('gt1')],

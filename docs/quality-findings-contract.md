@@ -181,10 +181,8 @@ Before filing, in this order, and the report records the step that
 decided each finding:
 
 1. **Key lookup.** `find_tasks_by_metadata(project_root, key="x_finding_key",
-   value=<key>)` (fused-memory MCP; until it lands, a read-only forensic
-   query per `CLAUDE.md` §"Forensic reads of tasks.db" that tests
-   membership with `json_each(metadata, '$.x_finding_key')`, since the key
-   may be a scalar or a list).
+   value=<key>)` (fused-memory MCP), which matches a list-valued
+   `x_finding_key` by membership.
    a. A task in `pending`, `in-progress`, `blocked`, `deferred` or
       `merge-deferred` → disposition `filed:<id>`; do not file.
    b. A `cancelled` task carrying `x_acceptance_reason` → `accepted:<id>`;

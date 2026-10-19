@@ -570,6 +570,7 @@ tasks:
       pattern: REIFY_PSI_GATE_PROC_PATH
       paths:
       - tests/infra/test_verify_admission_knob_parity.sh
+      - tests/infra/test_verify_plan_structure.py
       expect: present
   - name: the-unit-pinning-guard-is-co-changed-not-broken
     binding: 'rejection-mechanism — §Corrections (5): tests/infra/test_host_global_unit_pinning.sh

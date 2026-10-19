@@ -1362,7 +1362,7 @@ related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation
+claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1669,7 +1669,8 @@ One-off, timestamped, or id-suffixed annotation keys (e.g.
 metadata key — that just adds another `code=unknown_key` census line. Use
 the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
-value into a single `annotations` field.
+value into a single `annotations` field. An `x_` key is findable like any
+other top-level key through `find_tasks_by_metadata` (§9).
 
 `x_inv12_finding` and `x_inv12_owns` are the Tier-C keys of the INV-12
 sweep (exceptions are owned or ratified; PRD
@@ -1909,6 +1910,25 @@ a batch you just planned will not show up in `search_tasks` results even
 though it exists. Confirm a specific id landed with `get_task(id=...)`
 directly.
 
+**Look a task up by a metadata key with `find_tasks_by_metadata`, not a
+forensic sqlite read.** `find_tasks_by_metadata(project_root=...,
+key="x_finding_key", value="fk-…")` returns every task whose top-level
+`metadata[key]` matches, in every status including `deferred` and
+`cancelled` (unlike `search_tasks`, above). Omit `value` to match every task
+that carries the key at all. A str or int matches a scalar by equality and a
+list by membership, type-strictly, so `40` does not match `"40"`. Results
+are paged: follow `pagination.has_more` with `offset += returned`.
+`include_value=True` adds `matched_value`, the whole stored value, under a
+48,000 B page budget
+(`fused-memory/src/fused_memory/server/tools.py::RESULT_BYTE_BUDGET`);
+a single row over that budget comes back alone with `truncated_value: true`
+and its value elided, so read that task with `get_task`. `tasks_with_key`
+counts the tasks in the searched statuses that carry the key, so without a
+`statuses` filter `tasks_with_key == 0` means no task carries it at all (a
+misspelt key, or no producer has written it yet). An unknown status is
+rejected rather than searched. An error payload means the lookup failed,
+never "no match". Semantics: `plans/task-metadata-lookup-prd.md`.
+
 **Change a filed task's kind in place with `update_task`, not
 remove+refile.** If a task's `task_kind`, `before_done`, or other metadata
 needs correcting after filing, update it in place via `update_task` rather
@@ -1917,6 +1937,20 @@ anything depending on that id), history, and any escalations already
 attached to it. To retire a task instead of correcting it, cancel it
 (`status="cancelled"`) rather than removing it, so the record and its id
 remain resolvable by anything that referenced it.
+
+**Adding an escalation category.** Every filed category must be a member of
+`escalation/src/escalation/categories.py::EscalationCategory`; its module
+docstring states when a category is registered. `EscalationQueue.submit`,
+`submit_resolved` and the category-filtered readers raise
+`UnregisteredEscalationCategory` for anything else, and `escalate_blocker`,
+`escalate_info` and `promote_to_l2` return `{'error': ...}`. So a task that
+introduces a category adds the member IN THE SAME CHANGE, prefers passing the
+member over a bare string, and lists `escalation/src/escalation/categories.py`
+in its `files`, because that list is the lock.
+`escalation/tests/test_category_census.py` fails verify on an unregistered
+filer reached through literals, constants, imports or forwarding wrappers. It
+cannot see fully dynamic values (subscripts, call results from other modules);
+only the submit-time check catches those.
 
 ### Deferring a task
 

@@ -1,0 +1,30 @@
+{
+ "stream": "S24",
+ "prd_path": "docs/prds/review-all-settings-domains-and-deployment-profile.md",
+ "manifest_path": "docs/prds/review-all-settings-domains-and-deployment-profile.capability-manifest.yaml",
+ "leaves_estimate": 6,
+ "lead_rulings_on_open_questions": [
+  "Q1 confirmed: the hermetic-switch table lives in instance/guard.py::HERMETIC_SWITCHES (task 444 moved production refusals out of Settings validators); S24 owns the seam; the program seam row is amended to name instance/guard.py.",
+  "Q2: the YAML fleet-registry source is not a supported production configuration — add the row registry-yaml-only for roles {dispatch}, refused in production.",
+  "Q3: accepted — the friendly ValidationError print and exit 2 belong to S3's start sequence; S24 tests only a non-zero exit and the field name."
+ ],
+ "lead_actions_at_decompose": [
+  "every S24 leaf depends on 444",
+  "cancel 1051 with x_acceptance_reason naming 444 + S24-alpha",
+  "stamp fk-7d58a82ae8df on 454",
+  "cancel 995, 996, 999, 1000 with x_acceptance_reason naming S24-epsilon1 (if still pending)",
+  "S24-epsilon1 depends on 815"
+ ],
+ "revisions_to_earlier_rulings": [
+  "S20 Q2 revised: S24-alpha's deletion of run_dispatch's heartbeat check needs NO edge on S4 — the Settings type bound (feedback_heartbeat_seconds le DIVERGENCE_ESS_FRESH_S) refuses at every load, stronger than the role check; S4's construction-time check is the redundant second point.",
+  "2026-10-16 (Leo, S15 Q3 ruling): S24-gamma (1077) carries the staging rung — the hardened vs real-deployment predicates and a per-row environment scope on HERMETIC_SWITCHES (consent-off becomes a hardening row); S24-epsilon2 (1084) admits staging at render and refuses a simulated fleet in production. Lead decision: 1077 carries it, no new S24 leaf (one mechanism, one table). Recorded on both tasks; the S24 PRD §7 row carries a dated note."
+ ],
+ "cross_reference_lines": [
+  "S15's provider-mode-not-live row goes into HERMETIC_SWITCHES; S15's leaf depends on S24-gamma.",
+  "S14-epsilon depends on S24-epsilon2 (MOSQUITTO_LISTENER_PORT public; MQTT_HOST/PORT written into instance.env).",
+  "S3 depends on S24-alpha (frozen Settings, overrides at construction via bootstrap_role) and S24-delta (static dirs from settings).",
+  "S20-delta/epsilon depend on S24-alpha (moved defaults must satisfy alpha's domains).",
+  "S5 keeps StoreForwardBuffer's max_depth >= 1 refusal.",
+  "S23's renamed ops fields keep PositiveFloat/PositiveInt domains."
+ ]
+}

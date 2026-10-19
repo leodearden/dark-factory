@@ -683,7 +683,7 @@ fi
 # The error names the ENV VAR as well as the flag — a real second door into
 # this same guard, and an operator who used it would otherwise get an error
 # naming only a flag they never passed. Exit 2, the usage/WIRING class.
-if ! printf '%s\n' "$MAX_RECORD_AGE_DAYS" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
+if ! [[ "$MAX_RECORD_AGE_DAYS" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
     err "REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS (or --max-record-age-days) must be a non-negative integer of at most 5 digits, with no leading zero (days); got: '$MAX_RECORD_AGE_DAYS'"
     err "Run '$(basename "$0") --help' for usage."
     exit 2
@@ -698,7 +698,7 @@ MAX_RECORD_AGE_SECS=$(( MAX_RECORD_AGE_DAYS * 86400 ))
 # before the multiply: it looks like the same belt-and-braces and is the
 # opposite, because 0 means "bound disabled" — a swallowed arithmetic failure
 # would silently open the very hole this guard exists to close.
-if ! printf '%s\n' "${MAX_RECORD_AGE_SECS:-}" | grep -qE '^[0-9]+$'; then
+if ! [[ "${MAX_RECORD_AGE_SECS:-}" =~ ^[0-9]+$ ]]; then
     err "internal: --max-record-age-days $MAX_RECORD_AGE_DAYS did not yield a non-negative seconds bound; got: '${MAX_RECORD_AGE_SECS:-}'"
     exit 2
 fi

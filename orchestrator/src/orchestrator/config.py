@@ -1199,7 +1199,7 @@ class SpeculationProbeConfig(BaseModel):
     P(pass|depth) curve.
 
     ``probe_fraction=0.0`` (the default) disables the mechanism entirely:
-    :func:`orchestrator.merge_queue.select_probe_depth` always returns
+    :func:`orchestrator.merge_lane.worker.select_probe_depth` always returns
     ``None`` at fraction<=0, so dispatch falls through to the unchanged
     ``_verify_frontier_depth()`` path -- byte-identical to pre-task-2359
     behaviour.
@@ -1778,9 +1778,15 @@ class LaneCommand(BaseModel):
     (a shell string, via ``sh -c``) at idle nice/ionice in ``<worktree>/<cwd>``
     with ``DF_VERIFY_ROLE=offline``, off the merge hot path, always from the
     current ``main`` head. A red result routes through the existing
-    ``OfflineLaneWorker`` red path (confirm → fingerprint → dedup'd fix task →
-    staged L2), filing the fix task at ``fix_task_priority`` — no new mechanism
-    (INV-5). This generalizes the previously reify-hard-coded run seams to
+    ``OfflineLaneWorker`` red path: a red detection run is confirmed and
+    narrowed to the named tests; a command that declares ``outage_probe``
+    runs it first, and a probe that exits 75 naming a dependency makes the
+    pass an outage, escalated rather than filed; each failing test is a
+    per-test episode; an episode is filed as one fix task (at ``fix_task_priority``) once it is
+    reproduced on ``git.offline_lane_persist_passes`` spaced passes, with one
+    bounded level-1 escalation if the fix is unlanded after
+    ``git.offline_lane_red_unlanded_hours`` (plans/offline-lane-red-path-prd.md).
+    This generalizes the previously reify-hard-coded run seams to
     per-project config (PRD plans/integration-test-lane-prd.md, task alpha).
     """
 
@@ -1793,14 +1799,11 @@ class LaneCommand(BaseModel):
     command: str = Field(
         description=(
             'Shell command string launched via ``sh -c`` for this sub-run '
-            '(e.g. ``pytest -m integration``). Required. NOTE: the default '
-            'confirm/dedup path is pytest-oriented — it serializes via '
-            '``_serial_pytest_str`` and extracts still-failing pytest '
-            'node-ids. A non-pytest command that reproduces red (non-zero '
-            'exit, no parseable node-ids) is filed under a stable '
-            '``<name>::nonzero-exit`` sentinel rather than being swallowed as '
-            'a flake; inject a custom ``command_confirmation_runner`` for '
-            'richer per-failure dedup.'
+            '(e.g. ``pytest -m integration``). Required. A command that '
+            'exits non-zero while naming no test is held and filed under the '
+            "lane's unconfirmable pseudo-test "
+            '(``offline_lane_episode_state.py::UNCONFIRMABLE_SUFFIX``) rather '
+            'than being swallowed as a flake.'
         ),
     )
     cwd: str = Field(
@@ -1825,6 +1828,37 @@ class LaneCommand(BaseModel):
         description=(
             'When False this command is skipped by the offline-lane runner '
             '(a config-only off switch that leaves the entry in place).'
+        ),
+    )
+    outage_probe: str | None = Field(
+        default=None,
+        description=(
+            'Optional shell command run via ``sh -c`` once after a red '
+            'detection run, in ``<worktree>/<cwd>`` with the command\'s '
+            'environment but at normal priority (no idle nice/ionice). Exit 0 '
+            'means every external service the tests use is usable, and the red '
+            'goes to the confirm. Exit 75 '
+            '(``shared/src/shared/lane_probe.py::OUTAGE_EXIT_STATUS``) with a '
+            'first stdout line naming the failed dependency makes the pass an '
+            'outage, escalated rather than filed. Anything else, the timeout '
+            'included, is a broken probe, and the red goes to the confirm as if '
+            'none were declared (plans/offline-lane-red-path-prd.md D7). Read '
+            'by ``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
+        ),
+    )
+    outage_probe_timeout_secs: int = Field(
+        default=180,
+        ge=1,
+        description=(
+            'Seconds (default 180) the outage probe may run before its process '
+            'group is killed; a timeout is a broken probe. Read by '
+            '``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
         ),
     )
 
@@ -2059,15 +2093,41 @@ class GitConfig(BaseModel):
             'included) never widens what counts as a stale lock.'
         ),
     )
-    offline_lane_red_advances_before_blocker: int = Field(
-        default=3,
+    offline_lane_persist_passes: int = Field(
+        default=2,
         ge=1,
         description=(
-            'N = number of consecutive confirmed-red advances (same failing-'
-            'test-set fingerprint) the offline-deep lane worker (β3, PRD '
-            '§11.3 / C4) tolerates before promoting its filed fix task to a '
-            'born-at-L2 escalate_blocker. Not frozen — retunable via '
-            'orchestrator.yaml without a code change.'
+            'Number of counted passes (default 2) on which a per-test red '
+            'must reproduce before the offline-deep lane files its fix task '
+            '(PRD plans/offline-lane-red-path-prd.md D5); 1 restores filing '
+            'on the first reproduced pass. Read by '
+            '``offline_lane_episodes.lane_policy`` at every pass and tick, '
+            'never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_recheck_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'Minimum start-to-start spacing (seconds, default 1800.0) of '
+            'counted offline-lane passes, and the delay before a held red is '
+            're-observed (PRD D5, D12). '
+            'Read by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_red_unlanded_hours: float = Field(
+        default=24.0,
+        gt=0,
+        description=(
+            'Hours (default 24.0) a filed red may stay unlanded before the '
+            'lane raises its one bounded level-1 escalation (PRD D11); also '
+            'the expiry of a held episode (D5), one knob serving both. Read '
+            'by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
         ),
     )
     offline_lane_commands: list[LaneCommand] = Field(
@@ -2077,8 +2137,9 @@ class GitConfig(BaseModel):
             'entry drives one additional offline-lane sub-run — launched at '
             'idle nice/ionice via ``sh -c`` in ``<worktree>/<cwd>`` with '
             '``DF_VERIFY_ROLE=offline``, off the merge hot path, always from '
-            'head — that reuses the existing red path (confirm → dedup fix '
-            'task → staged L2). Generic commands run IN ADDITION to whichever '
+            'head — that reuses the existing red path (confirm → per-test '
+            'episodes → fix task filed on persistence); a declared '
+            '``outage_probe`` can turn a red into an escalated outage. Generic commands run IN ADDITION to whichever '
             'legacy seams (numeric / infra) are enabled. Defaults to [] '
             '(opt-in, byte-identical no-op). Uses default_factory to avoid a '
             'shared mutable default across model instances.'
@@ -3891,6 +3952,16 @@ class OrchestratorConfig(BaseSettings):
     # files. The orchestrator updates _revalidated_at and base_commit
     # directly, mirroring the confirm_plan MCP write semantics.
     revalidation_skip_enabled: bool = Field(default=True)
+    plan_text_fp_gate_enabled: bool = Field(
+        default=True,
+        description=(
+            'Task 4031: when the task description/details no longer '
+            'fingerprint to the plan _task_text_fp (or the plan has none), '
+            'decline the Lever-B revalidation skip and tell the revalidating '
+            'architect. OFF restores the pre-4031 skip; plans are still '
+            'stamped.'
+        ),
+    )
     max_revalidation_age_hours: float = Field(
         default=24.0,
         description=(
@@ -3918,6 +3989,16 @@ class OrchestratorConfig(BaseSettings):
         default=30,
         deprecated=True,
         description='Deprecated — set max_turns.simple_task instead.',
+    )
+
+    strict_mcp_config: bool = Field(
+        default=False,
+        description=(
+            'Scope every TaskWorkflow agent invocation to ONLY the orchestrator-built '
+            'mcp_config (--strict-mcp-config), ignoring the ambient project .mcp.json. '
+            'False in production (argv unchanged); EVAL_PROFILE sets it True so an eval '
+            'agent cannot reach live escalation / task DB / fused-memory (task 4757).'
+        ),
     )
 
     # Auto-eval — when the optimistic path (B-skip or C-simple) blocks at
@@ -6140,6 +6221,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # merge's breadth, and is read fresh off req.config at each gate
         # evaluation.  A safety kill switch behind a restart is not one.
         'merge_disjoint_skip_requires_verified_drift',
+        # Task-text amendment gate on the Lever-B skip (task 4031) — read off
+        # self.config at each revalidation decision and never captured, so a
+        # flip affects only the next decision.
+        'plan_text_fp_gate_enabled',
         # Merge-verify host selection order (task 5097, Lever C) — green-tier
         # because the policy is read per HostAllocator.acquire call and never
         # captured on the allocator, so a flip only changes which host the NEXT
@@ -6153,10 +6238,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # picked up by the very next invocation.
         'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
-        # leaf-mutation only per I3)
+        # leaf-mutation only per I3); the persistence trio is read by
+        # `offline_lane_episodes.lane_policy` at every pass, never cached
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
-        'git.offline_lane_red_advances_before_blocker',
+        'git.offline_lane_persist_passes',
+        'git.offline_lane_recheck_secs',
+        'git.offline_lane_red_unlanded_hours',
         # advance_main's foreign-index-lock stand-off budget (task 3060) —
         # a leaf-mutation-only tuning knob re-read per advance (never
         # captured at startup), so a reload takes effect on the very next

@@ -2,8 +2,8 @@
 
 Extracted verbatim from :mod:`orchestrator.workflow`: the ``WorkflowState``
 phase enum and the ``WorkflowOutcome`` enum, following the types-module +
-re-export-shim precedent established by :mod:`orchestrator.merge_types`
-(extracted from ``orchestrator.merge_queue``).  ``orchestrator.workflow``
+re-export-shim precedent established by :mod:`orchestrator.merge_lane.types`
+(extracted from ``orchestrator.merge_lane.worker``).  ``orchestrator.workflow``
 re-exports every name here through a top-level shim so existing importers
 (``from orchestrator.workflow import WorkflowState``, etc.) keep working
 unchanged.

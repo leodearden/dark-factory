@@ -18,7 +18,8 @@ from test_merge_deferred_recovery import ParkedScheduler, _abandoned_records
 from test_reconcile_stranded import _bind_queue
 
 from orchestrator.harness import Harness
-from orchestrator.merge_lane import MemberRedriveOutcome, SpeculativeMergeWorker
+from orchestrator.merge_lane import MemberRedriveOutcome
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 
 @pytest.fixture

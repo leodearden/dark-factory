@@ -28,9 +28,10 @@ See ``orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member`
 G6 archive verification: a scan of the live ``data/escalations`` archive (636
 records, 632 resolved/dismissed) found ``resolution_action`` values of
 *exactly* ``{close_only, resume, restart, abandon, park}`` and nothing else,
-occurring across escalation levels 0/1/2 and a wide, open category
-vocabulary (including categories like ``milestone_gate`` that are not even
-members of ``escalation.server.CATEGORIES``, which is inert/unvalidated).
+occurring across escalation levels 0/1/2 and a wide category vocabulary
+(including categories like ``milestone_gate`` far outside the original agent
+set). Legality is not narrowed by category: the registered vocabulary,
+``escalation.categories.EscalationCategory``, governs filing, not resolution.
 ``park`` at level 2 is semantically required (version-a) yet is absent from
 the archive, proving archive-absence does not imply illegality. Conclusion:
 the only combinations safe to reject are those whose *action* itself is

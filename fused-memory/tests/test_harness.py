@@ -16,6 +16,7 @@ from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.testing import make_gate_mock
 
 from fused_memory.models.reconciliation import (
@@ -8392,16 +8393,22 @@ class TestHarnessFilteredTaskTreeWiring:
         # Accessing a staticmethod via the class already unwraps it to a plain function
         real_helper = ReconciliationHarness._configure_task_sync
 
-        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+        def spy(
+            stage, *, filtered_task_tree=None, filtered_task_tree_fetched_at=None, remediation_mode=False
+        ):
             spy_calls.append(
                 {
                     'stage': stage,
                     'filtered_task_tree': filtered_task_tree,
+                    'filtered_task_tree_fetched_at': filtered_task_tree_fetched_at,
                     'remediation_mode': remediation_mode,
                 }
             )
             real_helper(
-                stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode
+                stage,
+                filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                remediation_mode=remediation_mode,
             )
 
         ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
@@ -8423,6 +8430,7 @@ class TestHarnessFilteredTaskTreeWiring:
         assert isinstance(stage2, TaskKnowledgeSync)
         assert call['stage'] is stage2
         assert call['filtered_task_tree'] is expected_tree
+        assert call['filtered_task_tree_fetched_at'] is not None
         assert call['remediation_mode'] is False
 
     @pytest.mark.asyncio
@@ -8448,16 +8456,22 @@ class TestHarnessFilteredTaskTreeWiring:
         spy_calls: list = []
         real_helper = ReconciliationHarness._configure_task_sync
 
-        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+        def spy(
+            stage, *, filtered_task_tree=None, filtered_task_tree_fetched_at=None, remediation_mode=False
+        ):
             spy_calls.append(
                 {
                     'stage': stage,
                     'filtered_task_tree': filtered_task_tree,
+                    'filtered_task_tree_fetched_at': filtered_task_tree_fetched_at,
                     'remediation_mode': remediation_mode,
                 }
             )
             real_helper(
-                stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode
+                stage,
+                filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                remediation_mode=remediation_mode,
             )
 
         ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
@@ -8693,6 +8707,89 @@ class TestHarnessFilteredTaskTreeWiring:
             f"fails this ordering check"
         )
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_the_pre_stage_tree_read_instant_into_stage2(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """Stage 2 receives the instant stamped right after the tree fetch (task 5093).
+
+        Same ordering proof as the remediation test above: the instant must be at
+        or after the fetch returned and strictly before Stage 1 ran, so a fresh
+        now() taken at Stage-2 configure time fails it.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        tree = self._make_tree()
+        fetch_state: dict = {}
+
+        async def _fetch(project_root):
+            fetch_state['fetched_returned_at'] = datetime.now(UTC)
+            return tree
+
+        harness._fetch_filtered_task_tree = _fetch
+
+        stage_state: dict = {}
+
+        async def _record_stage_ran(stage):
+            await asyncio.sleep(0.05)
+            stage_state['stage_ran_at'] = datetime.now(UTC)
+
+        async def _capture_stage2(stage):
+            stage_state['tree'] = stage.filtered_task_tree
+            stage_state['fetched_at'] = stage.filtered_task_tree_fetched_at
+
+        _mock_stage_run(harness.stages[0], before_return=_record_stage_ran)
+        _mock_stage_run(harness.stages[1], before_return=_capture_stage2)
+        _mock_stage_run(harness.stages[2])
+
+        await event_buffer.push(_make_event())
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+        assert stage_state['tree'] is tree
+        fetched_at = stage_state['fetched_at']
+        assert fetched_at is not None
+        assert fetched_at >= fetch_state['fetched_returned_at']
+        assert fetched_at < stage_state['stage_ran_at']
+
+    @pytest.mark.asyncio
+    async def test_remediation_threads_supplied_tree_read_instant_into_stage2(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """_run_remediation_pass hands Stage 2 the read instant of the tree it was given."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+        captured: dict = {}
+
+        async def capture_s2(stage):
+            captured['fetched_at'] = stage.filtered_task_tree_fetched_at
+
+        _mock_stage_run(stages[0])
+        _mock_stage_run(stages[1], before_return=capture_s2)
+        _mock_stage_run(stages[2])
+
+        instant = datetime.now(UTC) - timedelta(minutes=3)
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+            filtered_task_tree=self._make_tree(),
+            filtered_task_tree_fetched_at=instant,
+        )
+
+        assert captured.get('fetched_at') == instant
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""
@@ -8754,6 +8851,29 @@ class TestConfigureTaskSync:
 
         assert stage2.remediation_mode is True
         assert stage2.filtered_task_tree is tree
+
+    def test_configure_task_sync_sets_and_resets_tree_read_instant(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """The read instant travels with its tree; a configure call without one clears it."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stage2 = harness.stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+
+        instant = datetime.now(UTC)
+        ReconciliationHarness._configure_task_sync(
+            stage2, filtered_task_tree=self._make_tree(), filtered_task_tree_fetched_at=instant
+        )
+        assert stage2.filtered_task_tree_fetched_at is instant
+
+        ReconciliationHarness._configure_task_sync(stage2, filtered_task_tree=self._make_tree())
+        assert stage2.filtered_task_tree_fetched_at is None
 
     def test_configure_task_sync_is_staticmethod(self):
         """_configure_task_sync must be declared as a @staticmethod."""
@@ -16600,17 +16720,12 @@ class TestIntegrityGateInputParityWithRenderer:
         # dropped by any other process or developer would flip `corroborated` and
         # break test_uncorroborated_in_progress_cited_task_escalates for reasons
         # having nothing to do with the code under test. Stub values mirror the
-        # real absent-file returns exactly: read_scheduler_state's empty skeleton
-        # (scheduler_state.py::_empty_skeleton) and orchestrator_started_at's None
+        # real absent-file returns exactly: read_scheduler_state's
+        # SchedulerStateSnapshot.empty() and orchestrator_started_at's None
         # for an absent/unparseable lock.
         monkeypatch.setattr(
             harness_module, 'read_scheduler_state',
-            lambda _root: {
-                'queue': [], 'parks': {}, 'park_stacks': {},
-                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-                'snapshot_at': None,
-            },
+            lambda _root: SchedulerStateSnapshot.empty(),
         )
         monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 
@@ -17232,12 +17347,7 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
         # /tmp/test-project root).
         monkeypatch.setattr(
             harness_module, 'read_scheduler_state',
-            lambda _root: {
-                'queue': [], 'parks': {}, 'park_stacks': {},
-                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-                'snapshot_at': None,
-            },
+            lambda _root: SchedulerStateSnapshot.empty(),
         )
         monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 
@@ -19902,6 +20012,95 @@ class TestFullCycleWiringDiagnostics:
         )
         assert gqh.get('healthy') is False, (
             f'Expected graphiti_queue_health["healthy"]==False, got {gqh.get("healthy")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_attributes_dead_writes_by_operation(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """Stage 1's input and the unhealthy WARNING attribute dead writes per operation.
+
+        Task 5478.  Built through the constructor with the stages stubbed at class
+        level, so no private harness attribute is touched.  The WARNING keeps its
+        bare-token message; its extra carries the breakdown.
+        """
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            IntegrityCheck,
+            TaskKnowledgeSync,
+        )
+
+        dead_by_operation = {'add_episode': 2, 'add_memory_graphiti': 1}
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        mock_memory_service.durable_queue.get_stats = AsyncMock(
+            return_value={
+                'counts': {'dead': 3},
+                'oldest_pending_age_seconds': None,
+                'dead_by_operation': dict(dead_by_operation),
+            }
+        )
+        empty_project = AsyncMock()
+        empty_project.get_tasks = AsyncMock(return_value={'tasks': []})
+        empty_project.get_statuses_fresh = AsyncMock(return_value={})
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=empty_project,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=FusedMemoryConfig(
+                reconciliation=ReconciliationConfig(
+                    enabled=True,
+                    explore_codebase_root='/tmp/test',
+                    agent_llm_provider='anthropic',
+                    agent_llm_model='claude-sonnet-4-20250514',
+                    judge_enabled=False,
+                )
+            ),
+            known_projects={'test-project': '/tmp/test-project'},
+        )
+
+        stage1_queue_health: list = []
+
+        async def fake_run(
+            self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
+        ):
+            if isinstance(self, MemoryConsolidator):
+                stage1_queue_health.append(self.graphiti_queue_health)
+            now = datetime.now(UTC)
+            return StageReport(stage=self.stage_id, started_at=now, completed_at=now)
+
+        harness_logger = 'fused_memory.reconciliation.harness'
+        with (
+            patch.object(MemoryConsolidator, 'run', fake_run),
+            patch.object(TaskKnowledgeSync, 'run', fake_run),
+            patch.object(IntegrityCheck, 'run', fake_run),
+            caplog.at_level(logging.WARNING, logger=harness_logger),
+        ):
+            await harness.run_full_cycle(
+                'test-project', 'attribution-test', events=[_make_event()],
+            )
+
+        assert len(stage1_queue_health) == 1, (
+            f'expected Stage 1 to run once, saw {stage1_queue_health!r}'
+        )
+        assert stage1_queue_health[0]['dead_by_operation'] == dead_by_operation
+
+        unhealthy = [
+            r for r in caplog.records
+            if r.name == harness_logger
+            and r.getMessage() == 'reconciliation.graphiti_queue_unhealthy'
+        ]
+        assert len(unhealthy) == 1, (
+            f'expected exactly one bare-token unhealthy warning, got {unhealthy!r}'
+        )
+        assert getattr(unhealthy[0], 'dead_by_operation', None) == dead_by_operation, (
+            'the unhealthy warning extra must carry dead_by_operation'
         )
 
     @pytest.mark.asyncio

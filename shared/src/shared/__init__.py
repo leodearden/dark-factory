@@ -26,6 +26,7 @@ if TYPE_CHECKING:
         connect_daemon,
     )
     from shared.cli_invoke import (
+        BUDGET_EXHAUSTED_SUBTYPE,
         CAP_HIT_RESUME_PROMPT,
         CRASH_RECOVERY_RESUME_PROMPT,
         AgentFailureClass,
@@ -109,6 +110,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'apply_wal_pragmas': 'async_sqlite_base',
     'connect_daemon': 'async_sqlite_base',
     # shared.cli_invoke
+    'BUDGET_EXHAUSTED_SUBTYPE': 'cli_invoke',
     'CAP_HIT_RESUME_PROMPT': 'cli_invoke',
     'CRASH_RECOVERY_RESUME_PROMPT': 'cli_invoke',
     'AgentFailureClass': 'cli_invoke',
@@ -236,6 +238,7 @@ __all__ = [
     'apply_full_durability_pragmas',
     'connect_daemon',
     'apply_full_durability_pragmas_sync',
+    'BUDGET_EXHAUSTED_SUBTYPE',
     'CAP_HIT_RESUME_PROMPT',
     'CRASH_RECOVERY_RESUME_PROMPT',
     'AgentFailureClass',

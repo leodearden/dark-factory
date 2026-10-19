@@ -1684,7 +1684,12 @@ def publish(report_path):
     return sibling
 '''
 
-_CONFIG_YAML = 'write_triage:\n  enabled: false\n  judge_enabled: true\n'
+_SCORING_FIXED = '''\
+"""Fixture stand-in for fused-memory/scripts/eval_write_triage_scoring.py."""
+EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))
+'''
+
+_CONFIG_YAML ='write_triage:\n  enabled: false\n  judge_enabled: true\n'
 
 
 def _make_gate_repo(
@@ -1695,6 +1700,7 @@ def _make_gate_repo(
     shared_src: bool = False,
     eval_src: str | None = None,
     eval_text: str | None = None,
+    scoring_text: str | None = _SCORING_FIXED,
     repo_name: str = 'gate-repo',
 ) -> Path:
     """A throwaway git repo the gate script can be run from.
@@ -1719,6 +1725,10 @@ def _make_gate_repo(
     ``eval_write_triage_judge.py`` instead of the ``_EVAL_FIXED``/
     ``_EVAL_FAILING`` constants ``eval_src`` selects between (default
     ``'failing'`` when neither is given, matching the historical default).
+
+    ``scoring_text`` is written VERBATIM as the fixture's
+    ``eval_write_triage_scoring.py``, which item 2 also reads; ``None`` leaves
+    that file out of the fixture commit.
     """
     assert eval_text is None or eval_src is None, (
         'eval_text and eval_src are mutually exclusive'
@@ -1747,6 +1757,10 @@ def _make_gate_repo(
     (repo / 'fused-memory' / 'scripts' / 'eval_write_triage_judge.py').write_text(
         eval_source,
     )
+    if scoring_text is not None:
+        (repo / 'fused-memory' / 'scripts' / 'eval_write_triage_scoring.py').write_text(
+            scoring_text,
+        )
     (repo / 'fused-memory' / 'config').mkdir(parents=True)
     (repo / 'fused-memory' / 'config' / 'config.yaml').write_text(_CONFIG_YAML)
 
@@ -2718,6 +2732,129 @@ class TestItemsTwoAndFourReadingIsNotRaceProne:
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert 'FAIL  item 4' in proc.stdout, proc.stdout[:4000]
         assert 'PASS  item 4' not in proc.stdout, proc.stdout[:4000]
+
+    def test_a_defect_pattern_ahead_of_a_large_scoring_source_fails_item_2(self, tmp_path):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            eval_src='fixed',
+            scoring_text=_defect_first_eval_source('EVAL_OUTCOMES = list(TRIAGE_OUTCOMES)'),
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'FAIL  item 2' in proc.stdout, proc.stdout[:4000]
+        assert 'PASS  item 2' not in proc.stdout, proc.stdout[:4000]
+
+
+_SCORING_MODULE = 'eval_write_triage_scoring.py'
+_CLI_MODULE = 'eval_write_triage_judge.py'
+_REAL_EVAL_SCRIPTS = _REPO_ROOT / 'fused-memory' / 'scripts'
+
+
+def _item2_fail_lines(stdout: str) -> list[str]:
+    return [line for line in stdout.splitlines() if 'FAIL  item 2' in line]
+
+
+class TestItemTwoReadsTheScoringModule:
+    """Since task 5845, EVAL_OUTCOMES and the confusion/per-class order live in
+    eval_write_triage_scoring.py, so an item 2 that reads only the CLI passes
+    whatever happens there. Items 1 and 5 pass throughout, so the FAILING
+    ITEMS line names only the item under test.
+    """
+
+    @pytest.mark.parametrize(
+        'scoring_text',
+        [
+            'EVAL_OUTCOMES = list(TRIAGE_OUTCOMES)\n',
+            'confusion = dict.fromkeys(TRIAGE_OUTCOMES, 0)\n',
+        ],
+    )
+    def test_a_defect_in_the_scoring_module_fails_item_2(self, tmp_path, scoring_text):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+            scoring_text=scoring_text,
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(_SCORING_MODULE in line for line in _item2_fail_lines(proc.stdout)), (
+            proc.stdout
+        )
+        assert 'PASS  item 2' not in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+        assert 'FAILING ITEMS: 2' in proc.stdout.splitlines(), proc.stdout
+
+    def test_a_missing_scoring_module_fails_item_2_closed(self, tmp_path):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+            scoring_text=None,
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(
+            _UNVERIFIABLE in line and _SCORING_MODULE in line
+            for line in _item2_fail_lines(proc.stdout)
+        ), proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+        assert 'FAILING ITEMS: 2' in proc.stdout.splitlines(), proc.stdout
+
+    def test_a_defect_in_the_cli_is_blamed_on_the_cli(self, tmp_path):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_text=_EVAL_ITEM2_ONLY_FAILING,
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        fail_lines = _item2_fail_lines(proc.stdout)
+        assert any(_CLI_MODULE in line for line in fail_lines), proc.stdout
+        assert not any(_SCORING_MODULE in line for line in fail_lines), proc.stdout
+
+
+class TestItemTwoPolicesTheRealEvalModules:
+    """Item 2 run over the checkout's OWN eval CLI and scoring sources.
+
+    The clean run is the control that makes the mutation run non-vacuous; the
+    mutation is the reviewer's own, planted where EVAL_OUTCOMES is built today.
+    """
+
+    def _gate_repo(self, tmp_path: Path, *, scoring_text: str) -> Path:
+        return _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_text=(_REAL_EVAL_SCRIPTS / _CLI_MODULE).read_text(),
+            scoring_text=scoring_text,
+        )
+
+    def test_the_real_modules_pass_items_2_and_4(self, tmp_path):
+        repo = self._gate_repo(
+            tmp_path, scoring_text=(_REAL_EVAL_SCRIPTS / _SCORING_MODULE).read_text(),
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 2' in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+
+    def test_the_reviewers_mutation_of_the_real_scoring_module_fails_item_2(self, tmp_path):
+        source = (_REAL_EVAL_SCRIPTS / _SCORING_MODULE).read_text()
+        assert source.count('tuple(sorted(TRIAGE_OUTCOMES))') == 1, (
+            'EVAL_OUTCOMES is no longer built in eval_write_triage_scoring.py: '
+            'repoint SCORING in scripts/check_write_triage_flip_preconditions.sh '
+            '(item 2) at its new home, then update this test'
+        )
+        mutated = source.replace('tuple(sorted(TRIAGE_OUTCOMES))', 'list(TRIAGE_OUTCOMES)')
+        repo = self._gate_repo(tmp_path, scoring_text=mutated)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAILING ITEMS: 2' in proc.stdout.splitlines(), proc.stdout
+        assert any(_SCORING_MODULE in line for line in _item2_fail_lines(proc.stdout)), (
+            proc.stdout
+        )
 
 
 def _item5_note(stdout: str) -> str:

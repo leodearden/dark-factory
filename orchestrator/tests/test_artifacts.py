@@ -17,6 +17,7 @@ from shared import safe_io
 
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
     ReviewAggregation,
     TaskArtifacts,
@@ -406,6 +407,40 @@ class TestPlanProvenance:
         assert updated['task_id'] == 'task-1'
         assert updated['analysis'] == 'Some analysis'
         assert len(updated['steps']) == 1
+
+    def test_stamp_plan_provenance_writes_the_task_text_fingerprint(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
+        updated = artifacts.read_plan()
+        assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
+        assert updated['_session_id'] == 'session-abc123'
+        assert '_created_at' in updated
+
+    def test_stamp_plan_provenance_fingerprint_overwrites_a_stale_one(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan({**VALID_PLAN_WITH_STEPS, PLAN_TASK_TEXT_FP_KEY: 'tfp:old'})
+        artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
+        assert artifacts.read_plan()[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
+
+    def test_stamp_plan_provenance_without_fingerprint_keeps_the_existing_one(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('planner', task_text_fp='tfp:authored')
+        artifacts.stamp_plan_provenance('implementer-iteration')
+        updated = artifacts.read_plan()
+        assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:authored'
+        assert updated['_session_id'] == 'implementer-iteration'
+
+    def test_stamp_plan_provenance_without_fingerprint_adds_none(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert PLAN_TASK_TEXT_FP_KEY not in artifacts.read_plan()
 
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))

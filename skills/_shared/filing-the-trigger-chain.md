@@ -19,14 +19,13 @@ skills cite it and do not restate it.
 
 One chain per (project, skill) may be open. Before filing, look for tasks carrying
 `metadata.trigger_chain` for this skill in any non-terminal status (the
-`shared.task_statuses.ACTIVE` set, which includes `deferred`): once it lands,
-`find_tasks_by_metadata(project_root, key="trigger_chain", value=None, statuses=<non-terminal>)`
-filtered on `matched_value["skill"] == "<skill>"` and no `superseded_by` (the tool matches
-top-level keys only); until then the read-only forensic query of `CLAUDE.md` §"Forensic reads
-of tasks.db" on `json_extract(metadata, '$.trigger_chain.skill')`. If one exists, this run supersedes it
-(§5) before filing its own. Once the `plans/completion-driven-triggers-prd.md` guard
-lands, `submit_task` refuses a second open chain with `error_type: TriggerChainOpen`
-and the same §5 applies.
+`shared.task_statuses.ACTIVE` set, which includes `deferred`):
+`find_tasks_by_metadata(project_root, key="trigger_chain", value=None, statuses=<non-terminal>, include_value=True)`
+filtered on `matched_value["skill"] == "<skill>"` and no `superseded_by`, paging on
+`has_more`. The tool matches top-level keys only, and returns `matched_value` only with
+`include_value=True`. If one exists, this run supersedes it (§5) before filing its own.
+Once the `plans/completion-driven-triggers-prd.md` guard lands, `submit_task` refuses a
+second open chain with `error_type: TriggerChainOpen` and the same §5 applies.
 
 ## 2. Pick the form
 

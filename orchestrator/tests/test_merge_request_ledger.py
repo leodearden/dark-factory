@@ -1,4 +1,4 @@
-"""Unit tests for orchestrator.merge_request_ledger (task MQ-invariants eta / 1992).
+"""Unit tests for orchestrator.merge_lane.request_ledger (task MQ-invariants eta / 1992).
 
 Steps covered:
   step-1 RED   — RequestLedger lifecycle + exactly-once
@@ -7,12 +7,12 @@ Steps covered:
   step-4 GREEN — implement the alarm + sentinel
   step-5 RED   — re-export shim identity
 
-This module intentionally imports only orchestrator.merge_types /
-orchestrator.config (NOT orchestrator.merge_queue) at module scope for the
+This module intentionally imports only orchestrator.merge_lane.types /
+orchestrator.config (NOT orchestrator.merge_lane.worker) at module scope for the
 pure data-structure tests, per the plan's "narrow unit-test surface" design
 decision — RequestLedger has no git/GitOps dependency at all. The lone
 exception is step-5's shim-identity check, which imports
-orchestrator.merge_queue LOCALLY inside its test method (mirroring every
+orchestrator.merge_lane.worker LOCALLY inside its test method (mirroring every
 other RED-until-GREEN symbol in this file) so a not-yet-wired name never
 breaks collection of the rest of the file.
 """
@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file duplication convention — see test_merge_queue_resolve_release.py
@@ -71,11 +71,11 @@ def _make_request(
 class TestRequestLedgerLifecycle:
     """RequestLedger arm/sweep/requeue lifecycle (task 1992 step-1).
 
-    RED until step-2 GREEN adds orchestrator.merge_request_ledger.
+    RED until step-2 GREEN adds orchestrator.merge_lane.request_ledger.
     """
 
     async def test_on_dequeue_arms_the_ledger(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t1', 'task/t1')
@@ -87,7 +87,7 @@ class TestRequestLedgerLifecycle:
         assert req.request_id in ledger.open_request_ids()
 
     async def test_stuck_entries_respects_threshold(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t2', 'task/t2')
@@ -105,7 +105,7 @@ class TestRequestLedgerLifecycle:
         assert entry.age_secs == pytest.approx(2000)
 
     async def test_passive_resolution_via_set_result_sweeps_entry(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t3', 'task/t3')
@@ -120,7 +120,7 @@ class TestRequestLedgerLifecycle:
 
     async def test_passive_resolution_via_cancel_sweeps_entry(self) -> None:
         """Abandoned (cancelled) Futures count as resolved too."""
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t4', 'task/t4')
@@ -134,7 +134,7 @@ class TestRequestLedgerLifecycle:
         assert len(ledger) == 0
 
     async def test_on_requeued_removes_then_redequeue_restarts_age(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t5', 'task/t5')
@@ -155,7 +155,7 @@ class TestRequestLedgerLifecycle:
         assert stuck[0].age_secs == pytest.approx(2000)
 
     async def test_double_on_dequeue_keeps_earliest_and_does_not_duplicate(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t6', 'task/t6')
@@ -169,7 +169,7 @@ class TestRequestLedgerLifecycle:
         assert stuck[0].age_secs == pytest.approx(1500)  # measured from t0, not t0+500
 
     async def test_double_on_requeued_is_idempotent(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t7', 'task/t7')
@@ -181,7 +181,7 @@ class TestRequestLedgerLifecycle:
         assert ledger.is_empty()
 
     async def test_is_empty_reflects_state(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         assert ledger.is_empty()
@@ -204,7 +204,7 @@ class TestRequestLedgerLifecycle:
     # -----------------------------------------------------------------
 
     async def test_mark_warned_reflected_in_stuck_entries_already_warned(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t9', 'task/t9')
@@ -226,7 +226,7 @@ class TestRequestLedgerLifecycle:
         the previous episode's warned flag — mirrors the escalation's
         has_open_l1 dedup, which likewise doesn't dedup across episodes.
         """
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t10', 'task/t10')
@@ -245,13 +245,13 @@ class TestRequestLedgerLifecycle:
         )
 
     async def test_mark_warned_is_a_noop_for_absent_request_id(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         ledger.mark_warned('no-such-request')  # must not raise
 
     async def test_discard_removes_entry_regardless_of_unresolved_future(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         req = _make_request('t11', 'task/t11')
@@ -265,7 +265,7 @@ class TestRequestLedgerLifecycle:
         assert not req.result.done()  # discard never touches the Future
 
     async def test_discard_is_idempotent_for_absent_request_id(self) -> None:
-        from orchestrator.merge_request_ledger import RequestLedger
+        from orchestrator.merge_lane.request_ledger import RequestLedger
 
         ledger = RequestLedger()
         ledger.discard('no-such-request')  # must not raise
@@ -320,7 +320,7 @@ def _make_stuck(
     age_secs: float = 16201.0,
     phase: str = 'unowned',
 ):
-    from orchestrator.merge_request_ledger import StuckRequest
+    from orchestrator.merge_lane.request_ledger import StuckRequest
 
     return StuckRequest(
         request_id=request_id, task_id=task_id, branch=branch,
@@ -335,7 +335,7 @@ class TestMergeRequestStuckSentinel:
     """
 
     def test_sentinel_is_per_request_id(self):
-        from orchestrator.merge_request_ledger import _merge_request_stuck_sentinel
+        from orchestrator.merge_lane.request_ledger import _merge_request_stuck_sentinel
 
         assert _merge_request_stuck_sentinel('mr-abc12345') == '__merge_request_stuck__mr-abc12345'
 
@@ -347,7 +347,7 @@ class TestAlarmMergeRequestStuck:
     """
 
     def _call(self, eq, stuck, *, event_store=None):
-        from orchestrator.merge_request_ledger import _alarm_merge_request_stuck
+        from orchestrator.merge_lane.request_ledger import _alarm_merge_request_stuck
         _alarm_merge_request_stuck(eq, stuck, event_store=event_store)
 
     def test_none_queue_is_noop(self):

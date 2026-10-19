@@ -18,6 +18,7 @@ from fused_memory.reconciliation.live_workflow_section import (
     render_live_workflow_authority_rules,
 )
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    PRESERVED_SPECIMEN_COMPONENTS_KEY,
     preservation_mem0_filters,
 )
 from fused_memory.reconciliation.prompts import (
@@ -1019,7 +1020,10 @@ reset, a redispatch, or an operator gate task. Emit the finding at `severity='{F
 `preservation_specimen_guard.filter_preservation_specimen_flags`, which corroborates the \
 task against both stores and drops such a flag regardless of how it is worded — so a \
 stranded flag for a corroborated specimen will be dropped whatever you call it. It keeps \
-the flag whenever no citation exists or the corroboration could not be read.
+the flag whenever no citation exists or the corroboration could not be read. A finding \
+whose `task_id` joins several ids is dropped only when EVERY id is a corroborated \
+specimen; otherwise it is kept and annotated `{PRESERVED_SPECIMEN_COMPONENTS_KEY}` with \
+each specimen's citation — so put only the task the stranded claim is about in `task_id`.
 
 This rule exists because of a real incident: dark_factory task 3105 is the sole preserved \
 live validation specimen for gate task 3546, and this re-flag twice became an operator \

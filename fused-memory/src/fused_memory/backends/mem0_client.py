@@ -1,6 +1,5 @@
 """Per-project Mem0 AsyncMemory instance manager."""
 
-import asyncio
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Sequence
 from contextlib import aclosing
@@ -8,13 +7,14 @@ from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
 
+from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 
 logger = logging.getLogger(__name__)
 
-#: Return type of whatever a timed call is awaiting — see Mem0Backend._timed.
+#: Return type of whatever a timed call is awaiting — see Mem0Backend._timed_read.
 _T = TypeVar('_T')
 
 # The canonical Qdrant payload key for a memory's text, with the historical
@@ -230,21 +230,16 @@ class Mem0Backend:
     stringifies EMPTY, so a bare one reaches an operator's log, and
     ``MemoryService._store_failure_diagnostics['error']``, as no text at all.
     Propagating a fault while discarding the one detail that attributes it is
-    only half a fix, so both halves are enforced in one place: :meth:`_timed`
-    is the sole ``asyncio.wait_for`` call site on this class, reached through
-    :meth:`_timed_read` / :meth:`_timed_write`.
+    only half a fix, so both halves are enforced in one place: every timed
+    call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
+    to ``backends/timeout_budget.py::await_within``, the single home of the
+    message format.
 
     This paragraph is the CANONICAL statement of the rule, and a method's own
     ``Raises:`` line adds only the consequence specific to IT — so there is one
     copy of the rule to keep accurate rather than one per method.  Several
     methods predating task 5265 do still restate their own propagation inline;
     that is tolerated drift, not licence to add more.
-
-    ``GraphitiBackend`` still swallows its own inner ``TimeoutError`` on
-    ``search`` and several sibling reads.  That asymmetry is deliberate, not an
-    oversight: it is entangled with a second, independent degrade mechanism in
-    ``services/memory_service.py``, so it was held out of scope here and is
-    tracked separately.
     """
 
     def __init__(self, config: FusedMemoryConfig):
@@ -366,29 +361,17 @@ class Mem0Backend:
             logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
         return self._instances[project_id]
 
-    @staticmethod
-    async def _timed(awaitable: Awaitable[_T], op: str, timeout: float) -> _T:
-        """Await *awaitable* under *timeout*, raising a timeout that names itself.
-
-        THE single ``asyncio.wait_for`` call site on this class, so both halves
-        of the class-wide timeout posture — propagate, and say what timed out
-        — have exactly one home (INV-5).  *op* is the method name as a reader
-        grepping a log would look for it; *timeout* is echoed rather than read
-        back off ``self`` so the message can never name a budget other than the
-        one actually applied.
-        """
-        try:
-            return await asyncio.wait_for(awaitable, timeout=timeout)
-        except TimeoutError as exc:
-            raise TimeoutError(f'Mem0 {op} timed out after {timeout}s') from exc
-
     async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
-        """:meth:`_timed` under this backend's READ budget."""
-        return await self._timed(awaitable, op, self._read_timeout)
+        """``await_within`` under this backend's READ budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._read_timeout,
+        )
 
     async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
-        """:meth:`_timed` under this backend's WRITE budget."""
-        return await self._timed(awaitable, op, self._write_timeout)
+        """``await_within`` under this backend's WRITE budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._write_timeout,
+        )
 
     async def _timed_collection_read(
         self, awaitable: Awaitable[_T], op: str, collection_name: str, *, if_absent: _T,

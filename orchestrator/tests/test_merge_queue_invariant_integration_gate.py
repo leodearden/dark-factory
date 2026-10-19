@@ -61,7 +61,7 @@ hand into the lane's internals — items appended to ``_inflight``, verify
 driven by calling ``_run_inflight_verify``/``_finalize_inflight``/
 ``_remerge`` directly, the heartbeat's ``_check_request_liveness`` /
 ``_check_resource_audit`` invoked as methods, and five lane functions
-replaced by ``patch('orchestrator.merge_queue.…')``. A gate asserting
+replaced by ``patch('orchestrator.merge_lane.worker.…')``. A gate asserting
 composition cannot be built out of calls that bypass the composition, so
 every surviving scenario now submits real requests on the public queue of a
 running lane and injects its fault through an injected port (``FakeVerifier``
@@ -119,7 +119,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane, WaiterRecord
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InFlightMergeRegistry,
@@ -129,7 +130,6 @@ from orchestrator.merge_queue import (
     coalesce_or_enqueue_merge_request,
     item_merge_wt,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import RunnerUnavailable
 
 _STOP_TIMEOUT = 30.0

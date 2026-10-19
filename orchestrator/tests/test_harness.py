@@ -328,7 +328,7 @@ class TestHarnessMergeLivenessGuard:
             pass
 
         with patch(
-            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
+            'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run',
             _noop_run,
         ):
             # Must NOT raise MergeLivenessConfigError under heartbeat model
@@ -353,7 +353,7 @@ class TestHarnessMergeLivenessGuard:
             pass
 
         with patch(
-            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
+            'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run',
             _noop_run,
         ):
             # Must NOT raise MergeLivenessConfigError
@@ -389,7 +389,7 @@ class TestHarnessMergeLivenessGuard:
             pass
 
         with patch(
-            'orchestrator.merge_queue.SpeculativeMergeWorker.run',
+            'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run',
             _noop_run,
         ):
             # Must NOT raise MergeLivenessConfigError under either model
@@ -454,7 +454,7 @@ class TestHarnessMergeVerifySurvivorBarrierWiring:
 
         try:
             with patch(
-                'orchestrator.merge_queue.SpeculativeMergeWorker.run', _noop_run,
+                'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run', _noop_run,
             ):
                 await harness._start_merge_worker()
                 await asyncio.wait_for(worker_started.wait(), timeout=5)
@@ -487,7 +487,7 @@ class TestHarnessMergeVerifySurvivorBarrierWiring:
 
         try:
             with patch(
-                'orchestrator.merge_queue.SpeculativeMergeWorker.run', _noop_run,
+                'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run', _noop_run,
             ):
                 # Must NOT raise despite the barrier raising.
                 await harness._start_merge_worker()

@@ -500,6 +500,24 @@ Close it; do not `stamp_triage` it. A stamp leaves the record pending, and a pen
 
 `AUTO-CLOSED (L1 <escalation_id>): eval-lane-contained — <task_id> — eval fixture artifact, measurement scored from cell result artifacts [benign]`
 
+### Converted strands (any category) — `metadata.strand_converted`
+
+**What it is.** The stranded-task sweep (`orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded`, active only when `convert_to_blocked_enforce` is true) moves an `in-progress` row with no live claimant and an open pinning record to `blocked`. It files nothing. It stamps `metadata.strand_converted = {at, shape, pinning_escalation_ids}` (schema `shared/src/shared/strand_conversion.py::StrandConverted`) and emits one `strand_converted` event naming the same records. Those records are the row's ownership tokens: resolving them is its only exit, and a `resume` re-pends it.
+
+**Class discriminator.** On `get_task(<task_id>)`, both hold:
+- `task["status"] == "blocked"`
+- the record's id is in `task["metadata"]["strand_converted"]["pinning_escalation_ids"]`
+
+The stamp outlives the conversion, so it is the status check together with the id membership that makes it current.
+
+**Disposition.** Route the record by its OWN category exactly as the rows below say; conversion changes no category's disposition. On top of that:
+- Add `converted strand: strand_converted.at=<at> shape=<shape>` to the promote `evidence`, or to the `resolution` when you close.
+- An absent `dry_run_proposals` entry is EXPECTED. Conversion files nothing, so no block-time proposal ran, and the low-risk auto-unblocker aborting on the record is by design (spec `docs/task-escalation-state-spec.md` §7, item 8). Write "no proposal: converted strand (by design)" rather than treating it as a defect.
+- Never `close_only` the record as stale merely because the task is `blocked` with no active workflow. That shape IS the converted state, and closing the record removes the row's only owner.
+- Never set the task's status or re-pend it by hand, and never file a new record for it.
+
+**Digest.** Append ` [converted strand <at>]` to the category's normal digest line.
+
 ### Autonomous dispatch categories (handle and resolve)
 
 These categories require only admin-level MCP operations. Dispatch them directly, then resolve.
@@ -868,6 +886,45 @@ category. If `disposition == "integration_skew"`:
    )
    ```
 4. Add to digest: `PROMOTED (L2 <id>): task_failure — <task_id> — <summary>` (include proposal snippet if present)
+
+#### `workflow_exit_contract`
+
+**Producer.** `orchestrator/src/orchestrator/exit_contract.py::record_exit_verdict` files ONE L1 per task (deduped on an open L1 of this category), with `agent_role="orchestrator"`, `severity="blocking"` and `suggested_action="investigate_exit_contract"`, and only when `workflow_exit_contract_enforce` is true. With it false (the shipped default) the contract runs in log mode: events only, no records. A `verdict='store_unavailable'` never files a record.
+
+**Meaning.** A workflow's `run()` exited with an (outcome, status) pair outside the proven `shared/src/shared/task_transitions.py::_OUTCOME_ALLOWED` table (`check='outcome_status'`), or with a report phase that disagrees with the state machine (`check='phase'`). It is a CONTRACT violation, not a task failure: the task's own work may be fine, and its status row was left exactly as found.
+
+**Extraction.** The first line of `detail` is the rendered verdict, `verdict='violation' mode='enforce' check=... outcome=... status=... report_phase=... machine_state=... failed_write=... escalation_id=...` (values repr-quoted). Read `check`, `outcome`, `status`, `report_phase` and `machine_state` from it, and quote the line.
+
+**Pin warning.** An open blocking L1 on the real task id is a queue-handoff pin (`escalation/src/escalation/pins.py::classify_pins`, link 3), so while it is open the recovery sweeps hold the task. Do not `close_only` it to unstick the task.
+
+**Disposition.** Always promote: the call is a judgement between two causes.
+- (a) THE PAIR IS LEGITIMATE AND THE TABLE IS TOO TIGHT. A designed producer reaches this pair, and `_OUTCOME_ALLOWED[<outcome>]` simply does not list `<status>`. The fix is to widen the table, a code change filed against the exit-contract table.
+- (b) THE WORKFLOW GENUINELY EXITED WRONGLY. The defect is in the exiting path (the producer that wrote, or failed to write, the status), and the task row may need human repair.
+
+`check='phase'` is always (b): the table is not involved. Before promoting, Grep `_OUTCOME_ALLOWED` for the `<outcome>` row and quote it in the evidence, and re-read the task's status with `get_task`.
+
+**Cluster.** Every pending `workflow_exit_contract` L1 with the same `(check, outcome, status)` shares one cause, whichever task it is on; cluster them.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<task_id>,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="workflow-exit-contract:<check>:<outcome>-><status>",
+  evidence=<detail line + quoted _OUTCOME_ALLOWED row + current status>,
+  options=[
+    "A: the pair is legitimate — widen _OUTCOME_ALLOWED[<outcome>] to admit <status>",
+    "B: the workflow exited wrongly — fix the exiting path; repair the task row if it is stuck",
+    "C: an existing task already owns this pair — link it and keep the record open until it lands",
+    "D: something else",
+  ],
+  summary=<escalation summary>,
+  category="workflow_exit_contract",
+  # severity omitted — inherited from the members.
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): workflow_exit_contract — <task_id> — <check> <outcome>-><status>`
 
 #### `infra_issue`
 

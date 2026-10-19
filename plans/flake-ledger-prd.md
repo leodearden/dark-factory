@@ -8,6 +8,8 @@
 write-time enforcement, and **ledger-health escalation**. Explicitly does **not** own the main-health
 escalation's *instruction* — that is task **3774** (§7).
 
+> **Amended 2026-10-18** by plans/offline-lane-red-path-prd.md (ε0, task 6934): the §5.9 owner is still filed inside `open_debt()`, but no longer on the observation path — the recorder (§8.3) writes a suppression's occurrence rows and one item per suppressed test on the ledger's due list (`flake_debt_due`) in one local transaction, and the ledger's drain (`orchestrator/src/orchestrator/flake_debt_drain.py`) calls `open_debt()` for each item afterwards, so task 4974's per-observation filing cap and 120-second budget are retired. `open_debt()` gains one rule: when the stored owner is done and the observation's head does not contain its fix commit, the cycle closes and is not re-opened, and no `regressed_after_resolution` escalation fires.
+
 Goal, in Leo's words: *not to accept flaky tests, but to efficiently detect them, track them, limit
 the damage for as long as they exist, and de-flake them conclusively* — as a **mostly-unattended
 orchestrator subsystem** that escalates only on exceptional difficulty.
@@ -296,6 +298,19 @@ status before it is trusted (INV-3) rather than assumed still-open from the stor
 **Coupling rule — binding:** *the ledger reads task status but never writes it, except the initial
 filing.* The ledger never marks a task done, never blocks one, never reprioritises one. A de-flake
 task's lifecycle belongs to the orchestrator; the ledger only observes it.
+
+**"Removing the test from the ledger" is the ledger's act, not the agent's.** The de-flake task's
+text (`flake_ledger.py::RESPONSIBILITY_REMOVE_FROM_LEDGER`) tells the agent the ledger closes the cycle
+itself once it observes the task `done`. The agent cannot do it: the ledger is the main checkout's
+`data/orchestrator/runs.db` (`flake_ledger.py::ledger_db_path`), outside the task worktree the agent
+works in, and the agent's own task is not `done` while it runs. The close is `resolve_debt`'s, on a
+live read of the owner; it stamps the task's merge commit from that read (`metadata.done_provenance.commit`),
+and a `done` task with no recorded commit still resolves, so the commit is never a precondition.
+Today the close is lazy only: `open_debt` makes it at the next suppression of the same test, which a
+real fix prevents, so a fixed test's row stays open until task θ (3792) lands the eager periodic
+sweep. The agent's duty is the same either way: keep the test's pytest node-id byte-identical, since
+`flake_debt.test_id` is the primary key and a renamed, parametrized or re-classed test orphans the row
+and hides a recurrence.
 
 ### 5.10 Chronic 3-in-20 is retired as a gate, repurposed as severity
 

@@ -446,16 +446,7 @@ class Escalation:
     task_id: str
     agent_role: str
     severity: str  # "blocking" | "info" | "critical" | "urgent"
-    category: str  # scope_violation, design_concern, cleanup_needed,
-    # dependency_discovered, risk_identified, infra_issue,
-    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog,
-    # recon_missing_index
-    # REFACTOR TRIGGER (task 3709): this vocabulary is prose, not a checked
-    # contract — nothing rejects a typo'd category at submit time, and the
-    # dedup correctness of every categorized detector depends on filer and
-    # reader spelling it identically.  The NEXT category addition promotes
-    # this comment to an enum (or a submit-time lint) instead of growing
-    # another line.
+    category: str  # a registered escalation.categories.EscalationCategory value — enforced at queue submit, never on rehydration
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
@@ -643,7 +634,7 @@ class Escalation:
     # The evidence commit whose landing this filing could NOT attribute — the
     # `verdict.probe['citation']` of the rejected landing-evidence verdict
     # (task 4499).  Written at FILING time by
-    # `orchestrator.landing_evidence::file_unattributed_landing_escalation`,
+    # `orchestrator.merge_lane.landing_evidence::file_unattributed_landing_escalation`,
     # and read back AFTER the record has been resolved as the identity half of
     # the `(task_id, category, citation_sha)` triple that suppresses an
     # identical refile.  That read-after-resolve is the whole point: the reject

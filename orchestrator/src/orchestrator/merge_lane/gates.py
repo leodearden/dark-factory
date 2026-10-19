@@ -42,7 +42,7 @@ from orchestrator.verify import VerifyResult, run_verification
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 AUTO_CHAIN_GENERATIONS_ENABLED: bool = False

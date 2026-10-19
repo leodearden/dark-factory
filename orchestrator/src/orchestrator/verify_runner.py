@@ -283,22 +283,18 @@ class MergeVerifySpec:
                           project's own dark-factory-orchestrator.yaml — its single
                           home (INV-9), and the file to read before assuming what a
                           key here means.
-                          Residual risk on a REMOTE dispatch is wasted wall-clock,
-                          not a false green. The measured case is the retry env
-                          from
-                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env:
-                          its *_NEXTEST_FILTER_FILE_* values are dispatcher-absolute
-                          paths to UNTRACKED files that git push does not carry, so
-                          the remote finds them missing — and reify's consumer then
-                          refuses to narrow, loudly, and runs that profile FULL (an
-                          independent tree-OID guard refuses the same way on a
-                          drifted sidecar). The same dict's REIFY_RUN_ALL_MEMBER_SUBSET
-                          and REIFY_GUI_RETRY_SPECS DO narrow remotely, uncorroborated
-                          by that guard, and are sound here: the remote verifies the
-                          same pushed tree and consumes no dispatcher build artefacts.
-                          Making the filter files shippable needs merge_queue.py
-                          (outside task 5496's scope); follow-up ticket
-                          tkt_0RTNRCDNA8DDHVN6P8ZNV2JXXK.
+                          The failed-only retry env from
+                          orchestrator/src/orchestrator/merge_lane/worker.py::_build_retry_verify_env
+                          has path-valued keys that cannot resolve remotely:
+                          its nextest filter files are UNTRACKED files in the
+                          dispatching host's merge_wt, which the git-pushed merge
+                          SHA does not carry. That env is therefore never shipped:
+                          merge_lane/worker.py::_run_post_merge_verify builds it
+                          only for a LOCAL dispatch (runner is None), so a REMOTE
+                          retry runs FULL and is charged to the legacy (full)
+                          retry budget, not the narrowed one. Pinned by
+                          orchestrator/tests/test_merge_queue_verify_retry.py::test_remote_dispatch_retry_runs_full_and_writes_nothing_on_the_dispatcher
+                          (and ..._is_charged_to_the_legacy_budget).
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
     merge_verify_workspace : force-workspace profile of the merge gate (fix a,
@@ -695,7 +691,7 @@ class LocalRunner:
     """Wraps the current local verify path (run_scoped_verification + _run_unscoped_typechecks).
 
     The verify callables are injected at construction time so that:
-    1. Existing test patches on 'orchestrator.merge_queue.run_scoped_verification'
+    1. Existing test patches on 'orchestrator.merge_lane.worker.run_scoped_verification'
        keep intercepting (call-time resolution, not import-time binding).
     2. There is no verify_runner → merge_queue module-level import cycle.
 
@@ -3579,7 +3575,7 @@ class HostAllocator:
           internal ``_SLOT_*`` constants so a consumer can never come to depend
           on the internal spelling.
         - This is the sanctioned read path for
-          :meth:`~orchestrator.merge_queue.SpeculativeMergeWorker.snapshot`
+          :meth:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker.snapshot`
           (task 3275), which must NOT reach into ``_slots`` / ``_quarantine``
           directly.  Pure read — no mutation, no I/O, no await — so it is safe
           to call from that synchronous method.

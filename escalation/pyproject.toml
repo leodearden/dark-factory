@@ -38,7 +38,7 @@ dev = [
     "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
     # Needed by TestMergeRequestDedup / TestGetMergeQueue in tests/test_server.py
-    # (added by task 1604), which lazily import orchestrator.merge_queue and
+    # (added by task 1604), which lazily import orchestrator.merge_lane.worker and
     # orchestrator.git_ops. Dev-only — does not affect the published escalation
     # package. orchestrator depends on escalation at runtime, so this is a
     # dev-scoped workspace cycle, which uv resolves as one graph.

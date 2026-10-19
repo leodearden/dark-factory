@@ -299,7 +299,7 @@ done
 # value feeds $(( CRITICAL_FREE_GIB * 1024^3 )) — a leading zero would be read
 # as OCTAL (08/09 error out leaving the variable unset, 010 silently means 8)
 # and a huge value would wrap negative on 64-bit and invert the comparison.
-if ! printf '%s\n' "$CRITICAL_FREE_GIB" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
+if ! [[ "$CRITICAL_FREE_GIB" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
     _warn "REIFY_WARM_LANE_GC_SWEEP_CRITICAL_FREE_GIB (or --critical-free-gib) is not a valid integer (0-99999, no leading zeros): '$CRITICAL_FREE_GIB'."
     _warn "Run '$(basename "$0") --help' for usage."
     exit 2
@@ -333,7 +333,7 @@ df_out="$("$DF" -B1 --output=avail -- "$MOUNT")" || {
 
 if [ -n "$df_out" ]; then
     avail_bytes="$(printf '%s\n' "$df_out" | awk 'NR==2{print $1}')"
-    if printf '%s\n' "$avail_bytes" | grep -qE '^[0-9]+$'; then
+    if [[ "$avail_bytes" =~ ^[0-9]+$ ]]; then
         critical_bytes=$(( CRITICAL_FREE_GIB * 1024 * 1024 * 1024 ))
         if [ "$avail_bytes" -le "$critical_bytes" ]; then
             _info "EMERGENCY low-water: avail=${avail_bytes} bytes <= floor=${critical_bytes} bytes (${CRITICAL_FREE_GIB} GiB) on $MOUNT — engaging --disk-pressure: reclaimable-lane resets now use rm -rf <lane>/target outright (free-before-reseed at true ENOSPC; acquire_lane re-seeds lazily per D10 §9.5; see esc-5058-5/esc-5114-1/esc-5115-2)"

@@ -47,7 +47,7 @@ from escalation.server import (
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         MergeRequest,
         QueuedBranch,
         RealMergeItem,
@@ -1093,24 +1093,22 @@ class TestSeverityValidation:
 
 
 # ---------------------------------------------------------------------------
-# TestStrandedBlockedCategory: 'stranded_blocked' is registered in CATEGORIES
+# TestStrandedBlockedCategory: 'stranded_blocked' is a registered category
 # ---------------------------------------------------------------------------
 
 
 class TestStrandedBlockedCategory:
-    """CATEGORIES constant must include 'stranded_blocked' (PRD-3 D5 data-contract)."""
+    """'stranded_blocked' must be a registered category (PRD-3 D5 data-contract)."""
 
     def test_stranded_blocked_in_categories(self):
-        """'stranded_blocked' must be a member of CATEGORIES at runtime.
+        """'stranded_blocked' must be a member of EscalationCategory at runtime.
 
-        This is a data-contract assertion on a runtime constant — not a prose
-        test.  CATEGORIES is the canonical list downstream consumers (task ε,
-        task ι, task ζ) rely on to recognise the category.
+        ``escalation.categories.EscalationCategory`` is the canonical registry
+        downstream consumers (task ε, task ι, task ζ) rely on to recognise the
+        category, and the queue rejects a filing outside it.
         """
-        from escalation.server import CATEGORIES
-        assert 'stranded_blocked' in CATEGORIES, (
-            f"'stranded_blocked' missing from CATEGORIES; current list: {CATEGORIES}"
-        )
+        from escalation.categories import EscalationCategory
+        assert 'stranded_blocked' in EscalationCategory
 
 
 # ---------------------------------------------------------------------------
@@ -1329,12 +1327,11 @@ class TestResolveIssueTableBGate:
 
     @pytest.mark.asyncio
     async def test_novel_category_does_not_narrow_legality(self, tmp_path: Path):
-        """A category absent from server.CATEGORIES (e.g. 'milestone_gate') still resolves.
+        """A category outside the original agent set (e.g. 'milestone_gate') still resolves.
 
         Proves the Table B gate does not narrow legality by category — the G6
-        archive verification found live resolutions across a wide, open
-        category vocabulary that server.CATEGORIES (inert/unvalidated) does
-        not even fully list.
+        archive verification found live resolutions across a wide category
+        vocabulary, far beyond the original agent set.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
@@ -3761,7 +3758,7 @@ class TestMergeRequestDedup:
     """
 
     def _make_registry(self):
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
         return InFlightMergeRegistry()
@@ -3831,8 +3828,8 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator import merge_queue as _mq_mod  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import worker as _mq_mod
+        from orchestrator.merge_lane.worker import (
             MergeDispatchResult,
         )
 
@@ -4018,7 +4015,9 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4076,7 +4075,9 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4127,7 +4128,9 @@ class TestMergeRequestDedup:
         False — the default is a strict no-op (unchanged behavior)."""
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4185,7 +4188,7 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             register_and_enqueue_merge_request,
         )
@@ -4318,6 +4321,20 @@ class TestMergeRequestDedup:
         )
 
 
+def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object) -> None:
+    """Install *stub* where both readers of ``patch_content_contained`` look it up.
+
+    The server reads it through the façade, whose home for it is
+    ``orchestrator.merge_lane.landing_evidence``; the worker's
+    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    """
+    import orchestrator.merge_lane.landing_evidence as landing_evidence
+    import orchestrator.merge_lane.worker as worker
+
+    for module in (worker, landing_evidence):
+        monkeypatch.setattr(module, 'patch_content_contained', stub)
+
+
 # ---------------------------------------------------------------------------
 # TestMergeRequestWorkflowVerifyEmission — step-1/3 (2411): verified_green
 # ---------------------------------------------------------------------------
@@ -4348,24 +4365,20 @@ class TestMergeRequestWorkflowVerifyEmission:
         import asyncio
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         sentinel_base_sha = 's' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value=sentinel_base_sha),
         )
         # is_ancestor is stubbed False to reach the fresh-dispatch path; the
         # task-2945 patch-id backstop then runs after that miss.  Stub it False
         # (this SimpleNamespace git_ops has no project_root for a real
         # `git cherry`, and a genuine fresh dispatch is not patch-id-contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4436,22 +4449,18 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4501,22 +4510,18 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4625,7 +4630,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         # Monkeypatched for determinism even though the post-step-4 gate
@@ -4633,17 +4638,13 @@ class TestMergeRequestWorkflowVerifyEmission:
         # is None — avoids relying on a real git subprocess pre-step-4.
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the gate path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4797,7 +4798,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -4880,7 +4881,7 @@ class TestGetMergeQueue:
         import asyncio
         import time
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeRequest,
         )
@@ -4938,7 +4939,7 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
@@ -4990,7 +4991,7 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
@@ -5047,7 +5048,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5182,7 +5183,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5313,7 +5314,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5410,7 +5411,7 @@ class TestGetMergeQueue:
         # production VERIFYING->FINALIZING->GATE_REVERIFY transitions take effect.
         worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
-        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         captured_reverify_kwargs: dict = {}
 
@@ -5508,7 +5509,9 @@ class TestGetMergeQueue:
         and snapshot() reports an active 'gate_reverify' state.
         """
         from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         REBASED_SHA = 'rebased0abc'
         REBASED_FROM = 'from0sha'
@@ -5528,7 +5531,7 @@ class TestGetMergeQueue:
             merge_commit='deadbeef00000002',
         )
 
-        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         GATE_FAIL = MergeOutcome('blocked', reason='post-rebase reverify gate failed')
 
@@ -5610,7 +5613,7 @@ class TestGetMergeQueue:
         cleanly via ``unhalt_wip()``.
         """
         from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             ItemLifecycleState,  # type: ignore[reportMissingImports]
         )
 
@@ -6336,7 +6339,7 @@ class TestMergeStatus:
         )
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
         )
