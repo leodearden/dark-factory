@@ -3547,9 +3547,10 @@ def test_owner_ppid_is_exported_and_is_the_owning_claudes_direct_parent(
     Task 4193 (L2 ruling item 4-i). This is the ownership discriminator for
     the window BEFORE the session registry record carries a
     ``claude_session_id`` -- measured median ~27s, p90 ~141s over the live
-    fleet, and unbounded. ``session_hooks._owner_ppid_verdict`` compares it
-    against ``_parent_pid_of(_owning_claude_pid())``, so the contract this
-    test pins is exactly: *the value the child sees equals the child's own
+    fleet, and unbounded.
+    ``session_ownership_probes.EventProbes.owner_ppid_verdict`` compares it
+    against the owning claude's direct parent, so the contract this test pins
+    is exactly: *the value the child sees equals the child's own
     ``getppid()``*.
 
     That holds only because ``claude`` is invoked WITHOUT ``exec`` -- an
@@ -3597,8 +3598,8 @@ def test_owner_ppid_is_exported_and_is_the_owning_claudes_direct_parent(
         f"CLAUDE_SPAWN_OWNER_PPID ({exported}) must equal the launched "
         f"claude's own direct parent pid ({actual_parent}) -- if these "
         f"diverge, the payload shell was exec'd away and "
-        f"session_hooks._owner_ppid_verdict would misread every owner event "
-        f"as an inheritor"
+        f"session_ownership_probes.EventProbes.owner_ppid_verdict would "
+        f"misread every owner event as an inheritor"
     )
 
 
