@@ -26,6 +26,7 @@ suppress_resettled_review_suggestions: true
 # Merge conflict reduction
 max_advance_attempts: 3
 max_pre_merge_retries: 2
+pre_merge_reverify: false
 max_merge_retries: 3
 inter_iteration_rebase: true
 # Rebase onto main before each verify retry (Fix 3 — closes the verify-only

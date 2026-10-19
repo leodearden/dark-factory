@@ -26,7 +26,9 @@ This module builds the CM up from the bottom:
     implement-phase _run_scoped_verification_with_infra_retry
     (TestTaskLaneVerifyHoldsLease) and the merge-phase post-rebase re-verify in
     _run_merge_phase (TestMergePhaseReverifyHoldsLease), so unwrapping either
-    one fails a test.
+    one fails a test. Since task 6580 the merge-phase re-verify runs only with
+    the ``pre_merge_reverify`` rollback switch on; by default the merge phase
+    rebases and submits holding no lease.
 """
 from __future__ import annotations
 
@@ -182,7 +184,7 @@ def _passing_result() -> VerifyResult:
     )
 
 
-def _build_task_workflow(tmp_path: Path):
+def _build_task_workflow(tmp_path: Path, **config_overrides):
     """A TaskWorkflow on a REAL pure-FS GitOps + a real (non-git) worktree dir.
 
     project_root need not be a git repo: this path exercises only
@@ -193,7 +195,9 @@ def _build_task_workflow(tmp_path: Path):
     """
     project_root = tmp_path / 'project'
     project_root.mkdir(exist_ok=True)
-    config = OrchestratorConfig(project_root=project_root, git=_git_config())
+    config = OrchestratorConfig(
+        project_root=project_root, git=_git_config(), **config_overrides,
+    )
     git_ops = GitOps(config.git, config.project_root)
     worktree = git_ops.worktree_base / '42'
     worktree.mkdir(parents=True, exist_ok=True)
@@ -264,37 +268,86 @@ class _StopMergePhase(Exception):
     downstream merge-queue submit path."""
 
 
+def _stub_merge_phase_preamble(mp: pytest.MonkeyPatch, workflow) -> None:
+    """Mock the _run_merge_phase preamble so control reaches Phase 1 (the
+    pre-merge rebase) without any real git / state-machine work. Only the REAL
+    task_verify_lease flock and the patched seams matter here.
+    (_check_escalations is already MagicMock->[] via _make_workflow.)"""
+    mp.setattr(workflow, '_maybe_defer_as_train_member', AsyncMock(return_value=None))
+    mp.setattr(workflow, '_enter_phase', MagicMock())
+    mp.setattr(workflow, '_check_scope_invariant', AsyncMock(return_value=None))
+    mp.setattr(workflow, '_recover_before_merge', AsyncMock(return_value=None))
+    mp.setattr(workflow.git_ops, 'get_main_sha', AsyncMock(return_value='mainsha'))
+    mp.setattr(workflow.git_ops, 'rebase_onto_main', AsyncMock(return_value=True))
+    # git rev-parse HEAD in the preamble — return a stub head SHA.
+    mp.setattr(
+        'orchestrator.workflow._run', AsyncMock(return_value=(0, 'headsha\n', '')),
+    )
+
+
 @pytest.mark.asyncio
 class TestMergePhaseReverifyHoldsLease:
-    """The merge-phase post-rebase re-verify ALSO runs INSIDE task_verify_lease
-    (step-6; workflow.py _run_merge_phase, the ``async with
-    self.git_ops.task_verify_lease(self.worktree)`` around the pre-merge
-    re-verify).
+    """The merge phase's Phase-1 rebase and its lane lease (task 6580).
 
-    This site is STRUCTURALLY INDEPENDENT of the implement-phase site covered by
-    TestTaskLaneVerifyHoldsLease — a future edit could unwrap this one without
-    failing that test — so it gets its OWN held-flock call-site spy (the exact
-    warm-lane-gc race the change targets). The _run_merge_phase preamble is
-    mocked out just far enough to reach the pre-merge re-verify; the spy asserts
-    the lane flock is HELD, then raises _StopMergePhase to unwind cleanly before
-    the merge-queue submit path (which is irrelevant to the flock hold).
+    Default (``pre_merge_reverify`` False, Leo ruling 2026-10-09): the merge
+    phase rebases and submits with NO task-role verify and NO lane lease — the
+    merge gate verifies every landing (task 1724).
+
+    Rollback arm (``pre_merge_reverify`` True): the post-rebase re-verify runs
+    INSIDE task_verify_lease (step-6). That site is STRUCTURALLY INDEPENDENT of
+    the implement-phase site covered by TestTaskLaneVerifyHoldsLease — a future
+    edit could unwrap this one without failing that test — so it gets its OWN
+    held-flock call-site spy (the exact warm-lane-gc race task 3027 targets).
+    Each spy raises _StopMergePhase to unwind before the downstream merge path.
     """
 
-    async def test_pre_merge_reverify_holds_task_lane_flock(self, tmp_path: Path):
+    async def test_red_tip_reaches_merge_without_verify_or_lease(
+        self, tmp_path: Path,
+    ):
         workflow = _build_task_workflow(tmp_path)
         assert workflow.worktree is not None  # narrow Path | None for the spy
         lock_path = lane_lock_path(workflow.worktree)
 
-        # Mock the _run_merge_phase preamble so control reaches the pre-merge
-        # re-verify without any real git / state-machine work. Only the REAL
-        # task_verify_lease flock and the patched run_scoped_verification matter
-        # here. (_check_escalations is already MagicMock->[] via _make_workflow.)
-        workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        workflow._enter_phase = MagicMock()  # type: ignore[method-assign]  # skip the real state-machine transition
-        workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        workflow._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        workflow.git_ops.get_main_sha = AsyncMock(return_value='mainsha')  # type: ignore[method-assign]
-        workflow.git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        # A RED task-scope verdict at the rebased tip: reaching merge must not
+        # depend on it, because it must never be asked.
+        verify_mock = AsyncMock(return_value=VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='red at the rebased tip', timed_out=False,
+        ))
+        submitted: dict = {}
+
+        async def _submit_spy(branch_name, *, pre_rebased, merge_phase):
+            fd = acquire_merge_verify_flock(lock_path, 0.0)
+            try:
+                assert fd is not None, (
+                    'the task lane flock must be FREE when the merge phase '
+                    'submits — no task_verify_lease is taken by default'
+                )
+            finally:
+                if fd is not None:
+                    release_merge_verify_flock(fd)
+            submitted.update(branch=branch_name, pre_rebased=pre_rebased)
+            raise _StopMergePhase()
+
+        with pytest.MonkeyPatch.context() as mp:
+            _stub_merge_phase_preamble(mp, workflow)
+            mp.setattr('orchestrator.workflow.run_scoped_verification', verify_mock)
+            mp.setattr(workflow, '_submit_to_merge_queue', _submit_spy)
+            with pytest.raises(_StopMergePhase):
+                await workflow._run_merge_phase('task/42')
+
+        assert verify_mock.await_count == 0, (
+            'the default merge phase must not run the task-role re-verify'
+        )
+        assert submitted == {'branch': 'task/42', 'pre_rebased': True}, (
+            'a clean rebase onto an unmoved main must submit pre_rebased=True '
+            'from the rebase outcome alone'
+        )
+
+    async def test_pre_merge_reverify_holds_task_lane_flock(self, tmp_path: Path):
+        workflow = _build_task_workflow(tmp_path, pre_merge_reverify=True)
+        assert workflow.worktree is not None  # narrow Path | None for the spy
+        lock_path = lane_lock_path(workflow.worktree)
 
         held_asserted = False
 
@@ -323,12 +376,8 @@ class TestMergePhaseReverifyHoldsLease:
         verify_mock = AsyncMock(side_effect=_assert_flock_held_then_bail)
 
         with pytest.MonkeyPatch.context() as mp:
+            _stub_merge_phase_preamble(mp, workflow)
             mp.setattr('orchestrator.workflow.run_scoped_verification', verify_mock)
-            # git rev-parse HEAD in the preamble — return a stub head SHA.
-            mp.setattr(
-                'orchestrator.workflow._run',
-                AsyncMock(return_value=(0, 'headsha\n', '')),
-            )
             with pytest.raises(_StopMergePhase):
                 await workflow._run_merge_phase('task/42')
 

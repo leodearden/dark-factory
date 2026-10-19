@@ -3456,6 +3456,11 @@ class OrchestratorConfig(BaseSettings):
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)
     max_pre_merge_retries: int = Field(default=2)
+    # Rollback switch only (task 6580, Leo ruling 2026-10-09): the merge
+    # phase rebases and submits; the merge gate verifies every landing
+    # (task 1724). True restores the advisory task-role re-verify of the
+    # rebased tip. OPERATIONS.md §"Config reload vs restart" (green tier).
+    pre_merge_reverify: bool = Field(default=False)
     max_merge_retries: int = Field(default=3)
     inter_iteration_rebase: bool = Field(default=True)
     # Fix 3 — rebase onto main before each verify (including the first) so
@@ -6182,6 +6187,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # useless at the moment it matters.
         'transient_requeue_backoff_base_secs',
         'transient_requeue_backoff_cap_secs',
+        # Merge-phase re-verify rollback switch (task 6580).  Flat field read
+        # by TaskWorkflow._rebase_before_enqueue at each merge attempt from
+        # the shared live config object, so a flip applies from the next
+        # merge attempt.
+        'pre_merge_reverify',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor

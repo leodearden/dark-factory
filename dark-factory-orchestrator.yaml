@@ -1491,20 +1491,19 @@ verify_host_policy: prefer_remote
 verify_drift_check_every_n_lands: 10
 verify_cross_check_remote_green: false
 
-# Pre-merge rebase-and-reverify: run it ONCE and never repeat it (Leo, 2026-09-06).
-# workflow.py's merge phase rebases the task branch onto main and runs a full
-# task-role scoped verify (admission-gated, 3 slots on this box) BEFORE submitting
-# to the merge queue; the stock loop repeats that whole cycle up to
-# max_pre_merge_retries times whenever main moved during the verify. MEASURED
-# 2026-09-06: "main moved during pre-merge rebase, retrying" fired 29 times in one
-# day on this host, each retry a 40-90 min verify under load, and task 5050 sat ~15h
-# in that step. With 1 the loop runs one rebase+verify; if main moved meanwhile the
-# task submits anyway with pre_rebased=False and the merge queue's own rebase +
-# post-merge verify (which happens regardless) is the one that lands it. This
-# knob is NOT in RELOADABLE_FIELDS — it takes effect at the next orchestrator
-# restart. Follow-up lever (policy PRD, task 5098): whether the pre-merge verify
-# should run at all when the queue re-verifies on landing.
+# Pre-merge rebase: the merge phase only REBASES (Leo, 2026-10-09, task 6580).
+# workflow.py's merge phase rebases the task branch onto main and submits it to the
+# merge queue; it no longer runs a task-role scoped verify first, because the merge
+# queue's own gate verifies every landing (task 1724) and that verdict had no
+# reader. This closes the "should the pre-merge verify run at all" sub-question
+# task 5098 held. max_pre_merge_retries bounds the rebase retry when main moved
+# during the rebase; with 1 a moved main submits with pre_rebased=False and the
+# queue's rebase lands it. This knob is NOT in RELOADABLE_FIELDS — it takes
+# effect at the next orchestrator restart.
 max_pre_merge_retries: 1
+# Rollback switch only (green tier, mcp__escalation__reload_config): true restores
+# the advisory post-rebase task-role re-verify on the next merge attempt.
+pre_merge_reverify: false
 
 # Config-driven off-hot-path offline lane — dark-factory qdrant-integration
 # instance (plans/integration-test-lane-prd.md, task beta). Restores the

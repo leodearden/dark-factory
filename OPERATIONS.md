@@ -294,7 +294,8 @@ Three things a census must not assume:
   sits against N junit reports.
 - **Several merge-path callers archive nothing at all**, because they pass
   no `archive_root`: the pre-existing-main baseline probe, the shadow/drift
-  runners, the unscoped type-check gate, the workflow pre-merge re-verify,
+  runners, the unscoped type-check gate, the workflow pre-merge re-verify
+  (it runs only when `pre_merge_reverify` is rolled back on),
   and the flake gate's isolated re-run
   (`verify.py::confirm_isolated_rerun_verdict`) — so a module's archived
   report is always the leg's own, never the re-run's. `archive_root is None`
@@ -1214,6 +1215,11 @@ takes no arguments: it always re-reads that process's own
   kill all land on the next dispatch round.
 - `plan_text_fp_gate_enabled` (task 4031 amendment gate; OFF = pre-4031
   Lever-B skip).
+- `pre_merge_reverify` (default `false`; task 6580, Leo ruling 2026-10-09).
+  The workflow merge phase rebases the task branch onto main and submits it
+  with no task-role verify: the merge gate verifies every landing (task 1724),
+  so that verdict had no reader. `true` restores the advisory post-rebase
+  re-verify — a rollback switch only, read at each merge attempt.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
