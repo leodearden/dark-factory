@@ -1,7 +1,7 @@
 """The vocabulary and policy for a task submission the curator could not judge.
 
 Why it was deferred (:class:`DeferReason`), when it is retried
-(:class:`DeferralPolicy`; a deferral has no terminal bound, it waits for a
+(:class:`CurationRetryPolicy`; a deferral has no terminal bound, it waits for a
 verdict), and how a create that no curator verdict judged is marked
 (:func:`dedupe_skipped_marker`). The bottom layer of the
 curator's defer seam: the curator, the ticket store and the interceptor
@@ -65,7 +65,7 @@ def _require_aware(name: str, value: datetime) -> None:
 
 
 @dataclass(frozen=True)
-class DeferralPolicy:
+class CurationRetryPolicy:
     backoff_base_seconds: float
     backoff_max_seconds: float
 
@@ -76,15 +76,15 @@ class DeferralPolicy:
         }
         non_positive = {name: value for name, value in bounds.items() if not value > 0}
         if non_positive:
-            raise ValueError(f'DeferralPolicy bounds must be > 0, got {non_positive}')
+            raise ValueError(f'CurationRetryPolicy bounds must be > 0, got {non_positive}')
         if self.backoff_max_seconds < self.backoff_base_seconds:
             raise ValueError(
-                f'DeferralPolicy backoff_max_seconds ({self.backoff_max_seconds}) must be '
+                f'CurationRetryPolicy backoff_max_seconds ({self.backoff_max_seconds}) must be '
                 f'>= backoff_base_seconds ({self.backoff_base_seconds})'
             )
 
     @classmethod
-    def from_config(cls, curator: CuratorConfig) -> DeferralPolicy:
+    def from_config(cls, curator: CuratorConfig) -> CurationRetryPolicy:
         return cls(
             backoff_base_seconds=curator.deferral_backoff_base_seconds,
             backoff_max_seconds=curator.deferral_backoff_max_seconds,

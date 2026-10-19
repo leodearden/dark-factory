@@ -11,7 +11,7 @@ from _fm_helpers import seed_resolved_ticket
 from shared.async_sqlite_base import CheckpointResult
 from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
-from fused_memory.middleware.curation_deferral import DeferralPolicy, DeferReason
+from fused_memory.middleware.curation_deferral import CurationRetryPolicy, DeferReason
 from fused_memory.middleware.ticket_store import (
     AWAITING_CURATION,
     CurationBacklog,
@@ -936,7 +936,7 @@ class TestDedupHealthWindow:
 # ---------------------------------------------------------------------------
 
 
-_POLICY = DeferralPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0)
+_POLICY = CurationRetryPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0)
 
 
 def _rewrite_row(db_path, ticket_id: str, **columns) -> None:

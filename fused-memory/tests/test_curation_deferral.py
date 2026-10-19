@@ -10,7 +10,7 @@ from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware.curation_deferral import (
     DEDUPE_SKIPPED_KEY,
     POOL_UNAVAILABLE_ERRORS,
-    DeferralPolicy,
+    CurationRetryPolicy,
     DeferReason,
     backlog_severity,
     dedupe_skipped_marker,
@@ -20,11 +20,11 @@ from fused_memory.middleware.curation_deferral import (
 NOW = datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC)
 
 
-def _policy(base: float = 60.0, max_backoff: float = 1800.0) -> DeferralPolicy:
-    return DeferralPolicy(backoff_base_seconds=base, backoff_max_seconds=max_backoff)
+def _policy(base: float = 60.0, max_backoff: float = 1800.0) -> CurationRetryPolicy:
+    return CurationRetryPolicy(backoff_base_seconds=base, backoff_max_seconds=max_backoff)
 
 
-class TestDeferralPolicy:
+class TestCurationRetryPolicy:
     def test_first_retry_waits_the_base(self):
         assert _policy().next_attempt_at(attempts=1, now=NOW) == NOW + timedelta(seconds=60)
 
@@ -79,7 +79,7 @@ class TestDeferralPolicy:
     def test_from_config_reads_the_curator_knobs(self):
         curator = CuratorConfig(deferral_backoff_base_seconds=7.0, deferral_backoff_max_seconds=70.0)
 
-        assert DeferralPolicy.from_config(curator) == _policy(base=7.0, max_backoff=70.0)
+        assert CurationRetryPolicy.from_config(curator) == _policy(base=7.0, max_backoff=70.0)
 
 
 def _frozen(*, capped=(), auth_failed=(), scope=None) -> PoolFrozen:

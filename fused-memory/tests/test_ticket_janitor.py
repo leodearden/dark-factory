@@ -27,7 +27,7 @@ from _fm_helpers import LoopFreedomProbe
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import ticket_janitor
-from fused_memory.middleware.curation_deferral import DeferralPolicy, DeferReason
+from fused_memory.middleware.curation_deferral import CurationRetryPolicy, DeferReason
 from fused_memory.middleware.ticket_janitor import (
     CURATION_BACKLOG_ANCHOR,
     TicketJanitor,
@@ -1249,7 +1249,7 @@ class TestDedupOutageDetector:
         assert self._escalations(roots['beta']) == []
 
 
-_PARK_POLICY = DeferralPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0)
+_PARK_POLICY = CurationRetryPolicy(backoff_base_seconds=60.0, backoff_max_seconds=1800.0)
 
 
 async def _park(

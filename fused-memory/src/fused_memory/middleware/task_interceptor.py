@@ -36,7 +36,7 @@ from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy
 from fused_memory.middleware.curation_deferral import (
     POOL_UNAVAILABLE_ERRORS,
-    DeferralPolicy,
+    CurationRetryPolicy,
     dedupe_skipped_marker,
     pool_defer_reason,
 )
@@ -5108,8 +5108,8 @@ class TaskInterceptor:
                 {'stage': 'zot_duplicate_escalation', 'error': str(exc)}
             )
 
-    def _deferral_policy(self) -> DeferralPolicy:
-        return DeferralPolicy.from_config(
+    def _curation_retry_policy(self) -> CurationRetryPolicy:
+        return CurationRetryPolicy.from_config(
             self._config.curator if self._config is not None else CuratorConfig(),
         )
 
@@ -5138,7 +5138,7 @@ class TaskInterceptor:
             f'ticket {ticket_id}: only a defer decision parks, got {decision!r}'
         )
         attempts = await asyncio.shield(self._ticket_store.mark_awaiting_curation(
-            ticket_id, reason=decision.defer_reason, policy=self._deferral_policy(),
+            ticket_id, reason=decision.defer_reason, policy=self._curation_retry_policy(),
         ))
         return attempts is not None
 

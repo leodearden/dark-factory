@@ -39,7 +39,7 @@ from shared.async_sqlite_base import (
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
 
 if TYPE_CHECKING:
-    from fused_memory.middleware.curation_deferral import DeferralPolicy
+    from fused_memory.middleware.curation_deferral import CurationRetryPolicy
 
 AWAITING_CURATION: Final = 'awaiting_curation'
 
@@ -348,7 +348,7 @@ class TicketStore:
         ticket_id: str,
         *,
         reason: DeferReason,
-        policy: DeferralPolicy,
+        policy: CurationRetryPolicy,
         now: datetime | None = None,
     ) -> int | None:
         """Park a ``pending`` ticket the curator could not judge, for *reason*.
