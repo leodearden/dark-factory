@@ -34,21 +34,15 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+import _psi_admission_yaml
 import pytest
 from _orch_helpers import idle_psi_sample
-from _psi_admission_yaml import write_config_with_nondefault_psi_admission
 from shared.psi import PsiSample, read_psi_sample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.scheduler import Scheduler
 
-
-@pytest.fixture(autouse=True)
-def _nondefault_psi_admission_yaml(monkeypatch, tmp_path) -> None:
-    """Run every test here against a yaml whose psi_admission differs from code."""
-    monkeypatch.setenv(
-        'ORCH_CONFIG_PATH', str(write_config_with_nondefault_psi_admission(tmp_path))
-    )
+_nondefault_psi_admission_yaml = _psi_admission_yaml.nondefault_psi_admission_yaml
 
 
 def _pending_task(

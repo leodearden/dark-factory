@@ -42,21 +42,16 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import _psi_admission_yaml
 import pytest
-from _psi_admission_yaml import write_config_with_nondefault_psi_admission
+from _psi_admission_yaml import cpu_arm_cfg
 from shared.psi import PsiSample, read_psi_sample
 
 from orchestrator.config import FusedMemoryConfig, OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.event_store import EventStore
 from orchestrator.scheduler import Scheduler
 
-
-@pytest.fixture(autouse=True)
-def _nondefault_psi_admission_yaml(monkeypatch, tmp_path) -> None:
-    """Run every test here against a yaml whose psi_admission differs from code."""
-    monkeypatch.setenv(
-        'ORCH_CONFIG_PATH', str(write_config_with_nondefault_psi_admission(tmp_path))
-    )
+_nondefault_psi_admission_yaml = _psi_admission_yaml.nondefault_psi_admission_yaml
 
 # ---------------------------------------------------------------------------
 # Minimal task-dict + PSI-sample helpers (mirrored from
@@ -116,15 +111,6 @@ def _psi(
         io_some10=io_some10,
         read_ok=read_ok,
     )
-
-
-def _psi_cfg(**overrides) -> PsiAdmissionConfig:
-    """A fresh gate config whose CPU arm, which these tests drive, is explicit.
-
-    Fresh per call, never a shared instance: apply_reload mutates submodels in
-    place.
-    """
-    return PsiAdmissionConfig(cpu_some_avg10=85.0, **overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +349,7 @@ class TestPsiSaturationTransition:
         event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='da4-s1')
         clock = _FakeClock()
         config = OrchestratorConfig(
-            max_per_module=1, max_concurrent_tasks=6, psi_admission=_psi_cfg(),
+            max_per_module=1, max_concurrent_tasks=6, psi_admission=cpu_arm_cfg(),
         )
 
         tasks = [
@@ -456,7 +442,7 @@ class TestPsiSaturationTransition:
         clock = _FakeClock()
         config = OrchestratorConfig(
             max_per_module=1,
-            psi_admission=_psi_cfg(min_inflight_floor=2),
+            psi_admission=cpu_arm_cfg(min_inflight_floor=2),
         )
 
         tasks = [
@@ -532,7 +518,7 @@ class TestPsiSaturationTransition:
         event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='da4-s3')
         clock = _FakeClock()
         config = OrchestratorConfig(
-            max_per_module=1, max_concurrent_tasks=4, psi_admission=_psi_cfg(),
+            max_per_module=1, max_concurrent_tasks=4, psi_admission=cpu_arm_cfg(),
         )
 
         heavy_tasks = [

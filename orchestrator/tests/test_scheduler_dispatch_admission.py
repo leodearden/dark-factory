@@ -31,21 +31,16 @@ from __future__ import annotations
 from dataclasses import asdict
 from unittest.mock import AsyncMock, Mock
 
+import _psi_admission_yaml
 import pytest
-from _psi_admission_yaml import write_config_with_nondefault_psi_admission
+from _psi_admission_yaml import cpu_arm_cfg
 from _recording_event_store import _RecordingEventStore
 from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.scheduler import Scheduler
 
-
-@pytest.fixture(autouse=True)
-def _nondefault_psi_admission_yaml(monkeypatch, tmp_path) -> None:
-    """Run every test here against a yaml whose psi_admission differs from code."""
-    monkeypatch.setenv(
-        'ORCH_CONFIG_PATH', str(write_config_with_nondefault_psi_admission(tmp_path))
-    )
+_nondefault_psi_admission_yaml = _psi_admission_yaml.nondefault_psi_admission_yaml
 
 # ---------------------------------------------------------------------------
 # Minimal task-dict + PSI-sample helpers
@@ -116,15 +111,6 @@ def _psi(
     )
 
 
-def _psi_cfg(**overrides) -> PsiAdmissionConfig:
-    """A fresh gate config whose CPU arm, which these tests drive, is explicit.
-
-    Fresh per call, never a shared instance: apply_reload mutates submodels in
-    place.
-    """
-    return PsiAdmissionConfig(cpu_some_avg10=85.0, **overrides)
-
-
 async def _sole_deferral_data(sample: PsiSample, psi_cfg: PsiAdmissionConfig) -> dict:
     """Hold one heavy candidate on *sample*; return its dispatch_deferred data."""
     event_store = _RecordingEventStore()
@@ -156,7 +142,7 @@ class TestDispatchAdmissionThrottleDirection:
     async def test_heavy_deferred_deterministic_dispatches_same_tick(self) -> None:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
+            OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
             event_store=event_store,  # type: ignore[arg-type]
         )
         scheduler.finish_startup()
@@ -200,7 +186,7 @@ class TestDispatchAdmissionThrottleDirection:
             cpu_some60=33.0,
         )
 
-        data = await _sole_deferral_data(sample, _psi_cfg())
+        data = await _sole_deferral_data(sample, cpu_arm_cfg())
 
         assert data['metric'] == 'mem_full_avg10'
         assert data['sample'] == asdict(sample)
@@ -220,7 +206,7 @@ class TestDispatchAdmissionWorkConserving:
     async def test_idle_psi_dispatches_all_heavy_candidates(self) -> None:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
+            OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
             event_store=event_store,  # type: ignore[arg-type]
         )
         scheduler.finish_startup()
@@ -254,7 +240,7 @@ class TestDispatchAdmissionFloorDeadlockFreedom:
     async def test_zero_in_flight_still_dispatches_under_saturation(self) -> None:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
+            OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
             event_store=event_store,  # type: ignore[arg-type]
         )
         scheduler.finish_startup()
@@ -275,7 +261,7 @@ class TestDispatchAdmissionFloorDeadlockFreedom:
         event_store = _RecordingEventStore()
         config = OrchestratorConfig(
             max_per_module=1,
-            psi_admission=_psi_cfg(min_inflight_floor=2),
+            psi_admission=cpu_arm_cfg(min_inflight_floor=2),
         )
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         scheduler.finish_startup()
@@ -301,24 +287,24 @@ class TestDispatchAdmissionMetricRanking:
     io_some_avg10 > cpu_some_avg10 (the legacy CPU arm ranks last)."""
 
     async def test_cpu_and_io_both_saturated_reports_io(self) -> None:
-        data = await _sole_deferral_data(_psi(cpu_some10=90.0, io_some10=50.0), _psi_cfg())
+        data = await _sole_deferral_data(_psi(cpu_some10=90.0, io_some10=50.0), cpu_arm_cfg())
 
         assert data['metric'] == 'io_some_avg10'
 
     async def test_io_only_saturated_reports_io(self) -> None:
-        data = await _sole_deferral_data(_psi(io_some10=50.0), _psi_cfg())
+        data = await _sole_deferral_data(_psi(io_some10=50.0), cpu_arm_cfg())
 
         assert data['metric'] == 'io_some_avg10'
 
     async def test_mem_some_outranks_io(self) -> None:
-        data = await _sole_deferral_data(_psi(mem_some10=20.0, io_some10=50.0), _psi_cfg())
+        data = await _sole_deferral_data(_psi(mem_some10=20.0, io_some10=50.0), cpu_arm_cfg())
 
         assert data['metric'] == 'mem_some_avg10'
 
     async def test_mem_full_outranks_every_other_arm(self) -> None:
         sample = _psi(cpu_some10=90.0, mem_some10=99.0, mem_full10=50.0, io_some10=99.0)
 
-        data = await _sole_deferral_data(sample, _psi_cfg())
+        data = await _sole_deferral_data(sample, cpu_arm_cfg())
 
         assert data['metric'] == 'mem_full_avg10'
 
@@ -408,7 +394,7 @@ class TestDispatchAdmissionDisabledGate:
         event_store = _RecordingEventStore()
         config = OrchestratorConfig(
             max_per_module=1,
-            psi_admission=_psi_cfg(enabled=False),
+            psi_admission=cpu_arm_cfg(enabled=False),
         )
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         scheduler.finish_startup()
@@ -442,7 +428,7 @@ class TestDispatchAdmissionFailOpen:
         caplog.set_level('WARNING')
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
+            OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
             event_store=event_store,  # type: ignore[arg-type]
         )
         scheduler.finish_startup()
@@ -581,7 +567,7 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
     async def test_single_tick_multiple_heavy_skips_emit_one_event(self) -> None:
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
+            OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
             event_store=event_store,  # type: ignore[arg-type]
         )
         scheduler.finish_startup()
@@ -606,7 +592,7 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
         event_store = _RecordingEventStore()
         clock = _FakeClock()
         scheduler = Scheduler(
-            OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg()),
+            OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg()),
             event_store=event_store,  # type: ignore[arg-type]
             time_source=clock,
         )
@@ -651,7 +637,7 @@ class TestDispatchAdmissionPinnedLoopParity:
         from orchestrator.overrides import OverrideStore
 
         event_store = _RecordingEventStore()
-        config = OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg())
+        config = OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg())
         store = OverrideStore(tmp_path / 'o.db')
         store.set_override('/proj', 'Z', pinned=True)
 
@@ -680,7 +666,7 @@ class TestDispatchAdmissionPinnedLoopParity:
         from orchestrator.overrides import OverrideStore
 
         event_store = _RecordingEventStore()
-        config = OrchestratorConfig(max_per_module=1, psi_admission=_psi_cfg())
+        config = OrchestratorConfig(max_per_module=1, psi_admission=cpu_arm_cfg())
         store = OverrideStore(tmp_path / 'o.db')
         store.set_override('/proj', 'W', pinned=True)
 
