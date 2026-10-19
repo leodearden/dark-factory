@@ -9193,6 +9193,8 @@ def create_mcp_server(
 
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
+        Under an unavailable curator pool the ticket parks as
+        ``awaiting_curation`` and is curated later.
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
         path for batched human decomposition (e.g., breaking a PRD into ~50
@@ -9578,6 +9580,11 @@ def create_mcp_server(
           is the target task's id.
         - ``failed``   — an error occurred; ``reason`` describes it. Common
           reasons: ``timeout``, ``server_restart``, ``expired``.
+        - ``awaiting_curation`` — NON-terminal: the curator's account pool could
+          not serve, so the submission is durably parked and retried
+          automatically. NO ``task_id`` is returned. It is neither a failure
+          nor a creation: do NOT re-submit and do NOT count it as created;
+          call ``resolve_ticket`` again later.
         - ``refused``  — a deterministic guard (cancelled-premise blocklist /
           recon premise registry) rejected the candidate. **NO TASK WAS
           CREATED and NO ``task_id`` is returned** — the key is absent, not
@@ -9648,8 +9655,8 @@ def create_mcp_server(
 
         Args:
             project_root: Absolute path to project root.
-            status: Optional status filter ('pending', 'created', 'failed',
-                'combined', 'refused'). 'refused' means a deterministic guard
+            status: Optional status filter ('pending', 'awaiting_curation',
+                'created', 'failed', 'combined', 'refused', 'cancelled'). 'refused' means a deterministic guard
                 rejected the candidate and no task was created.
                 When None, all statuses are returned.
             since: Optional ISO-8601 timestamp; only tickets with
@@ -9817,7 +9824,7 @@ def create_mcp_server(
     @mcp.tool()
     @mcp_tool_errors()
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
-        """Cancel a pending curator ticket by its ticket_id.
+        """Cancel a pending or parked (``awaiting_curation``) curator ticket by its ticket_id.
 
         Four outcome shapes (v1 contract):
 

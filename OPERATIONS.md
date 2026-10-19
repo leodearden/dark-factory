@@ -733,7 +733,8 @@ That latency is faster than any real model call.
   ledger is written only while `usage_cap.enabled`; without it the table
   stays empty whatever the curator does, so skip this check.
 - **It does not fire during an all-accounts-capped period, by design.** Capped
-  tickets wait, so their latency rises. Caps show in `get_curator_state` and on
+  tickets park as `awaiting_curation` (outside the window), and a later
+  verdict's latency includes the parked time. Caps show in `get_curator_state` and on
   the dashboard. A project filing fewer than `min_samples` tickets per window
   is below the detector's floor. Nor is the detector wired while
   `curator.enabled` is false: a disabled curator creates every ticket fast

@@ -2030,6 +2030,27 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
 
+    def test_dedupe_skipped_metadata_key_is_blessed(self):
+        """The task curator's no-dedupe-verdict marker must not census-warn (task 4503).
+
+        Stamped on every create the curator's dedupe pass did not judge, and
+        the key a re-dedupe sweep selects on. The unblessed control key shows
+        the scan is live for this blob.
+        """
+        _, warnings = parse_metadata(
+            {
+                'dedupe_skipped': {
+                    'reason': 'create: curator-failed: llm unavailable',
+                    'at': '2026-10-18T12:00:00+00:00',
+                },
+                'dedupe_skipped_control': 'v',
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'dedupe_skipped' not in unknown_key_fields
+        assert 'dedupe_skipped_control' in unknown_key_fields
+
     def test_recurrence_metadata_key_is_blessed(self):
         """The recurring-chain link spec is deliberately blessed AND registered (task 4676).
 

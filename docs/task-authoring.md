@@ -1355,7 +1355,7 @@ agent_id, escalation_id, suggestion_hash, prd_path, prd_task_label,
 user_observable_signal, consumer_ref, substrate_confirmed,
 human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
-gate_escalated_at, before_done_ran_at, before_done_verified_at,
+dedupe_skipped, gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
@@ -1535,6 +1535,8 @@ apart: `curator_action` / `curator_justification` / `combined_at` are
 written by the **automated task curator**'s combine flow (fused-memory
 `task_interceptor`), while the `human_curator_*` keys below belong to a
 **human content curator** adjudicating a deterministic gate.
+`dedupe_skipped` `{reason, at}` marks a create no curator verdict judged; it is
+the re-dedupe sweep key.
 
 #### The human-curator-gate contract
 

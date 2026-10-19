@@ -1041,6 +1041,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'curator_action',
         'curator_justification',
         'combined_at',
+        # stamped by the task curator on every create its dedupe pass did not judge; the re-dedupe sweep key
+        'dedupe_skipped',
         'gate_escalated_at',
         'before_done_ran_at',
         'before_done_verified_at',

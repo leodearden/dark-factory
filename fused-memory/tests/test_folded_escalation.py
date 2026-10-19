@@ -855,6 +855,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
+    from fused_memory.middleware.curation_deferral import DeferReason
     from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
@@ -872,6 +873,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     )
     from fused_memory.middleware.scope_violation_escalator import (
         _OVERRIDE_ANCHOR_TASK_ID as SCOPE_OVERRIDE_ANCHOR,
+    )
+    from fused_memory.middleware.ticket_janitor import (
+        curation_backlog_anchor,
     )
     from fused_memory.server.markup_guard import (  # noqa: PLC0415
         _RESIDUE_ANCHOR_TASK_ID as GUARD_RESIDUE_ANCHOR,
@@ -932,6 +936,11 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'link_heal misfile-share': LINK_HEAL_MISFILE_SHARE_ANCHOR,
         'link_heal corrects-share': LINK_HEAL_CORRECTS_SHARE_ANCHOR,
         'link_heal adjudicator': LINK_HEAL_ADJUDICATOR_ANCHOR,
+        # -- the ticket janitor's curation backlog, one anchor per defer reason
+        **{
+            f'ticket_janitor curation-backlog {reason}': curation_backlog_anchor(reason)
+            for reason in DeferReason
+        },
         # -- the non-member neighbours. They dedupe on content fingerprints
         #    via `submit_or_dedupe`, not on a pending anchor, so they are NOT
         #    migrating — but they write to the SAME queue, so they can still

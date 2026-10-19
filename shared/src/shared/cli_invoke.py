@@ -128,9 +128,19 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         log and return / supervisor-driven
 #                                         restart; neither blocks a queue.
 #
-# fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s.
-#   (LLM triage calls)                    Best-effort middleware, fast-fail/
-#                                         defer contract; 120 s is intentional.
+# fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
+#   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,
+#                                         never creates, when the pool cannot
+#                                         serve: AllAccountsCappedException
+#                                         (after ~120 s of cap-retry patience)
+#                                         or PoolFrozen (frozen at call start,
+#                                         no wait) parks the ticket
+#                                         awaiting_curation; the ticket janitor
+#                                         retries it until it is curated; every
+#                                         create the curator did not judge is
+#                                         marked metadata.dedupe_skipped
+#                                         (fused_memory/middleware/
+#                                         curation_deferral.py).
 #
 # fused_memory/reconciliation             _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
 #   (agent_loop, judge, cli_stage_runner) Shared by all three stage runners.
@@ -222,7 +232,8 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # (task 6042): park_on_frozen_pool=False makes before_invoke raise
 # usage_gate.PoolFrozen where it would have parked, so a caller that must
 # defer rather than wait never blocks on a frozen pool.  The default stays
-# True, so every caller above still parks.  The fix belongs in the wrapper
+# True, so every caller above that does not pass False (the curator, the
+# legibility runner) still parks.  The fix belongs in the wrapper
 # because a wait in before_invoke is definitionally a cap wait and can be
 # attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
 # pool from a slow agent and would misattribute the latter.
