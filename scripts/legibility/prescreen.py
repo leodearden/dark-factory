@@ -34,6 +34,17 @@ def _attached_by(rule: Rule, run_id: str) -> dict[str, str]:
     return {"method": rule.value, "run_id": run_id}
 
 
+_FIXED_STATUSES = frozenset({"fixed", "retired"})
+"""Entry statuses a re-observation contradicts: fixed by a task (L5), or
+retired because the verifier reported it fixed (``census.py::retire_entry``).
+No rule attaches to such an entry; a cluster re-observing one is surfaced
+(plans/census-incremental-prd.md L5, consumers)."""
+
+
+def _is_fixed(entry: Mapping[str, Any]) -> bool:
+    return entry.get("status") in _FIXED_STATUSES
+
+
 @dataclass(frozen=True)
 class TitleMatch:
     """The catalogued records a title matches once normalised.
@@ -85,7 +96,7 @@ class Catalogue:
     def of(cls, cb: Mapping[str, Any]) -> Catalogue:
         entries = [entry for entry in cb.get("entries") or [] if isinstance(entry, Mapping)]
         candidates = [candidate for candidate in cb.get("candidates") or [] if isinstance(candidate, Mapping)]
-        fixed = {entry.get("id") for entry in entries if entry.get("status") == "fixed"}
+        fixed = {entry.get("id") for entry in entries if _is_fixed(entry)}
 
         def fixed_entry_of(record: Mapping[str, Any], *, is_entry: bool) -> str | None:
             if is_entry:
@@ -155,8 +166,10 @@ class Screened:
 
 @dataclass(frozen=True)
 class Surfaced:
-    """A cluster re-observing a fixed entry: verified, and reported."""
+    """A cluster re-observing a fixed entry, by *rule*'s match: verified, never
+    attached to that entry, and reported."""
 
+    rule: Rule
     title: str
     fixed_entry_ids: tuple[str, ...]
 
@@ -181,7 +194,7 @@ def screen(clusters: Sequence[dict], catalogue: Catalogue) -> Screen:
         if (attach := catalogue.attachable(title)) is not None:
             screened.append(Screened(Rule.TITLE, title, session, attach.matched))
         elif (match := catalogue.title_match(title)) is not None:
-            surfaced.append(Surfaced(title, match.fixed_entry_ids))
+            surfaced.append(Surfaced(Rule.TITLE, title, match.fixed_entry_ids))
             to_verify.append(cluster)
         elif sighted := catalogue.sighted(sessions):
             screened.append(Screened(Rule.SESSION, title, session, sighted))
@@ -223,14 +236,26 @@ def routed_records(records: Sequence[dict], catalogue: Catalogue, *, run_id: str
     return routed
 
 
-def keyed_entry(cb: Mapping[str, Any], identity: census_findings.FindingIdentity) -> dict | None:
-    """The first entry whose finding identity stands at *identity*'s area and
-    anchor, whatever its primary tag (plans/census-incremental-prd.md T2)."""
-    for entry in cb.get("entries") or []:
-        standing = census_findings.FindingIdentity.from_record(entry)
-        if standing is not None and (standing.area, standing.anchor) == (identity.area, identity.anchor):
-            return entry
-    return None
+def _entries_at(
+    cb: Mapping[str, Any], identity: census_findings.FindingIdentity,
+) -> list[tuple[dict, census_findings.FindingIdentity]]:
+    """Every entry whose finding identity stands at *identity*'s area and
+    anchor, whatever its primary tag (plans/census-incremental-prd.md T2),
+    with that standing identity."""
+    location = (identity.area, identity.anchor)
+    return [
+        (entry, standing) for entry in cb.get("entries") or []
+        if (standing := census_findings.FindingIdentity.from_record(entry)) is not None
+        and (standing.area, standing.anchor) == location
+    ]
+
+
+def _joinable(
+    cb: Mapping[str, Any], identity: census_findings.FindingIdentity,
+) -> tuple[dict, census_findings.FindingIdentity] | None:
+    """The first entry at *identity*'s location that is not fixed: the one a
+    verdict there joins."""
+    return next(((entry, standing) for entry, standing in _entries_at(cb, identity) if not _is_fixed(entry)), None)
 
 
 @dataclass(frozen=True)
@@ -259,20 +284,20 @@ def _record_by_id(records: Iterable[dict], record_id: str, *, kind: str) -> dict
 
 
 def attach_by_key(
-    cb: dict, candidate_id: str, entry: Mapping[str, Any], found: verdict.Verdict, *, run_id: str,
+    cb: dict, candidate_id: str, entry_id: str, found: verdict.Verdict, *, run_id: str,
 ) -> tuple[dict, KeyAttach]:
-    """A new codebook in which pending *candidate_id* is promoted onto
-    *entry* instead of to an entry of its own, and the attach it made.
+    """A new codebook in which pending *candidate_id* is promoted onto entry
+    *entry_id* instead of to an entry of its own, and the attach it made.
 
     The candidate takes the entry's standing identity; each of its sightings
     from a session the entry does not carry is appended to the entry, marked
     with the attach and the verifier's tags."""
-    identity = census_findings.FindingIdentity.from_record(entry)
-    if identity is None:
-        raise ValueError(f"attach_by_key: entry {entry.get('id')!r} carries no finding identity")
     result = copy.deepcopy(cb)
     candidate = _record_by_id(result.get("candidates") or [], candidate_id, kind="candidate")
-    target = _record_by_id(result.get("entries") or [], entry["id"], kind="entry")
+    target = _record_by_id(result.get("entries") or [], entry_id, kind="entry")
+    identity = census_findings.FindingIdentity.from_record(target)
+    if identity is None:
+        raise ValueError(f"attach_by_key: entry {entry_id!r} carries no finding identity")
     attached_by = _attached_by(Rule.KEY, run_id)
 
     candidate.update(census_findings.stamped(candidate, identity))
@@ -359,7 +384,6 @@ class ExternalFinding:
     key: str
     area: str
     anchor: str
-    primary_tag: str | None
     first_seen: str | None
     supersedes: tuple[str, ...]
     run_id: str
@@ -376,14 +400,12 @@ class ExternalFinding:
             and isinstance(anchor, str) and verdict.is_anchor(anchor)
         ):
             return None
-        tags = finding.get("tags")
         first_seen = finding.get("first_seen")
         supersedes = finding.get("supersedes")
         return cls(
             key=key,
             area=area,
             anchor=anchor,
-            primary_tag=tags[0] if isinstance(tags, list) and tags and isinstance(tags[0], str) else None,
             first_seen=first_seen if isinstance(first_seen, str) and first_seen else None,
             supersedes=tuple(
                 old for old in supersedes if isinstance(old, str) and codebook.is_finding_key(old)
@@ -403,10 +425,16 @@ class Adoption:
     in place of its minted one, and the external supersedes and first_seen."""
 
     identity: census_findings.FindingIdentity
-    supersedes: tuple[str, ...]
-    first_seen: str | None
     external: ExternalFinding
     matched_by: AdoptedBy
+
+    @property
+    def supersedes(self) -> tuple[str, ...]:
+        return self.external.supersedes
+
+    @property
+    def first_seen(self) -> str | None:
+        return self.external.first_seen
 
 
 @dataclass(frozen=True)
@@ -429,8 +457,6 @@ class InstrumentFindings:
             return None
         return Adoption(
             identity=dataclasses.replace(identity, key=external.key),
-            supersedes=external.supersedes,
-            first_seen=external.first_seen,
             external=external,
             matched_by=matched_by,
         )
@@ -480,6 +506,57 @@ def load_instrument_findings(project_root: str | Path, project_id: str) -> Instr
 
 
 # ---------------------------------------------------------------------------
+# Where a verified cluster enters the codebook: the key and cross-instrument
+# rules, decided once per cluster
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Placement:
+    """Where one verified cluster's pending candidate enters the codebook.
+
+    With *standing_entry_id* it joins that entry (:func:`attach_by_key`);
+    otherwise it is promoted to an entry of its own, adopting *adoption*'s
+    key when another instrument already keys its location. *identity* is the
+    one it files under either way. *surfaced* names the fixed entries at its
+    location that it re-observes rather than joins."""
+
+    identity: census_findings.FindingIdentity
+    standing_entry_id: str | None
+    adoption: Adoption | None
+    surfaced: Surfaced | None
+
+    @property
+    def supersedes(self) -> tuple[str, ...]:
+        return () if self.adoption is None else self.adoption.supersedes
+
+    def first_seen_run(self, run_id: str) -> str:
+        """The run a new entry was first seen in: the adopted finding's, else
+        *run_id*."""
+        return (None if self.adoption is None else self.adoption.first_seen) or run_id
+
+
+def place(
+    cb: Mapping[str, Any], title: str, identity: census_findings.FindingIdentity, inputs: InstrumentFindings,
+) -> Placement:
+    """Where the verified cluster *title*, at minted *identity*, enters *cb*:
+    onto the entry standing at its location, which keeps its key (the key
+    rule), else as a new entry under the key of the finding in *inputs* it
+    re-observes (the cross-instrument rule), else under *identity*."""
+    joinable = _joinable(cb, identity)
+    if joinable is not None:
+        entry, standing = joinable
+        return Placement(standing, entry["id"], None, None)
+    fixed_entry_ids = tuple(entry["id"] for entry, _ in _entries_at(cb, identity) if _is_fixed(entry))
+    adoption = inputs.match(identity)
+    return Placement(
+        identity=identity if adoption is None else adoption.identity,
+        standing_entry_id=None,
+        adoption=adoption,
+        surfaced=Surfaced(Rule.KEY, title, fixed_entry_ids) if fixed_entry_ids else None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # The run's ## Screened section
 # ---------------------------------------------------------------------------
 
@@ -495,6 +572,7 @@ class ReObserved:
 @dataclass(frozen=True)
 class ScreenReport:
     screen: Screen
+    surfaced_by_key: tuple[Surfaced, ...]
     attached: tuple[KeyAttach, ...]
     re_observed: tuple[ReObserved, ...]
     inputs: InstrumentFindings
@@ -517,7 +595,8 @@ class ScreenReport:
                 for item in self.screen.screened
             ],
             "surfaced": [
-                {"title": item.title, "fixed_entry_ids": list(item.fixed_entry_ids)} for item in self.screen.surfaced
+                {"rule": item.rule.value, "title": item.title, "fixed_entry_ids": list(item.fixed_entry_ids)}
+                for item in (*self.screen.surfaced, *self.surfaced_by_key)
             ],
             "attached": [
                 {
@@ -575,7 +654,8 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
             for item in record["screened"]
         ),
         *(
-            f"- surfaced, verified (re-observes fixed {', '.join(item['fixed_entry_ids'])}): {_title(item['title'])}"
+            f"- surfaced by {item['rule']}, verified (re-observes fixed {', '.join(item['fixed_entry_ids'])}): "
+            f"{_title(item['title'])}"
             for item in record["surfaced"]
         ),
         *(_attached_line(item) for item in record["attached"]),

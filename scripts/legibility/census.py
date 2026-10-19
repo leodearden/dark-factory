@@ -1782,29 +1782,16 @@ def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
     return {title: len(sessions) for title, sessions in sessions_by_title.items()}
 
 
-def _split_fileable(
-    verified: list[dict], cb: dict,
-) -> tuple[list[bool], dict[str | None, filing_policy.WithheldCluster]]:
-    """Whether this run files each of *verified*, one flag per cluster in
-    order, counting each cluster's sightings in the post-merge codebook *cb*:
-    a structural one never (``disposition.files``, contract §6), a mechanical
-    one by ``filing_policy.is_fileable``. The mechanical clusters held back
-    are keyed by title, the key promotion resolves a cluster by: only a
-    held-back cluster that is then PROMOTED is marked, and reported, withheld."""
-    sighting_counts = _sighting_counts_by_title(cb)
-    files_now: list[bool] = []
-    held_back: dict[str | None, filing_policy.WithheldCluster] = {}
-    for cluster in verified:
-        title = cluster.get("title")
-        sighting_count = sighting_counts.get(title, 0)
-        mechanical = disposition.files(cluster["verdict"])
-        fileable = mechanical and filing_policy.is_fileable(cluster, sighting_count=sighting_count)
-        files_now.append(fileable)
-        if mechanical and not fileable:
-            held_back[title] = filing_policy.WithheldCluster(
-                title=title, sighting_count=sighting_count,
-            )
-    return files_now, held_back
+def _filing_gate(cluster: dict, sighting_count: int) -> tuple[bool, filing_policy.WithheldCluster | None]:
+    """Whether this run files verified *cluster*, seen in *sighting_count*
+    distinct sessions, and the cluster as held back when it does not: a
+    structural one never files and is never held (``disposition.files``,
+    contract §6), a mechanical one files by ``filing_policy.is_fileable``."""
+    mechanical = disposition.files(cluster["verdict"])
+    files = mechanical and filing_policy.is_fileable(cluster, sighting_count=sighting_count)
+    if not mechanical or files:
+        return files, None
+    return False, filing_policy.WithheldCluster(title=cluster.get("title"), sighting_count=sighting_count)
 
 
 _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
@@ -1869,13 +1856,14 @@ def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pen
     """Every cluster to file this run, from the post-merge codebook *cb*.
 
     Each *fileable* cluster, given with the entry it was promoted to -- this
-    run, or by the standing promotion its recurrence was routed to -- or
-    None, is paired with the releasable withheld entry of its title, if any
-    -- a recurrence coded as a fresh candidate files one ticket for its
-    title, not two. Every other releasable withheld entry that
+    run, by the standing promotion its recurrence was routed to, or by a key
+    attach -- or None, is paired with the releasable withheld entry of its
+    title, if any, else with that entry when it is releasable withheld -- a
+    recurrence coded as a fresh candidate, or attached by key, files one
+    ticket for its entry, not two. Every other releasable withheld entry that
     ``filing_policy.is_fileable`` now accepts at its title's sighting count
-    follows. An entry withheld THIS run is never among them: the split that
-    withheld it used that same count.
+    follows. An entry withheld THIS run is never among them: the gate that
+    withheld it used that same count, and an attach that raised it files it.
 
     Each is paired with the entry its back-link lands on: the withheld entry
     it releases, else the entry it was promoted to. A *fileable* cluster was
@@ -1889,10 +1877,13 @@ def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pen
     entry_id_by_title: dict[str | None, str] = {}
     for entry in releasable:
         entry_id_by_title.setdefault(entry["title"], entry["id"])
+    releasable_ids = {entry["id"] for entry in releasable}
 
     queue = []
     for cluster, promoted_entry_id in fileable:
         withheld_entry_id = entry_id_by_title.get(cluster.get("title"))
+        if withheld_entry_id is None and promoted_entry_id in releasable_ids:
+            withheld_entry_id = promoted_entry_id
         queue.append(PendingFiling(
             cluster, withheld_entry_id, withheld_entry_id or promoted_entry_id, verified_present=True,
         ))
@@ -2680,19 +2671,22 @@ def run_census(
     verdict parser's defaults) and ``retire_entry`` for any entry ids
     *verify_fn* reports fixed; contract finding keys are stamped at promotion
     and at a verdict-bearing rejection (``census_findings``, areas from
-    ``finding_area.load_area_map``) -- a verdict at a keyed entry's location
-    attaches to that entry (``prescreen.attach_by_key``), and a promotion at
-    a finding another instrument's newest record keys adopts that key
+    ``finding_area.load_area_map``) -- ``prescreen.place`` decides where each
+    verified cluster goes: a verdict at a live keyed entry's location attaches
+    to that entry (``prescreen.attach_by_key``), one at only a fixed entry's
+    is promoted afresh and surfaced, and a promotion at a finding another
+    instrument's newest record keys adopts that key
     (``prescreen.load_instrument_findings``) -- and every entry sighted this run has the
     run appended to its ``last_seen_runs`` -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the route gate
     (``disposition.files``, contract §6: a structural verdict stays promoted
     and is listed under ## Structural, never filed) -> the singleton filing
-    gate over the mechanical rest (``_split_fileable``: a verified cluster
+    gate over the mechanical rest (``_filing_gate``: a verified cluster
     files only with an in-tree remediation or a recurrence, counted in the
-    merged codebook; a withheld one stays promoted, is marked withheld on its
-    entry and is listed in the report, while one whose verdict was dropped is
-    neither filed nor listed)
+    merged codebook at the title of the entry it lands on, after a key
+    attach; a withheld one stays promoted, is marked withheld on a new
+    entry and is listed in the report unless its entry files this run, while
+    one whose verdict was dropped is neither filed nor listed)
     -> ``disposition.backfill``, which links every historical
     ``source=legibility_census`` task to the entry its title was filed under,
     in the first run it can reach the store -> the outcome feedback of
@@ -3085,23 +3079,23 @@ def run_census(
     # report and the tests all read one structure.
     dropped_verdicts: list[DroppedVerdict] = []
 
-    # Split BEFORE promotion so a withheld cluster's entry is marked as it is
-    # created. Promotion cannot change the count: it only copies a candidate's
-    # sightings into its entry, and _sighting_counts_by_title dedups by session.
-    # A structural cluster (contract §6, D6) is promoted but never filed.
-    files_now, held_back = _split_fileable(verified, updated_codebook)
-    marked_withheld: list[filing_policy.WithheldCluster] = []
+    # Each verified cluster's filing is gated at the distinct sessions of the
+    # title its entry carries, counted in the merged codebook BEFORE promotion,
+    # so a withheld cluster's entry is marked as it is created. Promotion
+    # cannot change a count: it only copies a candidate's sightings into its
+    # entry, and _sighting_counts_by_title dedups by session. A key attach
+    # can, so its cluster is gated at its entry's count after the attach. A
+    # structural cluster (contract §6, D6) is promoted but never filed.
+    sighting_counts = _sighting_counts_by_title(updated_codebook)
+    fileable: list[tuple[dict, str | None]] = []
+    held_back: list[tuple[filing_policy.WithheldCluster, str]] = []
     promoted: list[census_findings.Adjudication] = []
     refuted: list[census_findings.Adjudication] = []
-    promoted_entry_ids: dict[int, str] = {}
     key_attaches: list[prescreen.KeyAttach] = []
+    surfaced_by_key: list[prescreen.Surfaced] = []
     re_observed: list[prescreen.ReObserved] = []
-    # A verified cluster whose entry stands on an identity other than the one
-    # it minted (a key attach's standing key, an adopted external key) files
-    # under its entry's.
-    filed_under_entry_identity: dict[int, dict] = {}
 
-    for index, cluster in enumerate(verified):
+    for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
             # A verify verdict this run PAID FOR that resolves to no pending
@@ -3122,61 +3116,60 @@ def run_census(
                 # test_dropped_verdict_contradiction_marker_inverts_between_the_loops.
                 contradicting_disposition="rejected",
             ))
-            standing_entry_id = _standing_entry_id(updated_codebook, cluster.get("title"))
-            if standing_entry_id is not None:
-                promoted_entry_ids[index] = standing_entry_id
+            files, _ = _filing_gate(cluster, sighting_counts.get(cluster.get("title"), 0))
+            if files:
+                fileable.append((cluster, _standing_entry_id(updated_codebook, cluster.get("title"))))
             continue
         found = cluster["verdict"]
-        # The key rule (plans/census-incremental-prd.md L6): a verdict at an
-        # entry's (area, anchor), this run's promotions included, attaches to
-        # that entry, which keeps its key, instead of promoting a duplicate.
-        standing = prescreen.keyed_entry(updated_codebook, cluster["finding"])
-        if standing is not None:
+        # The key and cross-instrument rules (plans/census-incremental-prd.md
+        # L6): a verdict at a live entry's (area, anchor), this run's
+        # promotions included, joins that entry, which keeps its key; any
+        # other is promoted, under the key of another instrument's finding
+        # at its location when there is one.
+        placement = prescreen.place(updated_codebook, cluster["title"], cluster["finding"], instrument_findings)
+        if placement.surfaced is not None:
+            surfaced_by_key.append(placement.surfaced)
+        if placement.standing_entry_id is not None:
             updated_codebook, key_attach = prescreen.attach_by_key(
-                updated_codebook, cand_id, standing, found, run_id=run_id,
+                updated_codebook, cand_id, placement.standing_entry_id, found, run_id=run_id,
             )
             key_attaches.append(key_attach)
-            promoted_entry_ids[index] = key_attach.entry_id
-            filed_under_entry_identity[index] = {**cluster, "finding": key_attach.identity}
-            if key_attach.entry_id not in {adjudication.record_id for adjudication in promoted}:
-                promoted.append(census_findings.Adjudication(key_attach.entry_id, found, cluster.get("cause")))
-            continue
-        entry_fields = {
-            "id": f"entry-{cand_id}",
-            "title": cluster.get("title"),
-            "severity": found.severity,
-            "severity_reason": found.severity_reason,
-            "status": "open",
-            "origin_phase": cluster.get("origin_phase") or "unknown",
-            "manifested_phase": cluster.get("manifested_phase") or "unknown",
-            **census_findings.first_sighting_fields(run_id),
-        }
-        # The cross-instrument rule (contract §9): a promotion at a finding
-        # another instrument's newest record keys takes that key, its
-        # supersedes and its first_seen, instead of minting a second key.
-        adoption = instrument_findings.match(cluster["finding"])
-        identity = cluster["finding"] if adoption is None else adoption.identity
-        if adoption is not None:
-            entry_fields["first_seen_run"] = adoption.first_seen or run_id
-            re_observed.append(prescreen.ReObserved(cluster["title"], entry_fields["id"], adoption))
-            filed_under_entry_identity[index] = {**cluster, "finding": identity}
-        held = held_back.get(cluster.get("title"))
+            entry_id = key_attach.entry_id
+            entry_title = _find_by_id(updated_codebook["entries"], entry_id, kind="key attach")["title"]
+            files, held = _filing_gate(cluster, _sighting_counts_by_title(updated_codebook).get(entry_title, 0))
+            if entry_id not in {adjudication.record_id for adjudication in promoted}:
+                promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
+        else:
+            entry_id = f"entry-{cand_id}"
+            files, held = _filing_gate(cluster, sighting_counts.get(cluster.get("title"), 0))
+            if placement.adoption is not None:
+                re_observed.append(prescreen.ReObserved(cluster["title"], entry_id, placement.adoption))
+            entry_fields = {
+                "id": entry_id,
+                "title": cluster.get("title"),
+                "severity": found.severity,
+                "severity_reason": found.severity_reason,
+                "status": "open",
+                "origin_phase": cluster.get("origin_phase") or "unknown",
+                "manifested_phase": cluster.get("manifested_phase") or "unknown",
+                **census_findings.first_sighting_fields(run_id),
+                "first_seen_run": placement.first_seen_run(run_id),
+                **({ENTRY_FILING_KEY: ENTRY_FILING_WITHHELD} if held is not None else {}),
+            }
+            updated_codebook = promote_candidate(
+                updated_codebook, cand_id, entry_fields, finding=placement.identity,
+                supersedes=placement.supersedes,
+            )
+            promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
         if held is not None:
-            entry_fields[ENTRY_FILING_KEY] = ENTRY_FILING_WITHHELD
-            marked_withheld.append(held)
-        updated_codebook = promote_candidate(
-            updated_codebook, cand_id, entry_fields, finding=identity,
-            supersedes=() if adoption is None else adoption.supersedes,
-        )
-        promoted.append(census_findings.Adjudication(entry_fields["id"], found, cluster.get("cause")))
-        promoted_entry_ids[index] = entry_fields["id"]
+            held_back.append((held, entry_id))
+        if files:
+            fileable.append(({**cluster, "finding": placement.identity}, entry_id))
 
-    fileable = [
-        (filed_under_entry_identity.get(index, cluster), promoted_entry_ids.get(index))
-        for index, (cluster, fileable_now) in enumerate(zip(verified, files_now, strict=True))
-        if fileable_now
-    ]
-    withheld = tuple(marked_withheld)
+    # A held cluster whose entry files this run anyway, through a cluster
+    # that joined it, is not withheld.
+    filed_entry_ids = {entry_id for _, entry_id in fileable}
+    withheld = tuple(held for held, entry_id in held_back if entry_id not in filed_entry_ids)
     structural = disposition.structural_findings(
         updated_codebook,
         [adjudication.record_id for adjudication in promoted if not disposition.files(adjudication.found)],
@@ -3353,7 +3346,9 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
-    screen_report = prescreen.ScreenReport(screen, tuple(key_attaches), tuple(re_observed), instrument_findings)
+    screen_report = prescreen.ScreenReport(
+        screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
+    )
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,

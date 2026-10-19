@@ -153,7 +153,20 @@ def test_a_title_matching_a_fixed_entry_is_surfaced_and_verified(title, fixed_en
 
     assert screen.to_verify == (cluster,)
     assert screen.screened == ()
-    assert screen.surfaced == (prescreen.Surfaced(title=title, fixed_entry_ids=(fixed_entry_id,)),)
+    assert screen.surfaced == (
+        prescreen.Surfaced(rule=prescreen.Rule.TITLE, title=title, fixed_entry_ids=(fixed_entry_id,)),
+    )
+
+
+def test_a_title_matching_a_retired_entry_is_surfaced_as_fixed():
+    cb = _catalogued()
+    cb["entries"].append(_entry("entry-retired", "Retired shape", "sess-retired", status="retired"))
+    cluster = _cluster("retired shape")
+
+    screen = prescreen.screen([cluster], prescreen.Catalogue.of(cb))
+
+    assert screen.to_verify == (cluster,)
+    assert [item.fixed_entry_ids for item in screen.surfaced] == [("entry-retired",)]
 
 
 def test_a_novel_title_from_an_already_sighted_session_is_screened_by_the_session_rule():
@@ -312,7 +325,8 @@ def test_only_the_novel_payload_mints_a_pending_candidate():
 
 
 # ---------------------------------------------------------------------------
-# The key rule: a verdict at a keyed entry's (area, anchor) attaches to it
+# place(): the key rule (a verdict at a live keyed entry's (area, anchor)
+# joins it) and the cross-instrument rule, decided once per cluster
 # ---------------------------------------------------------------------------
 
 _ANCHOR = "orchestrator/x.py::f"
@@ -357,13 +371,20 @@ def _keyed_codebook(*candidate_sessions: str) -> dict:
     }
 
 
-def test_keyed_entry_matches_area_and_anchor_whatever_the_primary_tag():
-    cb = _keyed_codebook()
+_NO_INPUTS = prescreen.InstrumentFindings((), None, ())
 
-    entry = prescreen.keyed_entry(cb, _minted())
 
-    assert entry is not None
-    assert entry["id"] == "entry-cand-20261001-1"
+def _place(cb: dict, identity=None, inputs: prescreen.InstrumentFindings = _NO_INPUTS) -> prescreen.Placement:
+    return prescreen.place(cb, "B title", identity or _minted(), inputs)
+
+
+def test_a_verdict_at_a_keyed_entrys_location_joins_it_whatever_the_primary_tag():
+    placement = _place(_keyed_codebook())
+
+    assert placement.standing_entry_id == "entry-cand-20261001-1"
+    assert placement.identity == _STANDING
+    assert placement.adoption is None
+    assert placement.surfaced is None
 
 
 @pytest.mark.parametrize(
@@ -371,21 +392,52 @@ def test_keyed_entry_matches_area_and_anchor_whatever_the_primary_tag():
     [_minted(anchor="orchestrator/x.py::g"), _minted(area="shared")],
     ids=["other-anchor", "other-area"],
 )
-def test_keyed_entry_finds_nothing_at_another_location(identity):
-    assert prescreen.keyed_entry(_keyed_codebook(), identity) is None
+def test_a_verdict_at_another_location_is_promoted_under_its_minted_identity(identity):
+    placement = _place(_keyed_codebook(), identity)
+
+    assert placement.standing_entry_id is None
+    assert placement.identity == identity
+    assert placement.surfaced is None
+    assert placement.supersedes == ()
+    assert placement.first_seen_run(_RUN) == _RUN
 
 
-def test_keyed_entry_never_matches_an_unkeyed_entry():
+def test_an_unkeyed_entry_is_never_joined():
     cb = _keyed_codebook()
     cb["entries"] = cb["entries"][:1]
 
-    assert prescreen.keyed_entry(cb, _minted()) is None
+    assert _place(cb).standing_entry_id is None
+
+
+@pytest.mark.parametrize("status", ["fixed", "retired"])
+def test_a_verdict_at_only_a_fixed_entrys_location_is_promoted_afresh_and_surfaced(status):
+    cb = _keyed_codebook()
+    cb["entries"][1]["status"] = status
+
+    placement = _place(cb)
+
+    assert placement.standing_entry_id is None
+    assert placement.identity == _minted()
+    assert placement.surfaced == prescreen.Surfaced(
+        rule=prescreen.Rule.KEY, title="B title", fixed_entry_ids=("entry-cand-20261001-1",),
+    )
+
+
+def test_a_live_entry_at_a_fixed_entrys_location_is_joined_and_nothing_is_surfaced():
+    cb = _keyed_codebook()
+    cb["entries"][1]["status"] = "fixed"
+    cb["entries"].append({**copy.deepcopy(cb["entries"][1]), "id": "entry-cand-20261010-1", "status": "open"})
+
+    placement = _place(cb)
+
+    assert placement.standing_entry_id == "entry-cand-20261010-1"
+    assert placement.surfaced is None
 
 
 def _attach(cb: dict, found: verdict.Verdict | None = None):
-    entry = prescreen.keyed_entry(cb, _minted())
-    assert entry is not None
-    return prescreen.attach_by_key(cb, "cand-20261019-1", entry, found or _found(), run_id=_RUN)
+    placement = _place(cb)
+    assert placement.standing_entry_id is not None
+    return prescreen.attach_by_key(cb, "cand-20261019-1", placement.standing_entry_id, found or _found(), run_id=_RUN)
 
 
 def _by_id(cb: dict, record_id: str) -> dict:
@@ -516,7 +568,6 @@ def test_an_external_finding_keeps_its_identity_and_only_its_key_supersedes(tmp_
         key=_EXTERNAL_KEY,
         area="orchestrator",
         anchor=_ANCHOR,
-        primary_tag="h4",
         first_seen="review-all-dark_factory-20261001",
         supersedes=(_OLD_KEY,),
         run_id=_REVIEW_ALL_RUN,
@@ -627,6 +678,28 @@ def test_an_unmatched_identity_adopts_nothing(tmp_path):
     assert _loaded(tmp_path).match(_minted(anchor="orchestrator/x.py::g")) is None
 
 
+def test_a_promotion_at_an_externally_keyed_location_is_placed_under_the_adopted_key(tmp_path):
+    cb = _keyed_codebook()
+    cb["entries"] = cb["entries"][:1]
+    minted = _minted(tags=("h13", verdict.KIND_TAG))
+
+    placement = _place(cb, minted, _loaded(tmp_path))
+
+    assert placement.standing_entry_id is None
+    assert placement.adoption is not None
+    assert placement.identity == dataclasses.replace(minted, key=_EXTERNAL_KEY)
+    assert placement.supersedes == (_OLD_KEY,)
+    assert placement.first_seen_run(_RUN) == "review-all-dark_factory-20261001"
+
+
+def test_a_live_entry_at_the_location_wins_over_the_external_finding(tmp_path):
+    placement = _place(_keyed_codebook(), inputs=_loaded(tmp_path))
+
+    assert placement.standing_entry_id == "entry-cand-20261001-1"
+    assert placement.adoption is None
+    assert placement.identity == _STANDING
+
+
 # ---------------------------------------------------------------------------
 # ScreenReport: per-rule counts, the run record, and the ## Screened section
 # rendered from the record alone (contract §5)
@@ -649,6 +722,9 @@ def _full_report(tmp_path: Path) -> prescreen.ScreenReport:
             _cluster("Fixed shape"),
             _cluster("Novel shape"),
         ),
+        surfaced_by_key=(
+            prescreen.Surfaced(rule=prescreen.Rule.KEY, title="D title", fixed_entry_ids=("entry-cand-20260901-1",)),
+        ),
         attached=(key_attach,),
         re_observed=(prescreen.ReObserved(title="C title", entry_id="entry-cand-20261019-3", adoption=adoption),),
         inputs=inputs,
@@ -658,6 +734,7 @@ def _full_report(tmp_path: Path) -> prescreen.ScreenReport:
 def _empty_report() -> prescreen.ScreenReport:
     return prescreen.ScreenReport(
         screen=prescreen.Screen((), (), ()),
+        surfaced_by_key=(),
         attached=(),
         re_observed=(),
         inputs=prescreen.InstrumentFindings((), _NO_INPUTS_NOTE, ()),
@@ -705,7 +782,8 @@ def test_the_section_names_every_item_and_where_it_went(tmp_path):
     assert _lines_naming(lines, "Rejected shape", "cand-20260701-3")
     assert _lines_naming(lines, "ENTRY only shape", "entry-only")
     assert _lines_naming(lines, "Brand new shape", "cand-20260701-1")
-    assert _lines_naming(lines, "Fixed shape", "entry-fixed", "surfaced")
+    assert _lines_naming(lines, "Fixed shape", "entry-fixed", "surfaced by title")
+    assert _lines_naming(lines, "D title", "entry-cand-20260901-1", "surfaced by key")
     assert not _lines_naming(lines, "Novel shape")
     assert _lines_naming(lines, "B title", "entry-cand-20261001-1")
     assert _lines_naming(lines, "C title", "entry-cand-20261019-3", _REVIEW_ALL_RUN)

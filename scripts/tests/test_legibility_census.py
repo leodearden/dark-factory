@@ -1439,6 +1439,7 @@ _NO_INSTRUMENT_RECORDS_NOTE = (
 
 _NOTHING_SCREENED = prescreen.ScreenReport(
     screen=prescreen.Screen((), (), ()),
+    surfaced_by_key=(),
     attached=(),
     re_observed=(),
     inputs=prescreen.InstrumentFindings((), _NO_INSTRUMENT_RECORDS_NOTE, ()),
@@ -11090,6 +11091,128 @@ def test_within_run_twins_at_one_anchor_promote_one_entry(tmp_path):
     assert record["method"]["extra"]["screened"]["key"] == 1
     assert [row["id"] for row in record["findings"] if row["verdict"] == "confirmed"] == [entry["id"]]
     assert len(kwargs["submit_fn"].calls) == 1
+
+
+def test_a_verdict_at_only_a_fixed_entrys_anchor_is_promoted_afresh_and_surfaced(tmp_path):
+    _write_briefing(tmp_path)
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_verifying_at_the_row5_anchor())
+    cb = _keyed_standing_codebook()
+    cb["entries"][-1]["status"] = "fixed"
+    kwargs["codebook_dict"] = cb
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    fixed = next(e for e in persisted["entries"] if e["id"] == _STANDING_ENTRY_ID)
+    assert fixed["status"] == "fixed"
+    assert [s["session"] for s in fixed["sightings"]] == ["sess-a"]
+    fresh = _persisted_promoted_entry(kwargs)
+    assert fresh["id"] != _STANDING_ENTRY_ID
+    assert (fresh["status"], fresh["finding_key"]) == ("open", _ROW5_KEY)
+
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["screened"]["key"] == 0
+    screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
+    assert [
+        line for line in screened.splitlines()
+        if "surfaced by key" in line and _STANDING_ENTRY_ID in line and _PROMOTED_TITLE in line
+    ]
+    assert [row["id"] for row in record["findings"] if row["verdict"] == "confirmed"] == [fresh["id"]]
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
+
+
+_TWIN_TITLE = "A same-session twin shape"
+
+
+def _same_session_twins_invoke(prompt, model):
+    reply = json.loads(_happy_invoke_response(prompt, model))
+    if "novel-verified" in prompt:
+        reply["candidates"].append({**reply["candidates"][0], "title": _TWIN_TITLE})
+    return json.dumps(reply)
+
+
+def _verifying_unremediated_at_the_row5_anchor(clusters, *, model):
+    found = verdict.Verdict(
+        verified=True,
+        reason="the verifier read orchestrator/x.py",
+        anchor=_ROW5_ANCHOR,
+        tags=("h13", verdict.KIND_TAG),
+        severity="high",
+        severity_reason="r",
+        route=verdict.Route.MECHANICAL,
+        remediation=None,
+    )
+    return {"verified": [{**cluster, "verdict": found} for cluster in clusters], "rejected": [], "fixed": []}
+
+
+def _unremediated_twins_kwargs(tmp_path, *, invoke, batch):
+    _write_briefing(tmp_path)
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(invoke),
+        batch_source=[batch],
+        verify_fn=_verifying_unremediated_at_the_row5_anchor,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        commit=_make_fake_commit(),
+    )
+
+
+def _row5_entry(kwargs) -> dict:
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    [entry] = [e for e in persisted["entries"] if e.get("finding_key") == _ROW5_KEY]
+    return entry
+
+
+def test_a_held_back_verdict_that_attaches_by_key_is_reported_withheld(tmp_path):
+    kwargs = _unremediated_twins_kwargs(
+        tmp_path,
+        invoke=_same_session_twins_invoke,
+        batch=[_hand_digest("novel-verified", "a genuinely new confusion shape")],
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _row5_entry(kwargs)
+    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["screened"]["key"] == 1
+    assert record["withheld"] == [
+        {"title": _PROMOTED_TITLE, "sighting_count": 1},
+        {"title": _TWIN_TITLE, "sighting_count": 1},
+    ]
+    recorded = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Recorded, Not Filed")
+    assert _TWIN_TITLE in recorded
+    assert kwargs["submit_fn"].calls == []
+
+
+def test_a_key_attach_that_raises_a_withheld_entry_to_two_sightings_files_and_releases_it(tmp_path):
+    kwargs = _unremediated_twins_kwargs(
+        tmp_path,
+        invoke=_happy_invoke_response,
+        batch=[
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+            _hand_digest("novel-rejected", "a spurious one-off"),
+        ],
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _row5_entry(kwargs)
+    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert {s["session"] for s in entry["sightings"]} == {"novel-verified", "novel-rejected"}
+    record = _run_record(kwargs)
+    assert record["method"]["extra"]["screened"]["key"] == 1
+    assert record["withheld"] == []
+    assert len(record["filing"]["decisions"]) == 1, "one filing for the entry, not one per cluster on it"
+    [payload] = kwargs["submit_fn"].calls
+    assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
 
 
 # ---------------------------------------------------------------------------
