@@ -19,6 +19,7 @@ import config_dir_archival_allowlist
 import loop_blocking_allowlist
 import pytest
 import silent_fallthrough_allowlist
+import test_timeout_marker_inversion_guard as timeout_marker_inversion_guard
 
 from shared.governed_exceptions import (
     Debt,
@@ -180,6 +181,16 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
         'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
     },
+)
+
+
+SHARED_TIMEOUT_MARKER_GRANDFATHERED = governed_exceptions(
+    'shared.tests.test_timeout_marker_inversion_guard._GRANDFATHERED',
+    'An in-band timeout-marker site in shared/tests that predates the timeout-marker '
+    'inversion guard, exempt from it until migrated; entries may only be removed.',
+    sorted('::'.join(site) for site in timeout_marker_inversion_guard._GRANDFATHERED),
+    default=Debt(TaskRef(6337)),
+    default_covers=1,
 )
 
 
