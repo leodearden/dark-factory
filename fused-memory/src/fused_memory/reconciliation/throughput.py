@@ -1,6 +1,6 @@
 """Reconciliation drain/inflow throughput analysis (task 3049).
 
-Answers three operator questions about a project's reconciliation pipeline:
+Answers four operator questions about a project's reconciliation pipeline:
 
 * **inflow** — how many events actually arrive, per hour and per day, broken
   down by event type;

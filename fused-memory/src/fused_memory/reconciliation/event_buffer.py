@@ -135,11 +135,17 @@ class _PushResult(NamedTuple):
     coalesced_count: int = 1
 
 
+_UNFOLDED_PUSH_LOG_LINE = {
+    _PushOutcome.buffered: 'reconciliation.event_buffered',
+    _PushOutcome.redelivered: 'reconciliation.event_redelivered',
+}
+
+
 def _log_push(event: ReconciliationEvent, key: str | None, result: _PushResult) -> None:
     """One structured line per push; a WARNING when a folded row turns hot."""
     if result.outcome is not _PushOutcome.coalesced:
         logger.info(
-            f'reconciliation.event_{result.outcome.value}',
+            _UNFOLDED_PUSH_LOG_LINE[result.outcome],
             extra={
                 'project_id': event.project_id,
                 'event_type': event.type.value,
