@@ -12,7 +12,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 from types import UnionType
-from typing import Any, Literal, NamedTuple, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
 
 import yaml
 from pydantic import (
@@ -50,6 +50,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
+from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
 
 logger = logging.getLogger(__name__)
@@ -3477,6 +3478,83 @@ class ConfigKeyCensusConfig(BaseModel):
     )
 
 
+_SampleRate = Annotated[float, Field(ge=0.0, le=1.0)]
+_CandidateName = Annotated[str, Field(min_length=1)]
+
+
+class ShadowEvalConfig(BaseModel):
+    """Live paired shadow eval (plans/live-shadow-eval-prd.md C6), under ``shadow_eval:``.
+
+    Assumption (Leo, 2026-09-11): the GLM Coding Plan is used only for eval, so
+    shadow cells contend with nothing for its credit allowance; no credit-budget
+    knob or quota-contention model exists. Revisit if the plan starts serving
+    other work.
+    """
+
+    enabled: bool = Field(default=False, description='Master switch; off opens no cell.')
+    sample_rate: _SampleRate = Field(
+        default=0.0, description='Probability a matching trigger opens a cell.',
+    )
+    candidate_sample_rates: dict[str, _SampleRate] = Field(
+        default_factory=dict,
+        description='Per-candidate sample_rate overrides; keys must be listed in candidates.',
+    )
+    shapes: list[ShadowShape] = Field(
+        default_factory=list, description='The enabled cell shapes.',
+    )
+    candidates: list[_CandidateName] = Field(
+        default_factory=list,
+        description='EvalConfig names, optionally <name>@<variant>.',
+    )
+    end_to_end_candidates: list[_CandidateName] = Field(
+        default_factory=list,
+        description='The candidates that also run end-to-end cells; each must be in candidates.',
+    )
+    max_concurrent: int = Field(default=1, ge=1, description='Cells running at once.')
+    daily_budget_usd: float = Field(
+        default=50.0,
+        ge=0.0,
+        description=(
+            'auto_eval_redo_budget_usd semantics: a trailing-24h USD sum of shadow '
+            'invocation cost, above which no cell opens.'
+        ),
+    )
+    settle_deadline_hours: float = Field(
+        default=168.0, gt=0.0,
+        description='How long an awaiting cell waits for its production reference.',
+    )
+    failure_streak_pause: int = Field(
+        default=5, ge=1, description='Consecutive failed cells that pause shadow eval.',
+    )
+    cost_ratio_ceiling: float = Field(
+        default=3.0, gt=0.0,
+        description='Candidate-to-incumbent cost ratio above which shadow eval pauses.',
+    )
+    n_min: int = Field(
+        default=12, ge=1,
+        description='Pairs below which a report line is UNDERPOWERED (provisional, PRD open question 2).',
+    )
+    seed: int = Field(default=0, description='Seed of the sampling RNG.')
+
+    @model_validator(mode='after')
+    def _listed_candidates_only(self) -> 'ShadowEvalConfig':
+        listed = set(self.candidates)
+        unlisted = {
+            'end_to_end_candidates': [c for c in self.end_to_end_candidates if c not in listed],
+            'candidate_sample_rates': sorted(set(self.candidate_sample_rates) - listed),
+        }
+        for field_name, names in unlisted.items():
+            if names:
+                raise ValueError(
+                    f'shadow_eval.{field_name} names {names} absent from '
+                    f'shadow_eval.candidates; such an entry would never fire'
+                )
+        return self
+
+    def sample_rate_for(self, candidate: str) -> float:
+        return self.candidate_sample_rates.get(candidate, self.sample_rate)
+
+
 # --- Top-level ---
 
 
@@ -4227,6 +4305,7 @@ class OrchestratorConfig(BaseSettings):
             '_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES whatever their phase.'
         ),
     )
+    shadow_eval: ShadowEvalConfig = Field(default_factory=ShadowEvalConfig)
 
     # Worktree identity guard (Fix C) — on crash-recovery / worktree reuse,
     # compare the worktree's stored title against the live DB task's title and
@@ -6434,6 +6513,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # and the 8h fleet-redeploy cadence, clearing a false-positive L2 without a
     # restart is materially better.
     _submodel_leaf_paths('config_key_census', ConfigKeyCensusConfig),
+    # Live shadow eval (task 5382, plans/live-shadow-eval-prd.md C6): green tier on
+    # purpose, NOT auto_eval_redo_budget_usd's restart tier (PRD S2).
+    _submodel_leaf_paths('shadow_eval', ShadowEvalConfig),
     {
         # Steward grace
         'steward_completion_timeout',

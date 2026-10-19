@@ -132,7 +132,7 @@ class TestCensusAndCli:
         block = {k: v for k, v in _FULL_BLOCK.items() if k != 'enabled'}
         block['enabeld'] = True
         path = _write_yaml(tmp_path, block)
-        assert 'shadow_eval.enabeld' in census_config_keys(path).unknown
+        assert [key.path for key in census_config_keys(path).unknown] == ['shadow_eval.enabeld']
         result = CliRunner().invoke(main, ['check-config', '--config', str(path)])
         assert result.exit_code == 1, result.output
         assert 'shadow_eval.enabeld' in result.output
