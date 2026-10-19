@@ -281,22 +281,29 @@ def configured_journal() -> Path:
     return WriteJournal(CHECKOUT_ROOT / data_dir).db_path
 
 
-def panel_windows(
-    end: datetime, hours: Sequence[int], *, now: datetime, read_retention_days: float
-) -> tuple[Window, ...]:
-    """Windows ending at *end*, refused if any reaches past the raw read horizon,
-    where a startup prune may delete raw reads between snapshot and verify."""
+def require_inside_read_horizon(
+    windows: Sequence[Window], *, now: datetime, read_retention_days: float
+) -> None:
+    """Refuse a window reaching past the raw read horizon: fused-memory's retention
+    prune, at startup and every ``prune_interval_seconds``, deletes raw reads older
+    than it, so counts there move for reasons the migration does not cause."""
     horizon = now - timedelta(days=read_retention_days)
-    windows = tuple(
-        Window(start=(end - timedelta(hours=h)).isoformat(), end=end.isoformat(), hours=h)
-        for h in hours
-    )
     for window in windows:
         if datetime.fromisoformat(window.start) < horizon:
             raise PreflightError(
                 f'a {window.hours}h window starting {window.start} reaches past the '
                 f'read retention horizon ({horizon.isoformat()})'
             )
+
+
+def panel_windows(
+    end: datetime, hours: Sequence[int], *, now: datetime, read_retention_days: float
+) -> tuple[Window, ...]:
+    windows = tuple(
+        Window(start=(end - timedelta(hours=h)).isoformat(), end=end.isoformat(), hours=h)
+        for h in hours
+    )
+    require_inside_read_horizon(windows, now=now, read_retention_days=read_retention_days)
     return windows
 
 
@@ -305,9 +312,12 @@ def panel_counts(conn: sqlite3.Connection, window: Window) -> dict[tuple[str, st
     return {(hour, kind, operation): n for hour, kind, operation, n in rows}
 
 
-def snapshot(conn: sqlite3.Connection, windows: Sequence[Window]) -> dict[str, Any]:
+def snapshot(
+    conn: sqlite3.Connection, windows: Sequence[Window], *, read_retention_days: float
+) -> dict[str, Any]:
     require_rollup_table(conn)
     return {
+        'read_retention_days': read_retention_days,
         'windows': [
             {
                 **asdict(window),
@@ -318,11 +328,21 @@ def snapshot(conn: sqlite3.Connection, windows: Sequence[Window]) -> dict[str, A
     }
 
 
-def verify(conn: sqlite3.Connection, recorded: dict[str, Any]) -> list[Mismatch]:
+def verify(
+    conn: sqlite3.Connection, recorded: dict[str, Any], *, now: datetime
+) -> list[Mismatch]:
+    """Mismatches against *recorded*; refused once a window has crossed the read
+    horizon the snapshot was taken under, since the prune may have moved it."""
     require_rollup_table(conn)
+    windows = [
+        Window(start=entry['start'], end=entry['end'], hours=entry['hours'])
+        for entry in recorded['windows']
+    ]
+    require_inside_read_horizon(
+        windows, now=now, read_retention_days=recorded['read_retention_days']
+    )
     mismatches = []
-    for entry in recorded['windows']:
-        window = Window(start=entry['start'], end=entry['end'], hours=entry['hours'])
+    for window, entry in zip(windows, recorded['windows'], strict=True):
         expected = {(hour, kind, op): n for hour, kind, op, n in entry['counts']}
         observed = panel_counts(conn, window)
         for key in sorted(expected.keys() | observed.keys()):
@@ -604,7 +624,7 @@ def _run_snapshot(args: argparse.Namespace) -> int:
         retention = configured_read_retention_days()
     windows = panel_windows(end, args.window_hours, now=now, read_retention_days=retention)
     with closing(connect_read_only(args.journal)) as conn:
-        recorded = snapshot(conn, windows)
+        recorded = snapshot(conn, windows, read_retention_days=retention)
     args.out.write_text(json.dumps(recorded, indent=2))
     _print_json({
         'out': str(args.out),
@@ -617,7 +637,7 @@ def _run_snapshot(args: argparse.Namespace) -> int:
 def _run_verify(args: argparse.Namespace) -> int:
     recorded = json.loads(args.snapshot.read_text())
     with closing(connect_read_only(args.journal)) as conn:
-        mismatches = verify(conn, recorded)
+        mismatches = verify(conn, recorded, now=datetime.now(UTC))
     _print_json({'mismatches': [asdict(m) for m in mismatches]})
     return 1 if mismatches else 0
 

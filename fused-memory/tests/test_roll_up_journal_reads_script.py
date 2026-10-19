@@ -19,8 +19,10 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.config.schema import WriteJournalConfig
 from fused_memory.services.read_rollup import keeps_read_row
 from fused_memory.services.write_journal import SCHEMA_SQL, WriteJournal
+from fused_memory.services.write_ops_retention import prune_write_ops_pass
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'roll_up_journal_reads.py'
 
@@ -365,6 +367,104 @@ class TestReadRetentionHorizon:
 
         assert code == 0, err
         assert report is not None and report['read_retention_days'] == 30.0
+
+    def test_verify_refuses_a_window_the_horizon_has_since_crossed(
+        self, journal, capsys, tmp_path,
+    ):
+        out = tmp_path / 'week.json'
+        code, _, err = self._week_snapshot(journal, capsys, out, '--read-retention-days', '30')
+        assert code == 0, err
+        recorded = json.loads(out.read_text())
+        assert recorded['read_retention_days'] == 30.0
+        # As if days passed: the recorded horizon now falls inside the window.
+        out.write_text(json.dumps({**recorded, 'read_retention_days': 2.0}))
+
+        code, report, err = _run(capsys, 'verify', '--journal', str(journal), '--snapshot', str(out))
+
+        assert code == 1
+        assert report is None
+        assert 'read retention horizon' in err
+
+
+def _month_of_history() -> list[dict]:
+    """Rows every 4 hours over 40 days ending 2 h ago, in time order, so the
+    oldest 10 days lie past the 30-day read horizon."""
+    newest = datetime.now(UTC) - timedelta(hours=2)
+    rows = []
+    for i in range(240):
+        shape = i % 5
+        kind, operation, success = {
+            0: ('read', 'get_task', 1),
+            1: ('read', 'get_statuses', 1),
+            2: ('read', 'search', 1),
+            3: ('read', 'get_task', 0),
+            4: ('write', 'add_memory', 1),
+        }[shape]
+        rows.append({
+            'id': f'aged-{i}',
+            'operation': operation,
+            'project_id': 'dark_factory',
+            'agent_id': None,
+            'kind': kind,
+            'success': success,
+            'error': None if success else 'boom',
+            'params': '{}',
+            'created_at': (newest - timedelta(hours=4 * (239 - i))).isoformat(),
+        })
+    return rows
+
+
+def _retention_prune_pass(journal_dir: Path) -> None:
+    async def _pass() -> None:
+        journal = WriteJournal(journal_dir)
+        await journal.initialize()
+        try:
+            await prune_write_ops_pass(journal, WriteJournalConfig())
+        finally:
+            await journal.close()
+
+    asyncio.run(_pass())
+
+
+class TestAlongsideTheRetentionPrune:
+    """fused-memory's retention prune keeps running, at startup and every
+    prune_interval_seconds, while the migration moves history."""
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_retention(self, monkeypatch):
+        monkeypatch.delenv('WRITE_JOURNAL_READ_RETENTION_DAYS', raising=False)
+
+    def test_every_count_only_row_is_counted_or_pruned_once_and_verify_holds(
+        self, tmp_path, capsys,
+    ):
+        journal_dir = tmp_path / 'journal'
+        db_path = _initialized_journal(journal_dir)
+        history = _month_of_history()
+        _insert_rows(db_path, history)
+        out = tmp_path / 'before.json'
+        _snapshot(db_path, capsys, out)
+
+        _migrate(db_path, capsys, '--max-chunks', '2')
+        before_prune = set(_write_ops_by_id(db_path))
+        _retention_prune_pass(journal_dir)
+        pruned = before_prune - set(_write_ops_by_id(db_path))
+        code, report, err = _migrate(db_path, capsys)
+        assert code == 0 and report is not None and report['remaining'] is None, err
+        _retention_prune_pass(journal_dir)
+
+        horizon = datetime.now(UTC) - timedelta(days=30)
+        by_id = {row['id']: row for row in history}
+        assert any(_is_count_only(by_id[row_id]) for row_id in pruned), (
+            'the prune took no count-only row, so this did not race the migration'
+        )
+        assert all(datetime.fromisoformat(by_id[row_id]['created_at']) < horizon for row_id in pruned)
+        assert _rollup_counts(db_path) == Counter(
+            _rollup_key(row) for row in history
+            if _is_count_only(row) and row['id'] not in pruned
+        )
+        code, report, err = _run(capsys, 'verify', '--journal', str(db_path), '--snapshot', str(out))
+        assert code == 0, (report, err)
+        assert report is not None and report['mismatches'] == []
 
 
 def _twin_journals(tmp_path) -> tuple[Path, Path]:

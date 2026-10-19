@@ -71,8 +71,12 @@ This records the Memory panel's numbers for 1 h, 24 h and 7 d windows, keyed
 `(hour, kind, operation)`. The windows end at the hour before the current one,
 so the in-flight hour is excluded. Override that with `--window-hours` /
 `--window-end`. Windows reaching past the raw read horizon are refused,
-because a fused-memory restart's prune may delete raw reads that old between
-snapshot and verify.
+because fused-memory's retention prune, which runs at startup and every
+`prune_interval_seconds` (30 min), deletes raw reads that old between
+snapshot and verify. The snapshot file records the horizon it was taken
+under, and `verify` refuses, rather than reporting mismatches, once a window
+has crossed it. With the default windows that leaves about three weeks
+between snapshot and the last verify.
 
 The horizon is fused-memory's `write_journal.read_retention_days`, 30 days
 unless `WRITE_JOURNAL_READ_RETENTION_DAYS` says otherwise. The script loads
@@ -122,6 +126,29 @@ task5405-rollup`, Ctrl-C, a crash) loses nothing. The interrupted chunk rolls
 back whole, and the remaining count-only rows ARE the work queue, so a rerun
 resumes where it stopped and never double-counts. `--max-seconds T` bounds a
 single run. A rerun after completion moves 0 rows.
+
+**The retention prune keeps running. Leave it on.** fused-memory runs
+`WriteJournal.prune_write_ops` at startup and every `prune_interval_seconds`
+(task 6655), each pass in its own short transactions, while `migrate` runs.
+They cannot lose or double-count a read. A chunk counts exactly the rows it
+deletes in one `BEGIN IMMEDIATE` transaction, the prune deletes only raw rows
+that still exist, and the prune never touches `read_op_counts`. So every
+count-only read ends up either counted by `migrate` or deleted by the prune,
+once. The prune takes only reads older than `read_retention_days`, the
+horizon it applied before task 5405, so the `snapshot` windows never see it.
+Such reads are dropped uncounted, as they always were, and `read_op_counts`
+history starts roughly one retention horizon before the migration.
+The two take the write lock in turn. A prune batch (500 rows, measured
+0.17-0.55 s) can wait behind one chunk, and a journalled tool call can wait
+behind both, about 2.5 s at the measured maxima. That is still inside
+fused-memory's 5000 ms `busy_timeout`. A prune batch caught behind a chunk
+longer than 5 s fails its pass with `Failed to prune write_ops: database is
+locked` at ERROR, and the next pass retries. Treat that line the way the
+pilot treats `max_chunk_seconds` above 2 s: lower `--chunk-rowids`.
+Measured 2026-10-19 on a 400,000-row scratch with 40 days of history, a
+prune pass every 0.2 s and live journal writes during `migrate --apply`:
+for every key, rollup plus pruned equalled the original count exactly.
+There were 0 journal drops and `verify` showed 0 mismatches.
 
 ### 5. Verify
 
@@ -339,7 +366,11 @@ build did not have yet:
   is ~97% CPU-busy. A maximum above 5 s is a dropped write in the live service,
   so watch `max_chunk_seconds` in the pilot; if the 25-chunk pilot shows more
   than ~2 s, lower `--chunk-rowids` or raise `--pause-seconds`.
-- **Projection:** the backlog is ~35.1M count-only rows, plus ~1M a day until
-  fused-memory restarts onto 5405. At the sustained 1,960 rows/s that is about
-  **5 h** of online migration (extrapolated from a 10-minute run; the pilot's
-  `rows_per_second` on the live file is the real figure).
+- **Projection:** the backlog was ~35.1M count-only rows on 2026-10-16, plus
+  ~1M a day until fused-memory restarts onto 5405. At the sustained
+  1,960 rows/s that is about **5 h** of online migration (extrapolated from a
+  10-minute run; the pilot's `rows_per_second` on the live file is the real
+  figure). Since task 6655 the periodic prune deletes count-only reads older
+  than `read_retention_days` before `migrate` reaches them, so once it has
+  drained, the backlog is at most ~30 days of reads, ~30M rows and ~4 h.
+  `status`'s `count_only_span` shows what is actually left.
