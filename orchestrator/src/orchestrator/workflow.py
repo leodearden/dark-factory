@@ -2175,30 +2175,23 @@ class TaskWorkflow:
         return union_files or None, self._resolve_module_configs(union_modules or None)
 
     async def _finalise_merged_done(self) -> WorkflowOutcome:
-        """Common DONE-finalisation for the happy-path merge.
+        """The single DONE tail after a successful MERGE phase.
 
-        Refreshes ``metadata.files`` from the merge diff, then calls
-        ``mark_done`` with ``kind='merged'``.  Extracted from ``run()`` so
-        the state machine stays under pyright's complexity threshold.
+        With ``_merge_sha`` set, refreshes ``metadata.files`` from the merge
+        diff, then calls ``mark_done`` with ``kind='merged'``.  A success with
+        no ``_merge_sha`` is decided by :meth:`_finalise_without_merge_sha`.
+        Extracted from ``run()`` so the state machine stays under pyright's
+        complexity threshold.
 
         Returns ``WorkflowOutcome.DONE`` on success; ``BLOCKED`` (with L1)
         when the persistence layer refuses.  The DONE phase is entered only
         once the done write has landed, so a refused write reaches
         ``_mark_blocked`` from a working machine and leaves a 'blocked' row
-        plus an L1.  A missing ``_merge_sha`` exits DONE without writing the
-        row (task 3113).
+        plus an L1.
         """
-        await self._reconcile_metadata_files_for_done()
         if not self._merge_sha:
-            # Eval mode and the coalesced already_merged case reach here; task 3113 owns this exit.
-            logger.error(
-                'Task %s: SUCCESS path reached without _merge_sha — '
-                'cannot construct done_provenance; exiting DONE without '
-                'writing the done row',
-                self.task_id,
-            )
-            self._enter_phase(WorkflowState.DONE)
-            return WorkflowOutcome.DONE
+            return await self._finalise_without_merge_sha()
+        await self._reconcile_metadata_files_for_done()
         # task 3057: this stamp is DELIBERATELY NOT routed through
         # `gate_mark_done_on_delivered_checks`, unlike the eleven
         # attribution-shaped seams in this module, harness.py and
@@ -2243,6 +2236,75 @@ class TaskWorkflow:
             f'invocations={self.metrics.agent_invocations}'
         )
         return WorkflowOutcome.DONE
+
+    async def _finalise_without_merge_sha(self) -> WorkflowOutcome:
+        """Resolve a merge-phase SUCCESS that carries no ``_merge_sha`` (task 3113).
+
+        Known routes here: the merge queue answering ``already_merged`` (a
+        coalesced duplicate submission, reify 5367/5602, or a restart-replayed
+        orphan) and the branch observed on main after a steward resolution in
+        :meth:`_run_merge_phase`.  Eval mode skips the merge by design and
+        keeps its DONE-without-row exit.  Otherwise the shared ladder
+        (:meth:`_recover_landed_branch`) stamps an honest provenance — a
+        journalled landing as ``merged``, an attributable one as
+        ``found_on_main``.  When nothing resolves, or resolving raises, the
+        task blocks behind an L1 from the still-working machine rather than
+        reporting a DONE whose row was never written.
+        """
+        if self._worktree_external:
+            await self._reconcile_metadata_files_for_done()
+            self._enter_phase(WorkflowState.DONE)
+            return WorkflowOutcome.DONE
+        head = main_sha = ''
+        try:
+            _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.worktree)
+            head = head.strip()
+            main_sha = await self.git_ops.get_main_sha()
+            resolved = await self._recover_landed_branch(
+                head, main_sha, guard='post-MERGE',
+            )
+            if resolved is not None:
+                return resolved
+            verdict = await self._unresolved_landing_verdict(head, main_sha)
+        except WorkflowCancelled:
+            raise
+        except Exception as exc:
+            logger.exception(
+                'Task %s: resolving a sha-less merge success failed', self.task_id,
+            )
+            verdict = f'resolution raised: {exc!r}'
+        return await self._mark_blocked(
+            'Merge phase reported success with no merge_sha and the landing '
+            'could not be attributed',
+            detail=(
+                f'task: {self.task_id}\n'
+                f'branch_head: {head or "(unresolved)"}\n'
+                f'main_sha: {main_sha or "(unresolved)"}\n'
+                f'verdict: {verdict}\n'
+                'the merge phase reported success with no merge_sha; known '
+                'routes are the merge queue returning already_merged (a '
+                'coalesced duplicate submission, or a restart-replayed orphan) '
+                'and the branch observed on main after a steward resolution'
+            ),
+            escalate_to_human=True,
+        )
+
+    async def _unresolved_landing_verdict(self, head: str, main_sha: str) -> str:
+        """Why :meth:`_recover_landed_branch` found nothing to stamp, for the L1 detail."""
+        if MergeProvenance.lookup(self.task_id) is not None:
+            return (
+                'landed-outbox journal row present, but the delivered-checks '
+                'guard withheld the recovery'
+            )
+        if not head:
+            return 'journal miss; branch head unresolved (git rev-parse HEAD was empty)'
+        if await self._branch_work_landed_on_main(head, main_sha, wt_head=None):
+            return (
+                'journal miss; branch work is on main but has no attributable '
+                'landing evidence, or the delivered-checks guard withheld the '
+                'recovery'
+            )
+        return 'journal miss; branch not found landed on main with recorded work'
 
     async def _reconcile_metadata_files_for_done(
         self, *, override_files: list[str] | None = None,
@@ -11611,6 +11673,8 @@ class TaskWorkflow:
                 self._merge_sha = result.merge_sha
             return WorkflowOutcome.DONE
         if result.status == 'already_merged':
+            # No merge_sha: the DONE tail (_finalise_without_merge_sha) is the
+            # single decision point for a sha-less success (task 3113).
             logger.info(f'Task {self.task_id}: already merged to main')
             return WorkflowOutcome.DONE
         if result.status == 'superseded':
@@ -15539,46 +15603,71 @@ class TaskWorkflow:
         citation is the stamped sha — task 4704; an unrelated main tip was
         stamped here for task 3269). Returns
         ``None`` in all other cases (not an ancestor, a spurious merge
-        signal, no attributable landing — the merge then runs, and its
-        already-merged-without-merge-sha path surfaces an L1 — or — task 3057
+        signal, no attributable landing — the merge then runs, and a
+        sha-less success surfaces an L1 from :meth:`_finalise_without_merge_sha`
+        — or — task 3057
         — the chokepoint withholding the recovery
         because the task's declared ``metadata.delivered_checks`` are not
         verifiably present on main) so the caller proceeds with the
         merge-retry loop, which is already how ``_run_merge_phase`` reads a
         ``None`` result.
         """
-        row: LandedRow | None = MergeProvenance.lookup(self.task_id)
-        if row is not None:
-            return await self._finalise_recovery_done(
-                basis='journal', sha=row.advanced_sha, kind='merged',
-                note='landed-outbox journal hit (pre-MERGE recovery)',
-            )
-
-        # wt_head=None: the merge phase runs after a rebase, where a
-        # post-rebase HEAD may coincide with base_commit even on a
-        # genuinely-implemented branch, so this caller must keep the
-        # iteration-log fallback rather than the SHA-primary signal (see
-        # _has_prior_implementation's docstring and task 2504).
-        if await self._branch_work_landed_on_main(branch_head, main_sha, wt_head=None):
-            evidence_sha = await self._discovered_landing_sha('pre-MERGE', branch_head)
-            if evidence_sha is None:
-                return None
-            return await self._finalise_recovery_done(
-                basis='fallback', sha=evidence_sha, kind='found_on_main',
-                note='branch already on main at merge phase (pre-MERGE recovery)',
-            )
-
-        # Not landed. Re-check is_ancestor (cheap, redundant on this path
-        # only) purely to scope the breadcrumb to the spurious-merge-signal
-        # sub-case (ancestor but no work) — a normal divergent (non-ancestor)
-        # merge must stay silent.
-        if await self.git_ops.is_ancestor(branch_head, main_sha):
+        recovered = await self._recover_landed_branch(
+            branch_head, main_sha, guard='pre-MERGE',
+        )
+        if recovered is not None:
+            return recovered
+        # Re-check is_ancestor (cheap, redundant on this path only) purely to
+        # scope the breadcrumb to the spurious-merge-signal sub-case (ancestor
+        # but no work) — a normal divergent (non-ancestor) merge must stay
+        # silent.
+        if (
+            await self.git_ops.is_ancestor(branch_head, main_sha)
+            and not self._has_prior_implementation(wt_head=None).has_work
+        ):
             logger.warning(
                 f'Task {self.task_id}: branch appears merged at '
                 f'merge phase but has no implementation entries '
                 f'— proceeding with merge'
             )
         return None
+
+    async def _recover_landed_branch(
+        self, branch_head: str, main_sha: str, *, guard: str,
+    ) -> WorkflowOutcome | None:
+        """The merge-phase already-landed ladder, shared by the pre- and post-MERGE guards.
+
+        Journal first (MP-1): a :meth:`MergeProvenance.lookup` row stamps
+        ``kind='merged'`` at its ``advanced_sha``.  On a miss, a branch whose
+        work landed on main (:meth:`_branch_work_landed_on_main`) stamps
+        ``found_on_main`` at the task's own citation
+        (:meth:`_discovered_landing_sha`).  Both stamps go through the
+        :meth:`_finalise_recovery_done` chokepoint (MP-2, delivered checks,
+        reject-to-L1); *guard* labels their notes.  An empty *branch_head*
+        skips the git tier.  Returns None when nothing resolved.
+        """
+        row: LandedRow | None = MergeProvenance.lookup(self.task_id)
+        if row is not None:
+            return await self._finalise_recovery_done(
+                basis='journal', sha=row.advanced_sha, kind='merged',
+                note=f'landed-outbox journal hit ({guard} recovery)',
+            )
+        # wt_head=None: the merge phase runs after a rebase, where a
+        # post-rebase HEAD may coincide with base_commit even on a
+        # genuinely-implemented branch, so this caller must keep the
+        # iteration-log fallback rather than the SHA-primary signal (see
+        # _has_prior_implementation's docstring and task 2504).
+        if not branch_head or not await self._branch_work_landed_on_main(
+            branch_head, main_sha, wt_head=None,
+        ):
+            return None
+        evidence_sha = await self._discovered_landing_sha(guard, branch_head)
+        if evidence_sha is None:
+            return None
+        return await self._finalise_recovery_done(
+            basis='fallback', sha=evidence_sha, kind='found_on_main',
+            note=f'branch already on main at merge phase ({guard} recovery)',
+        )
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
