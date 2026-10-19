@@ -6,7 +6,12 @@ import ast
 
 import pytest
 
-from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.pytest_mark_grammar import (
+    mark_elements,
+    marker_name,
+    pytestmark_elements,
+    pytestmark_value,
+)
 
 
 def _expr(source: str) -> ast.expr:
@@ -15,6 +20,10 @@ def _expr(source: str) -> ast.expr:
 
 def _statement(source: str) -> ast.stmt:
     return ast.parse(source).body[0]
+
+
+def _body(source: str) -> list[ast.stmt]:
+    return ast.parse(source).body
 
 
 @pytest.mark.parametrize(('source_expr', 'expected'), [
@@ -65,3 +74,36 @@ def test_mark_elements_unwraps_a_list_or_tuple_into_its_elements(source):
 def test_mark_elements_wraps_a_single_expression():
     value = _expr('pytest.mark.timeout(5)')
     assert mark_elements(value) == [value]
+
+
+def test_pytestmark_elements_hands_back_a_single_bound_element_itself():
+    body = _body('pytestmark = pytest.mark.slow\n')
+    statement = body[0]
+    assert isinstance(statement, ast.Assign)
+    elements = pytestmark_elements(body)
+    assert len(elements) == 1
+    assert elements[0] is statement.value
+
+
+def test_pytestmark_elements_unwraps_a_list_binding():
+    elements = pytestmark_elements(_body('pytestmark = [pytest.mark.slow, pytest.mark.timeout(5)]\n'))
+    assert [marker_name(element) for element in elements] == ['slow', 'timeout']
+
+
+def test_pytestmark_elements_takes_the_last_binding():
+    body = _body('pytestmark = pytest.mark.slow\npytestmark = [pytest.mark.timeout(5)]\n')
+    assert [marker_name(element) for element in pytestmark_elements(body)] == ['timeout']
+
+
+def test_pytestmark_elements_ignores_a_later_valueless_annotation():
+    body = _body('pytestmark = pytest.mark.slow\npytestmark: list\n')
+    assert [marker_name(element) for element in pytestmark_elements(body)] == ['slow']
+
+
+@pytest.mark.parametrize('source', [
+    'if True:\n    pytestmark = pytest.mark.slow\n',
+    'x = 1\n',
+    '',
+])
+def test_pytestmark_elements_is_empty_without_a_direct_child_binding(source):
+    assert pytestmark_elements(_body(source)) == []
