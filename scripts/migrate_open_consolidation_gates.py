@@ -11,6 +11,11 @@ retain arm
 (``fused_memory/reconciliation/consolidation_auto_executor.py::apply_auto_verdict``).
 Gates the predicate fails are left to the curator sitting.
 
+One run attempts at most ``consolidation_auto.max_auto_per_cycle`` executions,
+in task-id order. A later passing gate is reported ``deferred`` and runs next
+time. ``--dry-run`` spends the same budget, so its ``would_execute`` gates are
+the ones ``--execute`` will attempt.
+
 It never changes a task's status. The gate closes when its own runner resumes
 it, and the report lists the calls that do that.
 
@@ -206,8 +211,18 @@ class GateReport:
         return tuple(reason.code for reason in self.reasons)
 
     @property
-    def attempted_execution(self) -> bool:
-        return self.execution is not None or RefusalCode.EXECUTION_REFUSED in self.codes
+    def spends_execution_slot(self) -> bool:
+        """An execution this run attempted, or in a dry run would attempt."""
+        return (
+            self.disposition is Disposition.WOULD_EXECUTE
+            or self.execution is not None
+            or RefusalCode.EXECUTION_REFUSED in self.codes
+        )
+
+    @property
+    def mint_attempted(self) -> bool:
+        """A canonical for this topic was, may have been, or in a dry run would be minted."""
+        return self.verdict is AutoOutcome.PASS and self.spends_execution_slot
 
     @property
     def left_open(self) -> bool:
@@ -318,13 +333,19 @@ def _id_order(task_id: str) -> tuple[int, str]:
 
 
 async def migrate(ctx: RunContext, gates: Iterable[OpenGate]) -> tuple[GateReport, ...]:
-    """Every gate in order, executing at most ``max_auto_per_cycle`` of them per run."""
+    """Every gate in order, executing at most ``max_auto_per_cycle`` of them per run.
+
+    A dry run spends the same budget, so it previews what ``--execute`` writes.
+    A topic minted earlier in the run joins the slug list later gates are ruled
+    against, so two near-synonym gates cannot both mint and split one topic.
+    """
     reports: list[GateReport] = []
     for gate in gates:
-        attempts = sum(report.attempted_execution for report in reports)
-        reports.append(
-            await migrate_gate(ctx, gate, may_execute=attempts < ctx.config.max_auto_per_cycle),
-        )
+        spent = sum(report.spends_execution_slot for report in reports)
+        report = await migrate_gate(ctx, gate, may_execute=spent < ctx.config.max_auto_per_cycle)
+        if report.mint_attempted and report.topic is not None:
+            ctx = replace(ctx, canonical_slugs=(*ctx.canonical_slugs, report.topic))
+        reports.append(report)
     return tuple(reports)
 
 
@@ -345,10 +366,12 @@ async def _rule(ctx: RunContext, gate: OpenGate, topic: str, *, may_execute: boo
         return _refused(gate, topic, scroll_ids)
     assessment = await assess(ctx, gate, topic, scroll_ids)
     report = _dispose(ctx, assessment)
-    if ctx.mode is not Mode.EXECUTE or report.disposition is not Disposition.WOULD_EXECUTE:
+    if report.disposition is not Disposition.WOULD_EXECUTE:
         return report
     if not may_execute:
         return assessment.report(Disposition.DEFERRED, [Reason(MigrationCode.CYCLE_CAP_REACHED)])
+    if ctx.mode is Mode.DRY_RUN:
+        return report
     return await _execute(ctx, assessment)
 
 

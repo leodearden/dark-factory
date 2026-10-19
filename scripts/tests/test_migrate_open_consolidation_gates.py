@@ -29,6 +29,7 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from fused_memory.config.schema import ConsolidationAutoConfig
+from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
@@ -397,6 +398,19 @@ class TestActionableRefusals:
         assert gate['disposition'] == 'refused'
         assert 'claim_not_index_shaped' in gate['codes']
 
+    def test_peers_carrying_no_category_leave_the_category_undetermined(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        seed_tasks([gate_row(54, TOPIC, observed=fake.seed_many(3, category=None))])
+
+        _, payload = drive(root, fake, capsys, '--dry-run', '--claim', f'{TOPIC}={CLAIM}')
+
+        gate = gate_of(payload, 54)
+        assert gate['verdict'] == 'pass'
+        assert gate['category'] is None
+        assert gate['disposition'] == 'refused'
+        assert gate['codes'] == ['category_undetermined']
+
 
 class TestRunLevelRefusals:
     @pytest.mark.parametrize(
@@ -494,17 +508,21 @@ class TestExecuteGating:
         assert payload['gates'] == []
 
 
-def seed_gate_escalation(root: Path, task_id: int) -> str:
+def seed_gate_escalation(
+    root: Path, task_id: int, *, category: str = 'milestone_gate', timestamp: str | None = None,
+) -> str:
     queue = EscalationQueue(escalation_queue_dir(root))
     escalation_id = queue.make_id(str(task_id))
+    stamped = {'timestamp': timestamp} if timestamp is not None else {}
     queue.submit(Escalation(
         id=escalation_id,
         task_id=str(task_id),
         agent_role='orchestrator-deterministic',
         severity='critical',
-        category='milestone_gate',
+        category=category,
         summary='gate',
         level=2,
+        **stamped,
     ))
     return escalation_id
 
@@ -634,6 +652,22 @@ class TestExecuteWrites:
         assert {g['disposition'] for g in payload['gates']} == {'executed'}
         assert task_rows(db_path) == before
 
+    def test_the_resume_cites_the_newest_pending_milestone_gate_escalation(
+        self, root, fake, seed_tasks, capsys,
+    ):
+        seed_tasks([gate_row(89, TOPIC, observed=fake.seed_many(3))])
+        newest = seed_gate_escalation(root, 89, timestamp='2026-10-02T00:00:00+00:00')
+        seed_gate_escalation(root, 89, timestamp='2026-10-01T00:00:00+00:00')
+        seed_gate_escalation(
+            root, 89, category='design_concern', timestamp='2026-10-03T00:00:00+00:00',
+        )
+
+        code, payload = drive(root, fake, capsys, '--execute', '--claim', f'{TOPIC}={CLAIM}')
+
+        assert code == 0
+        (resume,) = gate_of(payload, 89)['next']
+        assert resume['arguments']['escalation_id'] == newest
+
     def test_the_text_report_carries_the_resume_call(self, root, fake, seed_tasks, capsys):
         seed_tasks([gate_row(88, TOPIC, observed=fake.seed_many(3))])
         escalation_id = seed_gate_escalation(root, 88)
@@ -672,6 +706,70 @@ class TestCapsAndIdempotency:
 
         assert gate_of(again, 91)['disposition'] == 'noop'
         assert gate_of(again, 92)['disposition'] == 'executed'
+
+    def test_dry_run_spends_the_same_cap_so_it_previews_the_execute_run(
+        self, root, seed_tasks, capsys,
+    ):
+        fake = FakeMemoryService(consolidation_auto=enabled_config(max_auto_per_cycle=1))
+        seed_tasks([
+            gate_row(97, TOPIC, observed=fake.seed_many(3)),
+            gate_row(98, OTHER_TOPIC, observed=fake.seed_many(3)),
+        ])
+        claims = ('--claim', f'{TOPIC}={CLAIM}', '--claim', f'{OTHER_TOPIC}={CLAIM}')
+
+        _, preview = drive(root, fake, capsys, '--dry-run', *claims)
+        _, done = drive(root, fake, capsys, '--execute', *claims)
+
+        assert [g['disposition'] for g in preview['gates']] == ['would_execute', 'deferred']
+        assert gate_of(preview, 98)['codes'] == ['cycle_cap_reached']
+        assert [g['disposition'] for g in done['gates']] == ['executed', 'deferred']
+
+    @pytest.mark.parametrize(
+        ('break_the_mint', 'detail'),
+        [
+            pytest.param(
+                lambda fake: setattr(fake, 'add_error', RuntimeError('mem0 write timed out')),
+                'RuntimeError',
+                id='add-raises',
+            ),
+            pytest.param(
+                lambda fake: fake.add_memory.configure_mock(
+                    side_effect=None,
+                    return_value=AddMemoryResponse(memory_ids=[], message='nothing landed'),
+                ),
+                'CanonicalWriteFailed',
+                id='add-lands-nothing',
+            ),
+        ],
+    )
+    def test_a_refused_execution_is_reported_and_still_spends_a_cap_slot(
+        self, root, seed_tasks, capsys, break_the_mint, detail,
+    ):
+        fake = FakeMemoryService(consolidation_auto=enabled_config(max_auto_per_cycle=1))
+        first_members = fake.seed_many(3)
+        seed_tasks([
+            gate_row(99, TOPIC, observed=first_members),
+            gate_row(100, OTHER_TOPIC, observed=fake.seed_many(3)),
+        ])
+        break_the_mint(fake)
+
+        code, payload = drive(
+            root, fake, capsys, '--execute',
+            '--claim', f'{TOPIC}={CLAIM}', '--claim', f'{OTHER_TOPIC}={CLAIM}',
+        )
+
+        assert code == 0
+        refused = gate_of(payload, 99)
+        assert refused['verdict'] == 'pass'
+        assert refused['disposition'] == 'refused'
+        assert [(r['code'], r['detail']) for r in refused['reasons']] == [('execution_refused', detail)]
+        assert refused['execution'] is None
+        assert refused['next'] == []
+        for member in first_members:
+            assert 'topic' not in fake.metadata_of(member)
+        deferred = gate_of(payload, 100)
+        assert deferred['disposition'] == 'deferred'
+        assert deferred['codes'] == ['cycle_cap_reached']
 
     def test_a_second_run_is_a_noop_that_writes_nothing_and_lists_the_resume_again(
         self, root, fake, seed_tasks, capsys,
@@ -730,3 +828,49 @@ class TestCapsAndIdempotency:
         assert gate['disposition'] == 'noop'
         assert gate['closure']['closed'] is True
         assert [c['arguments']['escalation_id'] for c in gate['next']] == [escalation_id]
+
+
+NEAR_SYNONYM_TOPIC = 'gate-topic-alpha-two'
+
+
+class TestSlugListAcrossTheRun:
+    """A topic this run mints joins the slug list every later gate is ruled against."""
+
+    @pytest.mark.parametrize(
+        ('mode', 'break_the_mint', 'first_disposition'),
+        [
+            pytest.param('--dry-run', None, 'would_execute', id='dry-run'),
+            pytest.param('--execute', None, 'executed', id='execute'),
+            pytest.param(
+                '--execute',
+                lambda fake: setattr(fake, 'add_error', TimeoutError('mem0 write timed out')),
+                'refused',
+                id='execute-refused-mint-may-have-landed',
+            ),
+        ],
+    )
+    def test_a_near_synonym_of_a_topic_minted_earlier_in_the_run_is_left_to_the_sitting(
+        self, root, fake, seed_tasks, capsys, mode, break_the_mint, first_disposition,
+    ):
+        later_members = fake.seed_many(3)
+        seed_tasks([
+            gate_row(111, TOPIC, observed=fake.seed_many(3)),
+            gate_row(112, NEAR_SYNONYM_TOPIC, observed=later_members),
+        ])
+        if break_the_mint is not None:
+            break_the_mint(fake)
+
+        code, payload = drive(
+            root, fake, capsys, mode,
+            '--claim', f'{TOPIC}={CLAIM}', '--claim', f'{NEAR_SYNONYM_TOPIC}={CLAIM}',
+        )
+
+        assert code == 0
+        assert gate_of(payload, 111)['disposition'] == first_disposition
+        later = gate_of(payload, 112)
+        assert later['verdict'] == 'fail'
+        assert later['disposition'] == 'left_to_sitting'
+        assert 'slug_near_collision' in later['codes']
+        assert fake.canonicals_of(NEAR_SYNONYM_TOPIC) == []
+        for member in later_members:
+            assert 'topic' not in fake.metadata_of(member)
