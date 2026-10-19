@@ -8,6 +8,7 @@ counted.  The fold rule itself is tested in test_coalescing.py.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -29,7 +30,8 @@ from fused_memory.reconciliation.coalescing import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 _PROJECT = 'dark_factory'
-_T0 = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+# In the past, so cleanup_drained(max_age_seconds=0) can sweep these rows.
+_T0 = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
 
 
 def _at(minutes: float) -> datetime:
@@ -434,3 +436,100 @@ async def test_drain_oldest_chunk_drains_a_folded_row_once(buf):
     assert chunk.payload[COALESCED_COUNT_KEY] == 2
     assert await buf.count_buffered(_PROJECT) == 0
     assert await buf.drain_oldest_chunk(_PROJECT, limit=10) == []
+
+
+# ── every pushed event is counted exactly once ─────────────────────────
+
+
+def _folds(db_path: Path) -> dict[tuple[str, str, str], int]:
+    return {
+        (row['project_id'], row['hour_bucket'], row['event_type']): row['coalesced_count']
+        for row in _raw(db_path, 'SELECT * FROM event_coalesced_hourly')
+    }
+
+
+def _arrivals(db_path: Path) -> dict[tuple[str, str, str], int]:
+    return {
+        (row['project_id'], row['hour_bucket'], row['event_type']): row['event_count']
+        for row in _raw(db_path, 'SELECT * FROM event_arrival_hourly')
+    }
+
+
+@pytest.mark.asyncio
+async def test_each_fold_is_counted_in_its_hour(buf, db_path):
+    for minute in (0, 10, 20):
+        await buf.push(_update('A', _at(minute)))
+    assert _folds(db_path) == {(_PROJECT, '2026-10-18T12', 'task_modified'): 2}
+
+
+@pytest.mark.asyncio
+async def test_folds_in_two_hours_are_counted_in_two_buckets(buf, db_path):
+    for minute in (0, 30, 90):
+        await buf.push(_update('A', _at(minute)))
+    assert _folds(db_path) == {
+        (_PROJECT, '2026-10-18T12', 'task_modified'): 1,
+        (_PROJECT, '2026-10-18T13', 'task_modified'): 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fold_counts_stay_in_their_project(buf, db_path):
+    for minute in (0, 1):
+        await buf.push(_task_event('reify', EventType.task_modified, 'A', _at(minute)))
+    await buf.push(_update('A', _at(2)))
+    assert _folds(db_path) == {('reify', '2026-10-18T12', 'task_modified'): 1}
+
+
+@pytest.mark.asyncio
+async def test_a_late_older_fold_counts_the_displaced_events_hour(buf, db_path):
+    await buf.push(_update('A', _at(90)))
+    await buf.push(_update('A', _at(10)))
+
+    [row] = await buf.peek_buffered(_PROJECT, limit=10)
+    assert row.timestamp == _at(10)
+    assert _folds(db_path) == {(_PROJECT, '2026-10-18T13', 'task_modified'): 1}
+
+
+@pytest.mark.asyncio
+async def test_every_pushed_event_is_counted_once_across_the_sweep(buf, db_path):
+    for minute in (0, 1, 2):
+        await buf.push(_update('A', _at(minute)))
+    await buf.drain(_PROJECT, run_id='r')
+    assert await buf.cleanup_drained(max_age_seconds=0) == 1
+
+    swept = sum(_arrivals(db_path).values())
+    folded = sum(_folds(db_path).values())
+    assert (swept, folded) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_no_op_pushes_are_not_counted(buf, db_path):
+    first = _update('A', _at(0))
+    second = _update('A', _at(1))
+    await buf.push(first)
+    await buf.push(second)
+    before = _folds(db_path)
+    assert before == {(_PROJECT, '2026-10-18T12', 'task_modified'): 1}
+
+    await buf.push(first)
+    await buf.push(second)
+    assert _folds(db_path) == before
+
+
+def _hot_task_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == 'reconciliation.coalesce_hot_task']
+
+
+@pytest.mark.asyncio
+async def test_a_task_folding_its_hundredth_event_is_announced_once(buf, caplog):
+    caplog.set_level(logging.WARNING, logger='fused_memory.reconciliation.event_buffer')
+    for n in range(99):
+        await buf.push(_update('A', _at(n)))
+    assert _hot_task_records(caplog) == []
+
+    await buf.push(_update('A', _at(99)))
+    [record] = _hot_task_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.__dict__['project_id'] == _PROJECT
+    assert record.__dict__['coalesce_key'] == 'task_modified:A:update_task'
+    assert record.__dict__['coalesced_count'] == 100
