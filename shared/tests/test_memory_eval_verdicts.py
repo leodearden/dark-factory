@@ -10,6 +10,7 @@ chains them, rather than from a hand-built grandfather set.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -17,8 +18,26 @@ import pytest
 from test_memory_eval_boundary import evaluate_exemplar
 
 from shared.memory_eval_limits import EvaluationResult, LimitsConfig, evaluate_series
-from shared.memory_eval_metrics import MetricSeries, load_metric_series, metrics_artifact_path
-from shared.memory_eval_verdicts import VerdictEntry, metric_fingerprint, verdict_entries
+from shared.memory_eval_metrics import (
+    MetricSeries,
+    canonical_json_text,
+    load_metric_series,
+    metrics_artifact_path,
+)
+from shared.memory_eval_verdicts import (
+    RUNNER_FAILURE_FINGERPRINT,
+    RunnerFailureRecord,
+    StormEscape,
+    VerdictEntry,
+    VerdictsArtifact,
+    VerdictsSchemaError,
+    build_verdicts_artifact,
+    load_verdicts_artifact,
+    metric_fingerprint,
+    serialize_verdicts_artifact,
+    storm_fingerprint,
+    verdict_entries,
+)
 
 _FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval'
 _EVAL_ID = 'e1-retrieval-health'
@@ -198,3 +217,169 @@ class TestMismatchedInputs:
     def test_a_different_run_is_refused(self):
         with pytest.raises(ValueError):
             verdict_entries(_series(_QUIET_STAMP), evaluate_exemplar())
+
+
+def _regression_run() -> tuple[MetricSeries, EvaluationResult]:
+    return _series(_REGRESSION_STAMP), evaluate_exemplar()
+
+
+def _thin_run() -> tuple[MetricSeries, EvaluationResult]:
+    thin = _series(_REGRESSION_STAMP, eval_id='e1-thin')
+    return thin, evaluate_series(thin, _baseline(), _config(), None)
+
+
+def _failure(**overrides) -> RunnerFailureRecord:
+    fields = {
+        'scope': 'e4-staleness-sweep', 'phase': 'produce',
+        'error_type': 'ProducerExit', 'message': 'exited 3', 'exit_code': 3,
+    }
+    return RunnerFailureRecord(**(fields | overrides))
+
+
+def _artifact(*, alarm_limit: int = 3, stamp: str = _REGRESSION_STAMP, failures=()):
+    evaluations = [_regression_run()] if stamp == _REGRESSION_STAMP else []
+    return build_verdicts_artifact(
+        evaluations, run_stamp=stamp, alarm_limit=alarm_limit, runner_failures=failures,
+    )
+
+
+class TestStormEscape:
+    def test_alarms_at_the_limit_do_not_trigger_the_storm(self):
+        storm = _artifact(alarm_limit=3).storm_escape
+        assert (storm.triggered, storm.alarm_count, storm.alarm_limit) == (False, 3, 3)
+        assert storm.aggregate_fingerprint is None
+
+    def test_alarms_over_the_limit_trigger_one_run_scoped_aggregate(self):
+        storm = _artifact(alarm_limit=2).storm_escape
+        assert (storm.triggered, storm.alarm_count, storm.alarm_limit) == (True, 3, 2)
+        assert storm.aggregate_fingerprint == storm_fingerprint(_REGRESSION_STAMP)
+
+    def test_the_aggregate_is_scoped_to_the_run(self):
+        assert storm_fingerprint(_REGRESSION_STAMP) != storm_fingerprint(_QUIET_STAMP)
+        rerun = _artifact(alarm_limit=2).storm_escape.aggregate_fingerprint
+        assert rerun == _artifact(alarm_limit=2).storm_escape.aggregate_fingerprint
+
+    @pytest.mark.parametrize('fields', [
+        {'triggered': True, 'alarm_count': 3, 'alarm_limit': 2},
+        {'triggered': False, 'alarm_count': 3, 'alarm_limit': 3, 'aggregate_fingerprint': 'f'},
+        {'triggered': False, 'alarm_count': 3, 'alarm_limit': 2},
+    ])
+    def test_an_inconsistent_storm_block_is_refused(self, fields):
+        with pytest.raises(ValueError):
+            StormEscape(**fields)
+
+
+class TestRunnerFailures:
+    def test_failures_are_carried_with_one_program_fingerprint(self):
+        artifact = _artifact(failures=[_failure(), _failure(scope='program', phase='runner')])
+        assert [f.scope for f in artifact.runner_failures] == ['e4-staleness-sweep', 'program']
+        assert artifact.runner_failure_fingerprint == RUNNER_FAILURE_FINGERPRINT
+
+    def test_the_failure_fingerprint_is_stamp_free(self):
+        later = _artifact(stamp=_QUIET_STAMP, failures=[_failure()])
+        assert later.runner_failure_fingerprint == RUNNER_FAILURE_FINGERPRINT
+
+    def test_no_failures_means_no_failure_fingerprint(self):
+        artifact = _artifact()
+        assert artifact.runner_failures == []
+        assert artifact.runner_failure_fingerprint is None
+
+    def test_a_failure_with_an_unknown_phase_is_refused(self):
+        with pytest.raises(ValueError):
+            _failure(phase='deploy')
+
+
+class TestArtifactAssembly:
+    def test_entries_from_several_evals_concatenate_in_input_order(self):
+        regression, thin = _regression_run(), _thin_run()
+        artifact = build_verdicts_artifact(
+            [regression, thin], run_stamp=_REGRESSION_STAMP, alarm_limit=10,
+        )
+        assert artifact.entries == [*verdict_entries(*regression), *verdict_entries(*thin)]
+
+    def test_an_evaluation_from_another_run_is_refused(self):
+        with pytest.raises(ValueError):
+            build_verdicts_artifact([_regression_run()], run_stamp=_QUIET_STAMP, alarm_limit=10)
+
+    def test_the_artifact_names_its_generator_and_version(self):
+        artifact = _artifact()
+        assert artifact.schema_version == 1
+        assert artifact.generator == 'shared.memory_eval_verdicts'
+        assert artifact.run_stamp == _REGRESSION_STAMP
+
+
+class TestStrictAtEmit:
+    def test_an_entry_with_both_item_and_window_is_refused(self):
+        entry = _regression_entries()[0]
+        with pytest.raises(ValueError):
+            VerdictEntry(**(entry.model_dump() | {'item': 'x'}))
+
+    def test_an_unknown_verdict_is_refused(self):
+        entry = _regression_entries()[0]
+        with pytest.raises(ValueError):
+            VerdictEntry(**(entry.model_dump() | {'verdict': 'meh'}))
+
+    def test_a_schema_version_other_than_one_is_refused(self):
+        payload = _artifact().model_dump() | {'schema_version': 2}
+        with pytest.raises(ValueError):
+            VerdictsArtifact(**payload)
+
+
+def _mutated(text: str, mutate) -> str:
+    data = json.loads(text)
+    mutate(data)
+    return json.dumps(data)
+
+
+_MUTATIONS = {
+    'schema_version': lambda d: d.update(schema_version=2),
+    'extra_entry_field': lambda d: d['entries'][0].update(surprise=1),
+    'unknown_verdict': lambda d: d['entries'][0].update(verdict='meh'),
+    'item_and_window': lambda d: d['entries'][0].update(item='x'),
+    'hand_edited_fingerprint': lambda d: d['entries'][0].update(fingerprint='0' * 64),
+    'extra_top_level_field': lambda d: d.update(surprise=1),
+}
+
+
+class TestSerializeAndLoad:
+    def test_serialize_then_load_round_trips(self, tmp_path):
+        for artifact in (_artifact(), _artifact(alarm_limit=2, failures=[_failure()])):
+            path = tmp_path / 'verdicts.json'
+            path.write_text(serialize_verdicts_artifact(artifact), encoding='utf-8')
+            assert load_verdicts_artifact(path) == artifact
+
+    def test_serialization_is_canonical(self):
+        text = serialize_verdicts_artifact(_artifact())
+        assert text == canonical_json_text(json.loads(text))
+
+    def test_inapplicable_optionals_are_absent_not_null(self):
+        data = json.loads(serialize_verdicts_artifact(_artifact(failures=[_failure(exit_code=None)])))
+        assert 'aggregate_fingerprint' not in data['storm_escape']
+        assert 'exit_code' not in data['runner_failures'][0]
+        assert all(('item' in e) != ('window' in e) for e in data['entries'])
+        quiet = json.loads(serialize_verdicts_artifact(_artifact()))
+        assert 'runner_failure_fingerprint' not in quiet
+        assert quiet['runner_failures'] == []
+
+    @pytest.mark.parametrize('name', sorted(_MUTATIONS))
+    def test_a_malformed_artifact_is_refused_at_load(self, tmp_path, name):
+        path = tmp_path / 'verdicts.json'
+        path.write_text(_mutated(serialize_verdicts_artifact(_artifact()), _MUTATIONS[name]))
+        with pytest.raises(VerdictsSchemaError):
+            load_verdicts_artifact(path)
+
+    def test_the_schema_error_is_a_value_error(self):
+        assert issubclass(VerdictsSchemaError, ValueError)
+
+
+class TestDashboardShapedRead:
+    """Only ``json`` and dict access — the keys the dashboard's verdicts reader consumes."""
+
+    def test_a_plain_reader_finds_entries_and_the_storm_block(self):
+        data = json.loads(serialize_verdicts_artifact(_artifact(alarm_limit=2)))
+        assert isinstance(data['entries'], list)
+        assert isinstance(data['storm_escape'], dict)
+        assert data['storm_escape']['triggered'] is True
+        for entry in data['entries']:
+            for key in ('eval_id', 'metric_id', 'verdict', 'fingerprint', 'value', 'limit_ref', 'run_stamp'):
+                assert key in entry
