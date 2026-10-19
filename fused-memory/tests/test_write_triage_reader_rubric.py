@@ -33,7 +33,7 @@ def _row(
     }
 
 
-def _resolved(rows: list[dict[str, Any]], binary: str, *, basis: str = 'current') -> object:
+def _resolved(rows: list[dict[str, Any]], binary: str, *, basis: str = 'current') -> Any:
     rubric = _mod()
     judgements = rubric.resolve_judgements(rows)
     return judgements[rubric.PairKey('e1', 't1', rubric.Basis(basis))].answer(rubric.Binary(binary))
@@ -159,7 +159,7 @@ class TestPerBinaryResolution:
         assert _resolved(rows, 'home', basis='attach_time') == _mod().Resolved.NO
 
 
-def _judged(target: str, *votes: dict[str, str]) -> object:
+def _judged(target: str, *votes: dict[str, str]) -> Any:
     """The Judgement of write 'w' read against *target*, one rater per vote; None if no votes."""
     if not votes:
         return None
@@ -168,11 +168,11 @@ def _judged(target: str, *votes: dict[str, str]) -> object:
     return rubric.resolve_judgements(rows)[rubric.PairKey('w', target, rubric.Basis.CURRENT)]
 
 
-def _derive(outcome: str, *votes: dict[str, str], **options: Any) -> object:
+def _derive(outcome: str, *votes: dict[str, str], **options: Any) -> Any:
     return _mod().derive(outcome, {'p': _judged('p', *votes)}, **options)
 
 
-def _decided(result: object) -> object:
+def _decided(result: Any) -> Any:
     assert isinstance(result, _mod().Decided), result
     return result
 
@@ -234,7 +234,7 @@ class TestTheDerivationTable:
 
 
 class TestTheStoredRule:
-    def _derive(self, by_target: dict[str, list[dict[str, str]]], **options: Any) -> object:
+    def _derive(self, by_target: dict[str, list[dict[str, str]]], **options: Any) -> Any:
         rubric = _mod()
         return rubric.derive(
             'stored', {target: _judged(target, *votes) for target, votes in by_target.items()},
@@ -275,7 +275,7 @@ class TestTheStoredRule:
 
 
 class TestDecisiveness:
-    def _gaps(self, result: object) -> list[tuple[str, str, str]]:
+    def _gaps(self, result: Any) -> list[tuple[str, str, str]]:
         assert isinstance(result, _mod().Incomplete), result
         return [(gap.target_id, gap.binary, gap.kind) for gap in result.missing]
 
