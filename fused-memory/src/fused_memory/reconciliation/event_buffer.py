@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     timestamp TEXT NOT NULL,
     payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'buffered',
-    drained_by_run_id TEXT
+    drained_by_run_id TEXT,
+    coalesce_key TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
@@ -84,6 +85,18 @@ CREATE TABLE IF NOT EXISTS event_arrival_hourly (
     hour_bucket TEXT NOT NULL,
     event_type TEXT NOT NULL,
     event_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, hour_bucket, event_type)
+);
+
+-- Task 4278 (recon lever 3): events push() folded into an older buffered row.
+-- Counted in the same write unit as the fold, so the partition stays exact:
+-- every pushed event is a live event_buffer row, OR in event_arrival_hourly,
+-- OR in event_coalesced_hourly.
+CREATE TABLE IF NOT EXISTS event_coalesced_hourly (
+    project_id TEXT NOT NULL,
+    hour_bucket TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    coalesced_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, hour_bucket, event_type)
 );
 """
@@ -174,6 +187,24 @@ class EventBuffer:
             # a single run instead of unconditionally restoring the whole project.
             if await add_column_if_missing(db, 'event_buffer', 'drained_by_run_id', 'TEXT'):
                 logger.info('EventBuffer: migrated event_buffer — added drained_by_run_id column')
+
+            # Add coalesce_key if missing (task 4278).  Rows written before it
+            # keep NULL and are never fold targets.  The index lives here, not
+            # in _BUFFER_SCHEMA_SQL, because that script runs first and would
+            # name a column a pre-existing table does not have yet.
+            if 'coalesce_key' not in eb_columns:
+                try:
+                    await db.execute('ALTER TABLE event_buffer ADD COLUMN coalesce_key TEXT')
+                    logger.info('EventBuffer: migrated event_buffer — added coalesce_key column')
+                except Exception as exc:
+                    if 'duplicate column name' not in str(exc).lower():
+                        raise
+                    logger.debug('EventBuffer: coalesce_key already exists (concurrent init)')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_eb_coalesce'
+                ' ON event_buffer(project_id, coalesce_key, status)'
+                ' WHERE coalesce_key IS NOT NULL'
+            )
 
             # Drop the now-redundant single-column project index.  idx_dw_project_claimed
             # (project_id, claimed_at) is a strict superset; keeping both wastes write
