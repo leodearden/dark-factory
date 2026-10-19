@@ -144,7 +144,6 @@ class TestResolveTargets:
             'sweep: orchestrator-beta.service',
             'sweep: orchestrator-gamma.service',
         ]
-        assert all(target.has_sweep for target in targets)
 
     def test_explicit_roots_are_exactly_the_run_set_deduplicated_in_order(
         self, units_dir: Path, tmp_path: Path
@@ -158,7 +157,6 @@ class TestResolveTargets:
             ProjectTarget(alpha, ('orchestrator-alpha.service',)),
             ProjectTarget(other, ()),
         )
-        assert targets[1].has_sweep is False
         assert targets[1].sweep_label == 'no sweep: surfaced only'
 
     def test_a_relative_explicit_root_is_resolved_absolute(

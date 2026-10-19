@@ -46,10 +46,6 @@ class ProjectTarget:
     units: tuple[str, ...]
 
     @property
-    def has_sweep(self) -> bool:
-        return bool(self.units)
-
-    @property
     def sweep_label(self) -> str:
         return f'sweep: {", ".join(self.units)}' if self.units else _NO_SWEEP_LABEL
 
