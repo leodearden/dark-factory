@@ -324,3 +324,113 @@ async def test_redelivering_a_folded_away_event_changes_nothing(buf, db_path):
     row = await _only_row(buf)
     assert row.payload[COALESCED_COUNT_KEY] == 2
     assert len(_raw(db_path, 'SELECT id FROM event_buffer')) == 1
+
+
+# ── the drain lifecycle keeps its invariants ───────────────────────────
+
+
+def _update(task_id: str, ts: datetime) -> ReconciliationEvent:
+    return _task_event(_PROJECT, EventType.task_modified, task_id, ts)
+
+
+def _episode(ts: datetime) -> ReconciliationEvent:
+    return _task_event(_PROJECT, EventType.episode_added, '', ts)
+
+
+@pytest.mark.asyncio
+async def test_a_folded_row_drains_in_its_earliest_constituents_slot(buf):
+    first_update = _update('A', _at(1))
+    for event in (_episode(_at(0)), first_update, _episode(_at(2)), _update('A', _at(3))):
+        await buf.push(event)
+
+    drained = await buf.drain(_PROJECT, run_id='r1')
+    assert [event.timestamp for event in drained] == [_at(0), _at(1), _at(2)]
+    assert drained[1].id == first_update.id
+    assert drained[1].payload[COALESCED_COUNT_KEY] == 2
+
+
+@pytest.mark.asyncio
+async def test_folds_cannot_walk_the_oldest_event_past_the_staleness_trigger(db_path):
+    b = EventBuffer(db_path=db_path, buffer_size_threshold=1000, max_staleness_seconds=60)
+    await b.initialize()
+    try:
+        now = datetime.now(UTC)
+        first = _update('644', now - timedelta(seconds=600))
+        await b.push(first)
+        for seconds_ago in (5, 1):
+            await b.push(_update('644', now - timedelta(seconds=seconds_ago)))
+
+        [row] = await b.peek_buffered(_PROJECT, limit=10)
+        assert row.timestamp == first.timestamp
+        stats = await b.get_buffer_stats(_PROJECT)
+        assert stats['oldest_event_age_seconds'] >= 600
+        triggered, reason = await b.should_trigger(_PROJECT)
+        assert triggered
+        assert reason.startswith('max_staleness:')
+    finally:
+        await b.close()
+
+
+@pytest.mark.asyncio
+async def test_every_peeked_id_drains_by_id_including_a_folded_row(buf):
+    await buf.push(_episode(_at(0)))
+    await buf.push(_update('A', _at(1)))
+    await buf.push(_update('A', _at(2)))
+
+    peeked = await buf.peek_buffered(_PROJECT, limit=10)
+    assert any(COALESCED_COUNT_KEY in event.payload for event in peeked)
+    drained = await buf.drain_by_ids(_PROJECT, [event.id for event in peeked], run_id='r2')
+    assert drained == len(peeked) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_fold_between_peek_and_drain_is_not_lost(buf):
+    await buf.push(_update('A', _at(0)))
+    await buf.push(_update('A', _at(1)))
+    [peeked] = await buf.peek_buffered(_PROJECT, limit=10)
+
+    await buf.push(_update('A', _at(2)))
+    assert await buf.drain_by_ids(_PROJECT, [peeked.id], run_id='r2') == 1
+    [drained] = await buf.get_drained_events(_PROJECT, 'r2')
+    assert drained.payload[COALESCED_COUNT_KEY] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_push_after_the_drain_starts_a_fresh_row(buf):
+    await buf.push(_update('A', _at(0)))
+    await buf.push(_update('A', _at(1)))
+    [peeked] = await buf.peek_buffered(_PROJECT, limit=10)
+    await buf.drain_by_ids(_PROJECT, [peeked.id], run_id='r2')
+
+    await buf.push(_update('A', _at(2)))
+    assert await buf.count_buffered(_PROJECT) == 1
+    [drained] = await buf.get_drained_events(_PROJECT, 'r2')
+    assert drained.payload == peeked.payload
+
+
+@pytest.mark.asyncio
+async def test_a_restored_row_keeps_its_merged_payload_and_folds_again(buf):
+    await buf.push(_update('A', _at(0)))
+    await buf.push(_update('A', _at(1)))
+    [peeked] = await buf.peek_buffered(_PROJECT, limit=10)
+    await buf.drain_by_ids(_PROJECT, [peeked.id], run_id='r2')
+
+    assert await buf.restore_drained(_PROJECT, run_id='r2') == 1
+    [restored] = await buf.peek_buffered(_PROJECT, limit=10)
+    assert restored.payload == peeked.payload
+
+    await buf.push(_update('A', _at(2)))
+    [refolded] = await buf.peek_buffered(_PROJECT, limit=10)
+    assert refolded.id == peeked.id
+    assert refolded.payload[COALESCED_COUNT_KEY] == 3
+
+
+@pytest.mark.asyncio
+async def test_drain_oldest_chunk_drains_a_folded_row_once(buf):
+    await buf.push(_update('A', _at(0)))
+    await buf.push(_update('A', _at(1)))
+
+    [chunk] = await buf.drain_oldest_chunk(_PROJECT, limit=10)
+    assert chunk.payload[COALESCED_COUNT_KEY] == 2
+    assert await buf.count_buffered(_PROJECT) == 0
+    assert await buf.drain_oldest_chunk(_PROJECT, limit=10) == []
