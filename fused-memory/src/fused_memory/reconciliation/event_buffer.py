@@ -4,8 +4,9 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 import aiosqlite
@@ -21,6 +22,11 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
+)
+from fused_memory.reconciliation.coalescing import (
+    coalesce_key,
+    coalesced_count,
+    merge_coalesced_payload,
 )
 from fused_memory.reconciliation.throughput import utc_hour_bucket
 from fused_memory.utils.sqlite_connector import Connector
@@ -111,6 +117,19 @@ _MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
 _CLEANUP_FETCH_CHUNK: int = 10_000
 
 
+class _PushOutcome(StrEnum):
+    """What one push did to the buffer."""
+
+    buffered = 'buffered'  # a new row
+    coalesced = 'coalesced'  # folded into an older buffered row
+    redelivered = 'redelivered'  # already stored, so nothing changed
+
+
+class _PushResult(NamedTuple):
+    outcome: _PushOutcome
+    coalesced_count: int = 1
+
+
 class EventBuffer:
     """SQLite-backed event buffer with cross-instance visibility and burst detection.
 
@@ -134,10 +153,12 @@ class EventBuffer:
         instance_id: str | None = None,
         *,
         connect: Connector = connect_daemon,
+        coalesce_task_events: bool = True,
     ):
         """*connect* is how ``initialize`` opens the buffer's one connection.
 
         It is given the database path and defaults to ``connect_daemon``.
+        *coalesce_task_events* switches push-time folding (see ``push``).
         """
         # _in_memory is derived from the caller's intent (db_path is None),
         # not from the resolved string ':memory:'.  This means explicitly
@@ -155,6 +176,7 @@ class EventBuffer:
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
         self._connect = connect
+        self.coalesce_task_events = coalesce_task_events
         self._access: AtomicConnection | None = None
         self._manual_triggers: set[str] = set()
 
@@ -233,29 +255,31 @@ class EventBuffer:
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
-        """Insert event into the shared buffer.
+        """Insert event into the shared buffer, folding a repeat task event.
 
-        Idempotent on the event id (UUID primary key): the conflict clause is
-        scoped to the primary key with ``ON CONFLICT(id) DO NOTHING`` so
-        re-pushing an already-committed event is a harmless no-op rather than an
-        IntegrityError. A duplicate only ever occurs on EventJournal-driven
-        startup recovery, which redelivers in-flight events at-least-once — the
-        drainer can be killed after this push commits but before it marks the
-        journal row processed, so recover() re-enqueues and re-pushes it (task
-        2709). Without the conflict clause the drainer would treat the duplicate
-        as a non-retriable error and dead-letter a perfectly good event.
+        Idempotent on the event id: ``ON CONFLICT(id) DO NOTHING`` makes the
+        at-least-once redelivery of EventJournal startup recovery a no-op
+        (task 2709), while any other constraint violation still raises.
 
-        Scoping to ``(id)`` rather than a bare ``INSERT OR IGNORE`` is
-        deliberate (loud-over-silent): only the intended duplicate-id case is
-        swallowed; any *other* constraint violation on this row — e.g. a
-        NOT NULL breach on project_id/event_type/event_source/timestamp — still
-        raises loudly instead of silently dropping the event.
+        An event with a ``coalescing.coalesce_key`` folds into the OLDEST
+        buffered row with the same key (task 4278).  That row keeps its id, so
+        an id ``peek_buffered`` handed out still drains via ``drain_by_ids``,
+        and its timestamp, which only ever moves earlier, so ``ORDER BY
+        timestamp`` positions and the ``MIN(timestamp)`` staleness trigger
+        hold.  The INSERT runs first: a unit whose first statement writes is
+        serialised against other connections, which a unit that SELECTs first
+        is not (``AtomicConnection.write``).  A fold landing between
+        ``peek_buffered`` and ``drain_by_ids`` reaches the stage as the
+        pre-fold payload; that is benign, because the target's task is already
+        in that batch and ``_ctx_task_event`` reads the task's live state.
         """
+        key = coalesce_key(event)
         async with self._require_access().write() as db:
-            await db.execute(
+            cursor = await db.execute(
                 """INSERT INTO event_buffer
-                   (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')
+                   (id, project_id, event_type, event_source, agent_id, timestamp, payload,
+                    status, coalesce_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered', ?)
                    ON CONFLICT(id) DO NOTHING""",
                 (
                     event.id,
@@ -265,20 +289,76 @@ class EventBuffer:
                     event.agent_id,
                     event.timestamp.isoformat(),
                     json.dumps(event.payload),
+                    key,
                 ),
             )
+            if cursor.rowcount == 0:
+                result = _PushResult(_PushOutcome.redelivered)
+            elif self.coalesce_task_events and key is not None:
+                result = await self._fold_into_oldest(db, event, key)
+            else:
+                result = _PushResult(_PushOutcome.buffered)
 
         if event.agent_id is not None:
             await self._update_burst_state(event.agent_id, event.timestamp)
 
-        logger.info(
-            'reconciliation.event_buffered',
-            extra={
-                'project_id': event.project_id,
-                'event_type': event.type.value,
-                'agent_id': event.agent_id,
-            },
+        if result.outcome is _PushOutcome.coalesced:
+            logger.info(
+                'reconciliation.event_coalesced',
+                extra={
+                    'project_id': event.project_id,
+                    'event_type': event.type.value,
+                    'coalesce_key': key,
+                    'coalesced_count': result.coalesced_count,
+                },
+            )
+        else:
+            logger.info(
+                f'reconciliation.event_{result.outcome.value}',
+                extra={
+                    'project_id': event.project_id,
+                    'event_type': event.type.value,
+                    'agent_id': event.agent_id,
+                },
+            )
+
+    async def _fold_into_oldest(
+        self, db: aiosqlite.Connection, event: ReconciliationEvent, key: str,
+    ) -> _PushResult:
+        """Fold the row ``push`` just inserted into the oldest buffered row sharing ``key``.
+
+        Runs on the open write unit's connection.  The just-inserted row is
+        uncommitted, so deleting it leaves no trace any reader could see.
+        """
+        async with db.execute(
+            """SELECT id, payload, timestamp FROM event_buffer
+               WHERE project_id = ? AND coalesce_key = ? AND status = 'buffered'
+                 AND id != ?
+               ORDER BY timestamp ASC
+               LIMIT 1""",
+            (event.project_id, key, event.id),
+        ) as cursor:
+            target = await cursor.fetchone()
+        if target is None:
+            return _PushResult(_PushOutcome.buffered)
+
+        await db.execute('DELETE FROM event_buffer WHERE id = ?', (event.id,))
+        fold = merge_coalesced_payload(
+            json.loads(target['payload']),
+            event.payload,
+            event_type=event.type,
+            incoming_id=event.id,
+            incoming_ts=event.timestamp,
+            row_ts=datetime.fromisoformat(target['timestamp']),
         )
+        if fold is None:
+            return _PushResult(_PushOutcome.redelivered)
+
+        await db.execute(
+            'UPDATE event_buffer SET payload = ?, timestamp = ? WHERE id = ?',
+            (json.dumps(fold.payload), fold.row_timestamp.isoformat(), target['id']),
+        )
+        return _PushResult(_PushOutcome.coalesced, coalesced_count(fold.payload))
 
     # ── Burst detection ────────────────────────────────────────────────
 
@@ -1074,10 +1154,13 @@ class EventBuffer:
 
         Task 3049: before deleting, roll the very same rows up into
         ``event_arrival_hourly`` so the project's arrival history survives the
-        DELETE.  This is the only ``DELETE FROM event_buffer`` in the codebase
-        — the single chokepoint where inflow history is destroyed — so rolling
-        up here captures 100% of events regardless of which drain path
-        (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked them.
+        DELETE.  This is the only DELETE of a COMMITTED ``event_buffer`` row in
+        the codebase — the single chokepoint where inflow history is destroyed
+        — so rolling up here captures 100% of events regardless of which drain
+        path (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked
+        them.  ``push``'s fold deletes only the row it inserted earlier in the
+        same uncommitted unit, and counts that event in
+        ``event_coalesced_hourly``.
 
         The rollup runs inside the SAME write unit as the DELETE, and takes its
         rows FROM that delete via ``DELETE ... RETURNING`` (SQLite >= 3.35,
