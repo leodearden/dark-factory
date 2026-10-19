@@ -2040,7 +2040,7 @@ class TestParseMetadataFailurePolicy:
         _, warnings = parse_metadata(
             {
                 'dedupe_skipped': {
-                    'reason': 'curation-gave-up after 1800s: all-accounts-capped',
+                    'reason': 'create: curator-failed: llm unavailable',
                     'at': '2026-10-18T12:00:00+00:00',
                 },
                 'dedupe_skipped_control': 'v',
