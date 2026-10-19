@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
@@ -45,13 +45,19 @@ from shared.task_statuses import TaskStatus
 # The spawn_context the flake ledger stamps on the de-flake owners it files:
 # orchestrator/src/orchestrator/flake_ledger.py::build_deflake_task_arguments
 DEFLAKE_SPAWN_CONTEXT: Final = 'flake_ledger_debt'
-NO_RECORD: Final = 'no record'
-INVALID_RECORD: Final = 'invalid record'
+
+
+class NoValidRecord(StrEnum):
+    """How a deferred row is held when no valid record names its hold."""
+
+    ABSENT = 'no record'
+    INVALID = 'invalid record'
+
 
 _FAILS_CHECK: Final = frozenset(
     {NeedsHumanReason.MISSING_RECORD, NeedsHumanReason.INVALID_RECORD, NeedsHumanReason.EXPIRY_OVERDUE}
 )
-_HELD_ORDER: Final = (*(kind.value for kind in DeferralKind), NO_RECORD, INVALID_RECORD)
+_HELD_ORDER: Final[tuple[DeferralKind | NoValidRecord, ...]] = (*DeferralKind, *NoValidRecord)
 _LISTED: Final = tuple(reason for reason in NeedsHumanReason if reason not in _FAILS_CHECK)
 _DETAIL_CHARS: Final = 300
 _TOOL: Final = 'deferral_census.py'
@@ -61,7 +67,7 @@ _TOOL: Final = 'deferral_census.py'
 class RowVerdict:
     task_id: int
     title: str
-    held: str
+    held: DeferralKind | NoValidRecord
     needs_human: NeedsHumanReason | None
     deflake_owner: bool
     invalid_detail: str | None = None
@@ -75,14 +81,14 @@ class Referents:
     holders: Mapping[int, ProcessIdentity]
 
 
-def _held(record: Deferral | InvalidRecord | None) -> str:
+def _held(record: Deferral | InvalidRecord | None) -> DeferralKind | NoValidRecord:
     match record:
         case None:
-            return NO_RECORD
+            return NoValidRecord.ABSENT
         case InvalidRecord():
-            return INVALID_RECORD
+            return NoValidRecord.INVALID
         case _:
-            return record.kind.value
+            return record.kind
 
 
 def _is_deflake_owner(row: TaskRow) -> bool:
@@ -138,7 +144,7 @@ def fails_check(verdict: RowVerdict) -> bool:
     return verdict.needs_human in _FAILS_CHECK
 
 
-def holder_liveness(identity: ProcessIdentity, *, proc_root: Path = PROC_ROOT) -> Liveness | None:
+def read_holder_liveness(identity: ProcessIdentity, *, proc_root: Path = PROC_ROOT) -> Liveness | None:
     """The holder's liveness, or None when /proc could not answer (never read as dead)."""
     try:
         return liveness(identity, proc_root=proc_root)
@@ -183,7 +189,7 @@ def census_project(store: DeferralStore, target: ProjectTarget, *, now: datetime
         carrier_statuses = store.statuses(target.root, found.carrier_ids)
     except StoreUnreachable as exc:
         return UnreadableProject(target, str(exc))
-    holder_states = {task_id: holder_liveness(holder) for task_id, holder in found.holders.items()}
+    holder_states = {task_id: read_holder_liveness(holder) for task_id, holder in found.holders.items()}
     return ProjectCensus(
         target=target,
         verdicts=classify_deferred(rows, now=now, carrier_statuses=carrier_statuses, holder_liveness=holder_states),
@@ -227,7 +233,7 @@ def _closing_line(census: ProjectCensus) -> list[str]:
 
 def _census_lines(census: ProjectCensus) -> list[str]:
     counts = Counter(verdict.held for verdict in census.verdicts)
-    table = [f'{counts[held]:>7}  {held}' for held in _HELD_ORDER if counts[held]]
+    table = [f'{counts[held]:>7}  {held.value}' for held in _HELD_ORDER if counts[held]]
     return [
         f'deferred rows by hold ({len(census.verdicts)}):',
         *(table or ['      0  (no deferred rows)']),

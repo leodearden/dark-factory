@@ -20,7 +20,7 @@ from typing import Any
 
 import deferral_census
 import pytest
-from deferral_census import RowVerdict, classify_deferred, fails_check, referents
+from deferral_census import NoValidRecord, RowVerdict, classify_deferred, fails_check, referents
 from deferral_fake_fused_memory import FakeFusedMemory
 from deferral_store import TaskRow
 from shared.process_identity import Liveness, ProcessIdentity, capture
@@ -28,6 +28,7 @@ from shared.task_deferral import (
     LAPSE_OVERDUE_AFTER_SECS,
     CarriedByDeferral,
     Deferral,
+    DeferralKind,
     HeldBySessionDeferral,
     LegacyUnknownDeferral,
     NeedsHumanReason,
@@ -114,7 +115,7 @@ class TestClassifyDeferred:
     ) -> None:
         verdict = classify_one(row(10, carried_by(carrier)))
 
-        assert verdict.held == 'carried_by'
+        assert verdict.held is DeferralKind.CARRIED_BY
         assert verdict.needs_human is expected
 
     @pytest.mark.parametrize(
@@ -132,7 +133,7 @@ class TestClassifyDeferred:
     def test_until_condition(self, record: Deferral, expected: NeedsHumanReason | None) -> None:
         verdict = classify_one(row(11, record))
 
-        assert verdict.held == 'until_condition'
+        assert verdict.held is DeferralKind.UNTIL_CONDITION
         assert verdict.needs_human is expected
 
     @pytest.mark.parametrize(
@@ -151,7 +152,7 @@ class TestClassifyDeferred:
     ) -> None:
         verdict = classify_one(row(12, held_by_session()), liveness=liveness)
 
-        assert verdict.held == 'held_by_session'
+        assert verdict.held is DeferralKind.HELD_BY_SESSION
         assert verdict.needs_human is expected
 
     @pytest.mark.parametrize(
@@ -162,13 +163,13 @@ class TestClassifyDeferred:
     def test_planning(self, age: timedelta, expected: NeedsHumanReason | None) -> None:
         verdict = classify_one(row(13, planning(stamped_at=NOW - age)))
 
-        assert verdict.held == 'planning'
+        assert verdict.held is DeferralKind.PLANNING
         assert verdict.needs_human is expected
 
     def test_legacy_unknown_needs_a_human(self) -> None:
         verdict = classify_one(row(14, legacy_unknown()))
 
-        assert verdict.held == 'legacy_unknown'
+        assert verdict.held is DeferralKind.LEGACY_UNKNOWN
         assert verdict.needs_human is NeedsHumanReason.LEGACY_UNKNOWN
         assert verdict.deflake_owner is False
 
@@ -181,7 +182,7 @@ class TestClassifyDeferred:
     def test_no_record_is_missing(self) -> None:
         verdict = classify_one(row(16, x_coalesced_into=5255))
 
-        assert verdict.held == 'no record'
+        assert verdict.held is NoValidRecord.ABSENT
         assert verdict.needs_human is NeedsHumanReason.MISSING_RECORD
 
     def test_a_malformed_record_is_invalid(self) -> None:
@@ -191,14 +192,14 @@ class TestClassifyDeferred:
 
         verdict = classify_one(malformed)
 
-        assert verdict.held == 'invalid record'
+        assert verdict.held is NoValidRecord.INVALID
         assert verdict.needs_human is NeedsHumanReason.INVALID_RECORD
 
     @pytest.mark.parametrize('metadata', ['[1, 2]', '"text"', '{not json'])
     def test_unreadable_wire_metadata_is_an_invalid_record(self, metadata: str) -> None:
         verdict = classify_one(TaskRow.from_wire(wire_row(18, metadata=metadata)))
 
-        assert verdict.held == 'invalid record'
+        assert verdict.held is NoValidRecord.INVALID
         assert verdict.needs_human is NeedsHumanReason.INVALID_RECORD
         assert verdict.deflake_owner is False
 
@@ -207,7 +208,7 @@ class TestClassifyDeferred:
 
         verdict = classify_one(TaskRow.from_wire(wire_row(19, metadata=text)))
 
-        assert verdict.held == 'legacy_unknown'
+        assert verdict.held is DeferralKind.LEGACY_UNKNOWN
 
     def test_one_verdict_per_row_in_order_carrying_id_and_title(self) -> None:
         rows = [row(21, carried_by(900)), row(20), row(22, legacy_unknown())]
@@ -228,7 +229,7 @@ class TestFailsCheck:
 
     @pytest.mark.parametrize('reason', [*NeedsHumanReason, None])
     def test_only_missing_invalid_and_overdue_fail(self, reason: NeedsHumanReason | None) -> None:
-        verdict = RowVerdict(task_id=1, title='t', held='x', needs_human=reason, deflake_owner=False)
+        verdict = RowVerdict(task_id=1, title='t', held=DeferralKind.PLANNING, needs_human=reason, deflake_owner=False)
 
         assert fails_check(verdict) is (reason in self.FAILING)
 
@@ -251,20 +252,20 @@ class TestReferents:
         assert dict(found.holders) == {33: HOLDER}
 
 
-class TestHolderLiveness:
+class TestReadHolderLiveness:
     def test_an_unreadable_proc_is_unknown_never_dead(self, tmp_path: Path) -> None:
         identity = capture(os.getpid())
         assert identity is not None
         empty_proc = tmp_path / 'proc'
         empty_proc.mkdir()
 
-        assert deferral_census.holder_liveness(identity, proc_root=empty_proc) is None
+        assert deferral_census.read_holder_liveness(identity, proc_root=empty_proc) is None
 
     def test_this_process_is_alive(self) -> None:
         identity = capture(os.getpid())
         assert identity is not None
 
-        assert deferral_census.holder_liveness(identity) is Liveness.ALIVE
+        assert deferral_census.read_holder_liveness(identity) is Liveness.ALIVE
 
 
 class TestTaskRowFromWire:
@@ -326,7 +327,7 @@ def _needs_human_count(rows: list[dict[str, Any]]) -> int:
     deferred = [TaskRow.from_wire(r) for r in rows if r['status'] == 'deferred']
     found = referents(deferred)
     statuses = {TaskRow.from_wire(r).task_id: TaskStatus(r['status']) for r in rows}
-    liveness = {task_id: deferral_census.holder_liveness(holder) for task_id, holder in found.holders.items()}
+    liveness = {task_id: deferral_census.read_holder_liveness(holder) for task_id, holder in found.holders.items()}
     verdicts = classify_deferred(
         deferred, now=datetime.now(UTC), carrier_statuses=statuses, holder_liveness=liveness
     )
