@@ -11,11 +11,15 @@ curator instead.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
+
+from shared.defects import DeclareEvent, OutcomeEvent
 
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
+    DefectWriteResult,
     DependencyResult,
     GetTasksResult,
     MetadataLookupResult,
@@ -304,6 +308,25 @@ class TaskBackendProtocol(Protocol):
         preserves the ``status=None`` passthrough that ``server/tools.py`` and
         ``task_interceptor.py`` forward via ``**kwargs``, and it makes the
         reject-only contract explicit for future backend authors.
+        """
+        ...
+
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        tag: str | None = None,
+    ) -> DefectWriteResult:
+        """Fold *events* into the task's ``defects`` / ``defect_test_retirements``, all or nothing.
+
+        The one post-creation writer of both defect keys: the rules are
+        ``fused_memory/backends/defect_records.py``'s, and the read-fold-write
+        runs in one write transaction. It takes no lock of the interceptor's,
+        so an in-process caller that already holds its own locks (the curator
+        combine) calls it directly; MCP callers reach it through
+        ``TaskInterceptor.apply_defect_events``.
         """
         ...
 

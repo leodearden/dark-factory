@@ -20,10 +20,6 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from fused_memory.backends.defect_ref_lookup import (
-    DefectRefCarrier,
-    lookup_defect_ref,
-)
 from shared.defects import (
     Declare,
     DeclareClosure,
@@ -54,6 +50,10 @@ from fused_memory.backends.defect_records import (
     DefectRefNotLive,
     DefectTaskTerminal,
     DefectTransitionRefused,
+)
+from fused_memory.backends.defect_ref_lookup import (
+    DefectRefCarrier,
+    lookup_defect_ref,
 )
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
@@ -269,12 +269,13 @@ async def test_a_retirement_superseded_by_an_undeclared_ref_is_refused(
     stack: BackendStack,
 ) -> None:
     task_id = await stack.seed()
+    before = stack.stored_bytes(task_id)
 
     with pytest.raises(DefectRefNotLive) as excinfo:
         await stack.apply(task_id, _superseded_by(_OTHER_REF))
 
     assert excinfo.value.to_error_dict()['relation'] == 'superseded_by'
-    assert await stack.metadata(task_id) == {}
+    assert stack.stored_bytes(task_id) == before
 
 
 @pytest.mark.asyncio

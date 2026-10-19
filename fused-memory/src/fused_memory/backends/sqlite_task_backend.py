@@ -13,7 +13,7 @@ import contextlib
 import json
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast, overload
 
@@ -25,6 +25,12 @@ from shared.async_sqlite_base import (
     apply_wal_pragmas,
     connect_daemon,
 )
+from shared.defects import (
+    DEFECT_TEST_RETIREMENTS_METADATA_KEY,
+    DEFECTS_METADATA_KEY,
+    DeclareEvent,
+    OutcomeEvent,
+)
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
 from shared.task_metadata import (
@@ -35,6 +41,8 @@ from shared.task_metadata import (
 )
 from shared.task_statuses import TERMINAL, TaskStatus
 
+from fused_memory.backends.defect_records import DefectRecords, DefectTaskTerminal
+from fused_memory.backends.defect_ref_lookup import require_refs_live
 from fused_memory.backends.metadata_lookup import (
     DEFAULT_LOOKUP_LIMIT,
     validate_metadata_lookup,
@@ -51,6 +59,7 @@ from fused_memory.backends.task_backend_errors import (
 )
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
+    DefectWriteResult,
     DependencyResult,
     GetTasksResult,
     MetadataLookupResult,
@@ -3728,6 +3737,55 @@ class SqliteTaskBackend:
             message=f'Task {task_id} updated',
         )
 
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        tag: str | None = None,
+    ) -> DefectWriteResult:
+        """See :meth:`TaskBackendProtocol.apply_defect_events`; the rules live in defect_records.py.
+
+        The liveness lookup reads before the write unit opens, because a read
+        must never nest inside :meth:`_write_unit` (see :meth:`_fresh_read_conn`).
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        tid = _parse_task_id(task_id)
+        await require_refs_live(self, project_root, events, tag=tag)
+        async with self._write_unit(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT status, metadata FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id, tag=tag)
+            if row['status'] in TERMINAL:
+                raise DefectTaskTerminal(task_id, row['status'])
+            stored = _stored_metadata_object(row['metadata'], task_id)
+            change = DefectRecords.from_metadata(stored).apply(events)
+            changed = change.changed_metadata()
+            new_metadata = _merge_metadata(
+                row['metadata'], json.dumps(changed), mode='merge',
+                project_root=project_root, tag=tag, task_id=tid,
+            )
+            await self._validate_metadata_on_write(
+                new_metadata, project_root=project_root, tag=tag, task_id=tid,
+                incoming_keys=set(changed),
+            )
+            await conn.execute(
+                'UPDATE tasks SET metadata = ?, updated_at = ? WHERE tag = ? AND id = ?',
+                (new_metadata, task_timestamp_now(), tag, tid),
+            )
+        records = change.records.as_metadata()
+        return {
+            'id': task_id,
+            'message': f'Applied {len(events)} defect event(s) to task {task_id}',
+            'defects': records[DEFECTS_METADATA_KEY],
+            'defect_test_retirements': records[DEFECT_TEST_RETIREMENTS_METADATA_KEY],
+        }
+
     async def stamp_audit_metadata(
         self,
         task_id: str,
@@ -4450,6 +4508,21 @@ _JSON_TYPE_NAMES: dict[type, str] = {
     float: 'number',
     type(None): 'null',
 }
+
+
+def _stored_metadata_object(stored_raw: str | None, task_id: str) -> dict[str, Any]:
+    """The row's stored metadata as an object (an absent blob is ``{}``); refuses any other shape."""
+    try:
+        stored = json.loads(stored_raw) if stored_raw else {}
+    except ValueError:
+        stored = None
+    if not isinstance(stored, dict):
+        raise TaskmasterError(
+            'TASKMASTER_TOOL_ERROR',
+            f'Task {task_id} metadata is not a JSON object, so its defect records cannot be '
+            f'read; nothing was written (stored {(stored_raw or "")[:80]!r})',
+        )
+    return stored
 
 
 def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict:

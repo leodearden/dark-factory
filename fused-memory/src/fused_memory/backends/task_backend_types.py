@@ -15,6 +15,15 @@ class AddTaskResult(TypedDict):
     message: str
 
 
+class DefectWriteResult(TypedDict):
+    """``apply_defect_events``' reply: both defect keys as stored after the write."""
+
+    id: str
+    message: str
+    defects: list[dict[str, Any]]
+    defect_test_retirements: list[dict[str, Any]]
+
+
 class UpdateTaskResult(TypedDict):
     id: str
     message: str
@@ -106,6 +115,7 @@ class MetadataLookupResult(TypedDict):
 
 __all__ = [
     'AddTaskResult',
+    'DefectWriteResult',
     'DependencyResult',
     'GetTasksResult',
     'MetadataLookupResult',

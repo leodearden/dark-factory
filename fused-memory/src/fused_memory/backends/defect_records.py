@@ -175,11 +175,14 @@ class DefectTaskTerminal(DefectWriteRefused):
 class DefectRefNotLive(DefectWriteRefused):
     refusal = DefectWriteRefusalCode.REF_NOT_LIVE
 
-    def __init__(self, ref: str, relation: str) -> None:
+    def __init__(self, ref: str, relation: str, *, unreadable_task_ids: Sequence[int] = ()) -> None:
+        unreadable = f' (tasks {list(unreadable_task_ids)} could not be read)' if unreadable_task_ids else ''
         super().__init__(
-            f'{relation} must name a live ref, one some task declares; no task declares {ref}',
+            f'{relation} must name a live ref, one some task declares; no readable task '
+            f'declares {ref}{unreadable}',
             ref=ref,
             relation=relation,
+            unreadable_task_ids=list(unreadable_task_ids),
         )
 
 
