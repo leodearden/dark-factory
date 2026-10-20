@@ -397,7 +397,9 @@ async def test_simple_task_invoke_exception_falls_through(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_simple_task_blocking_dependency_falls_through(tmp_path: Path):
+async def test_simple_task_blocking_dependency_falls_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     f = _make(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
         plan_to_write=_good_plan(),
@@ -410,7 +412,7 @@ async def test_simple_task_blocking_dependency_falls_through(tmp_path: Path):
         )
         return _make_result()
 
-    f.wf._invoke = _reports_blocking_dependency  # type: ignore[assignment]
+    monkeypatch.setattr(f.wf, '_invoke', _reports_blocking_dependency)
 
     outcome = await f.wf._run_simple_task()
     assert outcome is None
