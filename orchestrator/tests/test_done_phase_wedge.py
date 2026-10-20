@@ -23,7 +23,7 @@ from _workflow_helpers import (
     FakeScheduler,
     _build_harness,
     _build_workflow,
-    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _derive_meta_root_like_production,
     _init_repo,
 )
 
@@ -33,6 +33,9 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import WorkflowState
+
+# Autouse; named here so the agent-side doubles resolve the meta_root production does.
+pytestmark = pytest.mark.usefixtures(_derive_meta_root_like_production.__name__)
 
 TID = '42'
 GRACE = 0.5
