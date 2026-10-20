@@ -11442,7 +11442,7 @@ def _similarity_kwargs(tmp_path, chosen, *, codebook_dict=None, batch=None, **ad
         tmp_path,
         invoke=_make_fake_invoke(_happy_invoke_response),
         batch_source=[batch or [_hand_digest("dup-1", "nothing new here")]],
-        verify_fn=_poison("verify_fn"),
+        verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
         commit=_make_fake_commit(),
         codebook_dict=codebook_dict or _minimal_v2_codebook(),
@@ -11467,6 +11467,7 @@ def test_a_backlog_candidate_near_an_open_entry_is_attached_by_similarity(tmp_pa
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
+    assert _offered_titles(kwargs["verify_fn"]) in ([], [[]])
     persisted = codebook.load(kwargs["codebook_path"])
     assert codebook.validate(persisted) == []
     candidate = _persisted_record(kwargs, "cand-20260701-1")
@@ -11498,6 +11499,7 @@ def test_a_novel_cluster_near_an_entry_is_screened_and_its_candidate_attached(tm
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
+    assert _offered_titles(kwargs["verify_fn"]) in ([], [[]])
     persisted = codebook.load(kwargs["codebook_path"])
     assert codebook.validate(persisted) == []
     [candidate] = [c for c in persisted["candidates"] if c["title"] == "Silent no-op subagent contract"]
