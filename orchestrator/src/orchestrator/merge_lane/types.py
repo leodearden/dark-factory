@@ -441,6 +441,10 @@ class InFlightMergeRegistry:
         """True when *branch* has an active in-flight slot."""
         return branch in self._slots
 
+    def task_ids_in_flight(self) -> frozenset[str]:
+        """Each branch slot's first submitter's task id; a later id on a branch is not listed."""
+        return frozenset(entry.task_id for entry in self._slots.values())
+
     def entry(self, branch: str) -> _InFlightEntry | None:
         """Return the in-flight entry for *branch*, or None if free."""
         return self._slots.get(branch)
