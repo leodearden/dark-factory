@@ -35,6 +35,11 @@ def _aggregation(
     )
 
 
+def _stored_payload(cycle: int, reviews: ReviewAggregation):
+    """The payload as EventStore.emit persists it: JSON in the events row."""
+    return json.loads(json.dumps(review_completed_payload(cycle, reviews)))
+
+
 def test_payload_is_exactly_the_counts_of_the_aggregation():
     reviews = _aggregation(
         [review_issue('b1', 'blocking')],
@@ -42,7 +47,7 @@ def test_payload_is_exactly_the_counts_of_the_aggregation():
         reviews={'reviewer_a': {}, 'reviewer_b': {}},
     )
 
-    payload = review_completed_payload(3, reviews)
+    payload = _stored_payload(3, reviews)
 
     assert payload == {
         'cycle': 3,
@@ -60,7 +65,7 @@ def test_payload_is_exactly_the_counts_of_the_aggregation():
 
 
 def test_clean_pass_has_zero_counts_and_empty_tallies():
-    payload = review_completed_payload(1, _aggregation())
+    payload = _stored_payload(1, _aggregation())
 
     assert payload == {
         'cycle': 1,
@@ -85,7 +90,7 @@ def test_by_kind_counts_recognised_kinds_and_folds_the_rest_into_unspecified():
         ],
     )
 
-    payload = review_completed_payload(1, reviews)
+    payload = _stored_payload(1, reviews)
 
     assert payload['by_kind'] == {'defect': 1, 'docs': 2, UNSPECIFIED: 2}
     assert list(payload['by_kind']) == sorted(payload['by_kind'])
@@ -102,14 +107,14 @@ def test_by_category_counts_shared_labels_and_folds_unusable_ones_into_unspecifi
         ],
     )
 
-    payload = review_completed_payload(1, reviews)
+    payload = _stored_payload(1, reviews)
 
     assert payload['by_category'] == {'naming': 2, UNSPECIFIED: 3}
     assert list(payload['by_category']) == sorted(payload['by_category'])
 
 
 def test_reviewer_errors_are_counted_not_named():
-    payload = review_completed_payload(1, _aggregation(reviewer_errors=['reviewer_x']))
+    payload = _stored_payload(1, _aggregation(reviewer_errors=['reviewer_x']))
 
     assert payload['reviewer_errors'] == 1
 
