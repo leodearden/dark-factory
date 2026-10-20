@@ -7,12 +7,18 @@ answer, so a fake would only test the fake.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
-from orchestrator.evals.reviewer_trial.checkout import fixture_checkout
+from orchestrator.evals.reviewer_trial.checkout import (
+    FixtureNotMaterialisable,
+    fixture_checkout,
+)
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
     FixtureContext,
@@ -250,6 +256,45 @@ class TestUnknownBase:
             assert checkout.change_base is None
             assert _git(checkout.root, 'rev-parse', 'HEAD') == source.head
             assert checkout.unapplied_reason == 'synthetic diff never applied to any commit'
+
+
+@pytest.mark.asyncio
+class TestNotMaterialisable:
+    async def test_a_missing_source_cwd_is_not_materialisable_and_names_it(
+        self, tmp_path: Path, scratch: Path,
+    ):
+        missing = tmp_path / 'no-such-source'
+        diff = _fixture(_CHANGE_AT_BASE, cwd=missing, base_sha='a' * 40, changed_files=['a.py'])
+
+        with pytest.raises(FixtureNotMaterialisable, match='no-such-source') as raised:
+            async with fixture_checkout(diff, scratch_parent=scratch):
+                pass
+
+        assert raised.value.diff_id == 'fx_1'
+        assert list(scratch.iterdir()) == []
+
+    async def test_a_wedged_git_step_times_out_as_not_materialisable(
+        self, source: _Source, scratch: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        real_git = shutil.which('git')
+        assert real_git is not None
+        shim_dir = tmp_path / 'bin'
+        shim_dir.mkdir()
+        shim = shim_dir / 'git'
+        shim.write_text(f'#!/bin/sh\n[ "$1" = clone ] && exec sleep 60\nexec {real_git} "$@"\n')
+        shim.chmod(0o755)
+        monkeypatch.setenv('PATH', f'{shim_dir}{os.pathsep}{os.environ["PATH"]}')
+        diff = _fixture(
+            _CHANGE_AT_BASE, cwd=source.root, base_sha=source.base, changed_files=['a.py'],
+        )
+
+        started = time.monotonic()
+        with pytest.raises(FixtureNotMaterialisable, match='timed out'):
+            async with fixture_checkout(diff, scratch_parent=scratch, git_timeout_secs=1.0):
+                pass
+
+        assert time.monotonic() - started < 30
+        assert list(scratch.iterdir()) == []
 
 
 @pytest.mark.asyncio

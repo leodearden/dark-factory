@@ -26,6 +26,9 @@ _SCRATCH_COMMITTER = (
     '-c', 'commit.gpgsign=false',
 )
 
+SCRATCH_GIT_TIMEOUT_SECS = 300.0
+"""How long any one git step building a scratch clone may run before the fixture is skipped."""
+
 
 @dataclass(frozen=True)
 class FixtureCheckout:
@@ -68,40 +71,47 @@ class FixtureEnrichmentMissing(Exception):
 
 @asynccontextmanager
 async def fixture_checkout(
-    diff: CorpusDiff, scratch_parent: Path | None = None,
+    diff: CorpusDiff,
+    scratch_parent: Path | None = None,
+    *,
+    git_timeout_secs: float = SCRATCH_GIT_TIMEOUT_SECS,
 ) -> AsyncIterator[FixtureCheckout]:
     """Yield *diff*'s reviewed tree in a scratch clone, removed when the block exits.
 
     A diff that does not apply at its recorded base leaves HEAD at that base, and a
     fixture with no recorded base leaves HEAD at the source's HEAD; either way the
     checkout's ``unapplied_reason`` says why. Raises FixtureNotMaterialisable when
-    git cannot clone the source or check out the base at all.
+    the source directory is missing, or when git cannot clone the source or check
+    out the base at all, including a step killed after *git_timeout_secs*.
     """
     scratch = Path(tempfile.mkdtemp(prefix='reviewer-trial-', dir=scratch_parent))
     try:
-        yield await _materialise(diff, scratch / 'clone')
+        yield await _materialise(diff, scratch / 'clone', git_timeout_secs)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-async def _materialise(diff: CorpusDiff, clone: Path) -> FixtureCheckout:
+async def _materialise(diff: CorpusDiff, clone: Path, timeout: float) -> FixtureCheckout:
     source = await _required_git(
         diff, ['rev-parse', '--show-toplevel'], cwd=diff.cwd or DEFAULT_FIXTURE_CWD,
+        timeout=timeout,
     )
     await _required_git(
         diff, ['clone', '--shared', '--no-checkout', '--quiet', source, str(clone)],
+        timeout=timeout,
     )
     base = diff.context.base_sha if diff.context is not None else None
     await _required_git(
         diff,
         ['-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', base or 'HEAD'],
-        cwd=clone,
+        cwd=clone, timeout=timeout,
     )
     if base is None:
         return FixtureCheckout(clone, None, _no_base_reason(diff))
 
     applied = await run_git(
-        ['git', 'apply', '--index', '--recount'], clone, input_text=diff.diff_text,
+        ['git', 'apply', '--index', '--recount'], clone,
+        input_text=diff.diff_text, timeout=timeout,
     )
     if not applied.ok:
         return FixtureCheckout(clone, None, _failure_text(applied))
@@ -109,18 +119,24 @@ async def _materialise(diff: CorpusDiff, clone: Path) -> FixtureCheckout:
         diff,
         [*_SCRATCH_COMMITTER, 'commit', '--quiet', '--no-verify',
          '-m', f'reviewer-trial fixture {diff.diff_id}'],
-        cwd=clone,
+        cwd=clone, timeout=timeout,
     )
     return FixtureCheckout(clone, base, None)
 
 
 async def _required_git(
-    diff: CorpusDiff, args: Sequence[str], *, cwd: Path | None = None,
+    diff: CorpusDiff, args: Sequence[str], *, cwd: Path | None = None, timeout: float,
 ) -> str:
-    result = await run_git(['git', *args], cwd)
+    command = f'`git {" ".join(args)}`'
+    try:
+        result = await run_git(['git', *args], cwd, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise FixtureNotMaterialisable(
+            diff.diff_id, f'{command} could not start in {cwd}: {exc}',
+        ) from exc
     if not result.ok:
         raise FixtureNotMaterialisable(
-            diff.diff_id, f'`git {" ".join(args)}` failed: {_failure_text(result)}',
+            diff.diff_id, f'{command} failed: {_failure_text(result)}',
         )
     return result.stdout.strip()
 
