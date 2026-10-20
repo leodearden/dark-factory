@@ -19,12 +19,11 @@ from orchestrator.agents.roles import (
     CODE_QUALITY_GUIDANCE,
     REVIEWER_COMPREHENSIVE,
     AgentRole,
+    build_reviewer_prompt_spec,
     build_reviewer_role,
     reviewers_for,
 )
 
-INCUMBENT_RULE_2_LEAD = '**Blocking means broken.**'
-ANCHORED_RULE_2_LEAD = '**Block only on a stated ground.**'
 SPECIALIZATION_FOOTER = '## Your Specialization: '
 
 
@@ -81,26 +80,30 @@ class TestPromptSplit:
 
 
 class TestResolvedText:
-    def test_the_context_complete_text_carries_the_anchored_rule(self, tmp_path: Path):
+    def test_the_context_complete_role_resolves_to_its_own_generation(self, tmp_path: Path):
         store = PromptArtifactStore(tmp_path / 'artifacts')
+        role = _context_complete()
         incumbent = _resolve(store, REVIEWER_COMPREHENSIVE)
+        assert role.prompt_spec is not None
+        assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
 
-        text = _resolve(store, _context_complete())
+        text = _resolve(store, role)
 
+        assert text == role.prompt_spec.in_code_constant
+        assert text != REVIEWER_COMPREHENSIVE.prompt_spec.in_code_constant
         assert CODE_QUALITY_GUIDANCE in text
         assert incumbent[incumbent.index(SPECIALIZATION_FOOTER):] in text
-        assert ANCHORED_RULE_2_LEAD in text
-        assert INCUMBENT_RULE_2_LEAD not in text
 
-    def test_the_incumbent_text_keeps_its_rule(self, tmp_path: Path):
+    def test_the_incumbent_resolves_to_its_own_generation(self, tmp_path: Path):
         store = PromptArtifactStore(tmp_path / 'artifacts')
+        context_complete = _context_complete()
+        assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
+        assert context_complete.prompt_spec is not None
 
         text = _resolve(store, REVIEWER_COMPREHENSIVE)
 
-        assert REVIEWER_COMPREHENSIVE.prompt_spec is not None
         assert text == REVIEWER_COMPREHENSIVE.prompt_spec.in_code_constant
-        assert INCUMBENT_RULE_2_LEAD in text
-        assert ANCHORED_RULE_2_LEAD not in text
+        assert text != context_complete.prompt_spec.in_code_constant
 
     def test_an_incumbent_pin_never_reaches_the_new_generation(self, tmp_path: Path):
         store = PromptArtifactStore(tmp_path / 'artifacts')
@@ -125,6 +128,19 @@ class TestResolvedText:
 
         assert 'PINNED: an optimised' in _resolve(store, REVIEWER_COMPREHENSIVE)
         assert _resolve(store, role) == before
+
+
+def test_each_generation_resolves_to_the_public_builders_text(tmp_path: Path):
+    store = PromptArtifactStore(tmp_path / 'artifacts')
+
+    texts = {
+        briefing: _resolve(store, build_reviewer_role('x', 'spec', briefing))
+        for briefing in ReviewBriefing
+    }
+
+    for briefing, text in texts.items():
+        assert text == build_reviewer_prompt_spec('x', 'spec', briefing).in_code_constant
+    assert texts[ReviewBriefing.DIFF_ONLY] != texts[ReviewBriefing.CONTEXT_COMPLETE]
 
 
 def test_build_reviewer_role_shares_the_incumbent_tooling():
