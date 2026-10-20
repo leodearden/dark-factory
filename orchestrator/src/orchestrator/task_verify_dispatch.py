@@ -291,6 +291,7 @@ class TaskVerifyDispatcher:
         self._run_local = run_local
         self._decisions: dict[tuple[str, int], DispatchDecision] = {}
         self._warned_overrides: set[CollapsedOverride] = set()
+        self._remote_verdicts = 0
 
     async def __call__(
         self,
@@ -340,7 +341,26 @@ class TaskVerifyDispatcher:
         if isinstance(outcome, str):
             return await self._run_local_because(call, draft, outcome)
         draft.reason = 'remote'
-        return outcome
+        return await self._settle_remote(call, policy, outcome, draft)
+
+    async def _settle_remote(
+        self, call: _VerifyCall, policy: TaskVerifyPolicy, remote: VerifyResult,
+        draft: _DecisionDraft,
+    ) -> VerifyResult:
+        """Return *remote*, or the local verdict when a parity knob re-runs it locally."""
+        self._remote_verdicts += 1
+        every_n = policy.cross_check_every_n
+        cross = every_n > 0 and self._remote_verdicts % every_n == 0
+        confirm = policy.red_confirms_locally and not remote.passed
+        if not (cross or confirm):
+            return remote
+        draft.runner = self._pool.allocator.local_name
+        local = await self._run_local_because(call, draft, 'cross_check' if cross else 'red_confirm')
+        if cross:
+            draft.cross_check = CrossCheck(remote_passed=remote.passed, local_passed=local.passed)
+        if confirm:
+            draft.red_confirmed_locally = RedConfirmation(local_passed=local.passed)
+        return local
 
     async def _run_local_because(
         self, call: _VerifyCall, draft: _DecisionDraft, reason: DispatchReason,
