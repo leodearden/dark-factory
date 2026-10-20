@@ -19,7 +19,8 @@ from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
-from _merge_lane_fakes import FakeVerifier, fails, lane_scene_config
+from _merge_lane_fakes import FakeVerifier, fails, lane_scene_config, make_lane, merge_through_lane
+from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
@@ -36,6 +37,7 @@ from orchestrator.merge_lane.reverify_gate_decision import (
     emit_reverify_gate_decision,
 )
 from orchestrator.merge_lane.worker import _run_post_merge_verify
+from orchestrator.verify import VerifyResult
 
 _SHAS = {
     'merge_sha': 'a' * 40,
@@ -240,6 +242,19 @@ def _scene(tmp_path: Path) -> _Scene:
     )
 
 
+def _request(config: OrchestratorConfig, task_id: str, worktree: Path) -> MergeRequest:
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(task_id, _GIT.branch_prefix),
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _Rebased:
     """A verified merge commit, rebased onto a main that moved under its verify."""
@@ -268,16 +283,7 @@ async def _rebased_merge(
         rebased_onto = drift(scene.repo)
         _git(merge_wt, 'rebase', rebased_onto)
         yield _Rebased(
-            request=MergeRequest(
-                task_id=task_id,
-                branch=QueuedBranch.parse(task_id, _GIT.branch_prefix),
-                worktree=branch_wt,
-                pre_rebased=False,
-                task_files=None,
-                module_configs=[],
-                config=config,
-                result=asyncio.get_running_loop().create_future(),
-            ),
+            request=_request(config, task_id, branch_wt),
             merge_wt=merge_wt,
             verified=verified,
             rebased_from=rebased_from,
@@ -411,7 +417,8 @@ class TestReverifyGateRecordsItsDecision:
                 scene, rebased, FakeVerifier(default=fails(category='pytest', summary='red')),
             )
 
-        assert isinstance(outcome, MergeOutcome) and outcome.status == 'blocked', outcome
+        assert not isinstance(outcome, GateClearance), outcome
+        assert outcome.status == 'blocked', outcome
         [row] = scene.gate_rows()
         assert row['reason'] == 'overlap'
         verifies = scene.verify_rows(rebased.rebased_sha)
@@ -458,3 +465,82 @@ class TestReverifyGateRecordsItsDecision:
         [row] = scene.gate_rows()
         assert row['reason'] == 'disjoint_untrusted', row
         assert len(scene.verify_rows(same_tree_sha)) == 1
+
+
+# ─── Both production call sites hand the worker's store to the gate ─────────
+
+
+class _MovesMainOnItsFirstVerify:
+    """A merge verify that passes, moving main under itself on its first call."""
+
+    def __init__(self, repo: Path, drift: Drift) -> None:
+        self._repo = repo
+        self._drift = drift
+        self.calls = 0
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> VerifyResult:
+        self.calls += 1
+        if self.calls == 1:
+            self._drift(self._repo)
+        return VerifyResult(
+            passed=True, test_output='ok', lint_output='', type_output='', summary='ok',
+        )
+
+
+async def _through_the_lane(
+    scene: _Scene, request: MergeRequest, verify: _MovesMainOnItsFirstVerify,
+) -> MergeOutcome:
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(
+        scene.git_ops, queue, verifier=ScriptedVerifier(verify), event_store=scene.store,
+    )
+    return await merge_through_lane(lane, queue, request)
+
+
+@pytest.mark.asyncio
+class TestSingleBranchGateIsRecorded:
+    async def test_an_overlap_fire_through_the_lane_writes_its_decision_and_its_verify(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        config = scene.config(merge_verify_breadth='scoped', merge_verify_min_free_disk_bytes=0)
+        branch_wt = (await scene.git_ops.create_worktree('lane-5064')).path
+        _edit_shared_line(branch_wt, 2, 'shared line 2, edited by the branch')
+        verify = _MovesMainOnItsFirstVerify(scene.repo, _drift_on_the_branchs_file)
+
+        outcome = await _through_the_lane(
+            scene, _request(config, 'lane-5064', branch_wt), verify,
+        )
+
+        assert outcome.status == 'done', outcome
+        landed = _git(scene.repo, 'rev-parse', 'main')
+        [row] = scene.gate_rows()
+        assert (row['task_id'], row['reason'], row['reverify'], row['overlap']) == (
+            'lane-5064', 'overlap', True, ['shared.txt'],
+        )
+        assert row['merge_sha'] == landed
+        [reverify] = scene.verify_rows(landed)
+        assert reverify['passed'] is True
+
+    async def test_a_same_tree_skip_through_the_lane_is_recorded(self, tmp_path: Path) -> None:
+        scene = _scene(tmp_path)
+        config = scene.config(merge_verify_breadth='full', merge_gate_history_pure=True)
+        head_wt = (await scene.git_ops.create_worktree('head')).path
+        head_commit = _edit_shared_line(head_wt, 2, 'shared line 2, edited by the head')
+        follower_wt = (await scene.git_ops.create_worktree('follower')).path
+        _git(follower_wt, 'merge', '--ff-only', head_commit)
+        _edit_shared_line(follower_wt, 10, 'shared line 10, edited by the follower')
+
+        def lands_the_heads_patch(repo: Path) -> str:
+            _git(repo, 'cherry-pick', '-x', head_commit)
+            return _git(repo, 'rev-parse', 'HEAD')
+
+        outcome = await _through_the_lane(
+            scene, _request(config, 'follower', follower_wt),
+            _MovesMainOnItsFirstVerify(scene.repo, lands_the_heads_patch),
+        )
+
+        assert outcome.status == 'done', outcome
+        [row] = scene.gate_rows()
+        assert (row['task_id'], row['reason'], row['reverify']) == ('follower', 'same_tree', False)
+        assert row['merge_sha'] == _git(scene.repo, 'rev-parse', 'main')

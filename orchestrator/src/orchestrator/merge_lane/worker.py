@@ -6996,6 +6996,7 @@ async def _advance_train(
             max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
             merge_sha=tip.rebased_sha,
             run_post_merge_verify=train_verify,
+            event_store=worker._event_store,
         )
         if isinstance(gate, MergeOutcome):
             return _TrainAdvance(adv, landing_base=candidate_base, reverify_failure=gate)
@@ -21295,6 +21296,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merge_sha=rebased_sha,
                         keep_worktrees=set(self._owned_merge_worktrees),
                         run_post_merge_verify=_run_post_merge_verify,
+                        event_store=self._event_store,
                     )
                     if isinstance(gate, MergeOutcome):
                         # task 2604: route through the unified terminal

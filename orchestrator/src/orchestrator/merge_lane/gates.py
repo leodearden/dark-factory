@@ -3411,7 +3411,7 @@ async def _reverify_rebased_tree(
     merge_sha: str = '',
     keep_worktrees: Collection[Path] | None = None,
     run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
-    event_store: EventStore | None = None,
+    event_store: EventStore | None,
 ) -> MergeOutcome | GateClearance:
     """Shared gate for the disjoint-delta re-verify check.
 
