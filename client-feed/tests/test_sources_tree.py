@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 from _git_repo import Repo, make_repo
-from client_feed.sources.tree import LineCounts, VisibleTree, visible_tree
 
 from client_feed.contract import (
     FEED_VERSION,
@@ -18,6 +17,7 @@ from client_feed.contract import (
 )
 from client_feed.policy import Policy, matches_any
 from client_feed.sources.git import main_head
+from client_feed.sources.tree import LineCounts, VisibleTree, visible_tree
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 T1 = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
