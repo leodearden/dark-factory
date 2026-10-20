@@ -193,7 +193,9 @@ class TestBeforeDone:
 
     def test_script_root_bogus_rejected(self):
         with pytest.raises(ValidationError):
-            BeforeDone(script='scripts/x.sh', timeout_secs=60, script_root='elsewhere')  # type: ignore[arg-type]
+            BeforeDone.model_validate(
+                {'script': 'scripts/x.sh', 'timeout_secs': 60, 'script_root': 'elsewhere'},
+            )
 
 
 class TestDoneProvenance:
