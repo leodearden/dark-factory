@@ -14431,6 +14431,17 @@ class Harness:
         """True iff a workflow slot is currently active for ``task_id``."""
         return task_id in self._workflow_cancel_events
 
+    async def clear_verify_host_quarantine(self, host: str) -> dict[str, Any]:
+        """Operator clear of a benched remote verify host (task 6565, design D6).
+
+        Delegates to the merge worker's
+        :meth:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker.clear_host_quarantine`;
+        reports ``cleared=False`` with a reason when no merge worker runs.
+        """
+        if self._merge_worker is None:
+            return {'host': host, 'cleared': False, 'reason': 'no merge worker is running'}
+        return await self._merge_worker.clear_host_quarantine(host)
+
     def _cancel_causes(self) -> dict[str, str]:
         """The cancel-cause registry, lazily created when absent.
 

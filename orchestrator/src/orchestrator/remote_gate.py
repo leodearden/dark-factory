@@ -210,6 +210,10 @@ def classify_remote_exit(
     return 'gate'
 
 
+def _packaged_script(name: str) -> str:
+    return resources.files('orchestrator').joinpath('remote_gate', name).read_text(encoding='utf-8')
+
+
 def ensure_script_text() -> str:
     """The text of ``remote_gate/ensure-gate.sh``, shipped as package data.
 
@@ -220,6 +224,38 @@ def ensure_script_text() -> str:
     :func:`parse_ensure_report` line; on failure it exits non-zero, never 255,
     with the cause on stderr.
     """
-    return resources.files('orchestrator').joinpath('remote_gate', 'ensure-gate.sh').read_text(
-        encoding='utf-8',
-    )
+    return _packaged_script('ensure-gate.sh')
+
+
+def reap_script_text() -> str:
+    """The text of ``remote_gate/reap-gates.sh``, shipped as package data.
+
+    Its contract: env ``GATE_ROOT`` (absolute).  Under a root carrying
+    :data:`GATE_ROOT_MARKER` it deletes sha dirs idle for 7 days and trash
+    older than a day; elsewhere it does nothing.  Run detached: it prints
+    nothing and its outcome is not awaited.
+    """
+    return _packaged_script('reap-gates.sh')
+
+
+# The client-side tell of a host shim that ignores ORCH_GATE_BIN and runs a
+# shared tree too old to know the handshake (click's rc 2 reply).
+_GATE_IDENTITY_UNKNOWN = "No such command 'gate-identity'"
+
+
+def shim_suspected(stderr: str, pair: GateIdentityPair | None = None) -> bool:
+    """Whether a failed ensure points at the host shim rather than the gate.
+
+    True when the remote answered with another commit's identity, or did not
+    know ``gate-identity`` at all: both mean the shim ran a shared tree
+    instead of ``$ORCH_GATE_BIN`` (design D3).
+    """
+    if pair is not None and pair.remote.code_sha != pair.local.code_sha:
+        return True
+    return _GATE_IDENTITY_UNKNOWN in stderr
+
+
+SHIM_REMEDY = (
+    'the orchestrator shim on the verify host does not honour ORCH_GATE_BIN; '
+    'run scripts/deploy/install_laptop_gate_shim.sh'
+)

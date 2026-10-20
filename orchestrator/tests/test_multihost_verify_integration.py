@@ -62,6 +62,7 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import gated_remote_runner
 from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
@@ -2435,7 +2436,6 @@ class TestTwoHostFalseGreenCapstone:
         import json
 
         from orchestrator.verify_runner import (
-            RemoteRunner,
             build_merge_verify_spec,
             result_to_json,
             run_merge_verify_on_worktree,
@@ -2470,7 +2470,7 @@ class TestTwoHostFalseGreenCapstone:
                 return (0, '', '')
             return next(_it)
 
-        runner = RemoteRunner(
+        runner = gated_remote_runner(
             name='leo-laptop', ssh_host='leo-laptop.local', git_remote='origin',
             cwd='/repo', run=fake_run, id_factory=lambda: 'cap-id',
         )

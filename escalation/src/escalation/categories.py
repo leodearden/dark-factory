@@ -111,6 +111,7 @@ class EscalationCategory(StrEnum):
     VERIFY_CROSS_CHECK_MISMATCH = 'verify_cross_check_mismatch'
     VERIFY_DRIFT_DIVERGENCE = 'verify_drift_divergence'
     VERIFY_ENV_DIVERGENCE = 'verify_env_divergence'
+    VERIFY_HOST_SKEW = 'verify_host_skew'
     VERIFY_HOST_UNREACHABLE = 'verify_host_unreachable'
     VERIFY_WORKTREE_CONTENTION = 'verify_worktree_contention'
     WIP_CONFLICT = 'wip_conflict'

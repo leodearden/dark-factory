@@ -34,8 +34,14 @@ gate_bin="$dir/.venv/bin/orchestrator"
 mkdir -p "$GATE_ROOT"
 touch "$GATE_ROOT/.dark-factory-gate-root"
 
+# Renamed first so the sha path changes atomically, then deleted at once: a
+# build that fails on every ensure must not leave a checkout behind each time.
+# reap-gates.sh collects a leftover from an interrupted delete.
 to_trash() {
-	mv -T "$1" "$(mktemp -u -d "$GATE_ROOT/.trash-XXXXXXXX")"
+	local trash
+	trash=$(mktemp -u -d "$GATE_ROOT/.trash-XXXXXXXX")
+	mv -T "$1" "$trash"
+	rm -rf "$trash"
 }
 
 build() {

@@ -101,7 +101,9 @@ from orchestrator.merge_lane.liveness import (
     _MERGE_WORKER_LOOP_DIED_SENTINEL,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     _acquire_warm_verify_worktree,
+    _alarm_verify_host_skew,
     _alarm_verify_host_unreachable,
+    _clear_verify_host_skew,
     _clear_verify_host_unreachable,
     _safety_valve_due,
     acquire_chain_build_lane,
@@ -144,6 +146,7 @@ from orchestrator.merge_lane.speculation_controller import (
 )
 from orchestrator.merge_lane.types import (
     CHAIN_FAULT_REASONS,
+    UNTRACKED_HOST_WIRE,
     CapPermit,
     ChainResult,
     ChainTruncationReason,
@@ -178,8 +181,11 @@ from orchestrator.merge_lane.types import (
     VerifyWorktreeHandle,
     _HostUnavailability,
     _InFlightEntry,
+    escalation_policy,
     item_merge_wt,
+    quarantine_class,
 )
+from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.suffix_graph import (
     SuffixConflictGraph,
@@ -5572,7 +5578,11 @@ class _TrainMergeHost(Protocol):
 
     # ── verify hosts ──────────────────────────────────────────────────────
     def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator: ...
-    def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None: ...
+    def _quarantine_unreachable_host(
+        self, host: str, reason: str, now: float, *,
+        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
+    ) -> None: ...
+    def bench_unavailable_runner(self, name: str, exc: RunnerUnavailable) -> None: ...
     async def _cancel_and_release_tracked(self, lease: HostLease | None) -> bool: ...
     async def _teardown_verify_task(
         self,
@@ -7088,17 +7098,15 @@ class _TrainVerifyHost:
             return None
         return self._lease.runner
 
-    async def fall_back_to_local(self, reason: str) -> None:
-        """Bench the unreachable remote this train leased and move to local.
+    async def fall_back_to_local(self, exc: RunnerUnavailable) -> None:
+        """Bench the remote this train leased, by *exc*'s kind, and move to local.
 
-        The remote is quarantined through the worker's INV-A chokepoint, so the
+        The remote is benched through the worker's INV-A chokepoint, so the
         reprobe sweep can re-admit it. Local is leased when free, else unleased.
         """
         assert self._lease is not None and not self._lease.is_local, self._lease
         await self._allocator.quarantine_and_release(self._lease)
-        self._worker._quarantine_unreachable_host(
-            self._lease.name, reason, self._worker._clock.now(),
-        )
+        self._worker.bench_unavailable_runner(self._lease.name, exc)
         self._lease = self._allocator.acquire_local(self._local_factory)
 
     async def run_verify(
@@ -7176,10 +7184,10 @@ async def _leased_train_verify(
             if runner is None:
                 raise
             logger.warning(
-                'Train %s: verify host %s unreachable (%s); re-running the verify on local',
-                req.train_id, host.name, exc,
+                'Train %s: verify host %s unavailable (%s: %s); re-running the verify on local',
+                req.train_id, host.name, exc.kind, exc,
             )
-            await host.fall_back_to_local(str(exc))
+            await host.fall_back_to_local(exc)
             worker._note_verify_started(req.request_id, host=host.name)
             return await host.run_verify(verify_once(*args, runner=host.runner, **kwargs))
 
@@ -9325,6 +9333,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
     REPROBE_STILL_DOWN_INFO_SWEEPS: int = 3
     REPROBE_STILL_DOWN_INFO_PERIOD_SECS: float = 1800.0
+    # How often _reprobe_loop launches the remotes' detached gate reapers
+    # (task 6565, design D2: at most hourly per process).
+    GATE_REAP_INTERVAL_SECS: float = 3600.0
     # task 3043 amend (reviewer_comprehensive, robustness): upper bound on
     # _run_inflight_verify's orphan-guard reap.  The guard cancels its inner
     # _run_post_merge_verify task and awaits it in a `finally` on a
@@ -9911,6 +9922,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the tracker entry by _record_runner_recovered, so it cannot outlive
         # the episode it describes.
         self._reprobe_last_info: dict[str, tuple[float, int, int]] = {}
+        # Skew benches opened per (host, deployed sha) across tracker episodes
+        # (task 6565, design D6).  A readmit pops the tracker entry, so the
+        # count that makes a host's second skew bench sticky lives here.
+        self._skew_benches: dict[tuple[str, str | None], int] = {}
+        # When _reap_idle_gates last launched the remote gate reapers.
+        self._last_gate_reap_at: float | None = None
         # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
         # reference to running tasks, so without a strong ref here the drift
         # detective can be GC'd mid-run and a remote-PASS / local-FAIL
@@ -10871,10 +10888,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         project_root = getattr(self._git_ops, 'project_root', None)
         if project_root is not None:
             remotes = list(self._remote_runners) if self._remote_runners is not None else (
-                _build_remote_runners(
-                    config, project_root,
-                    deployed_sha=self._deployed_sha, quarantine=self._runner_quarantine,
-                )
+                self._remote_runners_from(config, project_root)
             )
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine
@@ -10895,43 +10909,78 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # fully-populated instance.
         return HostAllocator([], quarantine=self._runner_quarantine)
 
-    # ── per-host RunnerUnavailable streak tracker (task 1795) ────────────
+    def _remote_runners_from(self, config: OrchestratorConfig, cwd: Path) -> list:
+        """The config's remote runners, gated on this process's deployed sha.
+
+        A config with enabled runners needs that sha: without it there is no
+        gate to dispatch through, and a remote verify must never fall back to
+        a shared remote tree (task 6565, design D2).  ``cli.py::run`` refuses
+        to start in that state, so this raise is the second line.
+        """
+        enabled = [r.name for r in config.enabled_verify_runners]
+        if not enabled:
+            return []
+        if self._deployed_sha is None:
+            raise RuntimeError(
+                f'merge worker has enabled verify_runners {enabled} but no deployed '
+                'sha to gate them on (task 6565); start it with Harness(deployed_sha=...)'
+            )
+        return _build_remote_runners(
+            config, cwd, deployed_sha=self._deployed_sha, quarantine=self._runner_quarantine,
+        )
+
+    # ── per-host RunnerUnavailable tracker (tasks 1795, 6565) ────────────
 
     def _record_runner_unavailable(
-        self, host: str, reason: str, now: float
+        self, host: str, reason: str, now: float, *,
+        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
     ) -> bool:
-        """Record one RunnerUnavailable failure for *host* and return whether to escalate.
+        """Record one RunnerUnavailable of *kind* for *host* and return whether to escalate.
 
         Creates a new ``_HostUnavailability`` entry on the first call, then
         increments ``streak`` on each subsequent call.  ``first_unavailable_at``
         is fixed to the first-call timestamp so duration can be computed later.
-        ``reason`` is refreshed to the most-recent exception message.
 
-        Returns ``True`` when ``streak >= self._unreachable_escalate_after_n``
-        (the caller should fire ``_alarm_verify_host_unreachable``), ``False``
-        otherwise.  The streak is persistent until ``_record_runner_recovered``
-        clears it, so consecutive calls beyond the threshold continue returning
-        ``True`` (the alarm helper's ``has_open_l1`` dedup prevents re-submitting).
+        A 'skew'-class *kind* (:func:`quarantine_class`) sets the entry's kind,
+        reason and identity, and when it opens a skew bench it counts toward
+        the host's sticky bound (:meth:`_open_skew_bench`).  A 'transport' RU
+        never downgrades a skew entry: it refreshes the reason of a transport
+        entry only.
 
-        The consecutive-streak decision delegates to the shared
-        ``critical_gate.critical_filing_gate`` helper (task 2558): passing an int
-        ``threshold`` reproduces the original ``streak >= threshold`` predicate
-        exactly, so behavior is unchanged.
+        Returns whether the caller should alarm: always for an
+        :func:`escalation_policy` of 'immediate', else once ``streak`` reaches
+        ``self._unreachable_escalate_after_n`` (via the shared
+        ``critical_gate.critical_filing_gate``, task 2558).  The alarm helpers'
+        ``has_open_l1`` dedup prevents re-submitting.
         """
-        if host in self._runner_unavailable:
-            entry = self._runner_unavailable[host]
-            entry.streak += 1
+        entry = self._runner_unavailable.setdefault(
+            host, _HostUnavailability(streak=0, first_unavailable_at=now, reason=reason),
+        )
+        entry.streak += 1
+        if quarantine_class(kind) == 'skew':
+            if quarantine_class(entry.kind) == 'ru':
+                self._open_skew_bench(host, entry)
+            entry.kind, entry.reason, entry.identity = kind, reason, identity
+        elif quarantine_class(entry.kind) == 'ru':
             entry.reason = reason
-        else:
-            self._runner_unavailable[host] = _HostUnavailability(
-                streak=1,
-                first_unavailable_at=now,
-                reason=reason,
-            )
+        if escalation_policy(entry.kind, sticky=entry.sticky) == 'immediate':
+            return True
         return critical_filing_gate(
-            streak=self._runner_unavailable[host].streak,
+            streak=entry.streak,
             threshold=self._unreachable_escalate_after_n,
         )
+
+    def _open_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
+        """Count a new skew bench of *host* on this deployed sha; the second is sticky.
+
+        Every bench after the first follows a passing probe (a readmit is what
+        closed the previous one), so the second bench means the cause survives
+        a passing probe: re-admitting again would only spend another verify
+        (design D6).  A failing reprobe opens no bench and so never counts.
+        """
+        key = (host, self._deployed_sha.sha if self._deployed_sha is not None else None)
+        self._skew_benches[key] = self._skew_benches.get(key, 0) + 1
+        entry.sticky = self._skew_benches[key] >= 2
 
     def _record_runner_recovered(self, host: str) -> None:
         """Clear the unavailability tracker entry for *host* (idempotent).
@@ -10958,8 +11007,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return self._host_allocator.local_name
         return 'local'
 
-    def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None:
-        """Quarantine *host* for an unreachability reason AND record it (task 3043).
+    def _quarantine_unreachable_host(
+        self, host: str, reason: str, now: float, *,
+        kind: RunnerUnavailableKind = 'transport', identity: GateIdentityPair | None = None,
+    ) -> None:
+        """Quarantine *host* for a RunnerUnavailable of *kind* AND record it (tasks 3043, 6565).
+
+        The ONE chokepoint every RunnerUnavailable bench goes through, so the
+        design-D6 policy (:func:`quarantine_class`, :func:`escalation_policy`,
+        no downgrade, the sticky bound) is applied in one place; a skew-class
+        bench also emits ``verify_host_skew``.
 
         INV-A — **a host is never removed from the acquirable pool for an
         unreachability reason without a ``_runner_unavailable`` entry.**
@@ -11010,19 +11067,51 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         self._runner_quarantine.add(host)
 
-        _should_escalate = self._record_runner_unavailable(host, reason, now)
-        if not _should_escalate:
-            return
+        _should_escalate = self._record_runner_unavailable(
+            host, reason, now, kind=kind, identity=identity,
+        )
+        entry = self._runner_unavailable[host]
+        if quarantine_class(kind) == 'skew':
+            self._emit_skew_bench(host, entry)
+        if _should_escalate:
+            self._alarm_host(host, entry, now - entry.first_unavailable_at)
 
-        _entry = self._runner_unavailable.get(host)
+    def bench_unavailable_runner(self, name: str, exc: RunnerUnavailable) -> None:
+        """Bench remote *name* for *exc*, by its kind: the ``on_unavailable`` sink.
+
+        Pools, drift checks and the train fallback hand a RunnerUnavailable
+        here; it goes through :meth:`_quarantine_unreachable_host`.
+        """
+        self._quarantine_unreachable_host(
+            name, str(exc), self._clock.now(), kind=exc.kind, identity=exc.identity,
+        )
+
+    def _deployed_code_sha(self) -> str | None:
+        return self._deployed_sha.sha if self._deployed_sha is not None else None
+
+    def _emit_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
+        if self._event_store is None:
+            return
+        self._event_store.emit(EventType.verify_host_skew, data={
+            'host': host, 'kind': entry.kind, 'reason': entry.reason,
+            'sticky': entry.sticky, 'code_sha': self._deployed_code_sha(),
+            'identity': entry.identity.to_wire() if entry.identity is not None else None,
+        })
+
+    def _alarm_host(self, host: str, entry: _HostUnavailability, duration_s: float) -> None:
+        """File the dedup'd L1 for *host*'s bench, in its quarantine class's category."""
+        if quarantine_class(entry.kind) == 'skew':
+            _alarm_verify_host_skew(
+                self._escalation_queue, host, entry,
+                code_sha=self._deployed_code_sha(), duration_s=duration_s,
+            )
+            return
         _alarm_verify_host_unreachable(
             self._escalation_queue,
             host,
-            reason,
-            streak=_entry.streak if _entry is not None else 1,
-            duration_s=(
-                now - _entry.first_unavailable_at if _entry is not None else 0.0
-            ),
+            entry.reason,
+            streak=entry.streak,
+            duration_s=duration_s,
             event_store=self._event_store,
         )
 
@@ -11035,7 +11124,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         applicable::
 
             {name, is_local, slot_state, quarantined, quarantine_class,
-             unavailable_since, unavailable_secs, streak, reason}
+             unavailable_since, unavailable_secs, streak, reason,
+             kind, sticky, identity}
 
         *now* is the snapshot's own clock (``time.time()``), passed in so
         ``unavailable_secs`` is measured against the same instant as every
@@ -11050,19 +11140,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Notes
         -----
-        - ``quarantine_class`` is derived with the SAME predicate
-          :meth:`_reprobe_quarantined_hosts` uses to tell the two quarantine
-          origins apart — ``name in self._runner_unavailable``.  Since task
-          3043 that reprobe sweep is *tracker-driven*: it iterates
-          ``self._runner_unavailable`` directly (``for name, entry in
-          list(self._runner_unavailable.items())``) instead of iterating the
-          quarantine set and skipping untracked names, so the predicate is the
-          loop itself rather than a skip inside it.  Semantically unchanged —
-          and now stronger: ``quarantine_class == 'ru'`` means exactly "is a
-          reprobe candidate".  Sharing the predicate means this snapshot and
-          the reprobe path can never disagree about whether a quarantined host
-          is RU-recoverable (``'ru'``) or held for verdict divergence
-          (``'divergence'``, cleared only by an operator).
+        - ``quarantine_class`` of a quarantined host is the tracked entry's
+          :func:`quarantine_class` — ``'ru'`` (re-probed by ``ssh true``) or
+          ``'skew'`` (re-probed by ensure-gate, task 6565) — or
+          ``'divergence'`` for an untracked one, held for verdict divergence
+          and cleared only by an operator.  Tracker membership is the same
+          predicate the tracker-driven :meth:`_reprobe_quarantined_hosts`
+          loops on, and :meth:`probe_host` dispatches on the same function, so
+          this snapshot and the reprobe can never disagree.  ``kind``,
+          ``sticky`` and ``identity`` (``GateIdentityPair.to_wire()``) come
+          from the entry too, so a skew bench shows both gate identities.
         - ``unavailable_since`` / ``unavailable_secs`` / ``streak`` / ``reason``
           are populated whenever the host is RU-tracked, **independent of
           quarantine**, so a host accumulating failures below the quarantine
@@ -11115,14 +11202,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'slot_state': slot_state,
                 'quarantined': quarantined,
                 'quarantine_class': (
-                    ('ru' if ru is not None else 'divergence') if quarantined else None
+                    (quarantine_class(ru.kind) if ru is not None else 'divergence')
+                    if quarantined else None
                 ),
-                'unavailable_since': ru.first_unavailable_at if ru is not None else None,
-                'unavailable_secs': (
-                    max(0.0, now - ru.first_unavailable_at) if ru is not None else None
-                ),
-                'streak': ru.streak if ru is not None else None,
-                'reason': ru.reason if ru is not None else None,
+                **(ru.to_wire(now) if ru is not None else UNTRACKED_HOST_WIRE),
             }
 
         out: list[dict] = [
@@ -11177,7 +11260,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Per host:
 
-        1. Probes via ``runner.health()`` (cheap SSH reachability check).
+        1. Probes via :meth:`probe_host` — ``runner.health()`` for an 'ru'
+           bench, ensure-gate for a 'skew' one; a sticky bench is not probed.
         2. **On success** (host recovered): if the slot is PARKED and the runner
            exposes ``probe_clean``, re-admission additionally requires a clean
            probe — PARK means "the cancel RPC failed, so a stale verify may
@@ -11191,9 +11275,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
            ``HostAllocator``.  Otherwise the host is **re-admitted** via
            ``allocator.readmit`` — which un-quarantines *and* un-PARKs; plain
            ``clear_quarantine`` cannot recover a PARKED slot, since
-           ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then the
-           tracker is reset and :func:`_clear_verify_host_unreachable` resolves
-           the open L1 and emits a recovery event.
+           ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then
+           :meth:`readmit_host` resets the tracker and resolves the open L1s.
         3. **On failure** (host still unreachable): if
            ``self._unreachable_escalate_after_secs > 0`` **and**
            ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
@@ -11295,127 +11378,211 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     continue
 
-                # Probe health first so a host that recovers in the same cycle
-                # it would have tripped the time-based threshold goes directly
-                # to the recovery path, avoiding a spurious open→immediate-
-                # resolve L1 notification.
-                if await runner.health():
-                    # PARK safety: a PARKED slot may still be running a stale
-                    # verify (its cancel RPC failed), so require a clean probe
-                    # before freeing it.  A runner that does not implement the
-                    # optional probe is treated as clean.
-                    _is_parked = getattr(self._host_allocator, 'is_parked', None)
-                    _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
-                    _park_epoch = getattr(self._host_allocator, 'park_epoch', None)
-                    _probed_epoch = _park_epoch(name) if _park_epoch is not None else None
-                    if _was_parked:
-                        _probe_clean = getattr(runner, 'probe_clean', None)
-                        if _probe_clean is None:
-                            # FAIL-OPEN, but never SILENTLY (task 3043 amend).
-                            # PARK is the state with the least evidence of
-                            # cleanliness, so treating "no probe" as clean is
-                            # the more permissive outcome for the weaker
-                            # evidence — a polarity worth stating out loud.
-                            # It is nonetheless the right default: refusing
-                            # would make such a host PERMANENTLY
-                            # non-acquirable with no recovery path, i.e. the
-                            # exact strand class this task exists to remove.
-                            # And it is UNREACHABLE against a real
-                            # HostAllocator today: cancel_and_release is the
-                            # only PARK writer and it calls
-                            # `lease.runner.probe_clean()` unconditionally on
-                            # that very path (verify_runner.py:3219, two lines
-                            # after the PARK at 3217), so a runner lacking the
-                            # method cannot reach PARKED at all.  The WARNING
-                            # is what makes a future runner class that DOES
-                            # reach it visible instead of silently trusted.
-                            logger.warning(
-                                'reprobe: host %r is reachable again after %.0fs and its '
-                                'slot is PARKED, but its runner (%s) exposes no '
-                                'probe_clean() — re-admitting on reachability ALONE; a '
-                                'stale verify could still be running there',
-                                name,
-                                downtime_s,
-                                type(runner).__name__,
-                            )
-                        elif not await _probe_clean():
-                            logger.info(
-                                'reprobe: host %r is reachable again after %.0fs but its '
-                                'slot stays PARKED pending a clean probe (a stale verify '
-                                'may still be running there); retrying next sweep',
-                                name,
-                                downtime_s,
-                            )
-                            continue
-
-                    _readmit = getattr(self._host_allocator, 'readmit', None)
-                    if _readmit is None:
-                        self._host_allocator.clear_quarantine(name)
-                    elif not _readmit(name, expect_epoch=_probed_epoch):
-                        continue
-                    self._record_runner_recovered(name)
-                    _clear_verify_host_unreachable(
-                        self._escalation_queue,
-                        self._event_store,
-                        name,
-                        downtime_s=downtime_s,
-                    )
-                    logger.info(
-                        'reprobe: host %r recovered after %.0fs down — re-admitted to '
-                        'the verify pool (slot un-PARKed: %s)',
-                        name,
-                        downtime_s,
-                        _was_parked,
-                    )
+                # Probe first so a host that recovers in the same cycle it would
+                # have tripped the time-based threshold goes directly to the
+                # recovery path, avoiding a spurious open→immediate-resolve L1.
+                if await self.probe_host(name, runner):
+                    await self._readmit_probed_host(name, runner, now)
                 else:
-                    # Rate-limited (task 3043 amend): this is the one record
-                    # that repeats forever for a permanently-gone host.  INFO
-                    # for the first REPROBE_STILL_DOWN_INFO_SWEEPS sweeps of an
-                    # episode, INFO on any CHANGE (a new streak — a fresh
-                    # dispatch attempt failed since the last line), then at most
-                    # one INFO per REPROBE_STILL_DOWN_INFO_PERIOD_SECS.  Never
-                    # DROPPED: the suppressed sweeps log at DEBUG, so a
-                    # debug-level operator still sees every one.
-                    _last_at, _last_streak, _sweeps = self._reprobe_last_info.get(
-                        name, (None, None, 0)
-                    )
-                    _at_info = (
-                        _last_at is None
-                        or _sweeps < self.REPROBE_STILL_DOWN_INFO_SWEEPS
-                        or entry.streak != _last_streak
-                        or (now - _last_at) >= self.REPROBE_STILL_DOWN_INFO_PERIOD_SECS
-                    )
-                    logger.log(
-                        logging.INFO if _at_info else logging.DEBUG,
-                        'reprobe: host %r still unreachable after %.0fs down '
-                        '(streak=%d) — staying out of the verify pool',
-                        name,
-                        downtime_s,
-                        entry.streak,
-                    )
-                    self._reprobe_last_info[name] = (
-                        now if _at_info else (_last_at if _last_at is not None else now),
-                        entry.streak,
-                        _sweeps + 1,
-                    )
-                    # Host still unreachable: fire the time-based alarm path
-                    # (dedup'd — no-op if already open).
-                    # `> 0` guard: secs=0 disables the time-based trip
-                    # (streak-only).
-                    if self._unreachable_escalate_after_secs > 0 and downtime_s >= self._unreachable_escalate_after_secs:
-                        _alarm_verify_host_unreachable(
-                            self._escalation_queue,
-                            name,
-                            entry.reason,
-                            streak=entry.streak,
-                            duration_s=downtime_s,
-                            event_store=self._event_store,
-                        )
+                    self._note_host_still_out(name, entry, now)
             except Exception:
                 logger.exception(
                     'reprobe_quarantined_hosts: unexpected error probing %r; skipping',
                     name,
                 )
+
+    async def probe_host(self, name: str, runner: Any) -> bool:
+        """Whether tracked host *name* has recovered, probed as its bench class needs (design D6).
+
+        An 'ru' bench answers ``runner.health()`` (``ssh true``).  A 'skew'
+        bench answers ``runner.ensure_gate()`` — publish, build or reuse the
+        gate, handshake — so a host only comes back once it can run this
+        dispatcher's gate.  A sticky bench is never probed: it waits for an
+        operator clear or a restart.
+        """
+        entry = self._runner_unavailable[name]
+        if entry.sticky:
+            return False
+        if quarantine_class(entry.kind) == 'ru':
+            return await runner.health()
+        try:
+            await runner.ensure_gate(event_store=self._event_store)
+        except RunnerUnavailable as exc:
+            logger.info('reprobe: ensure-gate for skew-benched host %r failed (%s): %s',
+                        name, exc.kind, exc)
+            return False
+        return True
+
+    async def _readmit_probed_host(self, name: str, runner: Any, now: float) -> bool:
+        """Re-admit *name*, whose probe passed, unless its PARKED slot is not yet clean.
+
+        PARK means "the cancel RPC failed, so a stale verify may still be
+        running there", so a PARKED slot is freed only on a clean
+        ``probe_clean()``; a dirty host stays tracked and parked for the next
+        sweep.  Returns whether the host was re-admitted.
+        """
+        _is_parked = getattr(self._host_allocator, 'is_parked', None)
+        _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
+        _park_epoch = getattr(self._host_allocator, 'park_epoch', None)
+        _probed_epoch = _park_epoch(name) if _park_epoch is not None else None
+        entry = self._runner_unavailable.get(name)
+        downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
+        if _was_parked and not await self._parked_slot_is_clean(name, runner, downtime_s):
+            return False
+        if not self.readmit_host(name, now=now, expect_epoch=_probed_epoch):
+            return False
+        logger.info(
+            'reprobe: host %r recovered after %.0fs down — re-admitted to '
+            'the verify pool (slot un-PARKed: %s)',
+            name,
+            downtime_s,
+            _was_parked,
+        )
+        return True
+
+    async def _parked_slot_is_clean(self, name: str, runner: Any, downtime_s: float) -> bool:
+        _probe_clean = getattr(runner, 'probe_clean', None)
+        if _probe_clean is None:
+            # FAIL-OPEN, but never SILENTLY (task 3043 amend).  Refusing would
+            # make such a host PERMANENTLY non-acquirable; and against a real
+            # HostAllocator it is unreachable, since cancel_and_release (the
+            # only PARK writer) calls probe_clean() on that very path.
+            logger.warning(
+                'reprobe: host %r is reachable again after %.0fs and its '
+                'slot is PARKED, but its runner (%s) exposes no '
+                'probe_clean() — re-admitting on reachability ALONE; a '
+                'stale verify could still be running there',
+                name,
+                downtime_s,
+                type(runner).__name__,
+            )
+            return True
+        if await _probe_clean():
+            return True
+        logger.info(
+            'reprobe: host %r is reachable again after %.0fs but its '
+            'slot stays PARKED pending a clean probe (a stale verify '
+            'may still be running there); retrying next sweep',
+            name,
+            downtime_s,
+        )
+        return False
+
+    def _note_host_still_out(self, name: str, entry: _HostUnavailability, now: float) -> None:
+        """Log a failed reprobe (rate-limited) and fire the time-based alarm when due."""
+        downtime_s = now - entry.first_unavailable_at
+        # Rate-limited (task 3043 amend): this is the one record that repeats
+        # forever for a permanently-gone host.  INFO for the first
+        # REPROBE_STILL_DOWN_INFO_SWEEPS sweeps of an episode, INFO on any
+        # CHANGE (a new streak), then at most one INFO per
+        # REPROBE_STILL_DOWN_INFO_PERIOD_SECS.  Suppressed sweeps log at DEBUG.
+        _last_at, _last_streak, _sweeps = self._reprobe_last_info.get(
+            name, (None, None, 0)
+        )
+        _at_info = (
+            _last_at is None
+            or _sweeps < self.REPROBE_STILL_DOWN_INFO_SWEEPS
+            or entry.streak != _last_streak
+            or (now - _last_at) >= self.REPROBE_STILL_DOWN_INFO_PERIOD_SECS
+        )
+        logger.log(
+            logging.INFO if _at_info else logging.DEBUG,
+            'reprobe: host %r still unavailable (%s%s) after %.0fs down '
+            '(streak=%d) — staying out of the verify pool',
+            name,
+            quarantine_class(entry.kind),
+            ', sticky' if entry.sticky else '',
+            downtime_s,
+            entry.streak,
+        )
+        self._reprobe_last_info[name] = (
+            now if _at_info else (_last_at if _last_at is not None else now),
+            entry.streak,
+            _sweeps + 1,
+        )
+        # `> 0` guard: secs=0 disables the time-based trip (streak-only).
+        if 0 < self._unreachable_escalate_after_secs <= downtime_s:
+            self._alarm_host(name, entry, downtime_s)
+
+    def readmit_host(self, name: str, *, now: float, expect_epoch: int | None = None) -> bool:
+        """Return remote *name* to the verify pool and close its bench: THE readmit.
+
+        Un-quarantines and un-PARKs it (``allocator.readmit``, refused when the
+        park episode moved past *expect_epoch*), drops its tracker entry, and
+        resolves its open unreachability and skew L1s.  The reprobe sweep calls
+        it after a passing :meth:`probe_host`; :meth:`clear_host_quarantine`
+        (the operator clear) calls it without one.  The per-(host, sha) skew
+        count survives, so a host cleared after a sticky bench goes sticky
+        again on its next skew failure.  Returns whether the host was
+        re-admitted.
+        """
+        _readmit = getattr(self._host_allocator, 'readmit', None)
+        if _readmit is None:
+            if self._host_allocator is None:
+                return False
+            self._host_allocator.clear_quarantine(name)
+        elif not _readmit(name, expect_epoch=expect_epoch):
+            return False
+        entry = self._runner_unavailable.get(name)
+        downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
+        self._record_runner_recovered(name)
+        _clear_verify_host_unreachable(
+            self._escalation_queue, self._event_store, name, downtime_s=downtime_s,
+        )
+        _clear_verify_host_skew(
+            self._escalation_queue, self._event_store, name,
+            code_sha=self._deployed_code_sha(), downtime_s=downtime_s,
+        )
+        return True
+
+    async def clear_host_quarantine(self, name: str) -> dict[str, Any]:
+        """The operator clear (escalation tool ``clear_verify_host_quarantine``).
+
+        Re-admits remote *name* whatever benched it — an 'ru' or 'skew' bench,
+        sticky or not, or a verdict-divergence quarantine — without probing
+        its health; a PARKED slot is still freed only once ``probe_clean()``
+        finds no stale verify there.  Returns ``{host, cleared,
+        quarantine_class, was_sticky}`` plus ``reason`` when nothing was
+        cleared.
+        """
+        entry = self._runner_unavailable.get(name)
+        quarantined = name in self._runner_quarantine
+        result: dict[str, Any] = {
+            'host': name,
+            'cleared': False,
+            'quarantine_class': (
+                quarantine_class(entry.kind) if entry is not None
+                else 'divergence' if quarantined else None
+            ),
+            'was_sticky': bool(entry is not None and entry.sticky),
+        }
+        runner = (
+            self._host_allocator.remote_runner(name)
+            if isinstance(self._host_allocator, HostAllocator) else None
+        )
+        if runner is None:
+            return {**result, 'reason': f'{name!r} is not a remote verify host of this worker'}
+        if entry is None and not quarantined:
+            return {**result, 'reason': f'{name!r} is not benched'}
+        if not await self._readmit_probed_host(name, runner, self._clock.now()):
+            return {
+                **result,
+                'reason': 'its slot is PARKED and a stale verify may still be running there',
+            }
+        return {**result, 'cleared': True}
+
+    async def _reap_idle_gates(self, now: float) -> None:
+        """At most hourly, launch each in-pool remote's detached gate reaper (design D2)."""
+        if not isinstance(self._host_allocator, HostAllocator):
+            return
+        last = self._last_gate_reap_at
+        if last is not None and now - last < self.GATE_REAP_INTERVAL_SECS:
+            return
+        self._last_gate_reap_at = now
+        for name in self._host_allocator.host_names:
+            runner = self._host_allocator.remote_runner(name)
+            if runner is not None and name not in self._runner_unavailable:
+                await runner.reap_idle_gates()
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
 
@@ -13806,8 +13973,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           hosts: list of per-host state dicts (task 3275), one per host the
             allocator manages, in allocator order (local first), each
             {name, is_local, slot_state, quarantined, quarantine_class,
-            unavailable_since, unavailable_secs, streak, reason} — uniform
-            schema, None where N/A.  unavailable_since is an absolute epoch
+            unavailable_since, unavailable_secs, streak, reason, kind, sticky,
+            identity} — uniform schema, None where N/A.  unavailable_since is an absolute epoch
             (log correlation); unavailable_secs is the derived downtime
             relative to this snapshot's `now`, matching every other age field
             here.  [] when no allocator has been built yet (no verify
@@ -13816,9 +13983,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             live) is appended after the managed hosts with slot_state=None, so
             len(hosts) == occupancy.hosts_total + <orphan count> (equal in the
             steady state).  This is what makes an under-full `verifying N/M
-            hosts` line diagnosable; the four causes and their discriminators:
+            hosts` line diagnosable; the five causes and their discriminators:
               - RU-quarantined         : quarantine_class == 'ru' (auto-recovers
                                          via _reprobe_quarantined_hosts)
+              - skew-quarantined       : quarantine_class == 'skew' (re-probed by
+                                         ensure-gate unless sticky; identity
+                                         carries both gate identities)
               - divergence-quarantined : quarantine_class == 'divergence'
                                          (operator-cleared only)
               - leaked slot            : slot_state busy|parked with no matching
@@ -14599,8 +14769,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         a pool that is quarantined but idle would report no degradation at all
         — one of the three 2026-07 incidents where a stuck merge queue was
         diagnosed only by hand-correlating a ``verifying N/M hosts`` line
-        against allocator internals.  ``<class>`` is ``ru`` (auto-recovers via
-        :meth:`_reprobe_quarantined_hosts`) or ``divergence``
+        against allocator internals.  ``<class>`` is ``ru`` or ``skew``
+        (re-probed by :meth:`_reprobe_quarantined_hosts`) or ``divergence``
         (operator-cleared only).
 
         The ``depth == 0`` no-op gate above is UNCHANGED: a fully idle pipeline
@@ -14661,7 +14831,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _deg_suffix = ''
         if _deg:
             # No `or <fallback>` on quarantine_class: _host_states_block sets it
-            # to exactly 'ru' or 'divergence' whenever quarantined is True (and
+            # to exactly 'ru', 'skew' or 'divergence' whenever quarantined is True (and
             # _deg filters on that), so a fallback would be unreachable dead code
             # that quietly papered over an invariant break. If the invariant ever
             # does break, the anomalous None renders as-is — visible, not cosmetic
@@ -14755,14 +14925,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """Periodically probe quarantined remote hosts and clear on recovery.
 
         Runs independently of the merger/verifier loops so it fires even when
-        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and runs two
-        sweeps: the tracker-driven :meth:`_reprobe_quarantined_hosts` first, then
-        :meth:`_reprobe_untracked_parked_slots`, the backstop for PARKED hosts
-        with no tracker entry.
+        those are idle.  Wakes every ``_reprobe_interval_s`` seconds and runs
+        three steps: the tracker-driven :meth:`_reprobe_quarantined_hosts`
+        first, then :meth:`_reprobe_untracked_parked_slots`, the backstop for
+        PARKED hosts with no tracker entry, then the at-most-hourly
+        :meth:`_reap_idle_gates`.
 
-        Each sweep is fault-isolated: an unexpected exception is logged and
+        Each step is fault-isolated: an unexpected exception is logged and
         swallowed (same pattern as _heartbeat_loop), so a probe bug can neither
-        crash the worker nor disable the other sweep.
+        crash the worker nor disable the other steps.
         """
         while self._running:
             await self._clock.sleep(self._reprobe_interval_s)
@@ -14774,6 +14945,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 await self._reprobe_untracked_parked_slots()
             except Exception:
                 logger.exception('reprobe_untracked_parked_slots: unexpected error in loop')
+            try:
+                await self._reap_idle_gates(self._clock.now())
+            except Exception:
+                logger.exception('reap_idle_gates: unexpected error in loop')
 
     async def _reprobe_untracked_parked_slots(self) -> None:
         """Free PARKED hosts the tracker sweep cannot see; tracked ones stay its job."""
@@ -19180,6 +19355,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
                 spec_warm=False if chain is not None else _spec_warm,
+                kind=exc.kind,
+                identity=exc.identity,
             )
         except (MergeVerifyLeaseContended, MergeVerifyLeaseHeld) as exc:
             # The shared merge-verify <lane_dir>.lock was unavailable, so the
@@ -19668,9 +19845,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     and not _ru_owned_by_handler
                 ):
                     with contextlib.suppress(Exception):
-                        self._quarantine_unreachable_host(
-                            lease.name, str(_orphan_exc), self._clock.now(),
-                        )
+                        self.bench_unavailable_runner(lease.name, _orphan_exc)
                     with contextlib.suppress(Exception):
                         logger.warning(
                             'Task %s: in-flight verify unwound while its remote '
@@ -20892,6 +21067,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         entry.lease.name,
                         vr.reason or '<unknown>',
                         self._clock.now(),
+                        kind=vr.kind,
+                        identity=vr.identity,
                     )
                 # ── Dispose of the RU'd merge worktree (task 3251) ──────────
                 # _run_inflight_verify returns merge_wt UN-cleaned precisely so
@@ -20924,9 +21101,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # under `if lease.is_local` only, and a LOCAL lease dispatches
                 # runner=None, which makes _run_post_merge_verify build a
                 # LocalRunner-only VerifyRunnerPool — and every
-                # RunnerUnavailable raise site is either inside RemoteRunner or
-                # behind the INV-2 gate's `not isinstance(selected,
-                # RemoteRunner)` break, so no local-lease verify can raise it.
+                # RunnerUnavailable raise site is inside RemoteRunner, so no
+                # local-lease verify can raise it.
                 # REMOTE leases can raise it but skip the warm swap, so their
                 # merge_wt is a genuinely cold _merge-<uuid>.  The routing is
                 # therefore defensive, and deliberately so: admitting one remote

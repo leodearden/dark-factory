@@ -155,7 +155,9 @@ def test_build_remote_runners_hands_every_runner_the_deployed_sha():
         git=GitConfig(main_branch='main'),
         verify_env_probes=[],
         verify_runners=[
-            VerifyRunnerConfig(name=name, ssh_host='h.local', git_remote='r')
+            VerifyRunnerConfig(
+                name=name, ssh_host='h.local', git_remote='r', df_checkout_path='/df',
+            )
             for name in ('r1', 'r2')
         ],
     )

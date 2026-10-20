@@ -6,6 +6,7 @@ import importlib.resources
 import logging
 import math
 import os
+import posixpath
 import re
 import stat
 from dataclasses import dataclass
@@ -2958,6 +2959,18 @@ class RecoveryEmissionConfig(BaseModel):
     )
 
 
+class RemoteGatePaths(NamedTuple):
+    """Where one runner's remote gates live (task 6565, design D2).
+
+    ``source`` is the remote Dark-Factory repository gate checkouts are cloned
+    from; ``root`` holds one immutable checkout per deployed sha.  Both are
+    absolute paths on the remote host.
+    """
+
+    source: str
+    root: str
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -2984,20 +2997,23 @@ class VerifyRunnerConfig(BaseModel):
     df_checkout_path: str | None = Field(
         default=None,
         description=(
-            'Remote-host filesystem path to the Dark-Factory orchestrator '
-            '*code* checkout — the tree whose `orchestrator verify-merge` gate '
-            'this runner executes over ssh.  Distinct from git_remote (the '
-            'PROJECT checkout where the merge sha is pushed/tested).  When set, '
-            'enables the INV-2 contract-currency auto-sync at dispatch '
-            '(HEAD-compare vs the dispatcher, then git pull --ff-only + uv sync '
-            '--all-packages when stale, then a probe that the remote '
-            '`orchestrator` CLI still answers; plans/merge-verdict-integrity-prd.md '
-            '§1, §3.1).  The sync is --all-packages because a DF checkout is a uv '
-            'WORKSPACE, in which a bare `uv sync` exits 0 while pruning the '
-            'members\' console scripts — including the very entry point this '
-            'runner invokes over ssh (task 4539).  '
-            'Default None keeps auto-sync OFF (opt-in), byte-identical to the '
-            'pre-INV-2 behaviour for every not-yet-migrated runner.'
+            'Absolute remote-host path of the Dark-Factory repository the gate '
+            'checkouts are cloned from.  The dispatcher pushes its deployed sha '
+            'there as refs/gate/<sha>, and each verify runs in an immutable '
+            'checkout of that sha under gate_checkouts_path (task 6565, '
+            'plans/6565-remote-checkout-sync-design-2026-10-20.md D2).  Distinct '
+            'from git_remote (the PROJECT repo the merge sha is pushed to).  '
+            'REQUIRED for an enabled runner: a runner that cannot be gated is a '
+            'configuration error, never a dispatch through a shared tree.'
+        ),
+    )
+    gate_checkouts_path: str | None = Field(
+        default=None,
+        description=(
+            'Absolute remote-host directory holding one gate checkout per '
+            'deployed sha (task 6565, design D2).  None means the sibling '
+            '`dark-factory-gate` of df_checkout_path.  Restart-tier like the '
+            'rest of the runner.'
         ),
     )
     enabled: bool = Field(
@@ -3007,6 +3023,30 @@ class VerifyRunnerConfig(BaseModel):
             'Allows temporary disabling without removing the entry.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _require_gate_paths_when_enabled(self) -> 'VerifyRunnerConfig':
+        if self.enabled:
+            self.gate_paths()
+        return self
+
+    def gate_paths(self) -> RemoteGatePaths:
+        """This runner's absolute gate source and root; raises ValueError naming the runner."""
+        source = self.df_checkout_path
+        if not source or not posixpath.isabs(source):
+            raise ValueError(
+                f'verify_runners[{self.name!r}]: df_checkout_path must be an absolute '
+                f'remote path for an enabled runner (task 6565), got {source!r}'
+            )
+        root = self.gate_checkouts_path or posixpath.join(
+            posixpath.dirname(source.rstrip('/')), 'dark-factory-gate',
+        )
+        if not posixpath.isabs(root):
+            raise ValueError(
+                f'verify_runners[{self.name!r}]: gate_checkouts_path must be an '
+                f'absolute remote path, got {root!r}'
+            )
+        return RemoteGatePaths(source=source, root=root)
 
 
 class EnvProbeConfig(BaseModel):

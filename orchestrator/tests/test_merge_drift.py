@@ -360,7 +360,8 @@ class TestDriftCheckFullGateSpecNoDerivation:
         req.config = OrchestratorConfig(
             project_root=tmp_path,
             verify_runners=[  # type: ignore[arg-type]
-                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin',
+                 'df_checkout_path': '/df'},
             ],
             verify_env_probes=_LEVER_C_OFF,
         )
