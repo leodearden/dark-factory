@@ -4,10 +4,11 @@ run builds, its codebook transforms, its report section and its queue CLI
 (plans/census-incremental-prd.md L7, D3, D4)."""
 from __future__ import annotations
 
+import copy
 import math
 
 import pytest
-from legibility import config, embeddings, similarity
+from legibility import census_findings, codebook, config, embeddings, similarity, verdict
 
 _MODEL = 'text-embedding-3-small'
 
@@ -393,3 +394,191 @@ class TestBuildView:
 
         assert view.skipped is not None
         assert len(fake.calls) == 1
+
+
+_RUN = 'census-dark_factory-20261020'
+_IDENTITY = census_findings.FindingIdentity.mint(
+    'orchestrator', 'orchestrator/x.py::f', ('h13', verdict.KIND_TAG),
+)
+
+
+def _keyed(record: dict) -> dict:
+    return {**record, **_IDENTITY.to_fields()}
+
+
+def _by_id(cb: dict, record_id: str) -> dict:
+    return next(record for record in (*cb['entries'], *cb['candidates']) if record['id'] == record_id)
+
+
+class TestAttach:
+    _VECTORS = {'Entry A': _angle(0), 'Near': _angle(10), 'Novel near': _angle(15), 'Far': _angle(90)}
+
+    def _pre_merge(self) -> dict:
+        return _codebook(
+            entries=[_keyed(_entry('entry-a', 'Entry A', sessions=('s-entry',)))],
+            candidates=[
+                _candidate('cand-20260801-1', 'Near', cause=None, sessions=('s-1', 's-entry')),
+                _candidate('cand-20260801-2', 'Far', cause=None, sessions=('s-2',)),
+            ],
+        )
+
+    def _post_merge(self, cb: dict) -> dict:
+        merged = copy.deepcopy(cb)
+        merged['candidates'].append(_candidate(
+            'cand-20261020-1', 'Novel near', cause=None, first_seen='2026-10-20', sessions=('s-novel',),
+        ))
+        return merged
+
+    def _views(self, tmp_path):
+        cb = self._pre_merge()
+        view, _ = _view(tmp_path, cb, [_novel('Novel near', cause=None, session='s-novel')], vectors=self._VECTORS)
+        return cb, view
+
+    def test_every_attach_joins_its_entry_by_similarity(self, tmp_path):
+        cb, view = self._views(tmp_path)
+        merged = self._post_merge(cb)
+        before = copy.deepcopy(merged)
+
+        result, applied = similarity.attach(merged, view, run_id=_RUN)
+
+        assert merged == before
+        assert [(item.candidate_id, item.entry_id, item.novel) for item in applied] == [
+            ('cand-20260801-1', 'entry-a', False), ('cand-20261020-1', 'entry-a', True),
+        ]
+        assert [item.title for item in applied] == ['Near', 'Novel near']
+        for item in applied:
+            attached_by = {'method': 'similarity', 'score': item.score, 'run_id': _RUN}
+            candidate = _by_id(result, item.candidate_id)
+            assert candidate['disposition'] == 'promoted'
+            assert candidate['promoted_to'] == 'entry-a'
+            assert candidate['attached_by'] == attached_by
+            assert census_findings.FindingIdentity.from_record(candidate) == _IDENTITY
+        sightings = _by_id(result, 'entry-a')['sightings']
+        assert [sighting['session'] for sighting in sightings] == ['s-entry', 's-1', 's-novel']
+        assert sightings[1]['attached_by']['method'] == 'similarity'
+        assert _by_id(result, 'cand-20260801-2')['disposition'] == 'pending'
+        assert codebook.validate(result) == []
+
+    def test_scores_are_the_views(self, tmp_path):
+        cb, view = self._views(tmp_path)
+
+        _, applied = similarity.attach(self._post_merge(cb), view, run_id=_RUN)
+
+        assert [item.score for item in applied] == [
+            view.attaches[0].score, view.screened[0].score,
+        ]
+
+    def test_a_candidate_no_longer_pending_is_refused(self, tmp_path):
+        cb, view = self._views(tmp_path)
+        merged = self._post_merge(cb)
+        _by_id(merged, 'cand-20260801-1')['disposition'] = 'rejected'
+
+        with pytest.raises(ValueError, match='cand-20260801-1.*pending'):
+            similarity.attach(merged, view, run_id=_RUN)
+
+    def test_a_screened_cluster_with_no_pending_candidate_is_refused(self, tmp_path):
+        cb, view = self._views(tmp_path)
+
+        with pytest.raises(ValueError, match='Novel near.*pending'):
+            similarity.attach(copy.deepcopy(cb), view, run_id=_RUN)
+
+    def test_a_skipped_view_attaches_nothing(self, tmp_path):
+        cb = self._pre_merge()
+        view = similarity.View.skipped_by('embeddings endpoint answered HTTP 503', 1, _SETTINGS)
+
+        result, applied = similarity.attach(cb, view, run_id=_RUN)
+
+        assert (result, applied) == (cb, ())
+
+
+class TestAdjudicateMembers:
+    def _pending(self) -> dict:
+        return _codebook(candidates=[
+            _candidate('cand-20260801-1', 'Older member', cause=None, sessions=('s-1',)),
+            _candidate('cand-20260805-1', 'Representative', cause=None, first_seen='2026-08-05',
+                       sessions=('s-2',)),
+            _candidate('cand-20260801-9', 'Bystander', cause=None, sessions=('s-9',)),
+        ])
+
+    def _offered(self, cb: dict) -> tuple[similarity.QueuedCluster, ...]:
+        members = [
+            item for item in similarity.items_of(cb)
+            if item.record_id in ('cand-20260801-1', 'cand-20260805-1')
+        ]
+        offered = similarity.rank([members])
+        assert offered[0].representative.record_id == 'cand-20260805-1'
+        return offered
+
+    def _promoted(self, cb: dict) -> dict:
+        result = copy.deepcopy(cb)
+        representative = _by_id(result, 'cand-20260805-1')
+        result['entries'].append(_keyed({
+            **_entry('entry-cand-20260805-1', 'Representative', sessions=('s-2',)),
+        }))
+        representative.update(_IDENTITY.to_fields(), disposition='promoted', promoted_to='entry-cand-20260805-1')
+        return result
+
+    def test_members_join_a_promoted_representatives_entry(self):
+        cb = self._pending()
+        offered = self._offered(cb)
+        verified = self._promoted(cb)
+
+        result, adjudicated = similarity.adjudicate_members(verified, offered, run_id=_RUN)
+
+        [outcome] = adjudicated
+        assert outcome.representative == 'cand-20260805-1'
+        assert outcome.outcome is similarity.Outcome.VERIFIED
+        assert outcome.members == ('cand-20260801-1',)
+        member = _by_id(result, 'cand-20260801-1')
+        assert member['disposition'] == 'promoted'
+        assert member['promoted_to'] == 'entry-cand-20260805-1'
+        assert member['adjudicated_with'] == 'cand-20260805-1'
+        assert 'attached_by' not in member
+        assert census_findings.FindingIdentity.from_record(member) == _IDENTITY
+        sightings = _by_id(result, 'entry-cand-20260805-1')['sightings']
+        assert [sighting['session'] for sighting in sightings] == ['s-2', 's-1']
+        assert 'attached_by' not in sightings[1]
+        assert _by_id(result, 'cand-20260801-9')['disposition'] == 'pending'
+        assert codebook.validate(result) == []
+        codebook.assert_no_deletion(verified, result)
+
+    @pytest.mark.parametrize('identity', [_IDENTITY, None], ids=['keyed', 'unkeyed'])
+    def test_members_follow_a_rejected_representative(self, identity):
+        cb = self._pending()
+        offered = self._offered(cb)
+        rejected = copy.deepcopy(cb)
+        representative = _by_id(rejected, 'cand-20260805-1')
+        representative['disposition'] = 'rejected'
+        if identity is not None:
+            representative.update(identity.to_fields())
+
+        result, adjudicated = similarity.adjudicate_members(rejected, offered, run_id=_RUN)
+
+        assert [(item.outcome, item.members) for item in adjudicated] == [
+            (similarity.Outcome.REJECTED, ('cand-20260801-1',)),
+        ]
+        member = _by_id(result, 'cand-20260801-1')
+        assert member['disposition'] == 'rejected'
+        assert member['adjudicated_with'] == 'cand-20260805-1'
+        assert census_findings.FindingIdentity.from_record(member) == identity
+        assert codebook.validate(result) == []
+        codebook.assert_no_deletion(rejected, result)
+
+    def test_a_still_pending_representative_leaves_its_members_untouched(self):
+        cb = self._pending()
+
+        result, adjudicated = similarity.adjudicate_members(cb, self._offered(cb), run_id=_RUN)
+
+        assert result == cb
+        assert [(item.outcome, item.members) for item in adjudicated] == [
+            (similarity.Outcome.UNRESOLVED, ()),
+        ]
+
+    def test_a_member_no_longer_pending_is_refused(self):
+        cb = self._pending()
+        offered = self._offered(cb)
+        verified = self._promoted(cb)
+        _by_id(verified, 'cand-20260801-1')['disposition'] = 'rejected'
+
+        with pytest.raises(ValueError, match='cand-20260801-1.*pending'):
+            similarity.adjudicate_members(verified, offered, run_id=_RUN)
