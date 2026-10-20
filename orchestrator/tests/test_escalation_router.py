@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from _curator_fake import FakeCurator
@@ -25,11 +25,14 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.escalation_router import (
+    AGGREGATE_CATEGORY,
     AGGREGATE_ROLE,
     FALLBACK_ACTION,
+    OVERFLOW_SENTINEL,
     ROUTER_ID,
     Converted,
     Failed,
+    InfoL0Sweep,
     Refused,
     RouteContext,
     RouterHold,
@@ -440,3 +443,242 @@ class TestApplyNeverRaises:
         assert applied.disposition_class == 'router-error'
         (row,) = _dispositions(events)
         assert row['data']['class'] == 'router-error'
+
+
+# ---------------------------------------------------------------------------
+# The per-pass sweep
+# ---------------------------------------------------------------------------
+
+STARVATION = 'orchestrator-starvation-watchdog'
+SKEW = 'orchestrator-merge-skew-tripwire'
+
+
+def _sweep(ports: RouterPorts, *, max_conversions: int = 20) -> InfoL0Sweep:
+    return InfoL0Sweep(ports, by='orphan-reaper', max_conversions=max_conversions)
+
+
+async def _route_all(sweep: InfoL0Sweep, records: list[Escalation]) -> None:
+    for record in records:
+        await sweep.route(record, exit_kind=ExitKind.ORPHAN, task_status=None)
+
+
+def _aggregates(queue: EscalationQueue, sentinel: str) -> list[Escalation]:
+    return [
+        esc for esc in queue.get_by_task(sentinel, status='pending', level=1, agent_role=AGGREGATE_ROLE)
+        if esc.category == AGGREGATE_CATEGORY
+    ]
+
+
+def _hold(queue: EscalationQueue, record: Escalation, ticket: str, filed_at: datetime) -> Escalation:
+    queue.stamp_triage(record.id, triaged_by=ROUTER_ID, triage_note=hold_note(ticket, filed_at))
+    return _current(queue, record.id)
+
+
+class TestSweepRoute:
+    @pytest.mark.asyncio
+    async def test_a_work_note_is_decided_by_route_info_l0_and_converted(self, queue, ports, curator):
+        record = _seed(queue)
+        sweep = _sweep(ports)
+        await sweep.route(record, exit_kind=ExitKind.DONE, task_status='done')
+        (arguments,) = curator.calls_named('submit_task')
+        assert arguments['metadata']['escalation_id'] == record.id
+        assert 'Subject status: done' in arguments['description']
+
+    @pytest.mark.asyncio
+    async def test_a_router_held_record_is_skipped(self, queue, events, ports, curator):
+        record = _hold(queue, _seed(queue), 'tkt_77', datetime.now(UTC))
+        sweep = _sweep(ports)
+        await sweep.route(record, exit_kind=ExitKind.ORPHAN)
+        assert curator.calls == []
+        assert _dispositions(events) == []
+        assert read_hold(_current(queue, record.id)) == read_hold(record)
+
+    @pytest.mark.asyncio
+    async def test_conversions_past_the_cap_are_promoted_and_aggregated(self, queue, ports, curator):
+        records = [_seed(queue) for _ in range(5)]
+        sweep = _sweep(ports, max_conversions=2)
+        await _route_all(sweep, records)
+        sweep.close()
+
+        assert len(curator.calls_named('submit_task')) == 2
+        overflow_ids = [r.id for r in records[2:]]
+        assert [_current(queue, r.id).status for r in records] == ['pending'] * 2 + ['dismissed'] * 3
+        promoted = _router_l1s(queue, '42')
+        assert len(promoted) == 3
+        assert all('conversion_cap' in l1.detail for l1 in promoted)
+
+        (aggregate,) = _aggregates(queue, OVERFLOW_SENTINEL)
+        assert (aggregate.level, aggregate.severity, aggregate.agent_role) == (1, 'info', AGGREGATE_ROLE)
+        assert aggregate.filing_claimant_run_id == FILER_RUN_ID
+        assert all(esc_id in aggregate.detail for esc_id in overflow_ids)
+        assert not any(r.id in aggregate.detail for r in records[:2])
+
+    @pytest.mark.asyncio
+    async def test_after_one_unreachable_submit_later_conversions_promote_without_dispatch(
+        self, queue, events, ports, curator,
+    ):
+        curator.raise_on_submit()
+        records = [_seed(queue) for _ in range(3)]
+        sweep = _sweep(ports)
+        await _route_all(sweep, records)
+
+        assert len(curator.calls_named('submit_task')) == 1
+        reasons = [row['data']['reason'] for row in _dispositions(events)]
+        assert reasons == ['ticket_failed'] * 3
+        assert all(_current(queue, r.id).status == 'dismissed' for r in records)
+
+
+class TestSweepStatusInfoAggregates:
+    @staticmethod
+    def _mechanical(queue: EscalationQueue, role: str, n: int) -> list[Escalation]:
+        return [
+            _seed(queue, task_id=str(500 + i), agent_role=role, category='infra_issue')
+            for i in range(n)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_one_aggregate_per_class_lists_that_class_only(self, queue, ports, curator):
+        starved = self._mechanical(queue, STARVATION, 5)
+        skewed = self._mechanical(queue, SKEW, 2)
+        sweep = _sweep(ports)
+        await _route_all(sweep, starved + skewed)
+        sweep.close()
+
+        assert curator.calls == []
+        for record in starved + skewed:
+            assert _current(queue, record.id).resolution_class == 'status-info'
+        for role, members, others in ((STARVATION, starved, skewed), (SKEW, skewed, starved)):
+            (aggregate,) = _aggregates(queue, status_info_sentinel(role))
+            assert aggregate.task_id == status_info_sentinel(role)
+            assert aggregate.severity == 'info'
+            assert all(r.id in aggregate.detail for r in members)
+            assert not any(r.id in aggregate.detail for r in others)
+
+    @pytest.mark.asyncio
+    async def test_a_later_sweep_amends_the_still_open_aggregate(self, queue, ports):
+        first = _sweep(ports)
+        await _route_all(first, self._mechanical(queue, STARVATION, 2))
+        first.close()
+        (aggregate,) = _aggregates(queue, status_info_sentinel(STARVATION))
+        queue.submit(Escalation(
+            id=queue.make_id('l2'), task_id='l2', agent_role='escalation-watcher-auto',
+            severity='info', category=AGGREGATE_CATEGORY, summary='cluster', level=2,
+            members=[aggregate.id],
+        ))
+
+        later = [_seed(queue, task_id='600', agent_role=STARVATION, category='infra_issue')]
+        second = _sweep(ports)
+        await _route_all(second, later)
+        second.close()
+
+        (still,) = _aggregates(queue, status_info_sentinel(STARVATION))
+        assert still.id == aggregate.id
+        (amendment,) = still.amendments
+        assert later[0].id in amendment['detail']
+        assert amendment['agent_role'] == AGGREGATE_ROLE
+
+    @pytest.mark.asyncio
+    async def test_once_the_aggregate_is_resolved_the_next_sweep_files_a_fresh_one(self, queue, ports):
+        first = _sweep(ports)
+        await _route_all(first, self._mechanical(queue, STARVATION, 1))
+        first.close()
+        (old,) = _aggregates(queue, status_info_sentinel(STARVATION))
+        queue.resolve(old.id, 'digest read', resolved_by='escalation-watcher-auto')
+
+        second = _sweep(ports)
+        await _route_all(second, [_seed(queue, task_id='700', agent_role=STARVATION, category='infra_issue')])
+        second.close()
+        (fresh,) = _aggregates(queue, status_info_sentinel(STARVATION))
+        assert fresh.id != old.id
+
+    def test_a_sweep_that_routed_nothing_files_nothing(self, queue, ports):
+        _sweep(ports).close()
+        assert queue.get_pending() == []
+
+
+class TestSweepFinishHold:
+    FILED_AT = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+    TIMEOUT_SECS = 900.0
+
+    def _held(self, queue: EscalationQueue) -> tuple[Escalation, RouterHold]:
+        record = _hold(queue, _seed(queue), 'tkt_5', self.FILED_AT)
+        hold = read_hold(record)
+        assert hold is not None
+        return record, hold
+
+    async def _finish(self, ports, record, hold, *, after_secs: float):
+        sweep = _sweep(ports)
+        return await sweep.finish_hold(
+            record, hold, now=self.FILED_AT + timedelta(seconds=after_secs),
+            timeout_secs=self.TIMEOUT_SECS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_created_ticket_converts_citing_task_and_ticket(self, queue, events, ports, curator):
+        record, hold = self._held(queue)
+        curator.set_ticket('tkt_5', {'status': 'created', 'task_id': '9001'})
+        await self._finish(ports, record, hold, after_secs=60)
+
+        closed = _current(queue, record.id)
+        assert (closed.status, closed.resolution_class) == ('dismissed', 'converted')
+        assert '9001' in (closed.resolution or '') and 'tkt_5' in (closed.resolution or '')
+        (row,) = _dispositions(events)
+        assert (row['data']['class'], row['data']['ticket']) == ('converted', 'tkt_5')
+        (arguments,) = curator.calls_named('resolve_ticket')
+        assert (arguments['ticket'], arguments['project_root']) == ('tkt_5', '/srv/project')
+        assert 0 < arguments['timeout_seconds'] <= 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('answer', 'reason'), [
+        ({'status': 'refused', 'reason': 'cancelled premise'}, 'ticket_refused'),
+        ({'status': 'failed', 'reason': 'worker_dead', 'task_id': None}, 'ticket_failed'),
+    ])
+    async def test_a_ticket_the_curator_will_not_create_promotes(
+        self, queue, ports, curator, answer, reason,
+    ):
+        record, hold = self._held(queue)
+        curator.set_ticket('tkt_5', answer)
+        await self._finish(ports, record, hold, after_secs=60)
+        (l1,) = _router_l1s(queue, '42')
+        assert reason in l1.detail
+        assert l1.suggested_action == FALLBACK_ACTION
+        assert _current(queue, record.id).status == 'dismissed'
+
+    @pytest.mark.asyncio
+    async def test_an_undecided_ticket_inside_its_bound_leaves_the_record_alone(
+        self, queue, events, ports,
+    ):
+        record, hold = self._held(queue)
+        assert await self._finish(ports, record, hold, after_secs=self.TIMEOUT_SECS - 1) is None
+        after = _current(queue, record.id)
+        assert (after.status, after.triage_note) == ('pending', record.triage_note)
+        assert _router_l1s(queue, '42') == []
+        assert _dispositions(events) == []
+
+    @pytest.mark.asyncio
+    async def test_an_undecided_ticket_past_its_bound_promotes_ticket_timeout(self, queue, ports):
+        record, hold = self._held(queue)
+        await self._finish(ports, record, hold, after_secs=self.TIMEOUT_SECS + 1)
+        (l1,) = _router_l1s(queue, '42')
+        assert 'ticket_timeout' in l1.detail
+        assert l1.detail.startswith(record.detail)
+
+    @pytest.mark.asyncio
+    async def test_after_one_unreachable_lookup_later_holds_are_not_dispatched(
+        self, queue, ports, curator, monkeypatch,
+    ):
+        first, first_hold = self._held(queue)
+        second, second_hold = self._held(queue)
+
+        async def unreachable(name, arguments, *, timeout=15):
+            curator.calls.append((name, dict(arguments)))
+            raise ConnectionError('fused-memory unreachable')
+
+        sweep = InfoL0Sweep(
+            RouterPorts(queue, None, unreachable, '/srv/project', FILER_RUN_ID),
+            by='orphan-reaper', max_conversions=20,
+        )
+        now = self.FILED_AT + timedelta(seconds=60)
+        assert await sweep.finish_hold(first, first_hold, now=now, timeout_secs=self.TIMEOUT_SECS) is None
+        assert await sweep.finish_hold(second, second_hold, now=now, timeout_secs=self.TIMEOUT_SECS) is None
+        assert len(curator.calls_named('resolve_ticket')) == 1
