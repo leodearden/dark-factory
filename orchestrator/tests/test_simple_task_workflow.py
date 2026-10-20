@@ -16,7 +16,7 @@ from shared.task_text_fingerprint import task_text_fingerprint
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import BlastRadiusResult
+from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -468,6 +468,35 @@ async def test_optimistic_stamp_preserves_narrowed_files(tmp_path: Path):
     # failure above is the clobber, not a missing stamp.
     assert backend.blob['optimistic_path'] == 'simple_task'
     assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_unchanged_lock_set_heals_wiped_metadata_files(tmp_path: Path):
+    """Task 3113: a SIMPLE_TASK whose plan modules equal the held lock set,
+    dispatched with a wiped ``metadata.files``, leaves the plan boundary with
+    the scope restored from plan.files — and task 4031's ``plan_text_fp``
+    mirror survives that heal write."""
+    plan = _good_plan()
+    held = files_to_modules(plan['files'], 2)
+    backend = FakeMetadataBackend()
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+        task_metadata={'files': []},
+        modules=held,
+        metadata_backend=backend,
+    )
+    assert set(f.wf.modules) == set(files_to_modules(plan['files'], f.wf.config.lock_depth))
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert backend.blast_radius_calls == []
+    assert backend.blob['files'] == plan['files']
+    assert backend.blob['plan_text_fp'] == task_text_fingerprint(
+        'Add a docstring to foo.', None,
+    )
 
 
 @pytest.mark.asyncio

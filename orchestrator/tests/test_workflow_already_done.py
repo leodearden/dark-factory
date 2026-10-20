@@ -699,6 +699,32 @@ class TestHandleAlreadyDoneReportAttribution:
         assert kwargs['note'].startswith('architect-reported task already on main')
         assert queue.get_by_task('50') == []
 
+    async def test_stamp_keeps_the_declared_files(self, tmp_path: Path):
+        """The architect stamp runs with no ``_merge_sha``, so the merge diff is
+        uncomputable: the declared scope must survive the stamp rather than be
+        blanked to ``[]`` (task 3113)."""
+        declared = ['helpers/foo.py', 'helpers/bar.py']
+        f = _make(
+            worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+            declared_files=tuple(declared), commit_files=tuple(declared),
+        )
+        update_task = AsyncMock(return_value=True)
+        f.wf.scheduler.update_task = update_task
+        f.wf.scheduler.get_task = AsyncMock(
+            return_value={'id': '50', 'metadata': {'files': list(declared)}},
+        )
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        assert outcome == WorkflowOutcome.DONE
+        cast(AsyncMock, f.wf.scheduler.mark_done).assert_awaited_once()
+        assert update_task.await_args is not None
+        assert update_task.await_args.args[1]['files'] == declared
+        assert f.wf.task['metadata']['files'] == declared
+        assert queue.get_by_task('50') == []
+
     async def test_no_queue_still_holds_and_never_stamps(self, tmp_path: Path):
         """Nothing to file into: the existing non-escalating block still runs,
         so the task is held visibly rather than stamped or dropped."""
