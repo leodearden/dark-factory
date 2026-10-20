@@ -63,13 +63,15 @@ def test_strict_improvement_needs_three_trials_all_strictly_better() -> None:
 def test_summary_costs_and_decisions_and_markdown() -> None:
     inc = [_rec('inc', d, t, [('g1', 'blocking')], [], 0.5, cost=2.0) for d in ('d1', 'd2') for t in (1, 2, 3)]
     arm = [_rec('arm', d, t, [('g1', 'blocking'), ('g2', 'blocking')], ['blocking'], 0.6, cost=4.0) for d in ('d1', 'd2') for t in (1, 2, 3)]
-    arms, decisions = campaign.summarize_campaign(inc + arm, 'inc', BLOCKING_GT, complement_threshold=0.10)
+    arms, decisions = campaign.summarize_campaign(inc + arm, 'inc', BLOCKING_GT)
     by = {a.name: a for a in arms}
     assert by['inc'].cost_per_review == pytest.approx(2.0)
     assert by['inc'].cost_per_blocking_finding == pytest.approx(12.0 / 3)  # g1 is blocking truth only on d1
     assert by['arm'].blocking_precision == pytest.approx(3 / 9, abs=1e-3)
     assert by['arm'].complement_count == 6 and by['arm'].incumbent_matched == 6
     assert by['arm'].complement_share == pytest.approx(1.0)
+    assert by['arm'].blocking_complement_count == 3 and by['arm'].blocking_incumbent_matched == 3
+    assert by['arm'].blocking_complement_share == pytest.approx(1.0)
     assert decisions.complement_pass == {'arm': True}
     assert by['arm'].paired_vs_incumbent[0] == {'trial': 1, 'wins': 2, 'losses': 0, 'ties': 0, 'mean_delta': pytest.approx(0.1)}
     md = campaign.format_markdown(arms, decisions)
@@ -334,6 +336,64 @@ class TestComplementClearsTheBand:
 
         assert campaign.clears_self_complement_band(rows, _band(0.2)) is False
         assert campaign.clears_self_complement_band(rows, _band(0.2), min_trials=2) is True
+
+
+BAND_GT = {'d1': {'b1', 'b2', 'b3', 'b4'}, 'd2': {'b5', 'b6', 'b7', 'b8'}}
+
+
+def _caught(variant: str, trial: int, by_diff: dict[str, set[str]]) -> list[dict]:
+    return [
+        _rec(variant, diff, trial, [(gt, 'blocking') for gt in sorted(ids)], [], 0.5)
+        for diff, ids in by_diff.items()
+    ]
+
+
+def test_complement_pass_is_decided_against_the_incumbents_self_complement_band() -> None:
+    steady = {'d1': {'b1', 'b2'}, 'd2': {'b5', 'b6'}}
+    inc = [*_caught('inc', 1, steady),
+           *_caught('inc', 2, {'d1': {'b1', 'b2', 'b3'}, 'd2': {'b5', 'b6'}}),
+           *_caught('inc', 3, steady)]
+    clears = [r for t in (1, 2, 3) for r in _caught('clears', t, {'d1': {'b1', 'b2', 'b3', 'b4'}, 'd2': {'b5', 'b6', 'b7'}})]
+    noisy = [r for t in (1, 2, 3) for r in _caught('noisy', t, {'d1': {'b1', 'b2', 'b3', 'n1', 'n2'}, 'd2': {'b5', 'b6', 'b7', 'n3'}})]
+
+    arms, decisions = campaign.summarize_campaign(inc + clears + noisy, 'inc', BAND_GT)
+
+    assert decisions.self_complement.blocking_max == pytest.approx(1 / 4)
+    assert [r['blocking_share'] for r in decisions.complement_by_trial['clears']] == [0.75, 0.4, 0.75]
+    assert [r['blocking_share'] for r in decisions.complement_by_trial['noisy']] == [0.5, 0.2, 0.5]
+    assert next(a for a in arms if a.name == 'noisy').complement_share > 0.10
+    assert decisions.complement_pass == {'noisy': False, 'clears': True}
+
+    md = campaign.format_markdown(arms, decisions)
+    lines = md.splitlines()
+    band_lines = [line for line in lines if line.startswith('Incumbent self-complement band')]
+    assert len(band_lines) == 1
+    assert '(6 ordered trial pairs)' in band_lines[0] and 'blocking 0.0%–25.0%' in band_lines[0]
+    clears_line = next(line for line in lines if line.startswith('- `clears` blocking complement'))
+    noisy_line = next(line for line in lines if line.startswith('- `noisy` blocking complement'))
+    assert '**PASS**' in clears_line
+    assert '**FAIL**' in noisy_line and 't2 20.0% (1/5)' in noisy_line
+    assert not any(line.startswith('- `inc` blocking complement') for line in lines)
+    assert 'of incumbent recall' not in md
+
+    decided = campaign.to_json(arms, decisions)['decisions']
+    assert decided['self_complement']['blocking_max'] == pytest.approx(1 / 4)
+    assert len(decided['complement_by_trial']['clears']) == 3
+    assert 'complement_threshold' not in decided
+
+
+def test_an_incumbent_with_one_measured_trial_has_no_band_and_every_candidate_fails() -> None:
+    inc = [_rec('inc', 'd1', 1, [('gx', 'blocking')], [], 0.5)]
+    arm = [_rec('arm', 'd1', 1, [('g1', 'blocking'), ('g2', 'blocking')], [], 0.5)]
+
+    arms, decisions = campaign.summarize_campaign(inc + arm, 'inc', BLOCKING_GT)
+
+    assert decisions.complement_pass == {'arm': False}
+    lines = campaign.format_markdown(arms, decisions).splitlines()
+    band_line = next(line for line in lines if line.startswith('Incumbent self-complement band'))
+    assert 'fewer than two measured trials' in band_line
+    arm_line = next(line for line in lines if line.startswith('- `arm` blocking complement'))
+    assert '**FAIL**' in arm_line and 't1 n/a (2/0)' in arm_line
 
 
 def _scored(variant: str, diff: str, trial: int, *, br: float, f1: float) -> dict:
