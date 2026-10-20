@@ -1107,6 +1107,29 @@ def validate_coding_record(record: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Reading an entry through the candidate promoted to it
+# ---------------------------------------------------------------------------
+
+def promoted_from(codebook: Mapping[str, Any], entry_id: str) -> dict | None:
+    """The candidate promoted to entry *entry_id* as its own entry: linked by
+    ``promoted_to`` and neither attached nor adjudicated onto it."""
+    for candidate in codebook.get("candidates") or []:
+        if (
+            candidate.get("promoted_to") == entry_id
+            and "attached_by" not in candidate
+            and "adjudicated_with" not in candidate
+        ):
+            return candidate
+    return None
+
+
+def entry_field(codebook: Mapping[str, Any], entry: Mapping[str, Any], field: str) -> str | None:
+    """*entry*'s *field* (``cause`` or ``area``): its own when a correction has
+    written it, else that of the candidate it was promoted from."""
+    return entry.get(field) or (promoted_from(codebook, entry["id"]) or {}).get(field)
+
+
+# ---------------------------------------------------------------------------
 # load / dump — deterministic canonical YAML I/O
 # ---------------------------------------------------------------------------
 

@@ -34,15 +34,15 @@ def _attached_by(rule: Rule, run_id: str) -> dict[str, str]:
     return {"method": rule.value, "run_id": run_id}
 
 
-_FIXED_STATUSES = frozenset({"fixed", "retired"})
+FIXED_STATUSES = frozenset({"fixed", "retired"})
 """Entry statuses a re-observation contradicts: fixed by a task (L5), or
 retired because the verifier reported it fixed (``census.py::retire_entry``).
 No rule attaches to such an entry; a cluster re-observing one is surfaced
 (plans/census-incremental-prd.md L5, consumers)."""
 
 
-def _is_fixed(entry: Mapping[str, Any]) -> bool:
-    return entry.get("status") in _FIXED_STATUSES
+def is_fixed(entry: Mapping[str, Any]) -> bool:
+    return entry.get("status") in FIXED_STATUSES
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ def _preferred(records: Sequence[CataloguedTitle], title: str) -> CataloguedTitl
     return next((record for record in records if record.title == title), records[0])
 
 
-def _sessions_of(record: Mapping[str, Any]) -> list[str]:
+def sessions_of(record: Mapping[str, Any]) -> list[str]:
     return [
         sighting["session"]
         for sighting in record.get("sightings") or []
@@ -96,7 +96,7 @@ class Catalogue:
     def of(cls, cb: Mapping[str, Any]) -> Catalogue:
         entries = [entry for entry in cb.get("entries") or [] if isinstance(entry, Mapping)]
         candidates = [candidate for candidate in cb.get("candidates") or [] if isinstance(candidate, Mapping)]
-        fixed = {entry.get("id") for entry in entries if _is_fixed(entry)}
+        fixed = {entry.get("id") for entry in entries if is_fixed(entry)}
 
         def fixed_entry_of(record: Mapping[str, Any], *, is_entry: bool) -> str | None:
             if is_entry:
@@ -116,7 +116,7 @@ class Catalogue:
 
         sessions: dict[str, list[str]] = {}
         for record in (*candidates, *entries):
-            for session in dict.fromkeys(_sessions_of(record)):
+            for session in dict.fromkeys(sessions_of(record)):
                 sessions.setdefault(session, []).append(record["id"])
         return cls(
             candidate_titles=index(candidates, is_entry=False),
@@ -189,7 +189,7 @@ def screen(clusters: Sequence[dict], catalogue: Catalogue) -> Screen:
     surfaced: list[Surfaced] = []
     for cluster in clusters:
         title = cluster["title"]
-        sessions = _sessions_of(cluster)
+        sessions = sessions_of(cluster)
         session = sessions[0] if sessions else None
         if (attach := catalogue.attachable(title)) is not None:
             screened.append(Screened(Rule.TITLE, title, session, attach.matched))
@@ -255,7 +255,7 @@ def _joinable(
 ) -> tuple[dict, census_findings.FindingIdentity] | None:
     """The first entry at *identity*'s location that is not fixed: the one a
     verdict there joins."""
-    return next(((entry, standing) for entry, standing in _entries_at(cb, identity) if not _is_fixed(entry)), None)
+    return next(((entry, standing) for entry, standing in _entries_at(cb, identity) if not is_fixed(entry)), None)
 
 
 @dataclass(frozen=True)
@@ -303,7 +303,7 @@ def attach_by_key(
     candidate.update(census_findings.stamped(candidate, identity))
     candidate.update(disposition="promoted", promoted_to=target["id"], attached_by=attached_by)
     sightings = target.setdefault("sightings", [])
-    carried = set(_sessions_of(target))
+    carried = set(sessions_of(target))
     for sighting in candidate.get("sightings") or []:
         if sighting.get("session") in carried:
             continue
@@ -546,7 +546,7 @@ def place(
     if joinable is not None:
         entry, standing = joinable
         return Placement(standing, entry["id"], None, None)
-    fixed_entry_ids = tuple(entry["id"] for entry, _ in _entries_at(cb, identity) if _is_fixed(entry))
+    fixed_entry_ids = tuple(entry["id"] for entry, _ in _entries_at(cb, identity) if is_fixed(entry))
     adoption = inputs.match(identity)
     return Placement(
         identity=identity if adoption is None else adoption.identity,

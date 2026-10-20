@@ -1799,20 +1799,14 @@ _RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
 retired confusion needs no ticket."""
 
 
-def _entry_text(cb: dict, entry: Mapping[str, Any], field: str) -> str | None:
-    """*entry*'s *field* (``cause`` or ``area``): its own when a correction has
-    written it, else that of the candidate it was promoted from."""
-    return entry.get(field) or (_promoted_from(cb, entry["id"]) or {}).get(field)
-
-
 def _entry_cluster(cb: dict, entry: dict) -> dict:
-    """A fileable cluster rebuilt from codebook *entry*, by :func:`_entry_text`;
+    """A fileable cluster rebuilt from codebook *entry*, by ``codebook.entry_field``;
     its severity and finding identity are the entry's own."""
     sightings = list(entry.get("sightings") or [])
     cluster = _cluster_record(
         title=entry["title"],
-        cause=_entry_text(cb, entry, "cause"),
-        area=_entry_text(cb, entry, "area"),
+        cause=codebook.entry_field(cb, entry, "cause"),
+        area=codebook.entry_field(cb, entry, "area"),
         origin_phase=entry["origin_phase"],
         manifested_phase=entry["manifested_phase"],
         evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
@@ -1983,15 +1977,6 @@ def _reverify(
     reported_probes = result.get("headroom_probes") if isinstance(result, Mapping) else None
     probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
     return disposition.reverifications(result, offered=offered, deferred=deferred)
-
-
-def _promoted_from(cb: dict, entry_id: str) -> dict | None:
-    """The candidate ``promote_candidate`` promoted to entry *entry_id*, found
-    by its ``promoted_to`` link."""
-    for candidate in cb.get("candidates") or []:
-        if candidate.get("promoted_to") == entry_id:
-            return candidate
-    return None
 
 
 def _with_finding(cluster: dict, area_map: finding_area.AreaMap) -> dict:
@@ -3395,7 +3380,7 @@ def run_census(
                 refuted=refuted,
                 sighted=sighted,
                 run_id=run_id,
-                cause_of=functools.partial(_entry_text, updated_codebook, field="cause"),
+                cause_of=functools.partial(codebook.entry_field, updated_codebook, field="cause"),
                 disposition_of=lambda entry: str(disposition.disposition_of(entry, standings)),
             )
         ],
