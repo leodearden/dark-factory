@@ -183,13 +183,20 @@ class TestReaperFinishesHolds:
         assert [e for e in _queue(harness).get_pending() if e.level == 1] == []
 
 
+def _seed_storm(harness: Harness, first_task: int, n: int) -> list[Escalation]:
+    """*n* aged starvation-watchdog notes; durable writes are not under test here."""
+    with patch('os.fsync'):
+        return [
+            _submit_aged(harness, str(first_task + i), agent_role=STARVATION, category='infra_issue')
+            for i in range(n)
+        ]
+
+
 @pytest.mark.asyncio
 class TestReaperRoutesInfoOrphans:
     async def test_a_mechanical_storm_closes_status_info_under_one_aggregate(self, harness: Harness):
-        storm = [
-            _submit_aged(harness, str(10_000 + i), agent_role=STARVATION, category='infra_issue')
-            for i in range(489)
-        ]
+        harness.event_store = None  # 489 durable event commits cost seconds and are not under test
+        storm = _seed_storm(harness, 10_000, 489)
 
         await harness._reap_orphan_l0_escalations()
 
@@ -199,10 +206,7 @@ class TestReaperRoutesInfoOrphans:
         assert _l1s(harness, agent_role='harness-orphan-reaper') == []
         assert _curator(harness).calls == []
 
-        later = [
-            _submit_aged(harness, str(20_000 + i), agent_role=STARVATION, category='infra_issue')
-            for i in range(3)
-        ]
+        later = _seed_storm(harness, 20_000, 3)
         await harness._reap_orphan_l0_escalations()
 
         (still,) = _aggregates(harness, status_info_sentinel(STARVATION))

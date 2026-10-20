@@ -23,6 +23,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
+from escalation.disposition import ExitKind
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
 from shared.asyncio_tasks import abandon_task
@@ -93,6 +94,7 @@ from orchestrator.deterministic_runner import (
     DeterministicRunner,
     build_milestone_gate_escalation_fields,
 )
+from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, read_hold, router_owns
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
 from orchestrator.flake_ledger import ledger_db_path
@@ -14151,6 +14153,23 @@ class Harness:
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
+    def _router_ports(self, queue: EscalationQueue) -> RouterPorts:
+        """The I/O the info-L0 router may touch from the harness."""
+        return RouterPorts(
+            queue=queue,
+            event_store=getattr(self, 'event_store', None),
+            dispatch_tool=self.scheduler.dispatch_tool,
+            project_root=str(self.config.project_root),
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+
+    def _router_eligible(self, esc: Escalation) -> bool:
+        """True when the info-L0 router, not the eval-lane rule, owns *esc*."""
+        return (
+            router_owns(esc, enabled=self.config.info_l0_router_enabled)
+            and eval_lane_provenance(esc.task_id, esc.worktree) is None
+        )
+
     #: "not read yet", distinguishable from a genuine ``get_task`` -> ``None``
     #: (no such row).  Scoped to :meth:`_reap_orphan_l0_escalations`'s per-record
     #: memo, whose whole point is that ONE record costs at most ONE task read.
@@ -14185,6 +14204,10 @@ class Harness:
         timeout = self.config.orphan_l0_timeout_secs
         now = datetime.now(UTC)
         promoted = 0
+        router = InfoL0Sweep(
+            self._router_ports(self._escalation_queue), by='orphan-reaper',
+            max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+        )
 
         for esc in self._escalation_queue.get_pending():
             if esc.level != 0:
@@ -14211,6 +14234,18 @@ class Harness:
                 logger.info(
                     'Orphan L0 reaper: dismissed eval-lane orphan for task_id=%s (%s)',
                     esc.task_id, eval_lane_reason,
+                )
+                continue
+
+            # A router hold (PRD D9) is owned by this reaper alone, so it is
+            # finished ahead of the liveness arm: a live newer incarnation
+            # never consumes it.
+            routed_here = self._router_eligible(esc)
+            hold = read_hold(esc) if routed_here else None
+            if hold is not None:
+                await router.finish_hold(
+                    esc, hold, now=now,
+                    timeout_secs=self.config.info_l0_router_ticket_timeout_secs,
                 )
                 continue
 
@@ -14281,6 +14316,13 @@ class Harness:
                     f'filing incarnation {esc.filing_claimant_run_id} is gone, '
                     f'current claimant is {live_run_id}'
                 )
+
+            if routed_here:
+                fetched = None if task is self._UNFETCHED else cast('dict | None', task)
+                await router.route(
+                    esc, exit_kind=ExitKind.ORPHAN, task_status=(fetched or {}).get('status'),
+                )
+                continue
 
             # Defense-in-depth: never double-escalate a task a human is
             # already looking at.  B1 (commit 1a1eca9a67) stopped the main
@@ -14438,6 +14480,7 @@ class Harness:
             )
             promoted += 1
 
+        router.close()
         if promoted:
             logger.warning(
                 'Orphan L0 reaper: promoted %d escalation(s) to L1', promoted,
