@@ -3165,25 +3165,23 @@ _MUTATING_GIT_SUBCOMMANDS = frozenset({
 })
 
 
+_FILE_WRITING_GIT_FLAGS: dict[str, tuple[str, ...]] = {
+    'diff': ('--output',),
+    'log': ('--output',),
+    'show': ('--output',),
+}
+
+
 def _rendered_argv(kwargs: dict) -> list[str]:
-    """The CLI argv the captured investigation call becomes.
-
-    A call that passes no ``permission_mode`` gets ``invoke_agent``'s own
-    default, read off its signature, so the argv is the one the CLI receives.
-    """
-    import inspect
-
+    """The CLI argv the captured investigation call becomes."""
     from shared.cli_invoke import build_claude_argv
 
-    from orchestrator.agents.invoke import invoke_agent
-
-    default_mode = inspect.signature(invoke_agent).parameters['permission_mode'].default
     argv, temp_files = build_claude_argv(
         model=kwargs['model'],
         max_budget_usd=kwargs['max_budget_usd'],
         system_prompt=kwargs['system_prompt'],
         max_turns=kwargs['max_turns'],
-        permission_mode=kwargs.get('permission_mode', default_mode),
+        permission_mode=kwargs['permission_mode'],
         allowed_tools=kwargs['allowed_tools'],
         disallowed_tools=kwargs['disallowed_tools'],
         mcp_config=None,
@@ -3195,6 +3193,28 @@ def _rendered_argv(kwargs: dict) -> list[str]:
     for path in temp_files:
         Path(path).unlink(missing_ok=True)
     return argv
+
+
+def _bash_rule_matches(rule: str, command: str) -> bool:
+    """Whether the ``Bash(...)`` permission *rule* matches *command*: a trailing
+    ``:*`` makes a prefix rule, and any other ``*`` is a wildcard."""
+    match = re.fullmatch(r'Bash\((.+)\)', rule)
+    if match is None:
+        return False
+    content = match.group(1)
+    if content.endswith(':*') and '*' not in content[:-2]:
+        prefix = content[:-2]
+        return command == prefix or command.startswith(f'{prefix} ')
+    pattern = '.*'.join(re.escape(part) for part in content.split('*'))
+    return re.fullmatch(pattern, command) is not None
+
+
+def _allowed_git_subcommands(allowed_tools: list[str]) -> set[str]:
+    return {
+        match.group(1)
+        for entry in allowed_tools
+        if (match := re.fullmatch(r'Bash\(git (\S+):\*\)', entry))
+    }
 
 
 def _flag_values(argv: list[str], flag: str) -> list[str]:
@@ -3236,48 +3256,74 @@ class TestInvestigationPermissionEnvelope:
     async def test_no_git_subcommand_the_envelope_allows_can_mutate(self, tmp_path):
         kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
 
-        allowed_subs = {
-            match.group(1)
-            for entry in kwargs['allowed_tools']
-            if (match := re.fullmatch(r'Bash\(git (\S+):\*\)', entry))
-        }
+        allowed_subs = _allowed_git_subcommands(kwargs['allowed_tools'])
         assert allowed_subs, kwargs['allowed_tools']
         mutating = sorted(allowed_subs & _MUTATING_GIT_SUBCOMMANDS)
         assert not mutating, f'the envelope grants mutation-capable git subcommands: {mutating}'
 
+    @pytest.mark.asyncio
+    async def test_a_file_writing_flag_of_an_allowed_git_subcommand_is_denied_anywhere(
+        self, tmp_path,
+    ):
+        """A read-only subcommand still writes any reachable path through
+        ``--output``, and a prefix allow rule admits the flag in any position."""
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        writes = [
+            f'git {sub} --stat {flag}=out.txt'
+            for sub in sorted(_allowed_git_subcommands(kwargs['allowed_tools']))
+            for flag in _FILE_WRITING_GIT_FLAGS.get(sub, ())
+        ]
+        assert writes, 'the envelope grants no subcommand with a known file-writing flag'
+        undenied = [
+            command for command in writes
+            if not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
+        ]
+        assert not undenied, f'file-writing git forms the envelope does not deny: {undenied}'
+
 
 _FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)
+_DATA_FENCE_LANGUAGES = frozenset({'json', 'yaml', 'yml', 'toml'})
+_SHELL_COMMENT = re.compile(r'(^|\s)#.*$')
 _INLINE_SPAN = re.compile(r'`([^`\n]+)`')
-_SHELL_COMPOSITION = re.compile(r'\$\(|`|&&|\|\||[;|]')
+_LEADING_NAME = re.compile(r'[A-Za-z][\w-]*')
+_PLACEHOLDER = re.compile(r'<[^<>\s]+>')
+_SHELL_COMPOSITION = re.compile(r'\$\(|`|&&|\|\||[;|<>]')
 
 
-def _instructed_commands(skill: str) -> list[str]:
-    """Every shell command *skill* tells the investigator to run."""
-    commands = [
-        line.strip()
-        for lang, body in _FENCE.findall(skill) if lang == 'bash'
+def _instructed_calls(skill: str) -> list[str]:
+    """Every tool call and shell command *skill* tells the investigator to run.
+
+    Every fence is read whatever its language tag, except one tagged with a
+    data format, which shows output rather than instructing a call.
+    """
+    calls = [
+        _SHELL_COMMENT.sub('', line).strip()
+        for lang, body in _FENCE.findall(skill) if lang not in _DATA_FENCE_LANGUAGES
         for line in body.splitlines()
-        if line.strip() and not line.strip().startswith('#')
     ]
     prose = _FENCE.sub('', skill)
-    commands += [span for span in _INLINE_SPAN.findall(prose) if span.startswith('git ')]
-    return commands
+    calls += [span for span in _INLINE_SPAN.findall(prose) if span.startswith('git ')]
+    return [call for call in calls if call]
 
 
-def _admitted(command: str, allowed_tools: list[str]) -> bool:
-    """Whether a ``Bash(<prefix>:*)`` rule admits *command* as one simple command.
+def _admitted(call: str, kwargs: dict) -> bool:
+    """Whether the envelope admits *call*: a tool call by its tool's name, a
+    shell command by an allow rule that no deny rule overrides.
 
-    A prefix rule never admits a composed command as a whole, so substitution
-    and operators leave it unadmitted.
+    A ``Bash`` rule never admits a composed command as a whole, so
+    substitution, operators and redirection leave it unadmitted.  A
+    ``<placeholder>`` is the skill's notation for a value, not a redirection.
     """
+    name = _LEADING_NAME.match(call)
+    if name is not None and name.group() in kwargs['allowed_tools']:
+        return True
+    command = _PLACEHOLDER.sub('VALUE', call)
     if _SHELL_COMPOSITION.search(command):
         return False
-    prefixes = [
-        match.group(1)
-        for entry in allowed_tools
-        if (match := re.fullmatch(r'Bash\((.+):\*\)', entry))
-    ]
-    return any(command == p or command.startswith(f'{p} ') for p in prefixes)
+    return any(
+        _bash_rule_matches(rule, command) for rule in kwargs['allowed_tools']
+    ) and not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
 
 
 class TestSkillCommandsFitTheEnvelope:
@@ -3285,14 +3331,16 @@ class TestSkillCommandsFitTheEnvelope:
     prompt, which silently degrades the investigation rather than failing it."""
 
     @pytest.mark.asyncio
-    async def test_every_git_command_the_skill_instructs_is_admitted_by_the_envelope(
+    async def test_every_call_the_skill_instructs_is_admitted_by_the_envelope(
         self, tmp_path,
     ):
         kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
 
-        commands = _instructed_commands(kwargs['system_prompt'])
-        assert commands, 'no instructed command extracted from the unblock-auto skill'
-        unadmitted = [c for c in commands if not _admitted(c, kwargs['allowed_tools'])]
+        calls = _instructed_calls(kwargs['system_prompt'])
+        assert any(call.startswith('git ') for call in calls), (
+            f'no git command extracted from the unblock-auto skill: {calls}'
+        )
+        unadmitted = [call for call in calls if not _admitted(call, kwargs)]
         assert not unadmitted, (
-            f'the unblock-auto skill instructs commands its envelope denies: {unadmitted}'
+            f'the unblock-auto skill instructs calls its envelope denies: {unadmitted}'
         )

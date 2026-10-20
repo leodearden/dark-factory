@@ -258,7 +258,10 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
 # admits. Every entry is therefore a grant, and each must be read-only.
 # Bash(pytest:*) and Bash(cargo:*) are omitted: both write build artefacts or
 # fetch from the network. Git is granted per read-only subcommand, never as a
-# wildcard and never `git branch`, which creates and deletes refs.
+# wildcard and never `git branch`, which creates and deletes refs. A prefix
+# rule admits any flag after its subcommand, so the one file-writing flag of
+# diff, log and show, --output, is denied below wherever it appears. Residual:
+# `git status` may refresh the index's stat cache, which changes no content.
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
@@ -288,6 +291,9 @@ _DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    'Bash(git diff *--output*)',
+    'Bash(git log *--output*)',
+    'Bash(git show *--output*)',
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
