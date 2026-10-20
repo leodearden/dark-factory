@@ -21,7 +21,7 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.testing import make_gate_mock
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness
+from orchestrator.harness import _WATCHER_MAX_CAP_RETRIES, Harness
 
 _INVOKE_PATCH = 'orchestrator.harness.invoke_agent'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
@@ -87,4 +87,4 @@ class TestWatcherRotationCapPolicy:
             await h._run_watcher_rotation()
 
         assert ei.value.retries == invoke_agent.await_count
-        assert invoke_agent.await_count < 100
+        assert ei.value.retries == _WATCHER_MAX_CAP_RETRIES

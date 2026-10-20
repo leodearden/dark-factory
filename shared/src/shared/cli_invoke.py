@@ -2447,8 +2447,9 @@ async def invoke_with_cap_retry(
     *resume_on_cap_hit*, when ``True`` (the default), applies the two-part
     resume rule above.  ``False`` makes every cap-hit re-dispatch fresh, for
     a stateless caller whose retry would preserve nothing worth keeping.  It
-    governs only the loop's own cap-hit re-arm: a caller-preset
-    ``resume_session_id`` (crash recovery) is unaffected.
+    governs only the loop's own cap-hit re-arm: the first dispatch still
+    honours a preset ``resume_session_id`` (crash recovery); every cap-hit
+    re-dispatch is fresh.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").

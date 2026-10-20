@@ -67,6 +67,20 @@ def _gate(caps: int) -> MagicMock:
 
 @pytest.mark.asyncio
 class TestResumeOnCapHitOptOut:
+    async def test_first_dispatch_honours_preset_resume_then_cap_hit_retry_is_fresh(self):
+        inv = AsyncMock(side_effect=[_capped('sess-1'), _ok()])
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            await invoke_with_cap_retry(
+                _gate(1), 'lbl-preset', invoke_fn=inv,
+                resume_on_cap_hit=False, prompt=_ORIGINAL,
+                resume_session_id='crashed-sess',
+            )
+
+        first, retry = (c.kwargs for c in inv.call_args_list)
+        assert first['resume_session_id'] == 'crashed-sess'
+        assert not retry.get('resume_session_id')
+        assert retry['prompt'] == _ORIGINAL
+
     async def test_opt_out_retries_fresh_without_config_dir(self):
         inv = AsyncMock(side_effect=[_capped('sess-1'), _ok()])
         with patch(_SLEEP_PATCH, new_callable=AsyncMock):
