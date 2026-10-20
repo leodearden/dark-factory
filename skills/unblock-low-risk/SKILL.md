@@ -221,29 +221,44 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      terminal state:
 
      ```
-     deadline = now() + 1200 s          # 20-minute hard ceiling
+     deadline = now() + 1200 s          # 20-minute polling ceiling (resume mode: 3 h — see "Resuming a handed-off merge")
      # merge-state-vocab:begin partition=LIVE_STATES
      #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
      #   scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
      #   and this set goes red until it matches.
      while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
      # merge-state-vocab:end
-         wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
+         wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)   # resume mode: min=60, max=300
          sleep(wait)   # unattended: realise per skills/merge-queue/SKILL.md#waiting-between-polls, its FOREGROUND form only -- a bare sleep 60 is blocked by the harness
          result = mcp__escalation__merge_status(request_id)
      # merge-state-vocab:begin partition=LIVE_STATES
      #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES (second copy).
      if state ∈ {queued, verifying, gate, finalizing}:   # deadline exceeded, entry still live
      # merge-state-vocab:end
-         mcp__escalation__merge_cancel(request_id)
-         ABORT   # leave escalation pending; 'one attempt, abort on doubt'
+         if state == queued:      # never picked up by the merge worker — cancel-before-pickup
+             mcp__escalation__merge_cancel(request_id)
+             ABORT
+         else:                    # picked up: a verify is running — NEVER cancel
+             HAND OFF             # return outcome "handed_off" with request_id (see Return value)
      ```
 
      Use `eta_seconds` from each `merge_status` response as the cadence hint; clamp to [15 s,
-     60 s]. Cap total polling at 20 minutes: if the entry is still live at the deadline, call
-     `merge_cancel(request_id)` and ABORT — leaving the escalation pending for a human,
-     consistent with the skill's bounded-operation ethos and 'one attempt, abort on doubt'
-     principle. Proceed to step 9 with the final `result.state` if the deadline is not reached.
+     60 s]. The 20-minute ceiling bounds **this sub-agent's lifetime, not the merge**. At the
+     deadline the entry's state decides:
+     - **Still `queued`** — no worker has started it, so cancelling costs nothing: call
+       `merge_cancel(request_id)` and ABORT, leaving the escalation pending for a human.
+     - **Any other live state** (`verifying`, `gate`, `finalizing`, or any live state added
+       later) — the merge worker picked it up and a verify is running. **Never `merge_cancel`
+       it**: on a pending waiter `escalation/src/escalation/server.py::merge_cancel` retires the
+       entry and reaps its in-flight worktree, discarding a verify that may be green. A merge
+       verify runs about 50–60 min (`plans/verify-admission-task-slots-gate.md`, M2), so a
+       picked-up entry at 20 minutes is the normal case, not a doubt signal. Instead **HAND
+       OFF**: leave the task status and the escalation untouched, call no `merge_cancel`, and
+       return `outcome: "handed_off"` with the `request_id` and the observed state in `reason`.
+       The escalation-watcher resumes it through [resume mode](#resuming-a-handed-off-merge-resume-mode).
+       Handing off is **not** an ABORT, so the cancel rule in "Aborting" does not apply to it.
+
+     Proceed to step 9 with the final `result.state` if the deadline is not reached.
 
 9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
    overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
@@ -348,7 +363,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        which exit applies, never whether a write is permitted.
      - **If it has not resolved yet, both available exits are non-failures.** Either keep polling
        the **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same
-       clamped cadence) for whatever remains of step 8's 20-minute deadline, re-running the
+       clamped cadence) for whatever remains of step 8's polling deadline, re-running the
        ancestry disposition on each tick; or, once that deadline is spent, **ABORT with an
        explicitly non-failure disposition** — report the branch as *in flight on a successor*,
        naming the `superseded_by` value, and leave the escalation pending for a human. In neither
@@ -470,7 +485,7 @@ eyeballed listing.
     task/<task_id>` is safe once `git cherry main task/<task_id>` is non-empty and every line
     starts with `-`; leaving the ref in place is also fine.)
   - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you
-    cannot read — **never write**. Keep polling to step 8's 20-minute ceiling, then take the
+    cannot read — **never write**. Keep polling to step 8's polling deadline, then take the
     **landed-but-not-credited** report, citing the tip merge sha and the current status.
 
   In **neither** case `merge_cancel`, and in neither case report not-landed. This is
