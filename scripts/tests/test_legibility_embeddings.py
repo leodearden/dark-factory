@@ -318,6 +318,32 @@ class TestVectorsFor:
             )
         assert excinfo.value.requests_made == 1
 
+    def test_a_cached_vector_of_another_dimension_raises_naming_the_cache_and_writes_nothing(self, tmp_path):
+        embeddings.vectors_for(
+            _texts(('r1', 'alpha')), embedder=_embedder(tmp_path, _RecordingEmbed()), model=_MODEL,
+        )
+        before = (tmp_path / 'embeddings.sqlite').read_bytes()
+        wider = _RecordingEmbed(reply=lambda texts: [[1.0, 2.0, 3.0, 4.0]] * len(texts))
+
+        with pytest.raises(embeddings.EmbeddingFailed, match=re.escape(str(tmp_path / 'embeddings.sqlite'))) as excinfo:
+            embeddings.vectors_for(
+                _texts(('r1', 'alpha'), ('r2', 'beta')), embedder=_embedder(tmp_path, wider), model=_MODEL,
+            )
+        assert excinfo.value.requests_made == 1
+        assert (tmp_path / 'embeddings.sqlite').read_bytes() == before
+
+    def test_batches_of_different_dimensions_raise(self, tmp_path):
+        widths = iter([2, 3])
+        fake = _RecordingEmbed(reply=lambda texts: [[1.0] * next(widths)] * len(texts))
+
+        with pytest.raises(embeddings.EmbeddingFailed) as excinfo:
+            embeddings.vectors_for(
+                _texts(('r1', 'alpha'), ('r2', 'beta')),
+                embedder=_embedder(tmp_path, fake), model=_MODEL, batch_size=1,
+            )
+        assert excinfo.value.requests_made == 2
+        assert not (tmp_path / 'embeddings.sqlite').exists()
+
     def test_non_sqlite_cache_file_raises_naming_the_path(self, tmp_path):
         path = tmp_path / 'embeddings.sqlite'
         path.write_bytes(b'this is not a sqlite database, not even close' * 20)

@@ -268,9 +268,10 @@ def vectors_for(
     texts: Sequence[Text], *, embedder: Embedder, model: str, batch_size: int = REQUEST_BATCH,
 ) -> Embedded:
     """A vector per ``Text.key``: cached ones read, the rest embedded in
-    batches of *batch_size* with no retry. The cache is written only when
-    every batch succeeded, and then holds exactly this call's cacheable
-    texts. Raises EmbeddingFailed or VectorCacheError, never a partial result.
+    batches of *batch_size* with no retry. Every vector has one dimension.
+    The cache is written only when every batch succeeded, and then holds
+    exactly this call's cacheable texts. Raises EmbeddingFailed or
+    VectorCacheError, never a partial result.
     """
     cached_rows = _read_cache(embedder.cache_path, model)
     vectors: dict[str, Vector] = {}
@@ -283,6 +284,13 @@ def vectors_for(
             vectors[text.key] = hit
     fresh, requests = _embed_misses(misses, embedder=embedder, model=model, batch_size=batch_size)
     vectors.update(fresh)
+    dimensions = sorted({len(vector) for vector in vectors.values()})
+    if len(dimensions) > 1:
+        raise EmbeddingFailed(
+            f'vectors of {", ".join(map(str, dimensions))} dimensions under {model} from the embedder '
+            f'and the vector cache {embedder.cache_path}; one index needs one dimension',
+            requests_made=requests,
+        )
     keep = frozenset(
         (text.record_id, _sha256(text.text), model) for text in texts if text.record_id is not None
     )

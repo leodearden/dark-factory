@@ -2712,34 +2712,37 @@ def test_render_report_flagless_output_is_byte_identical_golden():
 # step-17: RED — run_census() DEFER path (headroom banner)
 # ---------------------------------------------------------------------------
 
-_FRESH_AXES = itertools.count(16)
-"""One-hot axes no test chooses: a test's own vectors use axes below 16."""
+_EMBED_WIDTH = 256
+"""Every fake vector's dimension, as one embedding model's is."""
+_FRESH_TRIPLES = itertools.combinations(range(16, _EMBED_WIDTH), 3)
+"""The axes of each fresh vector. A test's own vectors use the axes below 16,
+so a fresh vector is orthogonal to them, and two distinct triples share at most
+two axes, so two fresh vectors are at cosine 2/3 or less: below every threshold."""
 
 
-def _padded(vectors: list[list[float]]) -> list[list[float]]:
-    """*vectors* padded with zeros to one length, as one embeddings response is."""
-    width = max(len(vector) for vector in vectors)
-    return [vector + [0.0] * (width - len(vector)) for vector in vectors]
+def _widened(vector: list[float]) -> list[float]:
+    return [*vector, *[0.0] * (_EMBED_WIDTH - len(vector))]
 
 
-def _fresh_axis() -> list[float]:
-    return [*[0.0] * next(_FRESH_AXES), 1.0]
+def _fresh_vector() -> list[float]:
+    axes = set(next(_FRESH_TRIPLES))
+    return [1.0 if axis in axes else 0.0 for axis in range(_EMBED_WIDTH)]
 
 
 def _nothing_similar_embed(texts, *, model):
     """An embed_fn under which no two texts are ever similar, even across
-    runs sharing one vector cache: each text it is handed gets a fresh axis."""
-    return _padded([_fresh_axis() for _ in texts])
+    runs sharing one vector cache: each text it is handed gets a fresh vector."""
+    return [_fresh_vector() for _ in texts]
 
 
 def _keyed_embed(chosen: dict[str, list[float]]):
     """An embed_fn giving each text in *chosen* the vector the test chose and
-    every other text a fresh axis; records each call's texts in ``.calls``."""
+    every other text a fresh vector; records each call's texts in ``.calls``."""
     calls: list[list[str]] = []
 
     def embed(texts, *, model):
         calls.append(list(texts))
-        return _padded([list(chosen[text]) if text in chosen else _fresh_axis() for text in texts])
+        return [_widened(list(chosen[text])) if text in chosen else _fresh_vector() for text in texts]
 
     embed.calls = calls
     return embed
