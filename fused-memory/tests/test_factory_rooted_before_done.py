@@ -206,9 +206,11 @@ class TestGuardAndModelAgree:
 class TestSubmitTaskFactoryRootedPredicate:
     """The user-observable signal: a factory-owned predicate files against a
     project that does not carry the script, resolved by the DEFAULT resolver
-    to the dark-factory checkout these tests run from."""
+    to the dark-factory checkout these tests run from. The script is the
+    resolver's own validity marker, so it exists wherever that resolver
+    succeeds."""
 
-    FACTORY_SCRIPT = 'scripts/check_write_triage_enabled.py'
+    FACTORY_SCRIPT = 'scripts/watcher-rearm.sh'
 
     @pytest.fixture
     def git_project_root(self, project_root: Path) -> Path:
@@ -230,7 +232,7 @@ class TestSubmitTaskFactoryRootedPredicate:
             'submit_task',
             {
                 'project_root': str(project_root),
-                'title': 'Write triage stays enabled',
+                'title': 'A factory-owned predicate',
                 'description': 'A factory-owned predicate filed against another project.',
                 'task_kind': 'deterministic',
                 'metadata': {'before_done': before_done},
