@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.agents.briefing import VerifyAttemptContext
+from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -301,13 +301,6 @@ class TestPerTaskVerifyRole:
         )
 
 
-async def _invoke_building_twice(role, build_prompt, cwd, output_schema=None):
-    """An _invoke double standing in for a re-dispatch after a cap wait."""
-    await build_prompt()
-    await build_prompt()
-    return AgentResult(success=True, output='')
-
-
 def _test_failure_a() -> VerifyResult:
     return VerifyResult(
         passed=False,
@@ -340,13 +333,23 @@ class TestDebuggerReceivesAttemptContext:
         debugger_prompt = AsyncMock(return_value='debug')
         monkeypatch.setattr(workflow.briefing, 'build_debugger_prompt', debugger_prompt)
         monkeypatch.setattr(workflow, '_inter_iteration_rebase', AsyncMock(return_value=None))
-        monkeypatch.setattr(workflow, '_invoke', _invoke_building_twice)
+        prompt_builders: list = []
+
+        async def record_dispatch(role, build_prompt, cwd, output_schema=None):
+            prompt_builders.append(build_prompt)
+            return AgentResult(success=True, output='')
+
+        monkeypatch.setattr(workflow, '_invoke', record_dispatch)
         monkeypatch.setattr(workflow.config, 'escalate_preexisting_main_break', False)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', AsyncMock(side_effect=results),
         )
 
         outcome = await _run_verify_loop(workflow)
+        # Build each prompt only now, after the loop has moved past every attempt:
+        # a builder that read the loop's live attempt state would see the last one.
+        for build_prompt in prompt_builders:
+            await build_prompt()
         contexts = [call.kwargs['attempt_context'] for call in debugger_prompt.await_args_list]
         return outcome, contexts
 
@@ -361,10 +364,12 @@ class TestDebuggerReceivesAttemptContext:
         ctx1 = VerifyAttemptContext(attempt=1, max_attempts=5, prior_causes=())
         ctx2 = VerifyAttemptContext(
             attempt=2, max_attempts=5,
-            prior_causes=('test_failure: FAILED tests/test_x.py::test_a',),
+            prior_causes=(
+                PriorAttemptCause('test_failure', 'FAILED tests/test_x.py::test_a'),
+            ),
         )
         assert outcome == WorkflowOutcome.DONE
-        assert contexts == [ctx1, ctx1, ctx2, ctx2]
+        assert contexts == [ctx1, ctx2]
 
     async def test_prior_without_cause_hint_falls_back_to_summary(
         self, config, git_ops, task_assignment, monkeypatch,
@@ -377,5 +382,7 @@ class TestDebuggerReceivesAttemptContext:
             ],
         )
 
-        third_dispatch = contexts[4]
-        assert third_dispatch.prior_causes[1] == 'lint_failure: Failures: lint issues'
+        third_dispatch = contexts[2]
+        assert third_dispatch.prior_causes[1] == PriorAttemptCause(
+            'lint_failure', 'Failures: lint issues',
+        )

@@ -21,6 +21,7 @@ def _result(**overrides) -> VerifyResult:
         'lint_output': '',
         'type_output': '',
         'summary': 'Failures: tests failed',
+        'test_leg_failed': True,
     }
     fields.update(overrides)
     return VerifyResult(**fields)
@@ -82,6 +83,36 @@ class TestNoMarkerOutputIsEmittedLabelled:
         assert '## Type Check Output' in report
         assert _NO_MARKER_NOTE in _section(report, '## Type Check Output')
         assert '## Type Errors' not in report
+
+    def test_green_test_leg_output_is_not_shown_beside_a_lint_failure(self):
+        report = _result(
+            test_output='....\n19639 passed in 2351s\n',
+            lint_output='x.py:1:1: F401 unused import',
+            test_leg_failed=False,
+            category='lint_failure',
+            summary='Failures: lint issues',
+        ).failure_report()
+
+        assert '## Lint Issues' in report
+        assert '## Test Output' not in report
+        assert _NO_MARKER_NOTE not in report
+
+    def test_green_test_leg_output_is_not_shown_beside_a_type_failure(self):
+        report = _result(
+            test_output='....\n19639 passed in 2351s\n',
+            type_output='error: type mismatch',
+            test_leg_failed=False,
+            category='type_error',
+            summary='Failures: type errors',
+        ).failure_report()
+
+        assert '## Type Errors' in report
+        assert '## Test Output' not in report
+
+    def test_a_result_that_never_recorded_its_test_leg_shows_no_marker_less_test_output(self):
+        result = _result(test_output='....\n19639 passed in 2351s\n', test_leg_failed=False)
+
+        assert result.failure_report() == result.summary
 
     def test_type_output_with_error_keeps_the_type_errors_heading(self):
         report = _result(type_output='error: type mismatch').failure_report()
@@ -189,3 +220,14 @@ class TestTruncationIsLabelledAndAnchored:
         assert section.startswith('\n\n```\n')
         assert excerpt_lines, f'no truncation line in {heading}'
         assert excerpt_lines[0] > last_fence
+
+
+class TestAggregateKeepsTheTestLegVerdict:
+    def test_a_failed_test_leg_in_any_module_marks_the_aggregate(self):
+        from orchestrator.verify import _aggregate_results
+
+        green = _result(test_output='5 passed', test_leg_failed=False, lint_output='x: F401')
+        red = _result(test_output='boom\n1 error', test_leg_failed=True)
+
+        assert _aggregate_results([green, red]).test_leg_failed is True
+        assert _aggregate_results([green, green]).test_leg_failed is False

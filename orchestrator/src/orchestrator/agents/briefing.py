@@ -268,17 +268,30 @@ def _plan_scope(plan: dict, task_id: str | None) -> BriefingScope:
 
 
 @dataclass(frozen=True)
+class PriorAttemptCause:
+    """Why one earlier verify attempt failed: its failure category and cause text."""
+
+    category: str
+    cause: str
+
+
+@dataclass(frozen=True)
 class VerifyAttemptContext:
     """Where a debugger dispatch sits in its verify/debug loop.
 
     ``attempt`` is the 1-based number of the verify attempt that just failed.
-    ``prior_causes`` holds one display line per earlier failed attempt in the
-    same loop, oldest first.
+    ``prior_causes`` holds one entry per earlier failed attempt in the same
+    loop, oldest first.
     """
 
     attempt: int
     max_attempts: int
-    prior_causes: tuple[str, ...] = ()
+    prior_causes: tuple[PriorAttemptCause, ...] = ()
+
+
+def _format_prior_cause(attempt: int, prior: PriorAttemptCause) -> str:
+    cause = ' '.join(prior.cause.split())
+    return f'- attempt {attempt}: {prior.category or "uncategorized"}: {cause}'
 
 
 def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
@@ -294,7 +307,7 @@ def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
             'followed each one:'
         )
         lines.extend(
-            f'- attempt {i}: {cause}' for i, cause in enumerate(ctx.prior_causes, start=1)
+            _format_prior_cause(i, prior) for i, prior in enumerate(ctx.prior_causes, start=1)
         )
         lines.append('')
         lines.append(

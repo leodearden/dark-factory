@@ -4533,6 +4533,14 @@ class VerifyResult:
     # UNSCOPED_TYPECHECK_* sentinel results, and any hand-constructed result.
     # `[]` = "no failing legs" (a pass), which is likewise not a licence.
     failing_leg_categories: list[str] | None = None
+    # Task 5357: True iff the TEST leg ran and exited non-zero. `lint_output` and
+    # `type_output` are blanked on a passing leg at construction but
+    # `test_output` is not (chronic_flake reads it on passes), so
+    # `failure_report` needs this to tell a failed test leg's raw tail from a
+    # green run's. False is the default for results that never recorded it
+    # (hand-built, `_trivial_pass`, an older remote's wire payload), which keeps
+    # their report as before: a marker-less test output is not shown.
+    test_leg_failed: bool = False
     # Task 2823: True IFF this result came from _trivial_pass — a config-only
     # (no .py/.rs) merge that short-circuited verification WITHOUT running any
     # suite. The merge worker's pass path keys on this to refuse advancing main
@@ -4673,7 +4681,7 @@ class VerifyResult:
                     '## Test Failures', self.test_output, cap=3000,
                     logs_listed=logs_listed,
                 ))
-            else:
+            elif self.test_leg_failed:
                 sections.append(_render_output_section(
                     '## Test Output', self.test_output, cap=3000,
                     note=_NO_FAILURE_MARKER_NOTE, logs_listed=logs_listed,
@@ -7832,6 +7840,7 @@ async def run_verification(
         test_output=attempt.test.output,
         lint_output=attempt.lint.output if attempt.lint.rc != 0 else '',
         type_output=attempt.type.output if attempt.type.rc != 0 else '',
+        test_leg_failed=attempt.test.rc != 0,
         summary=summary,
         timed_out=timed_out,
         cause_hint=cause_hint,
@@ -8024,6 +8033,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         skipped_test_ids=skipped_test_ids,
         failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
+        test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
     )
 

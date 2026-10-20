@@ -13,7 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.agents.briefing import BriefingAssembler, VerifyAttemptContext
+from orchestrator.agents.briefing import (
+    BriefingAssembler,
+    PriorAttemptCause,
+    VerifyAttemptContext,
+)
+from orchestrator.agents.roles import DEBUGGER
 from orchestrator.config import GitConfig, OrchestratorConfig
 
 _FAILURES = '## Test Failures\n\n```\nFAILED tests/test_x.py::test_a\n```'
@@ -64,7 +69,10 @@ async def test_first_attempt_is_numbered_and_called_first(briefing):
 async def test_later_attempt_lists_prior_causes_oldest_first(briefing):
     prompt = await _prompt(briefing, attempt_context=VerifyAttemptContext(
         attempt=3, max_attempts=5,
-        prior_causes=('test_failure: FAILED a', 'lint_failure: F401 b'),
+        prior_causes=(
+            PriorAttemptCause('test_failure', 'FAILED a'),
+            PriorAttemptCause('lint_failure', 'F401 b'),
+        ),
     ))
 
     assert 'Verify attempt 3 of 5 failed' in prompt
@@ -82,7 +90,10 @@ async def test_first_and_third_attempt_prompts_differ(briefing):
     )
     third = await _prompt(briefing, attempt_context=VerifyAttemptContext(
         attempt=3, max_attempts=5,
-        prior_causes=('test_failure: FAILED a', 'test_failure: FAILED a'),
+        prior_causes=(
+            PriorAttemptCause('test_failure', 'FAILED a'),
+            PriorAttemptCause('test_failure', 'FAILED a'),
+        ),
     ))
 
     assert first != third
@@ -92,3 +103,23 @@ def test_verify_attempt_context_is_immutable():
     ctx = VerifyAttemptContext(attempt=1, max_attempts=5)
 
     pytest.raises(dataclasses.FrozenInstanceError, setattr, ctx, 'attempt', 2)
+
+
+@pytest.mark.asyncio
+async def test_a_multiline_or_uncategorised_prior_cause_renders_on_one_line(briefing):
+    prompt = await _prompt(briefing, attempt_context=VerifyAttemptContext(
+        attempt=2, max_attempts=5,
+        prior_causes=(PriorAttemptCause('', 'Failures: tests failed,\n  lint issues'),),
+    ))
+
+    assert '- attempt 1: uncategorized: Failures: tests failed, lint issues\n' in prompt
+
+
+def test_debugger_role_prompt_names_the_sections_the_briefing_can_carry():
+    prompt = DEBUGGER.system_prompt
+
+    assert '## Test Output' in prompt
+    assert '## Type Check Output' in prompt
+    assert '## Verify Logs' in prompt
+    assert '"Excerpt: N of M characters shown"' in prompt
+    assert '# Verify Attempt' in prompt

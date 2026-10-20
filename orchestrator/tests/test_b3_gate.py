@@ -1931,7 +1931,10 @@ class TestStopScanExcludesCapturedOutput:
         from orchestrator.verify import VerifyResult
 
         streams = {'test_output': '', 'lint_output': '', 'type_output': '', **stream}
-        report = VerifyResult(passed=False, summary='Failures: tests failed', **streams)
+        report = VerifyResult(
+            passed=False, summary='Failures: tests failed',
+            test_leg_failed=bool(streams['test_output']), **streams,
+        )
         block_reason = 'Post-merge verification failed: tests failed\n\n' + report.failure_report()
 
         assert '```' in block_reason

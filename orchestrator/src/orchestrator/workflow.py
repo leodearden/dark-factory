@@ -69,7 +69,7 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import chronic_flake
-from orchestrator.agents.briefing import VerifyAttemptContext
+from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
@@ -10294,7 +10294,7 @@ class TaskWorkflow:
         """Run verification, invoke debugger on failures."""
         assert self.worktree is not None and self.artifacts is not None
         verify_attempt = 0
-        prior_causes: list[str] = []
+        prior_causes: list[PriorAttemptCause] = []
 
         while True:
             # Fix 3: rebase onto main BEFORE each verify (including the first).
@@ -10448,9 +10448,9 @@ class TaskWorkflow:
                     attempt_context=attempt_context,
                 )
 
-            prior_causes.append(
-                f'{result.category or "uncategorized"}: {result.cause_hint or result.summary}'
-            )
+            prior_causes.append(PriorAttemptCause(
+                category=result.category, cause=result.cause_hint or result.summary,
+            ))
 
             pre_head = await self._get_head_commit()
             debug_result = await self._invoke(DEBUGGER, build_prompt, self.worktree)
