@@ -337,7 +337,7 @@ class TestReverifyMemberSoloContract:
                 escalation_queue=escalation_queue,
             )
 
-        assert post_merge_verify.await_args.kwargs['escalation_queue'] is escalation_queue
+        assert post_merge_verify.call_args.kwargs['escalation_queue'] is escalation_queue
 
     async def test_solo_worktree_cleaned_up_on_pass(self) -> None:
         """Pass-path: worktree+branch are RETAINED (handed off to _attribute_train_failure).

@@ -1703,4 +1703,4 @@ class TestSoloReverifyCarriesTheEscalationQueue:
         with patch('orchestrator.merge_lane.worker.reverify_member_solo', new=reverify):
             await f.wf._reverify_one_member({'id': '101'}, 'pred-ref')
 
-        assert reverify.await_args.kwargs['escalation_queue'] is f.esc_queue
+        assert reverify.call_args.kwargs['escalation_queue'] is f.esc_queue
