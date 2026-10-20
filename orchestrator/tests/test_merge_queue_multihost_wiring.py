@@ -3059,8 +3059,8 @@ class _FakeAllocatorForReprobe:
         """Resolve a runner for ANY declared remote — quarantined or not."""
         return self._remotes.get(name)
 
-    def readmit(self, name: str) -> None:
-        """Un-quarantine AND un-PARK, mirroring ``HostAllocator.readmit``.
+    def readmit(self, name: str, *, expect_epoch: int | None = None) -> bool:
+        """Un-quarantine AND un-PARK, mirroring ``HostAllocator.readmit`` (no park epochs here).
 
         Delegates to :meth:`clear_quarantine` so the quarantine-set effect is
         identical to the old recovery call (that is why the 1795 suite's
@@ -3070,6 +3070,7 @@ class _FakeAllocatorForReprobe:
         self.readmitted.append(name)
         self._parked.discard(name)
         self.clear_quarantine(name)
+        return True
 
     def is_parked(self, name: str) -> bool:
         return name in self._parked
@@ -5433,6 +5434,71 @@ class TestParkedRemoteLeaseIsRecorded:
             side_effect=RuntimeError('boom'),
         ):
             assert await worker._cancel_and_release_tracked(lease) is False
+
+
+class _ReparkingDuringProbeRunner(_UnreachableRemoteRunner):
+    """Once armed, its next clean probe races an un-quarantine, free, re-lease and failed cancel."""
+
+    def __init__(self, name, *, allocator_ref):
+        super().__init__(name, reachable=False)
+        self._allocator_ref = allocator_ref
+        self.armed = False
+
+    async def probe_clean(self):
+        if self.armed:
+            self.armed = False
+            alloc = self._allocator_ref[0]
+            alloc.clear_quarantine(self.name)
+            assert alloc.unpark(self.name) is True
+            relet = alloc.acquire_remote()
+            self.reachable = False
+            await alloc.cancel_and_release(relet)
+            self.reachable = True
+        return self.reachable
+
+
+@pytest.mark.asyncio
+class TestTrackedParkedHostRecovery:
+    """Task 3310 review: the two sweeps divide PARKED hosts between them, and
+    the tracker's re-admission frees only the park episode its probe saw."""
+
+    async def _tracked_parked(self, worker, alloc):
+        lease = alloc.acquire_remote()
+        assert lease is not None
+        await worker._cancel_and_release_tracked(lease)
+        assert alloc.is_parked('leo-laptop') is True
+        assert 'leo-laptop' in worker._runner_unavailable
+
+    async def test_backstop_sweep_leaves_a_tracked_parked_host_to_the_tracker(self):
+        worker, _eq, alloc, runner = _make_parking_worker()
+        await self._tracked_parked(worker, alloc)
+        runner.reachable = True
+
+        await worker._reprobe_untracked_parked_slots()
+        assert alloc.is_parked('leo-laptop') is True
+
+        await worker._reprobe_quarantined_hosts(worker._clock.now())
+        assert alloc.is_parked('leo-laptop') is False
+        assert 'leo-laptop' not in worker._runner_unavailable
+        assert alloc.is_quarantined('leo-laptop') is False
+
+    async def test_tracker_does_not_readmit_a_park_episode_newer_than_its_probe(self):
+        worker, _eq, _fake = _make_ru_worker(escalate_after_n=2)
+        allocator_ref: list[HostAllocator] = []
+        runner = _ReparkingDuringProbeRunner('leo-laptop', allocator_ref=allocator_ref)
+        alloc = _ParkingAllocator([runner], quarantine=worker._runner_quarantine)
+        allocator_ref.append(alloc)
+        worker._host_allocator = alloc
+        await self._tracked_parked(worker, alloc)
+        probed_epoch = alloc.park_epoch('leo-laptop')
+        runner.reachable = True
+        runner.armed = True
+
+        await worker._reprobe_quarantined_hosts(worker._clock.now())
+
+        assert alloc.park_epoch('leo-laptop') == (probed_epoch or 0) + 1
+        assert alloc.is_parked('leo-laptop') is True
+        assert 'leo-laptop' in worker._runner_unavailable
 
 
 @pytest.mark.asyncio

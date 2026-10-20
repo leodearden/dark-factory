@@ -3865,6 +3865,54 @@
           "current": 31638
         }
       ]
+    },
+    {
+      "task_id": "3310",
+      "reason": "review fixes: the tracker sweep re-admits only the park episode its probe saw (readmit(expect_epoch=)); worker-level tests pin the backstop exclusion and the epoch-guarded re-admission through the existing reprobe seams",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2200,
+          "current": 2203
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_reprobe_quarantined_hosts",
+          "baseline": 48,
+          "current": 51
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22256,
+          "current": 22258
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_multihost_wiring.py",
+          "baseline": 347,
+          "current": 358
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4875,
+          "current": 4878
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57386,
+          "current": 57388
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6543,
+          "current": 6554
+        }
+      ]
     }
   ]
 }

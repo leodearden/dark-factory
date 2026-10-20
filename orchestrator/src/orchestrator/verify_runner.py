@@ -4247,7 +4247,7 @@ class HostAllocator:
         """
         self._quarantine.discard(name)
 
-    def readmit(self, name: str) -> None:
+    def readmit(self, name: str, *, expect_epoch: int | None = None) -> bool:
         """Fully re-engage host *name* in the pool: un-quarantine AND un-PARK.
 
         This is the auto-reprobe re-engagement primitive (task 1795 recovery,
@@ -4273,11 +4273,25 @@ class HostAllocator:
         ``health()`` AND ``probe_clean()`` — so that freeing the slot cannot
         double-dispatch onto a host still churning on a previous merge.
 
+        *expect_epoch* is the :meth:`park_epoch` the caller read before its
+        probe.  When the slot's park episode has changed since (freed and
+        re-PARKed across the probe's await), the probe vouched for an older
+        episode: nothing is changed and False is returned, so the host stays
+        quarantined and PARKED for the next sweep.
+
         Idempotent: a repeat call on an already-FREE, unquarantined host is a
-        safe no-op.
+        safe no-op.  Returns True when the host was re-admitted.
         """
-        self._unpark(name, expect_epoch=None, source='readmit')
+        if expect_epoch is not None and self.park_epoch(name) != expect_epoch:
+            logger.info(
+                'HostAllocator: host %r not re-admitted — its park episode changed '
+                'since the probe (expected epoch %d, now %s)',
+                name, expect_epoch, self.park_epoch(name),
+            )
+            return False
+        self._unpark(name, expect_epoch=expect_epoch, source='readmit')
         self._quarantine.discard(name)
+        return True
 
     def is_quarantined(self, name: str) -> bool:
         """Return True if host *name* is currently quarantined.

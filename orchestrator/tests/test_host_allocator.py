@@ -1316,6 +1316,31 @@ class TestHostAllocatorReadmit:
         assert [h['name'] for h in alloc.host_states()] == before
         assert 'no-such-host' not in {h['name'] for h in alloc.host_states()}
 
+    async def test_readmit_refuses_a_park_episode_newer_than_the_probe(self):
+        """A probe vouches for one park episode; a re-PARK across its await is not re-admitted."""
+        from orchestrator.verify_runner import HostAllocator
+
+        shared_q: set[str] = set()
+        runner = _ReachabilityRunner('remoteA', reachable=False)
+        alloc = HostAllocator([runner], quarantine=shared_q)
+        first = alloc.acquire_remote()
+        assert first is not None
+        await alloc.cancel_and_release(first, sleep=_noop_sleep, max_attempts=1)
+        probed_epoch = alloc.park_epoch('remoteA')
+
+        assert alloc.unpark('remoteA') is True
+        second = alloc.acquire_remote()
+        assert second is not None
+        await alloc.cancel_and_release(second, sleep=_noop_sleep, max_attempts=1)
+        shared_q.add('remoteA')
+
+        assert alloc.readmit('remoteA', expect_epoch=probed_epoch) is False
+        assert alloc.is_parked('remoteA') is True
+        assert alloc.is_quarantined('remoteA') is True
+        assert alloc.readmit('remoteA', expect_epoch=alloc.park_epoch('remoteA')) is True
+        assert alloc.is_parked('remoteA') is False
+        assert alloc.is_quarantined('remoteA') is False
+
     # -- (e) REGRESSION PIN: why clear_quarantine alone is not enough -----------
 
     async def test_clear_quarantine_alone_leaves_parked_host_unusable(self):

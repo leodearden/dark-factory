@@ -11232,6 +11232,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # optional probe is treated as clean.
                     _is_parked = getattr(self._host_allocator, 'is_parked', None)
                     _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
+                    _park_epoch = getattr(self._host_allocator, 'park_epoch', None)
+                    _probed_epoch = _park_epoch(name) if _park_epoch is not None else None
                     if _was_parked:
                         _probe_clean = getattr(runner, 'probe_clean', None)
                         if _probe_clean is None:
@@ -11273,10 +11275,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             continue
 
                     _readmit = getattr(self._host_allocator, 'readmit', None)
-                    if _readmit is not None:
-                        _readmit(name)
-                    else:
+                    if _readmit is None:
                         self._host_allocator.clear_quarantine(name)
+                    elif not _readmit(name, expect_epoch=_probed_epoch):
+                        continue
                     self._record_runner_recovered(name)
                     _clear_verify_host_unreachable(
                         self._escalation_queue,
