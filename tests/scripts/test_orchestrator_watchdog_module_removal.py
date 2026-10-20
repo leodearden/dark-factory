@@ -14,22 +14,15 @@ import json
 import os
 import pathlib
 import subprocess
-import sys
 import time
 from collections.abc import Callable
 from types import ModuleType
 
 import pytest
 
+from df_pytest_isolation import synthetic_unit
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path so the
-# workspace members resolve to their src/ packages (mirrors
-# test_orchestrator_watchdog.py).
-if str(REPO_ROOT.resolve()) not in sys.path:
-    sys.path.append(str(REPO_ROOT.resolve()))
-
-from df_pytest_isolation import synthetic_unit  # noqa: E402
 
 # Saved before any test wraps subprocess.run, so the fixture's own git calls
 # and the pass-through wrappers below always reach the real binary.
