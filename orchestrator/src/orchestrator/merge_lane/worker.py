@@ -5996,11 +5996,11 @@ async def classify_and_merge(
         # NOTE: _emit_speculative str-converts every data value (see its
         # `{k: str(v) ...}` coercion below), so depth lands here as a str
         # (e.g. "2") — unlike the merge_verify event's depth (dispatch, in
-        # verify_runner.py), which is a native int. chain_telemetry.py::
-        # _is_legacy_deep_label and analyze_speculation_depth.py::
-        # is_legacy_deep_label coerce both, but a future consumer
-        # that aggregates depth across both event types should not assume a
-        # single type.
+        # verify_runner.py), which is a native int. The merge_verify-only
+        # legacy-label readers (chain_telemetry.py::_is_legacy_deep_label et al.)
+        # accept a str depth defensively, for foreign/legacy runs.db rows; a
+        # consumer aggregating depth across both event types must not assume
+        # a single type.
         worker._emit_speculative(
             EventType.speculative_merge, req.task_id, base_sha=base_sha,
             depth=worker._verify_frontier_depth(),

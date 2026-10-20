@@ -58,9 +58,8 @@ def _usable_chain_items(data: Mapping[str, Any]) -> int | None:
 def _is_legacy_deep_label(data: Mapping[str, Any]) -> bool:
     """True for a row whose only depth signal is a legacy ``depth >= 2`` label.
 
-    Both the native-int and the str spelling count, because
-    orchestrator/src/orchestrator/merge_lane/worker.py::_emit_speculative
-    str-coerces payload values.
+    Both the native-int and the str spelling count, defensively, for
+    foreign or legacy runs.db rows; the merge_verify producer emits an int.
     """
     depth = data.get('depth')
     if _usable_chain_items(data) is not None or not isinstance(depth, (int, str)):
@@ -95,7 +94,9 @@ def summarize_chain_telemetry(
 
     Known divergences of other readers, deliberately not reconciled here:
     scripts/merge-deep-canary-predicate.sh admits bool ``True`` as
-    ``landed_via_chain == 1`` (``isinstance``), and
+    ``landed_via_chain == 1`` (``isinstance``), and its window compares an
+    ISO ``T``-separated timestamp against ``datetime('now', '-N days')``'s
+    space-separated form, so an N-day window admits up to N+1 days of rows;
     scripts/merge_lane_throughput.py::compute_chains coerces floats and sums
     ``landed_via_chain`` only on ``state == 'done'`` rows.
     scripts/tests/test_chain_telemetry_agreement.py is the mechanical lock

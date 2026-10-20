@@ -1,4 +1,4 @@
-"""Every deep merge-ahead chain-telemetry reader agrees with git-derived truth on one fixture (task 3188 ε).
+"""Every deep merge-ahead chain-telemetry reader agrees with hand-derived truth on one fixture (task 3188 ε).
 
 The four readers are orchestrator/src/orchestrator/chain_telemetry.py::summarize_chain_telemetry
 (the operator digest), scripts/analyze_speculation_depth.py (the forensic miner),
