@@ -5,11 +5,11 @@ cannot disagree about which ``metadata.complexity`` values mean "simple".
 """
 from __future__ import annotations
 
-__all__ = ['is_simple_complexity']
+__all__ = ['SIMPLE_COMPLEXITY', 'is_simple_complexity']
 
-_SIMPLE = 'simple'
+SIMPLE_COMPLEXITY = 'simple'
 
 
 def is_simple_complexity(value: object) -> bool:
     """True iff *value* normalises to ``'simple'`` (case-insensitive, stripped)."""
-    return str(value or '').strip().lower() == _SIMPLE
+    return str(value or '').strip().lower() == SIMPLE_COMPLEXITY

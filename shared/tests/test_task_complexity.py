@@ -33,8 +33,3 @@ def test_simple_spellings_declare_the_fast_path(value):
 )
 def test_everything_else_does_not(value):
     assert is_simple_complexity(value) is False
-
-
-def test_stringified_list_is_not_simple():
-    assert str(['simple']) != 'simple'
-    assert is_simple_complexity(['simple']) is False

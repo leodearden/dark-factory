@@ -11,13 +11,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from shared.task_complexity import is_simple_complexity
+from shared.task_complexity import SIMPLE_COMPLEXITY, is_simple_complexity
 
 from fused_memory.middleware.lock_charter_guard import extract_files
 
 __all__ = ['simple_task_files_error']
 
-_COMPLEXITY = 'simple'
 _REQUIRED_KEY = 'files'
 
 
@@ -35,7 +34,7 @@ def simple_task_files_error(metadata: Mapping[str, Any]) -> dict[str, Any] | Non
             'dispatch-time lock, with no architect to derive scope.'
         ),
         'error_type': 'SimpleTaskFilesRequired',
-        'complexity': _COMPLEXITY,
+        'complexity': SIMPLE_COMPLEXITY,
         'required_key': _REQUIRED_KEY,
         'hint': (
             'Put the specific FILE paths you will edit in metadata.files (a '
