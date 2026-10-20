@@ -428,7 +428,7 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     """Rescope a fallback TYPE/LINT command into subpackage *sub*'s own uv context.
 
     Cold-verify dev-dep race (task 2355): on a cold throwaway merge-verify
-    worktree (:func:`create_throwaway_verify_worktree`) the shared ``.venv``
+    worktree (:func:`create_ephemeral_verify_worktree`) the shared ``.venv``
     starts empty. When a diff lives entirely under a single real subpackage
     (see :func:`_single_subproject_prefix`), the TEST command is already
     scoped to run *inside* that subpackage via ``uv run`` (task 2344), which

@@ -813,7 +813,7 @@ async def acquire_chain_build_lane(
     contend with the serial head verify.
     That method already handles knob-off (``spec_warm_lane_pool is None``) and
     pool exhaustion by cold-falling-back to
-    :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree` with
+    :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree` with
     ``warm=False``, so no knob branch is needed here.
 
     **Fail-closed serial-lane guard.**  A resolution that lands on the serial

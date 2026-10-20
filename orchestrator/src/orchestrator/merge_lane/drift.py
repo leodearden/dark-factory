@@ -205,14 +205,14 @@ async def _run_drift_check(
             the local trust-anchor runs its scoped verify and unscoped type-checks.
     """
     # wt is initialised before the try so the finally guard (`if wt is not None`)
-    # is safe even when create_throwaway_verify_worktree itself raises.  Moving the
+    # is safe even when create_ephemeral_verify_worktree itself raises.  Moving the
     # creation inside the try ensures the docstring contract ("Exceptions are caught
     # and logged") holds for all failure modes — disk-full / git errors included.
     wt = None
     local_lease = None
     remote_lease = None
     try:
-        wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
         # Hold THIS throwaway lane's flock for the duration of the drift
         # verify (task 3018).  Three things to know:
         #
@@ -239,7 +239,7 @@ async def _run_drift_check(
         # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
         #     MergeVerifyLeaseContended fail-safe branch is warranted: the
         #     `_merge-<uuid>` path was just minted by
-        #     create_throwaway_verify_worktree and is uncontended by
+        #     create_ephemeral_verify_worktree and is uncontended by
         #     construction — nobody else knows it.  (Were one ever raised it
         #     would land in the except-Exception fail-open below, the same
         #     detective-control degradation as any other drift-check error.)

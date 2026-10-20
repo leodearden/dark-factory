@@ -6641,7 +6641,7 @@ class GitOps:
                 'acquire_spec_lane: spec pool absent (knob off) — cold fallback '
                 'for %s', merge_commit[:8],
             )
-            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            wt = await self.create_ephemeral_verify_worktree(merge_commit)
             return wt, False
 
         lane = await pool.try_acquire()
@@ -6651,7 +6651,7 @@ class GitOps:
                 'acquire_spec_lane: pool exhausted — cold fallback for %s',
                 merge_commit[:8],
             )
-            wt = await self.create_throwaway_verify_worktree(merge_commit)
+            wt = await self.create_ephemeral_verify_worktree(merge_commit)
             return wt, False
 
         # ── Create-once or reset-in-place ────────────────────────────────────
@@ -6754,7 +6754,7 @@ class GitOps:
             'of %s runs COLD', reason, lane, merge_commit[:8],
         )
         await pool.release(lane)
-        return await self.create_throwaway_verify_worktree(merge_commit), False
+        return await self.create_ephemeral_verify_worktree(merge_commit), False
 
     async def release_spec_lane(self, lane: Path, *, warm: bool) -> None:
         """Release a ``_spec-`` lane after a speculative merge verify.
@@ -6767,7 +6767,7 @@ class GitOps:
         **Cold path** (``warm=False`` — ephemeral fallback worktree):
             ``await self.cleanup_merge_worktree(lane)`` — removes the
             throwaway ``_merge-<uuid>`` worktree created by
-            :meth:`create_throwaway_verify_worktree`.
+            :meth:`create_ephemeral_verify_worktree`.
 
         **Idempotent**: releasing a FREE lane, an already-cleaned path, or an
         unknown path is a no-op (never raises).  Mirrors the
@@ -13028,29 +13028,29 @@ class GitOps:
             os.unlink(lane_lock_path(merge_wt))
         await self._prune_registrations(context='cleanup_merge_worktree')
 
-    async def create_throwaway_verify_worktree(self, merge_commit: str) -> Path:
-        """Create an ephemeral ``_merge-<uuid>`` worktree at *merge_commit*.
+    async def create_ephemeral_verify_worktree(self, sha: str) -> Path:
+        """Create a detached ``_merge-<uuid>`` worktree at *sha* for one cold verify run.
 
-        Thin public wrapper over :meth:`_create_merge_worktree` for use by
-        the warm-vs-cold shadow compare (PRD §10 invariant 6(b)).  The
-        returned worktree is:
+        Thin public wrapper over :meth:`_create_merge_worktree`.  Its callers
+        are the merge lane's drift check, shadow compare and warm-pool cold
+        fallbacks, and ``orchestrator verify-task``.  The returned worktree is:
 
-        * Checked out at *merge_commit* (detached HEAD).
+        * Checked out at *sha* (detached HEAD).
         * Named ``_merge-<uuid>`` — NEVER the fixed ``_merge-verify`` path.
         * Intended for a single cold verify run; callers must remove it via
           :meth:`cleanup_merge_worktree` (in a ``finally`` block) after use.
 
         Unlike the warm :meth:`reset_persistent_merge_worktree` path, this
         worktree has no retained ``target/`` warmth — it is a true from-scratch
-        cold verify worktree (PRD §10 invariant 6(b): "cold throwaway").
+        cold verify worktree.
 
         Args:
-            merge_commit: The merge commit SHA to check out in the new worktree.
+            sha: The commit to check out in the new worktree.
 
         Returns:
             Path to the freshly created ephemeral worktree directory.
         """
-        wt, _ = await self._create_merge_worktree(base_sha=merge_commit)
+        wt, _ = await self._create_merge_worktree(base_sha=sha)
         return wt
 
     @property
