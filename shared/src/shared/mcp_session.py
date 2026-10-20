@@ -204,7 +204,11 @@ class McpSession:
     One schedule covers a whole logical call, its handshake included. A
     transient failure drops the session, since a restarted server has
     forgotten it, so the next attempt runs the handshake again before it
-    re-posts the same request, ``client_op_id`` and all.
+    re-posts the same request, ``client_op_id`` and all. The key is minted
+    into a copy, never the caller's dict, so a caller that retries ABOVE the
+    session must supply its own ``client_op_id``, as
+    ``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``
+    does.
 
     ``call_tool`` returns the JSON-RPC body as the server sent it, a JSON-RPC
     error or ``result.isError`` reply included: reading the tool's verdict is

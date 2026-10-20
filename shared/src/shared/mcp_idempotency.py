@@ -13,7 +13,10 @@ frozenset and injection helper into one place so the two copies cannot drift.
 Caveat (unchanged by this hoist): the two call sites differ in what surrounds
 this helper. ``shared.mcp_session.McpSession`` calls
 ``maybe_inject_client_op_id`` ONCE before its transport retry loop, so every
-retry of a logical call reuses the same key; ``SyncMcpSession`` does not inject,
+retry of a logical call reuses the same key. It injects into a copy of the
+caller's arguments, so a caller that retries ABOVE the session supplies its own
+key (``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``
+mints one with this helper before its retry loop). ``SyncMcpSession`` does not inject,
 because it has no retry loop. The dashboard's ``_raw_call`` has
 no transport retry loop, so each invocation generates a fresh key when none is
 supplied — see the dashboard twin's docstring for the full caveat. Only the
