@@ -132,22 +132,32 @@ def paired_comparison(
     return out
 
 
-def complement(arm: list[ScoreRecord], incumbent: list[ScoreRecord]) -> tuple[int, int]:
+def complement(
+    arm: list[ScoreRecord],
+    incumbent: list[ScoreRecord],
+    restrict_to: dict[str, set[str]] | None = None,
+) -> tuple[int, int]:
     """Return ``(complement_count, incumbent_matched)``.
 
     The complement is every ground-truth issue *arm* matched on a fixture
     and trial where the incumbent missed it; ``incumbent_matched`` is the
     incumbent's total matched count over the same pairs, so the ratio is
-    the complement as a share of incumbent recall.
+    the complement as a share of incumbent recall. *restrict_to* counts
+    only the named ground-truth ids per diff on both sides, e.g. the
+    blocking ones.
     """
-    inc = {_key(r): _matched_gt_ids(r) for r in incumbent}
+    def counted(rec: ScoreRecord) -> set[str]:
+        ids = _matched_gt_ids(rec)
+        return ids if restrict_to is None else ids & restrict_to.get(rec['diff_id'], set())
+
+    inc = {_key(r): counted(r) for r in incumbent}
     comp = 0
     inc_total = 0
     for rec in arm:
         k = _key(rec)
         if k not in inc:
             continue
-        comp += len(_matched_gt_ids(rec) - inc[k])
+        comp += len(counted(rec) - inc[k])
         inc_total += len(inc[k])
     return comp, inc_total
 
