@@ -1091,6 +1091,8 @@ Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <
 
 These require human judgment. Apply shallow RCA: sibling tasks of the same PRD parent often cluster here.
 
+**Note-to-file records never arrive here.** `mcp__escalation__escalate_info(note_to_file=True)` files them already resolved (`resolution_class: note-to-file`, `resolution_action: close_only`) and archives them at filing, so no pending L0/L1 carries one and there is nothing to route, close or promote. An info `design_concern` that does arrive is an ordinary note, and an all-info cluster of those is handled by the [info-only cluster rung](#info-only-cluster-info_only_cluster).
+
 Root_cause hint:
 - `design_concern` / `missing_premise`: `"design-concern:<module-or-parent-task-slug>"`
 - `risk_identified`: `"risk:<module-or-area-slug>"` — **except** a `risk_identified` L1 whose `task_id` starts with `__recovery_veto_streak__`: those are handled by [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) above and must NOT take this generic key.
