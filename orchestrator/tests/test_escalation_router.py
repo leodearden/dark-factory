@@ -127,20 +127,24 @@ class TestClassifyTicket:
         curator.set_ticket('tkt_1', payload)
         return await curator('resolve_ticket', {'ticket': 'tkt_1'})
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('status', ['created', 'combined'])
     async def test_a_named_task_is_converted(self, status):
         body = await self._answer({'status': status, 'task_id': '9001'})
         assert classify_ticket(body) == Converted('9001')
 
+    @pytest.mark.asyncio
     async def test_refused_carries_the_reason(self):
         body = await self._answer({'status': 'refused', 'reason': 'cancelled premise'})
         assert classify_ticket(body) == Refused('cancelled premise')
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('reason', ['worker_dead', 'unknown_ticket', 'server_restart'])
     async def test_terminal_failure_carries_the_reason(self, reason):
         body = await self._answer({'status': 'failed', 'reason': reason, 'task_id': None})
         assert classify_ticket(body) == Failed(reason)
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('payload', [
         {'status': 'failed', 'reason': 'timeout', 'task_id': None},
         {'status': 'failed', 'reason': 'server_closed', 'task_id': None},
