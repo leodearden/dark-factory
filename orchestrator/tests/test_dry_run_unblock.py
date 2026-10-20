@@ -1976,6 +1976,60 @@ class TestDryRunCapExhaustionRealLoop:
         assert 'capped' in entry['proposal_text'].lower()
 
 
+class TestFrozenPoolInvestigationIsBounded:
+    """A pool frozen BEFORE the investigation starts used to park it in the
+    gate until a reset, out of reach of ``_DRY_RUN_CAP_WAIT_SANITY_SECS``."""
+
+    @pytest.mark.asyncio
+    async def test_a_pool_frozen_at_spawn_writes_infra_failure_within_the_bound(
+        self, tmp_path, monkeypatch,
+    ):
+        from datetime import UTC, datetime, timedelta
+
+        from _orch_helpers import build_usage_gate
+        from shared.config_models import AccountConfig
+        from shared.invocation_outcome import CapHit
+
+        from orchestrator import dry_run_unblock
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        gate = build_usage_gate(
+            [AccountConfig(name='only', oauth_token_env='TEST_TOKEN_ONLY')], ['tok-only'],
+        )
+        async with gate.invoke_slot() as slot:
+            slot.report(CapHit(resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap'))
+        assert gate.is_paused, 'fixture must freeze the pool before the investigation starts'
+        monkeypatch.setattr(dry_run_unblock, '_DRY_RUN_CAP_WAIT_SANITY_SECS', 0.2)
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+        mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+        try:
+            with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+                await asyncio.wait_for(
+                    run_dry_run_unblock(
+                        task_id='4002',
+                        worktree=str(tmp_path),
+                        reason='verify exhausted',
+                        detail='',
+                        scheduler=scheduler,
+                        mcp=MagicMock(),
+                        config=_make_config(),
+                        usage_gate=gate,
+                    ),
+                    5.0,
+                )
+        finally:
+            await gate.shutdown()
+
+        mock_invoke.assert_not_awaited()
+        _assert_one_proposal_persist(scheduler)
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', entry
+        assert entry['risk_label'] == 'human-review-required', entry
+        assert 'capped' in entry['proposal_text'].lower(), entry
+
+
 class TestCapHitRetriesFresh:
     """A capped investigation retries FRESH through the real cap-retry loop,
     even when its transcript records progress the default would resume."""

@@ -22,6 +22,7 @@ auth-failed through the gate's public slot API, never by writing its state.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,7 +30,7 @@ from pathlib import Path
 import pytest
 from _usage_gate_test_helpers import SCOPE, make_gate
 
-from shared.cli_invoke import AgentResult, invoke_with_cap_retry
+from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 from shared.invocation_outcome import AuthFailed, CapHit, InvocationOutcome
 from shared.usage_gate import PoolFrozen
 
@@ -241,3 +242,62 @@ async def test_a_bounded_park_still_serves_an_account_that_reopens_in_time(gates
 
     assert lease is not None and lease.name == 'b', lease
     assert elapsed < allowance, f'served after {elapsed:.3f}s, not within the {allowance}s bound'
+
+
+class _RecordingInvoke:
+    """An ``invoke_fn`` that records each dispatch and succeeds."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs) -> AgentResult:
+        self.calls.append(kwargs)
+        return AgentResult(success=True, output='done')
+
+
+def _invoke_parking(gate, invoke_fn, *, cap_wait_sanity_secs):
+    return invoke_with_cap_retry(
+        gate, 'lbl',
+        cap_wait_sanity_secs=cap_wait_sanity_secs,
+        invoke_fn=invoke_fn,
+        prompt='p', system_prompt='s', cwd=Path('/tmp'),
+    )
+
+
+async def test_cap_wait_sanity_secs_bounds_the_park_of_a_pool_frozen_at_call_start(
+    gates, caplog,
+):
+    gate = await gates(('a', 'b'), _cap(), _AUTH)
+    invoke_fn = _RecordingInvoke()
+
+    with (
+        caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
+        pytest.raises(AllAccountsCappedException) as excinfo,
+    ):
+        await asyncio.wait_for(
+            _invoke_parking(gate, invoke_fn, cap_wait_sanity_secs=0.2), _BOUND_SECS,
+        )
+
+    assert excinfo.value.label == 'lbl'
+    frozen = excinfo.value.__cause__
+    assert isinstance(frozen, PoolFrozen), frozen
+    assert frozen.capped_account_names == ('a',)
+    assert frozen.auth_failed_account_names == ('b',)
+    assert not invoke_fn.calls, 'a frozen pool must never be dispatched on'
+    assert any(
+        rec.levelno == logging.ERROR and rec.name == 'shared.cli_invoke'
+        and 'lbl' in rec.getMessage()
+        for rec in caplog.records
+    ), [(rec.name, rec.getMessage()) for rec in caplog.records]
+
+
+async def test_without_a_sanity_bound_the_park_is_still_unbounded(gates):
+    gate = await gates(('a', 'b'), _cap(), _cap())
+    invoke_fn = _RecordingInvoke()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            _invoke_parking(gate, invoke_fn, cap_wait_sanity_secs=None), 0.3,
+        )
+
+    assert not invoke_fn.calls
