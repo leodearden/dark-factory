@@ -34,7 +34,7 @@ from orchestrator.task_verify_dispatch import (
     eligible,
 )
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyInfraError, VerifyResult
 from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_runner import HostAllocator, RemoteRunner, result_to_json
 
@@ -752,3 +752,107 @@ class TestCancellation:
         result = await h.call(attempt_id=2)
         assert result is h.local.result
         assert h.only_sidecar(attempt_id=2)['reason'] == 'host_parked'
+
+
+
+# ---------------------------------------------------------------------------
+# Parity knobs, read per call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestParity:
+    async def test_every_nth_remote_verdict_is_cross_checked_locally(self, tmp_path: Path) -> None:
+        policy = dataclasses.replace(_ORCH_ONLY, cross_check_every_n=2)
+        transport = _Transport(verify=_answers(_result(True, summary='remote verdict')))
+        h = _harness(tmp_path, policy, transport=transport)
+
+        first = await h.call(attempt_id=1)
+        assert first.summary == 'remote verdict'
+        assert h.local.calls == []
+        assert h.only_sidecar(attempt_id=1)['reason'] == 'remote'
+        assert h.only_sidecar(attempt_id=1)['cross_check'] is None
+
+        second = await h.call(attempt_id=2)
+        assert second is h.local.result
+        assert h.local.calls == [h.expected_call(attempt_id=2)]
+        assert h.transport.log.count('verify_task') == 2
+        sidecar = h.only_sidecar(attempt_id=2)
+        assert (sidecar['reason'], sidecar['decision'], sidecar['runner']) == (
+            'cross_check', 'local', 'local',
+        )
+        assert sidecar['cross_check'] == {'remote_passed': True, 'local_passed': True, 'agree': True}
+        assert sidecar['remote_wall_secs'] is not None
+
+        transport.verify = _answers(_result(False, category='test_failure'))
+        third = await h.call(attempt_id=3)
+        assert third.passed is False
+        assert h.only_sidecar(attempt_id=3)['reason'] == 'remote'
+
+        fourth = await h.call(attempt_id=4)
+        assert fourth is h.local.result
+        assert h.only_sidecar(attempt_id=4)['cross_check'] == {
+            'remote_passed': False, 'local_passed': True, 'agree': False,
+        }
+        _assert_slot_free(h)
+
+    async def test_a_refusal_does_not_consume_a_cross_check_turn(self, tmp_path: Path) -> None:
+        policy = dataclasses.replace(_ORCH_ONLY, cross_check_every_n=2)
+        h = _harness(tmp_path, policy, transport=_Transport(verify=_answers(_result(True))))
+
+        await h.call(attempt_id=1)
+        h.hooks.demand = True
+        await h.call(attempt_id=2)
+        h.hooks.demand = False
+        await h.call(attempt_id=3)
+
+        assert h.only_sidecar(attempt_id=2)['reason'] == 'merge_demand'
+        assert h.only_sidecar(attempt_id=3)['reason'] == 'cross_check'
+
+    async def test_a_remote_red_is_confirmed_locally(self, tmp_path: Path) -> None:
+        policy = dataclasses.replace(_ORCH_ONLY, red_confirms_locally=True)
+        remote_red = _result(False, category='test_failure')
+        h = _harness(tmp_path, policy, transport=_Transport(verify=_answers(remote_red)))
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['decision'], sidecar['runner']) == (
+            'red_confirm', 'local', 'local',
+        )
+        assert sidecar['red_confirmed_locally'] == {'remote_passed': False, 'local_passed': True}
+        assert sidecar['cross_check'] is None
+        _assert_slot_free(h)
+
+    async def test_a_remote_green_is_not_confirmed_locally(self, tmp_path: Path) -> None:
+        policy = dataclasses.replace(_ORCH_ONLY, red_confirms_locally=True)
+        h = _harness(tmp_path, policy, transport=_Transport(verify=_answers(_result(True))))
+
+        result = await h.call()
+
+        assert result.passed is True
+        assert h.local.calls == []
+        assert h.only_sidecar()['reason'] == 'remote'
+
+    async def test_a_policy_reloaded_to_local_short_circuits(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))))
+        await h.call(attempt_id=1)
+
+        h.policy = TaskVerifyPolicy()
+        result = await h.call(attempt_id=2)
+
+        assert result is h.local.result
+        assert h.sidecars(attempt_id=2) == []
+        assert h.dispatcher.decision_for('7', 2) is None
+        assert h.only_sidecar(attempt_id=1)['reason'] == 'remote'
+
+    async def test_a_local_run_failure_keeps_the_route_reason(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, demand=True)
+        h.local.raises = VerifyInfraError('test', 28, 'No space left on device')
+
+        with pytest.raises(VerifyInfraError):
+            await h.call()
+
+        assert h.only_sidecar()['reason'] == 'merge_demand'
