@@ -871,8 +871,12 @@ def test_pushes_ride_the_batch_mode_bounded_ssh_transport():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('role', ['publish', 'verify_push'])
-async def test_a_push_that_never_returns_is_transport(monkeypatch, role):
-    """A host lost mid-push holds no lease past the bound, and a sleeping laptop is not skew."""
+async def test_a_push_that_never_returns_is_gate(monkeypatch, role):
+    """Past the bound the ssh session is alive, so the host was reached and its receive-pack hung.
+
+    A sleeping or lost host fails well inside the bound on the batch-mode
+    ssh options, with an ssh client line ('transport'); see the classify table.
+    """
     monkeypatch.setattr('orchestrator.verify_runner.ENSURE_CLIENT_TIMEOUT_SECS', 0.05)
 
     async def hang() -> tuple[int, str, str]:
@@ -882,9 +886,54 @@ async def test_a_push_that_never_returns_is_transport(monkeypatch, role):
     transport = _Scripted(**{role: hang})
     exc = await _unavailable(transport)
 
-    assert exc.kind == 'transport'
+    assert exc.kind == 'gate'
     assert 'exceeded' in str(exc)
     assert 'verify' not in transport.roles()
+
+
+def _process_gone(pid: int) -> bool:
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+    except FileNotFoundError:
+        return True
+    return stat.rsplit(')', 1)[1].split()[0] == 'Z'
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_push_leaves_no_git_or_ssh_behind(tmp_path: Path, monkeypatch):
+    """The default transport kills the push's whole process group when the bound fires."""
+    checkout = tmp_path / 'checkout'
+    checkout.mkdir()
+    _git(checkout, 'init', '-q')
+    sha = _commit(checkout, 'deployed')
+    fakebin = tmp_path / 'bin'
+    fakebin.mkdir()
+    pids = tmp_path / 'pids'
+    ssh = fakebin / 'ssh'
+    ssh.write_text(f'#!/usr/bin/env bash\necho "$PPID $$" > {pids}\nexec sleep 120\n')
+    ssh.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fakebin}:{os.environ["PATH"]}')
+    monkeypatch.setattr('orchestrator.verify_runner.ENSURE_CLIENT_TIMEOUT_SECS', 3.0)
+    runner = RemoteRunner(
+        'laptop', 'gate-host', 'gate-host', str(checkout),
+        df_remote_checkout='/laptop/dark-factory', gate_checkouts_path='/gates',
+        deployed_sha=DeployedSha(sha, indeterminate=False, dirty_wire_path=False),
+        code_checkout=str(checkout),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(RunnerUnavailable) as excinfo:
+        await runner.publish_sha()
+
+    assert time.monotonic() - started < 30, 'the bound waited for the hung push instead of killing it'
+    assert excinfo.value.kind == 'gate'
+    git_pid, ssh_pid = (int(pid) for pid in pids.read_text().split())
+    for _ in range(100):
+        if _process_gone(git_pid) and _process_gone(ssh_pid):
+            break
+        await asyncio.sleep(0.05)
+    assert _process_gone(git_pid), 'the timed-out git push is still running'
+    assert _process_gone(ssh_pid), "the timed-out push's ssh is still running"
 
 
 @pytest.mark.asyncio

@@ -12294,6 +12294,7 @@ class Harness:
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
             deployed_sha=self._deployed_sha,
+            verify_hosts=[r.name for r in self.config.verify_runners],
         )
 
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned

@@ -1166,15 +1166,19 @@ as `quarantine_class` in the `get_merge_queue()` snapshot (with `kind`,
   laptop going to sleep). Re-probed by `ssh <host> true`; a pass re-admits it.
 - **`skew`**: reached, but it could not run this dispatcher's gate, or a
   verify there produced no usable verdict (`kind` is `gate`, `unparseable`,
-  `no_verdict` or `wire_shape`); a push the host refused, or any non-zero
-  exit of a command it ran, is `gate`. Re-probed by the full `ensure-gate`
+  `no_verdict` or `wire_shape`); a push the host refused, a push still
+  running after the 600 s bound (the host was reached and its receive-pack
+  hung), or any non-zero exit of a command it ran, is `gate`. Re-probed by the
+  full `ensure-gate`
   (publish the deployed commit, build or reuse the gate checkout, identity
   handshake); a pass re-admits it. A `wire_shape` bench carries both gate
   identities (`code_sha` and wire fingerprint, local and remote) in
   `identity`. Its L1 is category `verify_host_skew`, sentinel
   `__verify_host_skew__<host>` (the deployed commit is in its detail), and is
-  resolved on re-admission; a restarted orchestrator resolves the one its
-  predecessor left open.
+  resolved on re-admission. When a restarted orchestrator's merge worker
+  starts, it resolves the skew L1s its predecessor left open for every host
+  in its `verify_runners` config (a host since removed from config is not
+  covered).
 - **`divergence`**: held after a local/remote verdict divergence. It has no
   stored reason today and is cleared only by an operator.
 

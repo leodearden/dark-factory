@@ -42,6 +42,7 @@ import logging
 import os
 import posixpath
 import shlex
+import signal
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -971,14 +972,26 @@ async def _default_subprocess_run(
     Returns (returncode, stdout_str, stderr_str).  A missing ``cwd`` surfaces as
     a raw ``FileNotFoundError`` (caught by callers as OSError → RunnerUnavailable)
     rather than the ``WorktreeMissing`` sentinel that git_ops._run would raise.
+
+    The child runs in its own process group.  If the await is cancelled (a
+    caller's ``asyncio.timeout``), the whole group is killed and the child
+    reaped before the cancellation propagates: a timed-out ``git push``
+    takes its ssh with it rather than leaving both running.
     """
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+        start_new_session=True,
     )
-    stdout_b, stderr_b = await proc.communicate()
+    try:
+        stdout_b, stderr_b = await proc.communicate()
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        await asyncio.shield(proc.wait())
+        raise
     return (
         proc.returncode or 0,
         stdout_b.decode().strip(),
@@ -1454,8 +1467,11 @@ class RemoteRunner:
     async def _push(self, target: str, refspec: str, *, cwd: str | Path) -> None:
         """``git push <target> <refspec>`` over the bounded ssh transport, or raise RunnerUnavailable.
 
-        A failure is classed on the push channel; a push still running after
-        ``ENSURE_CLIENT_TIMEOUT_SECS`` lost its host mid-transfer: 'transport'.
+        A failure is classed on the push channel.  The ssh options make an
+        unreachable or lost host fail within about a minute with an ssh client
+        line ('transport'), so a push still running after
+        ``ENSURE_CLIENT_TIMEOUT_SECS`` has a live session to a host whose
+        receive-pack or hook hung: 'gate', as for ensure-gate's own timeout.
         """
         argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, refspec]
         try:
@@ -1464,8 +1480,9 @@ class RemoteRunner:
         except TimeoutError as exc:
             # BEFORE the OSError clause: TimeoutError subclasses OSError.
             raise RunnerUnavailable(
-                f'git push {target} {refspec} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s',
-                kind='transport',
+                f'git push {target} {refspec} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s '
+                'on a reached host',
+                kind='gate',
             ) from exc
         except OSError as exc:
             raise RunnerUnavailable(

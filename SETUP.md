@@ -875,7 +875,7 @@ Four operator-facing facts:
   commit (about a second warm, a minute cold), are marked ready only once
   their own binary answers the handshake for their commit, are never written
   after that, and are reaped when idle for 7 days (leftover trash after 1 day)
-  by a detached sweep launched at most hourly per orchestrator process (never against a benched host) that touches only a root carrying the
+  by a detached sweep launched at most hourly per orchestrator process (never against a benched host: unreachable, skew or divergence) that touches only a root carrying the
   `.dark-factory-gate-root` marker. The dispatcher emits `runner_stale` then
   `runner_synced` (kind `gate_checkout`) when it had to build one.
 

@@ -9531,10 +9531,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         clock: ClockPort = PRODUCTION_CLOCK,
         remote_runners: Sequence[VerifyRunner] | None = None,
         deployed_sha: DeployedSha | None = None,
+        verify_hosts: Sequence[str] = (),
     ):
         self._git_ops = git_ops
         # Task 6565: handed to every RemoteRunner this worker builds.
         self._deployed_sha = deployed_sha
+        # Task 6565: every verify runner named in config, enabled or not; at
+        # start (run) the worker resolves the bench L1s a previous process
+        # left open for them.  A host since dropped from config is not covered.
+        self._verify_hosts = tuple(verify_hosts)
         self._queue = queue
         self._event_store = event_store
         # Task η (AFK coverage gap): harness-owned handles for the
@@ -10894,10 +10899,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine
             )
-            for remote in remotes:
-                _clear_verify_host_skew_of_an_earlier_process(
-                    self._escalation_queue, remote.name, code_sha=self._deployed_code_sha(),
-                )
             # Copy config knobs onto worker attrs so operator config drives
             # production while __init__ defaults keep bare-worker tests green
             # (mirrors _heartbeat_interval_s precedent).
@@ -11578,8 +11579,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._skew_benches.pop((name, self._deployed_code_sha()), None)
         return {**result, 'cleared': True}
 
+    def _clear_bench_alarms_of_an_earlier_process(self) -> None:
+        """Resolve the skew L1s a previous process left open for this worker's verify hosts.
+
+        A restart clears every bench (design D6), so at start no bench of
+        this process exists yet and any open skew L1 is its predecessor's.
+        Covers the hosts named in config (``verify_hosts``); fault-isolated,
+        since a queue error must never stop the worker starting.
+        """
+        for host in self._verify_hosts:
+            try:
+                _clear_verify_host_skew_of_an_earlier_process(
+                    self._escalation_queue, host, code_sha=self._deployed_code_sha(),
+                )
+            except Exception:
+                logger.exception('could not resolve the earlier skew L1 of host %r', host)
+
     async def _reap_idle_gates(self, now: float) -> None:
-        """At most hourly, launch each in-pool remote's detached gate reaper (design D2)."""
+        """At most hourly, launch the detached gate reaper of each remote in the pool (design D2).
+
+        A benched host (tracked unavailable, or quarantined for any reason,
+        verdict divergence included) is skipped.
+        """
         if not isinstance(self._host_allocator, HostAllocator):
             return
         last = self._last_gate_reap_at
@@ -11588,7 +11609,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._last_gate_reap_at = now
         for name in self._host_allocator.host_names:
             runner = self._host_allocator.remote_runner(name)
-            if runner is not None and name not in self._runner_unavailable:
+            benched = name in self._runner_unavailable or self._host_allocator.is_quarantined(name)
+            if runner is not None and not benched:
                 await runner.reap_idle_gates()
 
     # ── owned-worktree liveness ledger ───────────────────────────────────
@@ -15230,6 +15252,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._spawn_loop('merger')
         self._spawn_loop('verifier')
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._clear_bench_alarms_of_an_earlier_process()
         self._reprobe_task = asyncio.create_task(self._reprobe_loop())
         try:
             await self._loops_finished.wait()

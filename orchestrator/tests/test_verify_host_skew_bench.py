@@ -48,8 +48,8 @@ class _Remote:
 
     is_local: ClassVar[bool] = False
 
-    def __init__(self) -> None:
-        self.name = _HOST
+    def __init__(self, name: str = _HOST) -> None:
+        self.name = name
         self.healthy = True
         self.ensure_error: RunnerUnavailable | None = None
         self.cancel_rc = 0
@@ -94,9 +94,10 @@ class _Events(EventStore):
 
 
 class _Scene:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, *, hosts: tuple[str, ...] = (_HOST,)) -> None:
         self.clock = FakeClock()
-        self.remote = _Remote()
+        self.remotes = [_Remote(name) for name in hosts]
+        self.remote = self.remotes[0]
         self.events = _Events()
         self.escalations = EscalationQueue(tmp_path / 'escalations')
         git_ops = MagicMock()
@@ -104,7 +105,8 @@ class _Scene:
         self.worker = SpeculativeMergeWorker(
             git_ops=git_ops, queue=asyncio.Queue(), event_store=self.events,
             escalation_queue=self.escalations, clock=self.clock,
-            remote_runners=[self.remote], deployed_sha=TEST_DEPLOYED_SHA,
+            remote_runners=self.remotes, deployed_sha=TEST_DEPLOYED_SHA,
+            verify_hosts=hosts,
         )
         self.allocator = self.worker._ensure_host_allocator(OrchestratorConfig(
             project_root=tmp_path,
@@ -113,8 +115,10 @@ class _Scene:
             verify_host_reprobe_interval_s=120.0,
         ))
 
-    def bench(self, kind: RunnerUnavailableKind, reason: str = 'boom', **kw: Any) -> None:
-        self.worker.bench_unavailable_runner(_HOST, RunnerUnavailable(reason, kind=kind, **kw))
+    def bench(
+        self, kind: RunnerUnavailableKind, reason: str = 'boom', *, host: str = _HOST, **kw: Any,
+    ) -> None:
+        self.worker.bench_unavailable_runner(host, RunnerUnavailable(reason, kind=kind, **kw))
 
     async def tick(self, *, advance: float = 120.0) -> None:
         self.clock.time += advance
@@ -274,16 +278,34 @@ async def test_the_skew_l1_names_the_shim_when_the_remote_answered_another_commi
 
 
 @pytest.mark.asyncio
-async def test_a_restarted_process_resolves_the_skew_l1_its_predecessor_left_open(
-    scene: _Scene, tmp_path: Path,
+async def test_a_restarted_process_resolves_the_skew_l1s_its_predecessor_left_open(
+    tmp_path: Path,
 ):
-    """A restart clears every bench, sticky included; its L1 must not be orphaned."""
-    scene.bench('gate')
-    await scene.tick()
-    scene.bench('gate')
-    assert [esc.detail.count('STICKY') for esc in scene.open_l1s()] == [1]
+    """A restart clears every bench, sticky included; its L1s must not be orphaned.
 
-    restarted = _Scene(tmp_path)
+    Resolved when the new worker starts, before any merge request arrives,
+    for every verify host in config.
+    """
+    hosts = (_HOST, 'desktop')
+    before = _Scene(tmp_path, hosts=hosts)
+    before.bench('gate')
+    await before.tick()
+    before.bench('gate')
+    before.bench('wire_shape', host='desktop')
+    assert sorted(esc.task_id for esc in before.open_l1s()) == [
+        '__verify_host_skew__desktop', f'__verify_host_skew__{_HOST}',
+    ]
+
+    restarted = _Scene(tmp_path, hosts=hosts)
+    running = asyncio.create_task(restarted.worker.run())
+    try:
+        for _ in range(500):
+            if not restarted.open_l1s():
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await restarted.worker.stop()
+        await running
 
     assert restarted.open_l1s() == []
     restarted.bench('gate')
@@ -407,3 +429,14 @@ async def test_the_gate_reaper_runs_at_most_hourly_and_only_on_hosts_in_the_pool
     scene.bench('transport')
     await scene.worker._reap_idle_gates(now + 3601)
     assert scene.remote.reaps == 1
+
+
+@pytest.mark.asyncio
+async def test_the_gate_reaper_skips_a_divergence_quarantined_host(scene: _Scene):
+    lease = scene.allocator.acquire_remote()
+    assert lease is not None
+    await scene.allocator.quarantine_and_release(lease)
+
+    await scene.worker._reap_idle_gates(scene.clock.now())
+
+    assert scene.remote.reaps == 0
