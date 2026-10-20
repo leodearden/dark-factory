@@ -23,7 +23,7 @@ from orchestrator.branch_stack import StackBaseLedger
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.liveness import release_chain_build_lane
-from orchestrator.merge_lane.types import ChainResult, QueuedBranch
+from orchestrator.merge_lane.types import ChainResult, GroupMergeRequest, QueuedBranch
 from orchestrator.merge_lane.worker import MergeRequest, build_chain
 
 # ---------------------------------------------------------------------------
@@ -77,6 +77,35 @@ def _make_request(task_id: str, git_ops: GitOps, config: OrchestratorConfig) -> 
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
+    )
+
+
+def _make_train_request(
+    tip_id: str, member_ids: list[str], git_ops: GitOps, config: OrchestratorConfig,
+) -> GroupMergeRequest:
+    tip = QueuedBranch.parse(tip_id, config.git.branch_prefix)
+
+    async def _status_check(_ids: list[str]) -> dict[str, str]:
+        return {}
+
+    async def _mark_member_done(_tid: str, _sha: str) -> None:
+        return None
+
+    return GroupMergeRequest(
+        task_id=tip_id,
+        branch=tip,
+        worktree=git_ops.worktree_base / tip_id,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        train_id=f'train-{tip_id}',
+        member_task_ids=member_ids,
+        tip_branch=tip,
+        tip_task_id=tip_id,
+        status_check=_status_check,
+        mark_member_done=_mark_member_done,
     )
 
 
@@ -171,6 +200,16 @@ class TestUnlandedStackBase:
         await _land_p(git_ops)
         assert await git_ops.unlanded_stack_base('task/M') is None
 
+    async def test_unreadable_landed_check_counts_as_unlanded(
+        self, git_ops: GitOps, git_config: GitConfig,
+    ) -> None:
+        await _stack_m_on_unlanded_p(git_ops)
+        p_tip = await _sha(git_ops, 'task/P')
+        no_main = GitOps(
+            git_config.model_copy(update={'main_branch': 'no-such-branch'}), git_ops.project_root,
+        )
+        assert await no_main.unlanded_stack_base('task/M') == p_tip
+
     async def test_reading_moves_nothing(self, git_ops: GitOps) -> None:
         await _stack_m_on_unlanded_p(git_ops)
         p_tip = await _sha(git_ops, 'task/P')
@@ -234,6 +273,18 @@ class TestBuildChainRefusesStackedLink:
 
         assert await _sha(git_ops, 'task/M') == m_tip
         assert await _ledger(git_ops).base_of('task/M') == p_tip
+
+    async def test_train_tip_stacked_on_its_co_member_is_refused_as_a_train(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        head = await _stack_m_on_unlanded_p(git_ops)
+        train = _make_train_request('M', ['P', 'M'], git_ops, config)
+
+        result = await build_chain(git_ops, [train], head, cap=1, target_depth=1)
+
+        assert result.links == [], f'{result=}'
+        assert result.truncated_at == 'M', f'{result=}'
+        assert result.truncated_reason == 'train_request', f'{result=}'
 
     async def test_link_whose_stack_base_landed_still_chains(
         self, git_ops: GitOps, config: OrchestratorConfig,
