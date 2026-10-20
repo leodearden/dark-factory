@@ -14170,6 +14170,46 @@ class Harness:
             and eval_lane_provenance(esc.task_id, esc.worktree) is None
         )
 
+    @staticmethod
+    def _dismiss_under_covering_l1(queue: EscalationQueue, esc: Escalation) -> bool:
+        """Dismiss orphan *esc* when an open L1 of its category covers its task.
+
+        Category-scoped by the unblock-4917 amendment: an L1 about another
+        category does not cover a new root cause.  Each covering L1 is amended
+        with the dismissed record, so the dismissal never silences it.  The
+        filter reads ``get_by_task`` directly because ``has_open_l1(category=)``
+        raises for a legacy category, and the reaper loop has no per-record
+        guard.
+        """
+        covering = [
+            l1 for l1 in queue.get_by_task(esc.task_id, status='pending', level=1)
+            if l1.category == esc.category
+        ]
+        if not covering:
+            return False
+        for l1 in covering:
+            queue.amend(
+                l1.id,
+                agent_role='harness-orphan-reaper',
+                summary=f'Covered orphan L0 {esc.id}: {esc.summary}',
+                detail=(
+                    f'{esc.id} ({esc.agent_role}, severity={esc.severity}) was dismissed '
+                    f'by the orphan reaper as covered by this open {esc.category} L1.\n\n'
+                    f'{esc.detail}'
+                ),
+            )
+        queue.resolve(
+            esc.id,
+            (
+                'Dismissed by orphan reaper — open L1 already covers this task '
+                f'(task_id={esc.task_id}, category={esc.category}, '
+                f'covering={", ".join(l1.id for l1 in covering)})'
+            ),
+            dismiss=True,
+            resolved_by='harness-orphan-reaper',
+        )
+        return True
+
     #: "not read yet", distinguishable from a genuine ``get_task`` -> ``None``
     #: (no such row).  Scoped to :meth:`_reap_orphan_l0_escalations`'s per-record
     #: memo, whose whole point is that ONE record costs at most ONE task read.
@@ -14329,18 +14369,10 @@ class Harness:
             # orphan source by skipping L0 creation on escalate_to_human
             # paths, but other L0 sources remain (agent escalate_info,
             # deep-reviewer L0s, steward-chained L0s) and an /unblock can be
-            # in flight.  If an L1 is already open for this task, dismiss the
-            # orphan L0 rather than promoting it to a duplicate "echo" L1.
-            if self._escalation_queue.has_open_l1(esc.task_id):
-                self._escalation_queue.resolve(
-                    esc.id,
-                    (
-                        'Dismissed by orphan reaper — open L1 already covers '
-                        f'this task (task_id={esc.task_id})'
-                    ),
-                    dismiss=True,
-                    resolved_by='harness-orphan-reaper',
-                )
+            # in flight.  If an L1 about the same category is already open for
+            # this task, dismiss the orphan L0 rather than promoting it to a
+            # duplicate "echo" L1.
+            if self._dismiss_under_covering_l1(self._escalation_queue, esc):
                 continue
 
             # Live lock-free-stage race (task 2931): defer — don't promote —
