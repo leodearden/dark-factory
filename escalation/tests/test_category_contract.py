@@ -46,7 +46,21 @@ _AGENT_INSTRUCTED = (
 )
 
 
+# Categories filed through ``escalation submit`` by producers in other
+# repositories, which the census cannot walk. Each entry names its producer.
+_EXTERNAL_PRODUCERS = (
+    pytest.param(
+        'validation_lane_red',
+        id='solar-challenge-platform:ci/cadence_alert.py::CATEGORY',
+    ),
+)
+
+
 class TestRegistry:
+    @pytest.mark.parametrize('value', _EXTERNAL_PRODUCERS)
+    def test_external_producer_categories_stay_registered(self, value: str):
+        assert value in EscalationCategory
+
     @pytest.mark.parametrize('value', _REGISTERED_AHEAD_OF_ANY_PRODUCER)
     def test_registered_ahead_of_any_producer(self, value: str):
         assert value in EscalationCategory
@@ -175,7 +189,7 @@ class TestQueueChokepoint:
             task_id='legacy',
             agent_role='implementer',
             severity='blocking',
-            category='validation_lane_red',
+            category='retired_legacy_category',
             summary='a record filed before the registry existed',
             level=1,
         )
@@ -184,7 +198,7 @@ class TestQueueChokepoint:
 
         loaded = queue.get('esc-legacy-1')
         assert loaded is not None
-        assert loaded.category == 'validation_lane_red'
+        assert loaded.category == 'retired_legacy_category'
         assert 'esc-legacy-1' in [e.id for e in queue.get_pending()]
 
         closed = queue.resolve('esc-legacy-1', 'closed')
