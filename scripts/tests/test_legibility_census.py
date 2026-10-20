@@ -2783,7 +2783,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         # Nothing is ever similar and the queue cap is 0, so a suite not about
         # the similarity stage (census PRD L7) sees no attach and no queue verify.
         embedder=embeddings.Embedder(
-            embed_fn=_nothing_similar_embed, cache_path=tmp_path / "embeddings.sqlite",
+            embed_fn=_nothing_similar_embed, cache_path=embeddings.cache_path("dark_factory"),
         ),
         config=_census_config(tmp_path),
         project_root=str(tmp_path),
@@ -11446,7 +11446,7 @@ def _similarity_kwargs(tmp_path, chosen, *, codebook_dict=None, batch=None, **ad
         synthesize_fn=_make_fake_synthesize_fn(),
         commit=_make_fake_commit(),
         codebook_dict=codebook_dict or _minimal_v2_codebook(),
-        embedder=embeddings.Embedder(embed_fn=embed, cache_path=tmp_path / "embeddings.sqlite"),
+        embedder=embeddings.Embedder(embed_fn=embed, cache_path=embeddings.cache_path("dark_factory")),
         config=_census_config(tmp_path, **{"max_clusters_per_run": 10, **adjudication}),
     )
     return kwargs, embed

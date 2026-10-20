@@ -116,6 +116,7 @@ from legibility import (  # noqa: E402
     config,
     digest,
     disposition,
+    embeddings,
     filing_policy,
     finding_area,
     invariants,
@@ -2599,6 +2600,7 @@ def run_census(
     status_fetcher,
     commit,
     roll_back,
+    embedder: embeddings.Embedder,
     codebook_dict: dict,
     config,
     project_root: str,
@@ -2674,7 +2676,9 @@ def run_census(
     is promoted afresh and surfaced, and a promotion at a finding another
     instrument's newest record keys adopts that key
     (``prescreen.load_instrument_findings``) -- and every entry sighted this run has the
-    run appended to its ``last_seen_runs`` -> ``codebook.validate`` (raises and aborts BEFORE
+    run appended to its ``last_seen_runs``; the similarity stage that screens,
+    attaches and queues by embedding is plans/census-incremental-prd.md L7
+    (``similarity.build_view``) -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the route gate
     (``disposition.files``, contract §6: a structural verdict stays promoted
     and is listed under ## Structural, never filed) -> the singleton filing
@@ -2913,7 +2917,10 @@ def run_census(
     screen = prescreen.screen(_novel_clusters(mining_result.records), catalogue)
     routed_records = prescreen.routed_records(mining_result.records, catalogue, run_id=run_id)
     session_screened = sum(1 for item in screen.screened if item.rule is prescreen.Rule.SESSION)
-    novel_clusters = list(screen.to_verify)
+    view = similarity.build_view(
+        codebook_dict, screen.to_verify, embedder=embedder, settings=config.census.adjudication,
+    )
+    novel_clusters = [cluster for cluster in screen.to_verify if not view.screens(cluster)]
     if max_verify_clusters is None:
         clusters_to_verify = novel_clusters
         verify_coverage = None
@@ -3069,6 +3076,7 @@ def run_census(
             "; ".join(skipped.describe() for skipped in merge.skipped_deletions),
         )
     codebook.warn_unknown_invariant_slugs(merge.invariant_slugs, invariant_slugs, run=run_id)
+    updated_codebook, attached = similarity.attach(updated_codebook, view, run_id=run_id)
 
     # ONE list for every verdict this run paid for and dropped, shared by both
     # adjudication loops below -- a per-loop name would fork the tally
@@ -3346,9 +3354,7 @@ def run_census(
     screen_report = prescreen.ScreenReport(
         screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
     )
-    adjudication_report = similarity.AdjudicationReport(
-        similarity.View(settings=config.census.adjudication, depth=(0, 0)), (), (), (), None,
-    )
+    adjudication_report = similarity.AdjudicationReport(view, attached, (), (), None)
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
@@ -3368,7 +3374,7 @@ def run_census(
         screened=screen_report.counts(),
         inputs_consumed=screen_report.inputs.consumed,
         inputs_consumed_note=screen_report.inputs.note,
-        embedding_calls=adjudication_report.view.requests,
+        embedding_calls=view.requests,
         adjudication=adjudication_report.counts(),
     )
     record = build_census_record(
