@@ -104,6 +104,7 @@ from orchestrator.merge_lane.liveness import (
     _alarm_verify_host_skew,
     _alarm_verify_host_unreachable,
     _clear_verify_host_skew,
+    _clear_verify_host_skew_of_an_earlier_process,
     _clear_verify_host_unreachable,
     _safety_valve_due,
     acquire_chain_build_lane,
@@ -10893,6 +10894,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._host_allocator = HostAllocator(
                 remotes, quarantine=self._runner_quarantine
             )
+            for remote in remotes:
+                _clear_verify_host_skew_of_an_earlier_process(
+                    self._escalation_queue, remote.name, code_sha=self._deployed_code_sha(),
+                )
             # Copy config knobs onto worker attrs so operator config drives
             # production while __init__ defaults keep bare-worker tests green
             # (mirrors _heartbeat_interval_s precedent).
@@ -10978,7 +10983,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         a passing probe: re-admitting again would only spend another verify
         (design D6).  A failing reprobe opens no bench and so never counts.
         """
-        key = (host, self._deployed_sha.sha if self._deployed_sha is not None else None)
+        key = (host, self._deployed_code_sha())
         self._skew_benches[key] = self._skew_benches.get(key, 0) + 1
         entry.sticky = self._skew_benches[key] >= 2
 
@@ -11510,11 +11515,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Un-quarantines and un-PARKs it (``allocator.readmit``, refused when the
         park episode moved past *expect_epoch*), drops its tracker entry, and
         resolves its open unreachability and skew L1s.  The reprobe sweep calls
-        it after a passing :meth:`probe_host`; :meth:`clear_host_quarantine`
-        (the operator clear) calls it without one.  The per-(host, sha) skew
-        count survives, so a host cleared after a sticky bench goes sticky
-        again on its next skew failure.  Returns whether the host was
-        re-admitted.
+        it after a passing :meth:`probe_host`, and keeps the per-(host, sha)
+        skew count that makes the next skew bench sticky;
+        :meth:`clear_host_quarantine` (the operator clear) calls it without a
+        probe and then resets that count, as a restart does.  Returns whether
+        the host was re-admitted.
         """
         _readmit = getattr(self._host_allocator, 'readmit', None)
         if _readmit is None:
@@ -11530,8 +11535,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._escalation_queue, self._event_store, name, downtime_s=downtime_s,
         )
         _clear_verify_host_skew(
-            self._escalation_queue, self._event_store, name,
-            code_sha=self._deployed_code_sha(), downtime_s=downtime_s,
+            self._escalation_queue, self._event_store, name, downtime_s=downtime_s,
         )
         return True
 
@@ -11541,9 +11545,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Re-admits remote *name* whatever benched it — an 'ru' or 'skew' bench,
         sticky or not, or a verdict-divergence quarantine — without probing
         its health; a PARKED slot is still freed only once ``probe_clean()``
-        finds no stale verify there.  Returns ``{host, cleared,
-        quarantine_class, was_sticky}`` plus ``reason`` when nothing was
-        cleared.
+        finds no stale verify there.  Like a restart, a clear resets the
+        host's skew count, so its next skew bench is a first one again
+        (design D6: sticky lasts until a restart or an operator clear).
+        Returns ``{host, cleared, quarantine_class, was_sticky}`` plus
+        ``reason`` when nothing was cleared.
         """
         entry = self._runner_unavailable.get(name)
         quarantined = name in self._runner_quarantine
@@ -11569,6 +11575,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 **result,
                 'reason': 'its slot is PARKED and a stale verify may still be running there',
             }
+        self._skew_benches.pop((name, self._deployed_code_sha()), None)
         return {**result, 'cleared': True}
 
     async def _reap_idle_gates(self, now: float) -> None:

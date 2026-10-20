@@ -10,8 +10,8 @@
 #   PATH       already carries uv and git; `orchestrator` is the host shim,
 #              which runs "${ORCH_GATE_BIN:-<shared tree>}"
 #
-# Invariant: a dir carrying .ready has answered `gate-identity` through its own
-# binary. Builds happen in place (a moved uv venv is dead: its shebangs and
+# Invariant: a dir carrying .ready has answered `gate-identity` for $SHA through
+# its own binary. Builds happen in place (a moved uv venv is dead: its shebangs and
 # editable .pth entries are absolute) under a per-sha build lock; after .ready
 # nothing writes into the dir. stdout carries only the final JSON line; every
 # diagnostic goes to stderr. Exit status 255 is the ssh client's own failure
@@ -74,7 +74,16 @@ if ! identity=$(handshake); then
 	built=true
 	identity=$(handshake) || die "rebuilt gate $dir failed its handshake" 70
 fi
-touch "$dir/.ready"
+# A shim that ignores ORCH_GATE_BIN answers for whatever tree it runs: such a
+# dir is not proven, so it stays unready and the client names the shim.
+answered=''
+code_sha_re='"code_sha":[[:space:]]*"([0-9a-f]{40})"'
+[[ $identity =~ $code_sha_re ]] && answered=${BASH_REMATCH[1]}
+if [[ $answered == "$SHA" ]]; then
+	touch "$dir/.ready"
+else
+	echo "ensure-gate: $dir answered for '${answered:-?}', not $SHA; not marking it ready" >&2
+fi
 # The last-used stamp the reaper ages: every ensure refreshes it.
 touch -c "$dir"
 exec 9>&-

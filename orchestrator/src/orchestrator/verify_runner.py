@@ -125,6 +125,7 @@ __all__ = [
     "VerifyRunnerPool",
     "RunnerUnavailableSink",
     "REMOTE_TOOL_PATH_PRELUDE",
+    "GIT_PUSH_SSH_CONFIG",
     "build_merge_verify_spec",
     "_module_config_from_command",
     "run_merge_verify_on_worktree",
@@ -920,6 +921,11 @@ _SSH_BASE_OPTS = [
     '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
 ]
 
+# The same options for git's own ssh transport, as a `git -c` global option, so
+# a RemoteRunner push to a sleeping host fails as fast and as batch-safely as
+# its ssh commands do instead of riding ~/.ssh/config (task 6565).
+GIT_PUSH_SSH_CONFIG = ('-c', f'core.sshCommand=ssh {" ".join(_SSH_BASE_OPTS)}')
+
 # Exit status ssh reserves for its OWN errors rather than the remote command's:
 # "ssh exits with the exit status of the remote command or with 255 if an error
 # occurred" (ssh(1), EXIT STATUS).  A sleeping host, a refused connection, a
@@ -1446,9 +1452,21 @@ class RemoteRunner:
             )
 
     async def _push(self, target: str, refspec: str, *, cwd: str | Path) -> None:
-        """``git push <target> <refspec>``; a failure raises RunnerUnavailable classed on the push channel."""
+        """``git push <target> <refspec>`` over the bounded ssh transport, or raise RunnerUnavailable.
+
+        A failure is classed on the push channel; a push still running after
+        ``ENSURE_CLIENT_TIMEOUT_SECS`` lost its host mid-transfer: 'transport'.
+        """
+        argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, refspec]
         try:
-            rc, _, stderr = await self._run(['git', 'push', target, refspec], cwd=cwd)
+            async with asyncio.timeout(ENSURE_CLIENT_TIMEOUT_SECS):
+                rc, _, stderr = await self._run(argv, cwd=cwd)
+        except TimeoutError as exc:
+            # BEFORE the OSError clause: TimeoutError subclasses OSError.
+            raise RunnerUnavailable(
+                f'git push {target} {refspec} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s',
+                kind='transport',
+            ) from exc
         except OSError as exc:
             raise RunnerUnavailable(
                 f'git push spawn failed: {exc}', kind=classify_remote_exit(None),

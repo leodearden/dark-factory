@@ -174,7 +174,8 @@ async def test_an_unknown_keyword_verdict_benches_as_skew_with_event_and_l1_at_o
     assert [e['kind'] for e in scene.events.of(EventType.verify_host_skew)] == ['wire_shape']
     [l1] = scene.open_l1s()
     assert l1.category == 'verify_host_skew'
-    assert l1.task_id == f'__verify_host_skew__{_HOST}@{TEST_DEPLOYED_SHA.sha}'
+    assert l1.task_id == f'__verify_host_skew__{_HOST}'
+    assert TEST_DEPLOYED_SHA.sha in l1.detail
 
 
 @pytest.mark.asyncio
@@ -273,6 +274,23 @@ async def test_the_skew_l1_names_the_shim_when_the_remote_answered_another_commi
 
 
 @pytest.mark.asyncio
+async def test_a_restarted_process_resolves_the_skew_l1_its_predecessor_left_open(
+    scene: _Scene, tmp_path: Path,
+):
+    """A restart clears every bench, sticky included; its L1 must not be orphaned."""
+    scene.bench('gate')
+    await scene.tick()
+    scene.bench('gate')
+    assert [esc.detail.count('STICKY') for esc in scene.open_l1s()] == [1]
+
+    restarted = _Scene(tmp_path)
+
+    assert restarted.open_l1s() == []
+    restarted.bench('gate')
+    assert restarted.host()['sticky'] is False
+
+
+@pytest.mark.asyncio
 async def test_two_skew_failures_in_one_episode_are_not_sticky(scene: _Scene):
     """No passing probe came between them, so the cause has not survived one."""
     scene.bench('gate')
@@ -334,7 +352,7 @@ async def test_the_operator_clear_lifts_a_sticky_bench(scene: _Scene):
     assert scene.in_pool()
     assert scene.open_l1s() == []
     scene.bench('gate')
-    assert scene.host()['sticky'] is True, 'the per-(host, sha) count survives the clear'
+    assert scene.host()['sticky'] is False, 'a clear resets the count, as a restart does'
 
 
 @pytest.mark.asyncio

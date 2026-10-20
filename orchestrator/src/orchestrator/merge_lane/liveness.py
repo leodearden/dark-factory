@@ -477,9 +477,11 @@ _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
 _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX = '__verify_host_recovered__'
 
 
-# Prefix for per-(host, deployed sha) gate-skew escalation sentinels (task
-# 6565): ``__verify_host_skew__<host>@<sha>``.  Separate from the
-# unreachability namespace so an open "unreachable" L1 never hides a skew one.
+# Prefix for per-host gate-skew escalation sentinels (task 6565):
+# ``__verify_host_skew__<host>``; the deployed sha is in the detail.  Separate
+# from the unreachability namespace so an open "unreachable" L1 never hides a
+# skew one.  Per host, not per sha, so a restarted process (a new sha) finds
+# and resolves the L1 its predecessor left open.
 _VERIFY_HOST_SKEW_SENTINEL_PREFIX = '__verify_host_skew__'
 
 
@@ -496,9 +498,9 @@ def _verify_host_unreachable_sentinel(host: str) -> str:
     return f'{_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX}{host}'
 
 
-def _verify_host_skew_sentinel(host: str, code_sha: str | None) -> str:
-    """Return the per-(host, deployed sha) dedup sentinel task_id for skew alarms."""
-    return f'{_VERIFY_HOST_SKEW_SENTINEL_PREFIX}{host}@{code_sha or "unknown"}'
+def _verify_host_skew_sentinel(host: str) -> str:
+    """Return the per-host dedup sentinel task_id for skew alarms."""
+    return f'{_VERIFY_HOST_SKEW_SENTINEL_PREFIX}{host}'
 
 
 def _alarm_verify_host_unreachable(
@@ -632,13 +634,14 @@ def _alarm_verify_host_skew(
     verify failed there: *entry* says how (``kind``, ``reason``, the two gate
     identities when a handshake mismatched) and whether the bench is sticky.
     Blocking and non-halting like the unreachability alarm, but in its own
-    category ``verify_host_skew`` and deduped per (host, deployed sha), so an
-    open unreachability L1 never hides it.  Names the host-shim remedy when
-    the failure points at the shim.  None-safe on *escalation_queue*.
+    category ``verify_host_skew`` and deduped per host, so an open
+    unreachability L1 never hides it; *code_sha* (the deployed sha) goes in
+    the detail.  Names the host-shim remedy when the failure points at the
+    shim.  None-safe on *escalation_queue*.
     """
     if escalation_queue is None:
         return
-    sentinel = _verify_host_skew_sentinel(host, code_sha)
+    sentinel = _verify_host_skew_sentinel(host)
     if escalation_queue.has_open_l1(sentinel):
         return
     shim = shim_suspected(entry.reason, entry.identity)
@@ -686,35 +689,60 @@ def _alarm_verify_host_skew(
     ))
 
 
+def _resolve_verify_host_skew(escalation_queue: Any, host: str, resolution: str) -> bool:
+    """Resolve *host*'s pending skew L1s with *resolution*; return whether one was open."""
+    if escalation_queue is None:
+        return False
+    sentinel = _verify_host_skew_sentinel(host)
+    if not escalation_queue.has_open_l1(sentinel):
+        return False
+    for esc in escalation_queue.get_by_task(sentinel, status='pending'):
+        escalation_queue.resolve(
+            esc.id, resolution, resolved_by='orchestrator-verify-host-monitor',
+        )
+    return True
+
+
 def _clear_verify_host_skew(
     escalation_queue: Any,
     event_store: Any,
     host: str,
     *,
-    code_sha: str | None,
     downtime_s: float,
 ) -> None:
-    """Resolve an open skew alarm for (*host*, *code_sha*) on readmit.
+    """Resolve an open skew alarm for *host* on readmit.
 
     Emits ``verify_host_recovered`` only when an alarm was open, mirroring
     :func:`_clear_verify_host_unreachable`.  None-safe on *escalation_queue*.
     """
-    if escalation_queue is None:
+    resolution = (
+        f'Host {host!r} re-admitted after {downtime_s / 60.0:.1f} min benched for gate skew.'
+    )
+    if not _resolve_verify_host_skew(escalation_queue, host, resolution):
         return
-    sentinel = _verify_host_skew_sentinel(host, code_sha)
-    if not escalation_queue.has_open_l1(sentinel):
-        return
-    for esc in escalation_queue.get_by_task(sentinel, status='pending'):
-        escalation_queue.resolve(
-            esc.id,
-            f'Host {host!r} re-admitted after {downtime_s / 60.0:.1f} min benched for gate skew.',
-            resolved_by='orchestrator-verify-host-monitor',
-        )
     if event_store is not None:
         event_store.emit(
             EventType.verify_host_recovered,
             data={'host': host, 'downtime_s': downtime_s, 'quarantine_class': 'skew'},
         )
+
+
+def _clear_verify_host_skew_of_an_earlier_process(
+    escalation_queue: Any, host: str, *, code_sha: str | None,
+) -> None:
+    """Resolve a skew L1 that a previous orchestrator process left open for *host*.
+
+    A restart clears every bench, sticky ones included (design D6): this
+    process starts with no bench and no skew count, so an L1 still open is
+    about a bench that no longer exists.  If the cause survives, this
+    process benches the host again and files a fresh L1.
+    """
+    _resolve_verify_host_skew(
+        escalation_queue, host,
+        f'Orchestrator restarted at {code_sha}; the skew bench of {host!r} from the '
+        'previous process is cleared (a restart resets every bench).  A new L1 '
+        'follows if the cause survives.',
+    )
 
 
 def _clear_verify_host_unreachable(

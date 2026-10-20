@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from _gate_fixtures import without_push_ssh_config
 from click.testing import CliRunner
 
 from orchestrator.deployed_sha import DeployedSha
@@ -47,6 +48,7 @@ from orchestrator.remote_gate import (
 )
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    GIT_PUSH_SSH_CONFIG,
     REMOTE_TOOL_PATH_PRELUDE,
     DriftDetector,
     DriftVerdict,
@@ -197,6 +199,12 @@ _PUSH_REFUSED_CONNECTION = (
     (128, 'kex_exchange_identification: read: Connection reset by peer', 'git_push', 'transport'),
     (128, 'Connection timed out during banner exchange', 'git_push', 'transport'),
     (128, 'Connection closed by 192.168.1.20 port 22', 'git_push', 'transport'),
+    # The connection lost mid-push: the laptop went to sleep.
+    (128, 'Connection to leo-laptop closed by remote host.\nfatal: the remote end hung up', 'git_push', 'transport'),
+    (128, 'Timeout, server leo-laptop not responding.\nfatal: the remote end hung up', 'git_push', 'transport'),
+    (128, 'client_loop: send disconnect: Broken pipe\nfatal: sha1 file write error', 'git_push', 'transport'),
+    (1, 'remote: Connection to db closed by remote host.\n ! [remote rejected] x', 'git_push', 'gate'),
+    (1, 'Connection to leo-laptop closed by remote host.', 'ssh', 'gate'),
     (1, ' ! [remote rejected] abc -> refs/gate/abc (deny updating a hidden ref)', 'git_push', 'gate'),
     (128, "fatal: '/home/leo/src/dark-factory' does not appear to be a git repository", 'git_push', 'gate'),
     (1, ' ! [remote rejected] main -> main (Working directory has unstaged changes)', 'git_push', 'gate'),
@@ -372,6 +380,25 @@ def test_a_gate_that_fails_its_first_handshake_is_never_marked_ready(remote: _Re
     assert not (remote.gate / '.ready').exists()
 
 
+def test_a_gate_answering_another_commit_is_reported_but_never_marked_ready(remote: _Remote):
+    """A shim that ignores ORCH_GATE_BIN answers for its own tree: no proof, no .ready."""
+    other = '0' * 40
+    (Path(remote.env['PATH'].split(':')[0]) / 'orchestrator').write_text(
+        '#!/usr/bin/env bash\n'
+        f'printf \'{{"code_sha": "{other}", "wire_fingerprint": "{FAKE_FINGERPRINT}"}}\\n\'\n',
+    )
+
+    result = remote.ensure()
+
+    assert result.returncode == 0, result.stderr
+    assert parse_ensure_report(result.stdout) == EnsureReport(
+        built=True, identity=GateIdentity(other, FAKE_FINGERPRINT),
+    )
+    assert not (remote.gate / '.ready').exists()
+    assert remote.ensure().returncode == 0
+    assert remote.builds() == 2, 'an unproven dir is rebuilt, never reused'
+
+
 def test_a_non_ready_dir_is_trashed_and_rebuilt(remote: _Remote):
     remote.gate.mkdir(parents=True)
     (remote.gate / 'half-built').write_text('x')
@@ -448,12 +475,15 @@ def test_the_build_lock_file_is_left_in_place(remote: _Remote):
 
 
 def test_ensure_never_exits_with_the_ssh_transport_status(remote: _Remote):
-    """rc 255 means 'the ssh client failed'; a gate failure must not look like one."""
-    (Path(remote.env['PATH'].split(':')[0]) / 'orchestrator').write_text(
-        '#!/usr/bin/env bash\nexit 255\n',
-    )
+    """rc 255 means 'the ssh client failed'; a gate failure must not look like one.
+
+    A tool that itself exits 255 (here ``uv sync``) aborts the script under
+    ``set -e`` with that status, so only the EXIT trap stands between it and
+    the ssh client's own failure code.
+    """
+    (Path(remote.env['PATH'].split(':')[0]) / 'uv').write_text('#!/usr/bin/env bash\nexit 255\n')
     result = remote.ensure()
-    assert result.returncode not in (0, 255)
+    assert result.returncode == 70, result.stderr
 
 
 @pytest.mark.parametrize(('name', 'value'), [
@@ -521,11 +551,11 @@ class _LocalHost:
     async def run(self, argv: list[str], *, cwd: str | Path | None = None) -> tuple[int, str, str]:
         self.calls.append(list(argv))
         env = None
-        cmd = list(argv)
+        cmd = without_push_ssh_config(argv)
         if argv[0] == 'ssh':
             cmd, env = ['bash', '-c', argv[-1]], self.ssh_env
-        elif argv[:2] == ['git', 'push'] and argv[2].startswith('gate-host:'):
-            cmd[2] = argv[2].removeprefix('gate-host:')
+        elif cmd[:2] == ['git', 'push'] and cmd[2].startswith('gate-host:'):
+            cmd[2] = cmd[2].removeprefix('gate-host:')
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cwd, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -692,10 +722,11 @@ class _Scripted:
 
     @staticmethod
     def role(argv: list[str]) -> str:
-        if argv[:2] == ['git', 'push']:
-            if '--delete' in argv:
+        plain = without_push_ssh_config(argv)
+        if plain[:2] == ['git', 'push']:
+            if '--delete' in plain:
                 return 'delete'
-            return 'publish' if ':refs/gate/' in argv[3] else 'verify_push'
+            return 'publish' if ':refs/gate/' in plain[3] else 'verify_push'
         if argv[0] == 'ssh':
             if argv[-1].endswith(' ensure-gate'):
                 return 'ensure'
@@ -745,8 +776,13 @@ async def test_publish_pushes_the_deployed_sha_by_url_from_the_code_checkout():
 
     assert transport.roles() == ['publish', 'ensure', 'verify_push', 'verify', 'delete']
     _, publish, cwd = transport.calls[0]
-    assert publish == ['git', 'push', 'leo-laptop:/laptop/dark-factory', f'{_SHA}:refs/gate/{_SHA}']
+    assert publish == [
+        'git', *GIT_PUSH_SSH_CONFIG, 'push',
+        'leo-laptop:/laptop/dark-factory', f'{_SHA}:refs/gate/{_SHA}',
+    ]
     assert cwd == '/dispatcher/checkout'
+    _, verify_push, _ = transport.calls[2]
+    assert verify_push[:1 + len(GIT_PUSH_SSH_CONFIG)] == ['git', *GIT_PUSH_SSH_CONFIG]
     ensure = transport.calls[1][1][-1]
     assert ensure.startswith(f'{REMOTE_TOOL_PATH_PRELUDE} env GATE_ROOT=/gates SHA={_SHA} ')
     assert 'SOURCE=/laptop/dark-factory bash -c ' in ensure
@@ -818,6 +854,37 @@ async def test_an_ensure_that_never_answers_is_gate(monkeypatch):
 
     assert exc.kind == 'gate'
     assert 'exceeded' in str(exc)
+
+
+def test_pushes_ride_the_batch_mode_bounded_ssh_transport():
+    """No push may prompt, or wait out the kernel's SYN retries, against a sleeping laptop."""
+    [flag, value] = GIT_PUSH_SSH_CONFIG
+    assert flag == '-c'
+    key, command = value.split('=', 1)
+    assert key == 'core.sshCommand'
+    words = shlex.split(command)
+    assert words[0] == 'ssh'
+    options = {words[i + 1].split('=', 1)[0] for i, w in enumerate(words) if w == '-o'}
+    assert options >= {'BatchMode', 'ConnectTimeout', 'ServerAliveInterval', 'ServerAliveCountMax'}
+    assert 'BatchMode=yes' in words
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('role', ['publish', 'verify_push'])
+async def test_a_push_that_never_returns_is_transport(monkeypatch, role):
+    """A host lost mid-push holds no lease past the bound, and a sleeping laptop is not skew."""
+    monkeypatch.setattr('orchestrator.verify_runner.ENSURE_CLIENT_TIMEOUT_SECS', 0.05)
+
+    async def hang() -> tuple[int, str, str]:
+        await asyncio.Event().wait()
+        raise AssertionError('unreachable')
+
+    transport = _Scripted(**{role: hang})
+    exc = await _unavailable(transport)
+
+    assert exc.kind == 'transport'
+    assert 'exceeded' in str(exc)
+    assert 'verify' not in transport.roles()
 
 
 @pytest.mark.asyncio

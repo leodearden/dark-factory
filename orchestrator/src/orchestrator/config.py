@@ -5390,10 +5390,12 @@ class OrchestratorConfig(BaseSettings):
         default=120.0,
         ge=1,
         description=(
-            'When Lever C is on, the _reprobe_loop checks quarantined remote hosts '
-            'for reachability (via RemoteRunner.health()) every this many seconds.  '
-            'On recovery the quarantine is cleared and the host re-enters the live '
-            'pool without an orchestrator restart.  Must be >= 1.'
+            'When Lever C is on, the _reprobe_loop re-probes benched remote hosts '
+            'every this many seconds: an unreachable (\'ru\') bench by '
+            'RemoteRunner.health() (ssh true), a gate-skew (\'skew\') bench by '
+            'RemoteRunner.ensure_gate(); a sticky skew bench is not probed (task '
+            '6565).  On a passing probe the host re-enters the live pool without '
+            'an orchestrator restart.  Must be >= 1.'
         ),
     )
 

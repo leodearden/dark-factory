@@ -4,7 +4,9 @@ Every RemoteRunner dispatch first publishes the deployed sha and runs
 ensure-gate over ssh (``RemoteRunner.ensure_gate``).  Tests about something
 else build their runner with :func:`gated_remote_runner`, whose injected
 ``run`` answers those two calls itself and hands every other call to the
-test's own fake, so that fake sees exactly the calls it saw before gating.
+test's own fake, so that fake sees exactly the calls it saw before gating:
+a push arrives as ``git push ...``, without the ``GIT_PUSH_SSH_CONFIG``
+transport options (test_remote_gate.py pins those on the raw argv).
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from typing import Any
 
 from orchestrator.deployed_sha import DeployedSha
 from orchestrator.remote_gate import GateIdentity, local_gate_identity
-from orchestrator.verify_runner import RemoteRunner
+from orchestrator.verify_runner import GIT_PUSH_SSH_CONFIG, RemoteRunner
 
 TEST_DEPLOYED_SHA = DeployedSha(sha='d' * 40, indeterminate=False, dirty_wire_path=False)
 TEST_DF_REMOTE = '/remote/dark-factory'
@@ -27,9 +29,18 @@ TEST_GATE_BIN = f'{TEST_GATE_ROOT}/{TEST_DEPLOYED_SHA.sha}/.venv/bin/orchestrato
 Run = Callable[..., Awaitable[tuple[int, str, str]]]
 
 
+def without_push_ssh_config(argv: list[str]) -> list[str]:
+    """*argv* with RemoteRunner's ``git -c core.sshCommand=...`` options removed."""
+    n = len(GIT_PUSH_SSH_CONFIG)
+    if argv[:1] == ['git'] and tuple(argv[1:1 + n]) == GIT_PUSH_SSH_CONFIG:
+        return ['git', *argv[1 + n:]]
+    return argv
+
+
 def is_gate_publish(argv: list[str]) -> bool:
     """The ``git push <host>:<df> <sha>:refs/gate/<sha>`` of ``RemoteRunner.publish_sha``."""
-    return argv[:2] == ['git', 'push'] and len(argv) > 3 and ':refs/gate/' in argv[3]
+    plain = without_push_ssh_config(argv)
+    return plain[:2] == ['git', 'push'] and len(plain) > 3 and ':refs/gate/' in plain[3]
 
 
 def is_ensure(argv: list[str]) -> bool:
@@ -52,7 +63,7 @@ def gated_run(inner: Run, *, built: bool = False) -> Run:
             return (0, '', '')
         if is_ensure(argv):
             return (0, reply, '')
-        return await inner(argv, cwd=cwd)
+        return await inner(without_push_ssh_config(argv), cwd=cwd)
 
     return run
 

@@ -47,14 +47,19 @@ GATE_ROOT_MARKER = '.dark-factory-gate-root'
 _FULL_SHA = re.compile(r'[0-9a-f]{40}')
 _SHA256_HEX = re.compile(r'[0-9a-f]{64}')
 
-# Lines the ssh CLIENT writes when it could not reach or keep the host.  A git
-# push over ssh exits 128 for these and for every other refusal alike, so its
-# stderr is the only place the cause shows.  Anchored at line start so a remote
-# program's output cannot match by mentioning a refused connection.
+# Lines the ssh CLIENT writes when it could not reach the host, or lost it
+# mid-session (a laptop going to sleep during a push).  A git push over ssh
+# exits 128 for these and for every other refusal alike, so its stderr is the
+# only place the cause shows.  Anchored at line start so a remote program's
+# output (which git prefixes "remote: ") cannot match by mentioning a refused
+# connection.
 _SSH_CONNECT_FAILURE = re.compile(
     r'^(?:ssh: (?:connect to host |Could not resolve hostname )'
     r'|kex_exchange_identification: '
     r'|Connection (?:closed|reset|timed out) '
+    r'|Connection to \S+ closed by remote host'
+    r'|Timeout, server \S+ not responding'
+    r'|client_loop: send disconnect: '
     r'|ssh_exchange_identification: )',
     re.MULTILINE,
 )
@@ -193,8 +198,9 @@ def classify_remote_exit(
     ssh client's own failure, 'transport'; any other non-zero rc means the host
     was reached and the command failed there (1, 2, 127, a crashed verify, a
     reaped gate dir), 'gate'.  On the ``'git_push'`` channel git exits 128 for
-    every failure, so the cause is read from stderr: an ssh connect failure is
-    'transport' (a sleeping laptop self-clears through the ssh-true reprobe);
+    every failure, so the cause is read from stderr: an ssh connect failure, or
+    the connection lost mid-push, is 'transport' (a sleeping laptop
+    self-clears through the ssh-true reprobe);
     any other refusal (ref rejected, repo not found, an ``updateInstead``
     rejection) is 'gate', so a deterministic refusal cannot loop through that
     reprobe.
