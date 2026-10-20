@@ -2509,6 +2509,7 @@ class Harness:
         try:
             await self._abandoned_member_sweep.run_pass(
                 lane=self._merge_worker,
+                requests=self._merge_inflight_registry,
                 tasks=self.scheduler,
                 escalations=self._escalation_queue,
                 claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),

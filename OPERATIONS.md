@@ -1084,6 +1084,8 @@ default 900s). It has no config knob of its own.
 these owners:
 
 - a train the merge worker still holds lists it;
+- a live `merge_request` or workflow submit under the member's own task id
+  holds it, from the submit until the request resolves (task 7022);
 - a live workflow holds it;
 - a live claimant holds it (`claimant_run_id` with a heartbeat inside
   `claimant_liveness_ttl_secs`);
@@ -1139,6 +1141,11 @@ To keep the sweep off a member you are carrying by hand, do one of these:
 - set a live claimant with `set_task_claimant` and keep its heartbeat fresh;
 - keep a non-`info` escalation at L1 or above open on it. An `info` record
   never pins, and neither does an L0 whose filing incarnation is dead.
+
+A carrier walked to `merge-deferred` and submitted with `merge_request` is
+held for as long as its request is live. The two-pass count starts only once
+the request resolves without landing (blocked, cancelled, or superseded into
+a train that derailed). Re-read the task after any non-landed outcome.
 
 ---
 
