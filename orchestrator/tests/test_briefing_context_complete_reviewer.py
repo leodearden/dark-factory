@@ -10,6 +10,7 @@ These tests drive the public seam
 
 from __future__ import annotations
 
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -17,9 +18,9 @@ from _briefing_helpers import (
     _mcp_search_envelope,
     _result,
     _search_arguments,
-    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _briefing_helpers import briefing as briefing
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.review_briefing import (
@@ -143,10 +144,10 @@ class TestSubjectSnapshot:
         subject = _subject(plan=_plan())
 
         with pytest.raises(TypeError):
-            subject.task['title'] = 'x'  # type: ignore[index]
+            cast(Any, subject.task)['title'] = 'x'
         assert subject.plan is not None
         with pytest.raises(TypeError):
-            subject.plan['analysis'] = 'x'  # type: ignore[index]
+            cast(Any, subject.plan)['analysis'] = 'x'
 
 
 @pytest.mark.asyncio

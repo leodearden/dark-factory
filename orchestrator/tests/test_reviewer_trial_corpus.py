@@ -6,9 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from _briefing_helpers import (
-    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
-)
+from _briefing_helpers import briefing as briefing
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.review_briefing import ReviewChange, ReviewSubject

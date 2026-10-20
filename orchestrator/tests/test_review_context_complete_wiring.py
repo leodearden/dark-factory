@@ -67,12 +67,12 @@ def _branch_with_main_merged_in(tmp_path: Path) -> Path:
 
 
 class _Spied:
-    def __init__(self, f: _Fixture):
+    def __init__(self, f: _Fixture, monkeypatch: pytest.MonkeyPatch):
         fake = FakeBriefing()
         self.context_complete = AsyncMock(side_effect=fake.build_context_complete_reviewer_prompt)
         self.diff_only = AsyncMock(side_effect=fake.build_reviewer_prompt)
-        fake.build_context_complete_reviewer_prompt = self.context_complete  # type: ignore[method-assign]
-        fake.build_reviewer_prompt = self.diff_only  # type: ignore[method-assign]
+        monkeypatch.setattr(fake, 'build_context_complete_reviewer_prompt', self.context_complete)
+        monkeypatch.setattr(fake, 'build_reviewer_prompt', self.diff_only)
         f.wf.briefing = fake
 
     def subject(self) -> ReviewSubject:
@@ -80,7 +80,9 @@ class _Spied:
         return self.context_complete.await_args.args[1]
 
 
-def _setup(tmp_path: Path, briefing: ReviewBriefing) -> tuple[_Fixture, _Spied]:
+def _setup(
+    tmp_path: Path, briefing: ReviewBriefing, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_Fixture, _Spied]:
     worktree = _branch_with_main_merged_in(tmp_path)
     f = _make(worktree=worktree, project_root=tmp_path / 'proj')
     config = f.wf.config
@@ -91,10 +93,11 @@ def _setup(tmp_path: Path, briefing: ReviewBriefing) -> tuple[_Fixture, _Spied]:
     config.max_reviewer_retries = 0
     f.wf.git_ops.get_diff_from_base = AsyncMock(return_value='STORED-BASE DIFF')
     f.wf.git_ops.get_diff_from_main = AsyncMock(return_value='MAIN DIFF')
-    f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
-        side_effect=_invoke_writes_review_verdict(f, verdict='PASS', summary='ok'),
+    monkeypatch.setattr(
+        f.wf, '_invoke',
+        AsyncMock(side_effect=_invoke_writes_review_verdict(f, verdict='PASS', summary='ok')),
     )
-    return f, _Spied(f)
+    return f, _Spied(f, monkeypatch)
 
 
 def _mirror(f: _Fixture) -> dict:
@@ -103,8 +106,8 @@ def _mirror(f: _Fixture) -> dict:
 
 @pytest.mark.asyncio
 class TestContextCompleteDispatch:
-    async def test_the_subject_is_the_branch_s_own_change(self, tmp_path: Path):
-        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE)
+    async def test_the_subject_is_the_branch_s_own_change(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE, monkeypatch)
         f.artifacts.write_plan({'task_id': '50', 'title': 'T', 'analysis': 'Bump a.', 'steps': []})
 
         await f.wf._review()
@@ -123,8 +126,9 @@ class TestContextCompleteDispatch:
 
     async def test_a_malformed_conventions_file_degrades_loudly(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ):
-        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE)
+        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE, monkeypatch)
         assert f.wf.worktree is not None
         conventions_file = f.wf.worktree / CONVENTIONS_RELPATH
         conventions_file.write_text('conventions: [unclosed\n')
@@ -138,8 +142,8 @@ class TestContextCompleteDispatch:
             for record in caplog.records
         )
 
-    async def test_a_failed_gather_is_an_error_verdict_naming_the_cause(self, tmp_path: Path):
-        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE)
+    async def test_a_failed_gather_is_an_error_verdict_naming_the_cause(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE, monkeypatch)
         f.wf.config.git.main_branch = 'no-such-branch'
         stored_base = f.artifacts.read_base_commit()
         assert stored_base
@@ -154,8 +158,8 @@ class TestContextCompleteDispatch:
         assert mirror['verdict'] == 'ERROR'
         assert stored_base in mirror['summary']
 
-    async def test_an_absent_plan_is_stated(self, tmp_path: Path):
-        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE)
+    async def test_an_absent_plan_is_stated(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        f, spied = _setup(tmp_path, ReviewBriefing.CONTEXT_COMPLETE, monkeypatch)
 
         await f.wf._review()
 
@@ -166,8 +170,8 @@ class TestContextCompleteDispatch:
 
 @pytest.mark.asyncio
 class TestDiffOnlyDispatch:
-    async def test_the_incumbent_reviews_the_stored_base_diff(self, tmp_path: Path):
-        f, spied = _setup(tmp_path, ReviewBriefing.DIFF_ONLY)
+    async def test_the_incumbent_reviews_the_stored_base_diff(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        f, spied = _setup(tmp_path, ReviewBriefing.DIFF_ONLY, monkeypatch)
 
         await f.wf._review()
 
@@ -178,8 +182,8 @@ class TestDiffOnlyDispatch:
         assert args == ('reviewer_comprehensive', 'STORED-BASE DIFF')
 
 
-def test_the_verdict_cache_fingerprint_follows_the_generation(tmp_path: Path):
-    f, _ = _setup(tmp_path, ReviewBriefing.DIFF_ONLY)
+def test_the_verdict_cache_fingerprint_follows_the_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    f, _ = _setup(tmp_path, ReviewBriefing.DIFF_ONLY, monkeypatch)
     diff_only = f.wf._reviewer_config_fingerprint()
 
     f.wf.config.review.reviewer_briefing = ReviewBriefing.CONTEXT_COMPLETE
