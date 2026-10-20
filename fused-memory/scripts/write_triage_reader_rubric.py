@@ -26,17 +26,25 @@ from fused_memory.server.write_triage import (
     TRIAGE_OUTCOMES,
 )
 
+ABSTAIN = 'UNCLEAR'
+"""The word a rater gives to abstain on any binary; it never counts toward a majority."""
+
+
+def is_abstain(word: object) -> bool:
+    """Whether *word* is the abstain word, in any binary's vocabulary or as a raw row value."""
+    return word == ABSTAIN
+
 
 class Answer(StrEnum):
     YES = 'YES'
     NO = 'NO'
-    UNCLEAR = 'UNCLEAR'
+    UNCLEAR = ABSTAIN
 
 
 class Scope(StrEnum):
     CENTRAL = 'CENTRAL'
     SECONDARY = 'SECONDARY'
-    UNCLEAR = 'UNCLEAR'
+    UNCLEAR = ABSTAIN
 
 
 class Binary(StrEnum):
@@ -70,7 +78,7 @@ class Resolved(StrEnum):
     NO = 'NO'
     CENTRAL = 'CENTRAL'
     SECONDARY = 'SECONDARY'
-    UNCLEAR = 'UNCLEAR'
+    UNCLEAR = ABSTAIN
     TIED = 'TIED'
 
 
@@ -98,7 +106,6 @@ _POLES: Mapping[Binary, tuple[Resolved, Resolved]] = MappingProxyType({
 M1_BAND = OUTCOME_RESTATED
 """The triage band whose writes M1 counts: band-winner cosine at or above t_high when written."""
 
-_UNCLEAR = 'UNCLEAR'
 _REQUIRED_KEYS = ('entry_id', 'target_id', 'basis', 'rater', 'role', 'batch')
 _IDENTITY_KEYS = ('entry_id', 'target_id', 'rater')
 
@@ -182,10 +189,10 @@ def _row_violation(row: Mapping[str, Any]) -> str | None:
     for binary in carried:
         if row[binary] not in set(_WORDS[binary]):
             return f'{binary} {row[binary]!r} is not one of {sorted(_WORDS[binary])}'
-    unclear = [binary for binary in carried if row[binary] == _UNCLEAR]
+    unclear = [binary for binary in carried if is_abstain(row[binary])]
     reason = row.get('unclear_reason')
     if unclear and not (isinstance(reason, str) and reason.strip()):
-        return f'{unclear[0]} {_UNCLEAR!r} needs a non-empty unclear_reason'
+        return f'{unclear[0]} {ABSTAIN!r} needs a non-empty unclear_reason'
     for follow_up, asked_after in _FOLLOWS.items():
         if follow_up in row and row.get(asked_after) != Answer.YES:
             return (
@@ -205,7 +212,7 @@ def _judgement(key: PairKey, votes: tuple[Vote, ...]) -> Judgement:
 
 
 def _majority(words: list[StrEnum], binary: Binary) -> Resolved:
-    decided = [word for word in words if word != _UNCLEAR]
+    decided = [word for word in words if not is_abstain(word)]
     if not decided:
         return Resolved.UNCLEAR
     positive, negative = _POLES[binary]
@@ -333,8 +340,11 @@ def derive(
     outcome, so a binary is decisive exactly when the derivation asks for it: a
     decisive unrated or tied binary makes the write Incomplete (naming every
     gap the three derivations met), a decisive UNCLEAR one makes it Unclear,
-    and a binary never asked never blocks. ``supersedes_target`` and
-    ``superseded_marks`` are metadata facts (ruling 5c), never rater answers.
+    and a binary never asked never blocks. The triage, status-quo and M1
+    derivations stand or fall together: a gap or an UNCLEAR in any one of them
+    decides the whole write, even when the others are complete.
+    ``supersedes_target`` and ``superseded_marks`` are metadata facts
+    (ruling 5c), never rater answers.
     """
     regimes = _regimes(
         outcome, judgements_by_target, supersedes_target=supersedes_target,

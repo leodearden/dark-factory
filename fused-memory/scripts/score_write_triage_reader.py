@@ -421,7 +421,7 @@ def _kappa(judgements: Mapping[_rubric.PairKey, _rubric.Judgement]) -> dict[str,
             continue
         for binary, overlap in pairs.items():
             answers = (primary[0].answers.get(binary), second[0].answers.get(binary))
-            if all(answer is not None and answer != 'UNCLEAR' for answer in answers):
+            if all(answer is not None and not _rubric.is_abstain(answer) for answer in answers):
                 overlap.append((str(answers[0]), str(answers[1])))
     return {
         'floor': KAPPA_FLOOR,
@@ -459,11 +459,12 @@ def _proportion(
 ) -> dict[str, Any]:
     """One metric block: *hit* among the decided *member* items (narrowed by *within*).
 
-    ``unclear`` counts the member items whose derivation was UNCLEAR; they are
-    outside n. The population figures are None without stratum weights. They
-    are a domain estimate: every scored item is a unit of its stratum, counting
-    in the denominator only when it is in n, so the bootstrap keeps each
-    stratum's sample size and lets the number of items in n vary.
+    ``unclear`` counts the member items whose derivation was UNCLEAR in any
+    regime; they are outside n. The population figures are None without
+    stratum weights. They are a domain estimate: every scored item is a unit
+    of its stratum, counting in the denominator only when it is in n, so the
+    bootstrap keeps each stratum's sample size and lets the number of items in
+    n vary.
     """
     members = [s for s in scored if member(s)]
     hit_by_index = {
@@ -480,16 +481,12 @@ def _proportion(
     return {
         'n': n,
         'hits': hits,
-        'rate': _rate(hits, n),
+        'rate': _stats.rate(hits, n),
         'wilson95': _stats.wilson95(hits, n),
         'unclear': sum(s.decided is None for s in members),
         'population_rate': None if weights is None else _stats.stratified_ratio(units, weights),
         'population_interval95': None if weights is None else _bootstrap(units, weights),
     }
-
-
-def _rate(hits: int, total: int) -> float | None:
-    return round(hits / total, 4) if total else None
 
 
 def _bootstrap(

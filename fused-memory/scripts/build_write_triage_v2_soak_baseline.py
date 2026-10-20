@@ -338,7 +338,7 @@ def assemble(
         for binary in Binary:
             if binary in kept:
                 summary[binary]['rated'] += 1
-            elif binary in row and binary in fixed and row[binary] != Answer.UNCLEAR:
+            elif binary in row and binary in fixed and not _rubric.is_abstain(row[binary]):
                 summary[binary]['n_compared'] += 1
                 summary[binary]['agree'] += row[binary] == fixed[binary]
         if kept:
@@ -367,7 +367,7 @@ def _kept_row(row: Mapping[str, Any], kept: Mapping[str, str]) -> dict[str, Any]
     identity = {key: row[key] for key in ('entry_id', 'target_id', 'basis', 'rater', 'role', 'batch')}
     if 'reason' in row:
         identity['reason'] = row['reason']
-    if Answer.UNCLEAR in kept.values() and 'unclear_reason' in row:
+    if any(map(_rubric.is_abstain, kept.values())) and 'unclear_reason' in row:
         identity['unclear_reason'] = row['unclear_reason']
     return {**identity, **kept}
 
@@ -567,15 +567,33 @@ def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(out / 'write_triage_v2_soak_strata.json', dict(STRATA))
     _write_json(out / 'write_triage_v2_soak_derivation.json', {
         'by_binary': assembly.derivation,
-        'rated_pairs': len({(item['entry_id'], item['target_id'])
-                            for item in key['items'].values() if not item['anchor']}),
-        'anchor_pairs': len({(item['entry_id'], item['target_id'])
-                             for item in key['items'].values() if item['anchor']}),
+        **rating_volume(list(key['items'].values())),
         'attach_time_unrecoverable': sorted(key['attach_time_unrecoverable']),
         'shards': {name: {'rater': spec['rater'], 'items': len(spec['items'])}
                    for name, spec in sorted(key['shards'].items())},
     })
     return {'items': len(soak), 'verdicts': len(assembly.verdicts)}
+
+
+def rating_volume(key_items: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """The distinct (entry, target) pairs the shards put before raters, by what they were for.
+
+    ``rated_current_pairs`` are the current-basis pairs whose v1 labels left a
+    decisive binary open, ``anchor_pairs`` the current-basis anchors v1 had
+    already settled, and ``attach_time_pairs`` the pairs re-read against the
+    parent's text at attach time. *key_items* are the scratch key's item entries.
+    """
+    def pairs(basis: str, *, anchor: bool) -> int:
+        return len({
+            (item['entry_id'], item['target_id']) for item in key_items
+            if item['basis'] == basis and item['anchor'] is anchor
+        })
+
+    return {
+        'rated_current_pairs': pairs(Basis.CURRENT, anchor=False),
+        'anchor_pairs': pairs(Basis.CURRENT, anchor=True),
+        'attach_time_pairs': pairs(Basis.ATTACH_TIME, anchor=False),
+    }
 
 
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:

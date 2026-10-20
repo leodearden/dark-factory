@@ -299,6 +299,21 @@ class TestShard:
         assert 'basis=attach_time' in shard.text
 
 
+class TestRatingVolume:
+    def _key_item(self, entry: str, basis: str = 'current', *, anchor: bool = False) -> dict[str, Any]:
+        return {'entry_id': entry, 'target_id': 'p1', 'basis': basis, 'anchor': anchor}
+
+    def test_counts_distinct_pairs_per_basis_apart_from_anchors(self) -> None:
+        key_items = [
+            self._key_item('open'), self._key_item('open'), self._key_item('open-too'),
+            self._key_item('settled', anchor=True),
+            self._key_item('open', 'attach_time'), self._key_item('settled', 'attach_time'),
+        ]
+        assert _mod().rating_volume(key_items) == {
+            'rated_current_pairs': 2, 'anchor_pairs': 1, 'attach_time_pairs': 2,
+        }
+
+
 class TestTheCli:
     def test_refuses_to_write_inside_the_bundle(self, tmp_path: Path) -> None:
         bundle = tmp_path / 'bundle'

@@ -1,5 +1,6 @@
 {
   "anchor_pairs": 35,
+  "attach_time_pairs": 13,
   "attach_time_unrecoverable": [],
   "by_binary": {
     "conflict": {
@@ -33,7 +34,7 @@
       "rated": 142
     }
   },
-  "rated_pairs": 314,
+  "rated_current_pairs": 312,
   "shards": {
     "attach_00": {
       "items": 13,

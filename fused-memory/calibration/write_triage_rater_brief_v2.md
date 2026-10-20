@@ -103,7 +103,7 @@ Paraphrased from hard cases in the 2026-10-19 soak.
   `{"id", "home", "loss", "conflict", "scope"?, "digest"?, "unclear_reason"?, "reason"}`.
   Give `scope` only when `conflict` is YES and `digest` only when `loss` is
   YES. `reason` is one sentence that names both claims.
-- About 10 blind anchors, items whose answers are already known, are mixed into
+- A few blind anchors, items whose answers are already known, are mixed into
   each shard to detect drift between batches.
 - Every item gets two blind raters. A third rater is asked only where the two
   disagree on a binary that decides the item's correctness.

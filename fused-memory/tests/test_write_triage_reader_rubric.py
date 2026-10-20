@@ -1,7 +1,8 @@
 """Tests for write_triage_reader_rubric.py — the one definition of write-triage rubric v2.
 
 Reached only through the public surface: ``resolve_judgements`` (the verdict
-row contract and per-binary majority) and ``derive`` (the derivation table).
+row contract and per-binary majority), ``derive`` (the derivation table) and
+``is_abstain`` (the one abstain word).
 The script is loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``.
 """
@@ -303,6 +304,12 @@ class TestDecisiveness:
         assert isinstance(result, _mod().Unclear)
         assert result.binaries == (('p', 'loss'),)
 
+    def test_an_unclear_status_quo_binary_leaves_out_a_decided_triage_reading(self) -> None:
+        result = _derive('contested', {'home': 'YES', 'conflict': 'NO', 'loss': 'UNCLEAR',
+                                       'unclear_reason': 'cut at the threshold'})
+        assert isinstance(result, _mod().Unclear)
+        assert result.binaries == (('p', 'loss'),)
+
     def test_a_non_decisive_tie_never_blocks(self) -> None:
         result = _derive('contested', {'home': 'YES', 'conflict': 'YES'},
                          {'home': 'NO', 'conflict': 'YES'})
@@ -350,3 +357,15 @@ class TestM1Hiddenness:
             ('p', 'digest', 'unrated'),
         ]
         assert _decided(_derive('amended', _HOME_MORE)).m1_hidden is None
+
+
+class TestTheAbstainWord:
+    @pytest.mark.parametrize('word', ['UNCLEAR', 'Answer', 'Scope', 'Resolved'])
+    def test_is_one_word_across_every_vocabulary(self, word: str) -> None:
+        rubric = _mod()
+        value = word if word == 'UNCLEAR' else getattr(rubric, word).UNCLEAR
+        assert rubric.is_abstain(value)
+
+    @pytest.mark.parametrize('word', ['YES', 'NO', 'CENTRAL', 'SECONDARY', 'TIED', None, 'unclear'])
+    def test_no_other_word_abstains(self, word: str | None) -> None:
+        assert not _mod().is_abstain(word)

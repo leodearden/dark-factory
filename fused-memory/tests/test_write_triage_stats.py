@@ -1,4 +1,4 @@
-"""Tests for write_triage_stats.py — the write-triage scorers' shared interval statistics.
+"""Tests for write_triage_stats.py — the write-triage reader scorer's interval statistics.
 
 The script is loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``. The Wilson and kappa expectations are literal oracle values,
@@ -7,6 +7,8 @@ computed independently with the textbook formulas (z = 1.96, four places).
 from __future__ import annotations
 
 import functools
+import math
+import random
 import types
 from pathlib import Path
 
@@ -23,6 +25,14 @@ def _mod() -> types.ModuleType:
 
 def _unit(stratum: str, numerator: float, denominator: float = 1.0) -> object:
     return _mod().StratumUnit(stratum=stratum, numerator=numerator, denominator=denominator)
+
+
+class TestRate:
+    def test_is_hits_over_total_to_four_places(self) -> None:
+        assert _mod().rate(1, 3) == 0.3333
+
+    def test_an_empty_sample_has_no_rate(self) -> None:
+        assert _mod().rate(0, 0) is None
 
 
 class TestWilson95:
@@ -130,6 +140,25 @@ class TestStratifiedBootstrap95:
         assert _mod().stratified_bootstrap95(
             units, {'a': 1.0, 'b': 3.0}, resamples=300, seed=5,
         ) == [0.25, 0.25]
+
+    def test_draws_each_stratum_in_name_order_from_one_seeded_generator(self) -> None:
+        units = self._units()
+        weights = {'a': 2.0, 'b': 1.0}
+        members = {name: [unit for unit in units if unit.stratum == name] for name in ('a', 'b')}
+        draws = random.Random(9)
+        ratios = []
+        for _ in range(400):
+            picked = [
+                unit for name in ('a', 'b')
+                for unit in draws.choices(members[name], k=len(members[name]))
+            ]
+            ratios.append(
+                sum(weights[unit.stratum] * unit.numerator for unit in picked)
+                / sum(weights[unit.stratum] * unit.denominator for unit in picked)
+            )
+        ratios.sort()
+        expected = [round(ratios[math.ceil(percent * 4) - 1], 4) for percent in (2.5, 97.5)]
+        assert _mod().stratified_bootstrap95(units, weights, resamples=400, seed=9) == expected
 
     def test_no_units_has_no_interval(self) -> None:
         assert _mod().stratified_bootstrap95([], {'a': 1.0}, resamples=100, seed=1) is None

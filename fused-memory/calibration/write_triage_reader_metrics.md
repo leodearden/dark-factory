@@ -54,6 +54,16 @@ M3, M4's splits) also carries the uncertainty in how many sampled writes fall
 in it. An item whose deciding binary resolved UNCLEAR is left out of n and
 counted as `unclear`.
 
+An item's regimes stand or fall together. It is decided only when its triage
+cells, its status-quo cells and, in the M1 band, M1 are all decided. One
+UNCLEAR deciding binary in any of them leaves the item out of every metric,
+even a metric that reads only another regime. For example, take a contested
+write with CONFLICT NO and HOME YES whose LOSS is UNCLEAR. Only the status quo
+asks about LOSS, yet the write is left out of M2, M4 and M5 too. In the same
+way, a gap in any one regime makes the scorer refuse the corpus, because harm
+compares the two regimes. `population.unclear_entry_ids` names every item
+left out.
+
 | Metric | Rule | Population and unit | Sample | Status |
 |---|---|---|---|---|
 | **M1** hidden information in the high-cosine band | the write's dispute or needed detail is not visible to a reader of the parent: CONFLICT, or HOME with LOSS for a restated write, or HOME with LOSS and DIGEST=NO for an amended one (`derive`, `Decided.m1_hidden`); contested and stored writes are visible | every write whose band-winner cosine was >= t_high when it was written (about 105 a week), whatever its outcome; unit = write | census | **gate: point estimate <= 0.15**, Wilson reported. Soak baseline 0.50 (v1 proxy) |
@@ -79,7 +89,9 @@ counted as `unclear`.
   resolved. A tie on a binary the derivation never asks for is left as it is.
 - UNCLEAR only where a truncation falls at the deciding point, with the point
   named. Such items are left out of every rate and counted.
-- About 10 blind anchors per shard detect drift between batches.
+- Blind anchors, items whose answers are already known, are mixed into each
+  primary shard to detect drift between batches;
+  `build_write_triage_v2_soak_baseline.py::ANCHORS_PER_SHARD` sets how many.
 
 ## 5. Reconstructing write-time state
 
@@ -206,10 +218,16 @@ comparison point.
   scratch directory, `data/write-triage-v2-rebase-2026-10-19/`.
 - **What the v1 labels fix**: `build_write_triage_v2_soak_baseline.py::v1_determined`.
   312 items needed rating, and 241 were fully fixed by v1.
+  `write_triage_v2_soak_derivation.json` counts these 312 as
+  `rated_current_pairs`. Its `anchor_pairs` (35) and `attach_time_pairs` (13)
+  are the anchors and attach-time re-reads below.
 - **Rating volume**: 459 blind ratings in 11 shards. Opus primary: 7 shards,
   347 items, of which 35 are fully fixed anchors. Opus attach-time: 1 shard, all
   13 parent-edited items, every one recoverable from history.db. Sonnet second:
   2 shards, an 80-item seeded overlap. Opus third: 1 shard, 19 decisive ties.
+  These raters read a brief that said "about 10" anchors per shard, while the
+  builder mixed in 5. The brief now says "a few", and no other wording has
+  changed.
   16 binaries remain tied and are not decisive: loss 8, digest 5, scope 3.
   One item resolved UNCLEAR and is left out of every rate.
 - **Kappa, primary against second.** In the corpus, a rated answer is kept only

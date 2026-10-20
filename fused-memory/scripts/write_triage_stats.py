@@ -1,9 +1,10 @@
-"""The write-triage scorers' shared interval statistics.
+"""Interval statistics for the write-triage reader scorer (rubric v2).
 
-Wilson 95% intervals for a sample proportion, nearest-rank percentiles,
-Cohen's kappa between two raters, and a stratum-weighted ratio with a seeded
-bootstrap interval that resamples within each stratum. Every figure is rounded
-to four places, so a report built from them is byte-stable across runs.
+A sample rate, Wilson 95% intervals for a sample proportion, nearest-rank
+percentiles, Cohen's kappa between two raters, and a stratum-weighted ratio
+with a seeded bootstrap interval that resamples within each stratum. Every
+figure is rounded to four places, so a report built from them is byte-stable
+across runs.
 """
 from __future__ import annotations
 
@@ -24,6 +25,11 @@ class StratumUnit:
     stratum: str
     numerator: float
     denominator: float
+
+
+def rate(hits: int, total: int) -> float | None:
+    """*hits*/*total*, or None when nothing was measured; never 0.0 for an empty sample."""
+    return round(hits / total, _PLACES) if total else None
 
 
 def wilson95(hits: int, total: int) -> list[float] | None:
@@ -82,9 +88,10 @@ def stratified_bootstrap95(
     """Nearest-rank 95% interval of :func:`stratified_ratio` over seeded resamples.
 
     Each draw resamples every stratum's units with replacement, keeping each
-    stratum's size, and recomputes the weighted ratio. Draws whose weighted
-    denominator is 0 are dropped; None when no units are given or every draw
-    is dropped.
+    stratum's size, and recomputes the weighted ratio. The strata are drawn in
+    name order from one ``random.Random(seed)``, so a seed always gives the
+    same draws. Draws whose weighted denominator is 0 are dropped; None when no
+    units are given or every draw is dropped.
     """
     units = _weighted_units(units, weights)
     if not units:
@@ -92,21 +99,27 @@ def stratified_bootstrap95(
     by_stratum: dict[str, list[StratumUnit]] = defaultdict(list)
     for unit in units:
         by_stratum[unit.stratum].append(unit)
-    strata = [by_stratum[name] for name in sorted(by_stratum)]
+    names = sorted(by_stratum)
+    numerators = [tuple(weights[name] * unit.numerator for unit in by_stratum[name]) for name in names]
+    denominators = [tuple(weights[name] * unit.denominator for unit in by_stratum[name]) for name in names]
     draws = random.Random(seed)
-    ratios = sorted(
-        ratio for ratio in (
-            _weighted_ratio(
-                [pick for members in strata for pick in draws.choices(members, k=len(members))],
-                weights,
-            )
-            for _ in range(resamples)
-        )
-        if ratio is not None
-    )
+    ratios: list[float] = []
+    for _ in range(resamples):
+        picks = [draws.choices(range(len(terms)), k=len(terms)) for terms in denominators]
+        denominator = _resampled_sum(denominators, picks)
+        if denominator:
+            ratios.append(_resampled_sum(numerators, picks) / denominator)
     if not ratios:
         return None
+    ratios.sort()
     return [round(nearest_rank(ratios, 2.5), _PLACES), round(nearest_rank(ratios, 97.5), _PLACES)]
+
+
+def _resampled_sum(terms_by_stratum: Sequence[Sequence[float]], picks: Sequence[Sequence[int]]) -> float:
+    """Each stratum's weighted terms at its picked indices, summed in stratum order."""
+    return sum([
+        terms[index] for terms, picked in zip(terms_by_stratum, picks, strict=True) for index in picked
+    ])
 
 
 def _weighted_units(

@@ -649,12 +649,14 @@ def _rescored_baseline() -> dict[str, Any]:
     return _mod().score_reader(items, verdicts, strata=strata)
 
 
+@pytest.mark.xdist_group('committed_v2_soak_baseline')
 class TestTheCommittedSoakBaseline:
     """The committed v2 soak baseline cannot drift from its committed inputs.
 
     Built by ``scripts/build_write_triage_v2_soak_baseline.py`` from the
     gitignored 2026-10-19 soak bundle. The invariants below are fixed by the
-    soak's v1 labels whatever the new ratings say.
+    soak's v1 labels whatever the new ratings say. The class runs on one xdist
+    worker, so the cached re-scoring is paid once per run.
     """
 
     def test_rescoring_the_inputs_reproduces_the_report(self) -> None:
