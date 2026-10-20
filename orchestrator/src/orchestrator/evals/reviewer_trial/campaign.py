@@ -18,6 +18,10 @@ reruns into a fresh ``--results-dir`` (or deletes ``trial-*/scores/``). An
 unmeasured score is never cached, so a rerun re-measures it. Rationale:
 docs/plan-scoring-and-judge.md, "Scoring instruments: unmeasured, never a tie
 or zero (task 6736)".
+
+The complement rule is the incumbent's own self-complement band (task 5438),
+not a fixed bar: a candidate's blocking complement must clear the incumbent's
+run-to-run maximum in every trial (``clears_self_complement_band``).
 """
 
 from __future__ import annotations
@@ -51,6 +55,9 @@ class ArmMetrics:
     complement_count: int = 0
     incumbent_matched: int = 0
     complement_share: float = 0.0
+    blocking_complement_count: int = 0
+    blocking_incumbent_matched: int = 0
+    blocking_complement_share: float = 0.0
     unmeasured: int = 0
     unmeasured_cost_usd: float = 0.0
 
@@ -60,7 +67,8 @@ class CampaignDecisions:
     incumbent: str
     strict_f1_improvement: dict[str, bool]
     complement_pass: dict[str, bool]
-    complement_threshold: float
+    self_complement: SelfComplementBand
+    complement_by_trial: dict[str, list[dict]]
     non_inferiority: dict[str, bool]
     non_inferiority_by_trial: dict[str, list[dict]]
 
@@ -298,6 +306,13 @@ def summarize_arm(
         metrics.complement_count, metrics.incumbent_matched = complement(measured, measured_incumbent)
         if metrics.incumbent_matched:
             metrics.complement_share = round(metrics.complement_count / metrics.incumbent_matched, 4)
+        metrics.blocking_complement_count, metrics.blocking_incumbent_matched = complement(
+            measured, measured_incumbent, restrict_to=blocking_gt_by_diff,
+        )
+        if metrics.blocking_incumbent_matched:
+            metrics.blocking_complement_share = round(
+                metrics.blocking_complement_count / metrics.blocking_incumbent_matched, 4,
+            )
     return metrics
 
 
@@ -350,7 +365,6 @@ def summarize_campaign(
     records: list[ScoreRecord],
     incumbent_name: str,
     blocking_gt_by_diff: dict[str, set[str]],
-    complement_threshold: float = 0.10,
 ) -> tuple[list[ArmMetrics], CampaignDecisions]:
     by_arm: dict[str, list[ScoreRecord]] = defaultdict(list)
     for rec in records:
@@ -364,11 +378,19 @@ def summarize_campaign(
         for name, recs in by_arm.items() if name != incumbent_name
     )
     candidates = {name: recs for name, recs in by_arm.items() if name != incumbent_name}
+    band = self_complement_band(incumbent_records, blocking_gt_by_diff)
+    complement_rows = {
+        name: complement_by_trial(recs, incumbent_records, blocking_gt_by_diff)
+        for name, recs in candidates.items()
+    }
     decisions = CampaignDecisions(
         incumbent=incumbent_name,
         strict_f1_improvement={a.name: strict_improvement(a, arms[0]) for a in arms[1:]},
-        complement_pass={a.name: a.complement_share >= complement_threshold for a in arms[1:]},
-        complement_threshold=complement_threshold,
+        complement_pass={
+            name: clears_self_complement_band(rows, band) for name, rows in complement_rows.items()
+        },
+        self_complement=band,
+        complement_by_trial=complement_rows,
         non_inferiority={
             name: non_inferior(recs, incumbent_records) for name, recs in candidates.items()
         },
@@ -384,13 +406,45 @@ def _fmt(value: float | None, spec: str) -> str:
     return 'n/a' if value is None else format(value, spec)
 
 
+def _band_line(band: SelfComplementBand) -> str:
+    head = 'Incumbent self-complement band'
+    if not band.pairs:
+        return f'{head}: none — the incumbent has fewer than two measured trials, so every candidate fails'
+    if band.blocking_max is None:
+        return f'{head}: none — the incumbent matched no blocking truth on any pair of its trials, so every candidate fails'
+    return (
+        f'{head} ({len(band.pairs)} ordered trial pairs): '
+        f'overall {_fmt(band.overall_min, ".1%")}–{_fmt(band.overall_max, ".1%")}, '
+        f'blocking {_fmt(band.blocking_min, ".1%")}–{_fmt(band.blocking_max, ".1%")}'
+    )
+
+
+def _complement_rule_lines(decisions: CampaignDecisions) -> list[str]:
+    ceiling = _fmt(decisions.self_complement.blocking_max, '.1%')
+    lines = []
+    for name, ok in decisions.complement_pass.items():
+        per_trial = '; '.join(
+            f"t{r['trial']} {_fmt(r['blocking_share'], '.1%')} "
+            f"({r['blocking_complement']}/{r['blocking_incumbent_matched']})"
+            for r in decisions.complement_by_trial[name]
+        ) or 'no shared measured cells'
+        lines.append(
+            f'- `{name}` blocking complement above the incumbent self-complement maximum '
+            f'({ceiling}) in every trial (at least 3): **{"PASS" if ok else "FAIL"}** ({per_trial})'
+        )
+    return lines
+
+
 def format_markdown(arms: list[ArmMetrics], decisions: CampaignDecisions) -> str:
     lines = [
-        '| Arm | trials | reviews | unmeasured | F1 | recall | precision | blocking P | blocking R | $/review | $/blocking finding | complement | F1 by trial |',
+        '| Arm | trials | reviews | unmeasured | F1 | recall | precision | blocking P | blocking R | $/review | $/blocking finding | complement (all / blocking) | F1 by trial |',
         '|---|---|---|---|---|---|---|---|---|---|---|---|---|',
     ]
     for a in arms:
-        comp = '—' if a.name == decisions.incumbent else f'{a.complement_count} ({a.complement_share:.1%})'
+        comp = '—' if a.name == decisions.incumbent else (
+            f'{a.complement_count} ({a.complement_share:.1%}) / '
+            f'{a.blocking_complement_count} ({a.blocking_complement_share:.1%})'
+        )
         lines.append(
             f'| {a.name} | {a.trials} | {a.reviews} | {a.unmeasured} | {_fmt(a.mean_f1, ".3f")} | '
             f'{_fmt(a.mean_recall, ".3f")} | {_fmt(a.mean_precision, ".3f")} | '
@@ -406,16 +460,12 @@ def format_markdown(arms: list[ArmMetrics], decisions: CampaignDecisions) -> str
         )
     lines.append('')
     lines.append(f'Incumbent: `{decisions.incumbent}`. Decision rules (pre-registered):')
+    lines.append(_band_line(decisions.self_complement))
     for name, ok in decisions.strict_f1_improvement.items():
         paired = next(a for a in arms if a.name == name).paired_vs_incumbent
         wl = '; '.join(f"t{p['trial']} {p['wins']}W/{p['losses']}L/{p['ties']}T Δ{p['mean_delta']:+.3f}" for p in paired)
         lines.append(f'- `{name}` strict paired F1 improvement in every trial: **{"PASS" if ok else "FAIL"}** ({wl})')
-    for name, ok in decisions.complement_pass.items():
-        share = next(a for a in arms if a.name == name).complement_share
-        lines.append(
-            f'- `{name}` complement ≥ {decisions.complement_threshold:.0%} of incumbent recall: '
-            f'**{"PASS" if ok else "FAIL"}** ({share:.1%})'
-        )
+    lines.extend(_complement_rule_lines(decisions))
     for name, ok in decisions.non_inferiority.items():
         deltas = '; '.join(
             f"t{d['trial']} BR{d['blocking_recall_delta']:+.3f} F1{d['f1_delta']:+.3f}"
