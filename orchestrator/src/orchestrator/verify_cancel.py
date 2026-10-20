@@ -93,6 +93,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from shared.proc_group import read_stat_fields
+from shared.safe_io import atomic_write_text
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -138,25 +139,9 @@ def pgid_file(worktree_base: Path, request_id: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Atomically write *text* to *path*, creating parent directories first.
-
-    Uses a sibling tmp file + ``os.replace`` for atomicity so a concurrent
-    reader never sees a partial write.  The temp name is derived additively
-    (``path.name + '.tmp'``) rather than with ``path.with_suffix('.tmp')``:
-    ``with_suffix`` replaces from the *last* dot, so request-ids containing
-    dots (e.g. ``'1.2.3'``) would produce colliding tmp names (``'1.tmp'``)
-    and defeat the atomicity guarantee for concurrent runs.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / (path.name + '.tmp')
-    tmp.write_text(text)
-    os.replace(tmp, path)
-
-
 def write_pgid_file(path: Path, pgid: int) -> None:
     """Atomically write *pgid* to *path*, creating parent directories first."""
-    _atomic_write_text(path, str(pgid))
+    atomic_write_text(path, str(pgid), mkdir=True)
 
 
 def remove_pgid_file(path: Path) -> None:
@@ -172,7 +157,7 @@ def worktree_path_file(pgid_path: Path) -> Path:
 
 def write_worktree_path(pgid_path: Path, worktree: Path) -> None:
     """Atomically record *worktree* as the verify worktree of *pgid_path*'s run."""
-    _atomic_write_text(worktree_path_file(pgid_path), str(worktree))
+    atomic_write_text(worktree_path_file(pgid_path), str(worktree), mkdir=True)
 
 
 def read_worktree_path(pgid_path: Path) -> Path | None:
