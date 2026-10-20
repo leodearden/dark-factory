@@ -6,18 +6,17 @@ import gzip
 import math
 import os
 import re
-import stat
 import xml.etree.ElementTree as ET
 import zlib
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
-from pydantic import BaseModel, ConfigDict, StrictInt, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
 
 from client_feed.contract import (
     NOT_RECORDED,
@@ -54,7 +53,6 @@ class ArchiveProblem(StrEnum):
     UNREADABLE = 'unreadable'
     MALFORMED_JUNIT = 'malformed_junit'
     MALFORMED_SUMMARY = 'malformed_summary'
-    MALFORMED_MAP = 'malformed_map'
 
 
 class ArchiveReadError(Exception):
@@ -106,13 +104,21 @@ def _listed(root: Path, directory: Path) -> list[ArchiveFile]:
     return [file for file in map(_archive_file, paths) if file is not None]
 
 
-def _run_files(files: Sequence[ArchiveFile], ended_at: datetime) -> list[ArchiveFile]:
-    """The junit and summary files of the run that ended at `ended_at`: since its newest plan, newest per name."""
-    candidates = [file for file in files if file.stamp <= ended_at]
-    start = max((file.stamp for file in candidates if file.kind is ArchiveFileKind.PLAN), default=None)
+def _run_files(
+    files: Sequence[ArchiveFile], started_at: datetime, ended_at: datetime
+) -> list[ArchiveFile]:
+    """The junit and summary files stamped within the run, from its newest plan on, newest per name.
+
+    The start bound matters for a run that archives no plan of its own (a remote verify writes only a
+    pass-summary): without it, the previous local run's files would read as this run's.
+    """
+    window = [file for file in files if started_at <= file.stamp <= ended_at]
+    start = max(
+        (file.stamp for file in window if file.kind is ArchiveFileKind.PLAN), default=started_at
+    )
     newest: dict[tuple[ArchiveFileKind, str], ArchiveFile] = {}
-    for file in sorted(candidates, key=lambda file: (file.stamp, file.path.name)):
-        if file.kind is not ArchiveFileKind.PLAN and (start is None or file.stamp >= start):
+    for file in sorted(window, key=lambda file: (file.stamp, file.path.name)):
+        if file.kind is not ArchiveFileKind.PLAN and file.stamp >= start:
             newest[(file.kind, file.qualifiers)] = file
     return sorted(newest.values(), key=lambda file: (file.stamp, file.qualifiers))
 
@@ -161,7 +167,7 @@ _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 
 
 def _case_id(classname: str, name: str) -> str:
-    """The one spelling of a case id, `classname::name`, shared by the junit and map sides."""
+    """The one spelling of a junit case id: `classname::name`."""
     return f'{classname}::{name}' if classname else name
 
 
@@ -183,55 +189,15 @@ def _outcome(testcase: ET.Element) -> tuple[CaseOutcome, str | None]:
     return CaseOutcome.PASSED, None
 
 
-def _junit_id_of_nodeid(nodeid: str) -> str:
-    """A pytest nodeid in its junit spelling, by pytest's own junitxml mangle_test_address rule."""
-    address, bracket, params = nodeid.partition('[')
-    names = address.split('::')
-    names[0] = names[0].replace('/', '.').removesuffix('.py')
-    names[-1] += bracket + params
-    return _case_id('.'.join(names[:-1]), names[-1])
-
-
-class _MapEntry(BaseModel):
-    """One nodeid of the defect plugin's collection map; its defects are not this reader's concern."""
-
-    model_config = ConfigDict(frozen=True, extra='ignore')
-
-    criterion: str | None
-
-
-_MAP_ADAPTER: Final = TypeAdapter(dict[str, _MapEntry])
-_JUNIT_SUFFIX: Final = f'.{_EXTENSIONS[ArchiveFileKind.JUNIT]}'
-_MAP_SUFFIX: Final = '.tests.json'
-
-
-def _criteria(root: Path, junit: Path) -> Mapping[str, str | None]:
-    """The criterion per junit case id from the map written beside `junit`; no map binds nothing."""
-    path = junit.with_name(junit.name.removesuffix(_JUNIT_SUFFIX) + _MAP_SUFFIX)
-    try:
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            return {}
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        raise _failure(root, path, ArchiveProblem.UNREADABLE) from exc
-    try:
-        entries = _MAP_ADAPTER.validate_json(raw)
-    except ValidationError as exc:
-        raise _failure(root, path, ArchiveProblem.MALFORMED_MAP) from exc
-    return {_junit_id_of_nodeid(nodeid): entry.criterion for nodeid, entry in entries.items()}
-
-
-def _case(testcase: ET.Element, criteria: Mapping[str, str | None]) -> CaseResult:
-    case_id = _case_id(testcase.get('classname', ''), testcase.get('name', ''))
+def _case(testcase: ET.Element) -> CaseResult:
+    """A case as the junit records it; binding it to a criterion is the criteria join's (client-feed PRD ε)."""
     seconds = _seconds(testcase.get('time'))
     outcome, exception_type = _outcome(testcase)
     return CaseResult(
-        id=case_id,
+        id=_case_id(testcase.get('classname', ''), testcase.get('name', '')),
         outcome=outcome,
         duration_ms=None if seconds is None else round(seconds * 1000),
-        criterion=criteria.get(case_id),
+        criterion=None,
         exception_type=exception_type,
     )
 
@@ -242,13 +208,13 @@ class _JunitReport:
     suite_seconds: tuple[float, ...]
 
 
-def _parse_junit(report: gzip.GzipFile, criteria: Mapping[str, str | None]) -> _JunitReport:
+def _parse_junit(report: gzip.GzipFile) -> _JunitReport:
     """Cases and suite times only: no message attribute and no element text is ever read."""
     cases: list[CaseResult] = []
     suite_seconds: list[float] = []
     for _, element in ET.iterparse(report, events=('end',)):
         if element.tag == 'testcase':
-            cases.append(_case(element, criteria))
+            cases.append(_case(element))
             element.clear()
         elif element.tag == 'testsuite' and (seconds := _seconds(element.get('time'))) is not None:
             suite_seconds.append(seconds)
@@ -256,10 +222,9 @@ def _parse_junit(report: gzip.GzipFile, criteria: Mapping[str, str | None]) -> _
 
 
 def _read_junit(root: Path, path: Path) -> _JunitReport:
-    criteria = _criteria(root, path)
     try:
         with gzip.open(path) as report:
-            return _parse_junit(report, criteria)
+            return _parse_junit(report)
     except (OSError, EOFError, zlib.error) as exc:
         raise _failure(root, path, ArchiveProblem.UNREADABLE) from exc
     except (ET.ParseError, ValueError) as exc:
@@ -268,11 +233,16 @@ def _read_junit(root: Path, path: Path) -> _JunitReport:
 
 @dataclass(frozen=True)
 class ArchivedTests:
-    """A run's junit cases: counts over every case, the listing cut to the run's case cap."""
+    """A run's junit cases: counts over every case, the listing cut to the run's case cap.
+
+    `junit_relpaths` names the run's junit files relative to the root, so a reader of what is archived
+    beside them (the criteria join's collection map) finds them without selecting the run again.
+    """
 
     counts: CaseCounts
     duration_ms: int | None
     cases: tuple[CaseResult, ...]
+    junit_relpaths: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -283,7 +253,9 @@ class ArchivedRun:
     tests: ArchivedTests | None
 
 
-def _tests(reports: Sequence[_JunitReport], max_cases: int) -> ArchivedTests:
+def _tests(
+    root: Path, junits: Sequence[Path], reports: Sequence[_JunitReport], max_cases: int
+) -> ArchivedTests:
     """Counts over every case; the listing leads with red cases (report order kept) and is cut to the cap."""
     cases = [case for report in reports for case in report.cases]
     tally = Counter(case.outcome for case in cases)
@@ -299,16 +271,28 @@ def _tests(reports: Sequence[_JunitReport], max_cases: int) -> ArchivedTests:
         ),
         duration_ms=round(sum(seconds) * 1000) if seconds else None,
         cases=listed,
+        junit_relpaths=tuple(junit.relative_to(root) for junit in junits),
     )
 
 
+def _require_aware(name: str, value: datetime) -> datetime:
+    if value.utcoffset() is None:
+        raise ValueError(f'{name} must be timezone-aware, got {value!r}')
+    return value
+
+
 def read_archived_run(
-    root: Path, task_id: int, *, ended_at: datetime, max_cases: int
+    root: Path, task_id: int, *, started_at: datetime, ended_at: datetime, max_cases: int
 ) -> ArchivedRun:
-    """The legs and test cases the orchestrator archived for `task_id`'s verify run that ended at `ended_at`."""
-    run = _run_files(_listed(root, root / ARCHIVE_RELPATH / str(task_id)), ended_at)
+    """The legs and test cases the orchestrator archived for `task_id`'s verify run between `started_at` and `ended_at`."""
+    started_at = _require_aware('started_at', started_at)
+    ended_at = _require_aware('ended_at', ended_at)
+    if started_at > ended_at:
+        raise ValueError(f'started_at {started_at} is after ended_at {ended_at}')
+    run = _run_files(_listed(root, root / ARCHIVE_RELPATH / str(task_id)), started_at, ended_at)
     summaries = [_read_summary(root, file.path) for file in run if file.kind is ArchiveFileKind.SUMMARY]
-    reports = [_read_junit(root, file.path) for file in run if file.kind is ArchiveFileKind.JUNIT]
+    junits = [file.path for file in run if file.kind is ArchiveFileKind.JUNIT]
+    reports = [_read_junit(root, junit) for junit in junits]
     return ArchivedRun(
-        legs=_legs(summaries), tests=_tests(reports, max_cases) if reports else None
+        legs=_legs(summaries), tests=_tests(root, junits, reports, max_cases) if reports else None
     )

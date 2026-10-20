@@ -122,8 +122,12 @@ def write_junit(
     return path
 
 
-def read(root: Path, ended_at: datetime, *, max_cases: int = 100) -> ArchivedRun:
-    return read_archived_run(root, TASK_ID, ended_at=ended_at, max_cases=max_cases)
+def read(
+    root: Path, ended_at: datetime, *, started_at: datetime = BASE, max_cases: int = 100
+) -> ArchivedRun:
+    return read_archived_run(
+        root, TASK_ID, started_at=started_at, ended_at=ended_at, max_cases=max_cases
+    )
 
 
 def case_ids(run: ArchivedRun) -> set[str]:
@@ -192,22 +196,54 @@ def test_the_run_is_bounded_by_its_plan_and_its_end(tmp_path: Path) -> None:
     assert case_ids(run) == {'tests.test_a::test_new'}
 
 
-def test_a_file_stamped_exactly_at_the_end_belongs_to_the_run(tmp_path: Path) -> None:
-    write_plan(tmp_path, at(0))
-    write_junit(tmp_path, at(5), junit_xml(passed('test_x')))
+def test_files_stamped_exactly_at_the_start_and_the_end_belong_to_the_run(tmp_path: Path) -> None:
+    write_junit(tmp_path, at(10), junit_xml(passed('test_first')), qualifiers='alpha')
+    write_junit(tmp_path, at(20), junit_xml(passed('test_last')), qualifiers='beta')
 
-    assert case_ids(read(tmp_path, at(5))) == {'tests.test_a::test_x'}
+    run = read(tmp_path, at(20), started_at=at(10))
+
+    assert case_ids(run) == {'tests.test_a::test_first', 'tests.test_a::test_last'}
 
 
-def test_without_a_plan_every_file_up_to_the_end_is_a_candidate(tmp_path: Path) -> None:
-    write_junit(tmp_path, at(0), junit_xml(passed('test_alpha_first')), qualifiers='alpha')
+def test_without_a_plan_every_file_within_the_run_is_a_candidate(tmp_path: Path) -> None:
+    write_junit(tmp_path, at(0), junit_xml(passed('test_before')), qualifiers='beta')
+    write_junit(tmp_path, at(10), junit_xml(passed('test_alpha_first')), qualifiers='alpha')
     write_junit(tmp_path, at(15), junit_xml(passed('test_beta')), qualifiers='beta')
     write_junit(tmp_path, at(30), junit_xml(passed('test_alpha_rerun')), qualifiers='alpha')
     write_junit(tmp_path, at(90), junit_xml(passed('test_after')), qualifiers='beta')
 
-    run = read(tmp_path, at(60))
+    run = read(tmp_path, at(60), started_at=at(5))
 
     assert case_ids(run) == {'tests.test_a::test_beta', 'tests.test_a::test_alpha_rerun'}
+
+
+def test_a_later_run_that_archived_no_plan_does_not_read_the_earlier_runs_files(
+    tmp_path: Path,
+) -> None:
+    write_plan(tmp_path, at(0))
+    write_summary(tmp_path, at(5), category='local_run')
+    write_junit(tmp_path, at(5), junit_xml(passed('test_local')))
+    write_summary(tmp_path, at(120), qualifiers='remote-laptop', infix='pass-summary')
+
+    run = read(tmp_path, at(120), started_at=at(110))
+
+    assert run.legs == NOT_RECORDED
+    assert run.tests is None
+
+
+NAIVE = datetime(2026, 10, 1, 10, 0)
+
+
+@pytest.mark.parametrize(
+    ('started_at', 'ended_at', 'named'),
+    [(NAIVE, at(60), 'started_at'), (at(0), NAIVE, 'ended_at'), (at(60), at(0), 'after')],
+    ids=['naive-start', 'naive-end', 'start-after-end'],
+)
+def test_an_unusable_run_window_is_refused_by_name(
+    tmp_path: Path, started_at: datetime, ended_at: datetime, named: str
+) -> None:
+    with pytest.raises(ValueError, match=named):
+        read(tmp_path, ended_at, started_at=started_at)
 
 
 def test_a_rerun_within_the_run_replaces_the_earlier_file(tmp_path: Path) -> None:
@@ -287,7 +323,7 @@ def test_another_tasks_directory_is_never_read(tmp_path: Path, task_id: int) -> 
     write_plan(tmp_path, at(0))
     write_junit(tmp_path, at(1), junit_xml(passed('test_x')))
 
-    run = read_archived_run(tmp_path, task_id, ended_at=at(60), max_cases=100)
+    run = read_archived_run(tmp_path, task_id, started_at=at(0), ended_at=at(60), max_cases=100)
 
     assert run.legs == NOT_RECORDED
     assert run.tests is None
@@ -516,87 +552,22 @@ def test_a_malformed_summary_raises_a_typed_error(tmp_path: Path, content: str) 
     _assert_names_the_file(_read_error(tmp_path), tmp_path, ArchiveProblem.MALFORMED_SUMMARY)
 
 
-def write_map(junit: Path, mapping: object) -> Path:
-    """The defect plugin's collection map, written beside its junit as '<junit stem>.tests.json'."""
-    path = junit.with_name(junit.name.removesuffix('.xml.gz') + '.tests.json')
-    path.write_text(mapping if isinstance(mapping, str) else json.dumps(mapping))
-    return path
-
-
-CRITERION_MAP = {
-    'tests/test_a.py::test_x': {'defects': [], 'criterion': 'C-1'},
-    'tests/test_a.py::TestK::test_y[a::b]': {'defects': ['D-1'], 'criterion': 'C-2'},
-    'tests/test_a.py::test_z': {'defects': [], 'criterion': None},
-}
-MAPPED_REPORT = junit_xml(
-    passed('test_x'),
-    passed('test_y[a::b]', 'tests.test_a.TestK'),
-    passed('test_z'),
-    passed('test_unmapped'),
-)
-
-
-def criteria(run: ArchivedRun) -> dict[str, str | None]:
-    assert run.tests is not None
-    return {case.id: case.criterion for case in run.tests.cases}
-
-
-def test_each_case_carries_its_criterion_from_the_map_beside_its_junit(tmp_path: Path) -> None:
+def test_the_run_names_its_junit_files_relative_to_the_root(tmp_path: Path) -> None:
     write_plan(tmp_path, at(0))
-    write_map(write_junit(tmp_path, at(1), MAPPED_REPORT), CRITERION_MAP)
+    alpha = write_junit(tmp_path, at(1), junit_xml(passed('test_a')), qualifiers='alpha')
+    beta = write_junit(tmp_path, at(2), junit_xml(passed('test_b')), qualifiers='beta')
 
-    assert criteria(read(tmp_path, at(60))) == {
-        'tests.test_a::test_x': 'C-1',
-        'tests.test_a.TestK::test_y[a::b]': 'C-2',
-        'tests.test_a::test_z': None,
-        'tests.test_a::test_unmapped': None,
-    }
+    tests = read(tmp_path, at(60)).tests
+
+    assert tests is not None
+    assert tests.junit_relpaths == (alpha.relative_to(tmp_path), beta.relative_to(tmp_path))
 
 
-def test_without_a_map_no_case_has_a_criterion(tmp_path: Path) -> None:
+def test_a_collection_map_beside_a_junit_is_never_read_as_a_run_file(tmp_path: Path) -> None:
     write_plan(tmp_path, at(0))
-    write_junit(tmp_path, at(1), MAPPED_REPORT)
-
-    assert set(criteria(read(tmp_path, at(60))).values()) == {None}
-
-
-def test_a_map_applies_only_to_its_own_junit(tmp_path: Path) -> None:
-    write_plan(tmp_path, at(0))
-    write_map(write_junit(tmp_path, at(1), junit_xml(passed('test_x')), qualifiers='alpha'), CRITERION_MAP)
-    write_junit(tmp_path, at(2), junit_xml(passed('test_x', 'tests.test_b')), qualifiers='beta')
-
-    assert criteria(read(tmp_path, at(60))) == {
-        'tests.test_a::test_x': 'C-1',
-        'tests.test_b::test_x': None,
-    }
-
-
-@pytest.mark.parametrize(
-    'mapping',
-    [
-        'not json',
-        '[]',
-        {'tests/test_a.py::test_x': {'defects': [], 'criterion': 5}},
-        {'tests/test_a.py::test_x': {'defects': []}},
-        {'tests/test_a.py::test_x': 'C-1'},
-    ],
-    ids=['not-json', 'not-an-object', 'non-string-criterion', 'no-criterion', 'bare-string-entry'],
-)
-def test_a_malformed_map_raises_a_typed_error(tmp_path: Path, mapping: object) -> None:
-    write_plan(tmp_path, at(0))
-    write_map(write_junit(tmp_path, at(1), MAPPED_REPORT), mapping)
-
-    error = _read_error(tmp_path)
-
-    assert error.problem is ArchiveProblem.MALFORMED_MAP
-    assert str(error.relpath).endswith('.tests.json')
-    assert str(tmp_path) not in str(error)
-
-
-def test_a_map_is_never_read_as_a_run_file(tmp_path: Path) -> None:
-    write_plan(tmp_path, at(0))
-    orphan_junit = task_dir(tmp_path) / f'attempt-1.alpha.junit-{stamp(at(1))}.xml.gz'
-    write_map(orphan_junit, 'not json')
+    junit_stem = f'attempt-1.alpha.junit-{stamp(at(1))}'
+    for name in (f'{junit_stem}.tests.json', f'{junit_stem}.xml.gz.tests.json'):
+        (task_dir(tmp_path) / name).write_text('not json')
 
     run = read(tmp_path, at(60))
 
