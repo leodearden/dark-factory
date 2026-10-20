@@ -391,7 +391,10 @@ def test_criteria_declared_refuses_a_duplicate_id() -> None:
 
 
 def test_criteria_declared_accepts_an_empty_declaration() -> None:
-    assert build('criteria_declared', criteria=[]).criteria == ()
+    declaration = contract.CriteriaDeclared.model_validate(
+        event_dict('criteria_declared', criteria=[])
+    )
+    assert declaration.criteria == ()
 
 
 @pytest.mark.parametrize(

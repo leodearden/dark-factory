@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from enum import StrEnum
@@ -167,6 +168,11 @@ class CriterionOutcome(StrEnum):
     PASSED = 'passed'
     FAILED = 'failed'
     NOT_RUN = 'not_run'
+
+
+class CriterionKind(StrEnum):
+    SUCCESS = 'success'
+    FAILURE = 'failure'
 
 
 class _Record(BaseModel):
@@ -471,6 +477,34 @@ class CriteriaResults(_Envelope):
     results: tuple[CriterionResult, ...]
 
 
+class Criterion(_Record):
+    """One acceptance criterion as acceptance/criteria.yaml declares it."""
+
+    id: NonEmptyStr
+    prd: RepoPath
+    capability: NonEmptyStr
+    statement: NonEmptyStr
+    kind: CriterionKind
+
+
+class CriteriaDeclared(_Envelope):
+    """Every acceptance criterion the project declares; each declaration replaces the last."""
+
+    type: Literal['criteria_declared'] = 'criteria_declared'
+    criteria: tuple[Criterion, ...]
+
+    @model_validator(mode='after')
+    def _ids_are_unique(self) -> Self:
+        declared = Counter(criterion.id for criterion in self.criteria)
+        duplicates = sorted(cid for cid, count in declared.items() if count > 1)
+        if duplicates:
+            raise ValueError(
+                f'criteria_declared ids must be unique: {", ".join(duplicates)} declared more'
+                f' than once'
+            )
+        return self
+
+
 FeedEvent = Annotated[
     Heartbeat
     | FactoryState
@@ -484,7 +518,8 @@ FeedEvent = Annotated[
     | TreeSnapshot
     | FileRevealed
     | RevealRefused
-    | CriteriaResults,
+    | CriteriaResults
+    | CriteriaDeclared,
     Field(discriminator='type'),
 ]
 FEED_EVENT_ADAPTER: Final = TypeAdapter(FeedEvent)
@@ -538,6 +573,7 @@ class FeedState(_Record):
     tree: TreeSnapshot | None
     revealed: tuple[RevealedFile, ...]
     criteria: dict[RunKind, CriteriaResults]
+    criteria_declared: dict[str, Criterion]
     recent: tuple[FeedEvent, ...]
 
 
