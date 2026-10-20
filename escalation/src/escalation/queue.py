@@ -1010,9 +1010,16 @@ class EscalationQueue:
 
         An unregistered ``escalation.category`` raises
         ``UnregisteredEscalationCategory`` before anything is written (see
-        ``escalation.categories``).
+        ``escalation.categories``).  A ``note_to_file`` record raises
+        ``ValueError`` before anything is written: it is never pending.
         """
         require_registered_category(escalation.category)
+        if escalation.note_to_file:
+            raise ValueError(
+                f'note-to-file record {escalation.id} (task {escalation.task_id}) '
+                'is filed resolved via submit_resolved and is never pending; '
+                'submit() refused it'
+            )
         with escalation_id_lock(self.queue_dir, escalation.id):
             self._atomic_write(escalation.id, escalation.to_json(), durable=True)
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
