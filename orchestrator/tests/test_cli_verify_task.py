@@ -14,13 +14,14 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner, Result
-from test_cli import _setup_verify_repo
+from test_cli import _patched_verify_merge, _setup_verify_repo
 
 import orchestrator.cli as cli_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.verify_cancel import (
+    PGID_DIR_NAME,
     pgid_file,
     read_worktree_path,
     worktree_path_file,
@@ -103,3 +104,37 @@ class TestCancelVerifyReapsRecordedWorktree:
         assert r.exit_code == 0, r.output
         assert sentinel.read_text() == 'keep me'
         assert str(stray) in r.stderr
+
+
+class TestVerifyMergeRecordsItsWorktree:
+    def test_records_acquired_worktree_mid_run_and_clears_it_on_exit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        invoke = _patched_verify_merge(tmp_path, monkeypatch)
+        pgf = pgid_file(tmp_path / '.worktrees', 'req-merge')
+        recorded_mid_run: list[Path | None] = []
+
+        async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
+            recorded_mid_run.append(read_worktree_path(pgf))
+            return object()
+
+        monkeypatch.setattr(
+            'orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify,
+        )
+
+        r = invoke('--request-id', 'req-merge')
+
+        assert r.exit_code == 0, r.output
+        assert recorded_mid_run == [tmp_path / '_merge-verify']
+        assert not worktree_path_file(pgf).exists()
+        assert not pgf.exists()
+
+    def test_without_request_id_records_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        invoke = _patched_verify_merge(tmp_path, monkeypatch)
+
+        r = invoke()
+
+        assert r.exit_code == 0, r.output
+        assert not (tmp_path / '.worktrees' / PGID_DIR_NAME).exists()
