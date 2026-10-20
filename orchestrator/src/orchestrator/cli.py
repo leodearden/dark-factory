@@ -10,7 +10,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import click
 from dotenv import load_dotenv
@@ -36,6 +36,9 @@ from orchestrator.verify_cancel import (
     write_lock_holder_pgid,
     write_pgid_file,
 )
+
+if TYPE_CHECKING:
+    from orchestrator.git_ops import GitOps
 
 load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
 
@@ -945,16 +948,44 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     click.echo(result_to_json(result))
 
 
+def _recorded_merge_worktree_remover(git_ops: 'GitOps') -> Callable[[Path], None]:
+    """Return cancel-verify's remover for the worktree a killed run recorded.
+
+    It reaps only a ``_merge-`` band entry directly under ``worktree_base``,
+    through the single guarded remover: ``cleanup_merge_worktree``'s primary
+    path does not band-check, so a corrupt record must not reach it with a
+    task worktree.
+    """
+    from orchestrator.git_ops import classify_worktree_entry
+
+    def remove(worktree: Path) -> None:
+        in_merge_band = (
+            worktree.resolve().parent == git_ops.worktree_base.resolve()
+            and classify_worktree_entry(worktree.name) == 'merge'
+        )
+        if not in_merge_band:
+            click.echo(
+                f'cancel-verify: not removing recorded worktree {worktree}: it is '
+                f'not a _merge- entry directly under {git_ops.worktree_base}',
+                err=True,
+            )
+            return
+        asyncio.run(git_ops.cleanup_merge_worktree(worktree))
+
+    return remove
+
+
 @main.command('cancel-verify')
 @click.option('--request-id', required=True,
-              help='Request ID passed to the verify-merge invocation to cancel.')
+              help='Request ID passed to the verify-merge or verify-task invocation '
+                   'to cancel; the worktree that run recorded is reaped too.')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None,
               help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
                    'is set). Selects the target project — determines worktree_base for '
                    'the pgid-file lookup.')
 def cancel_verify(request_id: str, config_path: Path | None):
-    """Kill the verify-merge process tree identified by --request-id and exit 0.
+    """Kill the verify-merge or verify-task tree identified by --request-id and exit 0.
 
     Reads the pgid file at
     ``<worktree_base>/.merge_verify_pgids/<request-id>`` (written by
@@ -962,7 +993,9 @@ def cancel_verify(request_id: str, config_path: Path | None):
     ``SIGKILL``\\s every descendant plus a ``killpg`` backstop.  This reaps the
     entire process tree including ``start_new_session`` build-command escapes
     (which leave ``verify-merge``'s process group but remain its descendants in
-    the ``/proc`` parent chain).
+    the ``/proc`` parent chain).  The SIGKILL skips that run's own ``finally``,
+    so the ``_merge-`` worktree it recorded beside the pgid file is reaped here
+    (:func:`_recorded_merge_worktree_remover`).
 
     **Idempotent**: exits 0 when the file is absent (already cancelled or never
     started), when the content is corrupt, or when all processes are already
@@ -993,6 +1026,7 @@ def cancel_verify(request_id: str, config_path: Path | None):
     killed_pgid: list[int] = []
     rc = cancel_request(
         pgf, failed_pids_out=failed_pids, killed_pgid_out=killed_pgid,
+        remove_worktree=_recorded_merge_worktree_remover(git_ops),
     )
     # ── task 3186 (PRD δ): CLEAR THE FIXED-KEY HOLDER RENDEZVOUS ────────────
     # `cancel_request` SIGKILLs the verify-merge tree, which skips that
