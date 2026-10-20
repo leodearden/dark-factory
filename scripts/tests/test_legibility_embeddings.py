@@ -3,6 +3,7 @@ and the host-local vector cache the census similarity stage reads
 (plans/census-incremental-prd.md D3)."""
 from __future__ import annotations
 
+import math
 import re
 
 import pytest
@@ -303,6 +304,9 @@ class TestVectorsFor:
         ),
         pytest.param(lambda texts: [[0.0, 0.0]] * len(texts), id='all-zero'),
         pytest.param(lambda texts: [[]] * len(texts), id='empty'),
+        pytest.param(lambda texts: [[1.0, math.nan]] * len(texts), id='nan'),
+        pytest.param(lambda texts: [[1.0, -math.inf]] * len(texts), id='inf'),
+        pytest.param(lambda texts: [[1.0, 1e300]] * len(texts), id='float32-overflow'),
     ])
     def test_unusable_vectors_raise(self, tmp_path, reply):
         fake = _RecordingEmbed(reply=reply)

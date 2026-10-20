@@ -238,6 +238,8 @@ def _checked(raw: Sequence[Sequence[float]], expected: int, *, requests_made: in
     vectors = [_float32(vector) for vector in raw]
     if len({len(vector) for vector in vectors}) > 1:
         raise failed('ragged dimensions')
+    if not all(math.isfinite(x) for vector in vectors for x in vector):
+        raise failed('a NaN or infinite component')
     if any(not math.fsum(x * x for x in vector) for vector in vectors):
         raise failed('an empty or all-zero vector')
     return vectors
