@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, wait_responsive
 from _workflow_helpers import (
     AgentStub,
     FakeScheduler,
@@ -122,7 +122,10 @@ async def test_real_workflow_blocking_after_done_releases_slot_and_locks_at_hard
 
     with patch('orchestrator.harness.build_workflow', return_value=workflow):
         slot = asyncio.create_task(harness._run_slot(assignment, sem), name=f'workflow-{TID}')
-        await asyncio.wait_for(wedging_scheduler.cancel_absorbed.wait(), timeout=BARRIER)
+        await wait_responsive(
+            wedging_scheduler.cancel_absorbed.wait(), timeout=BARRIER,
+            label='DONE-phase cleanup wedges on the heartbeat',
+        )
         assert workflow.state == WorkflowState.DONE
         assert not slot.done(), 'terminal cleanup should be wedged on the heartbeat'
 

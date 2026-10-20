@@ -15,6 +15,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 import pytest
+from _orch_helpers import wait_responsive
 
 from orchestrator.workflow_types import CancellationScope, WorkflowCancelled
 
@@ -81,7 +82,7 @@ async def test_one_cancel_proof_entry_is_abandoned_after_grace_and_later_entries
     )
 
     outer = asyncio.create_task(scope.supervise(_body_returns()))
-    await asyncio.wait_for(entered.wait(), timeout=_BARRIER)
+    await wait_responsive(entered.wait(), timeout=_BARRIER, label='the cancel-proof entry starts')
     loop = asyncio.get_running_loop()
     started = loop.time()
     await _hard_cancel_until_done(outer, every=_GRACE / 4, budget=_BARRIER)
@@ -111,7 +112,7 @@ async def test_fully_cancel_immune_entry_is_abandoned_and_scope_still_returns():
     outer = asyncio.create_task(scope.supervise(_body_waits()))
     await asyncio.sleep(0)
     outer.cancel()
-    await asyncio.wait_for(entered.wait(), timeout=_BARRIER)
+    await wait_responsive(entered.wait(), timeout=_BARRIER, label='the cancel-proof entry starts')
     await _hard_cancel_until_done(outer, every=_GRACE / 4, budget=_BARRIER)
 
     assert outer.done()
