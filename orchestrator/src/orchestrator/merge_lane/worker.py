@@ -5597,6 +5597,8 @@ async def reverify_member_solo(
     module_configs: list[ModuleConfig],
     event_store: EventStore | None = None,
     verifier: VerifyPort = PRODUCTION_VERIFIER,
+    *,
+    escalation_queue: Any = None,
 ) -> SoloVerifyResult:
     """Run post-merge verification on a single train member's un-stacked solo branch.
 
@@ -5634,6 +5636,9 @@ async def reverify_member_solo(
         event_store:    Optional EventStore for telemetry (may be None).
         verifier:       Forwarded to :func:`_run_post_merge_verify`; tests
                         inject a fake through it.
+        escalation_queue: Forwarded to :func:`_run_post_merge_verify`, so a
+                        flake the main-health probe suppresses can still file
+                        the INV-4 storm escalation.
 
     Returns:
         :class:`SoloVerifyResult` with passed/failed verdict and reason.
@@ -5658,6 +5663,7 @@ async def reverify_member_solo(
         event_store=event_store,
         merge_sha=tip_sha,
         verifier=verifier,
+        escalation_queue=escalation_queue,
     )
     if outcome is None:
         # Pass: hand off the live worktree+branch to _attribute_train_failure.
