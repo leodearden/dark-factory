@@ -3405,6 +3405,84 @@
       ]
     },
     {
+      "task_id": "3113",
+      "reason": "Net-additive regression test: TestFinaliseMergedDoneWithoutMergeSha pins that a sha-less merge success resolves through the landed-outbox journal. It must live in this file because it needs the module's autouse MergeProvenance reset, and its one private read is the call to _finalise_merged_done, the method under test; the basis-marker read was cut.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_workflow_merge_provenance.py",
+          "baseline": 88,
+          "current": 89
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6542,
+          "current": 6543
+        }
+      ]
+    },
+    {
+      "task_id": "3860",
+      "reason": "task 3860: snapshot guard so a decided pre-dispatch request is never reported queued, bounce tracker retire_item wired to _retire_item (root-cause fix), and review-fix tests pinning the retire_item wiring and registry-only ghost arm through the lane's private registry (net-additive bug fix + test coverage)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2192,
+          "current": 2195
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22145,
+          "current": 22172
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_bounce.py",
+          "baseline": 0,
+          "current": 3
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_lifecycle_registry.py",
+          "baseline": 180,
+          "current": 181
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12491,
+          "current": 12501
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4839,
+          "current": 4842
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57076,
+          "current": 57103
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6543,
+          "current": 6547
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31562,
+          "current": 31572
+        }
+      ]
+    },
+    {
       "task_id": "3154",
       "reason": "net-additive: task 3154 re-cut ruling park primitive (park_prior_incarnation + prior_incarnation_evidence and five helpers, each <=8 cognitive) in git_ops.py; Part A of the same task already lowered git_ops.py (cognitive 1446->1432, lines 16007->15977)",
       "measures": [
