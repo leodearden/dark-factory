@@ -206,6 +206,19 @@ try:
 except (KeyError, ValueError):
     ORCH_RESTART_MIN_INTERVAL_SECS = 259200
 
+# Watched trees whose .py removal arms a ModuleNotFoundError in every running
+# orchestrator; shared/src/ is added because the fleet imports shared.
+MODULE_REMOVAL_WATCHED_PATHS = [*WATCHED_PATHS, "shared/src/"]
+
+# Bounds how long a removal of one of those modules may wait, after it first
+# lands on main, before the staleness backstop redeploys the fleet ahead of
+# the clock gates above (task 7198; rationale in OPERATIONS.md section 8).
+# Same env-with-default idiom as STALENESS_GRACE_SECS.
+try:
+    MODULE_REMOVAL_GRACE_SECS = int(os.environ["ORCH_MODULE_REMOVAL_GRACE_SECS"])
+except (KeyError, ValueError):
+    MODULE_REMOVAL_GRACE_SECS = 600
+
 # Provenance recorded in every clock this script stamps (task 4823). These
 # MIRROR df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
 # ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV, which
