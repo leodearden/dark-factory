@@ -3,6 +3,8 @@ and the host-local vector cache the census similarity stage reads
 (plans/census-incremental-prd.md D3)."""
 from __future__ import annotations
 
+import re
+
 import pytest
 from legibility import embeddings
 
@@ -140,3 +142,206 @@ class TestOpenAIEmbed:
         with pytest.raises(embeddings.EmbeddingFailed):
             embeddings.openai_embed(['a'], model=_MODEL)
         assert len(post.calls) == 1
+
+
+class _RecordingEmbed:
+    """A fake embed_fn: a deterministic vector per (text, model), recording
+    each call's texts. ``fail_on`` makes the call with that 1-based number
+    raise EmbeddingFailed; ``reply`` overrides what a call returns."""
+
+    def __init__(self, *, fail_on: int | None = None, reply=None) -> None:
+        self.calls: list[list[str]] = []
+        self._fail_on = fail_on
+        self._reply = reply
+
+    @staticmethod
+    def vector(text: str, model: str) -> list[float]:
+        seed = sum(map(ord, f'{model}:{text}'))
+        return [float(seed % 7 + 1), float(seed % 5 + 1), float(seed % 3 + 1)]
+
+    def __call__(self, texts, *, model):
+        self.calls.append(list(texts))
+        if self._fail_on == len(self.calls):
+            raise embeddings.EmbeddingFailed('embeddings endpoint answered HTTP 503')
+        if self._reply is not None:
+            return self._reply(texts)
+        return [self.vector(text, model) for text in texts]
+
+    @property
+    def embedded_texts(self) -> list[str]:
+        return [text for call in self.calls for text in call]
+
+
+def _texts(*pairs: tuple[str | None, str]) -> list[embeddings.Text]:
+    return [
+        embeddings.Text(key=f'k{i}', record_id=record_id, text=text)
+        for i, (record_id, text) in enumerate(pairs)
+    ]
+
+
+def _embedder(tmp_path, embed_fn) -> embeddings.Embedder:
+    return embeddings.Embedder(embed_fn=embed_fn, cache_path=tmp_path / 'embeddings.sqlite')
+
+
+class TestVectorsFor:
+    def test_first_call_embeds_everything_in_batches(self, tmp_path):
+        fake = _RecordingEmbed()
+        texts = _texts(*[(f'r{i}', f'text {i}') for i in range(5)])
+
+        got = embeddings.vectors_for(
+            texts, embedder=_embedder(tmp_path, fake), model=_MODEL, batch_size=2,
+        )
+
+        assert [len(call) for call in fake.calls] == [2, 2, 1]
+        assert set(got.vectors) == {t.key for t in texts}
+        for text in texts:
+            assert got.vectors[text.key] == pytest.approx(fake.vector(text.text, _MODEL))
+        assert (got.requests, got.embedded, got.cached, got.pruned) == (3, 5, 0, 0)
+
+    def test_second_call_is_served_from_the_cache(self, tmp_path):
+        texts = _texts(('r1', 'alpha'), ('r2', 'beta'))
+        first = embeddings.vectors_for(
+            texts, embedder=_embedder(tmp_path, _RecordingEmbed()), model=_MODEL,
+        )
+        fake = _RecordingEmbed()
+
+        second = embeddings.vectors_for(texts, embedder=_embedder(tmp_path, fake), model=_MODEL)
+
+        assert fake.calls == []
+        assert (second.requests, second.embedded, second.cached, second.pruned) == (0, 0, 2, 0)
+        assert dict(second.vectors) == dict(first.vectors)
+
+    def test_changed_text_is_re_embedded_and_its_stale_row_pruned(self, tmp_path):
+        embeddings.vectors_for(
+            _texts(('r1', 'alpha'), ('r2', 'beta')),
+            embedder=_embedder(tmp_path, _RecordingEmbed()), model=_MODEL,
+        )
+        fake = _RecordingEmbed()
+
+        got = embeddings.vectors_for(
+            _texts(('r1', 'alpha, reworded'), ('r2', 'beta')),
+            embedder=_embedder(tmp_path, fake), model=_MODEL,
+        )
+
+        assert fake.embedded_texts == ['alpha, reworded']
+        assert (got.embedded, got.cached, got.pruned) == (1, 1, 1)
+
+    def test_changed_model_is_re_embedded(self, tmp_path):
+        texts = _texts(('r1', 'alpha'))
+        embeddings.vectors_for(
+            texts, embedder=_embedder(tmp_path, _RecordingEmbed()), model=_MODEL,
+        )
+        fake = _RecordingEmbed()
+
+        got = embeddings.vectors_for(
+            texts, embedder=_embedder(tmp_path, fake), model='text-embedding-3-large',
+        )
+
+        assert fake.embedded_texts == ['alpha']
+        assert got.vectors['k0'] == pytest.approx(fake.vector('alpha', 'text-embedding-3-large'))
+
+    def test_rows_of_records_no_longer_indexed_are_pruned(self, tmp_path):
+        embeddings.vectors_for(
+            _texts(('r1', 'alpha'), ('r2', 'beta'), ('r3', 'gamma')),
+            embedder=_embedder(tmp_path, _RecordingEmbed()), model=_MODEL,
+        )
+
+        got = embeddings.vectors_for(
+            _texts(('r2', 'beta')), embedder=_embedder(tmp_path, _RecordingEmbed()),
+            model=_MODEL,
+        )
+        assert got.pruned == 2
+
+        fake = _RecordingEmbed()
+        embeddings.vectors_for(
+            _texts(('r1', 'alpha'), ('r2', 'beta')),
+            embedder=_embedder(tmp_path, fake), model=_MODEL,
+        )
+        assert fake.embedded_texts == ['alpha']
+
+    def test_ephemeral_text_is_embedded_every_call_and_never_cached(self, tmp_path):
+        texts = _texts(('r1', 'alpha'), (None, 'a novel cluster'))
+        embeddings.vectors_for(
+            texts, embedder=_embedder(tmp_path, _RecordingEmbed()), model=_MODEL,
+        )
+        fake = _RecordingEmbed()
+
+        got = embeddings.vectors_for(texts, embedder=_embedder(tmp_path, fake), model=_MODEL)
+
+        assert fake.embedded_texts == ['a novel cluster']
+        assert (got.embedded, got.cached, got.pruned) == (1, 1, 0)
+        assert set(got.vectors) == {'k0', 'k1'}
+
+    def test_failed_batch_propagates_and_writes_nothing(self, tmp_path):
+        embeddings.vectors_for(
+            _texts(('kept', 'kept text')),
+            embedder=_embedder(tmp_path, _RecordingEmbed()), model=_MODEL,
+        )
+        failing = _RecordingEmbed(fail_on=2)
+        texts = _texts(*[(f'r{i}', f'text {i}') for i in range(5)])
+
+        with pytest.raises(embeddings.EmbeddingFailed, match='503') as excinfo:
+            embeddings.vectors_for(
+                texts, embedder=_embedder(tmp_path, failing), model=_MODEL, batch_size=2,
+            )
+        assert excinfo.value.requests_made == 2
+        assert len(failing.calls) == 2
+
+        fake = _RecordingEmbed()
+        after = embeddings.vectors_for(
+            _texts(('kept', 'kept text'), ('r0', 'text 0')),
+            embedder=_embedder(tmp_path, fake), model=_MODEL,
+        )
+        assert fake.embedded_texts == ['text 0']
+        assert after.cached == 1
+
+    @pytest.mark.parametrize('reply', [
+        pytest.param(lambda texts: [[1.0, 2.0]] * (len(texts) - 1), id='wrong-count'),
+        pytest.param(
+            lambda texts: [[1.0, 2.0]] + [[1.0, 2.0, 3.0]] * (len(texts) - 1),
+            id='ragged-dimensions',
+        ),
+        pytest.param(lambda texts: [[0.0, 0.0]] * len(texts), id='all-zero'),
+        pytest.param(lambda texts: [[]] * len(texts), id='empty'),
+    ])
+    def test_unusable_vectors_raise(self, tmp_path, reply):
+        fake = _RecordingEmbed(reply=reply)
+
+        with pytest.raises(embeddings.EmbeddingFailed) as excinfo:
+            embeddings.vectors_for(
+                _texts(('r1', 'alpha'), ('r2', 'beta')),
+                embedder=_embedder(tmp_path, fake), model=_MODEL,
+            )
+        assert excinfo.value.requests_made == 1
+
+    def test_non_sqlite_cache_file_raises_naming_the_path(self, tmp_path):
+        path = tmp_path / 'embeddings.sqlite'
+        path.write_bytes(b'this is not a sqlite database, not even close' * 20)
+        fake = _RecordingEmbed()
+
+        with pytest.raises(embeddings.VectorCacheError, match=re.escape(str(path))):
+            embeddings.vectors_for(
+                _texts(('r1', 'alpha')),
+                embedder=embeddings.Embedder(embed_fn=fake, cache_path=path), model=_MODEL,
+            )
+        assert fake.calls == []
+
+    def test_nothing_to_embed_creates_no_cache_file(self, tmp_path):
+        fake = _RecordingEmbed()
+        got = embeddings.vectors_for([], embedder=_embedder(tmp_path, fake), model=_MODEL)
+
+        assert dict(got.vectors) == {}
+        assert (got.requests, got.embedded, got.cached, got.pruned) == (0, 0, 0, 0)
+        assert not (tmp_path / 'embeddings.sqlite').exists()
+
+
+def test_cache_path_sits_in_the_project_state_dir(tmp_path, monkeypatch):
+    from legibility import trickle_state
+
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    path = embeddings.cache_path('dark_factory')
+
+    assert path.parent == trickle_state.project_state_dir('dark_factory')
+    assert path.name == embeddings.CACHE_FILENAME == 'embeddings.sqlite'
+    assert path.is_relative_to(tmp_path)
