@@ -7,8 +7,10 @@ downward only: this module must never import ``orchestrator.merge_lane`` or
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,16 +20,23 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, assert_never, get_args
 from shared.git_async import run_git
 from shared.safe_io import atomic_write_text
 
-from orchestrator.task_verify_spec import CollapsedOverride, collapsed_module_overrides
+from orchestrator.task_verify_spec import (
+    CollapsedOverride,
+    build_task_verify_spec,
+    collapsed_module_overrides,
+)
 from orchestrator.verify import run_scoped_verification
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool, Refusal
 from orchestrator.verify_plan import derive_verify_plan, executed_module_prefixes
+from orchestrator.verify_runner import RunnerUnavailable
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps
     from orchestrator.verify import VerifyResult
+    from orchestrator.verify_runner import HostLease
 
 logger = logging.getLogger(__name__)
 
@@ -322,14 +331,71 @@ class TaskVerifyDispatcher:
         scope = await self._scope_of(call)
         draft.tip_sha, draft.base_sha = scope.tip_sha, scope.base_sha
         if not self._eligible(call, policy, scope):
-            draft.reason = 'not_eligible'
-            return await call.run(self._run_local)
+            return await self._run_local_because(call, draft, 'not_eligible')
         lease = self._pool.acquire_for_task(call.task_id)
         if isinstance(lease, Refusal):
-            draft.reason = lease.reason
-            return await call.run(self._run_local)
+            return await self._run_local_because(call, draft, lease.reason)
+        outcome = await self._run_remote(call, scope, lease, draft)
+        if isinstance(outcome, str):
+            return await self._run_local_because(call, draft, outcome)
+        draft.reason = 'remote'
+        return outcome
+
+    async def _run_local_because(
+        self, call: _VerifyCall, draft: _DecisionDraft, reason: DispatchReason,
+    ) -> VerifyResult:
+        draft.reason = reason
+        return await call.run(self._run_local)
+
+    async def _run_remote(
+        self, call: _VerifyCall, scope: _TaskScope, lease: HostLease, draft: _DecisionDraft,
+    ) -> VerifyResult | DispatchReason:
+        """Run the verify on *lease*'s host; the lease ends here on every path."""
+        acquired = time.monotonic()
+        remote: asyncio.Future[VerifyResult] | None = None
+        try:
+            if await self._git_ops.has_uncommitted_work(call.worktree):
+                return 'dirty_tree'
+            sync = await lease.runner.sync_if_stale(
+                event_store=call.event_store, task_id=call.task_id,
+            )
+            if not sync.ok:
+                self._pool.mark_unavailable(lease, 'sync_stale')
+                return 'sync_stale'
+            spec = build_task_verify_spec(
+                call.config, call.module_configs, scope.task_files,
+                force_workspace=False, attempt_id=call.attempt_id,
+                task_id=call.task_id, tip_sha=scope.tip_sha,
+            )
+            remote = verifying = asyncio.ensure_future(lease.runner.run_task_verify(
+                spec, task_id=call.task_id, archive_root=call.archive_root,
+            ))
+            return await self._remote_verdict(verifying, lease, draft)
+        finally:
+            await self._end_lease(lease, remote)
+            draft.lease_held_secs = time.monotonic() - acquired
+
+    async def _remote_verdict(
+        self, remote: asyncio.Future[VerifyResult], lease: HostLease, draft: _DecisionDraft,
+    ) -> VerifyResult | DispatchReason:
+        started = time.monotonic()
+        try:
+            result = await asyncio.shield(remote)
+        except RunnerUnavailable as exc:
+            self._pool.mark_unavailable(lease, exc.kind)
+            return 'runner_unavailable'
+        finally:
+            draft.remote_wall_secs = time.monotonic() - started
+        self._pool.mark_recovered(lease)
+        if not result.passed and result.category in INFRA_TRANSIENT_CATEGORIES:
+            return 'infra_transient'
+        draft.runner = lease.name
+        return result
+
+    async def _end_lease(
+        self, lease: HostLease, remote: asyncio.Future[VerifyResult] | None,
+    ) -> None:
         await self._pool.release(lease)
-        raise NotImplementedError('the remote task-verify leg is not implemented yet')
 
     async def _scope_of(self, call: _VerifyCall) -> _TaskScope:
         tip = await run_git(['git', 'rev-parse', 'HEAD'], cwd=call.worktree)
