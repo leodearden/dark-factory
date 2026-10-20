@@ -6,7 +6,8 @@ commit).  The rebase drops that commit as already upstream, so the rebased
 tree IS the tree the verify passed, and even a whole-tree gate has nothing
 new to see.  Every scenario drives the production lane over a real git repo
 with a whole-tree merge gate, so the disjoint fast path can never be what
-clears it.
+clears it, and with ``merge_gate_history_pure`` declared unless the scenario
+is about the project that does not declare it.
 
 The single-request gate re-verifies through the production verifier, not the
 injected one, so those scenarios read the gate's decision from its
@@ -110,7 +111,7 @@ class _Scene:
     config: OrchestratorConfig
 
 
-def _scene(tmp_path: Path) -> _Scene:
+def _scene(tmp_path: Path, *, history_pure: bool = True) -> _Scene:
     repo = seed_repo(tmp_path / 'repo', _SEED)
     git = GitConfig(
         main_branch='main', branch_prefix='task/', worktree_dir='.worktrees',
@@ -118,7 +119,9 @@ def _scene(tmp_path: Path) -> _Scene:
     )
     return _Scene(
         repo=repo, git_ops=GitOps(git, repo),
-        config=lane_scene_config(repo, git, merge_verify_breadth='full'),
+        config=lane_scene_config(
+            repo, git, merge_verify_breadth='full', merge_gate_history_pure=history_pure,
+        ),
     )
 
 
@@ -175,6 +178,19 @@ async def test_rebase_that_drops_an_upstream_patch_lands_without_a_reverify(
     assert outcome.status == 'done', outcome
     assert _tree(scene.repo, 'main') == verify.calls[0].tree
     assert [row['gate_clearance'] for row in _gate_retries(store)] == ['same_tree']
+
+
+async def test_same_tree_reverifies_when_the_gate_reads_history(tmp_path: Path) -> None:
+    scene = _scene(tmp_path, history_pure=False)
+    follower_wt, head_commit = await _stacked_follower(scene)
+    verify = _MovingVerify(scene.repo, _lands_patch_of(head_commit))
+    store = _RecordingEventStore()
+
+    outcome = await _run(scene, _request(scene, 'follower', follower_wt), verify, store)
+
+    assert outcome.status == 'done', outcome
+    assert _tree(scene.repo, 'main') == verify.calls[0].tree
+    assert [row['gate_clearance'] for row in _gate_retries(store)] == ['reverified']
 
 
 async def test_rebase_onto_an_unrelated_drift_still_reverifies(tmp_path: Path) -> None:

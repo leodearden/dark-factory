@@ -3370,10 +3370,15 @@ async def _reverify_rebased_tree(
 
     Algorithm
     ---------
-    0. **Same tree**: when *merge_sha*'s tree equals *verified_merge_sha*'s,
-       return ``GateClearance.same_tree`` with no verify.  A whole-tree gate
-       that passed tree T sees exactly T again, so neither premise of
-       :func:`_disjoint_skip_blockers` is consulted: no inference is made.
+    0. **Same tree**, only when the project declares
+       ``merge_gate_history_pure``: when *merge_sha*'s tree equals
+       *verified_merge_sha*'s, return ``GateClearance.same_tree`` with no
+       verify.  PRECONDITION: the gate's verdict is a function of the tree
+       alone.  A gate leg that reads git history (ancestry of HEAD, a
+       merge-base) can turn red on the same tree under a new parent, so for
+       such a project the key stays False and the tree is re-verified.  Under
+       the precondition a gate that passed tree T sees exactly T again, and
+       neither premise of :func:`_disjoint_skip_blockers` is consulted.
     1. Call ``_rebase_delta_touched_overlap`` to compute the intersection of
        the branch-touched file set and the intervening main delta.
     2. **Disjoint** (empty intersection): consult
@@ -3417,7 +3422,8 @@ async def _reverify_rebased_tree(
         The worker's ``_run_post_merge_verify``, which this gate delegates the
         re-verify to when the delta overlaps.
     """
-    if await _same_tree(git_ops, verified_merge_sha, merge_sha):
+    history_pure = getattr(req.config, 'merge_gate_history_pure', False) is True
+    if history_pure and await _same_tree(git_ops, verified_merge_sha, merge_sha):
         logger.info(
             'Task %s: rebased tree %s is the tree verified at %s — skipping re-verify',
             req.task_id, merge_sha[:8], verified_merge_sha[:8],

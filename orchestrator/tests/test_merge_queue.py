@@ -16070,7 +16070,11 @@ class TestReverifyRebasedTree:
         from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
 
         merge_wt, req, verified, rebased_from, rebased_onto = await self._rebased_onto_drift(
-            git_ops, config.model_copy(update={'merge_verify_breadth': 'full'}), 'rvrt-same',
+            git_ops,
+            config.model_copy(
+                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+            ),
+            'rvrt-same',
         )
         _, rewritten, _ = await _run(
             ['git', 'commit-tree', f'{verified}^{{tree}}', '-p', rebased_onto, '-m', 'same tree'],
@@ -16105,7 +16109,10 @@ class TestReverifyRebasedTree:
         from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
 
         merge_wt, req, _, rebased_from, rebased_onto = await self._rebased_onto_drift(
-            git_ops, config.model_copy(update={'merge_verify_breadth': 'full'}),
+            git_ops,
+            config.model_copy(
+                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+            ),
             f'rvrt-closed-{len(verified_merge_sha)}',
         )
         _, rebased_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
