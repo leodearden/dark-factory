@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from types import ModuleType
@@ -21,6 +22,14 @@ from types import ModuleType
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
+
+# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path so the
+# workspace members resolve to their src/ packages (mirrors
+# test_orchestrator_watchdog.py).
+if str(REPO_ROOT.resolve()) not in sys.path:
+    sys.path.append(str(REPO_ROOT.resolve()))
+
+from df_pytest_isolation import synthetic_unit  # noqa: E402
 
 # Saved before any test wraps subprocess.run, so the fixture's own git calls
 # and the pass-through wrappers below always reach the real binary.
@@ -348,3 +357,176 @@ def test_absent_deploy_clock_waives_nothing_without_running_git(
     monkeypatch.setattr(wdog.subprocess, "run", recording_run)
     assert wdog._due_module_removals() == ()
     assert calls == []
+
+
+def _wire_pass(wdog: ModuleType, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Stub only the systemctl-level unit probes; return the recorded systemd-run calls.
+
+    git passes through to the real binary against the throwaway repo, so the
+    clock and lease gates, the watched-commit probe and _delegate_fleet_restart
+    all run for real.
+    """
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [synthetic_unit("stale")])
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _unit: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _unit: 300.0)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _unit: DEPLOY + 10)
+    delegations: list[list[str]] = []
+
+    def run(argv, *args, **kwargs):
+        if argv[0] == "git":
+            return _REAL_RUN(argv, *args, **kwargs)
+        if argv[0] == "systemd-run":
+            delegations.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        pytest.fail(f"unexpected subprocess in staleness_pass: {argv}")
+
+    monkeypatch.setattr(wdog.subprocess, "run", run)
+    return delegations
+
+
+def _fleet_redeploy_argv(wdog: ModuleType) -> list[str]:
+    return [
+        "systemd-run",
+        "--user",
+        "--collect",
+        "--no-block",
+        f"--unit={wdog.FLEET_STALENESS_REDEPLOY_UNIT}",
+        os.path.join(wdog.REPO_DIR, "scripts", "restart-all-orchestrators.sh"),
+        "--drain",
+    ]
+
+
+def _next_log_bucket(wdog: ModuleType, after: int) -> int:
+    """The first instant at or after *after* whose throttled skip lines are emitted."""
+    return after + (-after) % wdog.SKIP_LOG_INTERVAL_SECS
+
+
+@pytest.mark.parametrize(("scenario", "expected"), TRIGGERS)
+def test_due_removal_delegates_one_fleet_redeploy_inside_the_min_interval(
+    wdog: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    scenario: Scenario,
+    expected: tuple[str, ...],
+) -> None:
+    repo = _build_repo(tmp_path)
+    scenario(repo, CHANGE)
+    lines = _point_at(wdog, monkeypatch, tmp_path, repo, CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS)
+    delegations = _wire_pass(wdog, monkeypatch)
+
+    wdog.staleness_pass()
+
+    assert delegations == [_fleet_redeploy_argv(wdog)]
+    assert any("module-removal" in line and expected[0] in line for line in lines), lines
+
+
+def test_removal_inside_its_grace_delegates_nothing(
+    wdog: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    repo = _build_repo(tmp_path)
+    _delete(repo, CHANGE)
+    _point_at(wdog, monkeypatch, tmp_path, repo, CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS - 1)
+    delegations = _wire_pass(wdog, monkeypatch)
+
+    wdog.staleness_pass()
+
+    assert delegations == []
+
+
+@pytest.mark.parametrize("scenario", NON_TRIGGERS)
+def test_stale_fleet_without_a_removal_still_waits_out_the_min_interval(
+    wdog: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    scenario: Scenario,
+) -> None:
+    repo = _build_repo(tmp_path)
+    scenario(repo, CHANGE)
+    _point_at(wdog, monkeypatch, tmp_path, repo, CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS)
+    delegations = _wire_pass(wdog, monkeypatch)
+
+    wdog.staleness_pass()
+
+    assert delegations == []
+
+
+def test_live_lease_still_blocks_a_due_removal(
+    wdog: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    repo = _build_repo(tmp_path)
+    _delete(repo, CHANGE)
+    now = _next_log_bucket(wdog, CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS)
+    lines = _point_at(wdog, monkeypatch, tmp_path, repo, now)
+    lease = {"pid": os.getpid(), "started_ts": now - 60, "current_unit": synthetic_unit("held")}
+    pathlib.Path(wdog.FLEET_LEASE_PATH).write_text(json.dumps(lease))
+    delegations = _wire_pass(wdog, monkeypatch)
+
+    wdog.staleness_pass()
+
+    assert delegations == []
+    assert any("lease" in line for line in lines), lines
+
+
+def test_due_removal_waives_the_commit_grace(
+    wdog: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    now = CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS
+    repo = _build_repo(tmp_path)
+    _delete(repo, CHANGE)
+    _edit(repo, now - 60)
+    _point_at(wdog, monkeypatch, tmp_path, repo, now)
+    delegations = _wire_pass(wdog, monkeypatch)
+
+    wdog.staleness_pass()
+
+    assert delegations == [_fleet_redeploy_argv(wdog)]
+
+
+def test_waiver_stops_once_the_redeploy_stamps_the_clock(
+    wdog: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    now = CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS
+    repo = _build_repo(tmp_path)
+    _delete(repo, CHANGE)
+    _point_at(wdog, monkeypatch, tmp_path, repo, now)
+    delegations = _wire_pass(wdog, monkeypatch)
+    wdog.staleness_pass()
+    assert len(delegations) == 1
+
+    _write_clock(pathlib.Path(wdog.FLEET_DEPLOY_CLOCK_PATH), now)
+    wdog.staleness_pass()
+
+    assert len(delegations) == 1
+    assert wdog._due_module_removals() == ()
+
+
+def test_clock_stamped_mid_pass_cancels_the_waiver_delegation(
+    wdog: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    now = CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS
+    repo = _build_repo(tmp_path)
+    _delete(repo, CHANGE)
+    lines = _point_at(wdog, monkeypatch, tmp_path, repo, now)
+    reads = iter([DEPLOY, DEPLOY])
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: next(reads, now))
+    delegations = _wire_pass(wdog, monkeypatch)
+
+    wdog.staleness_pass()
+
+    assert delegations == []
+    assert any("stamped while this pass was probing" in line for line in lines), lines
+
+
+def test_failed_git_probe_inside_the_min_interval_delegates_nothing(
+    wdog: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    repo = _build_repo(tmp_path)
+    _delete(repo, CHANGE)
+    lines = _point_at(wdog, monkeypatch, tmp_path, repo, CHANGE + wdog.MODULE_REMOVAL_GRACE_SECS)
+    delegations = _wire_pass(wdog, monkeypatch)
+    _point_repo_dir_at_a_non_repo(wdog, monkeypatch, tmp_path)
+
+    wdog.staleness_pass()
+
+    assert delegations == []
+    assert any(line.startswith("WARNING:") for line in lines), lines
