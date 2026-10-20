@@ -6,17 +6,18 @@ import gzip
 import math
 import os
 import re
+import stat
 import xml.etree.ElementTree as ET
 import zlib
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
-from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
+from pydantic import BaseModel, ConfigDict, StrictInt, TypeAdapter, ValidationError
 
 from client_feed.contract import (
     NOT_RECORDED,
@@ -182,14 +183,55 @@ def _outcome(testcase: ET.Element) -> tuple[CaseOutcome, str | None]:
     return CaseOutcome.PASSED, None
 
 
-def _case(testcase: ET.Element) -> CaseResult:
+def _junit_id_of_nodeid(nodeid: str) -> str:
+    """A pytest nodeid in its junit spelling, by pytest's own junitxml mangle_test_address rule."""
+    address, bracket, params = nodeid.partition('[')
+    names = address.split('::')
+    names[0] = names[0].replace('/', '.').removesuffix('.py')
+    names[-1] += bracket + params
+    return _case_id('.'.join(names[:-1]), names[-1])
+
+
+class _MapEntry(BaseModel):
+    """One nodeid of the defect plugin's collection map; its defects are not this reader's concern."""
+
+    model_config = ConfigDict(frozen=True, extra='ignore')
+
+    criterion: str | None
+
+
+_MAP_ADAPTER: Final = TypeAdapter(dict[str, _MapEntry])
+_JUNIT_SUFFIX: Final = f'.{_EXTENSIONS[ArchiveFileKind.JUNIT]}'
+_MAP_SUFFIX: Final = '.tests.json'
+
+
+def _criteria(root: Path, junit: Path) -> Mapping[str, str | None]:
+    """The criterion per junit case id from the map written beside `junit`; no map binds nothing."""
+    path = junit.with_name(junit.name.removesuffix(_JUNIT_SUFFIX) + _MAP_SUFFIX)
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return {}
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise _failure(root, path, ArchiveProblem.UNREADABLE) from exc
+    try:
+        entries = _MAP_ADAPTER.validate_json(raw)
+    except ValidationError as exc:
+        raise _failure(root, path, ArchiveProblem.MALFORMED_MAP) from exc
+    return {_junit_id_of_nodeid(nodeid): entry.criterion for nodeid, entry in entries.items()}
+
+
+def _case(testcase: ET.Element, criteria: Mapping[str, str | None]) -> CaseResult:
+    case_id = _case_id(testcase.get('classname', ''), testcase.get('name', ''))
     seconds = _seconds(testcase.get('time'))
     outcome, exception_type = _outcome(testcase)
     return CaseResult(
-        id=_case_id(testcase.get('classname', ''), testcase.get('name', '')),
+        id=case_id,
         outcome=outcome,
         duration_ms=None if seconds is None else round(seconds * 1000),
-        criterion=None,
+        criterion=criteria.get(case_id),
         exception_type=exception_type,
     )
 
@@ -200,13 +242,13 @@ class _JunitReport:
     suite_seconds: tuple[float, ...]
 
 
-def _parse_junit(report: gzip.GzipFile) -> _JunitReport:
+def _parse_junit(report: gzip.GzipFile, criteria: Mapping[str, str | None]) -> _JunitReport:
     """Cases and suite times only: no message attribute and no element text is ever read."""
     cases: list[CaseResult] = []
     suite_seconds: list[float] = []
     for _, element in ET.iterparse(report, events=('end',)):
         if element.tag == 'testcase':
-            cases.append(_case(element))
+            cases.append(_case(element, criteria))
             element.clear()
         elif element.tag == 'testsuite' and (seconds := _seconds(element.get('time'))) is not None:
             suite_seconds.append(seconds)
@@ -214,9 +256,10 @@ def _parse_junit(report: gzip.GzipFile) -> _JunitReport:
 
 
 def _read_junit(root: Path, path: Path) -> _JunitReport:
+    criteria = _criteria(root, path)
     try:
         with gzip.open(path) as report:
-            return _parse_junit(report)
+            return _parse_junit(report, criteria)
     except (OSError, EOFError, zlib.error) as exc:
         raise _failure(root, path, ArchiveProblem.UNREADABLE) from exc
     except (ET.ParseError, ValueError) as exc:
