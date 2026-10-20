@@ -175,7 +175,7 @@ async def _run_drift_check(
     Mirrors ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` as an
     off-serial-lane detective control (spawned via :func:`_maybe_run_drift_check`).
     Creates a throwaway verify worktree, builds a 2-host pool (local trust-anchor
-    + eligible remote), runs :meth:`~orchestrator.verify_runner.DriftDetector.check`,
+    + eligible remote), runs ``DriftDetector.check_env_safely`` and then ``check``,
     and propagates any quarantined remote name into *quarantine_set* (the worker-
     level shared set consulted by ``_run_post_merge_verify``).
 
@@ -284,11 +284,10 @@ async def _run_drift_check(
                 # The throwaway worktree (wt) was created unconditionally above; only
                 # the LocalRunner *object* is deferred to the factory so it is not
                 # constructed if the local slot is unavailable.
-                _ttf = task_files_tuple  # capture for closure
 
                 def _local_factory() -> LocalRunner:
                     return LocalRunner(
-                        wt, req.config, req.module_configs, _ttf,
+                        wt, req.config, req.module_configs, task_files_tuple,
                         run_scoped=verifier.run_scoped,
                         run_unscoped=verifier.run_unscoped_typechecks,
                         task_id=req.task_id,
@@ -334,6 +333,7 @@ async def _run_drift_check(
                 escalation_queue=escalation_queue,
                 task_id=req.task_id,
             )
+            await detector.check_env_safely(req.config.verify_env_probes)
             # Capture the eligible remote BEFORE check() so we can propagate its
             # name even after the pool quarantines it (eligible_remote() returns
             # None after quarantine).

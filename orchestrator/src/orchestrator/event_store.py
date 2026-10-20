@@ -233,6 +233,24 @@ class EventType(StrEnum):
     # is recorded.
     verify_cross_check_mismatch = 'verify_cross_check_mismatch'
     verify_cross_check_inconclusive = 'verify_cross_check_inconclusive'
+    # Host-ENVIRONMENT parity at the drift-check cadence (task 4537, Lever C).
+    # Sibling of verdict_parity_ok above, and deliberately NOT folded into it:
+    # verdict_parity_ok says the two hosts reached the same verdict, which two
+    # hosts running different tool versions do on almost every commit — right
+    # up until the one where they don't.  These two say whether the hosts are
+    # running the same TOOLS in the first place.
+    #   verify_env_parity_ok: every compared probe matched.  Payload
+    #     {local_runner, remote_runner, probe_keys: [str], dimensions: [str]}.
+    #   verify_env_divergence: at least one probe differs.  Payload
+    #     {local_runner, remote_runner, drift_dimensions: [str],
+    #      diverging_probes: {key: {'local': str, 'remote': str}}} — both
+    #     values are carried so an operator can read the skew straight off the
+    #     event without re-probing either host.
+    # Env divergence is a DETECTIVE control only: it alarms (one deduped L1)
+    # and never quarantines, so a cosmetic probe difference cannot bench a
+    # verify host.  Absent when verify_env_probes is [] (the shipped default).
+    verify_env_parity_ok = 'verify_env_parity_ok'
+    verify_env_divergence = 'verify_env_divergence'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
     merge_queued = 'merge_queued'

@@ -1039,11 +1039,24 @@ class TestBaseCommitDiff:
 
 @pytest.mark.asyncio
 class TestPostRebaseVerifyFailure:
-    """Post-rebase verification failure is non-blocking — merge queue runs its own verify."""
+    """A red rebased tip still lands: the merge queue runs its own verify (task 1724).
 
-    async def test_post_rebase_verify_fails_proceeds_to_merge(
-        self, config, git_ops, task_assignment, monkeypatch
+    By default the merge phase only rebases (task 6580), so the in-worktree
+    verify is the only call through this stub; with the ``pre_merge_reverify``
+    rollback switch on, the advisory post-rebase verify runs too and its red
+    verdict is non-blocking.
+    """
+
+    @pytest.mark.parametrize(
+        ('pre_merge_reverify', 'expected_verify_calls'),
+        [(False, 1), (True, 2)],
+        ids=['default-rebase-only', 'rollback-reverify'],
+    )
+    async def test_post_rebase_red_tip_proceeds_to_merge(
+        self, config, git_ops, task_assignment, monkeypatch,
+        pre_merge_reverify, expected_verify_calls,
     ):
+        monkeypatch.setattr(config, 'pre_merge_reverify', pre_merge_reverify)
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
@@ -1054,9 +1067,9 @@ class TestPostRebaseVerifyFailure:
         async def verify_fn(cwd, cfg, module_configs=None, **kwargs):
             nonlocal verify_call
             verify_call += 1
-            # First verify: in-worktree (pass).
-            # Second verify: post-rebase (fail) — workflow should still proceed.
-            # The merge queue runs its own verify through conftest's autouse
+            # First verify: in-worktree (pass). Any later call through this
+            # stub is the merge-phase post-rebase verify, and it is RED. The
+            # merge queue runs its own verify through conftest's autouse
             # passed=True stub and never reaches this function.
             if verify_call <= 1:
                 return VerifyResult(
@@ -1073,14 +1086,14 @@ class TestPostRebaseVerifyFailure:
 
         outcome = (await workflow.run()).outcome
 
-        assert verify_call == 2, (
-            'expected exactly the in-worktree + post-rebase verifies through '
-            f'orchestrator.workflow.run_scoped_verification; got {verify_call}. '
-            'A third call means the merge queue no longer runs its own verify '
-            'through conftest, and this stub is now failing a verify it never '
-            'meant to judge.'
+        assert verify_call == expected_verify_calls, (
+            f'expected {expected_verify_calls} verify call(s) through '
+            'orchestrator.workflow.run_scoped_verification (the in-worktree '
+            'verify, plus the post-rebase verify only when pre_merge_reverify '
+            f'is on); got {verify_call}. An extra call means the merge queue '
+            'no longer runs its own verify through conftest, and this stub is '
+            'now failing a verify it never meant to judge.'
         )
-        # Post-rebase verify failure is non-blocking; merge queue handles it
         assert outcome == WorkflowOutcome.DONE
 
 
