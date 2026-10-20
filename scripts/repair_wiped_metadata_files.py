@@ -2,12 +2,14 @@
 """Repair ``metadata.files`` wiped by the DONE path — the WRITE counterpart to
 ``scripts/audit_wiped_metadata_files.py``.
 
-Task 3329. ``TaskWorkflow._reconcile_metadata_files_for_done``
-(orchestrator/src/orchestrator/workflow.py:2007) blanks a task's
-``metadata.files`` on two branches — reaching DONE with no merge sha, and its
-``if err is not None: files = []`` arm, which fires WITH a real sha present.
-Task 3113 owns the forward fix and is still ``pending``; this script backfills
-the records the wiper already damaged, using the plan scope the audit recovers.
+Before task 3113,
+``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_metadata_files_for_done``
+blanked a task's ``metadata.files`` on two branches — reaching DONE with no
+merge sha, and its ``if err is not None: files = []`` arm, which fired WITH a
+real sha present. 3113's fix reached main in 1f2f858e40: the reconcile now
+keeps the recorded scope when the merge diff is uncomputable. This script
+backfills the pre-fix damage, using the plan scope the audit recovers. Task
+3329 ran pass one and task 3427 pass two.
 
 WHAT THIS SCRIPT REFUSES TO DO
 ------------------------------
@@ -17,8 +19,8 @@ That is not fastidiousness — it is measured. Across this task's planning
 sessions three read-only audit runs returned 40, then 43, then 45 candidates,
 and in between one task (id 3086) MOVED from the repairable set into
 ``contradicted_real_merge_sha``. Repairing from the older payload would have
-written files onto a task the contradicted rule forbids touching. The wiper is
-live, so the population keeps drifting; only a fresh sweep is safe.
+written files onto a task the contradicted rule forbids touching. The wiper was
+live then, so the population kept drifting; only a fresh sweep is safe.
 
 SAFETY MODEL
 ------------
@@ -334,8 +336,8 @@ def classify_live_task(live_task: object, candidate: WipeCandidate) -> str:
     it is guaranteed to be undone — hence :data:`SKIP_NOT_TERMINAL`.
 
     :data:`SKIP_FILES_PRESENT` is what makes this script idempotent: a second
-    pass (the one the addendum predicts will be needed once 3113 lands) re-runs
-    cheaply and touches only what is still empty.
+    pass (task 3427's, run after 3113 landed) re-runs cheaply and touches only
+    what is still empty.
 
     The emptiness test reuses the audit's ``_coerce_file_list`` rather than
     bare truthiness, so the predicate deciding "this task still has no scope"

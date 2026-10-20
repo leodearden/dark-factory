@@ -1,12 +1,12 @@
 """Tests for scripts/repair_wiped_metadata_files.py — the WRITE counterpart to
 the read-only audit of the DONE-path ``metadata.files`` wipe.
 
-Task 3329 backfills ``metadata.files`` on the records that
-``TaskWorkflow._reconcile_metadata_files_for_done``
-(orchestrator/src/orchestrator/workflow.py:2007) already emptied. Task 3113 owns
-the forward fix and is still ``pending``, so the wiper is LIVE and the damaged
-population keeps growing — which is precisely why the repair re-runs the audit
-in-process on every invocation instead of consuming a pasted candidate list.
+The script backfills ``metadata.files`` on the records that
+``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_metadata_files_for_done``
+emptied before task 3113's fix reached main in 1f2f858e40. Task 3329 ran pass
+one and task 3427 pass two. While the wiper was live the damaged population
+kept growing — which is precisely why the repair re-runs the audit in-process
+on every invocation instead of consuming a pasted candidate list.
 
 NO TEST HERE ASSERTS A COUNT OR TASK ID DERIVED FROM THE LIVE DATABASES.
 This norm is inherited verbatim from scripts/tests/test_audit_wiped_metadata_files.py:
@@ -1291,7 +1291,7 @@ def test_repair_project_declines_to_write_when_the_live_task_is_not_terminal(tmp
 
 def test_repair_project_declines_to_write_when_the_live_task_already_has_files(tmp_path):
     """The idempotency arm of gate 3, enforced rather than merely classified.
-    A second pass (the one expected once 3113 lands) must re-read cheaply and
+    A second pass (task 3427's, run after 3113 landed) must re-read cheaply and
     touch only what is still empty — so the write must not be issued here."""
     root = _wiped_project(tmp_path)
     client = _FakeClient(
