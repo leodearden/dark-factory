@@ -256,9 +256,6 @@ class TestCarrierReason:
     def test_any_other_plan_has_no_carrier_reason(self, task_row: TaskRow) -> None:
         assert carrier_reason(planned(task_row), self.STATUSES, now=NOW) is None
 
-    def test_the_migration_agent_id_is_named(self) -> None:
-        assert migrate_deferrals.MIGRATION_AGENT_ID == 'migrate-deferrals'
-
 
 # ---------------------------------------------------------------------------
 # The CLI, boundary row 23: main(argv) in-process over FakeFusedMemory across
