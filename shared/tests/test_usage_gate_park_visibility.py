@@ -1,11 +1,11 @@
 """A fully-capped park must be VISIBLE, not silent (task 4945).
 
-THE GAP THIS CLOSES, named by the code itself. ``orchestrator/evals/
-runner.py`` documents that ``cap_wait_sanity_secs`` is consulted at exactly
-one place — ``_check_cap_wait``, in the cap-hit branch AFTER an invocation
-returned — so "the unbounded ``_open.wait()`` above is out of its reach",
-and filed making a fully-capped park visible as a follow-up. This is that
-follow-up.
+THE GAP THIS CLOSES. ``orchestrator/evals/runner.py`` documented that
+``cap_wait_sanity_secs`` was consulted only in the cap-hit branch AFTER an
+invocation returned, so the gate's fully-capped park was out of its reach,
+and filed making that park visible as a follow-up. This is that follow-up.
+Task 4002 has since bounded the park too; ``test_park_free_invocation.py``
+pins that.
 
 MEASURED BEFORE THE FIX: ``UsageGate.before_invoke`` logged
 ``'All accounts capped — waiting for any to reopen'`` exactly ONCE at INFO

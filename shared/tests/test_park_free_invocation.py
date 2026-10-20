@@ -1,18 +1,18 @@
-"""A park-free caller must be TOLD the pool is frozen, never parked (task 6042).
+"""How long a caller parks on a pool with no admissible account (tasks 6042, 4002).
 
-``UsageGate.before_invoke`` ends in an unbounded wait when no account is
-admissible: ``_wait_for_any_account_to_reopen`` for a frozen fleet, the
-per-scope waiter for an exhausted model scope. That is the right shape for
-the orchestrator's long-lived workers, which can afford to wait out a reset,
-and the wrong one for a nightly oneshot (the legibility trickle and census),
-which must DEFER and exit rather than hang until the weekly reset (task 4736).
+``UsageGate.before_invoke`` waits when no account is admissible:
+``_wait_for_any_account_to_reopen`` for a frozen fleet, the per-scope waiter
+for an exhausted model scope. Unbounded is the right shape for a long-lived
+worker that can wait out a reset, and the wrong one for a nightly oneshot (the
+legibility trickle and census), which must DEFER and exit rather than hang
+until the weekly reset (task 4736).
 
-``cap_wait_sanity_secs`` cannot bound that wait (it is consulted only after a
-RETURNED cap), and a caller-side ``asyncio.wait_for`` cannot tell a frozen
-pool from a slow agent. So the bound is a ``park`` keyword on the gate itself,
-surfaced through ``invoke_slot`` and ``invoke_with_cap_retry``'s
-``park_on_frozen_pool``. ``park=True`` stays the default and stays
-byte-identical for the fleet.
+A caller-side ``asyncio.wait_for`` cannot tell a frozen pool from a slow
+agent, so the bound lives in the gate: ``max_wait_secs`` bounds the park and
+``park=False`` is its zero allowance. ``invoke_with_cap_retry`` forwards the
+time left on its ``cap_wait_sanity_secs`` deadline as that allowance, and
+``park_on_frozen_pool=False`` as the zero. The default, ``park=True`` with no
+``max_wait_secs``, stays byte-identical for direct gate callers.
 
 Every await is bounded by ``asyncio.wait_for(..., 2.0)``, so a regression that
 parks FAILS this suite rather than hanging it. Accounts are capped and
