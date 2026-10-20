@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _curator_fake import FakeCurator
 from _recording_event_store import _RecordingEventStore
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -386,6 +387,10 @@ def strand_harness(harness: Harness, tmp_path: Path) -> Harness:
     harness._escalation_queue = EscalationQueue(tmp_path / 'strand_queue')
     harness.event_store = _RecordingEventStore()  # type: ignore[assignment]
     harness.config.orphan_l0_timeout_secs = THRESHOLD_SECS
+    harness.config.info_l0_router_enabled = True
+    harness.config.info_l0_router_ticket_timeout_secs = 900.0
+    harness.config.info_l0_router_max_conversions_per_sweep = 20
+    harness.scheduler.dispatch_tool = FakeCurator()
     return harness
 
 
@@ -466,15 +471,14 @@ class TestStaleL0StrandIsLoud:
 
         assert _strand_events(strand_harness) == []
 
-    async def test_info_severity_strand_reports_workflow_not_blocked(
+    async def test_an_aged_info_l0_is_routed_not_counted_as_a_strand(
         self, strand_harness: Harness
     ):
-        """Blocked-ness is DERIVED from the durable severity, never guessed.
+        """Strand telemetry counts blocking strands only (task 5200 amendment).
 
-        escalate_info files severity='info' and the agent keeps going;
-        escalate_blocker files severity='blocking' and the filing workflow
-        genuinely parks.  After a restart _escalation_events is empty, so the
-        record's own severity is the only surviving signal.
+        The info-L0 router routes an info note pending across the restart
+        (plans/info-l0-disposition-router-prd.md boundary #16), so the sweep
+        neither dismisses it unread nor reports it as a strand.
         """
         queue = _queue_of(strand_harness)
         _seed_escalation(
@@ -483,10 +487,10 @@ class TestStaleL0StrandIsLoud:
 
         await strand_harness._dismiss_stale_escalations()
 
-        events = _strand_events(strand_harness)
-        assert len(events) == 1
-        assert events[0]['data']['workflow_blocked'] is False
-        assert events[0]['data']['severity'] == 'info'
+        assert _strand_events(strand_harness) == []
+        record = _get(queue, 'esc-4242-1')
+        assert record.status == 'pending'
+        assert record.resolved_by != 'auto-dismissed'
 
     async def test_strand_sweep_logs_at_warning(self, strand_harness: Harness, caplog):
         """journald is loud too — a swept strand is not an INFO-level footnote."""

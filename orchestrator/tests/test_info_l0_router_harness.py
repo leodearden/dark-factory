@@ -340,3 +340,100 @@ class TestBlockingDedupIsCategoryScoped:
         assert _current(harness, legacy.id).status == 'dismissed'
         assert _current(harness, later.id).status == 'dismissed'
         assert [l1.task_id for l1 in _l1s(harness, agent_role='harness-orphan-reaper')] == ['8']
+
+
+def _strand_events(harness: Harness) -> list[dict]:
+    store = harness.event_store
+    assert store is not None
+    return store.fetch_events_by_type(EventType.stale_l0_strand_dismissed)
+
+
+@pytest.mark.asyncio
+class TestStartupAmnestyRoutesInfoNotes:
+    """Boundary #16: an info L0 pending across a restart is routed, never
+    dismissed unread; blocking strands are swept exactly as before."""
+
+    async def test_a_work_note_is_routed_and_survives_the_sweep_held(self, harness: Harness):
+        esc = _submit_aged(harness, '42', seconds_ago=30.0)
+
+        await harness._dismiss_stale_escalations()
+
+        held = _current(harness, esc.id)
+        assert (held.status, held.resolved_by) == ('pending', None)
+        hold = read_hold(held)
+        assert hold is not None and hold.ticket == 'tkt_1'
+        (row,) = _dispositions(harness)
+        assert (row['class'], row['by'], row['exit_kind']) == ('convert-pending', 'startup-amnesty', 'restart')
+        assert _strand_events(harness) == []
+
+    async def test_a_mechanical_note_closes_status_info_under_one_aggregate(self, harness: Harness):
+        esc = _submit_aged(harness, '42', agent_role=STARVATION, category='infra_issue')
+
+        await harness._dismiss_stale_escalations()
+
+        assert _current(harness, esc.id).resolution_class == 'status-info'
+        (aggregate,) = _aggregates(harness, status_info_sentinel(STARVATION))
+        assert esc.id in aggregate.detail
+        assert _strand_events(harness) == []
+
+    async def test_a_hold_from_before_the_restart_converts_when_its_ticket_was_created(
+        self, harness: Harness,
+    ):
+        esc = _hold(harness, _submit_aged(harness, '42'), 'tkt_9', filed_secs_ago=120.0)
+        _curator(harness).set_ticket('tkt_9', {'status': 'created', 'task_id': '9001'})
+
+        await harness._dismiss_stale_escalations()
+
+        assert _current(harness, esc.id).resolution_class == 'converted'
+        (row,) = _dispositions(harness)
+        assert (row['class'], row['exit_kind']) == ('converted', 'restart')
+
+    async def test_an_undecided_hold_from_before_the_restart_stays_pending(self, harness: Harness):
+        esc = _hold(harness, _submit_aged(harness, '42'), 'tkt_9', filed_secs_ago=120.0)
+
+        await harness._dismiss_stale_escalations()
+
+        after = _current(harness, esc.id)
+        assert (after.status, after.triage_note) == ('pending', esc.triage_note)
+        assert _curator(harness).calls_named('submit_task') == []
+
+    async def test_a_blocking_strand_is_still_swept_with_its_event_and_aggregate(
+        self, harness: Harness,
+    ):
+        strand = _submit_aged(harness, '5189', severity='blocking', category='task_failure')
+        _submit_aged(harness, '42', seconds_ago=30.0)
+
+        await harness._dismiss_stale_escalations()
+
+        swept = _current(harness, strand.id)
+        assert (swept.status, swept.resolved_by, swept.resolution_class) == (
+            'dismissed', 'auto-dismissed', 'stale-strand',
+        )
+        (event,) = _strand_events(harness)
+        assert event['data']['escalation_id'] == strand.id
+        (aggregate,) = _l1s(harness, agent_role='harness-stale-l0-strand-sweep')
+        assert strand.id in aggregate.detail
+
+    async def test_an_eval_lane_info_note_is_dismissed_as_before(self, harness: Harness):
+        esc = _submit_aged(harness, '2339', worktree=EVAL_WORKTREE, seconds_ago=30.0)
+
+        await harness._dismiss_stale_escalations()
+
+        assert (_current(harness, esc.id).status, _current(harness, esc.id).resolved_by) == (
+            'dismissed', 'auto-dismissed',
+        )
+        assert _curator(harness).calls == []
+
+    async def test_with_the_router_disabled_every_l0_is_dismissed_as_before(self, harness: Harness):
+        harness.config.info_l0_router_enabled = False
+        info = _submit_aged(harness, '42', seconds_ago=30.0)
+        blocking = _submit_aged(harness, '43', severity='blocking', seconds_ago=30.0)
+
+        await harness._dismiss_stale_escalations()
+
+        for esc in (info, blocking):
+            assert (_current(harness, esc.id).status, _current(harness, esc.id).resolved_by) == (
+                'dismissed', 'auto-dismissed',
+            )
+        assert _curator(harness).calls == []
+        assert _dispositions(harness) == []
