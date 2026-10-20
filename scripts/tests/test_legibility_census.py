@@ -11544,6 +11544,46 @@ def test_a_backlog_candidate_near_only_a_fixed_entry_is_not_attached(tmp_path, s
     assert _run_record(kwargs)["adjudication"]["attached"] == []
 
 
+@pytest.mark.parametrize("promoted_candidate", [False, True], ids=["fixed-entry", "candidate-promoted-to-the-fixed-entry"])
+def test_a_surfaced_cluster_near_an_open_entry_is_still_verified(tmp_path, promoted_candidate):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append({
+        "id": "entry-fixed",
+        "title": _L6_NOVEL_TITLE,
+        "severity": "medium",
+        "status": "fixed",
+        "origin_phase": "implement",
+        "manifested_phase": "verify",
+        "sightings": [_earlier_sighting()],
+    })
+    if promoted_candidate:
+        cb["candidates"] = [{
+            **_backlog_candidate("cand-20260701-1", _L6_NOVEL_TITLE, "s-fixed-earlier"),
+            "disposition": "promoted",
+            "promoted_to": "entry-fixed",
+        }]
+    assert codebook.validate(cb) == []
+    kwargs, _ = _similarity_kwargs(
+        tmp_path, {_ENTRY_A_TEXT: _ENTRY_AXIS, _NOVEL_TEXT: _NEAR}, codebook_dict=cb,
+        batch=[_hand_digest("novel-verified", "a genuinely new confusion shape")],
+    )
+    kwargs["verify_fn"] = _make_fake_verify_fn(rejected_titles={_L6_NOVEL_TITLE})
+
+    assert mod.run_census(**kwargs).status == "done"
+
+    assert _offered_titles(kwargs["verify_fn"])[0] == [_L6_NOVEL_TITLE]
+    assert _run_record(kwargs)["adjudication"]["attached"] == []
+    screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
+    assert [line for line in screened.splitlines() if "surfaced" in line and "entry-fixed" in line]
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    for candidate in persisted["candidates"]:
+        if candidate["title"] == _L6_NOVEL_TITLE:
+            assert candidate.get("promoted_to") != "entry-a"
+            assert (candidate.get("attached_by") or {}).get("method") != "similarity"
+    assert "novel-verified" not in {s["session"] for s in _persisted_record(kwargs, "entry-a")["sightings"]}
+
+
 # Row 12 part 2: the rest of the pending backlog, clustered, ranked and capped,
 # is verified one representative per cluster, and the other members follow it.
 
